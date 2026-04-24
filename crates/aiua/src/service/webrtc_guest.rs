@@ -17,19 +17,28 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 /// A lightweight Transceiver for peer-to-peer data channels bypassing the Philotic ledger.
 pub struct WebRtcGuest {
     session_id: String,
-    _target_node: String,
+    local_node_id: String,
+    target_node_id: String,
+    target_guest_id: Option<String>,
+    sender_guest_id: Option<String>,
     signal_tx: mpsc::Sender<WebRtcSignalMessage>,
 }
 
 impl WebRtcGuest {
     pub fn new(
         session_id: String,
-        target_node: String,
+        local_node_id: String,
+        target_node_id: String,
+        target_guest_id: Option<String>,
+        sender_guest_id: Option<String>,
         signal_tx: mpsc::Sender<WebRtcSignalMessage>,
     ) -> Self {
         Self {
             session_id,
-            _target_node: target_node,
+            local_node_id,
+            target_node_id,
+            target_guest_id,
+            sender_guest_id,
             signal_tx,
         }
     }
@@ -102,8 +111,10 @@ impl WebRtcGuest {
             // Send the Answer back out over the Mesh UDP control plane
             let signal = WebRtcSignalMessage {
                 session_id: self.session_id.clone(),
-                target_guest_id: "remote-requester".to_string(), // In reality we map this back to the requesting agent id
-                sender_node: "local-aiua-01".to_string(),        // In reality map from node caps
+                target_node_id: self.target_node_id.clone(),
+                target_guest_id: self.sender_guest_id.clone(),
+                sender_node: self.local_node_id.clone(),
+                sender_guest_id: self.target_guest_id.clone(),
                 signal: SignalPayload::Answer(local_desc.sdp),
             };
             let _ = self.signal_tx.send(signal).await;

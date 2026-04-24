@@ -1438,6 +1438,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
         let inbound_mat_req = ctx.ipc_materialization_requester.clone();
         let inbound_local_node_id = ctx.caps.node_id.clone();
         let webrtc_signal_tx_inbound = ctx.webrtc_signal_tx.clone();
+        let local_node_id_webrtc_inbound = ctx.caps.node_id.clone();
         tokio::spawn(async move {
             while let Some(msg) = inbox_rx.recv().await {
                 match msg.msg_type {
@@ -1627,13 +1628,17 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         >(&msg.payload)
                         {
                             let webrtc_signal_tx = webrtc_signal_tx_inbound.clone();
+                            let local_node_id = local_node_id_webrtc_inbound.clone();
                             tokio::spawn(async move {
                                 if let ansible_mesh_core::webrtc::SignalPayload::Offer(sdp) =
                                     signal_msg.signal
                                 {
                                     let guest = crate::service::webrtc_guest::WebRtcGuest::new(
                                         signal_msg.session_id,
+                                        local_node_id,
                                         msg.src_node,
+                                        signal_msg.target_guest_id,
+                                        signal_msg.sender_guest_id,
                                         webrtc_signal_tx,
                                     );
                                     if let Err(e) = guest.run_answering(sdp).await {
@@ -1657,13 +1662,24 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
             while let Some(signal) = webrtc_signal_rx.recv().await {
                 if let Ok(payload_bytes) = serde_json::to_vec(&signal) {
                     let Some(auth_key) =
-                        mesh_auth_key_for_node(webrtc_graph.as_ref(), &signal.target_guest_id)
+                        mesh_auth_key_for_node(webrtc_graph.as_ref(), &signal.target_node_id)
                             .ok()
                             .flatten()
                     else {
                         debug!(
                             "Skipping WebRTC signal for {} until mesh auth key exists",
-                            signal.target_guest_id
+                            signal.target_node_id
+                        );
+                        continue;
+                    };
+                    let Some(target_addr) =
+                        mesh_target_addr_for_node(webrtc_graph.as_ref(), &signal.target_node_id)
+                            .ok()
+                            .flatten()
+                    else {
+                        debug!(
+                            "Skipping WebRTC signal for {} until mesh reachability exists",
+                            signal.target_node_id
                         );
                         continue;
                     };
@@ -1685,7 +1701,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         version: 1,
                         msg_id,
                         src_node: local_node_id_webrtc.clone(),
-                        dest_node: signal.target_guest_id.clone(),
+                        dest_node: signal.target_node_id.clone(),
                         msg_type: ansible_mesh_core::MsgType::WebRtcSignal,
                         seq,
                         total: 1,
@@ -1695,8 +1711,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                     };
 
                     if let Ok(packet) = serde_json::to_vec(&msg) {
-                        let target_addr = "127.0.0.1:8999";
-                        if let Err(e) = socket_webrtc.send_to(&packet, target_addr).await {
+                        if let Err(e) = socket_webrtc.send_to(&packet, &target_addr).await {
                             tracing::error!("UDP WebRTC Signal send failed: {}", e);
                         }
                     }
@@ -6981,6 +6996,7 @@ mod tests {
         enable_guest_test_overrides, execution_reachability_for_hotel,
         extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
         hotel_base_port, hotel_ipc_socket_path, local_capability_advertisements,
+        mesh_target_addr_for_node,
         nearest_available_base_port, resolve_runtime_ports, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::domain::GraphDomain;
@@ -7005,6 +7021,25 @@ mod tests {
         assert_eq!(hotel.mesh_port, hotel_base_port("alpha-hotel"));
         assert_eq!(hotel.blob_port, hotel.mesh_port + 1);
         assert_eq!(hotel.execution_port, hotel.mesh_port + 2);
+    }
+
+    #[test]
+    fn mesh_target_addr_uses_target_node_identity() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let mut local = default_hotel_record("default");
+        local.mesh_host = Some("100.64.230.106".into());
+        let mut remote = default_hotel_record("mbp-jane");
+        remote.mesh_host = Some("100.79.239.64".into());
+        remote.mesh_port = 13104;
+        graph.upsert_hotel(&local).expect("upsert local hotel");
+        graph.upsert_hotel(&remote).expect("upsert remote hotel");
+
+        let target = mesh_target_addr_for_node(&graph, "mbp-jane-aiua-01")
+            .expect("resolve target")
+            .expect("remote target should exist");
+
+        assert_eq!(target, "100.79.239.64:13104");
     }
 
     #[test]
