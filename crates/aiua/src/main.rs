@@ -1057,6 +1057,13 @@ fn execution_reachability_for_hotel(
         .flatten()
         .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            hotel
+                .mesh_host
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "127.0.0.1".into());
     let protocol = graph
         .get_config_value("execution_protocol")
@@ -1241,7 +1248,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
     {
         let heartbeat_socket = daemon.socket();
         let heartbeat_graph = ctx.graph_domain.clone();
-        let heartbeat_hotel = ctx.hotel.clone();
+        let heartbeat_hotel_name = ctx.hotel_name.clone();
         let heartbeat_caps = ctx.caps.clone();
         let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1259,6 +1266,17 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         if targets.is_empty() {
                             continue;
                         }
+                        let heartbeat_hotel = match heartbeat_graph.get_hotel(&heartbeat_hotel_name) {
+                            Ok(Some(hotel)) => hotel,
+                            Ok(None) => {
+                                warn!("Skipping heartbeat: hotel record [{}] missing", heartbeat_hotel_name);
+                                continue;
+                            }
+                            Err(err) => {
+                                warn!("Failed to load current hotel record [{}] for heartbeat: {}", heartbeat_hotel_name, err);
+                                continue;
+                            }
+                        };
                         let execution_reachability =
                             execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
                         let node_health =
@@ -1295,7 +1313,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
     {
         let capability_socket = daemon.socket();
         let capability_graph = ctx.graph_domain.clone();
-        let capability_hotel = ctx.hotel.clone();
+        let capability_hotel_name = ctx.hotel_name.clone();
         let capability_caps = ctx.caps.clone();
         let mut capability_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1316,6 +1334,24 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         if targets.is_empty() {
                             continue;
                         }
+                        let capability_hotel = match capability_graph.get_hotel(&capability_hotel_name) {
+                            Ok(Some(hotel)) => hotel,
+                            Ok(None) => {
+                                warn!(
+                                    "Skipping capability sync: hotel record [{}] missing",
+                                    capability_hotel_name
+                                );
+                                continue;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Failed to load current hotel record [{}] for capability sync: {}",
+                                    capability_hotel_name,
+                                    err
+                                );
+                                continue;
+                            }
+                        };
 
                         let advertisements = match local_capability_advertisements(capability_graph.as_ref(), &capability_hotel) {
                             Ok(advertisements) => advertisements,
@@ -6574,6 +6610,20 @@ mod tests {
 
         assert_eq!(reachability.protocol, "tcp-framed-v1");
         assert_eq!(reachability.host, "jane-vps");
+        assert_eq!(reachability.port, hotel.execution_port);
+    }
+
+    #[test]
+    fn execution_reachability_falls_back_to_hotel_mesh_host() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let mut hotel = default_hotel_record("default");
+        hotel.mesh_host = Some("100.64.230.106".into());
+
+        let reachability = execution_reachability_for_hotel(&graph, &hotel);
+
+        assert_eq!(reachability.protocol, "tcp-framed-v1");
+        assert_eq!(reachability.host, "100.64.230.106");
         assert_eq!(reachability.port, hotel.execution_port);
     }
 
