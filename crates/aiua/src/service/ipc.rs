@@ -7432,6 +7432,148 @@ impl IpcServer {
                     mcp_route_count: 0,
                 }
             }
+
+            // ── MCP endpoint provisioning ──────────────────────────────────
+
+            IpcRequest::ProvisionMcpEndpoint { config } => {
+                let endpoint_id = config.endpoint_id.clone();
+                let port = config.port;
+
+                // Persist the endpoint config in the context graph.
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let preapproval_key = format!("__mcp_preapproval__:{endpoint_id}");
+
+                let config_json = match serde_json::to_string(&config) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "SERIALIZE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                };
+
+                if let Err(e) = graph.set_config_value(&config_key, &config_json) {
+                    return IpcResponse::error(
+                        "mcp_endpoint",
+                        "CONFIG_STORE_ERROR",
+                        e.to_string(),
+                    );
+                }
+
+                // Persist pre-approval rules separately for fast lookup.
+                if !config.preapproval_rules.is_empty() {
+                    let rules_json = match serde_json::to_string(&config.preapproval_rules) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return IpcResponse::error(
+                                "mcp_endpoint",
+                                "SERIALIZE_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    };
+                    if let Err(e) = graph.set_config_value(&preapproval_key, &rules_json) {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "CONFIG_STORE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                }
+
+                // Fan out the full config to the membrane-mcp guest inbox.
+                let guest_id = format!("mcp-membrane-{endpoint_id}");
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_config",
+                    "config": config,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &guest_id,
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(
+                    endpoint_id,
+                    port, "MCP endpoint config stored and fanned out."
+                );
+
+                IpcResponse::McpEndpointProvisioned {
+                    endpoint_id,
+                    port,
+                    materialized: false, // guest spawn deferred to Phase 3
+                }
+            }
+
+            IpcRequest::RevokeMcpEndpoint {
+                endpoint_id,
+                owner_agent_id,
+            } => {
+                // Verify ownership before clearing.
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let existing = graph.get_config_value(&config_key).ok().flatten();
+                if let Some(json) = existing {
+                    let existing_owner = serde_json::from_str::<serde_json::Value>(&json)
+                        .ok()
+                        .and_then(|v| v["owner_agent_id"].as_str().map(str::to_string));
+                    if existing_owner.as_deref() != Some(&owner_agent_id) {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "FORBIDDEN",
+                            format!(
+                                "endpoint {endpoint_id} is not owned by {owner_agent_id}"
+                            ),
+                        );
+                    }
+                }
+
+                // Read port before clearing (needed for response).
+                let port = serde_json::from_str::<serde_json::Value>(
+                    &graph.get_config_value(&config_key).ok().flatten().unwrap_or_default(),
+                )
+                .ok()
+                .and_then(|v| v["port"].as_u64())
+                .unwrap_or(0) as u16;
+
+                // Clear stored state.
+                let _ = graph.set_config_value(&config_key, "null");
+                let _ = graph.set_config_value(
+                    &format!("__mcp_preapproval__:{endpoint_id}"),
+                    "null",
+                );
+
+                // Signal the membrane-mcp guest to shut down.
+                let guest_id = format!("mcp-membrane-{endpoint_id}");
+                let task_json = serde_json::json!({
+                    "action": "revoke_mcp_config",
+                    "endpoint_id": endpoint_id,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &guest_id,
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(endpoint_id, "MCP endpoint revoked.");
+
+                IpcResponse::McpEndpointProvisioned {
+                    endpoint_id,
+                    port,
+                    materialized: false,
+                }
+            }
         }
     }
 
