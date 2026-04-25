@@ -50,3 +50,10 @@ philotic_backbone_peers:
 philotic_enable_rust_auth: "1"
 philotic_enable_rust_dispatcher: "1"
 philotic_enable_rust_task_lifecycle: "1"
+
+# ONNX Sidecar — 768-dim embeddings for web-exposed semantic search
+philotic_onnx_sidecar_enabled: true
+philotic_onnx_sidecar_port: 11435
+philotic_onnx_embed_repo: "Xenova/all-mpnet-base-v2"  # 768-dim, ONNX-optimized
+philotic_onnx_embed_dim: 768
+philotic_onnx_prefer_quantized: true

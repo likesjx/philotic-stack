@@ -24,6 +24,7 @@ philotic_binaries:
   - membrane
   - agent-core
   - model-router
+  - model-controller-onnx
 
 # Runtime ports
 philotic_beacon_port: 8999       # UDP — inter-hotel mesh
@@ -46,3 +47,10 @@ philotic_agents: {}
 
 # Log level
 philotic_rust_log: "info"
+
+# ONNX Sidecar Configuration
+philotic_onnx_sidecar_enabled: false
+philotic_onnx_sidecar_port: 11435
+philotic_onnx_embed_repo: "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim default
+philotic_onnx_embed_dim: 384
+philotic_onnx_prefer_quantized: true
