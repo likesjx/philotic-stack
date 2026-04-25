@@ -79,6 +79,16 @@ pub async fn install(hotel: String) -> Result<()> {
         <string>--hotel</string>
         <string>{hotel}</string>
     </array>{env_block}
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
     <key>KeepAlive</key>
     <true/>
     <key>RunAtLoad</key>

@@ -2607,6 +2607,12 @@ impl SessionState {
             if turn.is_null() {
                 return None;
             }
+            // Discard terminal turns — a process killed mid-turn leaves phase=failed/completed
+            // in the checkpoint; restoring them would block all new messages.
+            let phase_str = turn.get("phase").and_then(serde_json::Value::as_str).unwrap_or("queued");
+            if matches!(phase_str, "failed" | "completed") {
+                return None;
+            }
             let local_node_id = local_node_id();
 
             let task_id = turn

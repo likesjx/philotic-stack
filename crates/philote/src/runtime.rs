@@ -979,6 +979,94 @@ impl AgentRuntime {
         })
     }
 
+    /// Build `McpRouteRecord`s from the agent's effective toolset.
+    ///
+    /// Operator-stored overrides (key `__mcp_routes__:<agent_id>`) take precedence.
+    /// When no overrides are stored, every tool in `default_toolset` that has a real
+    /// catalog entry is projected as a self-targeting `Philote` route. Tools with no
+    /// catalog entry are skipped — they are model-internal only.
+    async fn mcp_routes_from_profile(
+        &mut self,
+    ) -> Vec<ansible_mesh_core::mcp_route::McpRouteRecord> {
+        use ansible_mesh_core::mcp_route::{
+            McpAuthScheme, McpRouteRecord, McpRouteSecurity, McpRouteTarget,
+        };
+
+        // Operator override takes precedence.
+        let key = format!("__mcp_routes__:{}", self.agent_id);
+        if let Ok(IpcResponse::ConfigData {
+            value_json: Some(json),
+            ..
+        }) = self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig { key: key.clone() })
+            .await
+        {
+            match serde_json::from_str::<Vec<McpRouteRecord>>(&json) {
+                Ok(r) if !r.is_empty() => {
+                    info!(agent_id = %self.agent_id, count = r.len(), "Using operator-stored MCP route overrides.");
+                    return r;
+                }
+                Ok(_) => {}
+                Err(e) => warn!(key = %key, err = %e, "Ignoring malformed operator MCP route override."),
+            }
+        }
+
+        // Derive from default_toolset — catalog entries only.
+        let catalog = crate::catalog::tool_catalog();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        self.default_agent_profile
+            .default_toolset
+            .iter()
+            .filter_map(|tool_name| {
+                let def = catalog.get(tool_name.as_str())?;
+                Some(McpRouteRecord {
+                    agent_id: self.agent_id.clone(),
+                    tool_name: tool_name.clone(),
+                    description: def.description.clone(),
+                    input_schema: def.input_schema.clone(),
+                    target: McpRouteTarget::Philote {
+                        agent_id: self.agent_id.clone(),
+                    },
+                    security: McpRouteSecurity {
+                        auth: McpAuthScheme::None,
+                        global_allotment: None,
+                        require_approval: crate::catalog::tool_requires_approval(tool_name),
+                    },
+                    updated_at: now,
+                })
+            })
+            .collect()
+    }
+
+    /// At startup, derive `McpRouteRecord`s from the agent profile and push them to
+    /// the hotel so the `membrane-mcp` guest advertises this philote's tools
+    /// immediately after restart. Operator-stored overrides take precedence over
+    /// the profile-derived set.
+    async fn register_mcp_routes(&mut self) {
+        let routes = self.mcp_routes_from_profile().await;
+        if routes.is_empty() {
+            info!(agent_id = %self.agent_id, "No MCP routes to register (empty default_toolset or no catalog matches).");
+            return;
+        }
+        let count = routes.len();
+        match self
+            .ipc_client
+            .send_request(IpcRequest::UpdateMcpRoutes {
+                agent_id: self.agent_id.clone(),
+                routes,
+            })
+            .await
+        {
+            Ok(_) => info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel."),
+            Err(e) => warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes"),
+        }
+    }
+
     /// At startup, enumerate all session apartments for this agent and purge any
     /// stale active turns left over from an unclean shutdown. Cleans the DB so
     /// sessions are not blocked before the first inbound message arrives.
@@ -1246,6 +1334,10 @@ impl AgentRuntime {
         // crash or unclean shutdown. This runs once at startup so callers don't have
         // to wait for the next inbound message to get a clean checkpoint.
         self.sweep_stale_session_turns().await;
+
+        // Re-advertise this philote's MCP tool routes to the hotel so that the
+        // membrane-mcp guest picks them up immediately on restart.
+        self.register_mcp_routes().await;
 
         loop {
             // Dispatch any tasks that were dequeued from a session's pending_user_tasks
@@ -8832,6 +8924,260 @@ impl AgentRuntime {
                     raw_transport_event: None,
                     error: None,
                     tool_name: Some("delegate.merge".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── mcp.provision ────────────────────────────────────────────────
+            "mcp.provision" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let args = &payload.arguments;
+
+                let endpoint_id = match args.get("endpoint_id").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "mcp.provision: missing required argument 'endpoint_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let port = match args.get("port").and_then(|v| v.as_u64()) {
+                    Some(p) if p > 0 && p < 65536 => p as u16,
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "mcp.provision: missing or invalid 'port' (must be 1–65535)".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let tools_raw = args.get("tools").cloned().unwrap_or(serde_json::json!([]));
+                let tools: Vec<ansible_mesh_core::mcp_endpoint::McpToolSpec> =
+                    match serde_json::from_value(tools_raw) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return self
+                                .fail_active_turn(
+                                    session_id,
+                                    turn_id,
+                                    format!("mcp.provision: invalid 'tools' shape — {e}"),
+                                )
+                                .await;
+                        }
+                    };
+
+                let preapproval_rules: Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule> =
+                    args.get("preapproval_rules")
+                        .and_then(|v| serde_json::from_value::<Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule>>(v.clone()).ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|mut rule: ansible_mesh_core::mcp_endpoint::McpPreapprovalRule| {
+                            rule.approved_by_turn = turn_id.clone();
+                            rule.approved_at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            rule
+                        })
+                        .collect();
+
+                let updated_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let config = ansible_mesh_core::mcp_endpoint::McpEndpointConfig {
+                    endpoint_id: endpoint_id.clone(),
+                    owner_agent_id: self.agent_id.clone(),
+                    port,
+                    path: None,
+                    tools,
+                    preapproval_rules,
+                    updated_at,
+                };
+
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::ProvisionMcpEndpoint { config })
+                    .await;
+
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::McpEndpointProvisioned {
+                        endpoint_id: ref eid,
+                        port: p,
+                        materialized,
+                    }) => {
+                        let status = if materialized {
+                            "spawned a new membrane-mcp guest"
+                        } else {
+                            "updated config on existing membrane-mcp guest"
+                        };
+                        (
+                            format!(
+                                "MCP endpoint provisioned.\n\
+                                 Endpoint ID: {eid}\n\
+                                 Port: {p}\n\
+                                 Status: {status}\n\
+                                 Pre-approval rules for this endpoint are now active."
+                            ),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua", &*code, message,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua", "IPC_ERROR", msg,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "mcp.provision: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = philotic_client::TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("mcp.provision: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some("mcp.provision".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── mcp.revoke ───────────────────────────────────────────────────
+            "mcp.revoke" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+
+                let endpoint_id = match payload
+                    .arguments
+                    .get("endpoint_id")
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "mcp.revoke: missing required argument 'endpoint_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::RevokeMcpEndpoint {
+                        endpoint_id: endpoint_id.clone(),
+                        owner_agent_id: self.agent_id.clone(),
+                    })
+                    .await;
+
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::McpEndpointProvisioned { endpoint_id: ref eid, .. }) => (
+                        format!("MCP endpoint '{eid}' revoked. The membrane-mcp guest has been signalled to shut down."),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua", &*code, message,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua", "IPC_ERROR", msg,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "mcp.revoke: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = philotic_client::TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("mcp.revoke: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some("mcp.revoke".into()),
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
