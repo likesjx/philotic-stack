@@ -6781,6 +6781,7 @@ async fn main() -> Result<()> {
     .with_memory_config(muninn_config_arc.clone())
     .with_training_storage(training_storage.clone())
     .with_materialization_requester(guest_manager.clone())
+    .with_webrtc_signal_tx(webrtc_signal_tx.clone())
     .with_registry(registry.clone())
     .with_operator_surface_channel(operator_surface_tx);
     let ipc_inboxes = ipc_server.inboxes();
