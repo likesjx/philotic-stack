@@ -4321,6 +4321,17 @@ impl IpcServer {
         )
     }
 
+    async fn handle_get_webrtc_session_status(session_id: String) -> IpcResponse {
+        let status = crate::service::webrtc_guest::WebRtcGuest::session_status(&session_id).await;
+        IpcResponse::success(
+            "webrtc_status",
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "status": status,
+            })),
+        )
+    }
+
     pub(crate) async fn deliver_event_envelope(
         inboxes: &InboxRegistry,
         event: &EventEnvelope,
@@ -4705,6 +4716,9 @@ impl IpcServer {
                     session_id,
                 )
                 .await
+            }
+            IpcRequest::GetWebRtcSessionStatus { session_id } => {
+                Self::handle_get_webrtc_session_status(session_id).await
             }
             IpcRequest::CreateTask {
                 target_role,
