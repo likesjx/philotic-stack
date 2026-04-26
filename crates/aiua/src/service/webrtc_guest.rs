@@ -1,7 +1,10 @@
 use ansible_mesh_core::webrtc::{SignalPayload, WebRtcSignalMessage};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -14,6 +17,13 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
+type PendingSessionRegistry = Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>;
+
+fn pending_sessions() -> &'static PendingSessionRegistry {
+    static REGISTRY: OnceLock<PendingSessionRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// A lightweight Transceiver for peer-to-peer data channels bypassing the Philotic ledger.
 pub struct WebRtcGuest {
     session_id: String,
@@ -25,6 +35,37 @@ pub struct WebRtcGuest {
 }
 
 impl WebRtcGuest {
+    pub async fn apply_answer(session_id: &str, answer_sdp: String) -> Result<bool> {
+        let pc = {
+            let registry = pending_sessions().lock().await;
+            registry.get(session_id).cloned()
+        };
+
+        let Some(pc) = pc else {
+            return Ok(false);
+        };
+
+        let desc = RTCSessionDescription::answer(answer_sdp).expect("Invalid SDP Answer format");
+        pc.set_remote_description(desc).await?;
+        info!("Applied remote SDP answer for WebRTC session {}", session_id);
+        Ok(true)
+    }
+
+    pub async fn close_session(session_id: &str) -> Result<bool> {
+        let pc = {
+            let mut registry = pending_sessions().lock().await;
+            registry.remove(session_id)
+        };
+
+        let Some(pc) = pc else {
+            return Ok(false);
+        };
+
+        pc.close().await?;
+        info!("Closed WebRTC session {}", session_id);
+        Ok(true)
+    }
+
     pub fn new(
         session_id: String,
         local_node_id: String,
@@ -123,6 +164,11 @@ impl WebRtcGuest {
                 self.session_id
             );
         }
+
+        pending_sessions()
+            .lock()
+            .await
+            .insert(self.session_id.clone(), pc.clone());
 
         // Keep the task alive until the connection dies
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {

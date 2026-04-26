@@ -1600,19 +1600,62 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                             let webrtc_signal_tx = webrtc_signal_tx_inbound.clone();
                             let local_node_id = local_node_id_webrtc_inbound.clone();
                             tokio::spawn(async move {
-                                if let ansible_mesh_core::webrtc::SignalPayload::Offer(sdp) =
-                                    signal_msg.signal
-                                {
-                                    let guest = crate::service::webrtc_guest::WebRtcGuest::new(
-                                        signal_msg.session_id,
-                                        local_node_id,
-                                        msg.src_node,
-                                        signal_msg.target_guest_id,
-                                        signal_msg.sender_guest_id,
-                                        webrtc_signal_tx,
-                                    );
-                                    if let Err(e) = guest.run_answering(sdp).await {
-                                        error!("WebRTC Transceiver Guest failed: {}", e);
+                                match signal_msg.signal {
+                                    ansible_mesh_core::webrtc::SignalPayload::Offer(sdp) => {
+                                        let guest =
+                                            crate::service::webrtc_guest::WebRtcGuest::new(
+                                                signal_msg.session_id,
+                                                local_node_id,
+                                                msg.src_node,
+                                                signal_msg.target_guest_id,
+                                                signal_msg.sender_guest_id,
+                                                webrtc_signal_tx,
+                                            );
+                                        if let Err(e) = guest.run_answering(sdp).await {
+                                            error!("WebRTC Transceiver Guest failed: {}", e);
+                                        }
+                                    }
+                                    ansible_mesh_core::webrtc::SignalPayload::Answer(sdp) => {
+                                        match crate::service::webrtc_guest::WebRtcGuest::apply_answer(
+                                            &signal_msg.session_id,
+                                            sdp,
+                                        )
+                                        .await
+                                        {
+                                            Ok(true) => {}
+                                            Ok(false) => debug!(
+                                                "Received WebRTC answer for unknown session {}",
+                                                signal_msg.session_id
+                                            ),
+                                            Err(e) => error!(
+                                                "Failed to apply WebRTC answer for session {}: {}",
+                                                signal_msg.session_id, e
+                                            ),
+                                        }
+                                    }
+                                    ansible_mesh_core::webrtc::SignalPayload::IceCandidate(candidate) => {
+                                        debug!(
+                                            "Received WebRTC ICE candidate for session {} but trickle ICE is not wired yet: {} bytes",
+                                            signal_msg.session_id,
+                                            candidate.len()
+                                        );
+                                    }
+                                    ansible_mesh_core::webrtc::SignalPayload::SessionEnded => {
+                                        match crate::service::webrtc_guest::WebRtcGuest::close_session(
+                                            &signal_msg.session_id,
+                                        )
+                                        .await
+                                        {
+                                            Ok(true) => {}
+                                            Ok(false) => debug!(
+                                                "Received WebRTC session end for unknown session {}",
+                                                signal_msg.session_id
+                                            ),
+                                            Err(e) => error!(
+                                                "Failed to close WebRTC session {}: {}",
+                                                signal_msg.session_id, e
+                                            ),
+                                        }
                                     }
                                 }
                             });
