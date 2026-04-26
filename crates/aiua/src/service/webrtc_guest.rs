@@ -84,6 +84,72 @@ impl WebRtcGuest {
         }
     }
 
+    pub async fn start_offering(
+        session_id: String,
+        local_node_id: String,
+        target_node_id: String,
+        target_guest_id: Option<String>,
+        sender_guest_id: Option<String>,
+        signal_tx: mpsc::Sender<WebRtcSignalMessage>,
+    ) -> Result<()> {
+        info!("Starting outbound WebRTC offer for session {}", session_id);
+
+        let mut m = MediaEngine::default();
+        m.register_default_codecs()?;
+
+        let mut registry = Registry::new();
+        registry = register_default_interceptors(registry, &mut m)?;
+
+        let api = APIBuilder::new()
+            .with_media_engine(m)
+            .with_interceptor_registry(registry)
+            .build();
+
+        let config = RTCConfiguration {
+            ice_servers: vec![RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let pc = Arc::new(api.new_peer_connection(config).await?);
+        let label = format!("philotic-session-{}", session_id);
+        let _dc = pc.create_data_channel(&label, None).await?;
+
+        pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+            info!("Outbound Peer Connection State has changed: {}", s);
+            if s == RTCPeerConnectionState::Failed {
+                warn!("Outbound Peer Connection has gone to failed exiting");
+            }
+            Box::pin(async {})
+        }));
+
+        let offer = pc.create_offer(None).await?;
+        let mut gather_complete = pc.gathering_complete_promise().await;
+        pc.set_local_description(offer.clone()).await?;
+        let _ = gather_complete.recv().await;
+
+        pending_sessions()
+            .lock()
+            .await
+            .insert(session_id.clone(), pc.clone());
+
+        if let Some(local_desc) = pc.local_description().await {
+            let signal = WebRtcSignalMessage {
+                session_id,
+                target_node_id,
+                target_guest_id,
+                sender_node: local_node_id,
+                sender_guest_id,
+                signal: SignalPayload::Offer(local_desc.sdp),
+            };
+            let _ = signal_tx.send(signal).await;
+        }
+
+        Ok(())
+    }
+
     /// Run the transceiver loop. In a real environment, this handles SDP offers,
     /// answers, and ICE routing for Live API DataChannels.
     pub async fn run_answering(self, offer_sdp: String) -> Result<()> {

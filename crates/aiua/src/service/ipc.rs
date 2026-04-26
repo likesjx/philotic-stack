@@ -913,6 +913,7 @@ pub struct IpcServer {
     peer_sockets: Arc<RwLock<HashMap<String, String>>>,
     muninn_config: Option<Arc<memory_core::MuninnConfig>>,
     training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
+    webrtc_signal_tx: Option<mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
     /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
     /// The sender is cloned into each `handle_client` task for forwarding.
     network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
@@ -2271,6 +2272,7 @@ impl IpcServer {
             peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
             training_storage: None,
+            webrtc_signal_tx: None,
             network_broadcast,
             operator_surface_tx: None,
         }
@@ -2305,6 +2307,14 @@ impl IpcServer {
         materialization_requester: Arc<dyn GuestMaterializationRequester>,
     ) -> Self {
         self.materialization_requester = Some(materialization_requester);
+        self
+    }
+
+    pub fn with_webrtc_signal_tx(
+        mut self,
+        webrtc_signal_tx: mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>,
+    ) -> Self {
+        self.webrtc_signal_tx = Some(webrtc_signal_tx);
         self
     }
 
@@ -2377,6 +2387,7 @@ impl IpcServer {
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     let training_storage = self.training_storage.clone();
+                    let webrtc_signal_tx = self.webrtc_signal_tx.clone();
                     let network_broadcast_rx = self.network_broadcast.subscribe();
                     let operator_surface_tx = self.operator_surface_tx.clone();
                     let socket_path = self.socket_path.clone();
@@ -2400,6 +2411,7 @@ impl IpcServer {
                             peer_sockets,
                             muninn_config,
                             training_storage,
+                            webrtc_signal_tx,
                             network_broadcast_rx,
                             operator_surface_tx,
                             socket_path,
@@ -2443,6 +2455,7 @@ impl IpcServer {
         training_storage: Option<
             Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
         >,
+        webrtc_signal_tx: Option<mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
         socket_path: String,
@@ -2610,6 +2623,7 @@ impl IpcServer {
                             &subagent_hooks,
                             &registry,
                             &peer_sockets,
+                            webrtc_signal_tx.as_ref(),
                             conn_id,
                             &outbound_tx,
                             &mut subscribed_roles,
@@ -4220,6 +4234,93 @@ impl IpcServer {
         Ok(false)
     }
 
+    fn hotel_exists_for_node(graph: &GraphDomain, target_node_id: &str) -> anyhow::Result<bool> {
+        Ok(graph
+            .list_hotels()?
+            .into_iter()
+            .any(|hotel| hotel.capabilities.node_id == target_node_id))
+    }
+
+    async fn handle_start_webrtc_session(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        current_identity: Option<&GuestIdentity>,
+        webrtc_signal_tx: Option<&mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
+        target_node_id: String,
+        target_guest_id: Option<String>,
+        session_id: Option<String>,
+    ) -> IpcResponse {
+        let Some(identity) = current_identity else {
+            return IpcResponse::error(
+                "webrtc",
+                "WEBRTC_UNREGISTERED",
+                "guest must register before starting a WebRTC session",
+            );
+        };
+
+        if target_node_id == local_node_id {
+            return IpcResponse::error(
+                "webrtc",
+                "WEBRTC_LOCAL_TARGET",
+                "WebRTC sessions must target a remote node",
+            );
+        }
+
+        match Self::hotel_exists_for_node(graph, &target_node_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return IpcResponse::error(
+                    "webrtc",
+                    "WEBRTC_UNKNOWN_TARGET",
+                    format!("unknown target node [{}]", target_node_id),
+                );
+            }
+            Err(err) => {
+                return IpcResponse::error("webrtc", "WEBRTC_GRAPH_ERROR", err.to_string());
+            }
+        }
+
+        let Some(webrtc_signal_tx) = webrtc_signal_tx.cloned() else {
+            return IpcResponse::error(
+                "webrtc",
+                "WEBRTC_DISABLED",
+                "hotel runtime is not configured with WebRTC signaling support",
+            );
+        };
+
+        let session_id = session_id.unwrap_or_else(|| format!("webrtc:{}", Uuid::new_v4()));
+        let sender_guest_id = Some(identity.guest_id.clone());
+        let local_node_id = local_node_id.to_string();
+        let target_node_for_task = target_node_id.clone();
+        let target_guest_for_task = target_guest_id.clone();
+        let session_id_for_task = session_id.clone();
+
+        tokio::spawn(async move {
+            if let Err(err) = crate::service::webrtc_guest::WebRtcGuest::start_offering(
+                session_id_for_task,
+                local_node_id,
+                target_node_for_task,
+                target_guest_for_task,
+                sender_guest_id,
+                webrtc_signal_tx,
+            )
+            .await
+            {
+                error!("Failed to start outbound WebRTC session: {}", err);
+            }
+        });
+
+        IpcResponse::success(
+            "webrtc",
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "target_node_id": target_node_id,
+                "target_guest_id": target_guest_id,
+                "initiator_guest_id": identity.guest_id,
+            })),
+        )
+    }
+
     pub(crate) async fn deliver_event_envelope(
         inboxes: &InboxRegistry,
         event: &EventEnvelope,
@@ -4269,6 +4370,7 @@ impl IpcServer {
         subagent_hooks: &SubagentHookRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
         peer_sockets: &Arc<RwLock<HashMap<String, String>>>,
+        webrtc_signal_tx: Option<&mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
         conn_id: Uuid,
         outbound_tx: &mpsc::UnboundedSender<IpcResponse>,
         subscribed_roles: &mut Vec<String>,
@@ -4587,6 +4689,22 @@ impl IpcServer {
                 )
                 .await;
                 IpcResponse::success("pub", None)
+            }
+            IpcRequest::StartWebRtcSession {
+                target_node_id,
+                target_guest_id,
+                session_id,
+            } => {
+                Self::handle_start_webrtc_session(
+                    graph,
+                    local_node_id,
+                    current_identity.as_ref(),
+                    webrtc_signal_tx,
+                    target_node_id,
+                    target_guest_id,
+                    session_id,
+                )
+                .await
             }
             IpcRequest::CreateTask {
                 target_role,
