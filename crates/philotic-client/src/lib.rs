@@ -909,6 +909,10 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
     },
+    /// Ask the hotel for the current status of a locally-tracked WebRTC session.
+    GetWebRtcSessionStatus {
+        session_id: String,
+    },
     /// Optimistically push a RAM-based memory apartment update to the Hotel's SQLite Graph
     SyncApartment {
         agent_id: String,

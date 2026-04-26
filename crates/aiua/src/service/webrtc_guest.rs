@@ -18,10 +18,36 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 type PendingSessionRegistry = Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>;
+type SessionStatusRegistry = Mutex<HashMap<String, String>>;
+const SMOKE_PING_PREFIX: &str = "philotic-webrtc-ping:";
+const SMOKE_PONG_PREFIX: &str = "philotic-webrtc-pong:";
 
 fn pending_sessions() -> &'static PendingSessionRegistry {
     static REGISTRY: OnceLock<PendingSessionRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_statuses() -> &'static SessionStatusRegistry {
+    static REGISTRY: OnceLock<SessionStatusRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn set_session_status(session_id: &str, status: impl Into<String>) {
+    session_statuses()
+        .lock()
+        .await
+        .insert(session_id.to_string(), status.into());
+}
+
+async fn set_session_status_if_incomplete(session_id: &str, status: impl Into<String>) {
+    let mut statuses = session_statuses().lock().await;
+    let should_preserve = matches!(
+        statuses.get(session_id).map(String::as_str),
+        Some("completed") | Some("pong_sent")
+    );
+    if !should_preserve {
+        statuses.insert(session_id.to_string(), status.into());
+    }
 }
 
 /// A lightweight Transceiver for peer-to-peer data channels bypassing the Philotic ledger.
@@ -35,6 +61,10 @@ pub struct WebRtcGuest {
 }
 
 impl WebRtcGuest {
+    pub async fn session_status(session_id: &str) -> Option<String> {
+        session_statuses().lock().await.get(session_id).cloned()
+    }
+
     pub async fn apply_answer(session_id: &str, answer_sdp: String) -> Result<bool> {
         let pc = {
             let registry = pending_sessions().lock().await;
@@ -47,6 +77,7 @@ impl WebRtcGuest {
 
         let desc = RTCSessionDescription::answer(answer_sdp).expect("Invalid SDP Answer format");
         pc.set_remote_description(desc).await?;
+        set_session_status(session_id, "answer_applied").await;
         info!("Applied remote SDP answer for WebRTC session {}", session_id);
         Ok(true)
     }
@@ -62,6 +93,7 @@ impl WebRtcGuest {
         };
 
         pc.close().await?;
+        set_session_status_if_incomplete(session_id, "closed").await;
         info!("Closed WebRTC session {}", session_id);
         Ok(true)
     }
@@ -93,6 +125,7 @@ impl WebRtcGuest {
         signal_tx: mpsc::Sender<WebRtcSignalMessage>,
     ) -> Result<()> {
         info!("Starting outbound WebRTC offer for session {}", session_id);
+        set_session_status(&session_id, "starting_offer").await;
 
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
@@ -115,7 +148,74 @@ impl WebRtcGuest {
 
         let pc = Arc::new(api.new_peer_connection(config).await?);
         let label = format!("philotic-session-{}", session_id);
-        let _dc = pc.create_data_channel(&label, None).await?;
+        let dc = pc.create_data_channel(&label, None).await?;
+
+        let ping_session_id = session_id.clone();
+        let ping_dc = dc.clone();
+        dc.on_open(Box::new(move || {
+            let ping_dc = ping_dc.clone();
+            let ping_session_id = ping_session_id.clone();
+            Box::pin(async move {
+                let ping = format!("{SMOKE_PING_PREFIX}{ping_session_id}");
+                match ping_dc.send_text(ping.clone()).await {
+                    Ok(_) => {
+                        set_session_status(&ping_session_id, "ping_sent").await;
+                        info!("Sent WebRTC ping for session {}", ping_session_id)
+                    }
+                    Err(err) => warn!(
+                        "Failed to send WebRTC ping for session {}: {}",
+                        ping_session_id, err
+                    ),
+                }
+            })
+        }));
+
+        let pong_session_id = session_id.clone();
+        let pong_target_node_id = target_node_id.clone();
+        let pong_target_guest_id = target_guest_id.clone();
+        let pong_local_node_id = local_node_id.clone();
+        let pong_sender_guest_id = sender_guest_id.clone();
+        let pong_signal_tx = signal_tx.clone();
+        dc.on_message(Box::new(move |msg: DataChannelMessage| {
+            let pong_session_id = pong_session_id.clone();
+            let pong_target_node_id = pong_target_node_id.clone();
+            let pong_target_guest_id = pong_target_guest_id.clone();
+            let pong_local_node_id = pong_local_node_id.clone();
+            let pong_sender_guest_id = pong_sender_guest_id.clone();
+            let pong_signal_tx = pong_signal_tx.clone();
+            Box::pin(async move {
+                let msg_str = String::from_utf8(msg.data.to_vec())
+                    .unwrap_or_else(|_| "[Binary Data]".to_string());
+                info!(
+                    "P2P Message on outbound DataChannel for session {}: '{}'",
+                    pong_session_id, msg_str
+                );
+                if let Some(returned_session_id) = msg_str.strip_prefix(SMOKE_PONG_PREFIX) {
+                    set_session_status(returned_session_id, "completed").await;
+                    info!("Received WebRTC pong for session {}", returned_session_id);
+                    let signal = WebRtcSignalMessage {
+                        session_id: pong_session_id.clone(),
+                        target_node_id: pong_target_node_id,
+                        target_guest_id: pong_target_guest_id,
+                        sender_node: pong_local_node_id,
+                        sender_guest_id: pong_sender_guest_id,
+                        signal: SignalPayload::SessionEnded,
+                    };
+                    if let Err(err) = pong_signal_tx.send(signal).await {
+                        warn!(
+                            "Failed to emit WebRTC session end for session {}: {}",
+                            pong_session_id, err
+                        );
+                    }
+                    if let Err(err) = WebRtcGuest::close_session(&pong_session_id).await {
+                        warn!(
+                            "Failed to close local WebRTC offer session {} after pong: {}",
+                            pong_session_id, err
+                        );
+                    }
+                }
+            })
+        }));
 
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             info!("Outbound Peer Connection State has changed: {}", s);
@@ -134,8 +234,10 @@ impl WebRtcGuest {
             .lock()
             .await
             .insert(session_id.clone(), pc.clone());
+        set_session_status(&session_id, "offer_created").await;
 
         if let Some(local_desc) = pc.local_description().await {
+            let session_id_for_signal = session_id.clone();
             let signal = WebRtcSignalMessage {
                 session_id,
                 target_node_id,
@@ -145,6 +247,7 @@ impl WebRtcGuest {
                 signal: SignalPayload::Offer(local_desc.sdp),
             };
             let _ = signal_tx.send(signal).await;
+            set_session_status(&session_id_for_signal, "offer_sent").await;
         }
 
         Ok(())
@@ -157,6 +260,7 @@ impl WebRtcGuest {
             "Spinning up WebRTC Transceiver Guest for session {}",
             self.session_id
         );
+        set_session_status(&self.session_id, "answering_offer").await;
 
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
@@ -192,11 +296,29 @@ impl WebRtcGuest {
             let d_id = d.id();
             info!("New DataChannel {} {}", d_label, d_id);
 
+            let d_for_message = d.clone();
             d.on_message(Box::new(move |msg: DataChannelMessage| {
-                let msg_str = String::from_utf8(msg.data.to_vec())
-                    .unwrap_or_else(|_| "[Binary Data]".to_string());
-                info!("P2P Message from DataChannel '{}': '{}'", d_label, msg_str);
-                Box::pin(async {})
+                let d_label = d_label.clone();
+                let d_for_message = d_for_message.clone();
+                Box::pin(async move {
+                    let msg_str = String::from_utf8(msg.data.to_vec())
+                        .unwrap_or_else(|_| "[Binary Data]".to_string());
+                    info!("P2P Message from DataChannel '{}': '{}'", d_label, msg_str);
+                    if let Some(session_id) = msg_str.strip_prefix(SMOKE_PING_PREFIX) {
+                        set_session_status(session_id, "ping_received").await;
+                        let pong = format!("{SMOKE_PONG_PREFIX}{session_id}");
+                        match d_for_message.send_text(pong.clone()).await {
+                            Ok(_) => {
+                                set_session_status(session_id, "pong_sent").await;
+                                info!("Sent WebRTC pong for session {}", session_id)
+                            }
+                            Err(err) => warn!(
+                                "Failed to send WebRTC pong for session {}: {}",
+                                session_id, err
+                            ),
+                        }
+                    }
+                })
             }));
 
             Box::pin(async {})
@@ -225,6 +347,7 @@ impl WebRtcGuest {
                 signal: SignalPayload::Answer(local_desc.sdp),
             };
             let _ = self.signal_tx.send(signal).await;
+            set_session_status(&self.session_id, "answer_sent").await;
             info!(
                 "Generated SDP Answer and dispatched to Mesh Control Plane for session {}",
                 self.session_id
