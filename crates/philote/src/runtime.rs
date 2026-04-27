@@ -870,6 +870,38 @@ impl AgentRuntime {
                 }
             }
         }
+
+        // Apply operator-persisted policy overrides from hotel config keys.
+        // These take precedence over the bundle so /voice and agent.configure persist
+        // correctly across restarts without requiring a bundle rebuild.
+        if let Ok(IpcResponse::ConfigData {
+            value_json: Some(ref json),
+            ..
+        }) = self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig {
+                key: "config:voice_response_policy".into(),
+            })
+            .await
+        {
+            if let Ok(policy) = serde_json::from_str::<VoiceResponsePolicy>(json) {
+                self.default_agent_profile.voice_response_policy = policy;
+            }
+        }
+        if let Ok(IpcResponse::ConfigData {
+            value_json: Some(ref json),
+            ..
+        }) = self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig {
+                key: "config:media_routing_policy".into(),
+            })
+            .await
+        {
+            if let Ok(policy) = serde_json::from_str::<MediaRoutingPolicy>(json) {
+                self.default_agent_profile.media_routing_policy = policy;
+            }
+        }
     }
 
     /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.
