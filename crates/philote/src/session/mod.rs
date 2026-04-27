@@ -1157,10 +1157,34 @@ impl SessionState {
                     name = call.tool_name,
                 ));
             }
-            prompt.push_str(
-                "Review the above tool results and continue. \
-                 Call another tool if needed, or respond to the user if you have enough information.",
-            );
+            let reentry_hint = if let Some(plan) = turn.active_plan.as_ref() {
+                let done = plan.steps.iter().filter(|s| s.status == "done").count();
+                let failed = plan.steps.iter().filter(|s| s.status == "failed").count();
+                let total = plan.steps.len();
+                if plan.status == "done" || (done + failed == total && total > 0) {
+                    "All plan steps are complete. Provide your final response to the user now. \
+                     Do not call any more tools."
+                        .to_string()
+                } else {
+                    let pending: Vec<String> = plan
+                        .steps
+                        .iter()
+                        .filter(|s| s.status == "pending" || s.status == "in_progress")
+                        .map(|s| format!("step {}: {}", s.id, s.description))
+                        .collect();
+                    format!(
+                        "{done}/{total} plan steps done. Remaining: {}. \
+                         Continue with the next pending step, or respond to the user if \
+                         all necessary work is complete.",
+                        pending.join("; ")
+                    )
+                }
+            } else {
+                "Review the above tool results. If your task is complete, respond to the user \
+                 now. Only call another tool if a specific next step is still required."
+                    .to_string()
+            };
+            prompt.push_str(&reentry_hint);
         }
 
         Some(prompt)
@@ -2254,6 +2278,7 @@ impl SessionState {
         }
 
         if !turn.working_tool_history.is_empty() {
+            let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
             lines.push(format!(
                 "Tool history entries in local working state: {}.",
                 turn.working_tool_history.len()
@@ -2261,18 +2286,54 @@ impl SessionState {
             lines.push("\n[Tool call history]".into());
             for (i, (call, result)) in turn.working_tool_history.iter().enumerate() {
                 let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+                let content = if result.content.len() > max_result_chars {
+                    format!(
+                        "{}… [truncated: {} chars total]",
+                        &result.content[..max_result_chars],
+                        result.content.len()
+                    )
+                } else {
+                    result.content.clone()
+                };
                 lines.push(format!(
                     "Call {n}: {name}({args})\nResult {n}: {content}",
                     n = i + 1,
                     name = call.tool_name,
-                    content = result.content,
+                    content = content,
                 ));
             }
-            lines.push(
-                "Review the above tool results and continue. \
-                 Call another tool if needed, or respond to the user if you have enough information."
-                    .into(),
-            );
+
+            // Build a structured re-entry footer based on plan state so the model
+            // knows exactly whether to continue calling tools or deliver a final reply.
+            let reentry_hint = if let Some(plan) = turn.active_plan.as_ref() {
+                let done = plan.steps.iter().filter(|s| s.status == "done").count();
+                let failed = plan.steps.iter().filter(|s| s.status == "failed").count();
+                let total = plan.steps.len();
+                if plan.status == "done" || (done + failed == total && total > 0) {
+                    "All plan steps are complete. Provide your final response to the user now. \
+                     Do not call any more tools."
+                        .to_string()
+                } else {
+                    let pending: Vec<String> = plan
+                        .steps
+                        .iter()
+                        .filter(|s| s.status == "pending" || s.status == "in_progress")
+                        .map(|s| format!("step {}: {}", s.id, s.description))
+                        .collect();
+                    format!(
+                        "{done}/{total} plan steps done. Remaining: {}. \
+                         Continue with the next pending step, or respond to the user if \
+                         all necessary work is complete.",
+                        pending.join("; ")
+                    )
+                }
+            } else {
+                // No active plan — use a conservative hint that doesn't bias toward more tools.
+                "Review the above tool results. If your task is complete, respond to the user \
+                 now. Only call another tool if a specific next step is still required."
+                    .to_string()
+            };
+            lines.push(reentry_hint);
         }
         if turn.pending_tool_call.is_some() {
             lines.push("A tool call is pending.".into());
@@ -5744,5 +5805,175 @@ mod tests {
         // Callers use resolve_model_execution_target which checks route assembly before falling
         // back to preferred_component_implementation — just assert both APIs are consistent.
         assert!(state.resolve_component_execution_route("voice.transcribe").is_some());
+    }
+
+    fn make_turn_with_plan(plan: ActivePlan) -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "c1".into(),
+            user_content: "set up roles".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: Some(plan),
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
+        }
+    }
+
+    #[test]
+    fn working_state_shows_all_done_when_plan_complete() {
+        let mut state =
+            SessionState::new("sess-2".into(), "agent-bjork-01".into(), "telegram".into());
+        let plan = ActivePlan {
+            goal: "configure roles".into(),
+            status: "done".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "create analyst role".into(),
+                tool_name: Some("role.create_or_update".into()),
+                status: "done".into(),
+            }],
+            context_1_advisory: None,
+        };
+        state.start_turn(make_turn_with_plan(plan));
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "role.create_or_update".into(),
+                arguments: serde_json::json!({"role_name": "analyst"}),
+            },
+            ToolResult {
+                tool_name: "role.create_or_update".into(),
+                content: "Role 'analyst' created/updated successfully.".into(),
+            },
+        );
+
+        let prompt = state.build_reentry_prompt().unwrap();
+        assert!(
+            prompt.contains("All plan steps are complete"),
+            "should show all-done message, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Call another tool if needed"),
+            "should not use old generic footer"
+        );
+    }
+
+    #[test]
+    fn working_state_shows_pending_steps_when_plan_partial() {
+        let mut state =
+            SessionState::new("sess-3".into(), "agent-bjork-01".into(), "telegram".into());
+        let plan = ActivePlan {
+            goal: "configure roles".into(),
+            status: "executing".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: "create analyst role".into(),
+                    tool_name: Some("role.create_or_update".into()),
+                    status: "done".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: "create coordinator role".into(),
+                    tool_name: Some("role.create_or_update".into()),
+                    status: "pending".into(),
+                },
+            ],
+            context_1_advisory: None,
+        };
+        state.start_turn(make_turn_with_plan(plan));
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "role.create_or_update".into(),
+                arguments: serde_json::json!({"role_name": "analyst"}),
+            },
+            ToolResult {
+                tool_name: "role.create_or_update".into(),
+                content: "Role 'analyst' created/updated successfully.".into(),
+            },
+        );
+
+        let prompt = state.build_reentry_prompt().unwrap();
+        assert!(
+            prompt.contains("1/2 plan steps done"),
+            "should show partial progress, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("coordinator role"),
+            "should name pending step"
+        );
+    }
+
+    #[test]
+    fn working_state_conservative_hint_without_plan() {
+        let mut state =
+            SessionState::new("sess-4".into(), "agent-bjork-01".into(), "telegram".into());
+        let turn = WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-x".into(),
+            chat_id: "c1".into(),
+            user_content: "do something".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
+        };
+        state.start_turn(turn);
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "echo".into(),
+                arguments: serde_json::json!({"text": "hi"}),
+            },
+            ToolResult {
+                tool_name: "echo".into(),
+                content: "hi".into(),
+            },
+        );
+
+        let prompt = state.build_reentry_prompt().unwrap();
+        assert!(
+            prompt.contains("If your task is complete, respond to the user now"),
+            "should use conservative no-plan hint, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Call another tool if needed"),
+            "should not use old generic footer"
+        );
     }
 }

@@ -2917,6 +2917,78 @@ impl AgentRuntime {
                     .await;
             }
 
+            // Dedup guard: if (tool_name, canonical_args) already appears in this
+            // turn's history with a non-error result, inject a correction note and
+            // re-enter the model without dispatching the tool again. This prevents
+            // spin loops where the model calls an idempotent tool (e.g. role.create_or_update)
+            // repeatedly after it already succeeded.
+            let canonical_args =
+                serde_json::to_string(&tool_call.arguments).unwrap_or_default();
+            let (already_succeeded, dedup_chat_id, dedup_reply_to, dedup_reply_role,
+                 dedup_reply_guest_id) = {
+                let state = self.sessions.get(&session_id);
+                let prev_success = state
+                    .and_then(|s| s.active_turn.as_ref())
+                    .map(|turn| {
+                        turn.working_tool_history.iter().any(|(prev_call, prev_result)| {
+                            prev_call.tool_name == tool_call.tool_name
+                                && serde_json::to_string(&prev_call.arguments)
+                                    .unwrap_or_default()
+                                    == canonical_args
+                                && !prev_result.content.to_lowercase().contains("error")
+                                && !prev_result.content.to_lowercase().contains("failed")
+                        })
+                    })
+                    .unwrap_or(false);
+                let (chat_id, reply_to, reply_role, reply_guest) = state
+                    .and_then(|s| s.active_turn.as_ref())
+                    .map(|t| {
+                        (
+                            t.chat_id.clone(),
+                            t.final_reply_to.clone(),
+                            t.final_reply_role.clone(),
+                            t.final_reply_guest_id.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                (prev_success, chat_id, reply_to, reply_role, reply_guest)
+            };
+
+            if already_succeeded {
+                warn!(
+                    "Session [{}] dedup guard: `{}` already succeeded this turn; \
+                     injecting correction note instead of re-dispatching.",
+                    session_id, tool_call.tool_name
+                );
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.set_provider_repair_note(format!(
+                        "`{}` with these arguments already succeeded earlier in this turn. \
+                         Do not call it again. Review the tool history and either proceed \
+                         to the next plan step or deliver your final response.",
+                        tool_call.tool_name
+                    ));
+                }
+                return self
+                    .handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        source: Some("agent".into()),
+                        session_id: Some(session_id),
+                        turn_id: Some(turn_id),
+                        chat_id: Some(dedup_chat_id),
+                        content: Some(format!(
+                            "[Duplicate call skipped] `{}` already ran and succeeded \
+                             earlier in this turn with these arguments.",
+                            tool_call.tool_name
+                        )),
+                        tool_name: Some(tool_call.tool_name),
+                        final_reply_to: Some(dedup_reply_to),
+                        final_reply_role: Some(dedup_reply_role),
+                        final_reply_guest_id: dedup_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await;
+            }
+
             // Emit step_started if streaming is enabled.
             let stream_events = self
                 .sessions
@@ -3201,6 +3273,53 @@ impl AgentRuntime {
                 Err(format!(
                     "Turn exceeded maximum tool iterations ({iteration_cap}). Aborting."
                 ))
+            } else if state
+                .active_turn
+                .as_ref()
+                .and_then(|t| t.active_plan.as_ref())
+                .map(|plan| {
+                    plan.status == "done"
+                        || (!plan.steps.is_empty()
+                            && plan
+                                .steps
+                                .iter()
+                                .all(|s| s.status == "done" || s.status == "failed"))
+                })
+                .unwrap_or(false)
+            {
+                // Plan-done early exit: the model has declared its plan complete.
+                // Force a final no-tool wrap-up so the model delivers its summary
+                // without being prompted to call more tools.
+                info!(
+                    "Session [{}] plan marked done after tool result; doing no-tool wrap-up.",
+                    session_id
+                );
+                is_finalizing = true;
+                match state.build_reentry_context_envelope() {
+                    Some((mut prompt, context, context_projection, _tools)) => {
+                        prompt.push_str(
+                            "\n\n[Your plan is complete. All steps have been executed. \
+                             Do not call any more tools. Provide your final response to the user now.]",
+                        );
+                        let active_turn = state.active_turn.as_ref().expect("turn exists");
+                        Ok((
+                            prompt,
+                            context,
+                            context_projection,
+                            active_turn.task_id,
+                            active_turn.user_content.clone(),
+                            active_turn.chat_id.clone(),
+                            active_turn.final_reply_to.clone(),
+                            active_turn.final_reply_role.clone(),
+                            active_turn.final_reply_guest_id.clone(),
+                            vec![], // strip tools — forces text-only reply
+                            state.checkpoint_memory_type(),
+                            state.checkpoint_json(),
+                            state.clone(),
+                        ))
+                    }
+                    None => Err("Active turn vanished at plan-done wrap-up".into()),
+                }
             } else {
                 // Build the full cognitive context envelope for re-entry.
                 // This ensures identity, instructions, memory, dialogue_window, active_turn,
