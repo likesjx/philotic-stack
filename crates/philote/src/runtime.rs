@@ -4817,10 +4817,15 @@ impl AgentRuntime {
             })
             .await?;
 
+        let voice_role_fallback = policy
+            .provider
+            .as_deref()
+            .map(implementation_to_model_role)
+            .unwrap_or_else(|| DEFAULT_VOICE_MODEL_ROLE.into());
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
             "voice.synthesize",
-            DEFAULT_VOICE_MODEL_ROLE,
+            &voice_role_fallback,
         );
 
         info!(
