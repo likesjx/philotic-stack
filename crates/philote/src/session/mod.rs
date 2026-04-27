@@ -119,6 +119,12 @@ pub struct SessionState {
     /// Wall-clock instant when the turn was parked for approval. Not persisted.
     /// Used by the turn-timeout watchdog to evict orphaned parked turns.
     pub parked_approval_since: Option<std::time::Instant>,
+    /// A turn parked in PlanningDiscussion phase. The next inbound user message
+    /// (or any non-empty text that is not a cancellation slash command) restores it
+    /// and re-enters the model with `plan_confirmed = true`.
+    pub parked_plan_turn: Option<WorkingTurn>,
+    /// Wall-clock instant when the plan turn was parked. Not persisted.
+    pub parked_plan_since: Option<std::time::Instant>,
 }
 
 impl SessionState {
@@ -148,6 +154,8 @@ impl SessionState {
             turn_waiting_since: None,
             parked_approval_turn: None,
             parked_approval_since: None,
+            parked_plan_turn: None,
+            parked_plan_since: None,
         }
     }
 
@@ -247,6 +255,34 @@ impl SessionState {
     /// True if a turn is parked waiting for operator approval.
     pub fn has_parked_approval_turn(&self) -> bool {
         self.parked_approval_turn.is_some()
+    }
+
+    /// Park the active turn for plan discussion. The turn must already have phase
+    /// `PlanningDiscussion`. The session becomes free for other work while the
+    /// operator reviews the proposed plan.
+    pub fn park_active_turn_for_plan(&mut self) {
+        self.parked_plan_since = Some(std::time::Instant::now());
+        self.parked_plan_turn = self.active_turn.take();
+    }
+
+    /// Restore the parked plan turn into `active_turn` and mark it confirmed.
+    /// `operator_note` is an optional steering hint from the operator's reply.
+    /// Returns `true` if a plan turn was parked.
+    pub fn restore_parked_plan_turn(&mut self, operator_note: Option<String>) -> bool {
+        if let Some(mut turn) = self.parked_plan_turn.take() {
+            self.parked_plan_since = None;
+            turn.plan_confirmed = true;
+            turn.plan_confirm_note = operator_note;
+            self.active_turn = Some(turn);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True if a turn is parked in PlanningDiscussion.
+    pub fn has_parked_plan_turn(&self) -> bool {
+        self.parked_plan_turn.is_some()
     }
 
     pub fn set_active_plan(&mut self, plan: ActivePlan) {
@@ -2247,6 +2283,16 @@ impl SessionState {
             format!("Cognitive step iteration: {}.", turn.iteration),
         ];
 
+        if turn.plan_confirmed {
+            let base = "Plan confirmed by operator. You are cleared to execute your plan. \
+                        Proceed with tool calls as declared.";
+            if let Some(note) = turn.plan_confirm_note.as_deref() {
+                lines.push(format!("{base} Operator note: {note}"));
+            } else {
+                lines.push(base.into());
+            }
+        }
+
         if let Some(plan) = turn.active_plan.as_ref() {
             lines.push(format!(
                 "Active plan: goal='{}', status='{}', steps={}.",
@@ -2537,6 +2583,11 @@ impl SessionState {
             .as_ref()
             .and_then(|t| serde_json::to_value(t).ok());
 
+        let parked_plan_turn = self
+            .parked_plan_turn
+            .as_ref()
+            .and_then(|t| serde_json::to_value(t).ok());
+
         // agent_profile, component_route_assembly, and tool_assembly are hotel-computed
         // and injected fresh by compose_session_snapshot on every turn. Persisting them
         // in the checkpoint causes unbounded circular growth: checkpoint → session.summary_json
@@ -2552,6 +2603,7 @@ impl SessionState {
             "bindings": self.bindings,
             "active_turn": active_turn,
             "parked_approval_turn": parked_approval_turn,
+            "parked_plan_turn": parked_plan_turn,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
                     "turn_id": turn.turn_id,
@@ -2573,7 +2625,9 @@ impl SessionState {
         json!({
             "session_id": self.session_id,
             "source": self.source,
-            "has_active_turn": self.active_turn.is_some() || self.parked_approval_turn.is_some(),
+            "has_active_turn": self.active_turn.is_some()
+                || self.parked_approval_turn.is_some()
+                || self.parked_plan_turn.is_some(),
             "updated_at": current_unix_ts(),
         })
     }
@@ -2806,6 +2860,14 @@ impl SessionState {
                     .get("paracrine_merge_completed")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                plan_confirmed: turn
+                    .get("plan_confirmed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                plan_confirm_note: turn
+                    .get("plan_confirm_note")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             })
         });
 
@@ -2822,6 +2884,13 @@ impl SessionState {
             .and_then(|v| if v.is_null() { None } else { Some(v) })
             .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
             .filter(|t| t.phase == TurnPhase::WaitingApproval);
+
+        // Restore parked plan turn if one was checkpointed.
+        let parked_plan_turn = checkpoint
+            .get("parked_plan_turn")
+            .and_then(|v| if v.is_null() { None } else { Some(v) })
+            .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
+            .filter(|t| t.phase == TurnPhase::PlanningDiscussion);
 
         Some(Self {
             session_id,
@@ -2854,6 +2923,8 @@ impl SessionState {
             turn_waiting_since: None,
             parked_approval_turn,
             parked_approval_since: None,
+            parked_plan_turn,
+            parked_plan_since: None,
         })
     }
 }
@@ -3483,6 +3554,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         }
     }
 
@@ -3517,6 +3590,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3670,6 +3745,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -3713,6 +3790,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4464,6 +4543,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let projection = state.build_context_projection("status");
@@ -4550,6 +4631,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let prompt = state.build_prompt("status");
@@ -4630,6 +4713,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4707,6 +4792,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5248,6 +5335,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5298,6 +5387,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         state.push_tool_history(
@@ -5363,6 +5454,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         state.push_tool_history(
@@ -5429,6 +5522,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let reentry = state
@@ -5703,6 +5798,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -5835,6 +5932,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         }
     }
 
@@ -5953,6 +6052,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         };
         state.start_turn(turn);
         state.push_tool_history(

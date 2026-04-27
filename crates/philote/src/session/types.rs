@@ -354,6 +354,15 @@ pub struct WorkingTurn {
     /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
     /// is no duplicate delivery after the explicit merge already fired.
     pub paracrine_merge_completed: bool,
+    /// Set to true when the operator has confirmed a plan_proposal and the parked
+    /// plan turn is restored. Injected into the working-state projection so the model
+    /// knows it is cleared to execute its declared plan.
+    #[serde(default)]
+    pub plan_confirmed: bool,
+    /// Optional operator steering note provided when confirming a plan. Threaded
+    /// into the working-state projection alongside `plan_confirmed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_confirm_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
