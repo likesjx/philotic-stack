@@ -491,8 +491,10 @@ local-push:
     echo "  ✓ phil"
     echo "✅ Local Homebrew install updated."
 
-# Push release binaries to any remote Homebrew host via SCP.
-remote-homebrew-push remote hotel expected_host:
+# Build release binaries locally (MacBook Air) and push them to mbp-jane via SCP.
+# mbp-jane is a separate machine — it has no repo, only runs Cellar-installed binaries.
+# Stops Jane on mbp-jane, installs, restarts.
+remote-homebrew-push remote hotel expected_host="":
     #!/usr/bin/env bash
     set -euo pipefail
     exec ./scripts/push-homebrew-remote.sh "{{remote}}" "{{hotel}}" "{{expected_host}}"
@@ -509,21 +511,19 @@ remote-homebrew-status remote hotel:
     @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
 
 jane-push:
-    just remote-homebrew-push mbp-jane mbp-jane MacBookPro
+    just remote-homebrew-push mbp-jane mbp-jane Jareds-MacBook-Pro
 
 # Stop Jane on mbp-jane without pushing new binaries.
 jane-stop:
-    #!/usr/bin/env bash
-    ssh mbp-jane "pkill -f '/opt/homebrew/bin/aiua' && echo '▶ aiua stopped' || echo '▶ aiua was not running'"
+    just remote-homebrew-stop mbp-jane mbp-jane
 
 # Start Jane on mbp-jane (without pushing — uses whatever binary is already installed).
 jane-start:
-    #!/usr/bin/env bash
-    ssh mbp-jane "nohup /opt/homebrew/bin/aiua --hotel mbp-jane >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    just remote-homebrew-start mbp-jane mbp-jane
 
 # Check whether Jane (aiua) is running on mbp-jane.
 jane-status:
-    @ssh mbp-jane "ps aux | grep '[/]opt/homebrew/bin/aiua' || echo 'aiua is not running on mbp-jane'"
+    @just remote-homebrew-status mbp-jane mbp-jane
 
 # ── VPS deploy (vps-jane / Linux x86_64 via Ansible) ────────────────────────
 # Strategy: rsync source to VPS → build there (VPS has rustup) → ansible
