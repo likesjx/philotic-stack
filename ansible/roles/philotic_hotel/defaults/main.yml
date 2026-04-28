@@ -38,6 +38,7 @@ philotic_binaries:
   - model-controller-openai
   - model-controller-mlx
   - model-controller-onnx
+  - philotic-web
 
 # Runtime ports
 philotic_beacon_port: 8999       # UDP — inter-hotel mesh
