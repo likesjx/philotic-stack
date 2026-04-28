@@ -125,6 +125,14 @@ pub struct SessionState {
     pub parked_plan_turn: Option<WorkingTurn>,
     /// Wall-clock instant when the plan turn was parked. Not persisted.
     pub parked_plan_since: Option<std::time::Instant>,
+    /// Consecutive successful executions per tool name within this session.
+    /// Resets to 0 on any failure. Used to auto-grant standing approval once
+    /// the agent has demonstrated reliability on a specific tool.
+    pub tool_success_streak: std::collections::HashMap<String, u32>,
+    /// Registered thresholds for auto-granting standing approval.
+    /// Maps tool_name → required consecutive successes.
+    /// Populated by the `approval.request_standing` planning tool.
+    pub pending_preapproval_thresholds: std::collections::HashMap<String, u32>,
 }
 
 impl SessionState {
@@ -156,6 +164,8 @@ impl SessionState {
             parked_approval_since: None,
             parked_plan_turn: None,
             parked_plan_since: None,
+            tool_success_streak: std::collections::HashMap::new(),
+            pending_preapproval_thresholds: std::collections::HashMap::new(),
         }
     }
 
@@ -502,6 +512,44 @@ impl SessionState {
     pub fn reset_approval_policy(&mut self) {
         self.approval_policy.preapproved_tools.clear();
         self.approval_policy.preapproved_classes.clear();
+    }
+
+    /// Register a streak-based standing preapproval for a tool.
+    /// If the tool has already met the threshold (streak >= required_successes), grants
+    /// preapproval immediately. Otherwise stores the threshold for auto-grant on success.
+    pub fn register_standing_preapproval(&mut self, tool_name: &str, required_successes: u32) {
+        let current = *self.tool_success_streak.get(tool_name).unwrap_or(&0);
+        if current >= required_successes {
+            if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
+                self.approval_policy.preapproved_tools.push(tool_name.to_string());
+            }
+        } else {
+            self.pending_preapproval_thresholds.insert(tool_name.to_string(), required_successes);
+        }
+    }
+
+    /// Record a successful tool execution for streak tracking.
+    /// If the streak hits a registered threshold, grants standing preapproval.
+    pub fn record_tool_streak_success(&mut self, tool_name: &str) {
+        let streak = self.tool_success_streak.entry(tool_name.to_string()).or_insert(0);
+        *streak += 1;
+        if let Some(&threshold) = self.pending_preapproval_thresholds.get(tool_name) {
+            if *streak >= threshold {
+                self.pending_preapproval_thresholds.remove(tool_name);
+                if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
+                    self.approval_policy.preapproved_tools.push(tool_name.to_string());
+                    tracing::info!(
+                        "ConditionalPreapproval: '{}' earned standing approval after {} successive successes.",
+                        tool_name, *streak
+                    );
+                }
+            }
+        }
+    }
+
+    /// Record a failed tool execution — resets the success streak for that tool.
+    pub fn record_tool_streak_failure(&mut self, tool_name: &str) {
+        self.tool_success_streak.insert(tool_name.to_string(), 0);
     }
 
     /// Known approval class names that can be pre-approved by class rather than by tool name.
@@ -2601,6 +2649,8 @@ impl SessionState {
             "status": self.status,
             "approval_policy": self.approval_policy,
             "bindings": self.bindings,
+            "tool_success_streak": self.tool_success_streak,
+            "pending_preapproval_thresholds": self.pending_preapproval_thresholds,
             "active_turn": active_turn,
             "parked_approval_turn": parked_approval_turn,
             "parked_plan_turn": parked_plan_turn,
@@ -2683,6 +2733,16 @@ impl SessionState {
             .get("approval_policy")
             .cloned()
             .and_then(|value| serde_json::from_value::<ApprovalPolicy>(value).ok())
+            .unwrap_or_default();
+        let tool_success_streak: std::collections::HashMap<String, u32> = checkpoint
+            .get("tool_success_streak")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let pending_preapproval_thresholds: std::collections::HashMap<String, u32> = checkpoint
+            .get("pending_preapproval_thresholds")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
         let bindings = checkpoint
             .get("bindings")
@@ -2925,6 +2985,8 @@ impl SessionState {
             parked_approval_since: None,
             parked_plan_turn,
             parked_plan_since: None,
+            tool_success_streak,
+            pending_preapproval_thresholds,
         })
     }
 }
@@ -3170,8 +3232,9 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         }
     }
 
-    // Always include observer tools — every philote can inspect its own session and hotel.
-    for always in ["session.status", "hotel.status", "hotel.logs"] {
+    // Always include observer and meta-approval tools — every philote can inspect its own
+    // session/hotel and request standing approval for tools it uses regularly.
+    for always in ["session.status", "hotel.status", "hotel.logs", "approval.request_standing"] {
         let always = always.to_string();
         if !toolset.contains(&always) {
             toolset.push(always);
@@ -3201,6 +3264,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "handoff.to_role"
             | "handoff.back"
             | "delegate.whisper"
+            | "approval.request_standing"
     )
 }
 

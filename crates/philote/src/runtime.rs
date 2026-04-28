@@ -3467,8 +3467,15 @@ impl AgentRuntime {
                     arguments: serde_json::json!({}),
                 });
 
-            state.push_tool_history(tool_call, tool_result.clone());
+            state.push_tool_history(tool_call.clone(), tool_result.clone());
             state.clear_pending_tool_call();
+
+            // Update conditional-preapproval streak tracking.
+            if step_failed {
+                state.record_tool_streak_failure(&tool_call.tool_name);
+            } else {
+                state.record_tool_streak_success(&tool_call.tool_name);
+            }
 
             // Track consecutive failures for stall detection.
             let consecutive_failures = if step_failed {
@@ -9407,6 +9414,68 @@ impl AgentRuntime {
                     error: None,
                     tool_name: Some("delegate.merge".into()),
                     arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "approval.request_standing" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let tool_name = payload
+                    .arguments
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let required_successes = payload
+                    .arguments
+                    .get("required_successes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3) as u32;
+
+                if tool_name.is_empty() {
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            turn_id,
+                            "approval.request_standing: missing required argument 'tool_name'".into(),
+                        )
+                        .await;
+                }
+
+                let content = if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.register_standing_preapproval(&tool_name, required_successes);
+                    let current_streak = *state.tool_success_streak.get(&tool_name).unwrap_or(&0);
+                    if state.approval_policy.preapproved_tools.contains(&tool_name) {
+                        format!(
+                            "Standing approval granted immediately for '{}' — \
+                             current streak ({}) already meets the threshold ({}).",
+                            tool_name, current_streak, required_successes
+                        )
+                    } else {
+                        format!(
+                            "Standing approval registered for '{}'. \
+                             It will be auto-granted after {} successive successes \
+                             (current streak: {}).",
+                            tool_name, required_successes, current_streak
+                        )
+                    }
+                } else {
+                    "Session not found.".into()
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    tool_name: Some("approval.request_standing".into()),
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
