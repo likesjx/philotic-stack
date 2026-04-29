@@ -2794,9 +2794,17 @@ fn reconcile_hotel_record(graph: &GraphDomain, hotel_name: &str) -> Result<Hotel
         hotel.execution_port = desired.execution_port;
         changed = true;
     }
-    // When a profile is active, always use the profile-derived socket path.
-    // The stored path may be from a non-profile run and must not win.
-    if hotel.ipc_socket_path.trim().is_empty() || profile_dir().is_some() {
+    let explicit_socket = std::env::var("PHILOTIC_HOTEL_SOCKET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    // When a profile is active or the operator explicitly configured a socket
+    // path, the derived/default value must override stale graph state.
+    if hotel.ipc_socket_path.trim().is_empty()
+        || profile_dir().is_some()
+        || explicit_socket.as_deref() == Some(desired.ipc_socket_path.as_str())
+    {
         hotel.ipc_socket_path = desired.ipc_socket_path;
         changed = true;
     }
