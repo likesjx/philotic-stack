@@ -45,7 +45,8 @@ impl C4Level {
             | NodeKind::CanonicalWorkflow
             // Profile projection tracking
             | NodeKind::ProfileDefinition
-            | NodeKind::RoleCharter => Some(Self::Context),
+            | NodeKind::RoleCharter
+            | NodeKind::AgentWorkFocus => Some(Self::Context),
 
             // C2: Container level
             NodeKind::Crate | NodeKind::Worktree | NodeKind::Workstream | NodeKind::Component => {
@@ -138,6 +139,7 @@ pub enum NodeKind {
     ProfileDefinition,
     RoleCharter,
     Agent,
+    AgentWorkFocus,
     Session,
     Decision,
     // Process documents (AGENTS.md, guides, lifecycle docs)
@@ -183,6 +185,7 @@ impl NodeKind {
             Self::ProfileDefinition => "profile_definition",
             Self::RoleCharter => "role_charter",
             Self::Agent => "agent",
+            Self::AgentWorkFocus => "agent_work_focus",
             Self::Session => "session",
             Self::Decision => "decision",
             Self::Document => "document",
@@ -227,6 +230,7 @@ impl NodeKind {
             "profile_definition" => Some(Self::ProfileDefinition),
             "role_charter" => Some(Self::RoleCharter),
             "agent" => Some(Self::Agent),
+            "agent_work_focus" => Some(Self::AgentWorkFocus),
             "session" => Some(Self::Session),
             "decision" => Some(Self::Decision),
             "document" => Some(Self::Document),
@@ -489,5 +493,6 @@ pub fn should_embed(kind: NodeKind) -> bool {
             | NodeKind::HarnessProfile
             | NodeKind::ProfileDefinition
             | NodeKind::RoleCharter
+            | NodeKind::AgentWorkFocus
     )
 }

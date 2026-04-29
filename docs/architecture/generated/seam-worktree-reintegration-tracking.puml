@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - worktree-reintegration-tracking
+
+rectangle "worktree-reintegration-tracking" as worktree_reintegration_tracking #Orange {
+}
+
+
+@enduml

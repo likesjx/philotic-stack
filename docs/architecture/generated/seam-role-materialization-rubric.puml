@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - role-materialization-rubric
+
+rectangle "role-materialization-rubric" as role_materialization_rubric #Orange {
+}
+
+
+@enduml

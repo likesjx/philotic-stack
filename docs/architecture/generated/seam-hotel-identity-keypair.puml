@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - hotel-identity-keypair
+
+rectangle "hotel-identity-keypair" as hotel_identity_keypair #Orange {
+}
+
+
+@enduml

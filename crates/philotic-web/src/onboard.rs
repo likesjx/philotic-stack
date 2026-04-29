@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use inquire::{Confirm, Password, Select, Text};
 use serde_json::{json, Map, Value};
-use std::path::Path;
+use std::{path::Path, process::Stdio};
 
 #[cfg(target_os = "macos")]
 use crate::service;
@@ -276,6 +276,16 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
     std::fs::write(config_path, &pretty)
         .with_context(|| format!("write {}", config_path.display()))?;
 
+    crate::load::run(Some(config_path.to_path_buf()), hotel_name.clone())
+        .await
+        .with_context(|| {
+            format!(
+                "load onboarding config for hotel '{}' from {}",
+                hotel_name,
+                config_path.display()
+            )
+        })?;
+
     #[cfg(target_os = "macos")]
     {
         println!();
@@ -285,6 +295,15 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
             .prompt()?;
         if install_service {
             service::install(hotel_name.clone()).await?;
+
+            println!();
+            let launch_setup_ui = Confirm::new("Launch the management UI setup guide now?")
+                .with_default(true)
+                .with_help_message("Opens the embedded desktop in your browser so you can configure models, components, and agent workspace details.")
+                .prompt()?;
+            if launch_setup_ui {
+                launch_management_ui(config_path)?;
+            }
         }
     }
 
@@ -304,6 +323,7 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
 
     println!();
     println!("  ✓ Config written to {}", config_path.display());
+    println!("  ✓ Hotel '{}' provisioned into the Context Graph", hotel_name);
     println!(
         "  ✓ {} agent{} configured",
         agent_count,
@@ -321,11 +341,32 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
     }
     println!();
     println!("  Next steps:");
-    println!("    phil start        start the hotel daemon");
+    println!("    phil status --hotel {}  inspect the daemon and agent config", hotel_name);
+    println!("    phil start --hotel {}   start the hotel daemon (if not using launchd)", hotel_name);
     println!("    phil service status  inspect the launchd service");
-    println!("    phil serve        open the management UI");
+    println!("    phil serve --open-path /setup-guide   open the management UI guide");
     println!();
 
+    Ok(())
+}
+
+fn launch_management_ui(config_path: &Path) -> Result<()> {
+    let current_exe = std::env::current_exe().context("resolve current philotic-web executable")?;
+    let mut cmd = std::process::Command::new(current_exe);
+    cmd.arg("serve")
+        .arg("--config")
+        .arg(config_path)
+        .arg("--open-path")
+        .arg("/setup-guide")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    if let Some(profile) = crate::init::active_profile() {
+        cmd.env("PHILOTIC_PROFILE", profile);
+    }
+
+    cmd.spawn().context("launch management UI")?;
     Ok(())
 }
 

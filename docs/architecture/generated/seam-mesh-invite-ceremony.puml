@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mesh-invite-ceremony
+
+rectangle "mesh-invite-ceremony" as mesh_invite_ceremony #Orange {
+}
+
+
+@enduml

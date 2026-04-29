@@ -3,7 +3,7 @@ title: Philotic Task Runner Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-04-24
 tags:
 - task-runner
 - tooling
@@ -15,6 +15,7 @@ related_docs:
 - TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
 - TOOL_MANAGEMENT_PLANE_PROPOSAL.md
 - RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md
+- COMPUTER_USE_TASK_RUNNER_PROPOSAL.md
 task_refs:
 - docs/task.md
 proposal_id: task-runner
@@ -22,8 +23,10 @@ implements: []
 implemented_by:
 - workspace-runner-overlay-slice
 - workspace-runner-base-policy-slice
+- desktop-observe-metadata-scaffold
 active_seams:
 - shell-runner-split
+- desktop-runner-materialization
 - runner-materialization-policy
 - unreachable-runner-fallback
 source_of_truth_targets:
@@ -64,10 +67,14 @@ Current code already points this way:
   - workspace runner base policy now rides in hotel/session-driven route metadata
   - `tool-runner` treats env vars as fallback defaults instead of primary truth
   - canonical session snapshots now include workspace runner base config for routed workspace tools
+- fourth coding slice landed:
+  - `desktop.observe` is cataloged and routed as a pinned `desktop` task-runner tool
+  - `tool-runner` advertises `desktop.observe` and returns metadata-only observation scaffolding
+  - screenshot and input actions remain deferred behind approval and artifact-policy seams
 
 Still pending:
 
-- explicit task-runner specialization and configuration
+- explicit task-runner specialization and configuration beyond the first `desktop.observe` scaffold
 - shell runner split
 - unreachable-incarnation fallback/materialization policy
 
@@ -85,6 +92,7 @@ Use it for:
 
 - filesystem access
 - shell execution
+- computer-use/desktop automation
 - other host/resource-bound work
 
 Keep it separate from:
@@ -102,6 +110,9 @@ The same is true for:
 - `workspace.search`
 - `workspace.write`
 - `shell.exec`
+- `desktop.observe`
+- `desktop.screenshot`
+- later `desktop.click`, `desktop.type`, `desktop.key`, and `desktop.scroll`
 
 These tools are abstract for planning purposes, but they are pinned at execution time because they target:
 
@@ -262,6 +273,26 @@ Policy focus:
 - streaming/interruption behavior
 
 This split matters because “list files” and “run shell commands” should not share the same trust posture just because both happen on a laptop.
+
+### Desktop / CUA Family
+
+- `desktop.observe`
+- `desktop.screenshot`
+- later `desktop.click`
+- later `desktop.type`
+- later `desktop.key`
+- later `desktop.scroll`
+
+Policy focus:
+
+- desktop-session binding
+- operator/session approval posture
+- observation redaction
+- screenshot artifact handling
+- high-agency input gating
+- lease-aware materialization
+
+Computer-use automation should be a pinned desktop runner family, not a desktop membrane shortcut. The membrane can present the approval and observation surface; the runner owns execution.
 
 ## Recommended Family Split
 

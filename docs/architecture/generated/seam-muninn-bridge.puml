@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - muninn-bridge
+
+rectangle "muninn-bridge" as muninn_bridge #Orange {
+}
+
+
+@enduml

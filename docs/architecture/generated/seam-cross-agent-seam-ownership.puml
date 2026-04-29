@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cross-agent-seam-ownership
+
+rectangle "cross-agent-seam-ownership" as cross_agent_ownership #Orange {
+}
+
+
+@enduml

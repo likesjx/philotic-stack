@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - philotic-profile-namespacing
+
+rectangle "philotic-profile-namespacing" as philotic_profile_namespacing #Orange {
+}
+
+
+@enduml

@@ -10,6 +10,10 @@ pub enum TurnPhase {
     Thinking,
     WaitingTool,
     WaitingApproval,
+    /// The model proposed a plan and is waiting for operator confirmation before
+    /// executing tools. The turn parks in `parked_plan_turn` so the session
+    /// can accept other work while the operator reviews.
+    PlanningDiscussion,
     WaitingVoice,
     Completed,
     Failed,
@@ -24,6 +28,7 @@ impl TurnPhase {
             Self::Thinking => "thinking",
             Self::WaitingTool => "waiting_tool",
             Self::WaitingApproval => "waiting_approval",
+            Self::PlanningDiscussion => "planning_discussion",
             Self::WaitingVoice => "waiting_voice",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -37,6 +42,7 @@ impl TurnPhase {
             "thinking" => Self::Thinking,
             "waiting_tool" => Self::WaitingTool,
             "waiting_approval" => Self::WaitingApproval,
+            "planning_discussion" => Self::PlanningDiscussion,
             "waiting_voice" => Self::WaitingVoice,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
@@ -50,7 +56,19 @@ pub enum AgentAction {
     Respond { content: String },
     ToolCall(ToolCall),
     RequestApproval(ApprovalRequest),
+    /// The model is proposing a plan before executing any tools. The runtime
+    /// surfaces the plan to the operator and parks the turn until they confirm.
+    PlanProposal(PlanProposalAction),
     Fail { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanProposalAction {
+    pub summary: String,
+    #[serde(default)]
+    pub steps: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_risk_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +128,22 @@ pub fn interpret_model_payload(agent_action: Option<&Value>, content: Option<&st
                             .unwrap_or("Approved.")
                             .to_string(),
                     });
+                }
+                "plan_proposal" => {
+                    if let Some(summary) = agent_action.get("summary").and_then(Value::as_str) {
+                        return AgentAction::PlanProposal(PlanProposalAction {
+                            summary: summary.to_string(),
+                            steps: agent_action
+                                .get("steps")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default(),
+                            approval_risk_hint: agent_action
+                                .get("approval_risk_hint")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        });
+                    }
                 }
                 "fail" => {
                     return AgentAction::Fail {

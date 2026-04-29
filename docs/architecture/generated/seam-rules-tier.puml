@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - rules-tier
+
+rectangle "rules-tier" as rules_tier #Orange {
+}
+
+
+@enduml

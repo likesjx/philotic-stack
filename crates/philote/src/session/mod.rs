@@ -119,6 +119,20 @@ pub struct SessionState {
     /// Wall-clock instant when the turn was parked for approval. Not persisted.
     /// Used by the turn-timeout watchdog to evict orphaned parked turns.
     pub parked_approval_since: Option<std::time::Instant>,
+    /// A turn parked in PlanningDiscussion phase. The next inbound user message
+    /// (or any non-empty text that is not a cancellation slash command) restores it
+    /// and re-enters the model with `plan_confirmed = true`.
+    pub parked_plan_turn: Option<WorkingTurn>,
+    /// Wall-clock instant when the plan turn was parked. Not persisted.
+    pub parked_plan_since: Option<std::time::Instant>,
+    /// Consecutive successful executions per tool name within this session.
+    /// Resets to 0 on any failure. Used to auto-grant standing approval once
+    /// the agent has demonstrated reliability on a specific tool.
+    pub tool_success_streak: std::collections::HashMap<String, u32>,
+    /// Registered thresholds for auto-granting standing approval.
+    /// Maps tool_name → required consecutive successes.
+    /// Populated by the `approval.request_standing` planning tool.
+    pub pending_preapproval_thresholds: std::collections::HashMap<String, u32>,
 }
 
 impl SessionState {
@@ -148,6 +162,10 @@ impl SessionState {
             turn_waiting_since: None,
             parked_approval_turn: None,
             parked_approval_since: None,
+            parked_plan_turn: None,
+            parked_plan_since: None,
+            tool_success_streak: std::collections::HashMap::new(),
+            pending_preapproval_thresholds: std::collections::HashMap::new(),
         }
     }
 
@@ -247,6 +265,34 @@ impl SessionState {
     /// True if a turn is parked waiting for operator approval.
     pub fn has_parked_approval_turn(&self) -> bool {
         self.parked_approval_turn.is_some()
+    }
+
+    /// Park the active turn for plan discussion. The turn must already have phase
+    /// `PlanningDiscussion`. The session becomes free for other work while the
+    /// operator reviews the proposed plan.
+    pub fn park_active_turn_for_plan(&mut self) {
+        self.parked_plan_since = Some(std::time::Instant::now());
+        self.parked_plan_turn = self.active_turn.take();
+    }
+
+    /// Restore the parked plan turn into `active_turn` and mark it confirmed.
+    /// `operator_note` is an optional steering hint from the operator's reply.
+    /// Returns `true` if a plan turn was parked.
+    pub fn restore_parked_plan_turn(&mut self, operator_note: Option<String>) -> bool {
+        if let Some(mut turn) = self.parked_plan_turn.take() {
+            self.parked_plan_since = None;
+            turn.plan_confirmed = true;
+            turn.plan_confirm_note = operator_note;
+            self.active_turn = Some(turn);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True if a turn is parked in PlanningDiscussion.
+    pub fn has_parked_plan_turn(&self) -> bool {
+        self.parked_plan_turn.is_some()
     }
 
     pub fn set_active_plan(&mut self, plan: ActivePlan) {
@@ -466,6 +512,44 @@ impl SessionState {
     pub fn reset_approval_policy(&mut self) {
         self.approval_policy.preapproved_tools.clear();
         self.approval_policy.preapproved_classes.clear();
+    }
+
+    /// Register a streak-based standing preapproval for a tool.
+    /// If the tool has already met the threshold (streak >= required_successes), grants
+    /// preapproval immediately. Otherwise stores the threshold for auto-grant on success.
+    pub fn register_standing_preapproval(&mut self, tool_name: &str, required_successes: u32) {
+        let current = *self.tool_success_streak.get(tool_name).unwrap_or(&0);
+        if current >= required_successes {
+            if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
+                self.approval_policy.preapproved_tools.push(tool_name.to_string());
+            }
+        } else {
+            self.pending_preapproval_thresholds.insert(tool_name.to_string(), required_successes);
+        }
+    }
+
+    /// Record a successful tool execution for streak tracking.
+    /// If the streak hits a registered threshold, grants standing preapproval.
+    pub fn record_tool_streak_success(&mut self, tool_name: &str) {
+        let streak = self.tool_success_streak.entry(tool_name.to_string()).or_insert(0);
+        *streak += 1;
+        if let Some(&threshold) = self.pending_preapproval_thresholds.get(tool_name) {
+            if *streak >= threshold {
+                self.pending_preapproval_thresholds.remove(tool_name);
+                if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
+                    self.approval_policy.preapproved_tools.push(tool_name.to_string());
+                    tracing::info!(
+                        "ConditionalPreapproval: '{}' earned standing approval after {} successive successes.",
+                        tool_name, *streak
+                    );
+                }
+            }
+        }
+    }
+
+    /// Record a failed tool execution — resets the success streak for that tool.
+    pub fn record_tool_streak_failure(&mut self, tool_name: &str) {
+        self.tool_success_streak.insert(tool_name.to_string(), 0);
     }
 
     /// Known approval class names that can be pre-approved by class rather than by tool name.
@@ -1027,6 +1111,11 @@ impl SessionState {
             .or_else(|| match capability {
                 "text.generate" => self.bindings.effective_model_controller.as_deref(),
                 "voice.synthesize" => self.agent_profile.voice_response_policy.provider.as_deref(),
+                "voice.transcribe" => self
+                    .agent_profile
+                    .media_routing_policy
+                    .transcription_provider
+                    .as_deref(),
                 _ => None,
             })
     }
@@ -1152,10 +1241,34 @@ impl SessionState {
                     name = call.tool_name,
                 ));
             }
-            prompt.push_str(
-                "Review the above tool results and continue. \
-                 Call another tool if needed, or respond to the user if you have enough information.",
-            );
+            let reentry_hint = if let Some(plan) = turn.active_plan.as_ref() {
+                let done = plan.steps.iter().filter(|s| s.status == "done").count();
+                let failed = plan.steps.iter().filter(|s| s.status == "failed").count();
+                let total = plan.steps.len();
+                if plan.status == "done" || (done + failed == total && total > 0) {
+                    "All plan steps are complete. Provide your final response to the user now. \
+                     Do not call any more tools."
+                        .to_string()
+                } else {
+                    let pending: Vec<String> = plan
+                        .steps
+                        .iter()
+                        .filter(|s| s.status == "pending" || s.status == "in_progress")
+                        .map(|s| format!("step {}: {}", s.id, s.description))
+                        .collect();
+                    format!(
+                        "{done}/{total} plan steps done. Remaining: {}. \
+                         Continue with the next pending step, or respond to the user if \
+                         all necessary work is complete.",
+                        pending.join("; ")
+                    )
+                }
+            } else {
+                "Review the above tool results. If your task is complete, respond to the user \
+                 now. Only call another tool if a specific next step is still required."
+                    .to_string()
+            };
+            prompt.push_str(&reentry_hint);
         }
 
         Some(prompt)
@@ -2218,6 +2331,16 @@ impl SessionState {
             format!("Cognitive step iteration: {}.", turn.iteration),
         ];
 
+        if turn.plan_confirmed {
+            let base = "Plan confirmed by operator. You are cleared to execute your plan. \
+                        Proceed with tool calls as declared.";
+            if let Some(note) = turn.plan_confirm_note.as_deref() {
+                lines.push(format!("{base} Operator note: {note}"));
+            } else {
+                lines.push(base.into());
+            }
+        }
+
         if let Some(plan) = turn.active_plan.as_ref() {
             lines.push(format!(
                 "Active plan: goal='{}', status='{}', steps={}.",
@@ -2249,6 +2372,7 @@ impl SessionState {
         }
 
         if !turn.working_tool_history.is_empty() {
+            let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
             lines.push(format!(
                 "Tool history entries in local working state: {}.",
                 turn.working_tool_history.len()
@@ -2256,18 +2380,54 @@ impl SessionState {
             lines.push("\n[Tool call history]".into());
             for (i, (call, result)) in turn.working_tool_history.iter().enumerate() {
                 let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+                let content = if result.content.len() > max_result_chars {
+                    format!(
+                        "{}… [truncated: {} chars total]",
+                        &result.content[..max_result_chars],
+                        result.content.len()
+                    )
+                } else {
+                    result.content.clone()
+                };
                 lines.push(format!(
                     "Call {n}: {name}({args})\nResult {n}: {content}",
                     n = i + 1,
                     name = call.tool_name,
-                    content = result.content,
+                    content = content,
                 ));
             }
-            lines.push(
-                "Review the above tool results and continue. \
-                 Call another tool if needed, or respond to the user if you have enough information."
-                    .into(),
-            );
+
+            // Build a structured re-entry footer based on plan state so the model
+            // knows exactly whether to continue calling tools or deliver a final reply.
+            let reentry_hint = if let Some(plan) = turn.active_plan.as_ref() {
+                let done = plan.steps.iter().filter(|s| s.status == "done").count();
+                let failed = plan.steps.iter().filter(|s| s.status == "failed").count();
+                let total = plan.steps.len();
+                if plan.status == "done" || (done + failed == total && total > 0) {
+                    "All plan steps are complete. Provide your final response to the user now. \
+                     Do not call any more tools."
+                        .to_string()
+                } else {
+                    let pending: Vec<String> = plan
+                        .steps
+                        .iter()
+                        .filter(|s| s.status == "pending" || s.status == "in_progress")
+                        .map(|s| format!("step {}: {}", s.id, s.description))
+                        .collect();
+                    format!(
+                        "{done}/{total} plan steps done. Remaining: {}. \
+                         Continue with the next pending step, or respond to the user if \
+                         all necessary work is complete.",
+                        pending.join("; ")
+                    )
+                }
+            } else {
+                // No active plan — use a conservative hint that doesn't bias toward more tools.
+                "Review the above tool results. If your task is complete, respond to the user \
+                 now. Only call another tool if a specific next step is still required."
+                    .to_string()
+            };
+            lines.push(reentry_hint);
         }
         if turn.pending_tool_call.is_some() {
             lines.push("A tool call is pending.".into());
@@ -2471,6 +2631,11 @@ impl SessionState {
             .as_ref()
             .and_then(|t| serde_json::to_value(t).ok());
 
+        let parked_plan_turn = self
+            .parked_plan_turn
+            .as_ref()
+            .and_then(|t| serde_json::to_value(t).ok());
+
         // agent_profile, component_route_assembly, and tool_assembly are hotel-computed
         // and injected fresh by compose_session_snapshot on every turn. Persisting them
         // in the checkpoint causes unbounded circular growth: checkpoint → session.summary_json
@@ -2484,8 +2649,11 @@ impl SessionState {
             "status": self.status,
             "approval_policy": self.approval_policy,
             "bindings": self.bindings,
+            "tool_success_streak": self.tool_success_streak,
+            "pending_preapproval_thresholds": self.pending_preapproval_thresholds,
             "active_turn": active_turn,
             "parked_approval_turn": parked_approval_turn,
+            "parked_plan_turn": parked_plan_turn,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
                     "turn_id": turn.turn_id,
@@ -2507,7 +2675,9 @@ impl SessionState {
         json!({
             "session_id": self.session_id,
             "source": self.source,
-            "has_active_turn": self.active_turn.is_some() || self.parked_approval_turn.is_some(),
+            "has_active_turn": self.active_turn.is_some()
+                || self.parked_approval_turn.is_some()
+                || self.parked_plan_turn.is_some(),
             "updated_at": current_unix_ts(),
         })
     }
@@ -2563,6 +2733,16 @@ impl SessionState {
             .get("approval_policy")
             .cloned()
             .and_then(|value| serde_json::from_value::<ApprovalPolicy>(value).ok())
+            .unwrap_or_default();
+        let tool_success_streak: std::collections::HashMap<String, u32> = checkpoint
+            .get("tool_success_streak")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let pending_preapproval_thresholds: std::collections::HashMap<String, u32> = checkpoint
+            .get("pending_preapproval_thresholds")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
         let bindings = checkpoint
             .get("bindings")
@@ -2746,6 +2926,14 @@ impl SessionState {
                     .get("paracrine_merge_completed")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                plan_confirmed: turn
+                    .get("plan_confirmed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                plan_confirm_note: turn
+                    .get("plan_confirm_note")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             })
         });
 
@@ -2762,6 +2950,13 @@ impl SessionState {
             .and_then(|v| if v.is_null() { None } else { Some(v) })
             .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
             .filter(|t| t.phase == TurnPhase::WaitingApproval);
+
+        // Restore parked plan turn if one was checkpointed.
+        let parked_plan_turn = checkpoint
+            .get("parked_plan_turn")
+            .and_then(|v| if v.is_null() { None } else { Some(v) })
+            .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
+            .filter(|t| t.phase == TurnPhase::PlanningDiscussion);
 
         Some(Self {
             session_id,
@@ -2794,6 +2989,10 @@ impl SessionState {
             turn_waiting_since: None,
             parked_approval_turn,
             parked_approval_since: None,
+            parked_plan_turn,
+            parked_plan_since: None,
+            tool_success_streak,
+            pending_preapproval_thresholds,
         })
     }
 }
@@ -3039,8 +3238,9 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         }
     }
 
-    // Always include observer tools — every philote can inspect its own session and hotel.
-    for always in ["session.status", "hotel.status", "hotel.logs"] {
+    // Always include observer and meta-approval tools — every philote can inspect its own
+    // session/hotel and request standing approval for tools it uses regularly.
+    for always in ["session.status", "hotel.status", "hotel.logs", "approval.request_standing"] {
         let always = always.to_string();
         if !toolset.contains(&always) {
             toolset.push(always);
@@ -3070,13 +3270,18 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "handoff.to_role"
             | "handoff.back"
             | "delegate.whisper"
+            | "approval.request_standing"
     )
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
+        "workspace.list"
+            | "workspace.read"
+            | "workspace.search"
+            | "workspace.write"
+            | "desktop.observe"
     )
 }
 
@@ -3087,6 +3292,10 @@ fn task_runner_kind_for_tool(tool_name: &str) -> Option<String> {
 
     if tool_name.starts_with("shell.") || tool_name == "bash.exec" {
         return Some("shell".into());
+    }
+
+    if tool_name.starts_with("desktop.") {
+        return Some("desktop".into());
     }
 
     None
@@ -3415,6 +3624,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         }
     }
 
@@ -3449,6 +3660,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3602,6 +3815,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -3645,6 +3860,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -3965,6 +4182,18 @@ mod tests {
         assert!(props.contains_key("command"));
         assert!(props.contains_key("working_dir"));
         assert!(props.contains_key("timeout_secs"));
+    }
+
+    #[test]
+    fn desktop_observe_is_desktop_class_and_low_agency() {
+        use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
+        let catalog = tool_catalog();
+        assert!(
+            catalog.contains_key("desktop.observe"),
+            "desktop.observe must be in catalog"
+        );
+        assert_eq!(tool_class("desktop.observe"), Some("desktop"));
+        assert!(!tool_requires_approval("desktop.observe"));
     }
 
     #[test]
@@ -4384,6 +4613,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let projection = state.build_context_projection("status");
@@ -4470,6 +4701,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let prompt = state.build_prompt("status");
@@ -4550,6 +4783,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4627,6 +4862,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5004,6 +5241,27 @@ mod tests {
     }
 
     #[test]
+    fn desktop_observe_gets_pinned_desktop_route() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("desktop.observe");
+        state.rebuild_default_tool_assembly();
+
+        let route = state
+            .resolve_tool_route("desktop.observe")
+            .expect("desktop.observe route should exist");
+
+        assert_eq!(route.execution_mode, "pinned");
+        assert_eq!(route.task_runner_kind.as_deref(), Some("desktop"));
+        assert_eq!(route.target_role, "tool.desktop.observe");
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("default_pinned_route")
+        );
+    }
+
+    #[test]
     fn conversational_turns_project_no_tools_by_default() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -5147,6 +5405,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5197,6 +5457,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         state.push_tool_history(
@@ -5262,6 +5524,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         state.push_tool_history(
@@ -5328,6 +5592,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let reentry = state
@@ -5602,6 +5868,8 @@ mod tests {
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
             paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -5616,5 +5884,267 @@ mod tests {
             .expect("recalled memory entry should render text");
         assert!(text.contains("[Recalled memory]"));
         assert!(text.contains("memory-architecture"));
+    }
+
+    #[test]
+    fn transcription_provider_surfaces_via_preferred_component_implementation() {
+        use crate::session::types::MediaRoutingPolicy;
+
+        let mut state =
+            SessionState::new("sess-tx".into(), "agent-bjork-01".into(), "telegram".into());
+        state.agent_profile.media_routing_policy = MediaRoutingPolicy {
+            transcription_provider: Some("onnx".into()),
+            voice_action: Some("transcribe".into()),
+            ..MediaRoutingPolicy::default()
+        };
+
+        // No component_route_assembly set — falls through to agent_profile lookup.
+        assert_eq!(
+            state.preferred_component_implementation("voice.transcribe"),
+            Some("onnx")
+        );
+        // Other capabilities are unaffected.
+        assert_eq!(
+            state.preferred_component_implementation("voice.synthesize"),
+            state.agent_profile.voice_response_policy.provider.as_deref()
+        );
+        assert_eq!(
+            state.preferred_component_implementation("text.generate"),
+            state.bindings.effective_model_controller.as_deref()
+        );
+    }
+
+    #[test]
+    fn transcription_provider_none_when_not_configured() {
+        let state =
+            SessionState::new("sess-tx2".into(), "agent-bjork-01".into(), "telegram".into());
+        // Default MediaRoutingPolicy has no transcription_provider.
+        assert_eq!(
+            state.preferred_component_implementation("voice.transcribe"),
+            None
+        );
+    }
+
+    #[test]
+    fn transcription_provider_round_trips_through_serde() {
+        use crate::session::types::MediaRoutingPolicy;
+
+        let policy = MediaRoutingPolicy {
+            transcription_provider: Some("onnx".into()),
+            voice_action: Some("transcribe".into()),
+            ..MediaRoutingPolicy::default()
+        };
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["transcription_provider"], "onnx");
+
+        let round_tripped: MediaRoutingPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.transcription_provider.as_deref(), Some("onnx"));
+    }
+
+    #[test]
+    fn component_route_assembly_takes_precedence_over_transcription_provider() {
+        use crate::session::types::{ComponentExecutionRoute, ComponentRouteAssembly, MediaRoutingPolicy};
+        use std::collections::BTreeMap;
+
+        let mut state =
+            SessionState::new("sess-tx3".into(), "agent-bjork-01".into(), "telegram".into());
+        state.agent_profile.media_routing_policy = MediaRoutingPolicy {
+            transcription_provider: Some("onnx".into()),
+            ..MediaRoutingPolicy::default()
+        };
+        // An explicit hotel-injected route for voice.transcribe should win.
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "voice.transcribe".to_string(),
+            ComponentExecutionRoute {
+                target_node: "remote-node-1".into(),
+                target_role: "model.local".into(),
+                execution_mode: "capability".into(),
+                ..ComponentExecutionRoute::default()
+            },
+        );
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: routes,
+        };
+
+        // resolve_component_execution_route hits first — preferred_component_implementation
+        // returns None because the route assembly takes the component_route_for_capability path.
+        // Callers use resolve_model_execution_target which checks route assembly before falling
+        // back to preferred_component_implementation — just assert both APIs are consistent.
+        assert!(state.resolve_component_execution_route("voice.transcribe").is_some());
+    }
+
+    fn make_turn_with_plan(plan: ActivePlan) -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "c1".into(),
+            user_content: "set up roles".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: Some(plan),
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+        }
+    }
+
+    #[test]
+    fn working_state_shows_all_done_when_plan_complete() {
+        let mut state =
+            SessionState::new("sess-2".into(), "agent-bjork-01".into(), "telegram".into());
+        let plan = ActivePlan {
+            goal: "configure roles".into(),
+            status: "done".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "create analyst role".into(),
+                tool_name: Some("role.create_or_update".into()),
+                status: "done".into(),
+            }],
+            context_1_advisory: None,
+        };
+        state.start_turn(make_turn_with_plan(plan));
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "role.create_or_update".into(),
+                arguments: serde_json::json!({"role_name": "analyst"}),
+            },
+            ToolResult {
+                tool_name: "role.create_or_update".into(),
+                content: "Role 'analyst' created/updated successfully.".into(),
+            },
+        );
+
+        let prompt = state.build_reentry_prompt().unwrap();
+        assert!(
+            prompt.contains("All plan steps are complete"),
+            "should show all-done message, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Call another tool if needed"),
+            "should not use old generic footer"
+        );
+    }
+
+    #[test]
+    fn working_state_shows_pending_steps_when_plan_partial() {
+        let mut state =
+            SessionState::new("sess-3".into(), "agent-bjork-01".into(), "telegram".into());
+        let plan = ActivePlan {
+            goal: "configure roles".into(),
+            status: "executing".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: "create analyst role".into(),
+                    tool_name: Some("role.create_or_update".into()),
+                    status: "done".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: "create coordinator role".into(),
+                    tool_name: Some("role.create_or_update".into()),
+                    status: "pending".into(),
+                },
+            ],
+            context_1_advisory: None,
+        };
+        state.start_turn(make_turn_with_plan(plan));
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "role.create_or_update".into(),
+                arguments: serde_json::json!({"role_name": "analyst"}),
+            },
+            ToolResult {
+                tool_name: "role.create_or_update".into(),
+                content: "Role 'analyst' created/updated successfully.".into(),
+            },
+        );
+
+        let prompt = state.build_reentry_prompt().unwrap();
+        assert!(
+            prompt.contains("1/2 plan steps done"),
+            "should show partial progress, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("coordinator role"),
+            "should name pending step"
+        );
+    }
+
+    #[test]
+    fn working_state_conservative_hint_without_plan() {
+        let mut state =
+            SessionState::new("sess-4".into(), "agent-bjork-01".into(), "telegram".into());
+        let turn = WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-x".into(),
+            chat_id: "c1".into(),
+            user_content: "do something".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+        };
+        state.start_turn(turn);
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "echo".into(),
+                arguments: serde_json::json!({"text": "hi"}),
+            },
+            ToolResult {
+                tool_name: "echo".into(),
+                content: "hi".into(),
+            },
+        );
+
+        let prompt = state.build_reentry_prompt().unwrap();
+        assert!(
+            prompt.contains("If your task is complete, respond to the user now"),
+            "should use conservative no-plan hint, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Call another tool if needed"),
+            "should not use old generic footer"
+        );
     }
 }

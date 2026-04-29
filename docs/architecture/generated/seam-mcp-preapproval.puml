@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-preapproval
+
+rectangle "mcp-preapproval" as mcp_preapproval #Orange {
+}
+
+
+@enduml

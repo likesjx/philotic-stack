@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - training-signal-capture
+
+rectangle "training-signal-capture" as training_signal_capture #Orange {
+}
+
+
+@enduml

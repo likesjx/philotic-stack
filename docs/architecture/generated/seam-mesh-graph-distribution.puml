@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mesh-graph-distribution
+
+rectangle "mesh-graph-distribution" as mesh_graph_distribution #Orange {
+}
+
+
+@enduml

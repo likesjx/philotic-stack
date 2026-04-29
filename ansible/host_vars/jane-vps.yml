@@ -19,7 +19,7 @@ philotic_agents:
     voice_response_policy:
       mode: "off"                          # off | auto | on  (/tts to toggle)
       provider: "elevenlabs"
-      voice_id: "{{ vault_beacon_elevenlabs_voice_id }}"
+      voice_id: "{{ vault_beacon_elevenlabs_voice_id | default('') }}"
       model: "eleven_multilingual_v2"
       send_text_caption: true              # send text alongside audio when mode=on
       fallback_to_text: true               # degrade gracefully if synthesis fails
@@ -35,6 +35,25 @@ philotic_artifacts_remote: true
 philotic_artifacts_dir: "/opt/philotic/src/target/release"
 
 # Mesh
+philotic_backbone_peers:
+  - name: "default"
+    host: "100.64.230.106"
+    beacon_port: 24849
+    blob_port: 24850
+    execution_port: 24851
+  - name: "mbp-jane"
+    host: "100.79.239.64"
+    beacon_port: 13104
+    blob_port: 13105
+    execution_port: 13106
+
 philotic_enable_rust_auth: "1"
 philotic_enable_rust_dispatcher: "1"
 philotic_enable_rust_task_lifecycle: "1"
+
+# ONNX Sidecar — 768-dim embeddings for web-exposed semantic search
+philotic_onnx_sidecar_enabled: true
+philotic_onnx_sidecar_port: 11435
+philotic_onnx_embed_repo: "Xenova/all-mpnet-base-v2"  # 768-dim, ONNX-optimized
+philotic_onnx_embed_dim: 768
+philotic_onnx_prefer_quantized: true

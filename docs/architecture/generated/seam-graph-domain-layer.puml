@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-domain-layer
+
+rectangle "graph-domain-layer" as graph_domain_layer #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - role-lens-activation
+
+rectangle "role-lens-activation" as role_lens_activation #Orange {
+}
+
+
+@enduml

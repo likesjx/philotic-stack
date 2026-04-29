@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - agent-graph-toolrunner
+
+rectangle "agent-graph-toolrunner" as agent_graph_toolrunner #Orange {
+}
+
+
+@enduml

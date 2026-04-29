@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - role-handoff-seam
+
+rectangle "role-handoff-seam" as role_handoff_seam #Orange {
+}
+
+
+@enduml

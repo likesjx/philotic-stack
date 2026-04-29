@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - doc-scanner
+
+rectangle "doc-scanner" as doc_scanner #Orange {
+}
+
+
+@enduml

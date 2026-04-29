@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-runner-store
+
+rectangle "graph-runner-store" as graph_runner_store #Orange {
+}
+
+
+@enduml

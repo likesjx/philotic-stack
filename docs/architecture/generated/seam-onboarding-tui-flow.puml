@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - onboarding-tui-flow
+
+rectangle "onboarding-tui-flow" as onboarding_tui_flow #Orange {
+}
+
+
+@enduml

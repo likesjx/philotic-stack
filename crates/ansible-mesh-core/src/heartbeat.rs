@@ -100,6 +100,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            node_health: None,
         };
 
         let encoded = serde_json::to_vec(&payload).expect("payload should encode");

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-adapter-table-surface
+
+rectangle "graph-adapter-table-surface" as graph_adapter_table_surface #Orange {
+}
+
+
+@enduml

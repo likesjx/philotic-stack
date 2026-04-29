@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - agent-resource-broker
+
+rectangle "agent-resource-broker" as agent_resource_broker #Orange {
+}
+
+
+@enduml

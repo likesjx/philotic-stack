@@ -77,6 +77,12 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
             description: "Show or reset the session approval policy.".into(),
             usage_hint: Some("/approval status | reset".into()),
         },
+        CommandManifestEntry {
+            command: "correct".into(),
+            description: "Submit a correction for the most recent transcription (Whisper flywheel)."
+                .into(),
+            usage_hint: Some("/correct <turn_id> <corrected text>".into()),
+        },
     ]
 }
 
@@ -111,6 +117,11 @@ pub enum SlashCommand {
         provider: Option<String>,
         voice_id: Option<String>,
     },
+    /// Submit a corrected transcript for a Whisper turn — feeds the training flywheel.
+    Correct {
+        turn_id: String,
+        text: String,
+    },
 }
 
 impl SlashCommand {
@@ -140,12 +151,14 @@ impl SlashCommand {
             | Self::ApprovalClear { .. } => None,
             Self::Tts { .. } => None,
             Self::Voice { .. } => None,
+            Self::Correct { .. } => None,
         }
     }
 
     pub fn steering_note(&self) -> Option<&str> {
         match self {
             Self::Approve { note } | Self::Deny { note } => note.as_deref(),
+            Self::Correct { text, .. } => Some(text.as_str()),
             _ => None,
         }
     }
@@ -214,6 +227,10 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/voice", provider, voice_id, ..] => Some(SlashCommand::Voice {
             provider: Some(normalize_voice_provider(provider)),
             voice_id: Some((*voice_id).to_string()),
+        }),
+        ["/correct", turn_id, rest @ ..] if !rest.is_empty() => Some(SlashCommand::Correct {
+            turn_id: (*turn_id).to_string(),
+            text: rest.join(" "),
         }),
         _ => None,
     }

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-formation-lifecycle
+
+rectangle "memory-formation-lifecycle" as memory_formation_lifecycle #Orange {
+}
+
+
+@enduml

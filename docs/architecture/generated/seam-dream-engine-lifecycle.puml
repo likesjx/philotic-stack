@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - dream-engine-lifecycle
+
+rectangle "dream-engine-lifecycle" as dream_engine_lifecycle #Orange {
+}
+
+
+@enduml

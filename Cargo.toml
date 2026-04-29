@@ -20,5 +20,8 @@ members = [
     "crates/media-prep",
     "crates/graph-intelligence",
     "crates/philotic-graph",
+    "crates/datasource",
+    "crates/graph-datasource",
+    "crates/router-listener",
 ]
 resolver = "2"

@@ -67,6 +67,23 @@
   when: not philotic_artifacts_remote
   notify: Restart philotic-hotel
 
+- name: Check which remote Philotic binaries are available on host
+  stat:
+    path: "{{ philotic_artifacts_dir }}/{{ item }}"
+  loop: "{{ philotic_binaries }}"
+  register: philotic_remote_artifact_stats
+  when: philotic_artifacts_remote
+
+- name: Warn about missing remote Philotic binaries
+  debug:
+    msg: >
+      Skipping remote artifact {{ item.item }} because {{ philotic_artifacts_dir }}/{{ item.item }}
+      is not present on the target host.
+  loop: "{{ philotic_remote_artifact_stats.results }}"
+  when:
+    - philotic_artifacts_remote
+    - not item.stat.exists
+
 - name: Install Philotic binaries (already built on host)
   copy:
     src: "{{ philotic_artifacts_dir }}/{{ item }}"
@@ -75,7 +92,13 @@
     group: "{{ philotic_group }}"
     mode: "0755"
     remote_src: yes
-  loop: "{{ philotic_binaries }}"
+  loop: >-
+    {{
+      philotic_remote_artifact_stats.results
+      | selectattr('stat.exists')
+      | map(attribute='item')
+      | list
+    }}
   when: philotic_artifacts_remote
   notify: Restart philotic-hotel
 
@@ -166,3 +189,50 @@
     enabled: yes
     state: started
     daemon_reload: yes
+
+# ── ONNX Sidecar (optional) ───────────────────────────────────────────────────
+
+- name: Create HuggingFace cache directory for ONNX models
+  file:
+    path: "{{ philotic_data_dir }}/hf-cache"
+    state: directory
+    owner: "{{ philotic_user }}"
+    group: "{{ philotic_group }}"
+    mode: "0755"
+  when: philotic_onnx_sidecar_enabled
+
+- name: Deploy ONNX sidecar systemd unit
+  template:
+    src: philotic-onnx-sidecar.service.j2
+    dest: /etc/systemd/system/philotic-onnx-sidecar.service
+    mode: "0644"
+  when: philotic_onnx_sidecar_enabled
+  notify:
+    - Reload systemd
+    - Restart philotic-onnx-sidecar
+
+- name: Enable and start ONNX sidecar
+  systemd:
+    name: philotic-onnx-sidecar
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: philotic_onnx_sidecar_enabled
+
+- name: Stop and disable ONNX sidecar when not enabled
+  systemd:
+    name: philotic-onnx-sidecar
+    enabled: no
+    state: stopped
+  when: not philotic_onnx_sidecar_enabled
+  ignore_errors: yes
+
+- name: Allow ONNX sidecar port through firewall
+  ufw:
+    rule: allow
+    port: "{{ philotic_onnx_sidecar_port }}"
+    proto: tcp
+  when:
+    - ansible_os_family == "Debian"
+    - philotic_onnx_sidecar_enabled
+  ignore_errors: yes

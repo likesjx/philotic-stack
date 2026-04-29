@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - same-identity-handoff-packet
+
+rectangle "same-identity-handoff-packet" as same_identity_handoff_packet #Orange {
+}
+
+
+@enduml

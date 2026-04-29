@@ -48,8 +48,8 @@ struct Args {
     #[arg(long, env = "PHILOTIC_ONNX_KOKORO_VOICE", default_value = DEFAULT_KOKORO_VOICE)]
     kokoro_voice: String,
 
-    /// Prefer the quantized ONNX variant (set to "0" to use fp32).
-    #[arg(long, env = "PHILOTIC_ONNX_PREFER_QUANTIZED", default_value = "true")]
+    /// Prefer the quantized ONNX variant ("true"/"false" or bare --prefer-quantized).
+    #[arg(long, env = "PHILOTIC_ONNX_PREFER_QUANTIZED", default_value = "true", num_args = 0..=1, default_missing_value = "true")]
     prefer_quantized: bool,
 
     /// Guest ID registered with the hotel (overrides PHILOTIC_ONNX_GUEST_ID).
@@ -64,7 +64,6 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-
     let args = Args::parse();
 
     let config = OnnxProviderConfig {

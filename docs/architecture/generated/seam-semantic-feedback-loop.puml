@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - semantic-feedback-loop
+
+rectangle "semantic-feedback-loop" as semantic_feedback_loop #Orange {
+}
+
+
+@enduml

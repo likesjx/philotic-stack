@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - context-swapped-roles
+
+rectangle "context-swapped-roles" as context_swapped_roles #Orange {
+}
+
+
+@enduml

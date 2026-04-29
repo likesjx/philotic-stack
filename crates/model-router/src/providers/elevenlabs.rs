@@ -253,6 +253,7 @@ impl ModelProvider for ElevenLabsProvider {
                     memory_concept: None,
                     memory_candidate: None,
                     active_plan: None,
+                    model_gen: None,
                 })
             }
 

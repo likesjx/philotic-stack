@@ -2343,6 +2343,11 @@ impl IpcServer {
                     });
                 }
                 Err(e) => {
+                    // EMFILE / ENFILE: FD table is full. Back off to let existing
+                    // connections drain rather than spinning and burning CPU.
+                    if e.raw_os_error() == Some(24) || e.raw_os_error() == Some(23) {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
                     error!("IPC listener accept error: {}", e);
                 }
             }
@@ -10117,16 +10122,17 @@ fn component_implementation_to_role(implementation: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
 
-    if prefix == "elevenlabs" {
-        "model.elevenlabs".into()
-    } else {
-        "model".into()
+    match prefix {
+        "elevenlabs" => "model.elevenlabs".into(),
+        "onnx" | "local" => "model.local".into(),
+        _ => "model".into(),
     }
 }
 
 fn default_component_role(capability: &str) -> &'static str {
     match capability {
         "voice.synthesize" => "model.elevenlabs",
+        "voice.transcribe" => "model.local",
         _ => "model",
     }
 }
@@ -10458,13 +10464,18 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "skill.register"
             | "subagent.spawn"
             | "role.configure"
+            | "bash.exec"
     )
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
+        "workspace.list"
+            | "workspace.read"
+            | "workspace.search"
+            | "workspace.write"
+            | "desktop.observe"
     )
 }
 
@@ -10475,6 +10486,10 @@ fn task_runner_kind_for_tool(tool_name: &str) -> Option<&'static str> {
 
     if tool_name.starts_with("shell.") {
         return Some("shell");
+    }
+
+    if tool_name.starts_with("desktop.") {
+        return Some("desktop");
     }
 
     None
@@ -11014,6 +11029,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/test.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11081,6 +11097,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/test.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11341,6 +11358,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11511,6 +11529,7 @@ mod tests {
                 readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("seed role incarnation");
 
@@ -11642,6 +11661,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11780,6 +11800,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12093,6 +12114,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12211,6 +12233,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12333,6 +12356,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12347,6 +12371,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12482,6 +12507,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12619,6 +12645,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12760,6 +12787,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12774,6 +12802,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12909,6 +12938,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12923,6 +12953,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -13060,6 +13091,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13208,6 +13240,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/unused.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13306,6 +13339,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/unused.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13320,6 +13354,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("seed orchestrator role");
         graph
@@ -13419,6 +13454,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/unused.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13521,6 +13557,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
         let server = IpcServer::new(
@@ -13663,6 +13700,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13707,6 +13745,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
 
@@ -14388,6 +14427,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(
@@ -14560,6 +14600,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
 
@@ -14647,6 +14688,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(
@@ -15133,6 +15175,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("role incarnation");
 
@@ -15509,6 +15552,45 @@ mod tests {
         assert_eq!(tools[0]["tool_name"], "workspace.read");
         assert!(assembly["execution_routes"].get("workspace.read").is_some());
         assert!(assembly["execution_routes"].get("workspace.list").is_none());
+    }
+
+    #[test]
+    fn compose_tool_assembly_routes_desktop_observe_as_pinned_desktop_runner() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["desktop.observe"],
+            "effective_rights": ["tool.desktop.observe"],
+            "shared_tool_markers": [{
+                "tool_name": "desktop.observe",
+                "class": "desktop",
+                "description": "Observe-only desktop metadata.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["desktop_bound", "local_only", "low_agency"]
+            }]
+        });
+        let registered = vec![ToolRunnerRegistryEntry {
+            guest_id: "tool-runner-01".into(),
+            supported_tools: vec!["desktop.observe".into()],
+            last_seen_at: 1,
+        }];
+        let live = vec![LiveToolRunner {
+            guest_id: "tool-runner-01".into(),
+            supported_tools: vec!["desktop.observe".into()],
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &registered, &live, &[], "local-aiua-01");
+        let route = &assembly["execution_routes"]["desktop.observe"];
+
+        assert_eq!(
+            assembly["tools_for_model"][0]["tool_name"],
+            "desktop.observe"
+        );
+        assert_eq!(route["execution_mode"], "pinned");
+        assert_eq!(route["task_runner_kind"], "desktop");
+        assert_eq!(route["target_role"], "tool.desktop.observe");
+        assert_eq!(
+            assembly["policy_annotations"]["desktop.observe"]["approval_required"],
+            false
+        );
     }
 
     #[test]
@@ -18092,6 +18174,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("role incarnation should seed");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -19337,6 +19420,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19453,6 +19537,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19534,6 +19619,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19611,6 +19697,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19698,6 +19785,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19792,6 +19880,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19892,6 +19981,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19996,6 +20086,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -20104,6 +20195,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -20182,6 +20274,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -20288,6 +20381,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -20349,6 +20443,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20440,6 +20535,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20529,6 +20625,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -20667,6 +20764,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20684,6 +20782,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: "/tmp/remote-aiua.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -20798,6 +20897,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20829,6 +20929,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: "/tmp/remote-aiua.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -20935,6 +21036,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -21087,6 +21189,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -21262,6 +21365,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: local_socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         local_graph
@@ -21279,6 +21383,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: remote_socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let local_registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -21328,6 +21433,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: remote_socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed remote hotel");
 
@@ -21597,6 +21703,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -21674,6 +21781,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let requester = Arc::new(MockMaterializationRequester::default());
@@ -21769,6 +21877,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let requester = Arc::new(MockMaterializationRequester::default());
@@ -21956,6 +22065,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.to_string(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed hotel");
         graph

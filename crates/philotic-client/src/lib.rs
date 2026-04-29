@@ -1314,11 +1314,6 @@ pub enum IpcResponse {
     AgentUpdated {
         agent: DesktopMembraneAgentView,
     },
-    /// Response to [`IpcRequest::GetUserProfile`] and [`IpcRequest::PatchUserProfile`].
-    UserProfileData {
-        timezone: Option<String>,
-        display_name: Option<String>,
-    },
     /// Response to [`IpcRequest::AssignSkill`] and [`IpcRequest::RevokeSkill`].
     SkillAssigned {
         role_name: String,
@@ -1464,6 +1459,15 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.
     ///
+    /// Response to [`IpcRequest::GetUserProfile`] and [`IpcRequest::PatchUserProfile`].
+    ///
+    /// NOTE: Like `MemoryConfig`, this variant has only optional fields and MUST appear
+    /// near the end of the enum. With `#[serde(untagged)]`, it would otherwise match any
+    /// JSON object that earlier variants don't claim (including Standard acks).
+    UserProfileData {
+        timezone: Option<String>,
+        display_name: Option<String>,
+    },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
@@ -1663,6 +1667,13 @@ impl PhiloticClient {
         )
     }
 
+    fn is_ignorable_push(response: &IpcResponse) -> bool {
+        matches!(
+            response,
+            IpcResponse::UserProfileData { .. } | IpcResponse::NetworkState { .. }
+        )
+    }
+
     /// Poll for inbound tasks routed from the Philotic Web
     pub async fn recv_task(&mut self) -> Result<IpcResponse> {
         if let Some(pending) = self.pending_push.pop_front() {
@@ -1673,6 +1684,9 @@ impl PhiloticClient {
             let resp = self.read_response().await?;
             if Self::is_push_message(&resp) {
                 return Ok(resp);
+            }
+            if Self::is_ignorable_push(&resp) {
+                continue;
             }
             anyhow::bail!(
                 "Unexpected non-push IPC response while waiting for inbound task: {:?}",

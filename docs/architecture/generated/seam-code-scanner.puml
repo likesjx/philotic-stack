@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - code-scanner
+
+rectangle "code-scanner" as code_scanner #Orange {
+}
+
+
+@enduml

@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-04-13
+last_updated: 2026-04-24
 tags:
 - source-of-truth
 - current-state
@@ -18,6 +18,7 @@ related_docs:
 - SESSION_LOOP_PROPOSAL.md
 - TELEGRAM_POLL_LEASE_PROPOSAL.md
 - DESKTOP_MEMBRANE_PROPOSAL.md
+- COMPUTER_USE_TASK_RUNNER_PROPOSAL.md
 - OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
 - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
 - MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
@@ -37,7 +38,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-04-13
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-04-24
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -128,6 +129,7 @@ Primary references:
 - abstract tool catalog seeding exists in the context graph
 - tool assembly uses catalog-backed metadata and approval annotations
 - local workspace tooling exists through `tool-runner`, and its shell path (`bash.exec`) can now delegate to `philotic-sandbox` as the backing enforcement worker when sandbox mode is configured, although broader routed error-envelope and management-plane work remains incomplete
+- computer-use automation is now scoped as a pinned desktop task-runner family (`desktop.*`/CUA); the first `desktop.observe` metadata-only scaffold is wired through `tool-runner` and pinned routing, while screenshot and input actions remain deferred, and the desktop membrane remains ingress/approval/visibility rather than executor
 - `model-router` is the shared model execution boundary for current providers
 - an `OpenAIProvider` adapter and dedicated `model-controller-openai` guest now exist on that seam, with OpenRouter/Ollama treated as compatibility modes unless their runtime lifecycle forces a different boundary
 - OpenAI auth now has hotel-side key management and validation commands, with endpoint-scoped secret refs, explicit base URL/default model settings, and optional project header support; the first real startup smoke is now green
@@ -138,6 +140,7 @@ Primary references:
 Primary references:
 - [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md)
 - [TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TASK_RUNNER_PROPOSAL.md)
+- [COMPUTER_USE_TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/COMPUTER_USE_TASK_RUNNER_PROPOSAL.md)
 - [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md)
 
 ### Deployment and memory protocol

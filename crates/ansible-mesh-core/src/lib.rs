@@ -24,6 +24,7 @@ pub mod model_manager;
 pub mod registry;
 pub mod resources;
 pub mod router_trace;
+pub mod whisper_training;
 pub mod runtime;
 pub mod sqlite_storage;
 pub mod storage;

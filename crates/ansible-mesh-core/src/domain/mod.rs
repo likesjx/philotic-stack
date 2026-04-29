@@ -1551,6 +1551,7 @@ mod tests {
             readiness_state: RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
+            home_node: None,
         };
         d.upsert_role_incarnation(&r).unwrap();
         let loaded = d.get_role_incarnation("bjork", "coder").unwrap().unwrap();

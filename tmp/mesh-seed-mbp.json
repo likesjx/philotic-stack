@@ -1,0 +1,25 @@
+[
+  {
+    "hotel_name": "beacon-test-hotel",
+    "mesh_host": "100.64.212.8",
+    "mesh_port": 11922,
+    "blob_port": 11923,
+    "execution_port": 11924,
+    "ipc_socket_path": "",
+    "active_pid": null,
+    "capabilities": {
+      "node_id": "beacon-test-hotel-ansible-01",
+      "roles": [
+        "ansible-node",
+        "hegemon"
+      ],
+      "models": [],
+      "tools": [],
+      "constraints": {
+        "latency_hint_ms": null,
+        "max_concurrent_jobs": null,
+        "trust_level": null
+      }
+    }
+  }
+]

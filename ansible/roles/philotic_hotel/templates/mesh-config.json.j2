@@ -7,7 +7,18 @@
   },
   "hotels": {
     "{{ philotic_hotel_name }}": {
-      "agents": {{ philotic_agents | to_nice_json }}
+      "agents": {{ philotic_agents | to_nice_json }}{% if philotic_backbone_peers | length > 0 %},
+      "backbone_peers": [
+{% for peer in philotic_backbone_peers %}
+        {
+          "name": "{{ peer.name }}",
+          "host": "{{ peer.host }}",
+          "beacon_port": {{ peer.beacon_port | default(philotic_beacon_port) }}{% if peer.blob_port is defined %},
+          "blob_port": {{ peer.blob_port }}{% endif %}{% if peer.execution_port is defined %},
+          "execution_port": {{ peer.execution_port }}{% endif %}
+        }{% if not loop.last %},{% endif %}
+{% endfor %}
+      ]{% endif %}
     }
   }
 }

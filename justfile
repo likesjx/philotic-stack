@@ -554,17 +554,17 @@ jane-status:
 ansible-inventory:
     cd ansible && ansible-inventory --list
 
-# Verify Ansible can reach configured mesh nodes
+# Verify Ansible can reach configured Philotic hotel targets
 ansible-ping:
-    cd ansible && ansible mesh_nodes -m ping
+    cd ansible && ansible philotic_hotels -m ping
 
-# Preview deployment changes without applying them
+# Preview Philotic hotel deployment changes without applying them
 ansible-check:
-    cd ansible && ansible-playbook deploy_mesh_node.yml --check --diff
+    cd ansible && ansible-playbook deploy_hotel.yml --check --diff
 
-# Deploy the mesh node playbook to configured hosts
+# Deploy the Philotic hotel playbook to configured hosts
 ansible-deploy:
-    cd ansible && ansible-playbook deploy_mesh_node.yml
+    cd ansible && ansible-playbook deploy_hotel.yml
 
 # ── Intel Graph (Semantic Intelligence) ─────────────────────────────────────────
 

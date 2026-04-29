@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-transform-engine
+
+rectangle "mcp-transform-engine" as mcp_transform_engine #Orange {
+}
+
+
+@enduml

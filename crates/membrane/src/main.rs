@@ -2060,7 +2060,12 @@ async fn run_seat_impl(
                                 // Turn lifecycle signal from agent-core: update delivery UX without
                                 // delivering a final reply.
                                 let event = task.get("event").and_then(Value::as_str).unwrap_or_default();
-                                info!("Turn event [{}] for session [{}]", event, session_id);
+                                let step_detail = task.get("partial_content").and_then(Value::as_str).unwrap_or("");
+                                if step_detail.is_empty() {
+                                    info!("Turn event [{}] for session [{}]", event, session_id);
+                                } else {
+                                    info!("Turn event [{}] ({}) for session [{}]", event, step_detail, session_id);
+                                }
                                 // waiting_approval stops the typing; the approval reply arrives as
                                 // a separate send_reply which will also cancel the turn entry.
                                 if event == "waiting_approval" {

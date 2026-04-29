@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-harness-control-plane
+
+rectangle "graph-harness-control-plane" as graph_harness_control_plane #Orange {
+}
+
+
+@enduml

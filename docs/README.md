@@ -1,6 +1,6 @@
 # Philotic Stack — Documentation Index
 
-> **Last Updated:** 2026-03-19
+> **Last Updated:** 2026-04-24
 
 ---
 
@@ -89,4 +89,5 @@ These docs are proposal space, not automatic runtime truth:
 ## Known Drift To Treat Carefully
 
 - Some crate READMEs still use older `Ansible` naming or port-first IPC wording.
+- The `ansible-mesh-core` monolith is actively being extracted into domain-specific `philotic-primitives-*` crates (mesh, hotel, agent, data, model, tool).
 - [PHILOTIC-ARCHITECTURE.md](PHILOTIC-ARCHITECTURE.md), [ARCHITECT_THOUGHTS_CONTEXT_GRAPH.md](ARCHITECT_THOUGHTS_CONTEXT_GRAPH.md), [walkthrough.md](walkthrough.md), and [architecture/PORT_BLUEPRINT.md](architecture/PORT_BLUEPRINT.md) are historical context, not current authority.

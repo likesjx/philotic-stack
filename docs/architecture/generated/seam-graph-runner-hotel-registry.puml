@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-runner-hotel-registry
+
+rectangle "graph-runner-hotel-registry" as graph_runner_hotel_registry #Orange {
+}
+
+
+@enduml

@@ -37,14 +37,14 @@
     <circle cx="15" cy="15.5" r="1.5" fill="#00e5ff"/>
   </g>
   <text x="550" y="42" text-anchor="middle" fill="#e8eaf0" font-size="20" font-weight="700" letter-spacing="0.5">Philotic Stack Architecture</text>
-  <text x="550" y="60" text-anchor="middle" fill="#8892b0" font-size="10" letter-spacing="0.3">Distributed AI Agent OS · Rust · Hotel / Guest Model · 14 Crates · ~74K LOC</text>
+  <text x="550" y="60" text-anchor="middle" fill="#8892b0" font-size="10" letter-spacing="0.3">Distributed AI Agent OS · Rust · Hotel / Guest Model · 29 Crates · ~100K LOC</text>
 
   <!-- ═══════════════════════════════════════════ -->
   <!-- TOP: Mesh Network Zone                      -->
   <!-- ═══════════════════════════════════════════ -->
   <rect x="20" y="78" width="1060" height="100" rx="8" fill="#161b2e" stroke="#d500f9" stroke-width="1" opacity="0.85"/>
   <text x="40" y="96" fill="#d500f9" font-size="9" font-weight="700" letter-spacing="1.6">MESH NETWORK</text>
-  <text x="240" y="96" fill="#8892b0" font-size="8">ansible-mesh-core</text>
+  <text x="240" y="96" fill="#8892b0" font-size="8">philotic-primitives-*</text>
 
   <!-- Peer Hotels -->
   <rect x="40" y="108" width="155" height="54" rx="6" fill="#1a1230" stroke="#d500f9" stroke-width="0.8"/>
@@ -73,7 +73,7 @@
   <!-- Auth -->
   <rect x="740" y="108" width="155" height="54" rx="6" fill="#1a1230" stroke="#d500f9" stroke-width="0.8"/>
   <text x="817" y="126" text-anchor="middle" fill="#ea80fc" font-size="10" font-weight="600">Auth Exchange</text>
-  <text x="817" y="141" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">OAuth + HMAC-PSK</text>
+  <text x="817" y="141" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">Ed25519 PKI identity</text>
   <text x="817" y="153" text-anchor="middle" fill="#8892b0" font-size="7.5">Hotel identity &amp; pairing</text>
 
   <!-- Homebrew -->
@@ -108,8 +108,8 @@
 
   <!-- Telegram Membrane -->
   <rect x="35" y="396" width="170" height="55" rx="6" fill="#0f2420" stroke="#1de9b6" stroke-width="0.8"/>
-  <text x="120" y="415" text-anchor="middle" fill="#1de9b6" font-size="11" font-weight="600">Telegram Membrane</text>
-  <text x="120" y="430" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">membrane crate</text>
+  <text x="120" y="415" text-anchor="middle" fill="#1de9b6" font-size="11" font-weight="600">Gateway Membranes</text>
+  <text x="120" y="430" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">membrane-* crates</text>
   <text x="120" y="442" text-anchor="middle" fill="#8892b0" font-size="7.5">Polls/webhooks → Hotel IPC</text>
   <circle cx="193" cy="409" r="3.5" fill="#00e676"/>
 
@@ -186,7 +186,7 @@
   <!-- Auth label inside hotel -->
   <rect x="268" y="474" width="165" height="36" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
   <text x="350" y="490" text-anchor="middle" fill="#00e5ff" font-size="9" font-weight="600">Auth Exchange</text>
-  <text x="350" y="502" text-anchor="middle" fill="#8892b0" font-size="7.5">OAuth · HMAC-PSK · session</text>
+  <text x="350" y="502" text-anchor="middle" fill="#8892b0" font-size="7.5">WireGuard Ed25519 PKI · session</text>
   <circle cx="423" cy="484" r="3" fill="#00e676"/>
 
   <!-- BeaconDaemon inside hotel -->
@@ -247,8 +247,8 @@
 
   <!-- Membrane (guest) -->
   <rect x="878" y="422" width="190" height="42" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
-  <text x="973" y="440" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Membrane (Guest)</text>
-  <text x="973" y="456" text-anchor="middle" fill="#8892b0" font-size="7.5">Telegram gateway process</text>
+  <text x="973" y="440" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Membranes (Guests)</text>
+  <text x="973" y="456" text-anchor="middle" fill="#8892b0" font-size="7.5">Telegram, Discord, MCP</text>
   <circle cx="1058" cy="434" r="3" fill="#00e676"/>
 
   <!-- Cognitive Loop detail -->
@@ -303,7 +303,7 @@
   <text x="967" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">RL training data</text>
 
   <!-- Storage layer library labels -->
-  <text x="285" y="728" text-anchor="middle" fill="#8892b0" font-size="7.5" font-style="italic">ansible-mesh-core · memory-core · philotic-client</text>
+  <text x="285" y="728" text-anchor="middle" fill="#8892b0" font-size="7.5" font-style="italic">philotic-primitives-* · memory-core · philotic-client</text>
   <text x="757" y="728" text-anchor="middle" fill="#8892b0" font-size="7.5" font-style="italic">onnx-runner · mlx-runner · philotic-sandbox</text>
 
   <!-- ═══════════════════════════════════════════ -->
@@ -378,7 +378,7 @@
   <text x="740" y="832" fill="#8892b0" font-size="7">aiua · philote · membrane · philotic-web · model-router · tool-runner · graph-runner · agent-graph-runner</text>
 
   <text x="640" y="852" fill="#00e676" font-size="8" font-weight="600">Libraries (6)</text>
-  <text x="730" y="852" fill="#8892b0" font-size="7">ansible-mesh-core · philotic-client · memory-core · onnx-runner · mlx-runner · philotic-sandbox</text>
+  <text x="730" y="852" fill="#8892b0" font-size="7">philotic-primitives-* · philotic-client · memory-core · onnx-runner · mlx-runner · philotic-sandbox</text>
 
   <!-- Key external integrations -->
   <text x="640" y="878" fill="#8892b0" font-size="9" font-weight="700" letter-spacing="1">EXTERNAL</text>

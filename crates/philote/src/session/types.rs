@@ -354,6 +354,15 @@ pub struct WorkingTurn {
     /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
     /// is no duplicate delivery after the explicit merge already fired.
     pub paracrine_merge_completed: bool,
+    /// Set to true when the operator has confirmed a plan_proposal and the parked
+    /// plan turn is restored. Injected into the working-state projection so the model
+    /// knows it is cleared to execute its declared plan.
+    #[serde(default)]
+    pub plan_confirmed: bool,
+    /// Optional operator steering note provided when confirming a plan. Threaded
+    /// into the working-state projection alongside `plan_confirmed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_confirm_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -422,6 +431,11 @@ pub struct MediaRoutingPolicy {
     /// When true (default), tools are stripped from the model request on media turns.
     #[serde(default = "default_true")]
     pub strip_tools_on_media: bool,
+    /// Which model implementation handles `voice.transcribe` for this agent.
+    /// Accepts the same values as `voice_response_policy.provider`: `"onnx"`, `"gemini"`, etc.
+    /// `None` falls back to the hotel-resolved route or the `model` role default.
+    #[serde(default)]
+    pub transcription_provider: Option<String>,
 }
 
 impl Default for MediaRoutingPolicy {
@@ -432,6 +446,7 @@ impl Default for MediaRoutingPolicy {
             image_action: None,
             document_action: None,
             strip_tools_on_media: true,
+            transcription_provider: None,
         }
     }
 }
@@ -650,7 +665,7 @@ pub struct ExecutionPolicy {
 impl Default for ExecutionPolicy {
     fn default() -> Self {
         Self {
-            iteration_cap: 10,
+            iteration_cap: 20,
             plan_required_on_skill: true,
             stream_tool_events: true,
             stall_detection_threshold: 3,

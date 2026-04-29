@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - role-context-shift
+
+rectangle "role-context-shift" as role_context_shift #Orange {
+}
+
+
+@enduml

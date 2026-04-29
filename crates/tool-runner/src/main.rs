@@ -85,6 +85,7 @@ impl WorkspaceRunnerConfig {
                     "workspace.list".into(),
                     "workspace.read".into(),
                     "workspace.search".into(),
+                    "desktop.observe".into(),
                 ]
             });
         let max_read_bytes = std::env::var("PHILOTIC_WORKSPACE_MAX_READ_BYTES")
@@ -335,8 +336,42 @@ fn execute_tool(
                 Err(err) => format!("workspace.search error: {err}"),
             }
         }
+        "desktop.observe" => execute_desktop_observe(arguments),
         _ => "unsupported tool".into(),
     }
+}
+
+fn execute_desktop_observe(arguments: &serde_json::Value) -> String {
+    let detail = arguments
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("summary");
+    let desktop_session_id = std::env::var("PHILOTIC_DESKTOP_SESSION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "desktop://local/default".into());
+    let current_dir = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
+
+    serde_json::to_string(&json!({
+        "tool_name": "desktop.observe",
+        "status": "observe_only_scaffold",
+        "runner_id": "tool-runner-01",
+        "incarnation_id": "tool-runner-01",
+        "hotel_id": local_node_id(),
+        "environment_id": "desktop://local/default",
+        "desktop_session_id": desktop_session_id,
+        "detail": detail,
+        "content_type": "application/vnd.philotic.desktop-observation+json",
+        "redaction_posture": "metadata_only",
+        "screenshot_available": false,
+        "input_actions_available": false,
+        "current_dir": current_dir,
+        "note": "desktop.observe is wired as an observe-only CUA scaffold; screenshot/click/type/key tools remain unavailable until approval and artifact policy land."
+    }))
+    .unwrap_or_else(|err| format!("desktop.observe error: {err}"))
 }
 
 fn search_workspace(
@@ -674,6 +709,7 @@ async fn main() -> Result<()> {
             "memory.remember".into(),
             "memory.forget".into(),
             "memory.link".into(),
+            "desktop.observe".into(),
             "bash.exec".into(),
         ],
     };
@@ -684,6 +720,7 @@ async fn main() -> Result<()> {
         "tool.workspace.list",
         "tool.workspace.read",
         "tool.workspace.search",
+        "tool.desktop.observe",
         "tool.memory.recall",
         "tool.memory.remember",
         "tool.memory.forget",
@@ -885,6 +922,37 @@ mod tests {
             config.allowed_tools.iter().any(|tool| tool == "echo"),
             "default runner config should expose echo so advertised utility tools remain executable"
         );
+    }
+
+    #[test]
+    fn default_runner_config_allows_desktop_observe_scaffold() {
+        let config = WorkspaceRunnerConfig::from_env();
+        assert!(
+            config
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "desktop.observe"),
+            "default runner config should expose the observe-only desktop scaffold"
+        );
+    }
+
+    #[test]
+    fn desktop_observe_returns_metadata_only_scaffold() {
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: None,
+            allowed_tools: vec!["desktop.observe".into()],
+            max_read_bytes: 256 * 1024,
+            max_search_results: 50,
+        };
+        let output = execute_tool(&config, "desktop.observe", &json!({ "detail": "summary" }));
+        let value: serde_json::Value = serde_json::from_str(&output).expect("json observation");
+
+        assert_eq!(value["tool_name"], "desktop.observe");
+        assert_eq!(value["status"], "observe_only_scaffold");
+        assert_eq!(value["task_runner_kind"], serde_json::Value::Null);
+        assert_eq!(value["redaction_posture"], "metadata_only");
+        assert_eq!(value["screenshot_available"], false);
+        assert_eq!(value["input_actions_available"], false);
     }
 
     #[test]

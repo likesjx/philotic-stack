@@ -110,6 +110,27 @@ fn tool_definitions() -> serde_json::Value {
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
+                "name": "graph_manage_proposal",
+                "description": "Manage a proposal as graph state and update the agent's work-focus record for it. Use this for proposal status/disposition changes and agent-visible working observations.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "proposal_id": { "type": "string", "description": "Proposal node ID or slug (e.g., 'doc:task-runner' or 'task-runner')" },
+                        "agent": { "type": "string", "description": "Agent managing this proposal" },
+                        "session": { "type": "string", "description": "Optional session ID" },
+                        "status": { "type": "string", "description": "Optional proposal status to set" },
+                        "disposition": { "type": "string", "description": "Optional proposal disposition to set" },
+                        "current_goal": { "type": "string", "description": "What the agent is currently trying to accomplish for this proposal" },
+                        "observation": { "type": "string", "description": "Agent working observation to append" },
+                        "assumption": { "type": "string", "description": "Agent assumption to append" },
+                        "open_question": { "type": "string", "description": "Open question to append" },
+                        "pending_writeback_item": { "type": "string", "description": "Item the agent believes should eventually write back to shared docs or graph state" },
+                        "reason": { "type": "string", "description": "Why this proposal management update is being made" }
+                    },
+                    "required": ["proposal_id", "agent", "reason"]
+                }
+            },
+            {
                 "name": "graph_decide",
                 "description": "Record a traced decision about a node (e.g., change proposal status, record an architectural decision)",
                 "inputSchema": {
@@ -479,6 +500,7 @@ async fn execute_tool(
         "graph_snippet" => tool_graph_snippet(state, arguments).await,
         "graph_search" => tool_graph_search(state, arguments).await,
         "graph_proposals" => tool_graph_proposals(state).await,
+        "graph_manage_proposal" => tool_graph_manage_proposal(state, arguments).await,
         "graph_decide" => tool_graph_decide(state, arguments).await,
         "graph_create_node" => tool_graph_create_node(state, arguments).await,
         "graph_update_node" => tool_graph_update_node(state, arguments).await,
@@ -543,6 +565,7 @@ async fn tool_graph_status(state: &AppState) -> Result<serde_json::Value, JsonRp
         NodeKind::Slice,
         NodeKind::Task,
         NodeKind::Agent,
+        NodeKind::AgentWorkFocus,
         NodeKind::TestRun,
         NodeKind::SmokeRun,
         NodeKind::UatRun,
@@ -806,6 +829,99 @@ async fn tool_graph_proposals(state: &AppState) -> Result<serde_json::Value, Jso
     }
 
     let text = serde_json::to_string_pretty(&results).unwrap_or_default();
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }]
+    }))
+}
+
+async fn tool_graph_manage_proposal(
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let proposal_id = args
+        .get("proposal_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing required parameter: proposal_id"))?;
+    let agent = args
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing required parameter: agent"))?;
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing required parameter: reason"))?;
+
+    let engine = state.engine.lock().await;
+    let result = engine
+        .manage_proposal(crate::engine::ManageProposalRequest {
+            proposal_id: proposal_id.to_string(),
+            agent: agent.to_string(),
+            session: args
+                .get("session")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            status: args
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            disposition: args
+                .get("disposition")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            current_goal: args
+                .get("current_goal")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            observation: args
+                .get("observation")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            assumption: args
+                .get("assumption")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            open_question: args
+                .get("open_question")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            pending_writeback_item: args
+                .get("pending_writeback_item")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            reason: reason.to_string(),
+        })
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "proposal_managed".to_string(),
+        payload: serde_json::json!({
+            "proposal_id": result.proposal.id,
+            "agent": agent,
+            "work_focus_id": result.work_focus.id,
+            "mutation_id": result.mutation.id,
+        }),
+    });
+
+    let text = serde_json::to_string_pretty(&serde_json::json!({
+        "managed": true,
+        "proposal": {
+            "id": result.proposal.id,
+            "name": result.proposal.name,
+            "status": result.proposal.properties.get("status"),
+            "disposition": result.proposal.properties.get("disposition"),
+        },
+        "agent": {
+            "id": result.agent_node.id,
+            "name": result.agent_node.name,
+        },
+        "work_focus": {
+            "id": result.work_focus.id,
+            "properties": result.work_focus.properties,
+        },
+        "mutation_id": result.mutation.id,
+    }))
+    .unwrap_or_default();
+
     Ok(serde_json::json!({
         "content": [{ "type": "text", "text": text }]
     }))

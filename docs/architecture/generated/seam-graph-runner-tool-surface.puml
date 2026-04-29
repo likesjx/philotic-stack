@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-runner-tool-surface
+
+rectangle "graph-runner-tool-surface" as graph_runner_tool_surface #Orange {
+}
+
+
+@enduml

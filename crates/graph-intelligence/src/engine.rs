@@ -7,6 +7,29 @@ pub struct GraphEngine {
     conn: Connection,
 }
 
+#[derive(Debug, Clone)]
+pub struct ManageProposalRequest {
+    pub proposal_id: String,
+    pub agent: String,
+    pub session: Option<String>,
+    pub status: Option<String>,
+    pub disposition: Option<String>,
+    pub current_goal: Option<String>,
+    pub observation: Option<String>,
+    pub assumption: Option<String>,
+    pub open_question: Option<String>,
+    pub pending_writeback_item: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ManageProposalResult {
+    pub proposal: Node,
+    pub agent_node: Node,
+    pub work_focus: Node,
+    pub mutation: Mutation,
+}
+
 impl GraphEngine {
     /// Open or create a SQLite database at the given path.
     /// Use ":memory:" for an in-memory database.
@@ -818,6 +841,252 @@ impl GraphEngine {
         }
         Ok(nodes)
     }
+
+    /// Update shared proposal state and the agent's graph-visible focus on that proposal.
+    pub fn manage_proposal(&self, req: ManageProposalRequest) -> Result<ManageProposalResult> {
+        let now = chrono::Utc::now();
+        let mut proposal = self
+            .resolve_proposal_node(&req.proposal_id)?
+            .with_context(|| format!("Proposal not found: {}", req.proposal_id))?;
+        let previous_status = proposal
+            .properties
+            .get("status")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let previous_disposition = proposal
+            .properties
+            .get("disposition")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+
+        let mut proposal_props = proposal.properties.as_object().cloned().unwrap_or_default();
+        if let Some(status) = req.status.as_deref().filter(|value| !value.is_empty()) {
+            proposal_props.insert("status".to_string(), serde_json::json!(status));
+        }
+        if let Some(disposition) = req.disposition.as_deref().filter(|value| !value.is_empty()) {
+            proposal_props.insert("disposition".to_string(), serde_json::json!(disposition));
+        }
+        proposal_props.insert(
+            "last_graph_managed_at".to_string(),
+            serde_json::json!(now.to_rfc3339()),
+        );
+        proposal_props.insert(
+            "last_graph_managed_by".to_string(),
+            serde_json::json!(req.agent.clone()),
+        );
+        if let Some(session) = req.session.as_deref().filter(|value| !value.is_empty()) {
+            proposal_props.insert(
+                "last_graph_managed_session".to_string(),
+                serde_json::json!(session),
+            );
+        }
+        proposal.properties = serde_json::Value::Object(proposal_props);
+        proposal.updated_at = now;
+        self.upsert_node(&proposal)?;
+
+        let agent_id = format!("agent:{}", graph_id_slug(&req.agent));
+        let agent_node = Node {
+            id: agent_id.clone(),
+            kind: NodeKind::Agent,
+            name: req.agent.clone(),
+            properties: serde_json::json!({
+                "agent": req.agent,
+                "last_active_at": now.to_rfc3339(),
+            }),
+            file_path: None,
+            worktree: String::new(),
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
+        };
+        self.upsert_node(&agent_node)?;
+
+        let focus_id = format!(
+            "agent_work_focus:{}:{}",
+            graph_id_slug(&req.agent),
+            proposal.id
+        );
+        let mut focus = self.get_node(&focus_id)?.unwrap_or_else(|| Node {
+            id: focus_id.clone(),
+            kind: NodeKind::AgentWorkFocus,
+            name: format!("{} focus on {}", req.agent, proposal.name),
+            properties: serde_json::json!({
+                "agent": req.agent,
+                "proposal_id": proposal.id,
+                "status": "active",
+                "observations": [],
+                "active_assumptions": [],
+                "open_questions": [],
+                "pending_writeback_items": [],
+                "created_at": now.to_rfc3339(),
+            }),
+            file_path: None,
+            worktree: String::new(),
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
+        });
+
+        let mut focus_props = focus.properties.as_object().cloned().unwrap_or_default();
+        focus_props.insert("agent".to_string(), serde_json::json!(req.agent.clone()));
+        focus_props.insert(
+            "proposal_id".to_string(),
+            serde_json::json!(proposal.id.clone()),
+        );
+        focus_props.insert("status".to_string(), serde_json::json!("active"));
+        focus_props.insert(
+            "last_synced_at".to_string(),
+            serde_json::json!(now.to_rfc3339()),
+        );
+        if let Some(session) = req.session.as_deref().filter(|value| !value.is_empty()) {
+            focus_props.insert("session".to_string(), serde_json::json!(session));
+        }
+        if let Some(goal) = req
+            .current_goal
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            focus_props.insert("current_goal".to_string(), serde_json::json!(goal));
+        }
+        append_string_property(&mut focus_props, "observations", req.observation.as_deref());
+        append_string_property(
+            &mut focus_props,
+            "active_assumptions",
+            req.assumption.as_deref(),
+        );
+        append_string_property(
+            &mut focus_props,
+            "open_questions",
+            req.open_question.as_deref(),
+        );
+        append_string_property(
+            &mut focus_props,
+            "pending_writeback_items",
+            req.pending_writeback_item.as_deref(),
+        );
+        focus.properties = serde_json::Value::Object(focus_props);
+        focus.updated_at = now;
+        self.upsert_node(&focus)?;
+
+        self.upsert_edge(&Edge {
+            source_id: agent_id.clone(),
+            target_id: focus_id.clone(),
+            relation: EdgeRelation::WorkingOn,
+            properties: serde_json::json!({"role": "agent_focus"}),
+            worktree: String::new(),
+        })?;
+        self.upsert_edge(&Edge {
+            source_id: focus_id.clone(),
+            target_id: proposal.id.clone(),
+            relation: EdgeRelation::WorkingOn,
+            properties: serde_json::json!({"role": "proposal_focus"}),
+            worktree: String::new(),
+        })?;
+
+        let mutation = Mutation {
+            id: format!("mut:{}", uuid::Uuid::new_v4()),
+            timestamp: now,
+            agent: Some(req.agent.clone()),
+            session: req.session.clone(),
+            action: "manage_proposal".to_string(),
+            target_node: Some(proposal.id.clone()),
+            from_value: serde_json::to_string(&serde_json::json!({
+                "status": previous_status,
+                "disposition": previous_disposition,
+            }))
+            .ok(),
+            to_value: serde_json::to_string(&serde_json::json!({
+                "status": req.status,
+                "disposition": req.disposition,
+                "work_focus": focus_id,
+            }))
+            .ok(),
+            reason: Some(req.reason.clone()),
+            details: serde_json::json!({
+                "agent_work_focus_id": focus.id,
+                "current_goal": req.current_goal,
+                "observation": req.observation,
+                "assumption": req.assumption,
+                "open_question": req.open_question,
+                "pending_writeback_item": req.pending_writeback_item,
+            }),
+        };
+        self.record_mutation(&mutation)?;
+
+        Ok(ManageProposalResult {
+            proposal,
+            agent_node,
+            work_focus: focus,
+            mutation,
+        })
+    }
+
+    fn resolve_proposal_node(&self, proposal_id: &str) -> Result<Option<Node>> {
+        let mut candidates = vec![proposal_id.to_string()];
+        if !proposal_id.contains(':') {
+            candidates.push(format!("doc:{proposal_id}"));
+            candidates.push(format!("proposal:{proposal_id}"));
+        }
+        if let Some(stripped) = proposal_id.strip_prefix("proposal:") {
+            candidates.push(format!("doc:{stripped}"));
+        }
+        if let Some(stripped) = proposal_id.strip_prefix("doc:") {
+            candidates.push(format!("proposal:{stripped}"));
+        }
+
+        candidates.sort();
+        candidates.dedup();
+        for candidate in candidates {
+            if let Some(node) = self.get_node(&candidate)? {
+                if node.kind == NodeKind::Proposal {
+                    return Ok(Some(node));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn append_string_property(
+    props: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let entry = props
+        .entry(key.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !entry.is_array() {
+        *entry = serde_json::json!([]);
+    }
+    let Some(items) = entry.as_array_mut() else {
+        return;
+    };
+    if !items.iter().any(|item| item.as_str() == Some(value)) {
+        items.push(serde_json::json!(value));
+    }
+}
+
+fn graph_id_slug(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 // ── Row mappers ──
@@ -956,5 +1225,75 @@ mod tests {
 
         let tx_node = engine.get_node("tx-node").unwrap();
         assert!(tx_node.is_some());
+    }
+
+    #[test]
+    fn test_manage_proposal_updates_shared_state_and_agent_focus() {
+        let engine = GraphEngine::open(":memory:").unwrap();
+        let now = chrono::Utc::now();
+
+        engine
+            .upsert_node(&Node {
+                id: "doc:graph-intelligence".into(),
+                kind: NodeKind::Proposal,
+                name: "Graph Intelligence".into(),
+                properties: serde_json::json!({
+                    "status": "proposed",
+                    "disposition": "proposed",
+                }),
+                file_path: Some("docs/architecture/GRAPH_INTELLIGENCE_PROPOSAL.md".into()),
+                worktree: String::new(),
+                created_at: now,
+                updated_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
+            })
+            .unwrap();
+
+        let result = engine
+            .manage_proposal(ManageProposalRequest {
+                proposal_id: "graph-intelligence".into(),
+                agent: "codex".into(),
+                session: Some("session:test".into()),
+                status: Some("accepted-current-slice".into()),
+                disposition: Some("accepted for current slice".into()),
+                current_goal: Some("Make proposals graph-managed".into()),
+                observation: Some("Proposal state needs a structured agent focus.".into()),
+                assumption: Some("Markdown remains an export projection.".into()),
+                open_question: Some("Which fields should write back automatically?".into()),
+                pending_writeback_item: Some("Update Graph Intelligence proposal text.".into()),
+                reason: "prove proposal management in intel-graph".into(),
+            })
+            .unwrap();
+
+        assert_eq!(result.proposal.id, "doc:graph-intelligence");
+        assert_eq!(
+            result.proposal.properties["status"],
+            "accepted-current-slice"
+        );
+        assert_eq!(result.work_focus.kind, NodeKind::AgentWorkFocus);
+        assert_eq!(
+            result.work_focus.properties["current_goal"],
+            "Make proposals graph-managed"
+        );
+        assert_eq!(
+            result.work_focus.properties["active_assumptions"][0],
+            "Markdown remains an export projection."
+        );
+
+        let focus_edges = engine.get_edges_from(&result.work_focus.id).unwrap();
+        assert!(focus_edges.iter().any(|edge| {
+            edge.relation == EdgeRelation::WorkingOn && edge.target_id == "doc:graph-intelligence"
+        }));
+
+        let mutations = engine
+            .get_mutations(Some("doc:graph-intelligence"), 10)
+            .unwrap();
+        assert!(mutations
+            .iter()
+            .any(|mutation| mutation.action == "manage_proposal"));
     }
 }

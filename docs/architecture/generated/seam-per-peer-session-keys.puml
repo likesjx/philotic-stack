@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - per-peer-session-keys
+
+rectangle "per-peer-session-keys" as per_peer_session_keys #Orange {
+}
+
+
+@enduml

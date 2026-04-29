@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-propagation-mesh
+
+rectangle "memory-propagation-mesh" as memory_propagation_mesh #Orange {
+}
+
+
+@enduml

@@ -3,7 +3,7 @@ title: Graph Intelligence — Project Context Engine
 doc_type: proposal
 domain: product-management-plane
 status: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-04-24
 tags:
 - graph
 - intelligence
@@ -77,6 +77,10 @@ Two crates:
   - **workstream orphan**: an active workstream with no active backing session
   - **seam orphan**: a seam with no adopted domain/proposal path or no live workstream adoption path
   - **resolution**: adopt by linking the seam to a proposal/domain and starting or reattaching a session; otherwise mark the seam closed/superseded/deferred and remove it from the active surface
+- Add graph-native proposal management so status/disposition changes and
+  agent work-focus records are recorded together. This makes proposal state a
+  shared graph object while preserving each agent's operational stance toward
+  that proposal as structured `agent_work_focus` state.
 
 ---
 
@@ -287,30 +291,33 @@ CREATE VIRTUAL TABLE snippets_fts USING fts5(signature, doc_comment, body, conte
 
 ### Split Authority Model
 
-Docs and code remain the source of truth for content. The graph is the
-source of truth for process state and traceability.
+Docs and code remain durable authored references. The graph is the source of
+truth for process state, traceability, and graph-managed proposal workflow.
 
 **Docs own:** proposal content, domain assignment, related_docs, seam
 definitions, task descriptions.
 
-**Graph owns:** decision log, agent session traces, status change
-history, traceability links (commit → seam), priority ordering,
-workstream assignments, review annotations.
+**Graph owns:** decision log, agent session traces, status/disposition
+change history, traceability links (commit → seam), priority ordering,
+workstream assignments, review annotations, and each agent's active
+work-focus records for proposals.
 
-**Shared (graph writes back to docs):** `status`, `last_updated`,
+**Shared (graph can export to docs):** `status`, `last_updated`,
 `active_seams`, `implemented_by`. These are the ONLY frontmatter
-fields the graph mutates.
+fields graph writeback should mutate.
 
 ### Writeback Rules
 
-1. Graph mutations to shared fields trigger an immediate file write.
+1. Graph mutations to shared fields update graph state and mutation history
+   immediately.
 2. The serializer parses YAML frontmatter, updates only mapped fields,
    preserves all other content byte-for-byte.
-3. Every writeback produces a git commit with provenance:
+3. Explicit writeback exports graph-managed shared fields to frontmatter.
+4. Every committed writeback produces a git commit with provenance:
    `"graph: update <PROPOSAL> status → <new> (agent: <name>, session: <id>)"`.
-4. Doc changes always target the develop worktree (proposals are shared
+5. Doc changes always target the develop worktree (proposals are shared
    across workstreams).
-5. Code-linked data (commits, snippets) is scoped to the relevant
+6. Code-linked data (commits, snippets) is scoped to the relevant
    worktree/branch.
 
 ### Multi-Worktree Model

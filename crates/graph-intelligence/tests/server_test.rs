@@ -210,6 +210,68 @@ async fn test_api_proposal_content_prefers_graph_authored_content() {
 }
 
 #[tokio::test]
+async fn test_api_manage_proposal_updates_agent_work_focus() {
+    let state = test_state();
+    let port = available_port();
+
+    let app = api::router(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let proposals: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{}/api/proposals", port))
+        .send()
+        .await
+        .expect("Failed to send request")
+        .json()
+        .await
+        .expect("Failed to parse proposals");
+
+    let proposal_id = proposals[0]["id"].as_str().expect("proposal id");
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/proposals/{}/manage",
+            port, proposal_id
+        ))
+        .json(&serde_json::json!({
+            "agent": "codex-test",
+            "session": "session:test-manage-proposal",
+            "status": "accepted-current-slice",
+            "current_goal": "Track proposals in intel-graph",
+            "observation": "Agent focus records bridge active work and shared proposal truth.",
+            "reason": "test proposal management endpoint"
+        }))
+        .send()
+        .await
+        .expect("Failed to manage proposal");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse response");
+    assert_eq!(body["managed"], true);
+    assert_eq!(
+        body["proposal"]["properties"]["status"],
+        "accepted-current-slice"
+    );
+    assert_eq!(body["work_focus"]["kind"], "agent_work_focus");
+    assert_eq!(
+        body["work_focus"]["properties"]["current_goal"],
+        "Track proposals in intel-graph"
+    );
+    assert!(body["mutation_id"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("mut:"));
+}
+
+#[tokio::test]
 async fn test_api_nodes_endpoint() {
     let state = test_state();
     let port = available_port();
