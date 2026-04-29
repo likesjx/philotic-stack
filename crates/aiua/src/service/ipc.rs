@@ -884,6 +884,10 @@ pub struct IpcServer {
     /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
     /// The sender is cloned into each `handle_client` task for forwarding.
     network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
+    /// In-process channel for operator surface query tasks.
+    /// When set, tasks addressed to `OPERATOR_SURFACE_QUERY_ROLE` are sent here
+    /// instead of through the UDS inbox registry, eliminating the self-connection.
+    operator_surface_tx: Option<mpsc::Sender<String>>,
 }
 
 struct LoggingLeaseObserver;
@@ -2234,7 +2238,13 @@ impl IpcServer {
             peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
             network_broadcast,
+            operator_surface_tx: None,
         }
+    }
+
+    pub fn with_operator_surface_channel(mut self, tx: mpsc::Sender<String>) -> Self {
+        self.operator_surface_tx = Some(tx);
+        self
     }
 
     /// Returns a sender for the hotel-wide broadcast channel.
@@ -2304,6 +2314,7 @@ impl IpcServer {
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     let network_broadcast_rx = self.network_broadcast.subscribe();
+                    let operator_surface_tx = self.operator_surface_tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -2323,6 +2334,7 @@ impl IpcServer {
                             peer_sockets,
                             muninn_config,
                             network_broadcast_rx,
+                            operator_surface_tx,
                         )
                         .await
                         {
@@ -2360,6 +2372,7 @@ impl IpcServer {
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
+        operator_surface_tx: Option<mpsc::Sender<String>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -2448,6 +2461,7 @@ impl IpcServer {
                             &mut subscribed_roles,
                             &mut current_identity,
                             &mut follow_up_responses,
+                            operator_surface_tx.as_ref(),
                         )
                         .await;
                         let _ = outbound_tx.send(response);
@@ -3710,6 +3724,7 @@ impl IpcServer {
         subscribed_roles: &mut Vec<String>,
         current_identity: &mut Option<GuestIdentity>,
         follow_up_responses: &mut Vec<IpcResponse>,
+        operator_surface_tx: Option<&mpsc::Sender<String>>,
     ) -> IpcResponse {
         match req {
             IpcRequest::Register(identity) => {
@@ -5030,6 +5045,20 @@ impl IpcServer {
                 target_guest_id,
                 task_json,
             } => {
+                // Short-circuit operator surface queries to the in-process channel,
+                // eliminating the UDS self-connection and its socket leak.
+                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                    if let Some(tx) = operator_surface_tx {
+                        let _ = tx.try_send(task_json).ok();
+                        return IpcResponse::Standard {
+                            ok: true,
+                            code: "OK".into(),
+                            message: "operator surface query dispatched in-process".into(),
+                            corr_id: String::new(),
+                            data: None,
+                        };
+                    }
+                }
                 let task_json = match (
                     infer_agent_context_for_task(
                         graph,
@@ -7594,6 +7623,148 @@ impl IpcServer {
                 IpcResponse::McpRoutesAccepted {
                     mcp_routes_agent_id: agent_id,
                     mcp_route_count: 0,
+                }
+            }
+
+            // ── MCP endpoint provisioning ──────────────────────────────────
+
+            IpcRequest::ProvisionMcpEndpoint { config } => {
+                let endpoint_id = config.endpoint_id.clone();
+                let port = config.port;
+
+                // Persist the endpoint config in the context graph.
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let preapproval_key = format!("__mcp_preapproval__:{endpoint_id}");
+
+                let config_json = match serde_json::to_string(&config) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "SERIALIZE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                };
+
+                if let Err(e) = graph.set_config_value(&config_key, &config_json) {
+                    return IpcResponse::error(
+                        "mcp_endpoint",
+                        "CONFIG_STORE_ERROR",
+                        e.to_string(),
+                    );
+                }
+
+                // Persist pre-approval rules separately for fast lookup.
+                if !config.preapproval_rules.is_empty() {
+                    let rules_json = match serde_json::to_string(&config.preapproval_rules) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return IpcResponse::error(
+                                "mcp_endpoint",
+                                "SERIALIZE_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    };
+                    if let Err(e) = graph.set_config_value(&preapproval_key, &rules_json) {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "CONFIG_STORE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                }
+
+                // Fan out the full config to the membrane-mcp guest inbox.
+                let guest_id = format!("mcp-membrane-{endpoint_id}");
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_config",
+                    "config": config,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &guest_id,
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(
+                    endpoint_id,
+                    port, "MCP endpoint config stored and fanned out."
+                );
+
+                IpcResponse::McpEndpointProvisioned {
+                    endpoint_id,
+                    port,
+                    materialized: false, // guest spawn deferred to Phase 3
+                }
+            }
+
+            IpcRequest::RevokeMcpEndpoint {
+                endpoint_id,
+                owner_agent_id,
+            } => {
+                // Verify ownership before clearing.
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let existing = graph.get_config_value(&config_key).ok().flatten();
+                if let Some(json) = existing {
+                    let existing_owner = serde_json::from_str::<serde_json::Value>(&json)
+                        .ok()
+                        .and_then(|v| v["owner_agent_id"].as_str().map(str::to_string));
+                    if existing_owner.as_deref() != Some(&owner_agent_id) {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "FORBIDDEN",
+                            format!(
+                                "endpoint {endpoint_id} is not owned by {owner_agent_id}"
+                            ),
+                        );
+                    }
+                }
+
+                // Read port before clearing (needed for response).
+                let port = serde_json::from_str::<serde_json::Value>(
+                    &graph.get_config_value(&config_key).ok().flatten().unwrap_or_default(),
+                )
+                .ok()
+                .and_then(|v| v["port"].as_u64())
+                .unwrap_or(0) as u16;
+
+                // Clear stored state.
+                let _ = graph.set_config_value(&config_key, "null");
+                let _ = graph.set_config_value(
+                    &format!("__mcp_preapproval__:{endpoint_id}"),
+                    "null",
+                );
+
+                // Signal the membrane-mcp guest to shut down.
+                let guest_id = format!("mcp-membrane-{endpoint_id}");
+                let task_json = serde_json::json!({
+                    "action": "revoke_mcp_config",
+                    "endpoint_id": endpoint_id,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &guest_id,
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(endpoint_id, "MCP endpoint revoked.");
+
+                IpcResponse::McpEndpointProvisioned {
+                    endpoint_id,
+                    port,
+                    materialized: false,
                 }
             }
         }
@@ -10858,6 +11029,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/test.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -10925,6 +11097,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/test.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11185,6 +11358,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11355,6 +11529,7 @@ mod tests {
                 readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("seed role incarnation");
 
@@ -11486,6 +11661,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11624,6 +11800,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11937,6 +12114,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12055,6 +12233,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12177,6 +12356,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12191,6 +12371,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12326,6 +12507,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12463,6 +12645,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12604,6 +12787,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12618,6 +12802,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12753,6 +12938,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12767,6 +12953,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -12904,6 +13091,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13052,6 +13240,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/unused.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13150,6 +13339,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/unused.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13164,6 +13354,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("seed orchestrator role");
         graph
@@ -13263,6 +13454,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: "/tmp/unused.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13365,6 +13557,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
         let server = IpcServer::new(
@@ -13507,6 +13700,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -13551,6 +13745,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
 
@@ -14232,6 +14427,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(
@@ -14404,6 +14600,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
 
@@ -14491,6 +14688,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(
@@ -14977,6 +15175,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("role incarnation");
 
@@ -17975,6 +18174,7 @@ mod tests {
                 readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("role incarnation should seed");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -19220,6 +19420,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19336,6 +19537,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19417,6 +19619,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19494,6 +19697,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19581,6 +19785,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19675,6 +19880,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19775,6 +19981,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -19879,6 +20086,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -19987,6 +20195,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -20065,6 +20274,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -20171,6 +20381,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -20232,6 +20443,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20323,6 +20535,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20412,6 +20625,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -20550,6 +20764,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20567,6 +20782,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: "/tmp/remote-aiua.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -20681,6 +20897,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20712,6 +20929,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: "/tmp/remote-aiua.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -20818,6 +21036,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -20970,6 +21189,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -21145,6 +21365,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: local_socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         local_graph
@@ -21162,6 +21383,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: remote_socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let local_registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -21211,6 +21433,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: remote_socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed remote hotel");
 
@@ -21480,6 +21703,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -21557,6 +21781,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let requester = Arc::new(MockMaterializationRequester::default());
@@ -21652,6 +21877,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let requester = Arc::new(MockMaterializationRequester::default());
@@ -21839,6 +22065,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.to_string(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed hotel");
         graph

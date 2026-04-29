@@ -1,9 +1,13 @@
-//! In-memory routing table for the MCP membrane.
+//! In-memory routing tables for the MCP membrane.
 //!
-//! The table is keyed by `tool_name`. Multiple agents can contribute routes;
-//! each route is tagged with its owning agent. The hotel pushes updates via
-//! `IpcRequest::UpdateMcpRoutes` / `IpcRequest::RevokeMcpRoutes`.
+//! Two tables coexist:
+//! - `RoutingTable` — legacy per-agent route records pushed via `UpdateMcpRoutes`
+//! - `McpEndpointTable` — config-driven table pushed via `update_mcp_config`
+//!
+//! `McpEndpointTable` takes priority for `tools/list` and `tools/call` when
+//! an endpoint config is present. The legacy table acts as fallback.
 
+use ansible_mesh_core::mcp_endpoint::{McpEndpointConfig, McpPreapprovalRule, McpToolSpec};
 use ansible_mesh_core::mcp_route::{McpRouteRecord, McpRouteTarget};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -132,4 +136,91 @@ pub type SharedRoutingTable = Arc<RwLock<RoutingTable>>;
 
 pub fn new_shared_table() -> SharedRoutingTable {
     Arc::new(RwLock::new(RoutingTable::new()))
+}
+
+// ── Config-driven endpoint table ──────────────────────────────────────────────
+
+/// Holds the current `McpEndpointConfig` pushed from the hotel.
+/// One config per membrane-mcp instance (each instance manages one endpoint).
+#[derive(Debug, Default)]
+pub struct McpEndpointTable {
+    config: Option<McpEndpointConfig>,
+}
+
+impl McpEndpointTable {
+    pub fn update(&mut self, config: McpEndpointConfig) {
+        info!(
+            endpoint_id = %config.endpoint_id,
+            tools = config.tools.len(),
+            "endpoint config updated"
+        );
+        self.config = Some(config);
+    }
+
+    pub fn revoke(&mut self) {
+        if let Some(ref c) = self.config {
+            info!(endpoint_id = %c.endpoint_id, "endpoint config revoked");
+        }
+        self.config = None;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.config.is_some()
+    }
+
+    /// All tool specs as MCP descriptors for `tools/list`.
+    pub fn tool_descriptors(&self) -> Vec<McpToolDescriptor> {
+        self.config.as_ref().map_or(vec![], |c| {
+            c.tools
+                .iter()
+                .map(|t| McpToolDescriptor {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.input_schema.clone(),
+                })
+                .collect()
+        })
+    }
+
+    /// Look up a tool spec by name.
+    pub fn find_tool(&self, name: &str) -> Option<&McpToolSpec> {
+        self.config
+            .as_ref()?
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+    }
+
+    /// Returns `true` if a pre-approval rule matches the given action.
+    /// A rule matches if its `action_pattern` equals the action exactly or is `"*"`.
+    /// Expired rules (by unix epoch) are skipped.
+    pub fn is_preapproved(&self, action: &str) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        self.config.as_ref().map_or(false, |c| {
+            c.preapproval_rules.iter().any(|rule| {
+                if let Some(exp) = rule.expires_at {
+                    if now > exp {
+                        return false;
+                    }
+                }
+                rule.action_pattern == "*" || rule.action_pattern == action
+            })
+        })
+    }
+
+    pub fn preapproval_rules(&self) -> &[McpPreapprovalRule] {
+        self.config
+            .as_ref()
+            .map_or(&[], |c| c.preapproval_rules.as_slice())
+    }
+}
+
+pub type SharedEndpointTable = Arc<RwLock<McpEndpointTable>>;
+
+pub fn new_shared_endpoint_table() -> SharedEndpointTable {
+    Arc::new(RwLock::new(McpEndpointTable::default()))
 }

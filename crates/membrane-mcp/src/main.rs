@@ -3,8 +3,10 @@ mod dispatch;
 mod protocol;
 mod routing;
 mod server;
+mod transform;
 
 use anyhow::Result;
+use ansible_mesh_core::mcp_endpoint::McpEndpointConfig;
 use ansible_mesh_core::mcp_route::McpRouteRecord;
 use async_trait::async_trait;
 use auth::{AllotmentTracker, VaultHashCache, VaultResolver};
@@ -12,7 +14,7 @@ use clap::Parser;
 use membrane::{LeaseRenewResult, MembraneGuest, OutboundReply};
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use tracing::info;
-use routing::new_shared_table;
+use routing::{new_shared_endpoint_table, new_shared_table};
 use server::{MembraneState, build_router};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -204,6 +206,26 @@ impl MembraneGuest for McpMembrane {
                 info!(agent_id, "agent routes revoked from hotel push");
                 Ok(true)
             }
+            "update_mcp_config" => {
+                let config: McpEndpointConfig = match payload
+                    .get("config")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                {
+                    Some(c) => c,
+                    None => {
+                        warn!("update_mcp_config push missing or invalid 'config' field");
+                        return Ok(false);
+                    }
+                };
+                let mut table = self.state.endpoint_table.write().await;
+                table.update(config);
+                Ok(true)
+            }
+            "revoke_mcp_config" => {
+                let mut table = self.state.endpoint_table.write().await;
+                table.revoke();
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -271,8 +293,11 @@ async fn main() -> Result<()> {
     let (inbound_tx, inbound_rx) = mpsc::channel(128);
     let pending_responses = Arc::new(Mutex::new(HashMap::new()));
 
+    let endpoint_table = new_shared_endpoint_table();
+
     let state = Arc::new(MembraneState {
         routing_table: table,
+        endpoint_table,
         vault_cache: VaultHashCache::new(),
         allotment: AllotmentTracker::new(),
         vault: Box::new(IpcVaultResolver),

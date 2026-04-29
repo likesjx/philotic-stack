@@ -1161,6 +1161,22 @@ pub enum IpcRequest {
     RevokeMcpRoutes {
         agent_id: String,
     },
+    /// Declare or update a full MCP endpoint configuration.
+    ///
+    /// The hotel stores the config, fans out an `update_mcp_config` push to
+    /// the relevant membrane-mcp guest, and records pre-approval rules.
+    /// Responds with [`IpcResponse::McpEndpointProvisioned`].
+    ProvisionMcpEndpoint {
+        config: ansible_mesh_core::mcp_endpoint::McpEndpointConfig,
+    },
+    /// Tear down an MCP endpoint and remove its config.
+    ///
+    /// The hotel fans out a `revoke_mcp_config` push and clears stored state.
+    /// Only the `owner_agent_id` that provisioned the endpoint may revoke it.
+    RevokeMcpEndpoint {
+        endpoint_id: String,
+        owner_agent_id: String,
+    },
     /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
     /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
     GracefulShutdown {
@@ -1411,6 +1427,15 @@ pub enum IpcResponse {
     McpRoutesAccepted {
         mcp_routes_agent_id: String,
         mcp_route_count: usize,
+    },
+    /// Response to [`IpcRequest::ProvisionMcpEndpoint`] /
+    /// [`IpcRequest::RevokeMcpEndpoint`].
+    McpEndpointProvisioned {
+        endpoint_id: String,
+        port: u16,
+        /// `true` if a new membrane-mcp guest was spawned; `false` if an
+        /// existing guest's config was updated in place.
+        materialized: bool,
     },
     DiscordGatewayLease {
         granted: bool,

@@ -112,76 +112,64 @@ struct MeshRuntimeContext {
     webrtc_signal_rx: WebRtcSignalReceiver,
 }
 
+/// Operator surface query worker — receives tasks via in-process channel (no UDS
+/// self-connection) and uses a single persistent `PhiloticClient` for outgoing
+/// queries and reply emission. This eliminates the socket-leak crash loop.
 async fn run_operator_surface_query_worker(
+    mut rx: tokio::sync::mpsc::Receiver<String>,
     socket_path: String,
     local_node_id: String,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
+    let mut backoff_ms: u64 = 500;
+    let mut client: Option<PhiloticClient> = None;
+
     loop {
-        let connect_fut = PhiloticClient::connect_at(
-            &socket_path,
-            GuestIdentity {
-                guest_id: "aiua-operator-surface-query-worker".into(),
-                role: OPERATOR_SURFACE_QUERY_ROLE.into(),
-                supported_tools: Vec::new(),
-            },
-        );
-        let mut client = tokio::select! {
+        // Drain the channel; if shutdown arrives, exit.
+        let task_json = tokio::select! {
             _ = shutdown_rx.recv() => return,
-            connect_result = connect_fut => match connect_result {
-                Ok(client) => client,
-                Err(err) => {
-                    warn!("Operator surface query worker failed to connect: {}", err);
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => return,
-                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => continue,
-                    }
-                }
+            msg = rx.recv() => match msg {
+                Some(j) => j,
+                None => return, // channel closed
             }
         };
 
-        match client
-            .send_request(IpcRequest::SubscribeInbox {
-                role: OPERATOR_SURFACE_QUERY_ROLE.into(),
-            })
-            .await
-        {
-            Ok(IpcResponse::Standard { ok: true, .. }) => {}
-            Ok(other) => {
-                warn!(
-                    "Operator surface query worker received unexpected subscribe response: {:?}",
-                    other
-                );
-                continue;
-            }
-            Err(err) => {
-                warn!("Operator surface query worker failed to subscribe: {}", err);
-                continue;
+        // Ensure we have a live query client (connect once; reconnect only on error).
+        if client.is_none() {
+            let connect_fut = PhiloticClient::connect_at(
+                &socket_path,
+                GuestIdentity {
+                    guest_id: "aiua-operator-surface-query-worker".into(),
+                    role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                    supported_tools: Vec::new(),
+                },
+            );
+            match connect_fut.await {
+                Ok(c) => {
+                    backoff_ms = 500;
+                    client = Some(c);
+                }
+                Err(err) => {
+                    warn!(
+                        backoff_ms,
+                        "Operator surface query worker: query client connect failed: {err}"
+                    );
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => return,
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)) => {}
+                    }
+                    backoff_ms = (backoff_ms * 2).min(30_000);
+                    continue;
+                }
             }
         }
 
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.recv() => return,
-                task_result = client.recv_task() => match task_result {
-                    Ok(IpcResponse::InboundTask { task_json, .. }) => {
-                        if let Err(err) = handle_operator_surface_query_task(
-                            &mut client,
-                            &local_node_id,
-                            &task_json,
-                        ).await {
-                            warn!("Operator surface query worker failed: {}", err);
-                        }
-                    }
-                    Ok(other) => {
-                        debug!("Operator surface query worker ignoring envelope: {:?}", other);
-                    }
-                    Err(err) => {
-                        warn!("Operator surface query worker disconnected: {}", err);
-                        break;
-                    }
-                }
-            }
+        let c = client.as_mut().unwrap();
+        if let Err(err) = handle_operator_surface_query_task(c, &local_node_id, &task_json).await {
+            warn!("Operator surface query worker task failed: {err}");
+            // Drop the client so we reconnect fresh on the next task.
+            client = None;
+            backoff_ms = 500;
         }
     }
 }
@@ -5611,15 +5599,20 @@ async fn main() -> Result<()> {
 
     let registry = Arc::new(RwLock::new(NodeRegistry::new()));
 
+    // In-process channel: operator surface query tasks are delivered here
+    // instead of through UDS self-connection, eliminating the socket leak.
+    let (operator_surface_tx, operator_surface_rx) = tokio::sync::mpsc::channel::<String>(128);
+
     let ipc_server = IpcServer::new(
-        socket_path,
+        socket_path.clone(),
         caps.node_id.clone(),
         dispatcher_tx.clone(),
         graph_domain_arc.clone(),
     )
     .with_memory_config(muninn_config_arc.clone())
     .with_materialization_requester(guest_manager.clone())
-    .with_registry(registry.clone());
+    .with_registry(registry.clone())
+    .with_operator_surface_channel(operator_surface_tx);
     let ipc_inboxes = ipc_server.inboxes();
     let ipc_parked_inbound = ipc_server.parked_inbound();
     let ipc_materialization_requester = ipc_server.materialization_requester_arc();
@@ -5683,7 +5676,8 @@ async fn main() -> Result<()> {
     }
 
     tokio::spawn(run_operator_surface_query_worker(
-        hotel.ipc_socket_path.clone(),
+        operator_surface_rx,
+        socket_path.clone(),
         caps.node_id.clone(),
         shutdown_rx.resubscribe(),
     ));
@@ -5946,7 +5940,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 6); // membrane, model-gemini, model-elevenlabs, tool-runner, graph-runner, agent
+        assert_eq!(guests.len(), 7); // membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, agent
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
