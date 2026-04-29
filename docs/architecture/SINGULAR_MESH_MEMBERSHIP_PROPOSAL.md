@@ -2,7 +2,7 @@
 title: Singular Mesh Membership Proposal
 doc_type: proposal
 domain: mesh-placement
-status: proposed
+status: accepted for current slice
 last_updated: 2026-04-29
 tags:
 - mesh
@@ -85,25 +85,28 @@ The mesh is the unit of trust. The inviter is the entry point, not the permanent
 
 ## Disposition
 
-Proposed.
+Accepted for the current slice.
 
-Current truth is still transitional:
+Current truth is still transitional, but no longer purely pairwise:
 
 - mesh invite/accept is real and secure
 - payload routing and WebRTC can work across joined hotel pairs
-- membership convergence is still edge-by-edge instead of fully mesh-wide
+- accepted membership now propagates mesh member records to the existing circle of trust and syncs the current circle back to the new member
+- direct peer auth can now be derived from long-lived transport identities when a freshly learned member has not yet spoken directly
+- revocation, richer audit, and full mesh-wide authority semantics are still open
 
-This proposal defines the intended model for the next placement and membership slices.
+This proposal now governs the first implementation slice toward converged singular membership rather than only naming the dream.
 
 ## Current Slice
 
-This slice should do three things:
+This slice now does four things:
 
 1. state the intended mesh model unambiguously
 2. name the current implementation gap honestly
-3. define the first implementation seams required to move from bilateral joins to converged mesh membership
+3. propagate accepted member records to the current mesh and sync the current mesh back to the newly accepted hotel
+4. derive direct peer auth from stable transport identities when a pairwise cached key is missing
 
-This is architecture truth-setting, not a claim that the singular model is already implemented.
+This is still transitional rather than “finished singular mesh.” The first converged membership path is implemented; revocation, richer audit lineage, and fully policy-driven role transport are not.
 
 ## Current Truth Vs Intended Truth
 

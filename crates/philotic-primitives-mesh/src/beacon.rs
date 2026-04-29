@@ -79,6 +79,8 @@ pub enum MsgType {
     ExecutionEventAck,
     /// A membership acceptance packet emitted after an invite is accepted
     MeshMembershipAccept,
+    /// Propagated mesh membership records used to converge the shared trust view
+    MeshMembershipSync,
     /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
     WebRtcSignal,
 }

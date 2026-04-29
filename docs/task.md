@@ -675,12 +675,20 @@ Seam IDs: `multi-hotel-route-consistency`, `cross-host-distributed-validation`, 
 - [ ] Review [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md).
 - [ ] Extend remote-capable route metadata consistently across remaining routed component classes beyond the first tool/model paths.
 - [ ] Preserve session-owned membrane reply routing while proving broader distributed component placement.
+- [ ] Concentrate Telegram-facing membranes on `jane-vps` as an explicit placement policy instead of an ad hoc deployment habit:
+  - define “membrane home hotel” posture and failover expectations
+  - keep laptop hotels mesh-visible and reachable without making them poller perimeters by default
+  - prove reply/approval routing when ingress lives on `jane-vps` and cognition lives elsewhere
 - [ ] Define the first remote materialization ceremony:
   - mesh-visible intent
   - deterministic winning target selection
   - targeted materialization request to the winner
   - readiness publication before parked work is released
   - explicit distinction between routeable-ready and lease-authorized when the component family is singleton-scoped
+- [ ] Land the next singular-mesh membership slice:
+  - propagate revocation mesh-wide instead of pairwise folklore
+  - move member-record sync from “first converged path” to audited canonical mesh authority
+  - make cross-hotel philote / role transport consume the converged membership view directly
 - [ ] Define the first capacity-relief placement flow:
   - stressed hotel help signal
   - candidate offers
