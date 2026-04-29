@@ -575,6 +575,13 @@ fn resolve_runtime_ports(hotel: &HotelRecord, mesh_enabled: bool) -> Result<(u16
 }
 
 fn hotel_ipc_socket_path(hotel_name: &str) -> String {
+    if let Ok(explicit) = std::env::var("PHILOTIC_HOTEL_SOCKET") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
     let safe_name = sanitize_hotel_name(hotel_name);
     profile_dir()
         .map(|d| {
@@ -7105,6 +7112,20 @@ mod tests {
         unsafe {
             std::env::remove_var("PHILOTIC_PROFILE");
             std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn explicit_socket_env_overrides_default_derivation() {
+        unsafe {
+            std::env::remove_var("PHILOTIC_PROFILE");
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", "/run/philotic/test.sock");
+        }
+
+        assert_eq!(hotel_ipc_socket_path("beacon-test-hotel"), "/run/philotic/test.sock");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
         }
     }
 

@@ -45,8 +45,10 @@ philotic_beacon_port: 8999       # UDP — inter-hotel mesh
 philotic_blob_port: 9001         # TCP — blob HTTP store
 philotic_hotel_port: 9000        # IPC listen port
 
-# IPC socket (default: systemd runtime dir for the named hotel)
-philotic_hotel_socket: "/run/philotic/{{ philotic_hotel_runtime_name }}.sock"
+# IPC socket and runtime dir. Keep this out of /tmp so systemd hardening does not
+# strand the control socket behind a private mount namespace.
+philotic_runtime_dir: "/run/philotic"
+philotic_hotel_socket: "{{ philotic_runtime_dir }}/{{ philotic_hotel_runtime_name }}.sock"
 
 # Mesh auth
 philotic_enable_rust_auth: "1"
