@@ -820,12 +820,9 @@ impl AgentRuntime {
                 })
                 .await
             {
-                Ok(IpcResponse::UserProfileData {
-                    timezone,
-                    display_name: _,
-                }) => {
+                Ok(IpcResponse::UserProfileData(p)) => {
                     if self.default_agent_profile.user_timezone.is_none() {
-                        if let Some(tz) = timezone {
+                        if let Some(tz) = p.timezone {
                             info!(hotel = %hotel_name, tz = %tz, "Injecting user timezone from hotel user profile.");
                             self.default_agent_profile.user_timezone = Some(tz);
                         }
@@ -10037,6 +10034,10 @@ impl AgentRuntime {
                     == Some(session_id)
                 {
                     if let Some(mut state) = SessionState::from_checkpoint(&checkpoint) {
+                        // Overwrite the restored agent_profile with the live default so
+                        // voice routing, media policy, and reflex configuration always
+                        // reflect the current hotel config rather than a stale snapshot.
+                        state.agent_profile = self.default_agent_profile.clone();
                         // Re-apply reflex materialization from the restored profile.
                         state.apply_reflex_materialization();
                         Self::fetch_and_inject_rules(

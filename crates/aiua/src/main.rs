@@ -2610,6 +2610,34 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "hotel.status".into(),
+            description: "Returns the current hotel status: active guests, registered roles, \
+                          materialized processes, and system health. Use this before asking the \
+                          operator for information about running agents or system state."
+                .into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "hotel.logs".into(),
+            description: "Returns recent hotel log lines. Use this to inspect system events, \
+                          errors, and agent activity before reaching for bash.exec. Defaults to \
+                          50 lines; request up to 500."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of recent log lines to return (max 500, default 50)."
+                    }
+                }
+            }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
             tool_name: "bash.exec".into(),
             description: "Last-resort shell execution. Runs a shell command and returns stdout, \
                           stderr, and exit code. Use ONLY when no Philotic-native tool can \
@@ -2819,7 +2847,6 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "agent.configure".into(),
                 "role.configure".into(),
-                "role.create_or_update".into(),
                 "skill.register".into(),
                 "skill.list".into(),
                 "skill.assign".into(),
@@ -2905,6 +2932,37 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             description: Some(
                 "Admin role profile — full skill crafting and role governance authority.".into(),
+            ),
+        },
+        ToolsetProfileRecord {
+            profile_name: "architect".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "skill.list".into(),
+                "hotel.status".into(),
+                "hotel.logs".into(),
+                "workspace.list".into(),
+                "workspace.read".into(),
+                "bash.exec".into(),
+            ],
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into()],
+            allowed_skills: vec!["handoff.back".into(), "capability.request".into()],
+            description: Some(
+                "Architect specialist role profile — systems, infrastructure, debugging. \
+                 bash.exec requires operator approval."
+                    .into(),
+            ),
+        },
+        ToolsetProfileRecord {
+            profile_name: "virtuoso".into(),
+            allowed_tools: vec!["session.status".into(), "echo".into(), "skill.list".into()],
+            allowed_classes: vec!["session".into(), "utility".into()],
+            allowed_skills: vec!["handoff.back".into()],
+            description: Some(
+                "Virtuoso specialist role profile — creative and expressive. \
+                 Minimal tools, focused on reflection and lyrical output."
+                    .into(),
             ),
         },
     ];
