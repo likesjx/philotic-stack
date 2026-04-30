@@ -227,6 +227,7 @@ impl BeaconDaemon {
             | MsgType::MeshEventAck
             | MsgType::MeshMembershipAccept
             | MsgType::MeshMembershipSync
+            | MsgType::MeshCatalogSync
             | MsgType::WebRtcSignal => {
                 let _ = self.inbox_tx.send(msg).await;
             }

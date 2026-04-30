@@ -81,6 +81,8 @@ pub enum MsgType {
     MeshMembershipAccept,
     /// Propagated mesh membership records used to converge the shared trust view
     MeshMembershipSync,
+    /// Propagated mesh-global tool, skill, and profile catalog records
+    MeshCatalogSync,
     /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
     WebRtcSignal,
 }

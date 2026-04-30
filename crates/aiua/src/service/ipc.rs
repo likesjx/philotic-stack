@@ -2018,6 +2018,160 @@ impl IpcServer {
             .unwrap_or_else(|| source_hotel.to_string())
     }
 
+    async fn best_place_to_run_view(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        agent_id: Option<&str>,
+        role_name: Option<&str>,
+        tool_name: Option<&str>,
+        required_markers: &[String],
+        prefer_locality: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+
+        if let (Some(agent_id), Some(role_name)) = (agent_id, role_name) {
+            if let Some(role) = graph.get_role_incarnation(agent_id, role_name)? {
+                if let Some(home_node) = role.home_node {
+                    return Ok(serde_json::json!({
+                        "recommended_node_id": home_node,
+                        "recommended_hotel": graph
+                            .list_hotels()?
+                            .into_iter()
+                            .find(|hotel| hotel.capabilities.node_id == home_node)
+                            .map(|hotel| hotel.hotel_name)
+                            .unwrap_or_else(|| source_hotel.clone()),
+                        "decision_basis": "role_home_pin",
+                        "reason": format!(
+                            "role [{}:{}] is explicitly pinned to a home hotel",
+                            agent_id, role_name
+                        ),
+                        "candidates": []
+                    }));
+                }
+            }
+        }
+
+        let mut markers = required_markers.to_vec();
+        if let Some(tool_name) = tool_name {
+            if let Some(tool) = graph.get_abstract_tool(tool_name)? {
+                markers.extend(tool.tool_markers);
+            }
+        }
+        markers.sort();
+        markers.dedup();
+
+        if markers
+            .iter()
+            .any(|marker| marker == "local_only" || marker == "desktop_bound")
+        {
+            return Ok(serde_json::json!({
+                "recommended_node_id": local_node_id,
+                "recommended_hotel": source_hotel,
+                "decision_basis": "local_marker_policy",
+                "reason": "required markers force local execution on the current hotel",
+                "candidates": [{
+                    "node_id": local_node_id,
+                    "hotel_name": source_hotel,
+                    "score": 100,
+                    "healthy": true,
+                    "tool_match": true
+                }]
+            }));
+        }
+
+        let guard = registry.read().await;
+        let mut candidates = Vec::new();
+        candidates.push(serde_json::json!({
+            "node_id": local_node_id,
+            "hotel_name": source_hotel,
+            "score": if prefer_locality { 35 } else { 10 },
+            "healthy": true,
+            "tool_match": tool_name.is_none(),
+            "reason": if prefer_locality {
+                "local canonical hotel gets a locality preference"
+            } else {
+                "local canonical hotel remains a valid fallback"
+            }
+        }));
+
+        for status in guard.active_nodes() {
+            let healthy = guard.is_node_healthy(&status.capabilities.node_id);
+            let tool_match = tool_name.map_or(true, |needle| {
+                status.capabilities.tools.iter().any(|tool| tool == needle)
+            });
+            let role_match = role_name.map_or(false, |needle| {
+                status
+                    .advertisements
+                    .iter()
+                    .any(|advertisement| advertisement.target_role == needle)
+            });
+            let mut score = 0i32;
+            if status.execution_reachability.is_some() {
+                score += 25;
+            }
+            if healthy {
+                score += 20;
+            } else {
+                score -= 50;
+            }
+            if tool_match {
+                score += 35;
+            }
+            if role_match {
+                score += 20;
+            }
+            if prefer_locality && status.capabilities.node_id == local_node_id {
+                score += 25;
+            }
+            if status
+                .capabilities
+                .roles
+                .iter()
+                .any(|role| matches!(role, ansible_mesh_core::NodeRole::BatteryConstrained))
+            {
+                score -= 10;
+            }
+            candidates.push(serde_json::json!({
+                "node_id": status.capabilities.node_id,
+                "hotel_name": Self::target_hotel_name(graph, status, &source_hotel),
+                "score": score,
+                "healthy": healthy,
+                "tool_match": tool_match,
+                "role_match": role_match,
+                "execution_reachable": status.execution_reachability.is_some(),
+            }));
+        }
+        drop(guard);
+
+        candidates.sort_by(|left, right| {
+            let left_score = left.get("score").and_then(|value| value.as_i64()).unwrap_or(0);
+            let right_score = right
+                .get("score")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            right_score.cmp(&left_score)
+        });
+
+        let recommended = candidates.first().cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "node_id": local_node_id,
+                "hotel_name": source_hotel,
+                "score": 0
+            })
+        });
+        Ok(serde_json::json!({
+            "recommended_node_id": recommended.get("node_id").and_then(|value| value.as_str()).unwrap_or(local_node_id),
+            "recommended_hotel": recommended.get("hotel_name").and_then(|value| value.as_str()).unwrap_or(source_hotel.as_str()),
+            "decision_basis": "registry_health_and_locality",
+            "reason": "ranked live mesh candidates using role home pins, locality policy, health, reachability, and tool affinity",
+            "required_markers": markers,
+            "candidates": candidates,
+        }))
+    }
+
     fn desktop_membrane_target_reachability_view(
         reachability: &ExecutionReachability,
     ) -> DesktopMembraneTargetReachabilityView {
@@ -8507,6 +8661,32 @@ impl IpcServer {
                     })),
                 )
             }
+
+            IpcRequest::BestPlaceToRun {
+                agent_id,
+                role_name,
+                tool_name,
+                required_markers,
+                prefer_locality,
+            } => match Self::best_place_to_run_view(
+                registry,
+                graph,
+                local_node_id,
+                agent_id.as_deref(),
+                role_name.as_deref(),
+                tool_name.as_deref(),
+                &required_markers,
+                prefer_locality,
+            )
+            .await
+            {
+                Ok(view) => IpcResponse::success("best_place_to_run", Some(view)),
+                Err(err) => IpcResponse::error(
+                    "best_place_to_run",
+                    "PLACEMENT_ERROR",
+                    err.to_string(),
+                ),
+            },
 
             IpcRequest::GetHotelLogs { lines } => {
                 // Compute log path using the same PHILOTIC_PROFILE convention as the DB path.

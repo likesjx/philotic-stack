@@ -1,3 +1,4 @@
+use crate::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
 use crate::NodeCapabilities;
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -81,6 +82,18 @@ pub struct MeshMembershipSyncPayload {
     pub mesh_id: String,
     pub issued_at: u64,
     pub records: Vec<MeshMemberRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshCatalogSyncPayload {
+    pub mesh_id: String,
+    pub issued_at: u64,
+    #[serde(default)]
+    pub abstract_tools: Vec<AbstractToolRecord>,
+    #[serde(default)]
+    pub abstract_skills: Vec<AbstractSkillRecord>,
+    #[serde(default)]
+    pub toolset_profiles: Vec<ToolsetProfileRecord>,
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -428,5 +441,41 @@ mod tests {
         let beta_key = derive_transport_shared_key(context, &beta_private, &alpha_public).unwrap();
 
         assert_eq!(alpha_key, beta_key);
+    }
+
+    #[test]
+    fn mesh_catalog_sync_round_trips_shared_catalog_records() {
+        let payload = MeshCatalogSyncPayload {
+            mesh_id: "default".into(),
+            issued_at: 123,
+            abstract_tools: vec![AbstractToolRecord {
+                tool_name: "hotel.best_place_to_run".into(),
+                description: "placement helper".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                class: "config".into(),
+                tool_markers: vec![],
+            }],
+            abstract_skills: vec![AbstractSkillRecord {
+                skill_name: "role.governance".into(),
+                description: "govern roles".into(),
+                implied_tools: vec!["hotel.best_place_to_run".into()],
+                ..Default::default()
+            }],
+            toolset_profiles: vec![ToolsetProfileRecord {
+                profile_name: "admin".into(),
+                allowed_tools: vec!["hotel.best_place_to_run".into()],
+                allowed_classes: vec!["config".into()],
+                allowed_skills: vec!["role.governance".into()],
+                description: Some("admin defaults".into()),
+            }],
+        };
+
+        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
+        let decoded: MeshCatalogSyncPayload =
+            serde_json::from_slice(&encoded).expect("payload should decode");
+        assert_eq!(decoded.mesh_id, "default");
+        assert_eq!(decoded.abstract_tools[0].tool_name, "hotel.best_place_to_run");
+        assert_eq!(decoded.abstract_skills[0].skill_name, "role.governance");
+        assert_eq!(decoded.toolset_profiles[0].profile_name, "admin");
     }
 }

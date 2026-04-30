@@ -1307,6 +1307,19 @@ pub enum IpcRequest {
     /// Return a safe view of hotel state: hotel name, active guests, agent identities.
     /// No secret or credential values are included.
     GetHotelStatus,
+    /// Ask the hotel to recommend the best execution placement for a role or tool need.
+    BestPlaceToRun {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default)]
+        required_markers: Vec<String>,
+        #[serde(default)]
+        prefer_locality: bool,
+    },
     /// Return the last `lines` lines from the hotel's log file.
     GetHotelLogs {
         lines: u32,
