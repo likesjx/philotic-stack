@@ -599,6 +599,10 @@ pub struct Exosome {
     pub source_chat_id: Option<String>,
 }
 
+fn default_training_limit() -> usize {
+    20
+}
+
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
@@ -1177,6 +1181,33 @@ pub enum IpcRequest {
         endpoint_id: String,
         owner_agent_id: String,
     },
+    // ── Training data admin IPC ───────────────────────────────────────────────
+    /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
+    ListTrainingSamples {
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default = "default_training_limit")]
+        limit: usize,
+        #[serde(default)]
+        filter: ansible_mesh_core::whisper_training::TrainingFilter,
+    },
+    /// Apply an operator correction to a training sample. Responds with [`IpcResponse::Standard`].
+    CorrectTrainingSample {
+        turn_id: String,
+        corrected_transcript: String,
+    },
+    /// Export eligible samples to a file. Responds with [`IpcResponse::Standard`] (data.exported_count).
+    ExportTrainingSamples {
+        format: ansible_mesh_core::whisper_training::TrainingExportFormat,
+        output_path: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Return aggregate counts by state. Responds with [`IpcResponse::Standard`] (data.status).
+    GetTrainingStatus {
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
     /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
     /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
     GracefulShutdown {
@@ -1203,6 +1234,18 @@ pub enum IpcRequest {
     GetHotelLogs {
         lines: u32,
     },
+}
+
+/// Payload for [`IpcResponse::UserProfileData`].
+///
+/// MUST use `deny_unknown_fields` so that `#[serde(untagged)]` deserialization rejects
+/// objects with unrecognised fields (e.g. `{ "config_json": "..." }`) instead of
+/// silently consuming them as `UserProfileData { timezone: None, display_name: None }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UserProfileDataPayload {
+    pub timezone: Option<String>,
+    pub display_name: Option<String>,
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -1461,13 +1504,10 @@ pub enum IpcResponse {
     ///
     /// Response to [`IpcRequest::GetUserProfile`] and [`IpcRequest::PatchUserProfile`].
     ///
-    /// NOTE: Like `MemoryConfig`, this variant has only optional fields and MUST appear
-    /// near the end of the enum. With `#[serde(untagged)]`, it would otherwise match any
-    /// JSON object that earlier variants don't claim (including Standard acks).
-    UserProfileData {
-        timezone: Option<String>,
-        display_name: Option<String>,
-    },
+    /// NOTE: `UserProfileDataPayload` uses `#[serde(deny_unknown_fields)]`, which causes
+    /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
+    /// This prevents this variant from swallowing `MemoryConfig` responses.
+    UserProfileData(UserProfileDataPayload),
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
@@ -1670,7 +1710,7 @@ impl PhiloticClient {
     fn is_ignorable_push(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::UserProfileData { .. } | IpcResponse::NetworkState { .. }
+            IpcResponse::UserProfileData(_) | IpcResponse::NetworkState { .. }
         )
     }
 

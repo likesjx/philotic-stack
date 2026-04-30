@@ -8347,6 +8347,398 @@ impl AgentRuntime {
                 }
             }
 
+            "role.list" => {
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ListRoleIncarnations {
+                        agent_id: self.agent_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let roles = data
+                            .get("roles")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if roles.is_empty() {
+                            ("No roles configured for this agent.".into(), None)
+                        } else {
+                            let mut lines = vec![format!(
+                                "Role roster for {} ({} roles):",
+                                self.agent_id,
+                                roles.len()
+                            )];
+                            for role in &roles {
+                                let name =
+                                    role.get("role_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                let profile = role
+                                    .get("toolset_profile")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let state = role
+                                    .get("readiness_state")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let home = role
+                                    .get("home_node")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("(authority hotel)");
+                                lines.push(format!(
+                                    "  {name}  profile={profile}  state={state}  home={home}"
+                                ));
+                            }
+                            (lines.join("\n"), None)
+                        }
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("Role list unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("role.list: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "training.list" => {
+                use philotic_client::IpcRequest;
+                use ansible_mesh_core::whisper_training::TrainingFilter;
+                let args = payload.arguments.as_object();
+                let limit = args
+                    .and_then(|a| a.get("limit"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(20);
+                let filter_str = args
+                    .and_then(|a| a.get("filter"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("all");
+                let filter = match filter_str {
+                    "uncorrected" => TrainingFilter::Uncorrected,
+                    "eligible" => TrainingFilter::Eligible,
+                    "exported" => TrainingFilter::Exported,
+                    _ => TrainingFilter::All,
+                };
+                let agent_id_filter = args
+                    .and_then(|a| a.get("agent_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ListTrainingSamples {
+                        agent_id: agent_id_filter,
+                        limit,
+                        filter,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                        let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let samples = data
+                            .get("samples")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if samples.is_empty() {
+                            (format!("No training samples found (filter: {filter_str})."), None)
+                        } else {
+                            let lines: Vec<String> = std::iter::once(
+                                format!("{count} training sample(s) (filter: {filter_str}):")
+                            )
+                            .chain(samples.iter().map(|s| {
+                                let sid = s.get("sample_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let turn = s.get("turn_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let raw = s.get("raw_transcript").and_then(|v| v.as_str()).unwrap_or("");
+                                let corrected = s.get("corrected_transcript").and_then(|v| v.as_str());
+                                let eligible = s.get("training_eligible").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let exported = s.get("exported_at").and_then(|v| v.as_u64()).is_some();
+                                let state = if exported { "exported" } else if eligible { "eligible" } else if corrected.is_some() { "corrected" } else { "uncorrected" };
+                                let transcript = corrected.unwrap_or(raw);
+                                format!("  [{state}] {sid}  turn={turn}  transcript={transcript:.80}")
+                            }))
+                            .collect();
+                            (lines.join("\n"), None)
+                        }
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("training.list: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("training.list: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "training.correct" => {
+                use philotic_client::IpcRequest;
+                let args = payload.arguments.as_object();
+                let turn_id = args
+                    .and_then(|a| a.get("turn_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let corrected_transcript = args
+                    .and_then(|a| a.get("corrected_transcript"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let (Some(turn_id), Some(corrected_transcript)) = (turn_id, corrected_transcript) else {
+                    let err = TaskErrorPayload::ipc_failure(
+                        "philote",
+                        "MISSING_ARGS",
+                        "training.correct requires 'turn_id' and 'corrected_transcript'",
+                    );
+                    return self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        chat_id: Some(payload.chat_id),
+                        content: Some(err.display_message()),
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await;
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::CorrectTrainingSample {
+                        turn_id: turn_id.clone(),
+                        corrected_transcript,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        (format!("Correction applied to turn '{turn_id}'. Sample marked training_eligible."), None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("training.correct: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("training.correct: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "training.export" => {
+                use philotic_client::IpcRequest;
+                use ansible_mesh_core::whisper_training::TrainingExportFormat;
+                let args = payload.arguments.as_object();
+                let format_str = args
+                    .and_then(|a| a.get("format"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("huggingface");
+                let output_path = args
+                    .and_then(|a| a.get("output_path"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let limit = args
+                    .and_then(|a| a.get("limit"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let Some(output_path) = output_path else {
+                    let err = TaskErrorPayload::ipc_failure(
+                        "philote",
+                        "MISSING_ARGS",
+                        "training.export requires 'format' and 'output_path'",
+                    );
+                    return self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        chat_id: Some(payload.chat_id),
+                        content: Some(err.display_message()),
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await;
+                };
+                let format = if format_str == "nemo" {
+                    TrainingExportFormat::Nemo
+                } else {
+                    TrainingExportFormat::HuggingFace
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ExportTrainingSamples {
+                        format,
+                        output_path: output_path.clone(),
+                        limit,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, data, .. }) => {
+                        let count = data
+                            .as_ref()
+                            .and_then(|d| d.get("exported_count"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        (format!("Exported {count} sample(s) ({format_str} format) → {output_path}"), None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("training.export: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("training.export: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "training.status" => {
+                use philotic_client::IpcRequest;
+                let args = payload.arguments.as_object();
+                let agent_id_filter = args
+                    .and_then(|a| a.get("agent_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetTrainingStatus {
+                        agent_id: agent_id_filter,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                        let status = data.get("status").cloned().unwrap_or_default();
+                        let total = status.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let uncorrected = status.get("uncorrected").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let eligible = status.get("eligible").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let exported = status.get("exported").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let content = format!(
+                            "Training data status:\n  total captured: {total}\n  uncorrected: {uncorrected}\n  eligible for export: {eligible}\n  exported: {exported}"
+                        );
+                        (content, None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("training.status: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("training.status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             "handoff.to_role" => {
                 let args = payload.arguments.as_object();
                 let role_name = args

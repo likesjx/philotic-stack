@@ -881,6 +881,7 @@ pub struct IpcServer {
     /// cross-hotel task forwarding without full mesh infrastructure.
     peer_sockets: Arc<RwLock<HashMap<String, String>>>,
     muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+    training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
     /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
     /// The sender is cloned into each `handle_client` task for forwarding.
     network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
@@ -2237,6 +2238,7 @@ impl IpcServer {
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
             peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
+            training_storage: None,
             network_broadcast,
             operator_surface_tx: None,
         }
@@ -2244,6 +2246,14 @@ impl IpcServer {
 
     pub fn with_operator_surface_channel(mut self, tx: mpsc::Sender<String>) -> Self {
         self.operator_surface_tx = Some(tx);
+        self
+    }
+
+    pub fn with_training_storage(
+        mut self,
+        storage: Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+    ) -> Self {
+        self.training_storage = Some(storage);
         self
     }
 
@@ -2313,6 +2323,7 @@ impl IpcServer {
                     let registry = self.registry.clone();
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
+                    let training_storage = self.training_storage.clone();
                     let network_broadcast_rx = self.network_broadcast.subscribe();
                     let operator_surface_tx = self.operator_surface_tx.clone();
                     tokio::spawn(async move {
@@ -2333,6 +2344,7 @@ impl IpcServer {
                             registry,
                             peer_sockets,
                             muninn_config,
+                            training_storage,
                             network_broadcast_rx,
                             operator_surface_tx,
                         )
@@ -2371,6 +2383,7 @@ impl IpcServer {
         registry: Arc<RwLock<NodeRegistry>>,
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+        training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
     ) -> anyhow::Result<()> {
@@ -2437,6 +2450,39 @@ impl IpcServer {
                             "FetchMemoryConfig handled"
                         );
                         let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
+                    }
+                    Ok(IpcRequest::ListTrainingSamples { agent_id, limit, filter }) => {
+                        let resp = Self::handle_list_training_samples(
+                            training_storage.as_deref(),
+                            agent_id.as_deref(),
+                            limit,
+                            &filter,
+                        );
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::CorrectTrainingSample { turn_id, corrected_transcript }) => {
+                        let resp = Self::handle_correct_training_sample(
+                            training_storage.as_deref(),
+                            &turn_id,
+                            &corrected_transcript,
+                        );
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::ExportTrainingSamples { format, output_path, limit }) => {
+                        let resp = Self::handle_export_training_samples(
+                            training_storage.as_deref(),
+                            &format,
+                            &output_path,
+                            limit,
+                        );
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::GetTrainingStatus { agent_id }) => {
+                        let resp = Self::handle_get_training_status(
+                            training_storage.as_deref(),
+                            agent_id.as_deref(),
+                        );
+                        let _ = outbound_tx.send(resp);
                     }
                     Ok(req) => {
                         let mut follow_up_responses = Vec::new();
@@ -6287,14 +6333,14 @@ impl IpcServer {
             }
             IpcRequest::GetUserProfile { hotel_name } => {
                 match graph.get_user_profile(&hotel_name) {
-                    Ok(Some(p)) => IpcResponse::UserProfileData {
+                    Ok(Some(p)) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
                         timezone: p.timezone,
                         display_name: p.display_name,
-                    },
-                    Ok(None) => IpcResponse::UserProfileData {
+                    }),
+                    Ok(None) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
                         timezone: None,
                         display_name: None,
-                    },
+                    }),
                     Err(e) => IpcResponse::error(
                         "get_user_profile",
                         "GET_USER_PROFILE_ERROR",
@@ -6322,10 +6368,10 @@ impl IpcServer {
                     display_name: display_name.or(existing.display_name),
                 };
                 match graph.upsert_user_profile(&hotel_name, &updated) {
-                    Ok(()) => IpcResponse::UserProfileData {
+                    Ok(()) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
                         timezone: updated.timezone,
                         display_name: updated.display_name,
-                    },
+                    }),
                     Err(e) => IpcResponse::error(
                         "patch_user_profile",
                         "PATCH_USER_PROFILE_ERROR",
@@ -6583,6 +6629,14 @@ impl IpcServer {
                 "memory",
                 "UNREACHABLE",
                 "FetchMemoryConfig dispatched early",
+            ),
+            IpcRequest::ListTrainingSamples { .. }
+            | IpcRequest::CorrectTrainingSample { .. }
+            | IpcRequest::ExportTrainingSamples { .. }
+            | IpcRequest::GetTrainingStatus { .. } => IpcResponse::error(
+                "training",
+                "UNREACHABLE",
+                "Training request intercepted before process_request",
             ),
             IpcRequest::RegisterGraphInstance {
                 graph_id,
@@ -9785,6 +9839,165 @@ impl IpcServer {
             );
         }
     }
+
+    // ── Training data admin handlers ──────────────────────────────────────────
+
+    fn handle_list_training_samples(
+        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        agent_id: Option<&str>,
+        limit: usize,
+        filter: &ansible_mesh_core::whisper_training::TrainingFilter,
+    ) -> IpcResponse {
+        let Some(storage) = storage else {
+            return IpcResponse::error(
+                "training_list",
+                "TRAINING_STORAGE_UNAVAILABLE",
+                "Training DB not configured for this hotel",
+            );
+        };
+        let capped = limit.min(200);
+        match storage.list_filtered(filter, agent_id, capped) {
+            Ok(samples) => {
+                let samples_json = serde_json::to_value(&samples).unwrap_or(serde_json::Value::Null);
+                IpcResponse::success(
+                    "training_list",
+                    Some(serde_json::json!({ "samples": samples_json, "count": samples.len() })),
+                )
+            }
+            Err(e) => IpcResponse::error("training_list", "QUERY_FAILED", &e.to_string()),
+        }
+    }
+
+    fn handle_correct_training_sample(
+        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        turn_id: &str,
+        corrected_transcript: &str,
+    ) -> IpcResponse {
+        let Some(storage) = storage else {
+            return IpcResponse::error(
+                "training_correct",
+                "TRAINING_STORAGE_UNAVAILABLE",
+                "Training DB not configured for this hotel",
+            );
+        };
+        match storage.update_correction(turn_id, corrected_transcript, "operator") {
+            Ok(true) => IpcResponse::success(
+                "training_correct",
+                Some(serde_json::json!({ "turn_id": turn_id, "updated": true })),
+            ),
+            Ok(false) => IpcResponse::error(
+                "training_correct",
+                "TURN_NOT_FOUND",
+                &format!("No sample found for turn_id '{turn_id}'"),
+            ),
+            Err(e) => IpcResponse::error("training_correct", "UPDATE_FAILED", &e.to_string()),
+        }
+    }
+
+    fn handle_export_training_samples(
+        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        format: &ansible_mesh_core::whisper_training::TrainingExportFormat,
+        output_path: &str,
+        limit: Option<usize>,
+    ) -> IpcResponse {
+        use ansible_mesh_core::whisper_training::TrainingExportFormat;
+        use std::io::Write;
+
+        let Some(storage) = storage else {
+            return IpcResponse::error(
+                "training_export",
+                "TRAINING_STORAGE_UNAVAILABLE",
+                "Training DB not configured for this hotel",
+            );
+        };
+        let capped = limit.unwrap_or(usize::MAX).min(10_000);
+        let samples = match storage.list_eligible(capped) {
+            Ok(s) => s,
+            Err(e) => return IpcResponse::error("training_export", "QUERY_FAILED", &e.to_string()),
+        };
+        if samples.is_empty() {
+            return IpcResponse::success(
+                "training_export",
+                Some(serde_json::json!({ "exported_count": 0, "output_path": output_path })),
+            );
+        }
+
+        let write_result = match format {
+            TrainingExportFormat::HuggingFace => {
+                let records: Vec<serde_json::Value> = samples
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "audio": s.audio_path,
+                            "sentence": s.corrected_transcript.as_deref().unwrap_or(&s.raw_transcript),
+                            "model_gen": s.model_gen,
+                            "sample_id": s.sample_id,
+                        })
+                    })
+                    .collect();
+                std::fs::write(output_path, serde_json::to_vec_pretty(&records).unwrap_or_default())
+            }
+            TrainingExportFormat::Nemo => {
+                let mut file = match std::fs::File::create(output_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string())
+                    }
+                };
+                for s in &samples {
+                    let record = serde_json::json!({
+                        "audio_filepath": s.audio_path.as_deref().unwrap_or(""),
+                        "text": s.corrected_transcript.as_deref().unwrap_or(&s.raw_transcript),
+                        "duration": 0.0,
+                    });
+                    if let Err(e) = writeln!(file, "{}", record) {
+                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
+                    }
+                }
+                Ok(())
+            }
+        };
+
+        if let Err(e) = write_result {
+            return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
+        }
+
+        let exported_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ids: Vec<String> = samples.iter().map(|s| s.sample_id.clone()).collect();
+        let count = ids.len();
+        if let Err(e) = storage.mark_exported_at(&ids, exported_at) {
+            warn!("training_export: failed to mark {} samples exported: {}", count, e);
+        }
+
+        IpcResponse::success(
+            "training_export",
+            Some(serde_json::json!({ "exported_count": count, "output_path": output_path })),
+        )
+    }
+
+    fn handle_get_training_status(
+        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        agent_id: Option<&str>,
+    ) -> IpcResponse {
+        let Some(storage) = storage else {
+            return IpcResponse::error(
+                "training_status",
+                "TRAINING_STORAGE_UNAVAILABLE",
+                "Training DB not configured for this hotel",
+            );
+        };
+        match storage.count_status(agent_id) {
+            Ok(counts) => {
+                let status_json =
+                    serde_json::to_value(&counts).unwrap_or(serde_json::Value::Null);
+                IpcResponse::success("training_status", Some(serde_json::json!({ "status": status_json })))
+            }
+            Err(e) => IpcResponse::error("training_status", "QUERY_FAILED", &e.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10460,11 +10673,19 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "session.status"
+            | "hotel.status"
+            | "hotel.logs"
             | "agent.configure"
             | "skill.register"
             | "subagent.spawn"
             | "role.configure"
+            | "role.list"
+            | "role.set_home"
             | "bash.exec"
+            | "training.list"
+            | "training.correct"
+            | "training.export"
+            | "training.status"
     )
 }
 

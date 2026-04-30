@@ -2638,6 +2638,44 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "role.list".into(),
+            description: "Lists all role incarnations configured for this agent, with their \
+                          toolset profile, readiness state, and home hotel. Call this before \
+                          role.configure or role.set_home to confirm the current roster."
+                .into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "role.set_home".into(),
+            description: "Pin a role's execution to a specific hotel (or clear the pin to use \
+                          the authority hotel). After pinning, handoff.to_role routes the role \
+                          there automatically. Requires role_name, reason, and optionally \
+                          target_hotel (omit or null to clear)."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The role to re-home."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "Hotel name to pin to. Omit or set null to clear the pin."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this role belongs on this hotel."
+                    }
+                },
+                "required": ["role_name", "reason"]
+            }),
+            class: "config".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
             tool_name: "bash.exec".into(),
             description: "Last-resort shell execution. Runs a shell command and returns stdout, \
                           stderr, and exit code. Use ONLY when no Philotic-native tool can \
@@ -2683,6 +2721,101 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             class: "desktop".into(),
             tool_markers: vec!["desktop_bound".into(), "local_only".into(), "low_agency".into()],
         },
+        // ── Training data admin tools ─────────────────────────────────────
+        AbstractToolRecord {
+            tool_name: "training.list".into(),
+            description: "List captured voice training samples. Filter by state: all (default), \
+                          uncorrected, eligible, or exported. Optionally narrow by agent_id."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of samples to return (default 20, max 200)."
+                    },
+                    "filter": {
+                        "type": "string",
+                        "enum": ["all", "uncorrected", "eligible", "exported"],
+                        "description": "Filter samples by correction/export state."
+                    },
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Restrict to samples from a specific agent."
+                    }
+                }
+            }),
+            class: "training".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "training.correct".into(),
+            description: "Apply an operator correction to a captured voice training sample. \
+                          Sets the ground-truth transcript and marks the sample training_eligible."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "turn_id": {
+                        "type": "string",
+                        "description": "The turn to correct."
+                    },
+                    "corrected_transcript": {
+                        "type": "string",
+                        "description": "The ground-truth transcript."
+                    }
+                },
+                "required": ["turn_id", "corrected_transcript"]
+            }),
+            class: "training".into(),
+            tool_markers: vec!["high_agency".into()],
+        },
+        AbstractToolRecord {
+            tool_name: "training.export".into(),
+            description: "Export training-eligible samples to a file for the fine-tuning pipeline. \
+                          Supports huggingface (JSON array) and nemo (one-JSON-per-line manifest) formats. \
+                          Marks exported samples so they are not re-exported."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "format": {
+                        "type": "string",
+                        "enum": ["huggingface", "nemo"],
+                        "description": "Output format."
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Absolute path for the export file."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max samples to export (default: all eligible)."
+                    }
+                },
+                "required": ["format", "output_path"]
+            }),
+            class: "training".into(),
+            tool_markers: vec!["high_agency".into()],
+        },
+        AbstractToolRecord {
+            tool_name: "training.status".into(),
+            description: "Return a summary of voice training sample counts: total captured, \
+                          uncorrected, eligible for export, and already exported. \
+                          Optionally filtered by agent_id."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Restrict counts to a specific agent."
+                    }
+                }
+            }),
+            class: "training".into(),
+            tool_markers: Vec::new(),
+        },
     ];
 
     for tool in &catalog {
@@ -2712,16 +2845,33 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         },
         AbstractSkillRecord {
             skill_name: "role.governance".into(),
-            description: "Govern role definitions and placement for the current agent identity, reasoning explicitly about purpose, capability posture, handoff behavior, home-hotel assignment, and limits before proposing changes.".into(),
-            implied_tools: vec!["session.status".into(), "agent.configure".into(), "role.create_or_update".into(), "role.set_home".into()],
+            description: "Govern role definitions and placement for the current agent identity. \
+                          Call role.list first to see the current roster, then use role.configure \
+                          to update a role or role.set_home to pin a role to a specific hotel. \
+                          Reason explicitly about purpose, capability posture, handoff behavior, \
+                          and limits before proposing any change.".into(),
+            implied_tools: vec![
+                "session.status".into(),
+                "role.list".into(),
+                "role.configure".into(),
+                "role.set_home".into(),
+                "agent.configure".into(),
+            ],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "role.authoring".into(),
-            description: "Author or revise a role lens using role.create_or_update. Gather missing inputs first (role_name, toolset_profile, reasoning.purpose, reasoning.toolset_rationale, reasoning.handoff_posture_and_limits), construct the full payload, call role.create_or_update, and optionally hand off into the new role when the operator wants immediate use.".into(),
+            description: "Author or revise a role using role.configure. Call role.list first to \
+                          confirm the role exists. Gather missing inputs (role_name, toolset_profile, \
+                          reasoning.purpose, reasoning.toolset_rationale, \
+                          reasoning.handoff_posture_and_limits), construct the full payload, call \
+                          role.configure, and optionally hand off into the updated role when the \
+                          operator wants immediate use. Admin roles may use role.create_or_update \
+                          to create brand-new roles not already in the roster.".into(),
             implied_tools: vec![
                 "session.status".into(),
-                "role.create_or_update".into(),
+                "role.list".into(),
+                "role.configure".into(),
                 "handoff.to_role".into(),
             ],
             validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
@@ -2744,7 +2894,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                     "is_admin"
                 ],
                 "repo_skill_path": "skills/role-authoring/SKILL.md",
-                "workflow_handoff": "role.create_or_update",
+                "workflow_handoff": "role.configure",
                 "format_example": {
                     "role_name": "researcher",
                     "toolset_profile": "research",
@@ -2828,6 +2978,31 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             implied_tools: vec!["delegate.to_external_cognitive_peer".into()],
             ..Default::default()
         },
+        AbstractSkillRecord {
+            skill_name: "memory.fix".into(),
+            description: "Diagnose and recover Muninn memory connectivity. Use when memory recall \
+                          fails, vault registration is missing, or the Muninn endpoint is \
+                          unreachable. Checks the configured vault endpoint, reports status, and \
+                          guides the operator through recovery steps. Does NOT modify hotel config \
+                          directly — surfaces the problem and a repair command for the operator."
+                .into(),
+            implied_tools: vec!["session.status".into(), "hotel.status".into(), "hotel.logs".into()],
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "training.admin".into(),
+            description: "Run a voice training data review session: list uncorrected samples, \
+                          apply corrections, check eligibility count, and export when ready. \
+                          Guides an admin philote through the full capture-correct-export loop."
+                .into(),
+            implied_tools: vec![
+                "training.list".into(),
+                "training.correct".into(),
+                "training.export".into(),
+                "training.status".into(),
+            ],
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -2847,6 +3022,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "agent.configure".into(),
                 "role.configure".into(),
+                "role.list".into(),
+                "role.set_home".into(),
                 "skill.register".into(),
                 "skill.list".into(),
                 "skill.assign".into(),
@@ -2863,6 +3040,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "role.governance".into(),
                 "role.authoring".into(),
                 "skill.authoring".into(),
+                "memory.fix".into(),
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
             ],
@@ -2910,16 +3088,23 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "subagent.spawn".into(),
                 "role.configure".into(),
                 "role.create_or_update".into(),
+                "role.list".into(),
+                "role.set_home".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
                 "delegate.whisper".into(),
+                "training.list".into(),
+                "training.correct".into(),
+                "training.export".into(),
+                "training.status".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
                 "utility".into(),
                 "config".into(),
                 "shell".into(),
+                "training".into(),
             ],
             allowed_skills: vec![
                 "skill.crafting".into(),
@@ -2929,25 +3114,27 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "role.authoring".into(),
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
+                "training.admin".into(),
             ],
             description: Some(
-                "Admin role profile — full skill crafting and role governance authority.".into(),
+                "Admin role profile — full skill crafting, role governance, and training data authority.".into(),
             ),
         },
         ToolsetProfileRecord {
             profile_name: "architect".into(),
             allowed_tools: vec![
                 "session.status".into(),
-                "echo".into(),
-                "skill.list".into(),
                 "hotel.status".into(),
                 "hotel.logs".into(),
+                "echo".into(),
+                "skill.list".into(),
+                "role.list".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "workspace".into()],
-            allowed_skills: vec!["handoff.back".into(), "capability.request".into()],
+            allowed_skills: vec!["handoff.back".into(), "capability.request".into(), "memory.fix".into()],
             description: Some(
                 "Architect specialist role profile — systems, infrastructure, debugging. \
                  bash.exec requires operator approval."
@@ -3010,11 +3197,16 @@ Responsibilities:
 - Author new delegation skills when you identify recurring patterns in your work.
 - Assign registered skills to your roles to expand your capabilities over time.
 
+## Role management
+
+Your roles are pre-configured and persist in the hotel database. They survive restarts.
+- Use role.list to see your full role roster, their toolset profiles, and readiness state.
+- Use role.configure to update an existing role's manifest, toolset profile, or loop config.
+- Use role.set_home to pin a role to a specific hotel (or clear the pin to run on this hotel).
+- Do NOT create new roles speculatively — the roster is set by the operator. If you need a new role, surface the request explicitly and wait for operator approval.
+- After any role update, hand off only when the operator asked to use it immediately.
+
 Rules:
-- Reason explicitly before creating a role: purpose, toolset, handoff posture, limits.
-- Use the role.authoring skill when preparing a role.create_or_update call so required fields are not omitted.
-- role.create_or_update always requires: role_name, toolset_profile, reasoning.purpose, reasoning.toolset_rationale, and reasoning.handoff_posture_and_limits.
-- After role creation succeeds, hand off into the new role only when the operator asked to use it immediately.
 - Do not bypass the approval gate; if a tool requires operator approval, surface it clearly.
 - Keep soul_text and core identity stable — those changes require operator approval.
 - Use handoff.to_role for sustained specialist work; use subagent.spawn for parallel bounded tasks.
@@ -3024,7 +3216,8 @@ Rules:
 - Never ignore a capability request from a sub-role — either grant it or explain why not before returning them.
 
 Tool preference:
-- Always prefer Philotic-native tools (hotel.status, hotel.logs, workspace.read, session.status, memory.recall) over shell commands.
+- Always prefer Philotic-native tools (hotel.status, hotel.logs, role.list, workspace.read, session.status) over shell commands.
+- Use role.list before any role governance action to confirm the current roster.
 - Use hotel.status to inspect running guests and agent identities before asking the operator for that information.
 - Use hotel.logs to tail the aiua log for recent events before reaching for bash.exec.
 - Use bash.exec only when no native tool can accomplish the task, and only after stating explicitly why bash is necessary.
@@ -3032,7 +3225,7 @@ Tool preference:
 - If no tool is needed to answer a question, respond directly — do not call a tool just because one is available.
 
 Approval posture:
-- Governance tools (role.create_or_update, skill.register, skill.assign, skill.list, handoff.to_role, handoff.back) run without per-action approval.
+- Governance tools (role.configure, role.list, skill.register, skill.assign, skill.list, handoff.to_role, handoff.back) run without per-action approval.
 - Self-configuration (agent.configure for approval_policy, profile, bindings) runs without approval.
 - Shell execution (bash.exec) and core identity field changes require operator approval.";
 
@@ -5357,6 +5550,21 @@ async fn main() -> Result<()> {
     let _graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
     let graph_domain_arc = Arc::new(GraphDomain::new(Arc::new(_graph_storage.adapter())));
 
+    // Open (or create) the training DB alongside the context DB.
+    let training_db_path_buf;
+    let training_db_path: &Path = if let Some(ref pdir) = profile_dir() {
+        training_db_path_buf = pdir.join("training.db");
+        &training_db_path_buf
+    } else {
+        Path::new("whisper_training.db")
+    };
+    let training_storage: Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage> =
+        Arc::new(
+            ansible_mesh_core::whisper_training::SqliteWhisperTrainingStorage::open(
+                training_db_path,
+            )?,
+        );
+
     let hotel_name = args
         .hotel
         .context("--hotel is required unless using a subcommand such as `aiua load`")?;
@@ -5521,7 +5729,8 @@ async fn main() -> Result<()> {
             dispatcher_tx,
             graph_domain_arc.clone(),
         )
-        .with_memory_config(muninn_config_arc.clone());
+        .with_memory_config(muninn_config_arc.clone())
+        .with_training_storage(training_storage.clone());
         tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
                 error!("Hotel Front Desk (UDS) failed: {}", e);
@@ -5668,6 +5877,7 @@ async fn main() -> Result<()> {
         graph_domain_arc.clone(),
     )
     .with_memory_config(muninn_config_arc.clone())
+    .with_training_storage(training_storage.clone())
     .with_materialization_requester(guest_manager.clone())
     .with_registry(registry.clone())
     .with_operator_surface_channel(operator_surface_tx);

@@ -208,6 +208,7 @@ async fn handle_capture(
         confidence: None,
         training_eligible: auto_eligible,
         timestamp,
+        exported_at: None,
     };
 
     match store.insert_sample(&sample) {

@@ -454,6 +454,8 @@ local-push:
     echo "▶ Building release binaries..."
     cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p graph-intelligence -p philotic-web
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
+    # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
+    chmod u+w "${AIUA_CELLAR}"
     for bin in $AIUA_BINS; do
         if [ ! -f "target/release/$bin" ]; then
             echo "  – $bin (not built, skipping)"
@@ -463,12 +465,12 @@ local-push:
             echo "  – $bin (not in local Cellar, skipping)"
             continue
         fi
-        chmod u+w "${AIUA_CELLAR}/$bin"
+        rm -f "${AIUA_CELLAR}/$bin"
         cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
-        xattr -c "${AIUA_CELLAR}/$bin" 2>/dev/null || true
-        chmod u-w "${AIUA_CELLAR}/$bin"
+        chmod 555 "${AIUA_CELLAR}/$bin"
         echo "  ✓ $bin"
     done
+    chmod u-w "${AIUA_CELLAR}"
     echo "▶ Installing phil to ${PHIL_CELLAR}..."
     chmod u+w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil" 2>/dev/null || true
     cp target/release/philotic-web "${PHIL_CELLAR}/philotic-web"
@@ -477,64 +479,25 @@ local-push:
     echo "  ✓ phil"
     echo "✅ Local Homebrew install updated."
 
-# Build release binaries locally (MacBook Air) and push them to mbp-jane via SCP.
-# mbp-jane is a separate machine — it has no repo, only runs Cellar-installed binaries.
-# Stops Jane on mbp-jane, installs, restarts.
-jane-push:
+# Push release binaries to any remote Homebrew host via SCP.
+remote-homebrew-push remote hotel expected_host:
     #!/usr/bin/env bash
     set -euo pipefail
-    REMOTE=mbp-jane
-    REMOTE_CELLAR="$(ssh "${REMOTE}" "ls -d /opt/homebrew/Cellar/aiua/*/bin 2>/dev/null | head -1")"
-    BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner"
-    PHIL_CELLAR="$(ssh "${REMOTE}" "ls -d /opt/homebrew/Cellar/philotic-web/*/bin 2>/dev/null | head -1")"
-    # Safety guard: verify we are actually talking to mbp-jane before touching anything.
-    # mbp-jane's system hostname is "MacBookPro" — the SSH alias is just our local label.
-    ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
-    if [[ "${ACTUAL_HOST}" != "MacBookPro" && "${ACTUAL_HOST}" != "Jareds-MacBook-Pro" ]]; then
-        echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected mbp-jane."
-        exit 1
-    fi
-    echo "▶ Building release binaries (local)..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p philotic-web
-    echo "▶ Stopping Jane on ${REMOTE}..."
-    ssh "${REMOTE}" "pkill -f '/opt/homebrew/bin/aiua' 2>/dev/null || true; sleep 2"
-    echo "▶ Pushing binaries to ${REMOTE}:${REMOTE_CELLAR}..."
-    for bin in $BINS; do
-        if [ ! -f "target/release/$bin" ]; then
-            echo "  – $bin (not built locally, skipping)"
-            continue
-        fi
-        NEW=false
-        if ! ssh "${REMOTE}" "test -f '${REMOTE_CELLAR}/$bin'"; then
-            NEW=true
-        fi
-        ssh "${REMOTE}" "chmod u+w '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
-        scp -q "target/release/$bin" "${REMOTE}:${REMOTE_CELLAR}/$bin"
-        ssh "${REMOTE}" "chmod +x '${REMOTE_CELLAR}/$bin'"
-        ssh "${REMOTE}" "xattr -d com.apple.quarantine '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
-        if [ "$NEW" = "true" ]; then
-            ssh "${REMOTE}" "ln -sf '${REMOTE_CELLAR}/$bin' '/opt/homebrew/bin/$bin' && echo '  ✓ $bin (new — symlinked)'" || echo "  ✓ $bin (new)"
-        else
-            ssh "${REMOTE}" "chmod u-w '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
-            echo "  ✓ $bin"
-        fi
-    done
-    if [ -n "${PHIL_CELLAR}" ]; then
-        ssh "${REMOTE}" "chmod u+w '${PHIL_CELLAR}/phil' '${PHIL_CELLAR}/philotic-web' 2>/dev/null || true"
-        scp -q "target/release/philotic-web" "${REMOTE}:${PHIL_CELLAR}/phil"
-        scp -q "target/release/philotic-web" "${REMOTE}:${PHIL_CELLAR}/philotic-web"
-        ssh "${REMOTE}" "chmod u-w '${PHIL_CELLAR}/phil' '${PHIL_CELLAR}/philotic-web' 2>/dev/null || true"
-        echo "  ✓ phil / philotic-web"
-    else
-        echo "  – phil / philotic-web (philotic-web Cellar not found on remote, skipping)"
-    fi
-    echo "▶ Clearing Gatekeeper quarantine on pushed binaries..."
-    ssh "${REMOTE}" "xattr -d com.apple.quarantine ${REMOTE_CELLAR}/* /opt/homebrew/Cellar/philotic-web/*/bin/* 2>/dev/null || true"
-    echo "▶ Applying config on ${REMOTE}..."
-    ssh "${REMOTE}" "/opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel mbp-jane"
-    echo "▶ Starting Jane on ${REMOTE}..."
-    ssh "${REMOTE}" "nohup /opt/homebrew/bin/aiua --hotel mbp-jane >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
-    echo "✅ Jane updated and running on ${REMOTE}."
+    exec ./scripts/push-homebrew-remote.sh "{{remote}}" "{{hotel}}" "{{expected_host}}"
+
+remote-homebrew-stop remote hotel:
+    #!/usr/bin/env bash
+    ssh "{{remote}}" "pkill -f 'aiua --hotel {{hotel}}' && echo '▶ aiua stopped for hotel {{hotel}}' || echo '▶ aiua was not running for hotel {{hotel}}'"
+
+remote-homebrew-start remote hotel:
+    #!/usr/bin/env bash
+    ssh "{{remote}}" "nohup env PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+
+remote-homebrew-status remote hotel:
+    @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
+
+jane-push:
+    just remote-homebrew-push mbp-jane mbp-jane MacBookPro
 
 # Stop Jane on mbp-jane without pushing new binaries.
 jane-stop:
