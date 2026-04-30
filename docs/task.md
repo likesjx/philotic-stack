@@ -689,10 +689,12 @@ Seam IDs: `multi-hotel-route-consistency`, `cross-host-distributed-validation`, 
   - propagate revocation mesh-wide instead of pairwise folklore
   - move member-record sync from “first converged path” to audited canonical mesh authority
   - make cross-hotel philote / role transport consume the converged membership view directly
+  - close the retroactive convergence gap so already-paired hotels learn the full current circle without requiring a fresh admission ceremony
 - [x] Sync the canonical mesh catalog across hotels instead of seeding hotel-local tool/skill/profile folklore:
   - replicate `abstract_tool`, `abstract_skill`, and `toolset_profile` records on change and periodic full sync
   - use the built-in `admin` profile as the first proving profile
   - let newly admitted hotels receive the current canonical catalog as part of the singular-mesh convergence path
+- [ ] Decide whether ad hoc `skill.register` writes are canonical mesh-catalog truth or hotel-local overlays, then implement that authority boundary instead of leaving dynamic skill propagation to vibes.
 - [x] Expose the first hotel-owned placement judgment API:
   - add `hotel.best_place_to_run`
   - respect explicit role home pins first
