@@ -21,6 +21,7 @@ related_docs:
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
 - HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md
 - DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md
+- REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md
 - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
 task_refs:
 - docs/task.md
@@ -125,6 +126,8 @@ Current embedded desktop behavior in `jaredlikes-desktop`:
 The actual desktop substrate and the system-settings vs workspace-app split are now documented explicitly in [DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md). That document is the right home for how the desktop itself is structured; this membrane proposal stays focused on authority and transport boundaries.
 
 This proves the direction, but it is still transitional rather than a finished membrane boundary because the first remote status and guest query paths are narrow and still rely on a daemon-owned management worker plus reply delivery over the existing task transport, guest inventory still falls back to an explicit error state when that remote path is unavailable, any future apartment-style diagnostic surface still needs a shaped hotel-owned design, bearer compatibility fallbacks still exist, and the shell-wide locked visual posture is still a first slice rather than the final environment-wide policy model.
+
+The next admin-facing boundary is now explicit too: remote hotel administration parity should be treated as its own operator-control-plane seam rather than an implied side effect of mesh-aware reads. That follow-on boundary is tracked in [REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md).
 
 One more boundary correction became explicit while exploring remote agent inventory and operator chat: continuing to add `desktop_membrane.*` actions and desktop-shaped reply contracts directly inside `aiua` core would undermine the intended plug-and-play membrane model. That correction is now tracked in [OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md).
 
