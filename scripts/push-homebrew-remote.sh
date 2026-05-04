@@ -60,10 +60,12 @@ while IFS= read -r bin_path; do
   scp -q "${bin_path}" "${REMOTE}:${STAGE_DIR}/${bin}"
   ssh "${REMOTE}" "chmod +x '${STAGE_DIR}/${bin}'"
 
-  if ssh "${REMOTE}" "test -f '${AIUA_CELLAR}/${bin}'"; then
-    ssh "${REMOTE}" "chmod u+w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
+  if ! ssh "${REMOTE}" "test -f '${AIUA_CELLAR}/${bin}'"; then
+    echo "  – ${bin} (not in remote Cellar, skipping)"
+    continue
   fi
 
+  ssh "${REMOTE}" "chmod u+w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
   ssh "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
   ssh "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
   ssh "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
