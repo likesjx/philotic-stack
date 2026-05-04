@@ -26,6 +26,12 @@
 //!   GET  /api/mesh/targets/:target_node_id/agents
 //!   GET  /api/mesh/targets/:target_node_id/components
 //!   GET  /api/mesh/targets/:target_node_id/components/:guest_id
+//!   POST /api/mesh/targets/:target_node_id/components
+//!   PATCH /api/mesh/targets/:target_node_id/components/:guest_id
+//!   DELETE /api/mesh/targets/:target_node_id/components/:guest_id
+//!   POST /api/mesh/targets/:target_node_id/components/:guest_id/enable
+//!   POST /api/mesh/targets/:target_node_id/components/:guest_id/disable
+//!   POST /api/mesh/targets/:target_node_id/components/:guest_id/restart
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
 //!   GET  /api/event-log
 //!   GET  /api/config
@@ -87,9 +93,9 @@ use philotic_client::{
     ComponentInventoryEntryView, ComponentManifest, CronJob, CronJobSource,
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView, GuestIdentity,
     IpcRequest, IpcResponse, LeaseEnvelope, OperatorTargetAgentInventoryView,
-    OperatorTargetComponentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, OperatorTargetView, PhiloticClient, ResponseRoutePolicyView,
-    OPERATOR_CHAT_REPLY_ROLE,
+    OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
+    OperatorTargetGuestInventoryView, OperatorTargetStatusView, OperatorTargetView, PhiloticClient,
+    ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -636,6 +642,27 @@ pub async fn run(
         .route(
             "/api/mesh/targets/:target_node_id/components/:guest_id",
             get(handle_mesh_target_component_detail),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components",
+            post(handle_mesh_target_component_create),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id",
+            axum::routing::patch(handle_mesh_target_component_patch)
+                .delete(handle_mesh_target_component_delete),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id/enable",
+            post(handle_mesh_target_component_enable),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id/disable",
+            post(handle_mesh_target_component_disable),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id/restart",
+            post(handle_mesh_target_component_restart),
         )
         .route(
             "/api/mesh/targets/:target_node_id/agents/:agent_id/chat",
@@ -1964,6 +1991,202 @@ async fn handle_mesh_target_component_detail(
             };
             (status_code, Json(json!({"error": err.to_string()}))).into_response()
         }
+    }
+}
+
+async fn handle_mesh_target_component_create(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+    Json(manifest): Json<ComponentManifest>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_register_target_component(&state.socket, &target_node_id, manifest).await {
+        Ok(component) => {
+            let event = json!({
+                "type": "component:created",
+                "payload": { "guest_id": component.guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            (StatusCode::CREATED, Json(component)).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+    Json(body): Json<PatchComponentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_desktop_membrane_target_component(&state.socket, &target_node_id, &guest_id).await {
+        Ok(current) => {
+            let manifest = ComponentManifest {
+                guest_id: guest_id.clone(),
+                role: body.role.unwrap_or(current.role),
+                hotel: body.hotel.unwrap_or(current.hotel),
+                command: body.command.unwrap_or(current.command),
+                args: body.args.unwrap_or(current.args),
+                env: body.env.unwrap_or(current.env),
+                component_config: body.component_config.unwrap_or(current.component_config),
+                auto_start: body.auto_start.unwrap_or(current.auto_start),
+            };
+            match ipc_register_target_component(&state.socket, &target_node_id, manifest).await {
+                Ok(component) => {
+                    let event = json!({
+                        "type": "component:updated",
+                        "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+                    });
+                    let _ = state.tx.send(event.to_string());
+                    Json(component).into_response()
+                }
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        Err(err) if err.to_string().contains("component not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "component not found"})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_delete(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+    Json(body): Json<DeleteComponentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if body.confirm_guest_id != guest_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "confirmation text must exactly match guest_id"})),
+        )
+            .into_response();
+    }
+    match ipc_remove_target_component(&state.socket, &target_node_id, &guest_id).await {
+        Ok(_) => {
+            let event = json!({
+                "type": "component:deleted",
+                "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "target_node_id": target_node_id}))
+                .into_response()
+        }
+        Err(err)
+            if err.to_string().contains("GUEST_NOT_FOUND")
+                || err.to_string().contains("component not found") =>
+        {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "component not found"})),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_enable(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_set_target_component_active(&state.socket, &target_node_id, &guest_id, true).await {
+        Ok(_) => {
+            let event = json!({
+                "type": "component:enabled",
+                "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "active": true, "target_node_id": target_node_id})).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_disable(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_set_target_component_active(&state.socket, &target_node_id, &guest_id, false).await {
+        Ok(_) => {
+            let event = json!({
+                "type": "component:disabled",
+                "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "active": false, "target_node_id": target_node_id})).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_restart(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_restart_target_component(&state.socket, &target_node_id, &guest_id).await {
+        Ok(_) => {
+            let event = json!({
+                "type": "component:restarted",
+                "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "target_node_id": target_node_id}))
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4124,6 +4347,116 @@ async fn ipc_desktop_membrane_target_component(
         .into_iter()
         .find(|component| component.guest_id == guest_id)
         .ok_or_else(|| anyhow!("component not found"))
+}
+
+async fn ipc_register_target_component(
+    socket: &str,
+    target_node_id: &str,
+    manifest: ComponentManifest,
+) -> Result<ComponentInventoryEntryView> {
+    let guest_id = manifest.guest_id.clone();
+    let mut client = connect_management_client(socket, "philotic-web-target-components").await?;
+    match client
+        .send_request(IpcRequest::RegisterOperatorTargetComponent {
+            target_node_id: target_node_id.to_string(),
+            manifest,
+        })
+        .await?
+    {
+        IpcResponse::ComponentInventory { components } => components
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("component mutation reply missing refreshed component"))
+            .and_then(|value| serde_json::from_value(value).map_err(Into::into)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected register_target_component response: {other:?}"
+        )),
+    }
+    .and_then(|component: ComponentInventoryEntryView| {
+        if component.guest_id == guest_id {
+            Ok(component)
+        } else {
+            Err(anyhow!("refreshed component reply guest mismatch"))
+        }
+    })
+}
+
+async fn ipc_set_target_component_active(
+    socket: &str,
+    target_node_id: &str,
+    guest_id: &str,
+    active: bool,
+) -> Result<OperatorTargetComponentMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-components").await?;
+    match client
+        .send_request(IpcRequest::SetOperatorTargetComponentActive {
+            target_node_id: target_node_id.to_string(),
+            guest_id: guest_id.to_string(),
+            active,
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetComponentMutationAckView {
+            operator_target_component_mutation,
+        } => Ok(operator_target_component_mutation),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected set_target_component_active response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_restart_target_component(
+    socket: &str,
+    target_node_id: &str,
+    guest_id: &str,
+) -> Result<OperatorTargetComponentMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-components").await?;
+    match client
+        .send_request(IpcRequest::RestartOperatorTargetComponent {
+            target_node_id: target_node_id.to_string(),
+            guest_id: guest_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetComponentMutationAckView {
+            operator_target_component_mutation,
+        } => Ok(operator_target_component_mutation),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected restart_target_component response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_remove_target_component(
+    socket: &str,
+    target_node_id: &str,
+    guest_id: &str,
+) -> Result<OperatorTargetComponentMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-components").await?;
+    match client
+        .send_request(IpcRequest::RemoveOperatorTargetComponent {
+            target_node_id: target_node_id.to_string(),
+            guest_id: guest_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetComponentMutationAckView {
+            operator_target_component_mutation,
+        } => Ok(operator_target_component_mutation),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected remove_target_component response: {other:?}"
+        )),
+    }
 }
 
 async fn ipc_list_role_incarnations(socket: &str, agent_id: &str) -> Result<Value> {

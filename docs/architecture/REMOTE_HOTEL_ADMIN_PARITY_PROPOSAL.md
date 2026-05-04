@@ -172,10 +172,11 @@ First honest slice:
 
 1. define the remote admin contract family
 2. land remote component inventory/detail parity through the existing `operator.targets.*` control-plane path
-3. enumerate which existing local desktop mutations should gain remote parity next
-4. keep target-scoped grants explicit
-5. keep secret handling ref-shaped and target-owned
-6. hook placement and handoff decisions into the same surface
+3. land the matching remote component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`) through that same control-plane family
+4. enumerate which existing local desktop mutations should gain remote parity next
+5. keep target-scoped grants explicit
+6. keep secret handling ref-shaped and target-owned
+7. hook placement and handoff decisions into the same surface
 
 This slice is intentionally architectural and sequencing-oriented, not a claim that the whole remote admin plane is implemented today.
 
@@ -186,6 +187,7 @@ Land these in order:
 1. remote component inventory + detail parity
   Current truth: landed through `/api/mesh/targets/:target_node_id/components` plus `/api/mesh/targets/:target_node_id/components/:guest_id`, backed by the same hotel-mediated operator query seam as target status/guest/agent reads.
 2. remote component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`)
+  Current truth: landed through matching target-scoped mesh routes and operator-surface mutation requests, keeping the target hotel authoritative for all component writes instead of teaching the desktop a second remote mutation dialect.
 3. remote config read/mutate parity for bounded operator-approved keys
 4. remote secrets/vault-ref inventory and rotation workflows
 5. remote placement and role transport actions

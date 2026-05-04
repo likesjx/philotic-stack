@@ -184,6 +184,20 @@ pub struct OperatorTargetComponentInventoryView {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetComponentMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub guest_id: String,
+    pub operation: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
 pub type DesktopMembraneTargetView = OperatorTargetView;
 pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
@@ -728,6 +742,23 @@ pub enum IpcRequest {
     },
     QueryOperatorTargetComponents {
         target_node_id: String,
+    },
+    RegisterOperatorTargetComponent {
+        target_node_id: String,
+        manifest: ComponentManifest,
+    },
+    SetOperatorTargetComponentActive {
+        target_node_id: String,
+        guest_id: String,
+        active: bool,
+    },
+    RestartOperatorTargetComponent {
+        target_node_id: String,
+        guest_id: String,
+    },
+    RemoveOperatorTargetComponent {
+        target_node_id: String,
+        guest_id: String,
     },
     SendOperatorChatTurn {
         target_node_id: String,
@@ -1498,6 +1529,9 @@ pub enum IpcResponse {
     },
     OperatorTargetComponentsView {
         operator_target_components: OperatorTargetComponentInventoryView,
+    },
+    OperatorTargetComponentMutationAckView {
+        operator_target_component_mutation: OperatorTargetComponentMutationAckView,
     },
     OperatorChatTurnReply {
         operator_chat_reply: OperatorChatTurnReply,

@@ -1229,7 +1229,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [ ] First-class remote hotel admin parity so the Philote desktop can manage a remote `aiua` through the same hotel-mediated control plane:
   - [x] write [REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md)
   - [x] add remote parity for component inventory/detail
-  - [ ] add remote parity for component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`)
+  - [x] add remote parity for component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`)
   - [ ] add bounded remote config read/mutate parity for operator-approved keys
   - [ ] add remote secret/vault-ref inventory and rotation workflows without normalizing plaintext fetches
   - [ ] add remote placement and role/philote transport actions through the same operator control plane

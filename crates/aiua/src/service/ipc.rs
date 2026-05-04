@@ -43,8 +43,9 @@ use philotic_client::{
     LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
     OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
     OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
-    OperatorTargetComponentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, PhiloticClient, ResponseRoutePolicyView, SubagentDelegation,
+    OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
+    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
+    ResponseRoutePolicyView, SubagentDelegation,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -1814,6 +1815,276 @@ impl IpcServer {
             );
         }
         Ok(view)
+    }
+
+    async fn mutate_operator_target_component(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        target_node_id: &str,
+        operation: &str,
+        manifest: Option<ComponentManifest>,
+        guest_id: Option<&str>,
+        active: Option<bool>,
+    ) -> anyhow::Result<IpcResponse> {
+        if target_node_id == local_node_id {
+            return match operation {
+                "register" => {
+                    let manifest =
+                        manifest.ok_or_else(|| anyhow::anyhow!("component manifest missing"))?;
+                    match Self::handle_register_component(
+                        graph,
+                        materialization_requester,
+                        manifest.clone(),
+                    )
+                    .await
+                    {
+                        IpcResponse::ComponentRegistered { .. } => {
+                            let component = Self::component_inventory_entries(
+                                graph,
+                                local_node_id,
+                            )?
+                            .into_iter()
+                            .find(|component| component.guest_id == manifest.guest_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "registered component [{}] missing from refreshed inventory",
+                                    manifest.guest_id
+                                )
+                            })?;
+                            Ok(IpcResponse::ComponentInventory {
+                                components: vec![
+                                    serde_json::to_value(component)
+                                        .unwrap_or(serde_json::Value::Null),
+                                ],
+                            })
+                        }
+                        other => Ok(other),
+                    }
+                }
+                "set_active" => {
+                    let guest_id = guest_id
+                        .ok_or_else(|| anyhow::anyhow!("guest id missing"))?
+                        .to_string();
+                    let active = active.ok_or_else(|| anyhow::anyhow!("active state missing"))?;
+                    match Self::handle_set_component_active(
+                        graph,
+                        materialization_requester,
+                        local_node_id,
+                        &guest_id,
+                        active,
+                    )
+                    .await
+                    {
+                        IpcResponse::Standard { ok: true, .. } => Ok(
+                            IpcResponse::OperatorTargetComponentMutationAckView {
+                                operator_target_component_mutation:
+                                    OperatorTargetComponentMutationAckView {
+                                        target_node_id: local_node_id.to_string(),
+                                        target_hotel: Self::local_hotel_name(
+                                            graph,
+                                            local_node_id,
+                                        )
+                                        .unwrap_or_default(),
+                                        source_hotel: Self::local_hotel_name(
+                                            graph,
+                                            local_node_id,
+                                        )
+                                        .unwrap_or_default(),
+                                        guest_id,
+                                        operation: if active {
+                                            "enable".into()
+                                        } else {
+                                            "disable".into()
+                                        },
+                                        ok: true,
+                                        active: Some(active),
+                                        note: Some(
+                                            "derived from the target hotel's canonical component mutation path".into(),
+                                        ),
+                                    },
+                            },
+                        ),
+                        other => Ok(other),
+                    }
+                }
+                "restart" => {
+                    let guest_id = guest_id
+                        .ok_or_else(|| anyhow::anyhow!("guest id missing"))?
+                        .to_string();
+                    match Self::handle_restart_component(
+                        graph,
+                        materialization_requester,
+                        local_node_id,
+                        &guest_id,
+                    )
+                    .await
+                    {
+                        IpcResponse::Standard { ok: true, .. } => Ok(
+                            IpcResponse::OperatorTargetComponentMutationAckView {
+                                operator_target_component_mutation:
+                                    OperatorTargetComponentMutationAckView {
+                                        target_node_id: local_node_id.to_string(),
+                                        target_hotel: Self::local_hotel_name(
+                                            graph,
+                                            local_node_id,
+                                        )
+                                        .unwrap_or_default(),
+                                        source_hotel: Self::local_hotel_name(
+                                            graph,
+                                            local_node_id,
+                                        )
+                                        .unwrap_or_default(),
+                                        guest_id,
+                                        operation: "restart".into(),
+                                        ok: true,
+                                        active: None,
+                                        note: Some(
+                                            "derived from the target hotel's canonical component mutation path".into(),
+                                        ),
+                                    },
+                            },
+                        ),
+                        other => Ok(other),
+                    }
+                }
+                "remove" => {
+                    let guest_id = guest_id
+                        .ok_or_else(|| anyhow::anyhow!("guest id missing"))?
+                        .to_string();
+                    match Self::handle_remove_component(graph, local_node_id, &guest_id).await {
+                        IpcResponse::Standard { ok: true, .. } => Ok(
+                            IpcResponse::OperatorTargetComponentMutationAckView {
+                                operator_target_component_mutation:
+                                    OperatorTargetComponentMutationAckView {
+                                        target_node_id: local_node_id.to_string(),
+                                        target_hotel: Self::local_hotel_name(
+                                            graph,
+                                            local_node_id,
+                                        )
+                                        .unwrap_or_default(),
+                                        source_hotel: Self::local_hotel_name(
+                                            graph,
+                                            local_node_id,
+                                        )
+                                        .unwrap_or_default(),
+                                        guest_id,
+                                        operation: "remove".into(),
+                                        ok: true,
+                                        active: None,
+                                        note: Some(
+                                            "derived from the target hotel's canonical component mutation path".into(),
+                                        ),
+                                    },
+                            },
+                        ),
+                        other => Ok(other),
+                    }
+                }
+                other => anyhow::bail!("unsupported target component mutation [{}]", other),
+            };
+        }
+
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: match operation {
+                "register" => "operator.targets.components.register",
+                "set_active" => "operator.targets.components.set_active",
+                "restart" => "operator.targets.components.restart",
+                "remove" => "operator.targets.components.remove",
+                other => anyhow::bail!("unsupported target component mutation [{}]", other),
+            }
+            .into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.clone(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: format!("mutate target component: {operation}"),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+                "manifest": manifest,
+                "guest_id": guest_id,
+                "active": active,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote component mutation emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_task())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("timed out waiting for target component mutation reply")
+            })??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected target component mutation reply envelope: {reply:?}");
+        };
+
+        if operation == "register" {
+            let view: ComponentInventoryEntryView = serde_json::from_str(&task_json)?;
+            return Ok(IpcResponse::ComponentInventory {
+                components: vec![serde_json::to_value(view).unwrap_or(serde_json::Value::Null)],
+            });
+        }
+
+        let ack: OperatorTargetComponentMutationAckView = serde_json::from_str(&task_json)?;
+        Ok(IpcResponse::OperatorTargetComponentMutationAckView {
+            operator_target_component_mutation: ack,
+        })
     }
 
     async fn send_operator_chat_turn(
@@ -5654,6 +5925,99 @@ impl IpcServer {
                     ),
                 }
             }
+            IpcRequest::RegisterOperatorTargetComponent {
+                target_node_id,
+                manifest,
+            } => match Self::mutate_operator_target_component(
+                registry,
+                graph,
+                materialization_requester,
+                local_node_id,
+                &target_node_id,
+                "register",
+                Some(manifest),
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => IpcResponse::error(
+                    "operator_target_component_register",
+                    "OPERATOR_TARGET_COMPONENT_REGISTER_ERROR",
+                    err.to_string(),
+                ),
+            },
+            IpcRequest::SetOperatorTargetComponentActive {
+                target_node_id,
+                guest_id,
+                active,
+            } => match Self::mutate_operator_target_component(
+                registry,
+                graph,
+                materialization_requester,
+                local_node_id,
+                &target_node_id,
+                "set_active",
+                None,
+                Some(&guest_id),
+                Some(active),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => IpcResponse::error(
+                    "operator_target_component_set_active",
+                    "OPERATOR_TARGET_COMPONENT_SET_ACTIVE_ERROR",
+                    err.to_string(),
+                ),
+            },
+            IpcRequest::RestartOperatorTargetComponent {
+                target_node_id,
+                guest_id,
+            } => match Self::mutate_operator_target_component(
+                registry,
+                graph,
+                materialization_requester,
+                local_node_id,
+                &target_node_id,
+                "restart",
+                None,
+                Some(&guest_id),
+                None,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => IpcResponse::error(
+                    "operator_target_component_restart",
+                    "OPERATOR_TARGET_COMPONENT_RESTART_ERROR",
+                    err.to_string(),
+                ),
+            },
+            IpcRequest::RemoveOperatorTargetComponent {
+                target_node_id,
+                guest_id,
+            } => match Self::mutate_operator_target_component(
+                registry,
+                graph,
+                materialization_requester,
+                local_node_id,
+                &target_node_id,
+                "remove",
+                None,
+                Some(&guest_id),
+                None,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => IpcResponse::error(
+                    "operator_target_component_remove",
+                    "OPERATOR_TARGET_COMPONENT_REMOVE_ERROR",
+                    err.to_string(),
+                ),
+            },
             IpcRequest::SendOperatorChatTurn {
                 target_node_id,
                 target_agent_id,
