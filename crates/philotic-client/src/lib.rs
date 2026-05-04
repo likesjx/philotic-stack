@@ -6,7 +6,7 @@ pub use ansible_mesh_core::resources::{
 pub use ansible_mesh_core::storage::ComponentManifest;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -147,11 +147,49 @@ pub struct OperatorTargetAgentInventoryView {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentInventoryEntryView {
+    pub guest_id: String,
+    pub role: String,
+    pub hotel: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub component_type: String,
+    pub is_active: bool,
+    pub auto_start: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_pid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<u64>,
+    #[serde(default)]
+    pub component_config: serde_json::Value,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetComponentInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub components: Vec<ComponentInventoryEntryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
 pub type DesktopMembraneTargetView = OperatorTargetView;
 pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
 pub type DesktopMembraneTargetGuestInventoryView = OperatorTargetGuestInventoryView;
 pub type DesktopMembraneTargetAgentInventoryView = OperatorTargetAgentInventoryView;
+pub type DesktopMembraneTargetComponentInventoryView = OperatorTargetComponentInventoryView;
 
 pub const OPERATOR_SURFACE_QUERY_ROLE: &str = "management.operator_surface_query";
 pub const OPERATOR_SURFACE_QUERY_REPLY_ROLE: &str = "management.operator_surface_query.reply";
@@ -688,6 +726,9 @@ pub enum IpcRequest {
     QueryOperatorTargetAgents {
         target_node_id: String,
     },
+    QueryOperatorTargetComponents {
+        target_node_id: String,
+    },
     SendOperatorChatTurn {
         target_node_id: String,
         target_agent_id: String,
@@ -701,6 +742,9 @@ pub enum IpcRequest {
         target_node_id: String,
     },
     ListDesktopMembraneAgents,
+    ListDesktopMembraneTargetComponents {
+        target_node_id: String,
+    },
     ListDesktopMembraneTargets,
     RenewTelegramPollLease {
         lease_key: String,
@@ -1452,6 +1496,9 @@ pub enum IpcResponse {
     OperatorTargetAgentsView {
         operator_target_agents: OperatorTargetAgentInventoryView,
     },
+    OperatorTargetComponentsView {
+        operator_target_components: OperatorTargetComponentInventoryView,
+    },
     OperatorChatTurnReply {
         operator_chat_reply: OperatorChatTurnReply,
     },
@@ -1460,6 +1507,9 @@ pub enum IpcResponse {
     },
     DesktopMembraneTargetGuestsView {
         membrane_target_guests: DesktopMembraneTargetGuestInventoryView,
+    },
+    DesktopMembraneTargetComponentsView {
+        membrane_target_components: DesktopMembraneTargetComponentInventoryView,
     },
     DesktopMembraneAgentsView {
         membrane_agents: Vec<DesktopMembraneAgentView>,

@@ -36,15 +36,15 @@ use ansible_mesh_core::{NodeCapabilities, NodeConstraints};
 use anyhow::{Context, bail};
 use ed25519_dalek::SigningKey;
 use philotic_client::{
-    DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
-    DesktopMembraneTargetGuestInventoryView, DesktopMembraneTargetReachabilityView,
-    DesktopMembraneTargetStatusView, DesktopMembraneTargetView, GuestIdentity, HookRoute,
-    HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus,
-    OPERATOR_CHAT_REPLY_ROLE, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
+    ComponentInventoryEntryView, DesktopMembraneAgentView, DesktopMembraneGuestView,
+    DesktopMembraneStatusView, DesktopMembraneTargetGuestInventoryView,
+    DesktopMembraneTargetReachabilityView, DesktopMembraneTargetStatusView,
+    DesktopMembraneTargetView, GuestIdentity, HookRoute, HookSubscription, IpcRequest, IpcResponse,
+    LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
     OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
     OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
-    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
-    ResponseRoutePolicyView, SubagentDelegation,
+    OperatorTargetComponentInventoryView, OperatorTargetGuestInventoryView,
+    OperatorTargetStatusView, PhiloticClient, ResponseRoutePolicyView, SubagentDelegation,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -1340,6 +1340,63 @@ impl IpcServer {
         }
     }
 
+    async fn operator_target_component_inventory_view(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+    ) -> anyhow::Result<OperatorTargetComponentInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+
+        if target_node_id == local_node_id {
+            return Ok(OperatorTargetComponentInventoryView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel: source_hotel.clone(),
+                source_hotel,
+                observation_kind: "local-canonical".into(),
+                available: true,
+                pending_remote_query_state: "none".into(),
+                components: Self::component_inventory_entries(graph, local_node_id)?,
+                note: Some("derived from the local hotel's canonical component inventory".into()),
+            });
+        }
+
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+
+        match Self::query_remote_operator_target_components(
+            graph,
+            local_node_id,
+            target_node_id,
+            &target_hotel,
+        )
+        .await
+        {
+            Ok(view) => Ok(view),
+            Err(err) => Ok(OperatorTargetComponentInventoryView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel,
+                source_hotel,
+                observation_kind: "remote-query-failed".into(),
+                available: false,
+                pending_remote_query_state: "error".into(),
+                components: Vec::new(),
+                note: Some(format!(
+                    "remote target component inventory requires a target-hotel operator query: {}",
+                    err
+                )),
+            }),
+        }
+    }
+
     async fn operator_target_agent_inventory_view(
         registry: &Arc<RwLock<NodeRegistry>>,
         graph: &GraphDomain,
@@ -1660,6 +1717,98 @@ impl IpcServer {
         if view.target_hotel != target_hotel {
             anyhow::bail!(
                 "remote target agents reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
+    }
+
+    async fn query_remote_operator_target_components(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+    ) -> anyhow::Result<OperatorTargetComponentInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.components".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target component inventory".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote component query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("timed out waiting for remote target component reply")
+            })??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote target component reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetComponentInventoryView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote target components reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote target components reply hotel mismatch: expected [{}], got [{}]",
                 target_hotel,
                 view.target_hotel
             );
@@ -2147,7 +2296,10 @@ impl IpcServer {
         drop(guard);
 
         candidates.sort_by(|left, right| {
-            let left_score = left.get("score").and_then(|value| value.as_i64()).unwrap_or(0);
+            let left_score = left
+                .get("score")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
             let right_score = right
                 .get("score")
                 .and_then(|value| value.as_i64())
@@ -5462,6 +5614,46 @@ impl IpcServer {
                     ),
                 }
             }
+            IpcRequest::ListDesktopMembraneTargetComponents { target_node_id } => {
+                match Self::operator_target_component_inventory_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(membrane_target_components) => {
+                        IpcResponse::DesktopMembraneTargetComponentsView {
+                            membrane_target_components,
+                        }
+                    }
+                    Err(err) => IpcResponse::error(
+                        "desktop_membrane_target_components",
+                        "DESKTOP_MEMBRANE_TARGET_COMPONENTS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::QueryOperatorTargetComponents { target_node_id } => {
+                match Self::operator_target_component_inventory_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(operator_target_components) => IpcResponse::OperatorTargetComponentsView {
+                        operator_target_components,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "operator_target_components",
+                        "OPERATOR_TARGET_COMPONENTS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
             IpcRequest::SendOperatorChatTurn {
                 target_node_id,
                 target_agent_id,
@@ -8681,11 +8873,9 @@ impl IpcServer {
             .await
             {
                 Ok(view) => IpcResponse::success("best_place_to_run", Some(view)),
-                Err(err) => IpcResponse::error(
-                    "best_place_to_run",
-                    "PLACEMENT_ERROR",
-                    err.to_string(),
-                ),
+                Err(err) => {
+                    IpcResponse::error("best_place_to_run", "PLACEMENT_ERROR", err.to_string())
+                }
             },
 
             IpcRequest::GetHotelLogs { lines } => {
@@ -9740,24 +9930,18 @@ impl IpcServer {
         }))
     }
 
-    fn handle_list_components(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
+    fn component_inventory_entries(
+        graph: &GraphDomain,
+        local_node_id: &str,
+    ) -> anyhow::Result<Vec<ComponentInventoryEntryView>> {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
             None => {
-                return IpcResponse::error(
-                    "list_components",
-                    "HOTEL_NOT_FOUND",
-                    "local hotel record not found",
-                );
+                anyhow::bail!("local hotel record not found");
             }
         };
 
-        let guests = match graph.list_guests(&hotel_name, false) {
-            Ok(g) => g,
-            Err(e) => {
-                return IpcResponse::error("list_components", "STORAGE_ERROR", e.to_string());
-            }
-        };
+        let guests = graph.list_guests(&hotel_name, false)?;
 
         // Load tool_runner_registry once to enrich tool-runner entries with capabilities.
         let tool_registry: Vec<serde_json::Value> = graph
@@ -9767,7 +9951,7 @@ impl IpcServer {
             .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
             .unwrap_or_default();
 
-        let components: Vec<serde_json::Value> = guests
+        Ok(guests
             .into_iter()
             .map(|g| {
                 let spawn_config = serde_json::from_str::<serde_json::Value>(&g.config_json)
@@ -9838,25 +10022,38 @@ impl IpcServer {
                     })
                     .unwrap_or_default();
 
-                serde_json::json!({
-                    "guest_id": g.guest_id,
-                    "role": g.role,
-                    "hotel": g.hotel_name,
-                    "command": command,
-                    "args": args,
-                    "env": env,
-                    "component_type": component_type,
-                    "is_active": g.is_active,
-                    "auto_start": g.is_active,
-                    "active_pid": g.active_pid,
-                    "last_active_at": g.last_active_at,
-                    "component_config": component_config,
-                    "capabilities": capabilities,
-                })
+                ComponentInventoryEntryView {
+                    guest_id: g.guest_id,
+                    role: g.role,
+                    hotel: g.hotel_name,
+                    command,
+                    args: serde_json::from_value(serde_json::Value::Array(args))
+                        .unwrap_or_default(),
+                    env: serde_json::from_value(env).unwrap_or_default(),
+                    component_type: component_type.into(),
+                    is_active: g.is_active,
+                    auto_start: g.is_active,
+                    active_pid: g.active_pid,
+                    last_active_at: g.last_active_at,
+                    component_config,
+                    capabilities,
+                }
             })
-            .collect();
+            .collect())
+    }
 
-        IpcResponse::ComponentInventory { components }
+    fn handle_list_components(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
+        match Self::component_inventory_entries(graph, local_node_id) {
+            Ok(components) => IpcResponse::ComponentInventory {
+                components: components
+                    .into_iter()
+                    .map(|component| {
+                        serde_json::to_value(component).unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect(),
+            },
+            Err(err) => IpcResponse::error("list_components", "STORAGE_ERROR", err.to_string()),
+        }
     }
 
     async fn handle_set_component_active(
@@ -12862,6 +13059,17 @@ mod tests {
                 operator_target_agents,
             } => operator_target_agents,
             other => panic!("unexpected operator target agents response: {other:?}"),
+        }
+    }
+
+    fn expect_operator_target_components(
+        response: IpcResponse,
+    ) -> OperatorTargetComponentInventoryView {
+        match response {
+            IpcResponse::OperatorTargetComponentsView {
+                operator_target_components,
+            } => operator_target_components,
+            other => panic!("unexpected operator target components response: {other:?}"),
         }
     }
 
@@ -23011,6 +23219,22 @@ mod tests {
         assert_eq!(agents.agents.len(), 1);
         assert_eq!(agents.agents[0].agent_id, "agent-jane-01");
         assert_eq!(agents.agents[0].authority_hotel, "local-hotel");
+
+        let components = expect_operator_target_components(
+            client
+                .send_request(IpcRequest::QueryOperatorTargetComponents {
+                    target_node_id: "local-aiua-01".into(),
+                })
+                .await
+                .expect("operator target components request"),
+        );
+        assert!(components.available);
+        assert_eq!(components.observation_kind, "local-canonical");
+        assert_eq!(components.components.len(), 1);
+        assert_eq!(
+            components.components[0].guest_id,
+            "local-hotel:membrane-gateway"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

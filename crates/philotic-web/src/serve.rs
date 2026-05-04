@@ -24,6 +24,8 @@
 //!   GET  /api/mesh/targets/:target_node_id/status
 //!   GET  /api/mesh/targets/:target_node_id/guests
 //!   GET  /api/mesh/targets/:target_node_id/agents
+//!   GET  /api/mesh/targets/:target_node_id/components
+//!   GET  /api/mesh/targets/:target_node_id/components/:guest_id
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
 //!   GET  /api/event-log
 //!   GET  /api/config
@@ -82,10 +84,12 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use philotic_client::{
-    ComponentManifest, CronJob, CronJobSource, DesktopMembraneAgentView, DesktopMembraneGuestView,
-    DesktopMembraneStatusView, GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
-    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView, OperatorTargetStatusView,
-    OperatorTargetView, PhiloticClient, ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE,
+    ComponentInventoryEntryView, ComponentManifest, CronJob, CronJobSource,
+    DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView, GuestIdentity,
+    IpcRequest, IpcResponse, LeaseEnvelope, OperatorTargetAgentInventoryView,
+    OperatorTargetComponentInventoryView, OperatorTargetGuestInventoryView,
+    OperatorTargetStatusView, OperatorTargetView, PhiloticClient, ResponseRoutePolicyView,
+    OPERATOR_CHAT_REPLY_ROLE,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -144,29 +148,6 @@ struct SetRoutingPolicyDispositionBody {
     state: String,
     reason: String,
 }
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct ComponentInventoryEntry {
-    guest_id: String,
-    role: String,
-    hotel: String,
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
-    component_type: String,
-    is_active: bool,
-    auto_start: bool,
-    #[serde(default)]
-    active_pid: Option<String>,
-    #[serde(default)]
-    last_active_at: Option<u64>,
-    #[serde(default)]
-    component_config: Value,
-    #[serde(default)]
-    capabilities: Vec<String>,
-}
-
 #[derive(Clone, Debug, serde::Serialize)]
 struct ComponentTemplateFieldView {
     key: String,
@@ -647,6 +628,14 @@ pub async fn run(
         .route(
             "/api/mesh/targets/:target_node_id/agents",
             get(handle_mesh_target_agents),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components",
+            get(handle_mesh_target_components),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id",
+            get(handle_mesh_target_component_detail),
         )
         .route(
             "/api/mesh/targets/:target_node_id/agents/:agent_id/chat",
@@ -1909,6 +1898,61 @@ async fn handle_mesh_target_agents(
 
     match ipc_desktop_membrane_target_agents(&state.socket, &target_node_id).await {
         Ok(agents) => Json(agents).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_components(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    match ipc_desktop_membrane_target_components(&state.socket, &target_node_id).await {
+        Ok(components) => Json(components).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_component_detail(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    match ipc_desktop_membrane_target_component(&state.socket, &target_node_id, &guest_id).await {
+        Ok(component) => Json(component).into_response(),
+        Err(err) if err.to_string().contains("component not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "component not found"})),
+        )
+            .into_response(),
         Err(err) => {
             let status_code = if err
                 .to_string()
@@ -4047,6 +4091,41 @@ async fn ipc_desktop_membrane_target_agents(
     }
 }
 
+async fn ipc_desktop_membrane_target_components(
+    socket: &str,
+    target_node_id: &str,
+) -> Result<OperatorTargetComponentInventoryView> {
+    let mut client =
+        connect_management_client(socket, "philotic-web-mesh-target-components").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetComponents {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetComponentsView {
+            operator_target_components,
+        } => Ok(operator_target_components),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target components response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_component(
+    socket: &str,
+    target_node_id: &str,
+    guest_id: &str,
+) -> Result<ComponentInventoryEntryView> {
+    let components = ipc_desktop_membrane_target_components(socket, target_node_id).await?;
+    components
+        .components
+        .into_iter()
+        .find(|component| component.guest_id == guest_id)
+        .ok_or_else(|| anyhow!("component not found"))
+}
+
 async fn ipc_list_role_incarnations(socket: &str, agent_id: &str) -> Result<Value> {
     let mut client = connect_management_client(socket, "philotic-web-roles").await?;
     match client
@@ -4412,13 +4491,13 @@ async fn ipc_revoke_skill(
     }
 }
 
-async fn ipc_list_components(socket: &str) -> Result<Vec<ComponentInventoryEntry>> {
+async fn ipc_list_components(socket: &str) -> Result<Vec<ComponentInventoryEntryView>> {
     let mut client = connect_management_client(socket, "philotic-web-components").await?;
     match client.send_request(IpcRequest::ListComponents {}).await? {
         IpcResponse::ComponentInventory { components } => components
             .into_iter()
             .map(serde_json::from_value)
-            .collect::<Result<Vec<ComponentInventoryEntry>, _>>()
+            .collect::<Result<Vec<ComponentInventoryEntryView>, _>>()
             .map_err(Into::into),
         IpcResponse::Standard {
             ok: false, message, ..
@@ -4427,7 +4506,7 @@ async fn ipc_list_components(socket: &str) -> Result<Vec<ComponentInventoryEntry
     }
 }
 
-async fn ipc_get_component(socket: &str, guest_id: &str) -> Result<ComponentInventoryEntry> {
+async fn ipc_get_component(socket: &str, guest_id: &str) -> Result<ComponentInventoryEntryView> {
     let components = ipc_list_components(socket).await?;
     components
         .into_iter()
@@ -4438,7 +4517,7 @@ async fn ipc_get_component(socket: &str, guest_id: &str) -> Result<ComponentInve
 async fn ipc_register_component(
     socket: &str,
     manifest: ComponentManifest,
-) -> Result<ComponentInventoryEntry> {
+) -> Result<ComponentInventoryEntryView> {
     let guest_id = manifest.guest_id.clone();
     let mut client = connect_management_client(socket, "philotic-web-components").await?;
     match client

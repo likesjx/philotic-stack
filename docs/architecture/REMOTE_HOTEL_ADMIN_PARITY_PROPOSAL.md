@@ -3,7 +3,7 @@ title: Remote Hotel Admin Parity Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: accepted-current-slice
-last_updated: 2026-05-02
+last_updated: 2026-05-04
 tags:
 - desktop
 - remote-admin
@@ -171,10 +171,11 @@ Define remote hotel admin parity as an explicit operator-control-plane seam and 
 First honest slice:
 
 1. define the remote admin contract family
-2. enumerate which existing local desktop mutations should gain remote parity first
-3. keep target-scoped grants explicit
-4. keep secret handling ref-shaped and target-owned
-5. hook placement and handoff decisions into the same surface
+2. land remote component inventory/detail parity through the existing `operator.targets.*` control-plane path
+3. enumerate which existing local desktop mutations should gain remote parity next
+4. keep target-scoped grants explicit
+5. keep secret handling ref-shaped and target-owned
+6. hook placement and handoff decisions into the same surface
 
 This slice is intentionally architectural and sequencing-oriented, not a claim that the whole remote admin plane is implemented today.
 
@@ -183,6 +184,7 @@ This slice is intentionally architectural and sequencing-oriented, not a claim t
 Land these in order:
 
 1. remote component inventory + detail parity
+  Current truth: landed through `/api/mesh/targets/:target_node_id/components` plus `/api/mesh/targets/:target_node_id/components/:guest_id`, backed by the same hotel-mediated operator query seam as target status/guest/agent reads.
 2. remote component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`)
 3. remote config read/mutate parity for bounded operator-approved keys
 4. remote secrets/vault-ref inventory and rotation workflows
