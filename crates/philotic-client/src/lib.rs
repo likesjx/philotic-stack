@@ -603,6 +603,10 @@ fn default_training_limit() -> usize {
     20
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
@@ -1208,6 +1212,24 @@ pub enum IpcRequest {
         #[serde(default)]
         agent_id: Option<String>,
     },
+    // ── ASR provider lifecycle ────────────────────────────────────────────────
+    /// Set up the Parakeet ASR provider: verify/install nemo-toolkit, write
+    /// component config, and register the guest for materialization.
+    /// Responds with [`IpcResponse::Standard`] (data.message).
+    AsrSetup {
+        /// Python interpreter path (default: "python3").
+        #[serde(default)]
+        python_path: Option<String>,
+        /// NeMo model name (default: nvidia/parakeet-tdt-0.6b-v2).
+        #[serde(default)]
+        model_name: Option<String>,
+        /// If true, attempt `pip install nemo-toolkit[asr]` when the import check fails.
+        #[serde(default = "default_true")]
+        auto_install: bool,
+    },
+    /// Return the current status of the Parakeet ASR provider (guest active, nemo available).
+    /// Responds with [`IpcResponse::Standard`] (data.status).
+    AsrStatus {},
     /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
     /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
     GracefulShutdown {

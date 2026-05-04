@@ -2130,9 +2130,27 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
                 "command": "graph-runner",
                 "args": [],
                 "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_GRAPH_RUNNER_ID": format!("{hotel_name}:graph-runner")
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:graph-datasource"),
+            role: "graph-datasource".into(),
+            config_json: serde_json::json!({
+                "command": "graph-datasource",
+                "args": [],
+                "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path,
                     "PHILOTIC_NODE_ID": node_id,
-                    "PHILOTIC_GRAPH_RUNNER_ID": format!("{hotel_name}:graph-runner")
+                    "PHILOTIC_GRAPH_DATASOURCE_ID": format!("{hotel_name}:graph-datasource")
                 }
             })
             .to_string(),
@@ -2315,13 +2333,18 @@ fn merge_agent_entries(
         }
     }
 
-    // Promote voice_id from voice_response_policy to elevenlabs_voice_id as a named fallback
-    // so model-router ProviderConfigs can pick it up without knowing about VoiceResponsePolicy.
-    if let Some(voice_id) = agent
+    // Promote the ElevenLabs-specific voice_id to elevenlabs_voice_id so model-router
+    // ProviderConfigs can pick it up without knowing about VoiceResponsePolicy.
+    // Prefer voice_ids.elevenlabs over the top-level voice_id (which belongs to onnx).
+    let elevenlabs_id = agent
         .get("voice_response_policy")
-        .and_then(|p| p.get("voice_id"))
-        .filter(|v| v.is_string())
-    {
+        .and_then(|p| {
+            p.get("voice_ids")
+                .and_then(|m| m.get("elevenlabs"))
+                .filter(|v| v.is_string())
+                .or_else(|| p.get("voice_id").filter(|v| v.is_string()))
+        });
+    if let Some(voice_id) = elevenlabs_id {
         merged
             .entry("elevenlabs_voice_id".to_string())
             .or_insert_with(|| voice_id.clone());
@@ -2816,6 +2839,46 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             class: "training".into(),
             tool_markers: Vec::new(),
         },
+        AbstractToolRecord {
+            tool_name: "asr.setup".into(),
+            description: "Set up the Parakeet ASR provider on this node: verifies Python + nemo-toolkit, \
+                          optionally installs nemo-toolkit[asr] via pip, writes the component config, \
+                          and registers the model-controller-parakeet guest for automatic materialization. \
+                          python_path defaults to 'python3'; auto_install defaults to true."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "python_path": {
+                        "type": "string",
+                        "description": "Python interpreter path (must have or will get nemo-toolkit)."
+                    },
+                    "model_name": {
+                        "type": "string",
+                        "description": "NeMo model name (default: nvidia/parakeet-tdt-0.6b-v2)."
+                    },
+                    "auto_install": {
+                        "type": "boolean",
+                        "description": "Attempt pip install if nemo import fails (default: true)."
+                    }
+                }
+            }),
+            class: "asr".into(),
+            tool_markers: vec!["high_agency".into()],
+        },
+        AbstractToolRecord {
+            tool_name: "asr.status".into(),
+            description: "Return the current status of the Parakeet ASR provider: whether the guest \
+                          is registered and active, its PID if running, and whether nemo-toolkit is \
+                          importable on this node."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: "asr".into(),
+            tool_markers: Vec::new(),
+        },
     ];
 
     for tool in &catalog {
@@ -3003,6 +3066,66 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             ..Default::default()
         },
+        AbstractSkillRecord {
+            skill_name: "inference.scripting".into(),
+            description: "Write, test, and iterate on Python inference scripts for local ML model \
+                          runners. Understands the script contract: receives audio/image path and \
+                          arguments via CLI, returns structured JSON on stdout. Uses bash.exec to \
+                          validate scripts against real data before committing. Writes finalized \
+                          scripts to the hotel's profile script directory so the Rust runner picks \
+                          them up without a recompile. Pairs with asr.admin and vision.admin for \
+                          full model provisioning."
+                .into(),
+            implied_tools: vec!["bash.exec".into()],
+            field_sources: serde_json::json!({
+                "contract": {
+                    "stdout": "JSON object with at minimum a 'text' or 'result' key",
+                    "stderr": "human-readable error messages only",
+                    "exit_code": "0 on success, non-zero on failure"
+                },
+                "script_dir": "~/.philotic/<profile>/scripts/",
+                "naming": "<model_slug>_infer.py  (e.g. parakeet_infer.py, falcon_ground_infer.py)",
+                "workflow": "draft → bash.exec test → iterate → write to script_dir → verify via status tool"
+            }),
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "asr.admin".into(),
+            description: "Provision and maintain ASR model runners on this node. Covers the full \
+                          lifecycle: check Python environment, write or refine the inference script \
+                          (pairs with inference.scripting), run asr.setup to register the guest, \
+                          verify with asr.status, and manage the training data pipeline \
+                          (capture → correct → export). Use when onboarding a new ASR model or \
+                          when transcription quality needs improvement."
+                .into(),
+            implied_tools: vec![
+                "asr.setup".into(),
+                "asr.status".into(),
+                "training.list".into(),
+                "training.correct".into(),
+                "training.export".into(),
+                "training.status".into(),
+            ],
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "vision.admin".into(),
+            description: "Provision and maintain vision model runners on this node. Covers: write \
+                          or refine the inference script for a grounding or OCR model \
+                          (pairs with inference.scripting), run vision.setup to register the guest, \
+                          verify with vision.status, and invoke image.ground or image.ocr to \
+                          validate output quality. Use when onboarding Falcon Perception, Falcon OCR, \
+                          or any script-hosted vision model."
+                .into(),
+            implied_tools: vec![
+                "vision.setup".into(),
+                "vision.status".into(),
+                "image.ground".into(),
+                "image.ocr".into(),
+            ],
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -3032,8 +3155,13 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "workspace.read".into(),
                 "bash.exec".into(),
                 "delegate.whisper".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
+                "graph.drop".into(),
+                "graph.grant_access".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "graph".into()],
             allowed_skills: vec![
                 "handoff.to_role".into(),
                 "handoff.back".into(),
@@ -3054,6 +3182,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "skill.list".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "workspace".into()],
             allowed_skills: vec!["handoff.back".into(), "capability.request".into()],
@@ -3061,14 +3192,28 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
         },
         ToolsetProfileRecord {
             profile_name: "research".into(),
-            allowed_tools: vec!["session.status".into(), "echo".into(), "skill.list".into()],
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "skill.list".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
+            ],
             allowed_classes: vec!["session".into(), "utility".into()],
             allowed_skills: vec!["handoff.back".into(), "capability.request".into()],
             description: Some("Research specialist role profile — minimal tool surface.".into()),
         },
         ToolsetProfileRecord {
             profile_name: "utility".into(),
-            allowed_tools: vec!["session.status".into(), "echo".into(), "skill.list".into()],
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "skill.list".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
+            ],
             allowed_classes: vec!["session".into(), "utility".into()],
             allowed_skills: vec!["capability.request".into()],
             description: Some("Bare utility profile — session and echo only.".into()),
@@ -3098,6 +3243,13 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "training.correct".into(),
                 "training.export".into(),
                 "training.status".into(),
+                "asr.setup".into(),
+                "asr.status".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
+                "graph.drop".into(),
+                "graph.grant_access".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -3105,6 +3257,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "config".into(),
                 "shell".into(),
                 "training".into(),
+                "asr".into(),
+                "graph".into(),
             ],
             allowed_skills: vec![
                 "skill.crafting".into(),
@@ -3115,9 +3269,12 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
                 "training.admin".into(),
+                "inference.scripting".into(),
+                "asr.admin".into(),
+                "vision.admin".into(),
             ],
             description: Some(
-                "Admin role profile — full skill crafting, role governance, and training data authority.".into(),
+                "Admin role profile — full skill crafting, role governance, training data authority, ASR provisioning, and vision model provisioning.".into(),
             ),
         },
         ToolsetProfileRecord {
@@ -3132,8 +3289,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "graph".into()],
             allowed_skills: vec!["handoff.back".into(), "capability.request".into(), "memory.fix".into()],
             description: Some(
                 "Architect specialist role profile — systems, infrastructure, debugging. \
@@ -3143,7 +3303,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
         },
         ToolsetProfileRecord {
             profile_name: "virtuoso".into(),
-            allowed_tools: vec!["session.status".into(), "echo".into(), "skill.list".into()],
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "skill.list".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
+            ],
             allowed_classes: vec!["session".into(), "utility".into()],
             allowed_skills: vec!["handoff.back".into()],
             description: Some(
@@ -3205,6 +3372,14 @@ Your roles are pre-configured and persist in the hotel database. They survive re
 - Use role.set_home to pin a role to a specific hotel (or clear the pin to run on this hotel).
 - Do NOT create new roles speculatively — the roster is set by the operator. If you need a new role, surface the request explicitly and wait for operator approval.
 - After any role update, hand off only when the operator asked to use it immediately.
+
+## role.create_or_update — hard constraints
+
+This tool writes a role DEFINITION. It is NOT an activation step.
+- NEVER call role.create_or_update before handoff.to_role or delegate.whisper.
+- NEVER call role.create_or_update because a user asked to switch roles or talk to a role.
+- If a role already exists, use handoff.to_role directly — no prior create_or_update needed.
+- Only call role.create_or_update when the operator explicitly asks you to create or change a role's definition (manifest, toolset, identity). A voice note asking to switch roles or talk to a role is NOT such a request.
 
 Rules:
 - Do not bypass the approval gate; if a tool requires operator approval, surface it clearly.

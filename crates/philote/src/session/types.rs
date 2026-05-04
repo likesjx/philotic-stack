@@ -2,6 +2,7 @@ use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
 use crate::reflex::MaterializationContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,9 @@ pub enum ContextLayerId {
     /// Authoritative operational rules derived from the agent graph at runtime.
     /// Distinct from identity prose — treated as hard constraints, not suggestions.
     Rules,
+    /// Structured knowledge the agent has stored in its own graph partition.
+    /// Entities, relationships, and facts retrieved via GraphRAG at session load.
+    AgentGraph,
 }
 
 impl ContextLayerId {
@@ -37,6 +41,7 @@ impl ContextLayerId {
             Self::Knowledge => "knowledge",
             Self::RecalledMemory => "recalled_memory",
             Self::Rules => "rules",
+            Self::AgentGraph => "agent_graph",
         }
     }
 }
@@ -482,12 +487,20 @@ pub struct VoiceResponsePolicy {
     /// Controls when the agent synthesizes speech for its responses.
     #[serde(default)]
     pub mode: TtsMode,
-    /// Voice synthesis provider hint (e.g. "elevenlabs").
+    /// Voice synthesis provider hint (e.g. "elevenlabs", "onnx").
     #[serde(default)]
     pub provider: Option<String>,
-    /// The agent's permanent voice identity — a provider-specific voice ID.
+    /// The agent's default voice identity — a provider-specific voice ID.
+    /// Prefer `effective_voice_id()` over reading this directly; it checks
+    /// `voice_ids` first so per-provider IDs are returned when the right
+    /// provider is active.
     #[serde(default)]
     pub voice_id: Option<String>,
+    /// Per-provider voice IDs. Populated when `/voice <provider> <id>` is used
+    /// at runtime, and seeded from `voice_id` on the initial provider at load time.
+    /// Allows lossless switching between providers.
+    #[serde(default)]
+    pub voice_ids: HashMap<String, String>,
     /// Provider model override (e.g. "eleven_multilingual_v2").
     #[serde(default)]
     pub model: Option<String>,
@@ -525,6 +538,41 @@ impl VoiceResponsePolicy {
             TtsMode::Auto => false,
         }
     }
+
+    /// Returns the voice ID to use for the current provider.
+    /// Checks the per-provider `voice_ids` map first, then falls back to the
+    /// legacy `voice_id` field. Always use this instead of reading `voice_id` directly.
+    pub fn effective_voice_id(&self) -> Option<&str> {
+        if let Some(provider) = self.provider.as_deref() {
+            if let Some(id) = self.voice_ids.get(provider) {
+                return Some(id.as_str());
+            }
+        }
+        self.voice_id.as_deref()
+    }
+
+    /// Seeds `voice_ids` from the initial `voice_id` + `provider` so that
+    /// switching away and back recovers the original ID automatically.
+    pub fn seed_voice_ids(&mut self) {
+        if let (Some(provider), Some(voice_id)) =
+            (self.provider.as_deref(), self.voice_id.as_deref())
+        {
+            self.voice_ids
+                .entry(provider.to_string())
+                .or_insert_with(|| voice_id.to_string());
+        }
+    }
+
+    /// Switches provider, updating `voice_ids` and returning the resolved voice ID.
+    /// When `new_voice_id` is given it is persisted for this provider.
+    /// When omitted the previously stored ID for the provider is used if available.
+    pub fn switch_provider(&mut self, new_provider: &str, new_voice_id: Option<&str>) -> Option<String> {
+        self.provider = Some(new_provider.to_string());
+        if let Some(vid) = new_voice_id {
+            self.voice_ids.insert(new_provider.to_string(), vid.to_string());
+        }
+        self.voice_ids.get(new_provider).cloned()
+    }
 }
 
 impl Default for VoiceResponsePolicy {
@@ -533,6 +581,7 @@ impl Default for VoiceResponsePolicy {
             mode: TtsMode::Off,
             provider: None,
             voice_id: None,
+            voice_ids: HashMap::new(),
             model: None,
             delivery_mode: VoiceDeliveryMode::Synthesized,
             speed_percent: None,

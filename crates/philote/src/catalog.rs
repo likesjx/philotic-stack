@@ -202,6 +202,126 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "graph.create".into(),
+        ToolDefinition {
+            tool_name: "graph.create".into(),
+            description: "Create a new named graph partition in the agent graph store. \
+                          Omit graph_id to create your own personal partition (keyed to your agent_id). \
+                          Each partition is an isolated SQLite-backed Cypher graph you own and can query."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Partition name (defaults to your agent_id if omitted)."
+                    }
+                }
+            }),
+            class: Some("graph".into()),
+        },
+    );
+
+    m.insert(
+        "graph.query".into(),
+        ToolDefinition {
+            tool_name: "graph.query".into(),
+            description: "Run a Cypher query against a graph partition. \
+                          Use this to read or write structured knowledge — entities, relationships, \
+                          and typed records — in the agent graph store. \
+                          Omit graph_id to query your own partition. \
+                          Supported patterns: MATCH (n:Label) RETURN n, \
+                          CREATE (n:Label {id:'...', ...}), \
+                          CREATE (a:L {id:'A'})-[:REL]->(b:L {id:'B'})."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Partition to query (defaults to your agent_id)."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Cypher query string."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Optional query parameters.",
+                        "default": {}
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: Some("graph".into()),
+        },
+    );
+
+    m.insert(
+        "graph.list".into(),
+        ToolDefinition {
+            tool_name: "graph.list".into(),
+            description: "List all graph partitions accessible to you in the agent graph store."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("graph".into()),
+        },
+    );
+
+    m.insert(
+        "graph.drop".into(),
+        ToolDefinition {
+            tool_name: "graph.drop".into(),
+            description: "Permanently drop a graph partition and all its data. \
+                          Only drop partitions you own."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Partition to drop."
+                    }
+                },
+                "required": ["graph_id"]
+            }),
+            class: Some("graph".into()),
+        },
+    );
+
+    m.insert(
+        "graph.grant_access".into(),
+        ToolDefinition {
+            tool_name: "graph.grant_access".into(),
+            description: "Grant another agent read or write access to one of your graph partitions."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Partition to share."
+                    },
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Agent to grant access to."
+                    },
+                    "access": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "description": "Access level to grant."
+                    }
+                },
+                "required": ["graph_id", "agent_id", "access"]
+            }),
+            class: Some("graph".into()),
+        },
+    );
+
+    m.insert(
         "workspace.list".into(),
         ToolDefinition {
             tool_name: "workspace.list".into(),
@@ -717,13 +837,16 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "role.create_or_update".into(),
         ToolDefinition {
             tool_name: "role.create_or_update".into(),
-            description: "Governed workflow surface for creating or updating a role incarnation for \
-                          the current agent identity. Use this to validate and apply a role lens \
-                          deliberately, including purpose, toolset, handoff posture, and limits. \
-                          Runtime execution currently resolves through the low-level role.configure \
-                          hotel mutation path for compatibility. Always include role_name, \
-                          toolset_profile, and the full reasoning object with purpose, \
-                          toolset_rationale, and handoff_posture_and_limits."
+            description: "Creates or modifies a role DEFINITION in the hotel database — it writes \
+                          a role's manifest, toolset profile, and identity addendum. This is a \
+                          configuration-only operation: it does NOT activate, switch to, or hand \
+                          off to the role. Do NOT call this before handoff.to_role or \
+                          delegate.whisper. If a role already exists and you want to switch to it, \
+                          use handoff.to_role directly without calling this first. Only call this \
+                          when the operator explicitly asks you to create a new role or change an \
+                          existing role's definition. Always include role_name, toolset_profile, \
+                          and the full reasoning object with purpose, toolset_rationale, and \
+                          handoff_posture_and_limits."
                 .into(),
             input_schema: json!({
                 "type": "object",

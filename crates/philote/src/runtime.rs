@@ -150,8 +150,7 @@ fn voice_response_provider_options(policy: &VoiceResponsePolicy) -> Map<String, 
     }
 
     if let Some(voice_id) = policy
-        .voice_id
-        .as_deref()
+        .effective_voice_id()
         .map(str::trim)
         .filter(|voice_id| !voice_id.is_empty())
     {
@@ -794,8 +793,9 @@ impl AgentRuntime {
                 value_json: Some(json),
                 ..
             }) => match serde_json::from_str::<AgentProfile>(&json) {
-                Ok(profile) => {
+                Ok(mut profile) => {
                     info!(agent_id = %self.agent_id, "Agent profile loaded from hotel.");
+                    profile.voice_response_policy.seed_voice_ids();
                     self.default_agent_profile = profile;
                 }
                 Err(e) => warn!("Failed to parse agent profile bundle: {}", e),
@@ -1467,6 +1467,11 @@ impl AgentRuntime {
                                 warn!("Failed to forward streaming_token: {}", err);
                             }
                         }
+                        Ok(task) if task.action.as_deref() == Some("datasource_response") => {
+                            if let Err(err) = self.handle_datasource_response(task).await {
+                                warn!("Failed to handle datasource_response: {}", err);
+                            }
+                        }
                         Ok(task) => {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_user_message(task, task_id).await {
@@ -1756,6 +1761,44 @@ impl AgentRuntime {
 
         self.ensure_session_loaded(&session_id, &source).await?;
         self.refresh_bindings_from_snapshot(&session_id).await;
+
+        // Fire-and-forget: fetch the agent's personal knowledge graph once per session load.
+        let should_preload = self
+            .sessions
+            .get_mut(&session_id)
+            .map(|s| {
+                if !s.graph_preload_dispatched {
+                    s.graph_preload_dispatched = true;
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+
+        if should_preload {
+            let node_id = local_node_id();
+            let agent_id = self.agent_id.clone();
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: node_id.clone(),
+                    target_role: "graph-datasource".into(),
+                    target_guest_id: None,
+                    task_json: serde_json::json!({
+                        "action": "graph.query",
+                        "graph_id": agent_id,
+                        "query": "MATCH (n) RETURN n",
+                        "reply_to": node_id,
+                        "reply_role": "agent",
+                        "session_id": session_id,
+                        "turn_id": "",
+                        "chat_id": "",
+                    })
+                    .to_string(),
+                })
+                .await;
+        }
 
         let (final_reply_to, final_reply_role, final_reply_guest_id) = {
             let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
@@ -4438,6 +4481,10 @@ impl AgentRuntime {
             let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
             state.set_pending_text_reply(display_text.clone());
             state.set_active_turn_phase(TurnPhase::WaitingVoice);
+            // Reset the stuck-turn timer so WaitingVoice gets its own full budget.
+            // Without this, time spent in earlier waiting phases (WaitingModel retries)
+            // counts against the WaitingVoice deadline and fires the watchdog too early.
+            self.stuck_turn_first_seen.remove(&session_id);
             (
                 task_id,
                 chat_id,
@@ -4479,7 +4526,7 @@ impl AgentRuntime {
             session_id,
             turn_id,
             target_role,
-            policy.voice_id.as_deref(),
+            policy.effective_voice_id(),
         );
 
         let provider_options = if let Some(speed_percent) = policy.speed_percent {
@@ -4498,7 +4545,7 @@ impl AgentRuntime {
             "request_class": "synthesis",
             "provider": policy.provider,
             "spoken_text": spoken_text.unwrap_or_else(|| strip_markup(&display_text)),
-            "voice_id": policy.voice_id,
+            "voice_id": policy.effective_voice_id(),
             "model": policy.model,
             "provider_options": provider_options,
             "session_id": session_id,
@@ -4783,22 +4830,20 @@ impl AgentRuntime {
         self.drain_next_user_task(&attend_session_id);
 
         // Attend hook (Slice E): fire-and-forget autobiographical memory write.
-        if let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) {
+        // Only saves when the model provided an explicit memory_candidate — raw turn
+        // content is never written as a fallback so the vault stays signal-only.
+        if let (Some(engine), Some(candidate)) = (
+            self.memory_engine_for(&self.agent_id, &self.agent_id),
+            memory_candidate,
+        ) {
             let agent_id = self.agent_id.clone();
-            let default_concept =
-                memory_concept.unwrap_or_else(|| format!("turn:{}", attend_turn_id));
-            let memory_candidate = memory_candidate.unwrap_or_else(|| MemoryCandidate {
-                concept: default_concept,
-                content: attend_content.clone(),
-                tags: Vec::new(),
-            });
             let mut tags = vec![
                 format!("agent:{}", agent_id),
                 format!("session:{}", attend_session_id),
             ];
-            tags.extend(memory_candidate.tags);
-            let concept = memory_candidate.concept;
-            let content_snapshot = memory_candidate.content;
+            tags.extend(candidate.tags);
+            let concept = memory_concept.unwrap_or(candidate.concept);
+            let content_snapshot = candidate.content;
             tokio::spawn(async move {
                 use memory_core::MemoryEngine as _;
                 if let Err(e) = engine
@@ -5706,6 +5751,49 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Store the result from a fire-and-forget graph.query preload into the session snapshot.
+    /// The snapshot is then injected as an AgentGraph context layer on the next model call.
+    async fn handle_datasource_response(&mut self, task: InboundTaskPayload) -> Result<()> {
+        let session_id = match &task.session_id {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => return Ok(()),
+        };
+
+        // Only handle graph.query preload responses; other datasource responses may arrive
+        // for user-initiated tool calls which have their own result path.
+        if task.capability.as_deref() != Some("graph.query") {
+            return Ok(());
+        }
+
+        let data = task
+            .result
+            .as_ref()
+            .and_then(|r| r.get("data"))
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = data
+            .iter()
+            .filter_map(|node| {
+                let label = node.get("label").and_then(|v| v.as_str())?;
+                let props = node.get("properties").cloned().unwrap_or(serde_json::json!({}));
+                Some(format!("{label}: {props}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.agent_graph_snapshot = Some(snapshot);
+        }
+
+        Ok(())
+    }
+
     /// Handle `/approval clear [reason]` — explicitly cancel and drop a parked approval
     /// turn, unblocking the session. Sends a cancellation notice to the original chat so
     /// the user sees it instead of "typing" forever, then acks the operator's command.
@@ -6544,17 +6632,22 @@ impl AgentRuntime {
                 let policy = &mut state.agent_profile.voice_response_policy;
                 match provider.as_deref() {
                     Some(p) => {
-                        policy.provider = Some(p.to_string());
-                        if let Some(vid) = voice_id.as_deref() {
-                            policy.voice_id = Some(vid.to_string());
-                            format!("Switched to {p} voice, using {vid} for this session.")
-                        } else {
-                            format!("Switched to {p} voice for this session.")
+                        let resolved = policy.switch_provider(p, voice_id.as_deref());
+                        match (voice_id.as_deref(), resolved.as_deref()) {
+                            (Some(vid), _) => {
+                                format!("Switched to {p} voice, using {vid} for this session.")
+                            }
+                            (None, Some(stored)) => {
+                                format!("Switched to {p} voice, using stored ID {stored}.")
+                            }
+                            (None, None) => {
+                                format!("Switched to {p} voice. No voice ID stored for {p} — use `/voice {p} <id>` to set one.")
+                            }
                         }
                     }
                     None => {
                         let current_provider = policy.provider.as_deref().unwrap_or("default");
-                        let current_voice = policy.voice_id.as_deref().unwrap_or("default");
+                        let current_voice = policy.effective_voice_id().unwrap_or("default");
                         format!(
                             "Current voice provider: {current_provider}, voice: {current_voice}."
                         )
@@ -8739,6 +8832,116 @@ impl AgentRuntime {
                 .await
             }
 
+            "asr.setup" => {
+                use philotic_client::IpcRequest;
+                let args = payload.arguments.as_object();
+                let python_path = args
+                    .and_then(|a| a.get("python_path"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let model_name = args
+                    .and_then(|a| a.get("model_name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let auto_install = args
+                    .and_then(|a| a.get("auto_install"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::AsrSetup {
+                        python_path,
+                        model_name,
+                        auto_install,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                        let msg = data
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("ASR provider configured.")
+                            .to_string();
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("asr.setup: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("asr.setup: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "asr.status" => {
+                use philotic_client::IpcRequest;
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::AsrStatus {})
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                        let registered = data.get("registered").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let active = data.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let pid = data.get("pid").and_then(|v| v.as_str()).unwrap_or("none");
+                        let nemo = data.get("nemo_available").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let guest_id = data.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?");
+                        let content = format!(
+                            "Parakeet ASR status:\n  guest: {guest_id}\n  registered: {registered}\n  active: {active}\n  pid: {pid}\n  nemo_available: {nemo}"
+                        );
+                        (content, None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("asr.status: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("asr.status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             "handoff.to_role" => {
                 let args = payload.arguments.as_object();
                 let role_name = args
@@ -10426,10 +10629,27 @@ impl AgentRuntime {
                     == Some(session_id)
                 {
                     if let Some(mut state) = SessionState::from_checkpoint(&checkpoint) {
+                        // Preserve runtime voice switches from the checkpoint before
+                        // overwriting agent_profile with the live hotel config.
+                        let checkpoint_voice_ids =
+                            state.agent_profile.voice_response_policy.voice_ids.clone();
+                        let checkpoint_provider =
+                            state.agent_profile.voice_response_policy.provider.clone();
+
                         // Overwrite the restored agent_profile with the live default so
                         // voice routing, media policy, and reflex configuration always
                         // reflect the current hotel config rather than a stale snapshot.
                         state.agent_profile = self.default_agent_profile.clone();
+
+                        // Restore any runtime voice provider/ID switches the user made
+                        // during the session so they follow the philote across restarts.
+                        if !checkpoint_voice_ids.is_empty() {
+                            state.agent_profile.voice_response_policy.voice_ids =
+                                checkpoint_voice_ids;
+                        }
+                        if let Some(provider) = checkpoint_provider {
+                            state.agent_profile.voice_response_policy.provider = Some(provider);
+                        }
                         // Re-apply reflex materialization from the restored profile.
                         state.apply_reflex_materialization();
                         Self::fetch_and_inject_rules(

@@ -377,9 +377,12 @@ impl GeminiProvider {
             .join("\n");
 
         let memory_instruction = if wants_concept {
-            " Also include \"memory_candidate\" with fields: \"concept\" (short kebab-case slug), \
-             \"content\" (compact autobiographical memory text for this exchange), and optional \
-             \"tags\" (array of short strings)."
+            " If — and only if — this exchange contains something genuinely worth remembering \
+             (a user preference, a decision made, a fact learned, or a pattern worth recalling later), \
+             include \"memory_candidate\" with fields: \"concept\" (short kebab-case slug), \
+             \"content\" (one or two sentences distilling what is worth keeping), and optional \
+             \"tags\" (array of short strings). Omit memory_candidate entirely for routine \
+             exchanges, simple questions, greetings, or transient state."
         } else {
             ""
         };
@@ -409,6 +412,7 @@ impl GeminiProvider {
         if wants_concept {
             properties["memory_candidate"] = json!({
                 "type": "OBJECT",
+                "nullable": true,
                 "properties": {
                     "concept": { "type": "STRING" },
                     "content": { "type": "STRING" },
@@ -419,6 +423,7 @@ impl GeminiProvider {
                 },
                 "required": ["concept", "content"]
             });
+            // Not pushed to required — model omits it when there's nothing worth saving.
         }
         if wants_plan {
             properties["active_plan"] = json!({
@@ -475,11 +480,14 @@ impl GeminiProvider {
     ) -> Value {
         let system_text = if wants_concept {
             "When generating your response, produce a JSON object with \"display_text\" \
-             (your full response formatted for text display, markdown is fine), \
+             (your full response formatted for text display, markdown is fine) and \
              \"spoken_text\" (a natural, expressive version for voice delivery — no markdown, \
-             conversational tone, written to be heard), and \"memory_candidate\" \
-             (an object with \"concept\" as a short kebab-case topic slug, \"content\" as a compact \
-             autobiographical memory text for this exchange, and optional \"tags\" as an array of strings)."
+             conversational tone, written to be heard). If — and only if — this exchange contains \
+             something genuinely worth remembering (a user preference, a decision, a fact learned, \
+             or a recurring pattern), also include \"memory_candidate\" (an object with \"concept\" \
+             as a short kebab-case slug, \"content\" as one or two sentences distilling what is \
+             worth keeping, and optional \"tags\"). Omit memory_candidate entirely for routine \
+             exchanges, greetings, or transient state."
         } else {
             "When generating your response, produce a JSON object with two fields: \
              \"display_text\" (your full response formatted for text display, \
@@ -496,6 +504,7 @@ impl GeminiProvider {
         if wants_concept {
             properties["memory_candidate"] = json!({
                 "type": "OBJECT",
+                "nullable": true,
                 "properties": {
                     "concept": { "type": "STRING" },
                     "content": { "type": "STRING" },
@@ -506,7 +515,7 @@ impl GeminiProvider {
                 },
                 "required": ["concept", "content"]
             });
-            required.push("memory_candidate");
+            // Not pushed to required — model omits when nothing is worth saving.
         }
         if wants_plan {
             properties["active_plan"] = json!({

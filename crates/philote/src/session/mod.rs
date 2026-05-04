@@ -133,6 +133,11 @@ pub struct SessionState {
     /// Maps tool_name → required consecutive successes.
     /// Populated by the `approval.request_standing` planning tool.
     pub pending_preapproval_thresholds: std::collections::HashMap<String, u32>,
+    /// Structured knowledge fetched from the agent's own graph partition at session load.
+    /// None = not yet fetched. Some("") = fetched but empty. Some(text) = ready to inject.
+    pub agent_graph_snapshot: Option<String>,
+    /// Whether a graph preload has been dispatched this session (to avoid duplicate fetches).
+    pub graph_preload_dispatched: bool,
 }
 
 impl SessionState {
@@ -166,6 +171,8 @@ impl SessionState {
             parked_plan_since: None,
             tool_success_streak: std::collections::HashMap::new(),
             pending_preapproval_thresholds: std::collections::HashMap::new(),
+            agent_graph_snapshot: None,
+            graph_preload_dispatched: false,
         }
     }
 
@@ -1675,6 +1682,20 @@ impl SessionState {
             );
         }
 
+        if let Some(graph_content) = self.agent_graph_snapshot.as_deref().filter(|s| !s.is_empty()) {
+            self.push_layer(
+                &mut layers,
+                &mut contributions,
+                ContextLayerId::AgentGraph,
+                "graph_datasource:agent_partition",
+                ContextAuthority::Advisory,
+                ContextMutability::Refreshable,
+                graph_content.to_string(),
+                vec!["agent_graph_snapshot".into()],
+                "graph_candidate",
+            );
+        }
+
         ContextProjection {
             conversation_turn: ConversationTurnScope {
                 conversation_turn_id: turn_id,
@@ -1738,6 +1759,7 @@ impl SessionState {
                 ContextLayerId::Working => "Working projection",
                 ContextLayerId::Knowledge => "Knowledge projection",
                 ContextLayerId::RecalledMemory => "Recalled memory projection",
+                ContextLayerId::AgentGraph => "Agent knowledge graph",
             };
             prompt.push_str(&format!("\n[{title}]\n"));
             prompt.push_str(&layer.rendered_content);
@@ -1782,6 +1804,7 @@ impl SessionState {
                     ContextLayerId::Relationship
                         | ContextLayerId::Knowledge
                         | ContextLayerId::RecalledMemory
+                        | ContextLayerId::AgentGraph
                 )
             })
             .map(|layer| {
@@ -1789,6 +1812,7 @@ impl SessionState {
                     ContextLayerId::Relationship => "relationship",
                     ContextLayerId::Knowledge => "knowledge",
                     ContextLayerId::RecalledMemory => "recalled_memory",
+                    ContextLayerId::AgentGraph => "agent_graph",
                     _ => "memory",
                 };
                 projection_item(&layer.rendered_content, &layer.owner, kind)
@@ -2993,6 +3017,8 @@ impl SessionState {
             parked_plan_since: None,
             tool_success_streak,
             pending_preapproval_thresholds,
+            agent_graph_snapshot: None,
+            graph_preload_dispatched: false,
         })
     }
 }
@@ -3158,6 +3184,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         .map(|tool_name| {
             let execution_mode = if is_local_agent_tool(tool_name) {
                 "local_agent"
+            } else if is_graph_datasource_tool(tool_name) {
+                "datasource"
             } else if is_pinned_tool(tool_name) {
                 "pinned"
             } else {
@@ -3169,6 +3197,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     target_node: local_node_id.clone(),
                     target_role: if execution_mode == "local_agent" {
                         "agent".into()
+                    } else if execution_mode == "datasource" {
+                        "graph-datasource".into()
                     } else {
                         format!("tool.{tool_name}")
                     },
@@ -3190,6 +3220,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
                         "agent_local_tool".into()
+                    } else if execution_mode == "datasource" {
+                        "graph_datasource_route".into()
                     } else if execution_mode == "pinned" {
                         "default_pinned_route".into()
                     } else {
@@ -3267,10 +3299,19 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "subagent.spawn"
             | "role.configure"
             | "role.create_or_update"
+            | "role.list"
+            | "role.set_home"
             | "handoff.to_role"
             | "handoff.back"
             | "delegate.whisper"
             | "approval.request_standing"
+    )
+}
+
+fn is_graph_datasource_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "graph.query" | "graph.create" | "graph.drop" | "graph.list" | "graph.grant_access"
     )
 }
 

@@ -2326,6 +2326,7 @@ impl IpcServer {
                     let training_storage = self.training_storage.clone();
                     let network_broadcast_rx = self.network_broadcast.subscribe();
                     let operator_surface_tx = self.operator_surface_tx.clone();
+                    let socket_path = self.socket_path.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -2347,6 +2348,7 @@ impl IpcServer {
                             training_storage,
                             network_broadcast_rx,
                             operator_surface_tx,
+                            socket_path,
                         )
                         .await
                         {
@@ -2386,6 +2388,7 @@ impl IpcServer {
         training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
+        socket_path: String,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -2482,6 +2485,41 @@ impl IpcServer {
                             training_storage.as_deref(),
                             agent_id.as_deref(),
                         );
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::AsrSetup { python_path, model_name, auto_install }) => {
+                        let graph_clone = Arc::clone(&graph);
+                        let local_node_id_clone = local_node_id.clone();
+                        let socket_path_clone = socket_path.clone();
+                        let resp = tokio::task::spawn_blocking(move || {
+                            Self::handle_asr_setup(
+                                &graph_clone,
+                                &local_node_id_clone,
+                                &socket_path_clone,
+                                python_path.as_deref().unwrap_or("python3"),
+                                model_name.as_deref(),
+                                auto_install,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            IpcResponse::error("asr_setup", "INTERNAL_ERROR", &e.to_string())
+                        });
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::AsrStatus {}) => {
+                        let graph_clone = Arc::clone(&graph);
+                        let local_node_id_clone = local_node_id.clone();
+                        let resp = tokio::task::spawn_blocking(move || {
+                            Self::handle_asr_status(
+                                &graph_clone,
+                                &local_node_id_clone,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            IpcResponse::error("asr_status", "INTERNAL_ERROR", &e.to_string())
+                        });
                         let _ = outbound_tx.send(resp);
                     }
                     Ok(req) => {
@@ -6638,6 +6676,11 @@ impl IpcServer {
                 "UNREACHABLE",
                 "Training request intercepted before process_request",
             ),
+            IpcRequest::AsrSetup { .. } | IpcRequest::AsrStatus {} => IpcResponse::error(
+                "asr",
+                "UNREACHABLE",
+                "ASR request intercepted before process_request",
+            ),
             IpcRequest::RegisterGraphInstance {
                 graph_id,
                 instance_id,
@@ -9998,6 +10041,169 @@ impl IpcServer {
             Err(e) => IpcResponse::error("training_status", "QUERY_FAILED", &e.to_string()),
         }
     }
+
+    // ── ASR provider lifecycle handlers ───────────────────────────────────────
+
+    fn handle_asr_setup(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        socket_path: &str,
+        python_path: &str,
+        model_name: Option<&str>,
+        auto_install: bool,
+    ) -> IpcResponse {
+        use std::process::Command;
+
+        let model = model_name.unwrap_or(parakeet_runner::DEFAULT_MODEL);
+
+        // Step 1: check nemo import.
+        let check_ok = Command::new(python_path)
+            .args(["-c", "import nemo.collections.asr"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let nemo_available = if !check_ok && auto_install {
+            info!("asr.setup: nemo import failed; attempting pip install nemo-toolkit[asr]");
+            let install = Command::new(python_path)
+                .args(["-m", "pip", "install", "nemo-toolkit[asr]"])
+                .output();
+            match install {
+                Ok(o) if o.status.success() => {
+                    // Re-verify after install.
+                    Command::new(python_path)
+                        .args(["-c", "import nemo.collections.asr"])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                    warn!("asr.setup: pip install failed: {stderr}");
+                    false
+                }
+                Err(e) => {
+                    warn!("asr.setup: pip install error: {e}");
+                    false
+                }
+            }
+        } else {
+            check_ok
+        };
+
+        if !nemo_available {
+            let hint = format!(
+                "nemo_asr import failed. Install manually: `{python_path} -m pip install nemo-toolkit[asr]`"
+            );
+            return IpcResponse::error("asr_setup", "NEMO_UNAVAILABLE", &hint);
+        }
+
+        // Step 2: write component config to hotel context graph.
+        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error("asr_setup", "HOTEL_NOT_FOUND", "could not resolve hotel name");
+        };
+        let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
+        let config = parakeet_runner::ParakeetConfig {
+            python_path: python_path.to_string(),
+            model_name: model.to_string(),
+            priority: 10,
+        };
+        let config_json = match serde_json::to_string(&config) {
+            Ok(j) => j,
+            Err(e) => return IpcResponse::error("asr_setup", "SERIALIZE_ERROR", &e.to_string()),
+        };
+        let key = format!("component:{guest_id}");
+        if let Err(e) = graph.set_config_value(&key, &config_json) {
+            return IpcResponse::error("asr_setup", "CONFIG_WRITE_ERROR", &e.to_string());
+        }
+
+        // Step 3: upsert the guest record so the reconcile loop spawns it.
+        let guest_record = GuestRecord {
+            hotel_name: hotel_name.clone(),
+            guest_id: guest_id.clone(),
+            role: "model.parakeet".to_string(),
+            config_json: serde_json::json!({
+                "command": "model-controller-parakeet",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path,
+                    "PHILOTIC_PARAKEET_GUEST_ID": guest_id,
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        };
+        if let Err(e) = graph.upsert_guest(&guest_record) {
+            return IpcResponse::error("asr_setup", "GUEST_REGISTER_ERROR", &e.to_string());
+        }
+
+        info!(
+            hotel = %hotel_name,
+            guest_id = %guest_id,
+            model = %model,
+            "asr.setup: parakeet guest registered; will be spawned within 5s"
+        );
+
+        IpcResponse::success(
+            "asr_setup",
+            Some(serde_json::json!({
+                "message": format!(
+                    "Parakeet ASR configured. Guest '{guest_id}' registered — will start within 5 seconds."
+                ),
+                "guest_id": guest_id,
+                "model": model,
+                "python_path": python_path,
+                "nemo_available": true,
+            })),
+        )
+    }
+
+    fn handle_asr_status(
+        graph: &GraphDomain,
+        local_node_id: &str,
+    ) -> IpcResponse {
+        use std::process::Command;
+
+        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error("asr_status", "HOTEL_NOT_FOUND", "could not resolve hotel name");
+        };
+        let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
+
+        // Read python_path from stored component config, fall back to "python3".
+        let component_key = format!("component:{guest_id}");
+        let python_path = graph
+            .get_config_value(&component_key)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<parakeet_runner::ParakeetConfig>(&json).ok())
+            .map(|cfg| cfg.python_path)
+            .unwrap_or_else(|| "python3".to_string());
+
+        let guest = graph.get_guest(&hotel_name, &guest_id).ok().flatten();
+        let guest_registered = guest.is_some();
+        let guest_active = guest.as_ref().map(|g| g.is_active).unwrap_or(false);
+        let guest_pid = guest.as_ref().and_then(|g| g.active_pid.clone());
+
+        let nemo_available = Command::new(&python_path)
+            .args(["-c", "import nemo.collections.asr"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        IpcResponse::success(
+            "asr_status",
+            Some(serde_json::json!({
+                "guest_id": guest_id,
+                "registered": guest_registered,
+                "active": guest_active,
+                "pid": guest_pid,
+                "nemo_available": nemo_available,
+                "python_path": python_path,
+            })),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10686,6 +10892,8 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "training.correct"
             | "training.export"
             | "training.status"
+            | "asr.setup"
+            | "asr.status"
     )
 }
 

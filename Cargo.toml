@@ -23,5 +23,6 @@ members = [
     "crates/datasource",
     "crates/graph-datasource",
     "crates/router-listener",
+    "crates/parakeet-runner",
 ]
 resolver = "2"
