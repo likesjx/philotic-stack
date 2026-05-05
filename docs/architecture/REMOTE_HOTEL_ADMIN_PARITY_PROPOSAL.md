@@ -193,6 +193,7 @@ Land these in order:
 4. remote secrets/vault-ref inventory and rotation workflows
   Current truth: landed through `/api/mesh/targets/:target_node_id/secrets`, `POST /api/mesh/targets/:target_node_id/secrets/rotate`, and `POST /api/mesh/targets/:target_node_id/vault`, with inventory returning only metadata/refs and target-hotel authority owning rotation or vault-entry creation. Plaintext fetches remain intentionally absent.
 5. remote placement and role transport actions
+  Current truth: landed through `GET /api/mesh/targets/:target_node_id/best-place-to-run` and `PUT /api/mesh/targets/:target_node_id/agents/:agent_id/roles/:role_name/home`, backed by the same target-hotel-authoritative `operator.targets.*` control-plane family. Placement now returns a target-scoped recommendation view, and role/philote transport is expressed honestly as remote role-home mutation followed by the existing daemon-owned handoff/materialization path instead of inventing a second desktop-only teleport ritual.
 
 That ordering keeps us moving from established read models toward higher-agency mutations without pretending every remote action deserves to be born in one giant ceremony.
 

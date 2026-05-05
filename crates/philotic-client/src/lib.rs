@@ -266,6 +266,33 @@ pub struct OperatorTargetSecretMutationAckView {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorTargetPlacementView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    pub placement: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetRoleHomeAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub agent_id: String,
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_node: Option<String>,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
 pub type DesktopMembraneTargetView = OperatorTargetView;
 pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
@@ -821,6 +848,19 @@ pub enum IpcRequest {
     QueryOperatorTargetSecrets {
         target_node_id: String,
     },
+    QueryOperatorTargetPlacement {
+        target_node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default)]
+        required_markers: Vec<String>,
+        #[serde(default)]
+        prefer_locality: bool,
+    },
     RegisterOperatorTargetComponent {
         target_node_id: String,
         manifest: ComponentManifest,
@@ -841,6 +881,14 @@ pub enum IpcRequest {
         plaintext: String,
         #[serde(default)]
         allowed_roles: Vec<String>,
+    },
+    SetOperatorTargetRoleHome {
+        target_node_id: String,
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_hotel: Option<String>,
     },
     SetOperatorTargetComponentActive {
         target_node_id: String,
@@ -1631,6 +1679,9 @@ pub enum IpcResponse {
     OperatorTargetSecretsView {
         operator_target_secrets: OperatorTargetSecretInventoryView,
     },
+    OperatorTargetPlacementView {
+        operator_target_placement: OperatorTargetPlacementView,
+    },
     OperatorTargetComponentMutationAckView {
         operator_target_component_mutation: OperatorTargetComponentMutationAckView,
     },
@@ -1639,6 +1690,9 @@ pub enum IpcResponse {
     },
     OperatorTargetSecretMutationAckView {
         operator_target_secret_mutation: OperatorTargetSecretMutationAckView,
+    },
+    OperatorTargetRoleHomeAckView {
+        operator_target_role_home: OperatorTargetRoleHomeAckView,
     },
     OperatorChatTurnReply {
         operator_chat_reply: OperatorChatTurnReply,

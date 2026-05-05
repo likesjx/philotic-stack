@@ -37,6 +37,8 @@
 //!   GET  /api/mesh/targets/:target_node_id/secrets
 //!   POST /api/mesh/targets/:target_node_id/secrets/rotate
 //!   POST /api/mesh/targets/:target_node_id/vault
+//!   GET  /api/mesh/targets/:target_node_id/best-place-to-run
+//!   PUT  /api/mesh/targets/:target_node_id/agents/:agent_id/roles/:role_name/home
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
 //!   GET  /api/event-log
 //!   GET  /api/config
@@ -100,10 +102,10 @@ use philotic_client::{
     IpcRequest, IpcResponse, LeaseEnvelope, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
-    OperatorTargetGuestInventoryView, OperatorTargetSecretInventoryView,
-    OperatorTargetSecretMutationAckView, OperatorTargetStatusView, OperatorTargetView,
-    PhiloticClient, ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
-    OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
+    OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
+    OperatorTargetSecretInventoryView, OperatorTargetSecretMutationAckView,
+    OperatorTargetStatusView, OperatorTargetView, PhiloticClient, ResponseRoutePolicyView,
+    OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -691,6 +693,14 @@ pub async fn run(
         .route(
             "/api/mesh/targets/:target_node_id/vault",
             post(handle_mesh_target_vault_add),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/best-place-to-run",
+            get(handle_mesh_target_best_place_to_run),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/agents/:agent_id/roles/:role_name/home",
+            put(handle_mesh_target_role_home_put),
         )
         .route(
             "/api/mesh/targets/:target_node_id/agents/:agent_id/chat",
@@ -2397,6 +2407,83 @@ async fn handle_mesh_target_vault_add(
     }
 }
 
+async fn handle_mesh_target_best_place_to_run(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+    Query(query): Query<PlacementQuery>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_desktop_membrane_target_placement(
+        &state.socket,
+        &target_node_id,
+        query.agent_id,
+        query.role_name,
+        query.tool_name,
+        query.required_markers,
+        query.prefer_locality,
+    )
+    .await
+    {
+        Ok(view) => Json(view).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_role_home_put(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, agent_id, role_name)): Path<(String, String, String)>,
+    Json(body): Json<SetRoleHomeBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let _ = &body.reason;
+    match ipc_set_target_role_home(
+        &state.socket,
+        &target_node_id,
+        &agent_id,
+        &role_name,
+        "orchestrator",
+        body.target_hotel,
+    )
+    .await
+    {
+        Ok(ack) => {
+            let event = json!({
+                "type": "role:home-updated",
+                "payload": { "target_node_id": target_node_id, "agent_id": agent_id, "role_name": role_name, "home_node": ack.home_node }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(ack).into_response()
+        }
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
 async fn handle_mesh_target_agent_chat(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -3634,6 +3721,27 @@ struct AddVaultEntryBody {
     allowed_roles: Vec<String>,
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PlacementQuery {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    role_name: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    required_markers: Vec<String>,
+    #[serde(default)]
+    prefer_locality: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct SetRoleHomeBody {
+    #[serde(default)]
+    target_hotel: Option<String>,
+    reason: String,
+}
+
 async fn handle_vault_add(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -4584,6 +4692,38 @@ async fn ipc_desktop_membrane_target_secrets(
     }
 }
 
+async fn ipc_desktop_membrane_target_placement(
+    socket: &str,
+    target_node_id: &str,
+    agent_id: Option<String>,
+    role_name: Option<String>,
+    tool_name: Option<String>,
+    required_markers: Vec<String>,
+    prefer_locality: bool,
+) -> Result<OperatorTargetPlacementView> {
+    let mut client =
+        connect_management_client(socket, "philotic-web-mesh-target-placement").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetPlacement {
+            target_node_id: target_node_id.to_string(),
+            agent_id,
+            role_name,
+            tool_name,
+            required_markers,
+            prefer_locality,
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetPlacementView {
+            operator_target_placement,
+        } => Ok(operator_target_placement),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target placement response: {other:?}"
+        )),
+    }
+}
+
 async fn ipc_desktop_membrane_target_component(
     socket: &str,
     target_node_id: &str,
@@ -4675,6 +4815,33 @@ async fn ipc_add_target_vault_entry(
             ok: false, message, ..
         } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected target vault entry response: {other:?}")),
+    }
+}
+
+async fn ipc_set_target_role_home(
+    socket: &str,
+    target_node_id: &str,
+    agent_id: &str,
+    role_name: &str,
+    calling_role: &str,
+    target_hotel: Option<String>,
+) -> Result<OperatorTargetRoleHomeAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-role-home").await?;
+    match client
+        .send_request(IpcRequest::SetOperatorTargetRoleHome {
+            target_node_id: target_node_id.to_string(),
+            agent_id: agent_id.to_string(),
+            role_name: role_name.to_string(),
+            calling_role: calling_role.to_string(),
+            target_hotel,
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetRoleHomeAckView {
+            operator_target_role_home,
+        } => Ok(operator_target_role_home),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected target role home response: {other:?}")),
     }
 }
 

@@ -46,9 +46,10 @@ use philotic_client::{
     OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
-    OperatorTargetGuestInventoryView, OperatorTargetSecretEntryView,
-    OperatorTargetSecretInventoryView, OperatorTargetSecretMutationAckView,
-    OperatorTargetStatusView, PhiloticClient, ResponseRoutePolicyView, SubagentDelegation,
+    OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
+    OperatorTargetSecretEntryView, OperatorTargetSecretInventoryView,
+    OperatorTargetSecretMutationAckView, OperatorTargetStatusView, PhiloticClient,
+    ResponseRoutePolicyView, SubagentDelegation,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -1594,6 +1595,83 @@ impl IpcServer {
         }
     }
 
+    async fn operator_target_placement_view(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        agent_id: Option<&str>,
+        role_name: Option<&str>,
+        tool_name: Option<&str>,
+        required_markers: &[String],
+        prefer_locality: bool,
+    ) -> anyhow::Result<OperatorTargetPlacementView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+
+        if target_node_id == local_node_id {
+            return Ok(OperatorTargetPlacementView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel: source_hotel.clone(),
+                source_hotel,
+                observation_kind: "local-canonical".into(),
+                available: true,
+                pending_remote_query_state: "none".into(),
+                placement: Self::best_place_to_run_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    agent_id,
+                    role_name,
+                    tool_name,
+                    required_markers,
+                    prefer_locality,
+                )
+                .await?,
+                note: Some("derived from the local hotel's canonical placement surface".into()),
+            });
+        }
+
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+
+        match Self::query_remote_operator_target_placement(
+            graph,
+            local_node_id,
+            target_node_id,
+            &target_hotel,
+            agent_id,
+            role_name,
+            tool_name,
+            required_markers,
+            prefer_locality,
+        )
+        .await
+        {
+            Ok(view) => Ok(view),
+            Err(err) => Ok(OperatorTargetPlacementView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel,
+                source_hotel,
+                observation_kind: "remote-query-failed".into(),
+                available: false,
+                pending_remote_query_state: "error".into(),
+                placement: serde_json::json!({}),
+                note: Some(format!(
+                    "remote target placement query requires a target-hotel operator query: {}",
+                    err
+                )),
+            }),
+        }
+    }
+
     async fn operator_target_agent_inventory_view(
         registry: &Arc<RwLock<NodeRegistry>>,
         graph: &GraphDomain,
@@ -2094,6 +2172,108 @@ impl IpcServer {
         if view.target_hotel != target_hotel {
             anyhow::bail!(
                 "remote target secret reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
+    }
+
+    async fn query_remote_operator_target_placement(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+        agent_id: Option<&str>,
+        role_name: Option<&str>,
+        tool_name: Option<&str>,
+        required_markers: &[String],
+        prefer_locality: bool,
+    ) -> anyhow::Result<OperatorTargetPlacementView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.placement".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target placement recommendation".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+                "agent_id": agent_id,
+                "role_name": role_name,
+                "tool_name": tool_name,
+                "required_markers": required_markers,
+                "prefer_locality": prefer_locality,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote placement query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("timed out waiting for remote target placement reply")
+            })??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote target placement reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetPlacementView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote target placement reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote target placement reply hotel mismatch: expected [{}], got [{}]",
                 target_hotel,
                 view.target_hotel
             );
@@ -2736,6 +2916,146 @@ impl IpcServer {
             let ack: OperatorTargetSecretMutationAckView = serde_json::from_str(&task_json)?;
             Ok(IpcResponse::OperatorTargetSecretMutationAckView {
                 operator_target_secret_mutation: ack,
+            })
+        }
+    }
+
+    async fn mutate_operator_target_role_home(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        agent_id: &str,
+        role_name: &str,
+        calling_role: &str,
+        target_hotel: Option<String>,
+    ) -> anyhow::Result<IpcResponse> {
+        if target_node_id == local_node_id {
+            let hotel_name = Self::local_hotel_name(graph, local_node_id).unwrap_or_default();
+            let calling_role_record = graph.get_role_incarnation(agent_id, calling_role);
+            let is_admin = calling_role_record
+                .ok()
+                .flatten()
+                .map(|r| r.is_admin || r.role_name == "orchestrator")
+                .unwrap_or(false);
+            if !is_admin {
+                anyhow::bail!(
+                    "role '{}' does not have authority to set home_node for other roles",
+                    calling_role
+                );
+            }
+
+            let mut record = graph
+                .get_role_incarnation(agent_id, role_name)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("role '{}' not found for agent '{}'", role_name, agent_id)
+                })?;
+            record.home_node = target_hotel.clone();
+            graph.upsert_role_incarnation(&record)?;
+
+            Ok(IpcResponse::OperatorTargetRoleHomeAckView {
+                operator_target_role_home: OperatorTargetRoleHomeAckView {
+                    target_node_id: local_node_id.to_string(),
+                    target_hotel: hotel_name.clone(),
+                    source_hotel: hotel_name,
+                    agent_id: agent_id.to_string(),
+                    role_name: role_name.to_string(),
+                    home_node: target_hotel,
+                    ok: true,
+                    note: Some(
+                        "derived from the target hotel's canonical role-home placement path".into(),
+                    ),
+                },
+            })
+        } else {
+            let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+                anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+            })?;
+            let guard = registry.read().await;
+            let status = guard.get_node(target_node_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mesh target [{target_node_id}] is not currently active in the registry"
+                )
+            })?;
+            let target_hotel_name = Self::target_hotel_name(graph, status, &source_hotel);
+            drop(guard);
+
+            let socket_path = graph
+                .get_hotel(&source_hotel)?
+                .map(|hotel| hotel.ipc_socket_path)
+                .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+            let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+            let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+            let mut client = PhiloticClient::connect_at(
+                &socket_path,
+                GuestIdentity {
+                    guest_id: reply_guest_id.clone(),
+                    role: reply_role.into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await?;
+            match client
+                .send_request(IpcRequest::SubscribeInbox {
+                    role: reply_role.into(),
+                })
+                .await?
+            {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => {
+                    anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}")
+                }
+            }
+            let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+                handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+                surface: "operator.targets.roles.set_home".into(),
+                request_id: Uuid::new_v4().to_string(),
+                source_hotel: source_hotel.clone(),
+                target_hotel: target_hotel_name.clone(),
+                target_node_id: target_node_id.to_string(),
+                caller_kind: "operator_surface_adapter".into(),
+                caller_id: local_node_id.to_string(),
+                visibility_scope: "operator".into(),
+                grant_scope: "default".into(),
+                intent: "mutate target role home placement".into(),
+                payload: serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "agent_id": agent_id,
+                    "role_name": role_name,
+                    "calling_role": calling_role,
+                    "target_hotel": target_hotel,
+                }),
+                reply_to_node: local_node_id.to_string(),
+                reply_to_role: reply_role.into(),
+                reply_to_guest_id: Some(reply_guest_id),
+                session_id: None,
+                trace: None,
+            })?;
+            match client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: target_node_id.to_string(),
+                    target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                    target_guest_id: None,
+                    task_json,
+                })
+                .await?
+            {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => {
+                    anyhow::bail!("unexpected remote role home mutation emit response: {other:?}")
+                }
+            }
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_task())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("timed out waiting for target role-home mutation reply")
+                })??;
+            let IpcResponse::InboundTask { task_json, .. } = reply else {
+                anyhow::bail!("unexpected target role-home mutation reply envelope: {reply:?}");
+            };
+            let ack: OperatorTargetRoleHomeAckView = serde_json::from_str(&task_json)?;
+            Ok(IpcResponse::OperatorTargetRoleHomeAckView {
+                operator_target_role_home: ack,
             })
         }
     }
@@ -6616,6 +6936,35 @@ impl IpcServer {
                     ),
                 }
             }
+            IpcRequest::QueryOperatorTargetPlacement {
+                target_node_id,
+                agent_id,
+                role_name,
+                tool_name,
+                required_markers,
+                prefer_locality,
+            } => match Self::operator_target_placement_view(
+                registry,
+                graph,
+                local_node_id,
+                &target_node_id,
+                agent_id.as_deref(),
+                role_name.as_deref(),
+                tool_name.as_deref(),
+                &required_markers,
+                prefer_locality,
+            )
+            .await
+            {
+                Ok(operator_target_placement) => IpcResponse::OperatorTargetPlacementView {
+                    operator_target_placement,
+                },
+                Err(err) => IpcResponse::error(
+                    "operator_target_placement",
+                    "OPERATOR_TARGET_PLACEMENT_ERROR",
+                    err.to_string(),
+                ),
+            },
             IpcRequest::RegisterOperatorTargetComponent {
                 target_node_id,
                 manifest,
@@ -6776,6 +7125,31 @@ impl IpcServer {
                 Err(err) => IpcResponse::error(
                     "operator_target_secret_add",
                     "OPERATOR_TARGET_SECRET_ADD_ERROR",
+                    err.to_string(),
+                ),
+            },
+            IpcRequest::SetOperatorTargetRoleHome {
+                target_node_id,
+                agent_id,
+                role_name,
+                calling_role,
+                target_hotel,
+            } => match Self::mutate_operator_target_role_home(
+                registry,
+                graph,
+                local_node_id,
+                &target_node_id,
+                &agent_id,
+                &role_name,
+                &calling_role,
+                target_hotel,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => IpcResponse::error(
+                    "operator_target_role_home",
+                    "OPERATOR_TARGET_ROLE_HOME_ERROR",
                     err.to_string(),
                 ),
             },
