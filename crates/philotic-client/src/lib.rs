@@ -6,7 +6,7 @@ pub use ansible_mesh_core::resources::{
 pub use ansible_mesh_core::storage::ComponentManifest;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::ErrorKind;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -198,6 +198,31 @@ pub struct OperatorTargetComponentMutationAckView {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetConfigView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub config: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetConfigMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub key: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
 pub type DesktopMembraneTargetView = OperatorTargetView;
 pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
@@ -208,6 +233,10 @@ pub type DesktopMembraneTargetComponentInventoryView = OperatorTargetComponentIn
 pub const OPERATOR_SURFACE_QUERY_ROLE: &str = "management.operator_surface_query";
 pub const OPERATOR_SURFACE_QUERY_REPLY_ROLE: &str = "management.operator_surface_query.reply";
 pub const OPERATOR_SURFACE_QUERY_HANDOFF_KIND: &str = "operator_surface_query";
+pub const OPERATOR_REMOTE_CONFIG_KEYS: &[&str] =
+    &["execution_host", "vault_registry", "tool_runner_registry"];
+pub const OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS: &[&str] =
+    &["execution_host", "tool_runner_registry"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperatorSurfaceQueryHandoff {
@@ -743,9 +772,17 @@ pub enum IpcRequest {
     QueryOperatorTargetComponents {
         target_node_id: String,
     },
+    QueryOperatorTargetConfig {
+        target_node_id: String,
+    },
     RegisterOperatorTargetComponent {
         target_node_id: String,
         manifest: ComponentManifest,
+    },
+    SetOperatorTargetConfig {
+        target_node_id: String,
+        key: String,
+        value_json: String,
     },
     SetOperatorTargetComponentActive {
         target_node_id: String,
@@ -1530,8 +1567,14 @@ pub enum IpcResponse {
     OperatorTargetComponentsView {
         operator_target_components: OperatorTargetComponentInventoryView,
     },
+    OperatorTargetConfigView {
+        operator_target_config: OperatorTargetConfigView,
+    },
     OperatorTargetComponentMutationAckView {
         operator_target_component_mutation: OperatorTargetComponentMutationAckView,
+    },
+    OperatorTargetConfigMutationAckView {
+        operator_target_config_mutation: OperatorTargetConfigMutationAckView,
     },
     OperatorChatTurnReply {
         operator_chat_reply: OperatorChatTurnReply,

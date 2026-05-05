@@ -3,7 +3,7 @@ title: Remote Hotel Admin Parity Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: accepted-current-slice
-last_updated: 2026-05-04
+last_updated: 2026-05-05
 tags:
 - desktop
 - remote-admin
@@ -189,6 +189,7 @@ Land these in order:
 2. remote component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`)
   Current truth: landed through matching target-scoped mesh routes and operator-surface mutation requests, keeping the target hotel authoritative for all component writes instead of teaching the desktop a second remote mutation dialect.
 3. remote config read/mutate parity for bounded operator-approved keys
+  Current truth: landed through `/api/mesh/targets/:target_node_id/config` plus `PUT /api/mesh/targets/:target_node_id/config/:key`, backed by the same target-hotel operator surface and intentionally bounded to approved non-secret keys (`execution_host`, `tool_runner_registry`, plus read-only `vault_registry` visibility).
 4. remote secrets/vault-ref inventory and rotation workflows
 5. remote placement and role transport actions
 

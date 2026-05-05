@@ -40,14 +40,16 @@ use philotic_client::{
     DesktopMembraneStatusView, DesktopMembraneTargetGuestInventoryView,
     DesktopMembraneTargetReachabilityView, DesktopMembraneTargetStatusView,
     DesktopMembraneTargetView, GuestIdentity, HookRoute, HookSubscription, IpcRequest, IpcResponse,
-    LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
+    LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
+    OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
     OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
     OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
+    OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
     OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
     ResponseRoutePolicyView, SubagentDelegation,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
@@ -1398,6 +1400,82 @@ impl IpcServer {
         }
     }
 
+    fn operator_target_config_entries(
+        graph: &GraphDomain,
+    ) -> anyhow::Result<BTreeMap<String, serde_json::Value>> {
+        let mut config = BTreeMap::new();
+        for key in OPERATOR_REMOTE_CONFIG_KEYS {
+            let value = match graph.get_config_value(key) {
+                Ok(Some(raw)) => {
+                    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::Value::String(raw))
+                }
+                Ok(None) => serde_json::Value::Null,
+                Err(err) => {
+                    anyhow::bail!("failed to load config key [{key}] from GraphStorage: {err}")
+                }
+            };
+            config.insert((*key).to_string(), value);
+        }
+        Ok(config)
+    }
+
+    async fn operator_target_config_view(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+    ) -> anyhow::Result<OperatorTargetConfigView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+
+        if target_node_id == local_node_id {
+            return Ok(OperatorTargetConfigView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel: source_hotel.clone(),
+                source_hotel,
+                observation_kind: "local-canonical".into(),
+                available: true,
+                pending_remote_query_state: "none".into(),
+                config: Self::operator_target_config_entries(graph)?,
+                note: Some("derived from the local hotel's bounded operator config surface".into()),
+            });
+        }
+
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+
+        match Self::query_remote_operator_target_config(
+            graph,
+            local_node_id,
+            target_node_id,
+            &target_hotel,
+        )
+        .await
+        {
+            Ok(view) => Ok(view),
+            Err(err) => Ok(OperatorTargetConfigView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel,
+                source_hotel,
+                observation_kind: "remote-query-failed".into(),
+                available: false,
+                pending_remote_query_state: "error".into(),
+                config: BTreeMap::new(),
+                note: Some(format!(
+                    "remote target config inventory requires a target-hotel operator query: {}",
+                    err
+                )),
+            }),
+        }
+    }
+
     async fn operator_target_agent_inventory_view(
         registry: &Arc<RwLock<NodeRegistry>>,
         graph: &GraphDomain,
@@ -1718,6 +1796,96 @@ impl IpcServer {
         if view.target_hotel != target_hotel {
             anyhow::bail!(
                 "remote target agents reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
+    }
+
+    async fn query_remote_operator_target_config(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+    ) -> anyhow::Result<OperatorTargetConfigView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.config".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target bounded config inventory".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote config query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for remote target config reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote target config reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetConfigView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote target config reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote target config reply hotel mismatch: expected [{}], got [{}]",
                 target_hotel,
                 view.target_hotel
             );
@@ -2084,6 +2252,124 @@ impl IpcServer {
         let ack: OperatorTargetComponentMutationAckView = serde_json::from_str(&task_json)?;
         Ok(IpcResponse::OperatorTargetComponentMutationAckView {
             operator_target_component_mutation: ack,
+        })
+    }
+
+    async fn mutate_operator_target_config(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        key: &str,
+        value_json: &str,
+    ) -> anyhow::Result<IpcResponse> {
+        if !OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS.contains(&key) {
+            anyhow::bail!("config key [{key}] is not operator-mutable on remote targets");
+        }
+
+        if target_node_id == local_node_id {
+            match graph.set_config_value(key, value_json) {
+                Ok(()) => {
+                    let hotel_name =
+                        Self::local_hotel_name(graph, local_node_id).unwrap_or_default();
+                    return Ok(IpcResponse::OperatorTargetConfigMutationAckView {
+                        operator_target_config_mutation: OperatorTargetConfigMutationAckView {
+                            target_node_id: local_node_id.to_string(),
+                            target_hotel: hotel_name.clone(),
+                            source_hotel: hotel_name,
+                            key: key.to_string(),
+                            ok: true,
+                            note: Some(
+                                "derived from the target hotel's bounded operator config mutation path"
+                                    .into(),
+                            ),
+                        },
+                    });
+                }
+                Err(err) => anyhow::bail!("failed to store config key [{key}]: {err}"),
+            }
+        }
+
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.config.set".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.clone(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: format!("mutate target bounded config key: {key}"),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+                "key": key,
+                "value_json": value_json,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote config mutation emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_task())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for target config mutation reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected target config mutation reply envelope: {reply:?}");
+        };
+        let ack: OperatorTargetConfigMutationAckView = serde_json::from_str(&task_json)?;
+        Ok(IpcResponse::OperatorTargetConfigMutationAckView {
+            operator_target_config_mutation: ack,
         })
     }
 
@@ -5925,6 +6211,25 @@ impl IpcServer {
                     ),
                 }
             }
+            IpcRequest::QueryOperatorTargetConfig { target_node_id } => {
+                match Self::operator_target_config_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(operator_target_config) => IpcResponse::OperatorTargetConfigView {
+                        operator_target_config,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "operator_target_config",
+                        "OPERATOR_TARGET_CONFIG_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
             IpcRequest::RegisterOperatorTargetComponent {
                 target_node_id,
                 manifest,
@@ -6015,6 +6320,27 @@ impl IpcServer {
                 Err(err) => IpcResponse::error(
                     "operator_target_component_remove",
                     "OPERATOR_TARGET_COMPONENT_REMOVE_ERROR",
+                    err.to_string(),
+                ),
+            },
+            IpcRequest::SetOperatorTargetConfig {
+                target_node_id,
+                key,
+                value_json,
+            } => match Self::mutate_operator_target_config(
+                registry,
+                graph,
+                local_node_id,
+                &target_node_id,
+                &key,
+                &value_json,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => IpcResponse::error(
+                    "operator_target_config_set",
+                    "OPERATOR_TARGET_CONFIG_SET_ERROR",
                     err.to_string(),
                 ),
             },

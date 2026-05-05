@@ -32,6 +32,8 @@
 //!   POST /api/mesh/targets/:target_node_id/components/:guest_id/enable
 //!   POST /api/mesh/targets/:target_node_id/components/:guest_id/disable
 //!   POST /api/mesh/targets/:target_node_id/components/:guest_id/restart
+//!   GET  /api/mesh/targets/:target_node_id/config
+//!   PUT  /api/mesh/targets/:target_node_id/config/:key
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
 //!   GET  /api/event-log
 //!   GET  /api/config
@@ -94,8 +96,10 @@ use philotic_client::{
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView, GuestIdentity,
     IpcRequest, IpcResponse, LeaseEnvelope, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
+    OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
     OperatorTargetGuestInventoryView, OperatorTargetStatusView, OperatorTargetView, PhiloticClient,
-    ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE,
+    ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
+    OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -663,6 +667,14 @@ pub async fn run(
         .route(
             "/api/mesh/targets/:target_node_id/components/:guest_id/restart",
             post(handle_mesh_target_component_restart),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/config",
+            get(handle_mesh_target_config),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/config/:key",
+            put(handle_mesh_target_config_put),
         )
         .route(
             "/api/mesh/targets/:target_node_id/agents/:agent_id/chat",
@@ -2190,6 +2202,82 @@ async fn handle_mesh_target_component_restart(
     }
 }
 
+async fn handle_mesh_target_config(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    match ipc_desktop_membrane_target_config(&state.socket, &target_node_id).await {
+        Ok(config) => Json(config).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_config_put(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, key)): Path<(String, String)>,
+    Json(body): Json<SetConfigBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if !OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS.contains(&key.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("config key '{}' is not operator-mutable on remote targets", key)})),
+        )
+            .into_response();
+    }
+    let value_json = match serde_json::to_string(&body.value) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid value: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    match ipc_set_target_config(&state.socket, &target_node_id, &key, &value_json).await {
+        Ok(ack) => {
+            let event = json!({
+                "type": "config:updated",
+                "payload": { "key": key, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(ack).into_response()
+        }
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else if err.to_string().contains("not operator-mutable") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
 async fn handle_mesh_target_agent_chat(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -3049,9 +3137,8 @@ async fn handle_config(headers: HeaderMap, State(state): State<AppState>) -> Res
     }
     // Read well-known operator-facing config keys. Values are returned as-is
     // (already JSON-encoded strings in the context graph).
-    let keys = &["execution_host", "vault_registry", "tool_runner_registry"];
     let mut out = serde_json::Map::new();
-    for key in keys {
+    for key in OPERATOR_REMOTE_CONFIG_KEYS {
         match ipc_get_config(&state.socket, key).await {
             Ok(Some(val)) => {
                 out.insert(key.to_string(), val);
@@ -4336,6 +4423,27 @@ async fn ipc_desktop_membrane_target_components(
     }
 }
 
+async fn ipc_desktop_membrane_target_config(
+    socket: &str,
+    target_node_id: &str,
+) -> Result<OperatorTargetConfigView> {
+    let mut client = connect_management_client(socket, "philotic-web-mesh-target-config").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetConfig {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetConfigView {
+            operator_target_config,
+        } => Ok(operator_target_config),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target config response: {other:?}"
+        )),
+    }
+}
+
 async fn ipc_desktop_membrane_target_component(
     socket: &str,
     target_node_id: &str,
@@ -4347,6 +4455,33 @@ async fn ipc_desktop_membrane_target_component(
         .into_iter()
         .find(|component| component.guest_id == guest_id)
         .ok_or_else(|| anyhow!("component not found"))
+}
+
+async fn ipc_set_target_config(
+    socket: &str,
+    target_node_id: &str,
+    key: &str,
+    value_json: &str,
+) -> Result<OperatorTargetConfigMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-config").await?;
+    match client
+        .send_request(IpcRequest::SetOperatorTargetConfig {
+            target_node_id: target_node_id.to_string(),
+            key: key.to_string(),
+            value_json: value_json.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetConfigMutationAckView {
+            operator_target_config_mutation,
+        } => Ok(operator_target_config_mutation),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected target config mutation response: {other:?}"
+        )),
+    }
 }
 
 async fn ipc_register_target_component(
