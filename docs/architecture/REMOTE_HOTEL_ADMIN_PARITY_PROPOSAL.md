@@ -14,6 +14,7 @@ related_docs:
 - DESKTOP_MEMBRANE_PROPOSAL.md
 - OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md
 - DESKTOP_COMPONENT_AUTHORING_PARITY_PROPOSAL.md
 - ROUTED_OPERATOR_CHAT_PROPOSAL.md
 - ARCHITECTURE_STATUS.md
@@ -196,6 +197,8 @@ Land these in order:
   Current truth: landed through `GET /api/mesh/targets/:target_node_id/best-place-to-run` and `PUT /api/mesh/targets/:target_node_id/agents/:agent_id/roles/:role_name/home`, backed by the same target-hotel-authoritative `operator.targets.*` control-plane family. Placement now returns a target-scoped recommendation view, and role/philote transport is expressed honestly as remote role-home mutation followed by the existing daemon-owned handoff/materialization path instead of inventing a second desktop-only teleport ritual.
 6. explicit confirmation ceremonies for dangerous remote actions
   Current truth: the first typed-confirmation safety layer is landed. Remote secret rotation requires `confirm_secret_ref == secret_ref`, remote vault-entry creation requires `confirm_vault_name == vault_name`, remote component restart/delete require `confirm_guest_id == guest_id`, and remote role-home moves require `confirm_role_binding == "{agent_id}:{role_name}"`. Reads and bounded non-secret config remain normal admin-posture actions for now.
+
+The larger follow-on effort for operator identity, bounded admin posture, target-scoped grants, and stronger dangerous-action ceremony is now tracked separately in [OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md) so this proposal can stay about remote admin parity instead of slowly becoming a security theology.
 
 That ordering keeps us moving from established read models toward higher-agency mutations without pretending every remote action deserves to be born in one giant ceremony.
 

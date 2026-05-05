@@ -1226,6 +1226,13 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
   - [ ] passkey-backed local-first operator login after OIDC and membrane step-up are landed
 - [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.
+- [ ] Launch the operator identity and dangerous-action ceremonies effort:
+  - [x] write [OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md)
+  - [ ] define the first desktop operator identity/session model
+  - [ ] define posture transitions and expiry for `normal` and `admin_elevated`
+  - [ ] classify current dangerous actions by ceremony tier
+  - [ ] define the first target-scoped grant record and lifecycle
+  - [ ] prove one end-to-end grant-backed remote admin action
 - [x] Define the first remote dangerous-action confirmation policy:
   - reads and bounded non-secret config remain admin-posture only
   - remote component restart/delete require typed `guest_id` confirmation
