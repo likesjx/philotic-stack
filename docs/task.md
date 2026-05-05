@@ -1226,6 +1226,12 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
   - [ ] passkey-backed local-first operator login after OIDC and membrane step-up are landed
 - [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.
+- [x] Define the first remote dangerous-action confirmation policy:
+  - reads and bounded non-secret config remain admin-posture only
+  - remote component restart/delete require typed `guest_id` confirmation
+  - remote secret rotation requires typed `secret_ref` confirmation
+  - remote vault entry creation requires typed `vault_name` confirmation
+  - remote role-home moves require typed `{agent_id}:{role_name}` confirmation
 - [ ] First-class remote hotel admin parity so the Philote desktop can manage a remote `aiua` through the same hotel-mediated control plane:
   - [x] write [REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md)
   - [x] add remote parity for component inventory/detail
@@ -1233,7 +1239,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [x] add bounded remote config read/mutate parity for operator-approved keys
   - [x] add remote secret/vault-ref inventory and rotation workflows without normalizing plaintext fetches
   - [x] add remote placement and role/philote transport actions through the same operator control plane
-  - [ ] define which of those actions require explicit target-scoped grants rather than elevated session posture alone
+  - [x] define the first confirmation boundary for dangerous remote actions
 - [ ] Define the first high-trust remote action ceremonies for:
   - secret rotation
   - node shutdown/restart

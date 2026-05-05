@@ -500,6 +500,39 @@ struct ExternalIdentityLinkStatusView {
     last_seen_at: i64,
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ConfirmGuestActionBody {
+    confirm_guest_id: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ConfirmSecretRefBody {
+    secret_ref: String,
+    plaintext: String,
+    confirm_secret_ref: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ConfirmVaultEntryBody {
+    vault_name: String,
+    plaintext: String,
+    #[serde(default)]
+    allowed_roles: Vec<String>,
+    confirm_vault_name: String,
+}
+
+fn require_exact_confirmation(provided: &str, expected: &str, label: &str) -> Result<(), Response> {
+    if provided == expected {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("confirmation text must exactly match {}", label)})),
+        )
+            .into_response())
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -2117,12 +2150,9 @@ async fn handle_mesh_target_component_delete(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    if body.confirm_guest_id != guest_id {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "confirmation text must exactly match guest_id"})),
-        )
-            .into_response();
+    if let Err(response) = require_exact_confirmation(&body.confirm_guest_id, &guest_id, "guest_id")
+    {
+        return response;
     }
     match ipc_remove_target_component(&state.socket, &target_node_id, &guest_id).await {
         Ok(_) => {
@@ -2206,9 +2236,14 @@ async fn handle_mesh_target_component_restart(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path((target_node_id, guest_id)): Path<(String, String)>,
+    Json(body): Json<ConfirmGuestActionBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) = require_exact_confirmation(&body.confirm_guest_id, &guest_id, "guest_id")
+    {
+        return response;
     }
     match ipc_restart_target_component(&state.socket, &target_node_id, &guest_id).await {
         Ok(_) => {
@@ -2332,10 +2367,15 @@ async fn handle_mesh_target_secret_rotate(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(target_node_id): Path<String>,
-    Json(body): Json<RotateSecretBody>,
+    Json(body): Json<ConfirmSecretRefBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) =
+        require_exact_confirmation(&body.confirm_secret_ref, &body.secret_ref, "secret_ref")
+    {
+        return response;
     }
     match ipc_rotate_target_secret(
         &state.socket,
@@ -2371,10 +2411,15 @@ async fn handle_mesh_target_vault_add(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(target_node_id): Path<String>,
-    Json(body): Json<AddVaultEntryBody>,
+    Json(body): Json<ConfirmVaultEntryBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) =
+        require_exact_confirmation(&body.confirm_vault_name, &body.vault_name, "vault_name")
+    {
+        return response;
     }
     match ipc_add_target_vault_entry(
         &state.socket,
@@ -2451,7 +2496,14 @@ async fn handle_mesh_target_role_home_put(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    let _ = &body.reason;
+    let confirmation_target = format!("{}:{}", agent_id, role_name);
+    if let Err(response) = require_exact_confirmation(
+        &body.confirm_role_binding,
+        &confirmation_target,
+        "agent_id:role_name",
+    ) {
+        return response;
+    }
     match ipc_set_target_role_home(
         &state.socket,
         &target_node_id,
@@ -2465,7 +2517,7 @@ async fn handle_mesh_target_role_home_put(
         Ok(ack) => {
             let event = json!({
                 "type": "role:home-updated",
-                "payload": { "target_node_id": target_node_id, "agent_id": agent_id, "role_name": role_name, "home_node": ack.home_node }
+                "payload": { "target_node_id": target_node_id, "agent_id": agent_id, "role_name": role_name, "home_node": ack.home_node, "reason": body.reason }
             });
             let _ = state.tx.send(event.to_string());
             Json(ack).into_response()
@@ -3687,19 +3739,18 @@ async fn handle_config_put(
 
 // ── POST /api/secrets/rotate ──────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
-struct RotateSecretBody {
-    secret_ref: String,
-    plaintext: String,
-}
-
 async fn handle_secret_rotate(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(body): Json<RotateSecretBody>,
+    Json(body): Json<ConfirmSecretRefBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) =
+        require_exact_confirmation(&body.confirm_secret_ref, &body.secret_ref, "secret_ref")
+    {
+        return response;
     }
     match ipc_rotate_secret(&state.socket, &body.secret_ref, &body.plaintext).await {
         Ok(()) => Json(json!({"ok": true})).into_response(),
@@ -3712,14 +3763,6 @@ async fn handle_secret_rotate(
 }
 
 // ── POST /api/vault ───────────────────────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct AddVaultEntryBody {
-    vault_name: String,
-    plaintext: String,
-    #[serde(default)]
-    allowed_roles: Vec<String>,
-}
 
 #[derive(Clone, Debug, serde::Deserialize)]
 struct PlacementQuery {
@@ -3740,15 +3783,21 @@ struct SetRoleHomeBody {
     #[serde(default)]
     target_hotel: Option<String>,
     reason: String,
+    confirm_role_binding: String,
 }
 
 async fn handle_vault_add(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(body): Json<AddVaultEntryBody>,
+    Json(body): Json<ConfirmVaultEntryBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) =
+        require_exact_confirmation(&body.confirm_vault_name, &body.vault_name, "vault_name")
+    {
+        return response;
     }
     match ipc_add_vault_entry(
         &state.socket,
@@ -4384,12 +4433,9 @@ async fn handle_component_delete(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    if body.confirm_guest_id != guest_id {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "confirmation text must exactly match guest_id"})),
-        )
-            .into_response();
+    if let Err(response) = require_exact_confirmation(&body.confirm_guest_id, &guest_id, "guest_id")
+    {
+        return response;
     }
     match ipc_remove_component(&state.socket, &guest_id).await {
         Ok(_) => {
@@ -4470,9 +4516,14 @@ async fn handle_component_restart(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(guest_id): Path<String>,
+    Json(body): Json<ConfirmGuestActionBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) = require_exact_confirmation(&body.confirm_guest_id, &guest_id, "guest_id")
+    {
+        return response;
     }
     match ipc_restart_component(&state.socket, &guest_id).await {
         Ok(_) => {

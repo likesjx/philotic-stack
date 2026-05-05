@@ -194,6 +194,8 @@ Land these in order:
   Current truth: landed through `/api/mesh/targets/:target_node_id/secrets`, `POST /api/mesh/targets/:target_node_id/secrets/rotate`, and `POST /api/mesh/targets/:target_node_id/vault`, with inventory returning only metadata/refs and target-hotel authority owning rotation or vault-entry creation. Plaintext fetches remain intentionally absent.
 5. remote placement and role transport actions
   Current truth: landed through `GET /api/mesh/targets/:target_node_id/best-place-to-run` and `PUT /api/mesh/targets/:target_node_id/agents/:agent_id/roles/:role_name/home`, backed by the same target-hotel-authoritative `operator.targets.*` control-plane family. Placement now returns a target-scoped recommendation view, and role/philote transport is expressed honestly as remote role-home mutation followed by the existing daemon-owned handoff/materialization path instead of inventing a second desktop-only teleport ritual.
+6. explicit confirmation ceremonies for dangerous remote actions
+  Current truth: the first typed-confirmation safety layer is landed. Remote secret rotation requires `confirm_secret_ref == secret_ref`, remote vault-entry creation requires `confirm_vault_name == vault_name`, remote component restart/delete require `confirm_guest_id == guest_id`, and remote role-home moves require `confirm_role_binding == "{agent_id}:{role_name}"`. Reads and bounded non-secret config remain normal admin-posture actions for now.
 
 That ordering keeps us moving from established read models toward higher-agency mutations without pretending every remote action deserves to be born in one giant ceremony.
 
@@ -219,7 +221,7 @@ So this proposal is directly adjacent to:
 
 ## Open Questions
 
-1. Which remote mutations should require explicit target-scoped grants beyond elevated operator posture?
+1. Which remote mutations should require explicit target-scoped grants beyond the new typed-confirmation ceremony?
 2. Which remote actions should be async job-style with progress streaming instead of synchronous mutation replies?
 3. Should remote component authoring reuse the exact `/api/components` shape with target scoping, or should target-scoped admin routes get their own namespace first?
 4. How should the desktop present “target canonical” versus “routed fallback” truth so operators do not mistake reachability gossip for real remote state?
