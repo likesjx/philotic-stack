@@ -223,6 +223,49 @@ pub struct OperatorTargetConfigMutationAckView {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretEntryView {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub vault_entries: Vec<OperatorTargetSecretEntryView>,
+    #[serde(default)]
+    pub config_refs: Vec<OperatorTargetSecretEntryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_name: Option<String>,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
 pub type DesktopMembraneTargetView = OperatorTargetView;
 pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
@@ -775,6 +818,9 @@ pub enum IpcRequest {
     QueryOperatorTargetConfig {
         target_node_id: String,
     },
+    QueryOperatorTargetSecrets {
+        target_node_id: String,
+    },
     RegisterOperatorTargetComponent {
         target_node_id: String,
         manifest: ComponentManifest,
@@ -783,6 +829,18 @@ pub enum IpcRequest {
         target_node_id: String,
         key: String,
         value_json: String,
+    },
+    RotateOperatorTargetSecret {
+        target_node_id: String,
+        secret_ref: String,
+        plaintext: String,
+    },
+    AddOperatorTargetVaultEntry {
+        target_node_id: String,
+        vault_name: String,
+        plaintext: String,
+        #[serde(default)]
+        allowed_roles: Vec<String>,
     },
     SetOperatorTargetComponentActive {
         target_node_id: String,
@@ -1570,11 +1628,17 @@ pub enum IpcResponse {
     OperatorTargetConfigView {
         operator_target_config: OperatorTargetConfigView,
     },
+    OperatorTargetSecretsView {
+        operator_target_secrets: OperatorTargetSecretInventoryView,
+    },
     OperatorTargetComponentMutationAckView {
         operator_target_component_mutation: OperatorTargetComponentMutationAckView,
     },
     OperatorTargetConfigMutationAckView {
         operator_target_config_mutation: OperatorTargetConfigMutationAckView,
+    },
+    OperatorTargetSecretMutationAckView {
+        operator_target_secret_mutation: OperatorTargetSecretMutationAckView,
     },
     OperatorChatTurnReply {
         operator_chat_reply: OperatorChatTurnReply,

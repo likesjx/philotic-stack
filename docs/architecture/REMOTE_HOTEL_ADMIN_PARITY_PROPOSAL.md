@@ -191,6 +191,7 @@ Land these in order:
 3. remote config read/mutate parity for bounded operator-approved keys
   Current truth: landed through `/api/mesh/targets/:target_node_id/config` plus `PUT /api/mesh/targets/:target_node_id/config/:key`, backed by the same target-hotel operator surface and intentionally bounded to approved non-secret keys (`execution_host`, `tool_runner_registry`, plus read-only `vault_registry` visibility).
 4. remote secrets/vault-ref inventory and rotation workflows
+  Current truth: landed through `/api/mesh/targets/:target_node_id/secrets`, `POST /api/mesh/targets/:target_node_id/secrets/rotate`, and `POST /api/mesh/targets/:target_node_id/vault`, with inventory returning only metadata/refs and target-hotel authority owning rotation or vault-entry creation. Plaintext fetches remain intentionally absent.
 5. remote placement and role transport actions
 
 That ordering keeps us moving from established read models toward higher-agency mutations without pretending every remote action deserves to be born in one giant ceremony.

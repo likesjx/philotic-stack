@@ -1231,7 +1231,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [x] add remote parity for component inventory/detail
   - [x] add remote parity for component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`)
   - [x] add bounded remote config read/mutate parity for operator-approved keys
-  - [ ] add remote secret/vault-ref inventory and rotation workflows without normalizing plaintext fetches
+  - [x] add remote secret/vault-ref inventory and rotation workflows without normalizing plaintext fetches
   - [ ] add remote placement and role/philote transport actions through the same operator control plane
   - [ ] define which of those actions require explicit target-scoped grants rather than elevated session posture alone
 - [ ] Define the first high-trust remote action ceremonies for:

@@ -34,6 +34,9 @@
 //!   POST /api/mesh/targets/:target_node_id/components/:guest_id/restart
 //!   GET  /api/mesh/targets/:target_node_id/config
 //!   PUT  /api/mesh/targets/:target_node_id/config/:key
+//!   GET  /api/mesh/targets/:target_node_id/secrets
+//!   POST /api/mesh/targets/:target_node_id/secrets/rotate
+//!   POST /api/mesh/targets/:target_node_id/vault
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
 //!   GET  /api/event-log
 //!   GET  /api/config
@@ -97,8 +100,9 @@ use philotic_client::{
     IpcRequest, IpcResponse, LeaseEnvelope, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
-    OperatorTargetGuestInventoryView, OperatorTargetStatusView, OperatorTargetView, PhiloticClient,
-    ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
+    OperatorTargetGuestInventoryView, OperatorTargetSecretInventoryView,
+    OperatorTargetSecretMutationAckView, OperatorTargetStatusView, OperatorTargetView,
+    PhiloticClient, ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
     OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
 };
 
@@ -675,6 +679,18 @@ pub async fn run(
         .route(
             "/api/mesh/targets/:target_node_id/config/:key",
             put(handle_mesh_target_config_put),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/secrets",
+            get(handle_mesh_target_secrets),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/secrets/rotate",
+            post(handle_mesh_target_secret_rotate),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/vault",
+            post(handle_mesh_target_vault_add),
         )
         .route(
             "/api/mesh/targets/:target_node_id/agents/:agent_id/chat",
@@ -2270,6 +2286,109 @@ async fn handle_mesh_target_config_put(
                 StatusCode::NOT_FOUND
             } else if err.to_string().contains("not operator-mutable") {
                 StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_secrets(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_desktop_membrane_target_secrets(&state.socket, &target_node_id).await {
+        Ok(secrets) => Json(secrets).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_secret_rotate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+    Json(body): Json<RotateSecretBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_rotate_target_secret(
+        &state.socket,
+        &target_node_id,
+        &body.secret_ref,
+        &body.plaintext,
+    )
+    .await
+    {
+        Ok(ack) => {
+            let event = json!({
+                "type": "secret:rotated",
+                "payload": { "target_node_id": target_node_id, "secret_ref": body.secret_ref }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(ack).into_response()
+        }
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_vault_add(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+    Json(body): Json<AddVaultEntryBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_add_target_vault_entry(
+        &state.socket,
+        &target_node_id,
+        &body.vault_name,
+        &body.plaintext,
+        body.allowed_roles,
+    )
+    .await
+    {
+        Ok(ack) => {
+            let event = json!({
+                "type": "vault:entry-added",
+                "payload": { "target_node_id": target_node_id, "vault_name": body.vault_name, "secret_ref": ack.secret_ref }
+            });
+            let _ = state.tx.send(event.to_string());
+            (StatusCode::CREATED, Json(ack)).into_response()
+        }
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
@@ -4444,6 +4563,27 @@ async fn ipc_desktop_membrane_target_config(
     }
 }
 
+async fn ipc_desktop_membrane_target_secrets(
+    socket: &str,
+    target_node_id: &str,
+) -> Result<OperatorTargetSecretInventoryView> {
+    let mut client = connect_management_client(socket, "philotic-web-mesh-target-secrets").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetSecrets {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetSecretsView {
+            operator_target_secrets,
+        } => Ok(operator_target_secrets),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target secrets response: {other:?}"
+        )),
+    }
+}
+
 async fn ipc_desktop_membrane_target_component(
     socket: &str,
     target_node_id: &str,
@@ -4481,6 +4621,60 @@ async fn ipc_set_target_config(
         other => Err(anyhow!(
             "unexpected target config mutation response: {other:?}"
         )),
+    }
+}
+
+async fn ipc_rotate_target_secret(
+    socket: &str,
+    target_node_id: &str,
+    secret_ref: &str,
+    plaintext: &str,
+) -> Result<OperatorTargetSecretMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-secrets").await?;
+    match client
+        .send_request(IpcRequest::RotateOperatorTargetSecret {
+            target_node_id: target_node_id.to_string(),
+            secret_ref: secret_ref.to_string(),
+            plaintext: plaintext.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetSecretMutationAckView {
+            operator_target_secret_mutation,
+        } => Ok(operator_target_secret_mutation),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected target secret rotation response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_add_target_vault_entry(
+    socket: &str,
+    target_node_id: &str,
+    vault_name: &str,
+    plaintext: &str,
+    allowed_roles: Vec<String>,
+) -> Result<OperatorTargetSecretMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-secrets").await?;
+    match client
+        .send_request(IpcRequest::AddOperatorTargetVaultEntry {
+            target_node_id: target_node_id.to_string(),
+            vault_name: vault_name.to_string(),
+            plaintext: plaintext.to_string(),
+            allowed_roles,
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetSecretMutationAckView {
+            operator_target_secret_mutation,
+        } => Ok(operator_target_secret_mutation),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected target vault entry response: {other:?}")),
     }
 }
 

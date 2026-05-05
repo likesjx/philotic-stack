@@ -46,8 +46,9 @@ use philotic_client::{
     OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
-    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
-    ResponseRoutePolicyView, SubagentDelegation,
+    OperatorTargetGuestInventoryView, OperatorTargetSecretEntryView,
+    OperatorTargetSecretInventoryView, OperatorTargetSecretMutationAckView,
+    OperatorTargetStatusView, PhiloticClient, ResponseRoutePolicyView, SubagentDelegation,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -1419,6 +1420,67 @@ impl IpcServer {
         Ok(config)
     }
 
+    fn operator_target_secret_inventory(
+        graph: &GraphDomain,
+    ) -> anyhow::Result<OperatorTargetSecretInventoryView> {
+        let vault_registry: Vec<serde_json::Value> = graph
+            .get_config_value("vault_registry")?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let vault_entries = vault_registry
+            .into_iter()
+            .filter_map(|entry| {
+                let name = entry
+                    .get("vault_name")
+                    .or_else(|| entry.get("name"))
+                    .and_then(|v| v.as_str())?
+                    .to_string();
+                let secret_ref = entry
+                    .get("secret_ref")
+                    .and_then(|v| v.as_str())?
+                    .to_string();
+                Some(OperatorTargetSecretEntryView {
+                    kind: "vault_token".into(),
+                    name,
+                    secret_ref: Some(secret_ref),
+                    key: None,
+                    configured: Some(true),
+                })
+            })
+            .collect();
+
+        let named_refs = [
+            ("gemini_oauth_access_token", "gemini_oauth_access_token_ref"),
+            (
+                "gemini_oauth_refresh_token",
+                "gemini_oauth_refresh_token_ref",
+            ),
+            ("telegram_bot_token", "telegram_bot_token"),
+        ];
+        let config_refs = named_refs
+            .into_iter()
+            .map(|(name, key)| OperatorTargetSecretEntryView {
+                kind: "config_ref".into(),
+                name: name.into(),
+                secret_ref: None,
+                key: Some(key.into()),
+                configured: Some(graph.get_config_value(key).ok().flatten().is_some()),
+            })
+            .collect();
+
+        Ok(OperatorTargetSecretInventoryView {
+            target_node_id: String::new(),
+            target_hotel: String::new(),
+            source_hotel: String::new(),
+            observation_kind: String::new(),
+            available: true,
+            pending_remote_query_state: "none".into(),
+            vault_entries,
+            config_refs,
+            note: None,
+        })
+    }
+
     async fn operator_target_config_view(
         registry: &Arc<RwLock<NodeRegistry>>,
         graph: &GraphDomain,
@@ -1470,6 +1532,62 @@ impl IpcServer {
                 config: BTreeMap::new(),
                 note: Some(format!(
                     "remote target config inventory requires a target-hotel operator query: {}",
+                    err
+                )),
+            }),
+        }
+    }
+
+    async fn operator_target_secret_view(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+    ) -> anyhow::Result<OperatorTargetSecretInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+
+        if target_node_id == local_node_id {
+            let mut inventory = Self::operator_target_secret_inventory(graph)?;
+            inventory.target_node_id = target_node_id.to_string();
+            inventory.target_hotel = source_hotel.clone();
+            inventory.source_hotel = source_hotel;
+            inventory.observation_kind = "local-canonical".into();
+            inventory.note =
+                Some("derived from the local hotel's bounded secret-ref inventory".into());
+            return Ok(inventory);
+        }
+
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+
+        match Self::query_remote_operator_target_secrets(
+            graph,
+            local_node_id,
+            target_node_id,
+            &target_hotel,
+        )
+        .await
+        {
+            Ok(view) => Ok(view),
+            Err(err) => Ok(OperatorTargetSecretInventoryView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel,
+                source_hotel,
+                observation_kind: "remote-query-failed".into(),
+                available: false,
+                pending_remote_query_state: "error".into(),
+                vault_entries: Vec::new(),
+                config_refs: Vec::new(),
+                note: Some(format!(
+                    "remote target secret inventory requires a target-hotel operator query: {}",
                     err
                 )),
             }),
@@ -1886,6 +2004,96 @@ impl IpcServer {
         if view.target_hotel != target_hotel {
             anyhow::bail!(
                 "remote target config reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
+    }
+
+    async fn query_remote_operator_target_secrets(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+    ) -> anyhow::Result<OperatorTargetSecretInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.secrets".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target secret-ref inventory".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote secret query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for remote target secret reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote target secret reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetSecretInventoryView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote target secret reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote target secret reply hotel mismatch: expected [{}], got [{}]",
                 target_hotel,
                 view.target_hotel
             );
@@ -2371,6 +2579,165 @@ impl IpcServer {
         Ok(IpcResponse::OperatorTargetConfigMutationAckView {
             operator_target_config_mutation: ack,
         })
+    }
+
+    async fn mutate_operator_target_secret(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        operation: &str,
+        target_node_id: &str,
+        secret_ref: Option<&str>,
+        vault_name: Option<&str>,
+        plaintext: &str,
+        allowed_roles: &[String],
+    ) -> anyhow::Result<IpcResponse> {
+        if target_node_id == local_node_id {
+            let hotel_name = Self::local_hotel_name(graph, local_node_id).unwrap_or_default();
+            match operation {
+                "rotate" => {
+                    let secret_ref = secret_ref
+                        .ok_or_else(|| anyhow::anyhow!("secret ref missing for rotate"))?;
+                    crate::vault::rotate_secret(graph, secret_ref, plaintext)?;
+                    Ok(IpcResponse::OperatorTargetSecretMutationAckView {
+                        operator_target_secret_mutation: OperatorTargetSecretMutationAckView {
+                            target_node_id: local_node_id.to_string(),
+                            target_hotel: hotel_name.clone(),
+                            source_hotel: hotel_name,
+                            operation: "rotate".into(),
+                            secret_ref: Some(secret_ref.to_string()),
+                            vault_name: None,
+                            ok: true,
+                            note: Some(
+                                "derived from the target hotel's bounded secret rotation path"
+                                    .into(),
+                            ),
+                        },
+                    })
+                }
+                "add" => {
+                    let vault_name =
+                        vault_name.ok_or_else(|| anyhow::anyhow!("vault name missing for add"))?;
+                    let secret_ref = Self::handle_add_vault_entry(
+                        graph,
+                        vault_name.to_string(),
+                        plaintext.to_string(),
+                        allowed_roles.to_vec(),
+                    )?;
+                    Ok(IpcResponse::OperatorTargetSecretMutationAckView {
+                        operator_target_secret_mutation: OperatorTargetSecretMutationAckView {
+                            target_node_id: local_node_id.to_string(),
+                            target_hotel: hotel_name.clone(),
+                            source_hotel: hotel_name,
+                            operation: "add".into(),
+                            secret_ref: Some(secret_ref),
+                            vault_name: Some(vault_name.to_string()),
+                            ok: true,
+                            note: Some(
+                                "derived from the target hotel's bounded vault-entry creation path"
+                                    .into(),
+                            ),
+                        },
+                    })
+                }
+                other => anyhow::bail!("unsupported target secret mutation [{}]", other),
+            }
+        } else {
+            let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+                anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+            })?;
+            let guard = registry.read().await;
+            let status = guard.get_node(target_node_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mesh target [{target_node_id}] is not currently active in the registry"
+                )
+            })?;
+            let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+            drop(guard);
+
+            let socket_path = graph
+                .get_hotel(&source_hotel)?
+                .map(|hotel| hotel.ipc_socket_path)
+                .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+            let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+            let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+            let mut client = PhiloticClient::connect_at(
+                &socket_path,
+                GuestIdentity {
+                    guest_id: reply_guest_id.clone(),
+                    role: reply_role.into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await?;
+            match client
+                .send_request(IpcRequest::SubscribeInbox {
+                    role: reply_role.into(),
+                })
+                .await?
+            {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => {
+                    anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}")
+                }
+            }
+            let surface = match operation {
+                "rotate" => "operator.targets.secrets.rotate",
+                "add" => "operator.targets.secrets.add",
+                other => anyhow::bail!("unsupported target secret mutation [{}]", other),
+            };
+            let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+                handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+                surface: surface.into(),
+                request_id: Uuid::new_v4().to_string(),
+                source_hotel: source_hotel.clone(),
+                target_hotel: target_hotel.clone(),
+                target_node_id: target_node_id.to_string(),
+                caller_kind: "operator_surface_adapter".into(),
+                caller_id: local_node_id.to_string(),
+                visibility_scope: "operator".into(),
+                grant_scope: "default".into(),
+                intent: format!("mutate target secret surface: {operation}"),
+                payload: serde_json::json!({
+                    "target_node_id": target_node_id,
+                    "secret_ref": secret_ref,
+                    "vault_name": vault_name,
+                    "plaintext": plaintext,
+                    "allowed_roles": allowed_roles,
+                }),
+                reply_to_node: local_node_id.to_string(),
+                reply_to_role: reply_role.into(),
+                reply_to_guest_id: Some(reply_guest_id),
+                session_id: None,
+                trace: None,
+            })?;
+            match client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: target_node_id.to_string(),
+                    target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                    target_guest_id: None,
+                    task_json,
+                })
+                .await?
+            {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => {
+                    anyhow::bail!("unexpected remote secret mutation emit response: {other:?}")
+                }
+            }
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_task())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("timed out waiting for target secret mutation reply")
+                })??;
+            let IpcResponse::InboundTask { task_json, .. } = reply else {
+                anyhow::bail!("unexpected target secret mutation reply envelope: {reply:?}");
+            };
+            let ack: OperatorTargetSecretMutationAckView = serde_json::from_str(&task_json)?;
+            Ok(IpcResponse::OperatorTargetSecretMutationAckView {
+                operator_target_secret_mutation: ack,
+            })
+        }
     }
 
     async fn send_operator_chat_turn(
@@ -6230,6 +6597,25 @@ impl IpcServer {
                     ),
                 }
             }
+            IpcRequest::QueryOperatorTargetSecrets { target_node_id } => {
+                match Self::operator_target_secret_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(operator_target_secrets) => IpcResponse::OperatorTargetSecretsView {
+                        operator_target_secrets,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "operator_target_secrets",
+                        "OPERATOR_TARGET_SECRETS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
             IpcRequest::RegisterOperatorTargetComponent {
                 target_node_id,
                 manifest,
@@ -6341,6 +6727,55 @@ impl IpcServer {
                 Err(err) => IpcResponse::error(
                     "operator_target_config_set",
                     "OPERATOR_TARGET_CONFIG_SET_ERROR",
+                    err.to_string(),
+                ),
+            },
+            IpcRequest::RotateOperatorTargetSecret {
+                target_node_id,
+                secret_ref,
+                plaintext,
+            } => match Self::mutate_operator_target_secret(
+                registry,
+                graph,
+                local_node_id,
+                "rotate",
+                &target_node_id,
+                Some(&secret_ref),
+                None,
+                &plaintext,
+                &[],
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => IpcResponse::error(
+                    "operator_target_secret_rotate",
+                    "OPERATOR_TARGET_SECRET_ROTATE_ERROR",
+                    err.to_string(),
+                ),
+            },
+            IpcRequest::AddOperatorTargetVaultEntry {
+                target_node_id,
+                vault_name,
+                plaintext,
+                allowed_roles,
+            } => match Self::mutate_operator_target_secret(
+                registry,
+                graph,
+                local_node_id,
+                "add",
+                &target_node_id,
+                None,
+                Some(&vault_name),
+                &plaintext,
+                &allowed_roles,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => IpcResponse::error(
+                    "operator_target_secret_add",
+                    "OPERATOR_TARGET_SECRET_ADD_ERROR",
                     err.to_string(),
                 ),
             },
