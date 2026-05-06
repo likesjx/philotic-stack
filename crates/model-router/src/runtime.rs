@@ -831,6 +831,48 @@ fn classify_provider_failure(
     if malformed_tool_call {
         payload.code = Some("MODEL_INVALID_TOOL_CALL".into());
         payload.retryable = Some(true);
+        payload.sub_kind = Some("content_error".into());
+        return payload;
+    }
+
+    // Network-level failures: connection refused, DNS, TLS, socket errors.
+    let is_network = message.contains("connection refused")
+        || message.contains("Connection refused")
+        || message.contains("failed to connect")
+        || message.contains("dns error")
+        || message.contains("No such host")
+        || message.contains("connection error")
+        || message.contains("error sending request");
+
+    if is_network {
+        payload.sub_kind = Some("network_error".into());
+        payload.retryable = Some(true);
+        return payload;
+    }
+
+    // Streaming idle timeout — emitted by providers when the SSE stream stalls.
+    if message.contains("streaming_timeout") {
+        payload.sub_kind = Some("streaming_timeout".into());
+        payload.retryable = Some(true);
+        return payload;
+    }
+
+    // Rate limit (HTTP 429).
+    if message.contains("429") || message.contains("rate limit") || message.contains("quota") {
+        payload.sub_kind = Some("rate_limit".into());
+        payload.retryable = Some(true);
+        return payload;
+    }
+
+    // Generic provider-side HTTP error (5xx or non-retryable 4xx).
+    if message.contains("500")
+        || message.contains("502")
+        || message.contains("503")
+        || message.contains("504")
+    {
+        payload.sub_kind = Some("provider_error".into());
+        payload.retryable = Some(true);
+        return payload;
     }
 
     payload

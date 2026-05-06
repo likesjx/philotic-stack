@@ -11,6 +11,34 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Filter for [`WhisperTrainingStorage::list_filtered`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingFilter {
+    #[default]
+    All,
+    Uncorrected,
+    Eligible,
+    Exported,
+}
+
+/// Summary counts returned by [`WhisperTrainingStorage::count_status`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrainingStatusCounts {
+    pub total: u64,
+    pub uncorrected: u64,
+    pub eligible: u64,
+    pub exported: u64,
+}
+
+/// Format for [`WhisperTrainingStorage::export_samples`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingExportFormat {
+    HuggingFace,
+    Nemo,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Records
 // ──────────────────────────────────────────────────────────────────────────────
@@ -46,6 +74,9 @@ pub struct WhisperTrainingSample {
     /// Confidence score from Whisper (avg log-prob normalised to 0–1), if available.
     #[serde(default)]
     pub confidence: Option<f32>,
+    /// Unix epoch seconds when this sample was exported; `None` until first export.
+    #[serde(default)]
+    pub exported_at: Option<u64>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -80,6 +111,21 @@ pub trait WhisperTrainingStorage: Send + Sync {
 
     /// Look up a sample by `turn_id`.
     fn get_by_turn_id(&self, turn_id: &str) -> Result<Option<WhisperTrainingSample>>;
+
+    /// Return samples matching `filter`, optionally narrowed to one agent.
+    fn list_filtered(
+        &self,
+        filter: &TrainingFilter,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WhisperTrainingSample>>;
+
+    /// Return aggregate counts grouped by correction/export state.
+    fn count_status(&self, agent_id: Option<&str>) -> Result<TrainingStatusCounts>;
+
+    /// Mark a batch of samples exported — sets `training_eligible = false` and
+    /// records `exported_at` as current Unix epoch seconds.
+    fn mark_exported_at(&self, sample_ids: &[String], exported_at: u64) -> Result<()>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -107,6 +153,12 @@ impl SqliteWhisperTrainingStorage {
 
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Enable WAL for concurrent access with router-listener.
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // Migrate: add exported_at to existing DBs that predate this column.
+        let _ = conn.execute_batch(
+            "ALTER TABLE whisper_training_samples ADD COLUMN exported_at INTEGER;",
+        );
         conn.execute_batch(
             "
             BEGIN;
@@ -123,7 +175,8 @@ impl SqliteWhisperTrainingStorage {
                 audio_path             TEXT,
                 timestamp              INTEGER NOT NULL,
                 training_eligible      INTEGER NOT NULL DEFAULT 0,
-                confidence             REAL
+                confidence             REAL,
+                exported_at            INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_whisper_training_ts
@@ -149,8 +202,8 @@ impl WhisperTrainingStorage for SqliteWhisperTrainingStorage {
             "INSERT OR IGNORE INTO whisper_training_samples
              (sample_id, agent_id, session_id, turn_id, raw_transcript,
               corrected_transcript, correction_source, model_gen, audio_path,
-              timestamp, training_eligible, confidence)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+              timestamp, training_eligible, confidence, exported_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 s.sample_id,
                 s.agent_id,
@@ -164,6 +217,7 @@ impl WhisperTrainingStorage for SqliteWhisperTrainingStorage {
                 s.timestamp as i64,
                 s.training_eligible as i64,
                 s.confidence.map(|f| f as f64),
+                s.exported_at.map(|t| t as i64),
             ],
         )?;
         Ok(())
@@ -192,7 +246,7 @@ impl WhisperTrainingStorage for SqliteWhisperTrainingStorage {
         let mut stmt = conn.prepare(
             "SELECT sample_id, agent_id, session_id, turn_id, raw_transcript,
                     corrected_transcript, correction_source, model_gen, audio_path,
-                    timestamp, training_eligible, confidence
+                    timestamp, training_eligible, confidence, exported_at
              FROM whisper_training_samples
              ORDER BY timestamp DESC LIMIT ?1",
         )?;
@@ -204,7 +258,7 @@ impl WhisperTrainingStorage for SqliteWhisperTrainingStorage {
         let mut stmt = conn.prepare(
             "SELECT sample_id, agent_id, session_id, turn_id, raw_transcript,
                     corrected_transcript, correction_source, model_gen, audio_path,
-                    timestamp, training_eligible, confidence
+                    timestamp, training_eligible, confidence, exported_at
              FROM whisper_training_samples
              WHERE training_eligible = 1
              ORDER BY timestamp DESC LIMIT ?1",
@@ -213,20 +267,11 @@ impl WhisperTrainingStorage for SqliteWhisperTrainingStorage {
     }
 
     fn mark_exported(&self, sample_ids: &[String]) -> Result<()> {
-        if sample_ids.is_empty() {
-            return Ok(());
-        }
-        let conn = self.conn.lock().unwrap();
-        // SQLite doesn't support bound arrays — use a transaction with individual updates.
-        let tx = conn.unchecked_transaction()?;
-        for id in sample_ids {
-            tx.execute(
-                "UPDATE whisper_training_samples SET training_eligible = 0 WHERE sample_id = ?1",
-                params![id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.mark_exported_at(sample_ids, now)
     }
 
     fn get_by_turn_id(&self, turn_id: &str) -> Result<Option<WhisperTrainingSample>> {
@@ -234,13 +279,102 @@ impl WhisperTrainingStorage for SqliteWhisperTrainingStorage {
         let mut stmt = conn.prepare(
             "SELECT sample_id, agent_id, session_id, turn_id, raw_transcript,
                     corrected_transcript, correction_source, model_gen, audio_path,
-                    timestamp, training_eligible, confidence
+                    timestamp, training_eligible, confidence, exported_at
              FROM whisper_training_samples
              WHERE turn_id = ?1
              LIMIT 1",
         )?;
         let mut samples = collect_samples(&mut stmt, params![turn_id])?;
         Ok(samples.pop())
+    }
+
+    fn list_filtered(
+        &self,
+        filter: &TrainingFilter,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WhisperTrainingSample>> {
+        let conn = self.conn.lock().unwrap();
+        let base = "SELECT sample_id, agent_id, session_id, turn_id, raw_transcript,
+                           corrected_transcript, correction_source, model_gen, audio_path,
+                           timestamp, training_eligible, confidence, exported_at
+                    FROM whisper_training_samples";
+        let where_filter = match filter {
+            TrainingFilter::All => "",
+            TrainingFilter::Uncorrected => "corrected_transcript IS NULL",
+            TrainingFilter::Eligible => "training_eligible = 1",
+            TrainingFilter::Exported => "exported_at IS NOT NULL",
+        };
+        let where_agent = agent_id.map(|_| "agent_id = ?2");
+        let where_clause = match (where_filter.is_empty(), where_agent) {
+            (true, None) => String::new(),
+            (false, None) => format!("WHERE {}", where_filter),
+            (true, Some(a)) => format!("WHERE {}", a),
+            (false, Some(a)) => format!("WHERE {} AND {}", where_filter, a),
+        };
+        let sql = format!("{} {} ORDER BY timestamp DESC LIMIT ?1", base, where_clause);
+        let mut stmt = conn.prepare(&sql)?;
+        if let Some(aid) = agent_id {
+            collect_samples(&mut stmt, params![limit as i64, aid])
+        } else {
+            collect_samples(&mut stmt, params![limit as i64])
+        }
+    }
+
+    fn count_status(&self, agent_id: Option<&str>) -> Result<TrainingStatusCounts> {
+        let conn = self.conn.lock().unwrap();
+        let agent_clause = if agent_id.is_some() {
+            "WHERE agent_id = ?1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT
+               COUNT(*),
+               SUM(CASE WHEN corrected_transcript IS NULL THEN 1 ELSE 0 END),
+               SUM(CASE WHEN training_eligible = 1 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN exported_at IS NOT NULL THEN 1 ELSE 0 END)
+             FROM whisper_training_samples {}",
+            agent_clause
+        );
+        let (total, uncorrected, eligible, exported) = if let Some(aid) = agent_id {
+            conn.query_row(&sql, params![aid], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })?
+        } else {
+            conn.query_row(&sql, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })?
+        };
+        Ok(TrainingStatusCounts { total, uncorrected, eligible, exported })
+    }
+
+    fn mark_exported_at(&self, sample_ids: &[String], exported_at: u64) -> Result<()> {
+        if sample_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        for id in sample_ids {
+            tx.execute(
+                "UPDATE whisper_training_samples
+                 SET training_eligible = 0, exported_at = ?1
+                 WHERE sample_id = ?2",
+                params![exported_at as i64, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -262,6 +396,7 @@ fn collect_samples(
             timestamp: row.get::<_, i64>(9)? as u64,
             training_eligible: row.get::<_, i64>(10)? != 0,
             confidence: row.get::<_, Option<f64>>(11)?.map(|f| f as f32),
+            exported_at: row.get::<_, Option<i64>>(12)?.map(|t| t as u64),
         })
     })?;
     let mut samples = Vec::new();
@@ -300,6 +435,7 @@ mod tests {
             timestamp: 1_700_000_000 + n,
             training_eligible: false,
             confidence: Some(0.87),
+            exported_at: None,
         }
     }
 
@@ -390,5 +526,61 @@ mod tests {
     fn get_by_turn_id_returns_none_for_missing() {
         let (s, _f) = open_tmp();
         assert!(s.get_by_turn_id("ghost-turn").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_filtered_uncorrected() {
+        let (s, _f) = open_tmp();
+        s.insert_sample(&make_sample(1)).unwrap();
+        s.insert_sample(&make_sample(2)).unwrap();
+        s.update_correction("turn-2", "fixed", "operator").unwrap();
+
+        let uncorrected = s.list_filtered(&TrainingFilter::Uncorrected, None, 10).unwrap();
+        assert_eq!(uncorrected.len(), 1);
+        assert_eq!(uncorrected[0].turn_id, "turn-1");
+    }
+
+    #[test]
+    fn list_filtered_by_agent() {
+        let (s, _f) = open_tmp();
+        let mut sample = make_sample(1);
+        sample.agent_id = "aria".into();
+        s.insert_sample(&sample).unwrap();
+        s.insert_sample(&make_sample(2)).unwrap();
+
+        let aria_only = s.list_filtered(&TrainingFilter::All, Some("aria"), 10).unwrap();
+        assert_eq!(aria_only.len(), 1);
+        assert_eq!(aria_only[0].agent_id, "aria");
+    }
+
+    #[test]
+    fn count_status_aggregates_correctly() {
+        let (s, _f) = open_tmp();
+        s.insert_sample(&make_sample(1)).unwrap();
+        s.insert_sample(&make_sample(2)).unwrap();
+        s.insert_sample(&make_sample(3)).unwrap();
+        s.update_correction("turn-2", "fixed", "operator").unwrap();
+        s.update_correction("turn-3", "fixed2", "operator").unwrap();
+        s.mark_exported_at(&["sample-0003".to_string()], 1_700_001_000).unwrap();
+
+        let counts = s.count_status(None).unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.uncorrected, 1);
+        assert_eq!(counts.eligible, 1); // turn-2 eligible, turn-3 was exported (eligible=0)
+        assert_eq!(counts.exported, 1);
+    }
+
+    #[test]
+    fn list_filtered_exported() {
+        let (s, _f) = open_tmp();
+        s.insert_sample(&make_sample(1)).unwrap();
+        s.insert_sample(&make_sample(2)).unwrap();
+        s.update_correction("turn-1", "fixed", "operator").unwrap();
+        s.mark_exported_at(&["sample-0001".to_string()], 1_700_001_000).unwrap();
+
+        let exported = s.list_filtered(&TrainingFilter::Exported, None, 10).unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].sample_id, "sample-0001");
+        assert!(exported[0].exported_at.is_some());
     }
 }

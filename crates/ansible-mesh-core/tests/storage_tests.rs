@@ -129,6 +129,7 @@ fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
             model_profile: Some("gemini-default".into()),
             context_window_policy: Some("balanced".into()),
             loop_script: None,
+            fallback_tiers: Vec::new(),
         },
         home_node: None,
     }

@@ -97,6 +97,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "memory-core",
+ "parakeet-runner",
  "philotic-client",
  "rand 0.8.5",
  "reqwest",
@@ -1636,10 +1637,15 @@ name = "graph-datasource"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
+ "async-trait",
  "datasource",
+ "regex",
+ "rusqlite",
+ "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2593,6 +2599,7 @@ dependencies = [
  "media-prep",
  "mlx-runner",
  "onnx-runner",
+ "parakeet-runner",
  "philotic-client",
  "reqwest",
  "serde",
@@ -2945,6 +2952,18 @@ dependencies = [
  "elliptic-curve",
  "primeorder",
  "sha2",
+]
+
+[[package]]
+name = "parakeet-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "philotic-client",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -22,6 +22,9 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{info, warn};
 
+/// Seconds without a byte chunk from the SSE stream before we abort and escalate.
+const STREAMING_IDLE_SECS: u64 = 8;
+
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
 const GEMINI_LIVE_PROTOCOL: &str = "gemini-live-v1beta";
@@ -377,9 +380,12 @@ impl GeminiProvider {
             .join("\n");
 
         let memory_instruction = if wants_concept {
-            " Also include \"memory_candidate\" with fields: \"concept\" (short kebab-case slug), \
-             \"content\" (compact autobiographical memory text for this exchange), and optional \
-             \"tags\" (array of short strings)."
+            " If — and only if — this exchange contains something genuinely worth remembering \
+             (a user preference, a decision made, a fact learned, or a pattern worth recalling later), \
+             include \"memory_candidate\" with fields: \"concept\" (short kebab-case slug), \
+             \"content\" (one or two sentences distilling what is worth keeping), and optional \
+             \"tags\" (array of short strings). Omit memory_candidate entirely for routine \
+             exchanges, simple questions, greetings, or transient state."
         } else {
             ""
         };
@@ -409,6 +415,7 @@ impl GeminiProvider {
         if wants_concept {
             properties["memory_candidate"] = json!({
                 "type": "OBJECT",
+                "nullable": true,
                 "properties": {
                     "concept": { "type": "STRING" },
                     "content": { "type": "STRING" },
@@ -419,6 +426,7 @@ impl GeminiProvider {
                 },
                 "required": ["concept", "content"]
             });
+            // Not pushed to required — model omits it when there's nothing worth saving.
         }
         if wants_plan {
             properties["active_plan"] = json!({
@@ -475,11 +483,14 @@ impl GeminiProvider {
     ) -> Value {
         let system_text = if wants_concept {
             "When generating your response, produce a JSON object with \"display_text\" \
-             (your full response formatted for text display, markdown is fine), \
+             (your full response formatted for text display, markdown is fine) and \
              \"spoken_text\" (a natural, expressive version for voice delivery — no markdown, \
-             conversational tone, written to be heard), and \"memory_candidate\" \
-             (an object with \"concept\" as a short kebab-case topic slug, \"content\" as a compact \
-             autobiographical memory text for this exchange, and optional \"tags\" as an array of strings)."
+             conversational tone, written to be heard). If — and only if — this exchange contains \
+             something genuinely worth remembering (a user preference, a decision, a fact learned, \
+             or a recurring pattern), also include \"memory_candidate\" (an object with \"concept\" \
+             as a short kebab-case slug, \"content\" as one or two sentences distilling what is \
+             worth keeping, and optional \"tags\"). Omit memory_candidate entirely for routine \
+             exchanges, greetings, or transient state."
         } else {
             "When generating your response, produce a JSON object with two fields: \
              \"display_text\" (your full response formatted for text display, \
@@ -496,6 +507,7 @@ impl GeminiProvider {
         if wants_concept {
             properties["memory_candidate"] = json!({
                 "type": "OBJECT",
+                "nullable": true,
                 "properties": {
                     "concept": { "type": "STRING" },
                     "content": { "type": "STRING" },
@@ -506,7 +518,7 @@ impl GeminiProvider {
                 },
                 "required": ["concept", "content"]
             });
-            required.push("memory_candidate");
+            // Not pushed to required — model omits when nothing is worth saving.
         }
         if wants_plan {
             properties["active_plan"] = json!({
@@ -1473,34 +1485,48 @@ impl ModelProvider for GeminiProvider {
         };
         let mut _display_text_out = String::new();
 
-        while let Some(chunk_result) = byte_stream.next().await {
-            let bytes = chunk_result.context("Gemini SSE stream read error")?;
-            for &byte in bytes.iter() {
-                if byte == b'\n' {
-                    let line = String::from_utf8_lossy(&line_buf).trim().to_string();
-                    line_buf.clear();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
-                        full_text.push_str(&text_chunk);
-                        if is_structured {
-                            // Extract display_text field content progressively.
-                            let tokens = Self::extract_display_text_tokens(
-                                &full_text,
-                                &mut cursor,
-                                &mut _display_text_out,
-                            );
-                            for token in tokens {
-                                let _ = token_tx.send(token).await;
+        let idle_dur = Duration::from_secs(STREAMING_IDLE_SECS);
+        loop {
+            match timeout(idle_dur, byte_stream.next()).await {
+                Ok(Some(chunk_result)) => {
+                    let bytes = chunk_result.context("Gemini SSE stream read error")?;
+                    for &byte in bytes.iter() {
+                        if byte == b'\n' {
+                            let line = String::from_utf8_lossy(&line_buf).trim().to_string();
+                            line_buf.clear();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
+                                full_text.push_str(&text_chunk);
+                                if is_structured {
+                                    let tokens = Self::extract_display_text_tokens(
+                                        &full_text,
+                                        &mut cursor,
+                                        &mut _display_text_out,
+                                    );
+                                    for token in tokens {
+                                        let _ = token_tx.send(token).await;
+                                    }
+                                } else {
+                                    let _ = token_tx.send(text_chunk).await;
+                                }
                             }
                         } else {
-                            // Plain text: forward the raw chunk directly.
-                            let _ = token_tx.send(text_chunk).await;
+                            line_buf.push(byte);
                         }
                     }
-                } else {
-                    line_buf.push(byte);
+                }
+                Ok(None) => break, // stream closed normally
+                Err(_elapsed) => {
+                    // No bytes arrived within STREAMING_IDLE_SECS. Abort — the token
+                    // "streaming_timeout" in the message is detected by classify_provider_failure
+                    // in model-router so philote can escalate to the next fallback tier.
+                    drop(token_tx);
+                    bail!(
+                        "streaming_timeout: Gemini SSE stream produced no data for {}s",
+                        STREAMING_IDLE_SECS
+                    );
                 }
             }
         }
@@ -1517,12 +1543,11 @@ impl ModelProvider for GeminiProvider {
         drop(token_tx);
 
         if full_text.trim().is_empty() {
-            // Streaming returned no content — Gemini sometimes returns SSE chunks with
-            // finishReason but no text (safety block, quota, structured-JSON returned
-            // outside SSE format, etc.). Fall back to the batch endpoint which surfaces
-            // the actual error or returns the real response.
-            warn!("Gemini streaming returned no content; retrying with batch invoke");
-            return self.invoke(task).await;
+            // Stream completed without delivering text content (safety block, quota, etc.).
+            // Do NOT fall back to batch — that path has no timeout and caused a 27-minute hang.
+            // Return a streaming_timeout error so philote escalates to the next fallback tier.
+            warn!("Gemini streaming returned no content; escalating to fallback tier");
+            bail!("streaming_timeout: Gemini SSE stream completed with no text content");
         }
 
         // Parse the accumulated full_text into a ProviderOutput the same way invoke() does.

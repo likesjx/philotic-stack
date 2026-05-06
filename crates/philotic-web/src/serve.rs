@@ -2291,10 +2291,7 @@ async fn ipc_get_user_profile(socket: &str, hotel_name: &str) -> Result<Value> {
         })
         .await?
     {
-        IpcResponse::UserProfileData {
-            timezone,
-            display_name,
-        } => Ok(json!({ "timezone": timezone, "display_name": display_name })),
+        IpcResponse::UserProfileData(p) => Ok(json!({ "timezone": p.timezone, "display_name": p.display_name })),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected get_user_profile response: {other:?}")),
     }
@@ -2315,10 +2312,7 @@ async fn ipc_patch_user_profile(
         })
         .await?
     {
-        IpcResponse::UserProfileData {
-            timezone,
-            display_name,
-        } => Ok(json!({ "timezone": timezone, "display_name": display_name })),
+        IpcResponse::UserProfileData(p) => Ok(json!({ "timezone": p.timezone, "display_name": p.display_name })),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected patch_user_profile response: {other:?}")),
     }

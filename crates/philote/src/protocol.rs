@@ -85,6 +85,12 @@ pub struct InboundTaskPayload {
     pub final_reply_guest_id: Option<String>,
     #[serde(default)]
     pub error: Option<TaskErrorPayload>,
+    /// Result payload from a datasource_response task (graph-datasource etc.).
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+    /// Capability identifier echoed back on datasource_response tasks.
+    #[serde(default)]
+    pub capability: Option<String>,
     /// Inline PCM audio from Discord voice bridge (voice.dialogue tasks).
     #[serde(default)]
     pub pcm_b64: Option<String>,

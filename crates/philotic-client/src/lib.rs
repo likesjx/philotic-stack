@@ -230,6 +230,11 @@ pub struct TaskErrorPayload {
     pub capability: Option<String>,
     #[serde(default)]
     pub retryable: Option<bool>,
+    /// Narrow error subtype for precise routing decisions.
+    /// Values: "network_error", "streaming_timeout", "rate_limit",
+    /// "provider_error", "content_error", "empty_response".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_kind: Option<String>,
 }
 
 impl TaskErrorPayload {
@@ -247,6 +252,7 @@ impl TaskErrorPayload {
             provider: provider.map(str::to_string),
             capability: capability.map(str::to_string),
             retryable: None,
+            sub_kind: None,
         }
     }
 
@@ -265,6 +271,7 @@ impl TaskErrorPayload {
             capability: Some(tool_name),
             provider: None,
             retryable: Some(false),
+            sub_kind: None,
         }
     }
 
@@ -282,6 +289,7 @@ impl TaskErrorPayload {
             provider: None,
             capability: None,
             retryable: Some(true),
+            sub_kind: None,
         }
     }
 
@@ -295,6 +303,7 @@ impl TaskErrorPayload {
             provider: None,
             capability: None,
             retryable: Some(true),
+            sub_kind: None,
         }
     }
 
@@ -597,6 +606,14 @@ pub struct Exosome {
     /// Used by the routing reflex to deliver the specialist's reply to the right channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_chat_id: Option<String>,
+}
+
+fn default_training_limit() -> usize {
+    20
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
@@ -1177,6 +1194,51 @@ pub enum IpcRequest {
         endpoint_id: String,
         owner_agent_id: String,
     },
+    // ── Training data admin IPC ───────────────────────────────────────────────
+    /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
+    ListTrainingSamples {
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default = "default_training_limit")]
+        limit: usize,
+        #[serde(default)]
+        filter: ansible_mesh_core::whisper_training::TrainingFilter,
+    },
+    /// Apply an operator correction to a training sample. Responds with [`IpcResponse::Standard`].
+    CorrectTrainingSample {
+        turn_id: String,
+        corrected_transcript: String,
+    },
+    /// Export eligible samples to a file. Responds with [`IpcResponse::Standard`] (data.exported_count).
+    ExportTrainingSamples {
+        format: ansible_mesh_core::whisper_training::TrainingExportFormat,
+        output_path: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Return aggregate counts by state. Responds with [`IpcResponse::Standard`] (data.status).
+    GetTrainingStatus {
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    // ── ASR provider lifecycle ────────────────────────────────────────────────
+    /// Set up the Parakeet ASR provider: verify/install nemo-toolkit, write
+    /// component config, and register the guest for materialization.
+    /// Responds with [`IpcResponse::Standard`] (data.message).
+    AsrSetup {
+        /// Python interpreter path (default: "python3").
+        #[serde(default)]
+        python_path: Option<String>,
+        /// NeMo model name (default: nvidia/parakeet-tdt-0.6b-v2).
+        #[serde(default)]
+        model_name: Option<String>,
+        /// If true, attempt `pip install nemo-toolkit[asr]` when the import check fails.
+        #[serde(default = "default_true")]
+        auto_install: bool,
+    },
+    /// Return the current status of the Parakeet ASR provider (guest active, nemo available).
+    /// Responds with [`IpcResponse::Standard`] (data.status).
+    AsrStatus {},
     /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
     /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
     GracefulShutdown {
@@ -1203,6 +1265,18 @@ pub enum IpcRequest {
     GetHotelLogs {
         lines: u32,
     },
+}
+
+/// Payload for [`IpcResponse::UserProfileData`].
+///
+/// MUST use `deny_unknown_fields` so that `#[serde(untagged)]` deserialization rejects
+/// objects with unrecognised fields (e.g. `{ "config_json": "..." }`) instead of
+/// silently consuming them as `UserProfileData { timezone: None, display_name: None }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UserProfileDataPayload {
+    pub timezone: Option<String>,
+    pub display_name: Option<String>,
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -1461,13 +1535,10 @@ pub enum IpcResponse {
     ///
     /// Response to [`IpcRequest::GetUserProfile`] and [`IpcRequest::PatchUserProfile`].
     ///
-    /// NOTE: Like `MemoryConfig`, this variant has only optional fields and MUST appear
-    /// near the end of the enum. With `#[serde(untagged)]`, it would otherwise match any
-    /// JSON object that earlier variants don't claim (including Standard acks).
-    UserProfileData {
-        timezone: Option<String>,
-        display_name: Option<String>,
-    },
+    /// NOTE: `UserProfileDataPayload` uses `#[serde(deny_unknown_fields)]`, which causes
+    /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
+    /// This prevents this variant from swallowing `MemoryConfig` responses.
+    UserProfileData(UserProfileDataPayload),
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
@@ -1670,7 +1741,7 @@ impl PhiloticClient {
     fn is_ignorable_push(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::UserProfileData { .. } | IpcResponse::NetworkState { .. }
+            IpcResponse::UserProfileData(_) | IpcResponse::NetworkState { .. }
         )
     }
 
@@ -1752,6 +1823,7 @@ mod tests {
             provider: Some("elevenlabs".into()),
             capability: Some("voice.synthesize".into()),
             retryable: Some(false),
+            sub_kind: None,
         };
 
         let rendered = payload.display_message();

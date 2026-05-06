@@ -99,7 +99,7 @@ pub struct SessionState {
     /// The payload preserves session_id, chat_id, and exosome context so the
     /// correct Telegram session/chat is restored when the task is dispatched.
     /// Voice tasks are queued raw and will be transcribed when they reach the front.
-    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload)>,
+    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload, std::time::Instant)>,
     /// Optional role name of the queue arbiter.
     /// When set, TEXT tasks queued while a turn is active are routed to this specialist
     /// role via paracrine dispatch for priority evaluation. The arbiter may call
@@ -133,6 +133,11 @@ pub struct SessionState {
     /// Maps tool_name → required consecutive successes.
     /// Populated by the `approval.request_standing` planning tool.
     pub pending_preapproval_thresholds: std::collections::HashMap<String, u32>,
+    /// Structured knowledge fetched from the agent's own graph partition at session load.
+    /// None = not yet fetched. Some("") = fetched but empty. Some(text) = ready to inject.
+    pub agent_graph_snapshot: Option<String>,
+    /// Whether a graph preload has been dispatched this session (to avoid duplicate fetches).
+    pub graph_preload_dispatched: bool,
 }
 
 impl SessionState {
@@ -166,6 +171,8 @@ impl SessionState {
             parked_plan_since: None,
             tool_success_streak: std::collections::HashMap::new(),
             pending_preapproval_thresholds: std::collections::HashMap::new(),
+            agent_graph_snapshot: None,
+            graph_preload_dispatched: false,
         }
     }
 
@@ -180,17 +187,25 @@ impl SessionState {
 
     /// Enqueue a user task for deferred processing after the current turn completes.
     pub fn enqueue_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_back((task_id, task));
+        self.pending_user_tasks.push_back((task_id, task, std::time::Instant::now()));
     }
 
     /// Prepend a user task to the front of the queue (high priority, arbiter-promoted).
     pub fn prepend_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_front((task_id, task));
+        self.pending_user_tasks.push_front((task_id, task, std::time::Instant::now()));
     }
 
-    /// Pop the next pending user task, if any.
+    /// Pop the next pending user task, if any. Strips the enqueue timestamp.
     pub fn dequeue_user_task(&mut self) -> Option<(uuid::Uuid, InboundTaskPayload)> {
-        self.pending_user_tasks.pop_front()
+        self.pending_user_tasks.pop_front().map(|(id, task, _)| (id, task))
+    }
+
+    /// Drop any queued tasks older than `max_age_secs`. Returns the number evicted.
+    pub fn evict_stale_queued_tasks(&mut self, max_age_secs: u64) -> usize {
+        let cutoff = std::time::Duration::from_secs(max_age_secs);
+        let before = self.pending_user_tasks.len();
+        self.pending_user_tasks.retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
+        before - self.pending_user_tasks.len()
     }
 
     /// How many tasks are waiting in the queue.
@@ -1675,6 +1690,20 @@ impl SessionState {
             );
         }
 
+        if let Some(graph_content) = self.agent_graph_snapshot.as_deref().filter(|s| !s.is_empty()) {
+            self.push_layer(
+                &mut layers,
+                &mut contributions,
+                ContextLayerId::AgentGraph,
+                "graph_datasource:agent_partition",
+                ContextAuthority::Advisory,
+                ContextMutability::Refreshable,
+                graph_content.to_string(),
+                vec!["agent_graph_snapshot".into()],
+                "graph_candidate",
+            );
+        }
+
         ContextProjection {
             conversation_turn: ConversationTurnScope {
                 conversation_turn_id: turn_id,
@@ -1738,6 +1767,7 @@ impl SessionState {
                 ContextLayerId::Working => "Working projection",
                 ContextLayerId::Knowledge => "Knowledge projection",
                 ContextLayerId::RecalledMemory => "Recalled memory projection",
+                ContextLayerId::AgentGraph => "Agent knowledge graph",
             };
             prompt.push_str(&format!("\n[{title}]\n"));
             prompt.push_str(&layer.rendered_content);
@@ -1782,6 +1812,7 @@ impl SessionState {
                     ContextLayerId::Relationship
                         | ContextLayerId::Knowledge
                         | ContextLayerId::RecalledMemory
+                        | ContextLayerId::AgentGraph
                 )
             })
             .map(|layer| {
@@ -1789,6 +1820,7 @@ impl SessionState {
                     ContextLayerId::Relationship => "relationship",
                     ContextLayerId::Knowledge => "knowledge",
                     ContextLayerId::RecalledMemory => "recalled_memory",
+                    ContextLayerId::AgentGraph => "agent_graph",
                     _ => "memory",
                 };
                 projection_item(&layer.rendered_content, &layer.owner, kind)
@@ -2614,6 +2646,7 @@ impl SessionState {
                 "consecutive_step_failures": turn.consecutive_step_failures,
                 "provider_repair_note": turn.provider_repair_note,
                 "provider_repair_attempts": turn.provider_repair_attempts,
+                "fallback_tier": turn.fallback_tier,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
@@ -2934,6 +2967,10 @@ impl SessionState {
                     .get("plan_confirm_note")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                fallback_tier: turn
+                    .get("fallback_tier")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u8,
             })
         });
 
@@ -2993,6 +3030,8 @@ impl SessionState {
             parked_plan_since: None,
             tool_success_streak,
             pending_preapproval_thresholds,
+            agent_graph_snapshot: None,
+            graph_preload_dispatched: false,
         })
     }
 }
@@ -3158,6 +3197,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         .map(|tool_name| {
             let execution_mode = if is_local_agent_tool(tool_name) {
                 "local_agent"
+            } else if is_graph_datasource_tool(tool_name) {
+                "datasource"
             } else if is_pinned_tool(tool_name) {
                 "pinned"
             } else {
@@ -3169,6 +3210,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     target_node: local_node_id.clone(),
                     target_role: if execution_mode == "local_agent" {
                         "agent".into()
+                    } else if execution_mode == "datasource" {
+                        "graph-datasource".into()
                     } else {
                         format!("tool.{tool_name}")
                     },
@@ -3190,6 +3233,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
                         "agent_local_tool".into()
+                    } else if execution_mode == "datasource" {
+                        "graph_datasource_route".into()
                     } else if execution_mode == "pinned" {
                         "default_pinned_route".into()
                     } else {
@@ -3267,10 +3312,19 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "subagent.spawn"
             | "role.configure"
             | "role.create_or_update"
+            | "role.list"
+            | "role.set_home"
             | "handoff.to_role"
             | "handoff.back"
             | "delegate.whisper"
             | "approval.request_standing"
+    )
+}
+
+fn is_graph_datasource_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "graph.query" | "graph.create" | "graph.drop" | "graph.list" | "graph.grant_access"
     )
 }
 
@@ -3626,6 +3680,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         }
     }
 
@@ -3662,6 +3717,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3817,6 +3873,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         state.complete_active_turn("hi".into());
@@ -3862,6 +3919,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4615,6 +4673,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let projection = state.build_context_projection("status");
@@ -4703,6 +4762,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let prompt = state.build_prompt("status");
@@ -4785,6 +4845,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4864,6 +4925,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5407,6 +5469,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5459,6 +5522,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         state.push_tool_history(
@@ -5526,6 +5590,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         state.push_tool_history(
@@ -5594,6 +5659,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let reentry = state
@@ -5870,6 +5936,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -6004,6 +6071,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         }
     }
 
@@ -6124,6 +6192,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         };
         state.start_turn(turn);
         state.push_tool_history(

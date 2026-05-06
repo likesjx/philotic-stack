@@ -11,6 +11,7 @@ memory-core = { path = "../memory-core" }
 anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+parakeet-runner = { path = "../parakeet-runner" }
 philotic-client = { path = "../philotic-client" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
