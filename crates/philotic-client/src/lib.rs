@@ -230,6 +230,11 @@ pub struct TaskErrorPayload {
     pub capability: Option<String>,
     #[serde(default)]
     pub retryable: Option<bool>,
+    /// Narrow error subtype for precise routing decisions.
+    /// Values: "network_error", "streaming_timeout", "rate_limit",
+    /// "provider_error", "content_error", "empty_response".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_kind: Option<String>,
 }
 
 impl TaskErrorPayload {
@@ -247,6 +252,7 @@ impl TaskErrorPayload {
             provider: provider.map(str::to_string),
             capability: capability.map(str::to_string),
             retryable: None,
+            sub_kind: None,
         }
     }
 
@@ -265,6 +271,7 @@ impl TaskErrorPayload {
             capability: Some(tool_name),
             provider: None,
             retryable: Some(false),
+            sub_kind: None,
         }
     }
 
@@ -282,6 +289,7 @@ impl TaskErrorPayload {
             provider: None,
             capability: None,
             retryable: Some(true),
+            sub_kind: None,
         }
     }
 
@@ -295,6 +303,7 @@ impl TaskErrorPayload {
             provider: None,
             capability: None,
             retryable: Some(true),
+            sub_kind: None,
         }
     }
 
@@ -1814,6 +1823,7 @@ mod tests {
             provider: Some("elevenlabs".into()),
             capability: Some("voice.synthesize".into()),
             retryable: Some(false),
+            sub_kind: None,
         };
 
         let rendered = payload.display_message();

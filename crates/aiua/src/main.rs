@@ -6383,7 +6383,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 7); // membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, agent
+        assert_eq!(guests.len(), 8); // membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, graph-datasource, agent
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()

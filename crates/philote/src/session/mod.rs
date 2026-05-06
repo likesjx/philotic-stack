@@ -99,7 +99,7 @@ pub struct SessionState {
     /// The payload preserves session_id, chat_id, and exosome context so the
     /// correct Telegram session/chat is restored when the task is dispatched.
     /// Voice tasks are queued raw and will be transcribed when they reach the front.
-    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload)>,
+    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload, std::time::Instant)>,
     /// Optional role name of the queue arbiter.
     /// When set, TEXT tasks queued while a turn is active are routed to this specialist
     /// role via paracrine dispatch for priority evaluation. The arbiter may call
@@ -187,17 +187,25 @@ impl SessionState {
 
     /// Enqueue a user task for deferred processing after the current turn completes.
     pub fn enqueue_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_back((task_id, task));
+        self.pending_user_tasks.push_back((task_id, task, std::time::Instant::now()));
     }
 
     /// Prepend a user task to the front of the queue (high priority, arbiter-promoted).
     pub fn prepend_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_front((task_id, task));
+        self.pending_user_tasks.push_front((task_id, task, std::time::Instant::now()));
     }
 
-    /// Pop the next pending user task, if any.
+    /// Pop the next pending user task, if any. Strips the enqueue timestamp.
     pub fn dequeue_user_task(&mut self) -> Option<(uuid::Uuid, InboundTaskPayload)> {
-        self.pending_user_tasks.pop_front()
+        self.pending_user_tasks.pop_front().map(|(id, task, _)| (id, task))
+    }
+
+    /// Drop any queued tasks older than `max_age_secs`. Returns the number evicted.
+    pub fn evict_stale_queued_tasks(&mut self, max_age_secs: u64) -> usize {
+        let cutoff = std::time::Duration::from_secs(max_age_secs);
+        let before = self.pending_user_tasks.len();
+        self.pending_user_tasks.retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
+        before - self.pending_user_tasks.len()
     }
 
     /// How many tasks are waiting in the queue.
@@ -2638,6 +2646,7 @@ impl SessionState {
                 "consecutive_step_failures": turn.consecutive_step_failures,
                 "provider_repair_note": turn.provider_repair_note,
                 "provider_repair_attempts": turn.provider_repair_attempts,
+                "fallback_tier": turn.fallback_tier,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
@@ -2958,6 +2967,10 @@ impl SessionState {
                     .get("plan_confirm_note")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                fallback_tier: turn
+                    .get("fallback_tier")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u8,
             })
         });
 
@@ -3667,6 +3680,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         }
     }
 
@@ -3703,6 +3717,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3858,6 +3873,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         state.complete_active_turn("hi".into());
@@ -3903,6 +3919,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4656,6 +4673,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let projection = state.build_context_projection("status");
@@ -4744,6 +4762,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let prompt = state.build_prompt("status");
@@ -4826,6 +4845,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4905,6 +4925,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5448,6 +5469,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5500,6 +5522,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         state.push_tool_history(
@@ -5567,6 +5590,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         state.push_tool_history(
@@ -5635,6 +5659,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let reentry = state
@@ -5911,6 +5936,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -6045,6 +6071,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         }
     }
 
@@ -6165,6 +6192,7 @@ mod tests {
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
+            fallback_tier: 0,
         };
         state.start_turn(turn);
         state.push_tool_history(

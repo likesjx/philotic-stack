@@ -3582,6 +3582,7 @@ impl IpcServer {
                 model_profile,
                 context_window_policy,
                 loop_script: None,
+                fallback_tiers: Vec::new(),
             },
             home_node: None,
         };

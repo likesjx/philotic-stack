@@ -236,6 +236,11 @@ pub struct TurnLoopConfig {
     /// standard hard-coded tool re-entry loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_script: Option<LoopScript>,
+    /// Ordered list of model roles for tiered provider fallback.
+    /// Tier 0 is attempted first; on retriable failure the loop advances to the
+    /// next tier. Defaults to `["model", "model.local"]` when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_tiers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

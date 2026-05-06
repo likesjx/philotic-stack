@@ -368,6 +368,10 @@ pub struct WorkingTurn {
     /// into the working-state projection alongside `plan_confirmed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_confirm_note: Option<String>,
+    /// Current position in the provider fallback ladder for this turn (0 = primary cloud).
+    /// Incremented each time the loop escalates to a lower-tier provider.
+    #[serde(default)]
+    pub fallback_tier: u8,
 }
 
 #[derive(Debug, Clone)]
