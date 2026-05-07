@@ -4339,6 +4339,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "table-datasource"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "datasource",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

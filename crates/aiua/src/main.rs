@@ -3126,6 +3126,25 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             ..Default::default()
         },
+        AbstractSkillRecord {
+            skill_name: "observability.pipeline".into(),
+            description: "Set up a structured event capture pipeline: create a local table, \
+                          register a router-listener handler that writes matching inbound events \
+                          into it, store a TableConfig node in your agent graph so the table appears \
+                          in your cognitive envelope, and apply retention rules. Use when you want \
+                          to capture recurring event streams (routing signals, transcriptions, \
+                          sensor data) in a queryable flat store that persists across sessions."
+                .into(),
+            implied_tools: vec![
+                "table.configure".into(),
+                "table.add_listener".into(),
+                "table.stats".into(),
+                "table.rolloff".into(),
+                "table.schema".into(),
+                "graph.query".into(),
+            ],
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -3160,8 +3179,15 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.list".into(),
                 "graph.drop".into(),
                 "graph.grant_access".into(),
+                "table.configure".into(),
+                "table.query".into(),
+                "table.insert".into(),
+                "table.rolloff".into(),
+                "table.stats".into(),
+                "table.schema".into(),
+                "table.add_listener".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "graph".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "graph".into(), "table".into()],
             allowed_skills: vec![
                 "handoff.to_role".into(),
                 "handoff.back".into(),
@@ -3171,6 +3197,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "memory.fix".into(),
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
+                "observability.pipeline".into(),
             ],
             description: Some("Default orchestrator role profile.".into()),
         },
@@ -3250,6 +3277,13 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.list".into(),
                 "graph.drop".into(),
                 "graph.grant_access".into(),
+                "table.configure".into(),
+                "table.query".into(),
+                "table.insert".into(),
+                "table.rolloff".into(),
+                "table.stats".into(),
+                "table.schema".into(),
+                "table.add_listener".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -3259,6 +3293,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "training".into(),
                 "asr".into(),
                 "graph".into(),
+                "table".into(),
             ],
             allowed_skills: vec![
                 "skill.crafting".into(),

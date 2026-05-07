@@ -321,6 +321,207 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         },
     );
 
+    // ── Table tools (table-datasource) ─────────────────────────────────────────
+
+    m.insert(
+        "table.configure".into(),
+        ToolDefinition {
+            tool_name: "table.configure".into(),
+            description: "Create a new table in the local table store using a CREATE TABLE SQL \
+                          statement. Use this to set up observability tables, event logs, or any \
+                          flat structured data that your agent-graph neighborhood should track."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "CREATE TABLE IF NOT EXISTS ... SQL DDL statement."
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.query".into(),
+        ToolDefinition {
+            tool_name: "table.query".into(),
+            description: "Run a SELECT query against a table in the local table store. \
+                          Returns rows as JSON objects. Use graph_id to specify the table name \
+                          and query for the SQL. Pass limit in parameters to cap results."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name (also set as the target table for the query context)."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "SELECT SQL query."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Optional query parameters. Include 'limit' to cap result count.",
+                        "default": {}
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.insert".into(),
+        ToolDefinition {
+            tool_name: "table.insert".into(),
+            description: "Insert a row into a table in the local table store. \
+                          Pass the table name as graph_id and the row as parameters."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Row data as column→value pairs."
+                    }
+                },
+                "required": ["graph_id", "parameters"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.rolloff".into(),
+        ToolDefinition {
+            tool_name: "table.rolloff".into(),
+            description: "Apply data retention rules to a table — delete rows older than \
+                          max_age_secs or keep only the newest max_rows rows. \
+                          Pass the table name as graph_id."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Rolloff options: max_rows (integer), max_age_secs (integer), ts_column (string, default 'timestamp').",
+                        "properties": {
+                            "max_rows": { "type": "integer" },
+                            "max_age_secs": { "type": "integer" },
+                            "ts_column": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["graph_id"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.stats".into(),
+        ToolDefinition {
+            tool_name: "table.stats".into(),
+            description: "Return row count and latest timestamp for a table in the local table store."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Options: ts_column (string, default 'timestamp').",
+                        "default": {}
+                    }
+                },
+                "required": ["graph_id"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.schema".into(),
+        ToolDefinition {
+            tool_name: "table.schema".into(),
+            description: "Return the CREATE TABLE DDL for a table in the local table store."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name."
+                    }
+                },
+                "required": ["graph_id"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.add_listener".into(),
+        ToolDefinition {
+            tool_name: "table.add_listener".into(),
+            description: "Register a router-listener handler that writes matching inbound events \
+                          into a local table. Merges into the hotel's router_listener.config so the \
+                          router-listener starts routing the specified event_kind to the named table \
+                          on its next reconnect. After calling this, run graph.query to store a \
+                          TableConfig node in your partition so the table appears in your cognitive \
+                          envelope on future sessions."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "event_kind": {
+                        "type": "string",
+                        "description": "The 'kind' field value on inbound envelopes to match (e.g. 'transcription_capture', 'routing_signal')."
+                    },
+                    "table_name": {
+                        "type": "string",
+                        "description": "Target table name in the local table store."
+                    },
+                    "schema_map": {
+                        "type": "object",
+                        "description": "Maps event envelope field names to table column names. Omit to pass through the full envelope."
+                    },
+                    "filter_keys": {
+                        "type": "object",
+                        "description": "Only process events where these envelope fields match these values."
+                    },
+                    "adapter_script": {
+                        "type": "string",
+                        "description": "Path to a Python adapter script. Receives raw event JSON on stdin, emits transformed row JSON on stdout."
+                    },
+                    "target_role": {
+                        "type": "string",
+                        "description": "Role to route table.insert tasks to (default: 'table-datasource')."
+                    }
+                },
+                "required": ["event_kind", "table_name"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
     m.insert(
         "workspace.list".into(),
         ToolDefinition {

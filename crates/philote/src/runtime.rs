@@ -1484,6 +1484,18 @@ impl AgentRuntime {
                         self.agent_id, task_id, source_node
                     );
 
+                    if let Ok(peek) = serde_json::from_str::<serde_json::Value>(&task_json) {
+                        let peeked_action = peek.get("action").and_then(|v| v.as_str()).unwrap_or("<none>");
+                        let snippet: String = task_json.chars().take(300).collect();
+                        info!(
+                            task_id = %task_id,
+                            action = %peeked_action,
+                            payload_bytes = %task_json.len(),
+                            snippet = %snippet,
+                            "Agent dispatch: action peek"
+                        );
+                    }
+
                     match serde_json::from_str::<InboundTaskPayload>(&task_json) {
                         Ok(task) if task.is_model_response() => {
                             let task_ref = task.clone();
@@ -10753,6 +10765,163 @@ impl AgentRuntime {
                     error: tool_err,
                     tool_name: Some("mcp.revoke".into()),
                     arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── table.add_listener ───────────────────────────────────────────
+            "table.add_listener" => {
+                let args = payload.arguments.as_object();
+
+                let event_kind = match args
+                    .and_then(|a| a.get("event_kind"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "table.add_listener: missing required argument 'event_kind'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let table_name = match args
+                    .and_then(|a| a.get("table_name"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "table.add_listener: missing required argument 'table_name'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let schema_map = args
+                    .and_then(|a| a.get("schema_map"))
+                    .and_then(|v| v.as_object())
+                    .cloned();
+                let filter_keys = args
+                    .and_then(|a| a.get("filter_keys"))
+                    .and_then(|v| v.as_object())
+                    .cloned();
+                let adapter_script = args
+                    .and_then(|a| a.get("adapter_script"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let target_role = args
+                    .and_then(|a| a.get("target_role"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("table-datasource")
+                    .to_string();
+
+                // Read current listener config.
+                let mut config: serde_json::Value = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetConfig {
+                        key: "router_listener.config".into(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::ConfigData { value_json: Some(raw), .. }) => {
+                        serde_json::from_str(&raw).unwrap_or(serde_json::json!({
+                            "filter_keys": {},
+                            "event_kinds": {}
+                        }))
+                    }
+                    _ => serde_json::json!({ "filter_keys": {}, "event_kinds": {} }),
+                };
+
+                // Merge filter_keys if provided.
+                if let Some(fk) = filter_keys {
+                    if let Some(obj) = config
+                        .get_mut("filter_keys")
+                        .and_then(|v| v.as_object_mut())
+                    {
+                        obj.extend(fk);
+                    }
+                }
+
+                // Ensure event_kinds map exists.
+                if config.get("event_kinds").is_none() {
+                    config["event_kinds"] = serde_json::json!({});
+                }
+
+                // Build and insert the event handler.
+                let mut handler = serde_json::json!({
+                    "mode": "table_insert",
+                    "table_name": table_name,
+                    "target_role": target_role,
+                });
+                if let Some(sm) = schema_map {
+                    handler["schema_map"] = serde_json::Value::Object(sm);
+                }
+                if let Some(script) = adapter_script {
+                    handler["adapter_script"] = serde_json::Value::String(script);
+                }
+
+                if let Some(kinds) =
+                    config.get_mut("event_kinds").and_then(|v| v.as_object_mut())
+                {
+                    kinds.insert(event_kind.clone(), handler);
+                }
+
+                // Write back.
+                let (content_str, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::SetConfig {
+                        key: "router_listener.config".into(),
+                        value_json: config.to_string(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => (
+                        format!(
+                            "Listener registered: event_kind='{event_kind}' → table='{table_name}'. \
+                             The router-listener applies this on its next reconnect. \
+                             Next: call graph.query to CREATE a (TableConfig {{id:'table_config:{table_name}', \
+                             name:'{table_name}'}}) node in your partition so this table appears in \
+                             your cognitive envelope on future sessions."
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua", &*code, message,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("table.add_listener: unexpected hotel response".into(), None),
+                    Err(e) => {
+                        let err = philotic_client::TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("table.add_listener: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content_str),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,

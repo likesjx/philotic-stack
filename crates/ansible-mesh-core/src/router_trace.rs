@@ -47,6 +47,9 @@ pub struct RouterTrainingRecord {
     /// Wall-clock time from task dispatch to provider response (milliseconds).
     #[serde(default)]
     pub latency_ms: Option<u64>,
+    /// Total tokens consumed (prompt + completion), if reported by the provider.
+    #[serde(default)]
+    pub token_count: Option<u64>,
     /// Unix epoch (seconds) when the routing call was made.
     pub timestamp: u64,
 }
@@ -117,6 +120,7 @@ impl SqliteRouterTraceStorage {
                 outcome      TEXT NOT NULL,
                 failure_code TEXT,
                 latency_ms   INTEGER,
+                token_count  INTEGER,
                 timestamp    INTEGER NOT NULL
             );
 
@@ -132,6 +136,8 @@ impl SqliteRouterTraceStorage {
             COMMIT;
             ",
         )?;
+        // Idempotent migration for existing databases.
+        let _ = conn.execute("ALTER TABLE router_traces ADD COLUMN token_count INTEGER", []);
         Ok(())
     }
 }
@@ -142,8 +148,8 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         conn.execute(
             "INSERT OR IGNORE INTO router_traces
              (trace_id, agent_id, session_id, turn_id, provider_id, model_id,
-              task_kind, outcome, failure_code, latency_ms, timestamp)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+              task_kind, outcome, failure_code, latency_ms, token_count, timestamp)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 r.trace_id,
                 r.agent_id,
@@ -155,6 +161,7 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
                 r.outcome,
                 r.failure_code,
                 r.latency_ms.map(|v| v as i64),
+                r.token_count.map(|v| v as i64),
                 r.timestamp as i64,
             ],
         )?;
@@ -165,7 +172,7 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT trace_id, agent_id, session_id, turn_id, provider_id, model_id,
-                    task_kind, outcome, failure_code, latency_ms, timestamp
+                    task_kind, outcome, failure_code, latency_ms, token_count, timestamp
              FROM router_traces ORDER BY timestamp DESC LIMIT ?1",
         )?;
         collect_records(&mut stmt, params![limit as i64])
@@ -179,7 +186,7 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT trace_id, agent_id, session_id, turn_id, provider_id, model_id,
-                    task_kind, outcome, failure_code, latency_ms, timestamp
+                    task_kind, outcome, failure_code, latency_ms, token_count, timestamp
              FROM router_traces WHERE agent_id = ?1
              ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -194,7 +201,7 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT trace_id, agent_id, session_id, turn_id, provider_id, model_id,
-                    task_kind, outcome, failure_code, latency_ms, timestamp
+                    task_kind, outcome, failure_code, latency_ms, token_count, timestamp
              FROM router_traces WHERE provider_id = ?1
              ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -218,7 +225,8 @@ fn collect_records(
             outcome: row.get(7)?,
             failure_code: row.get(8)?,
             latency_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
-            timestamp: row.get::<_, i64>(10)? as u64,
+            token_count: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+            timestamp: row.get::<_, i64>(11)? as u64,
         })
     })?;
     let mut records = Vec::new();
@@ -255,6 +263,7 @@ mod tests {
             outcome: outcome.into(),
             failure_code: None,
             latency_ms: Some(n * 100),
+            token_count: None,
             timestamp: 1_000_000 + n,
         }
     }

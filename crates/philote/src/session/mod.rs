@@ -3200,6 +3200,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                 "local_agent"
             } else if is_graph_datasource_tool(tool_name) {
                 "datasource"
+            } else if is_table_datasource_tool(tool_name) {
+                "table_datasource"
             } else if is_pinned_tool(tool_name) {
                 "pinned"
             } else {
@@ -3213,6 +3215,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         "agent".into()
                     } else if execution_mode == "datasource" {
                         "graph-datasource".into()
+                    } else if execution_mode == "table_datasource" {
+                        "table-datasource".into()
                     } else {
                         format!("tool.{tool_name}")
                     },
@@ -3236,6 +3240,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         "agent_local_tool".into()
                     } else if execution_mode == "datasource" {
                         "graph_datasource_route".into()
+                    } else if execution_mode == "table_datasource" {
+                        "table_datasource_route".into()
                     } else if execution_mode == "pinned" {
                         "default_pinned_route".into()
                     } else {
@@ -3319,6 +3325,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "handoff.back"
             | "delegate.whisper"
             | "approval.request_standing"
+            | "table.add_listener"
     )
 }
 
@@ -3326,6 +3333,18 @@ fn is_graph_datasource_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "graph.query" | "graph.create" | "graph.drop" | "graph.list" | "graph.grant_access"
+    )
+}
+
+fn is_table_datasource_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "table.configure"
+            | "table.query"
+            | "table.insert"
+            | "table.rolloff"
+            | "table.stats"
+            | "table.schema"
     )
 }
 

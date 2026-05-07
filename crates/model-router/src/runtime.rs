@@ -76,26 +76,27 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
         .build()?;
     let stub_response = std::env::var("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE").ok();
 
-    // Open the router training-tap trace store if configured.
-    let trace_store: Option<Arc<dyn RouterTraceStorage>> =
-        match std::env::var("PHILOTIC_ROUTER_TRACE_DB") {
-            Ok(path) => {
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                match SqliteRouterTraceStorage::open(&path) {
-                    Ok(store) => {
-                        info!(path = %path, "router training-tap trace store opened");
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        warn!(path = %path, "failed to open router trace store: {e}");
-                        None
-                    }
-                }
+    // Open the router training-tap trace store (always-on; path from env or default).
+    let trace_store: Option<Arc<dyn RouterTraceStorage>> = {
+        let path = std::env::var("PHILOTIC_ROUTER_TRACE_DB").unwrap_or_else(|_| {
+            let profile = std::env::var("PHILOTIC_PROFILE").unwrap_or_else(|_| "default".to_string());
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{home}/.philotic/{profile}/router_traces.db")
+        });
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match SqliteRouterTraceStorage::open(&path) {
+            Ok(store) => {
+                info!(path = %path, "router training-tap trace store opened");
+                Some(Arc::new(store))
             }
-            Err(_) => None,
-        };
+            Err(e) => {
+                warn!(path = %path, "failed to open router trace store: {e}");
+                None
+            }
+        }
+    };
 
     info!(
         "Listening for inbound model tasks on role [{}] from the Philotic Web...",
@@ -203,6 +204,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             let latency_ms = dispatch_start.elapsed().as_millis() as u64;
                             let native_live_model_result =
                                 native_live_tool_call_model_result(&output);
+                            let live_model_id = extract_output_model_gen(&output.final_output)
+                                .or_else(|| controller_task.model.clone());
                             match output.final_output {
                                 ProviderOutput::ToolCall {
                                     tool_name,
@@ -216,6 +219,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         "tool_call",
                                         None,
                                         latency_ms,
+                                        live_model_id,
+                                        None,
                                     );
                                     emit_tool_call_response(
                                         &mut ipc_client,
@@ -235,6 +240,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         "success",
                                         None,
                                         latency_ms,
+                                        live_model_id,
+                                        None,
                                     );
                                     let response = ControllerResponseEnvelope::from_output(
                                         &controller_task,
@@ -261,6 +268,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 "failure",
                                 failure_code.as_deref(),
                                 latency_ms,
+                                None,
+                                None,
                             );
                             error!("Native-live provider invocation failed: {}", err);
                             emit_failure(
@@ -364,6 +373,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 "tool_call",
                                 None,
                                 latency_ms,
+                                controller_task.model.clone(),
+                                None,
                             );
                             emit_tool_call_response(
                                 &mut ipc_client,
@@ -376,6 +387,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         }
                         Ok(output) => {
                             let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let model_id = extract_output_model_gen(&output)
+                                .or_else(|| controller_task.model.clone());
                             record_routing_trace(
                                 trace_store.as_deref(),
                                 &reply,
@@ -384,6 +397,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 "success",
                                 None,
                                 latency_ms,
+                                model_id,
+                                None,
                             );
 
                             // ── Transcription flywheel fan-out ────────────────
@@ -456,6 +471,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 "failure",
                                 failure_code.as_deref(),
                                 latency_ms,
+                                None,
+                                None,
                             );
                             error!("Provider invocation failed: {}", err);
                             emit_failure(
@@ -887,6 +904,15 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Extract the `model_gen` string from a `ProviderOutput` without consuming it.
+fn extract_output_model_gen(output: &ProviderOutput) -> Option<String> {
+    match output {
+        ProviderOutput::Text { model_gen, .. } => model_gen.clone(),
+        ProviderOutput::Embedding { model_gen, .. } => Some(model_gen.clone()),
+        ProviderOutput::Audio(_) | ProviderOutput::ToolCall { .. } => None,
+    }
+}
+
 /// Record a routing decision into the training-tap store, if one is open.
 ///
 /// Failures to write are logged as warnings and do not abort the request path.
@@ -898,19 +924,22 @@ fn record_routing_trace(
     outcome: &str,
     failure_code: Option<&str>,
     latency_ms: u64,
+    model_id: Option<String>,
+    token_count: Option<u64>,
 ) {
     let Some(store) = store else { return };
     let record = RouterTrainingRecord {
         trace_id: Ulid::new().to_string(),
-        agent_id: String::new(), // populated below if available from session context
+        agent_id: String::new(),
         session_id: reply.session_id.clone(),
         turn_id: reply.turn_id.clone(),
         provider_id: provider_id.to_string(),
-        model_id: None,
+        model_id,
         task_kind: task_kind.to_string(),
         outcome: outcome.to_string(),
         failure_code: failure_code.map(str::to_string),
         latency_ms: Some(latency_ms),
+        token_count,
         timestamp: now_epoch_secs(),
     };
     if let Err(e) = store.record_trace(&record) {
