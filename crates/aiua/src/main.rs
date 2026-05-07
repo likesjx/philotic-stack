@@ -2148,9 +2148,44 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
                 "command": "graph-datasource",
                 "args": [],
                 "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path,
-                    "PHILOTIC_NODE_ID": node_id,
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
                     "PHILOTIC_GRAPH_DATASOURCE_ID": format!("{hotel_name}:graph-datasource")
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:table-datasource"),
+            role: "table-datasource".into(),
+            config_json: serde_json::json!({
+                "command": "table-datasource",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_TABLE_DATASOURCE_ID": format!("{hotel_name}:table-datasource")
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:router-listener"),
+            role: "router-listener".into(),
+            config_json: serde_json::json!({
+                "command": "router-listener",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path,
+                    "PHILOTIC_NODE_ID": node_id
                 }
             })
             .to_string(),
@@ -6418,7 +6453,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 8); // membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, graph-datasource, agent
+        assert_eq!(guests.len(), 10); // membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, graph-datasource, table-datasource, router-listener, agent
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
