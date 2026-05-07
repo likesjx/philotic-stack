@@ -466,7 +466,9 @@ local-push:
             continue
         fi
         if [ ! -f "${AIUA_CELLAR}/$bin" ]; then
-            echo "  – $bin (not in local Cellar, skipping)"
+            cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
+            chmod 555 "${AIUA_CELLAR}/$bin"
+            echo "  + $bin (new)"
             continue
         fi
         rm -f "${AIUA_CELLAR}/$bin"
