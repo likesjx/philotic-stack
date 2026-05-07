@@ -177,6 +177,19 @@ impl KokoroBackend {
         }
         tokens.push(0); // trailing pad
 
+        // Kokoro ONNX model has a hard max of 512 tokens (encoder Expand node).
+        // Truncate to 511 content tokens + trailing pad to stay within the limit.
+        const MAX_TOKENS: usize = 512;
+        if tokens.len() > MAX_TOKENS {
+            tracing::warn!(
+                n_tokens = tokens.len(),
+                max = MAX_TOKENS,
+                "Kokoro input exceeds model capacity; truncating"
+            );
+            tokens.truncate(MAX_TOKENS - 1);
+            tokens.push(0); // re-add trailing pad
+        }
+
         let n_tokens = tokens.len();
         if n_tokens <= 2 {
             bail!(
