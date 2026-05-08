@@ -233,7 +233,40 @@ async fn transcode_raw_to_wav_16k(
             "WAV transcoder [{ffmpeg_bin}] returned empty output for [{source_mime_type}]"
         );
     }
-    Ok(output.stdout)
+    // ffmpeg writes 0xffffffff for RIFF chunk size and data chunk size when the
+    // output is a pipe (size unknown at write time). hound validates that the
+    // data chunk size is a multiple of bytes_per_sample, which fails for
+    // 0xffffffff with 16-bit samples (odd). Patch both sizes to the real values.
+    Ok(patch_wav_streaming_sizes(output.stdout))
+}
+
+/// Patch the RIFF chunk size and the first `data` chunk size in a WAV byte
+/// vector whose sizes were written as `0xffffffff` (streaming/pipe mode).
+fn patch_wav_streaming_sizes(mut bytes: Vec<u8>) -> Vec<u8> {
+    let total = bytes.len();
+    if total < 44 {
+        return bytes;
+    }
+    // RIFF chunk size lives at bytes[4..8].
+    let riff_size = (total.saturating_sub(8)) as u32;
+    bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+    // Scan for the first "data" chunk whose stored size is 0xffffffff.
+    let mut i = 12usize;
+    while i + 8 <= total {
+        if &bytes[i..i + 4] == b"data" {
+            let stored = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap());
+            if stored == u32::MAX {
+                let data_size = (total.saturating_sub(i + 8)) as u32;
+                bytes[i + 4..i + 8].copy_from_slice(&data_size.to_le_bytes());
+            }
+            break;
+        }
+        // Skip to the next chunk: 4-byte tag + 4-byte length + chunk payload.
+        let chunk_len = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap_or([0; 4]));
+        i += 8 + chunk_len as usize;
+    }
+    bytes
 }
 
 pub async fn prepare_audio_ligand_for_pcm(
