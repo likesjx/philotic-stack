@@ -1,6 +1,7 @@
 use crate::controller::{AudioArtifact, ControllerTask, ModelProvider, ProviderOutput, TaskKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use media_prep::transcode_to_wav_16k;
 use onnx_runner::{
     EmbeddingsBackend, EmbeddingsConfig, KokoroBackend, KokoroConfig, ModelCache, TranscribeConfig,
     WhisperBackend,
@@ -199,10 +200,21 @@ impl ModelProvider for OnnxProvider {
                     );
                 }
 
-                let wav_bytes = response
+                let raw_bytes = response
                     .bytes()
                     .await
-                    .context("failed to read audio response body")?;
+                    .context("failed to read audio response body")?
+                    .to_vec();
+
+                // Telegram voice memos arrive as OGG; transcode to 16 kHz mono
+                // WAV so WhisperBackend::decode_wav can parse them.
+                let mime = attachment.mime_type.as_deref().unwrap_or("audio/ogg");
+                let wav_bytes_owned =
+                    transcode_to_wav_16k(raw_bytes, mime, "ffmpeg")
+                        .await
+                        .with_context(|| {
+                            format!("transcode [{mime}] audio attachment for Whisper")
+                        })?;
 
                 // Run Whisper in a blocking task to avoid blocking the async executor.
                 let guard = self.whisper.read().await;
@@ -213,7 +225,6 @@ impl ModelProvider for OnnxProvider {
                 // so the closure can cross the `spawn_blocking` boundary without
                 // forcing `Send` on the backend itself.
                 let backend_ptr = backend as *const WhisperBackend as usize;
-                let wav_bytes_owned = wav_bytes.to_vec();
 
                 let output = tokio::task::spawn_blocking(move || {
                     // SAFETY: the RwLock read guard is held for the full duration

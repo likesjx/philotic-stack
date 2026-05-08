@@ -161,6 +161,81 @@ pub fn extract_audio_artifact_json(model_result: Option<&Value>) -> Option<Strin
     Some(serialized)
 }
 
+/// Transcode any audio format (OGG, MP3, etc.) to a 16 kHz mono WAV using
+/// ffmpeg.  Returns raw WAV bytes ready for `hound::WavReader`.
+///
+/// If the source is already WAV (`mime_type` starts with `"audio/wav"` or
+/// `"audio/x-wav"`), the bytes are returned unchanged to avoid a re-encode.
+pub async fn transcode_to_wav_16k(
+    source_bytes: Vec<u8>,
+    mime_type: &str,
+    ffmpeg_bin: &str,
+) -> Result<Vec<u8>> {
+    let normalized = mime_type.trim().to_ascii_lowercase();
+    if normalized.starts_with("audio/wav") || normalized.starts_with("audio/x-wav") {
+        return Ok(source_bytes);
+    }
+    transcode_raw_to_wav_16k(source_bytes, mime_type, ffmpeg_bin).await
+}
+
+async fn transcode_raw_to_wav_16k(
+    source_bytes: Vec<u8>,
+    source_mime_type: &str,
+    ffmpeg_bin: &str,
+) -> Result<Vec<u8>> {
+    let mut child = tokio::process::Command::new(ffmpeg_bin)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-f")
+        .arg("wav")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("pipe:1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to spawn [{ffmpeg_bin}] for WAV transcode from [{source_mime_type}]"
+            )
+        })?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("WAV transcoder missing stdin")?;
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, &source_bytes)
+        .await
+        .context("failed to stream source audio into WAV transcoder")?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to await WAV transcoder")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "WAV transcoder [{ffmpeg_bin}] failed for [{source_mime_type}]: {}",
+            stderr.trim()
+        );
+    }
+    if output.stdout.is_empty() {
+        bail!(
+            "WAV transcoder [{ffmpeg_bin}] returned empty output for [{source_mime_type}]"
+        );
+    }
+    Ok(output.stdout)
+}
+
 pub async fn prepare_audio_ligand_for_pcm(
     mime_type: &str,
     bytes: Vec<u8>,
