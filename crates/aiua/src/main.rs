@@ -1386,6 +1386,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                 &advertisements,
                                 Some(execution_reachability.clone()),
                                 &auth_key,
+                                None,
                             )
                             .await
                             {
@@ -3548,6 +3549,7 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
+            home_node: None,
         };
         // Always upsert — the hotel seed is the canonical source for the orchestrator manifest.
         // The manifest is institutional (same rules for all agents), not per-agent customizable.

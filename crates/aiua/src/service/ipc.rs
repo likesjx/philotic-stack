@@ -2294,17 +2294,6 @@ impl IpcServer {
         self.materialization_requester.clone()
     }
 
-    pub(crate) async fn handle_remote_role_handoff(
-        _graph: &GraphDomain,
-        _inboxes: &InboxRegistry,
-        _parked_inbound: &ParkedInboundRegistry,
-        _materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
-        _local_node_id: &str,
-        _payload_json: &str,
-    ) {
-        debug!("remote role handoff relay is not wired on this slice; ignoring handoff broadcast");
-    }
-
     pub async fn run(&self) -> anyhow::Result<()> {
         let path = Path::new(&self.socket_path);
 

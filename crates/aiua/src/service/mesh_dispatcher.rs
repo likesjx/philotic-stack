@@ -231,6 +231,7 @@ mod tests {
                 host: "100.79.239.65".into(),
                 port: 14000,
             }),
+            None,
         );
 
         let targets = execution_targets(&graph, &registry, "default-aiua-01")

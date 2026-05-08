@@ -34,11 +34,10 @@ pub struct NodeStatus {
     pub capabilities: NodeCapabilities,
     pub advertisements: Vec<CapabilityAdvertisement>,
     pub execution_reachability: Option<ExecutionReachability>,
-    pub node_health: Option<NodeHealthSnapshot>,
-    pub last_seen: Instant,
     /// Latest environment vitals reported by this node; None if the node
     /// has never sent health data or is running an older build.
     pub node_health: Option<NodeHealthSnapshot>,
+    pub last_seen: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +176,6 @@ impl NodeRegistry {
                 execution_reachability: completed.execution_reachability,
                 node_health: completed.node_health,
                 last_seen: Instant::now(),
-                node_health,
             },
         );
     }
