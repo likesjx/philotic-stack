@@ -2820,10 +2820,11 @@ impl SessionState {
             if turn.is_null() {
                 return None;
             }
-            // Discard terminal turns — a process killed mid-turn leaves phase=failed/completed
-            // in the checkpoint; restoring them would block all new messages.
+            // Discard non-restorable turns — after a restart, in-flight model/tool/voice
+            // calls are gone. Restoring them leaves is_turn_active()=true forever.
+            // Only waiting_approval is worth keeping (operator may still resolve it).
             let phase_str = turn.get("phase").and_then(serde_json::Value::as_str).unwrap_or("queued");
-            if matches!(phase_str, "failed" | "completed") {
+            if !matches!(phase_str, "waiting_approval") {
                 return None;
             }
             let local_node_id = local_node_id();

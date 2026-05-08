@@ -1283,6 +1283,10 @@ const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
         command: "new",
         description: "Start a fresh conversation.",
     },
+    TelegramBotCommand {
+        command: "voice",
+        description: "Swap voice provider: /voice local or /voice elevenlabs",
+    },
 ];
 
 const TELEGRAM_MAX_COMMANDS: usize = 100;

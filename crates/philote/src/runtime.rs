@@ -870,6 +870,38 @@ impl AgentRuntime {
                 }
             }
         }
+
+        // Apply operator-persisted policy overrides from hotel config keys.
+        // These take precedence over the bundle so /voice and agent.configure persist
+        // correctly across restarts without requiring a bundle rebuild.
+        if let Ok(IpcResponse::ConfigData {
+            value_json: Some(ref json),
+            ..
+        }) = self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig {
+                key: "config:voice_response_policy".into(),
+            })
+            .await
+        {
+            if let Ok(policy) = serde_json::from_str::<VoiceResponsePolicy>(json) {
+                self.default_agent_profile.voice_response_policy = policy;
+            }
+        }
+        if let Ok(IpcResponse::ConfigData {
+            value_json: Some(ref json),
+            ..
+        }) = self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig {
+                key: "config:media_routing_policy".into(),
+            })
+            .await
+        {
+            if let Ok(policy) = serde_json::from_str::<MediaRoutingPolicy>(json) {
+                self.default_agent_profile.media_routing_policy = policy;
+            }
+        }
     }
 
     /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.
@@ -4817,10 +4849,15 @@ impl AgentRuntime {
             })
             .await?;
 
+        let voice_role_fallback = policy
+            .provider
+            .as_deref()
+            .map(implementation_to_model_role)
+            .unwrap_or_else(|| DEFAULT_VOICE_MODEL_ROLE.into());
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
             "voice.synthesize",
-            DEFAULT_VOICE_MODEL_ROLE,
+            &voice_role_fallback,
         );
 
         info!(

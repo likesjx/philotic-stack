@@ -371,6 +371,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_voice_command() {
+        assert_eq!(
+            parse_slash_command("/voice local"),
+            Some(SlashCommand::Voice {
+                provider: Some("onnx".into()),
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice elevenlabs"),
+            Some(SlashCommand::Voice {
+                provider: Some("elevenlabs".into()),
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice"),
+            Some(SlashCommand::Voice {
+                provider: None,
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice kokoro af_heart"),
+            Some(SlashCommand::Voice {
+                provider: Some("onnx".into()),
+                voice_id: Some("af_heart".into()),
+            })
+        );
+    }
+
+    #[test]
     fn ignores_non_commands_and_unknown_commands() {
         assert_eq!(parse_slash_command("hello"), None);
         assert_eq!(parse_slash_command("/unknown"), None);
