@@ -138,6 +138,10 @@ pub struct SessionState {
     pub agent_graph_snapshot: Option<String>,
     /// Whether a graph preload has been dispatched this session (to avoid duplicate fetches).
     pub graph_preload_dispatched: bool,
+    /// ID of the `UserTask` created when the agent proposed the current plan.
+    /// `None` until a plan_proposal is accepted and persisted to the hotel graph.
+    /// Cleared when the task completes, fails, or is cancelled.
+    pub active_user_task_id: Option<String>,
 }
 
 impl SessionState {
@@ -173,6 +177,7 @@ impl SessionState {
             pending_preapproval_thresholds: std::collections::HashMap::new(),
             agent_graph_snapshot: None,
             graph_preload_dispatched: false,
+            active_user_task_id: None,
         }
     }
 
@@ -2687,6 +2692,7 @@ impl SessionState {
             "active_turn": active_turn,
             "parked_approval_turn": parked_approval_turn,
             "parked_plan_turn": parked_plan_turn,
+            "active_user_task_id": self.active_user_task_id,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
                     "turn_id": turn.turn_id,
@@ -3033,6 +3039,10 @@ impl SessionState {
             pending_preapproval_thresholds,
             agent_graph_snapshot: None,
             graph_preload_dispatched: false,
+            active_user_task_id: checkpoint
+                .get("active_user_task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         })
     }
 }

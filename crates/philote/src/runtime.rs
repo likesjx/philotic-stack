@@ -3052,6 +3052,85 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        // Persist the plan as a durable UserTask in the hotel context graph.
+        // Best-effort — a storage failure here does not abort the planning flow.
+        let user_task_id = Uuid::new_v4().to_string();
+        let steps_json: Vec<serde_json::Value> = proposal
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(idx, step)| {
+                let description = step
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(step)")
+                    .to_string();
+                let risk = step
+                    .get("risk")
+                    .and_then(|v| v.as_str())
+                    .or(proposal.approval_risk_hint.as_deref())
+                    .unwrap_or("safe")
+                    .to_string();
+                json!({
+                    "idx": idx,
+                    "description": description,
+                    "risk": risk,
+                    "status": "pending",
+                    "output": null,
+                    "error": null,
+                    "started_at": null,
+                    "completed_at": null,
+                })
+            })
+            .collect();
+        let approved_risk_ceiling = proposal
+            .approval_risk_hint
+            .as_deref()
+            .unwrap_or("safe")
+            .to_string();
+
+        let create_result = self
+            .ipc_client
+            .send_request(IpcRequest::CreateUserTask {
+                task_id: user_task_id.clone(),
+                session_id: session_id.clone(),
+                agent_id: self.agent_id.clone(),
+                chat_id: chat_id.clone(),
+                goal: proposal.summary.clone(),
+                approved_risk_ceiling,
+                planning_model_tier: 0,
+                quiet: false,
+            })
+            .await;
+
+        match create_result {
+            Ok(IpcResponse::UserTaskCreated { .. }) => {
+                // Patch in the plan steps now that the node exists.
+                let steps_str = serde_json::to_string(&steps_json).unwrap_or_default();
+                let _ = self
+                    .ipc_client
+                    .send_request(IpcRequest::UpdateUserTask {
+                        task_id: user_task_id.clone(),
+                        status: "awaiting_approval".into(),
+                        steps_json: Some(steps_str),
+                        next_step_idx: Some(0),
+                        approval_note: None,
+                    })
+                    .await;
+
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.active_user_task_id = Some(user_task_id.clone());
+                }
+                info!(user_task_id, "UserTask created and steps set for plan proposal");
+            }
+            Ok(other) => {
+                warn!(?other, "CreateUserTask returned unexpected response");
+            }
+            Err(e) => {
+                warn!(error = %e, "CreateUserTask failed — plan persists in-memory only");
+            }
+        }
+
         // Build the plan summary for the operator.
         let steps_text = if proposal.steps.is_empty() {
             String::new()
