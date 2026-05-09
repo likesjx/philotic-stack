@@ -1019,3 +1019,93 @@ pub struct SpawnedSubagentRef {
     pub lease_epoch: u64,
     pub lease_expires_at: u64,
 }
+
+// ── User Task Engine types ─────────────────────────────────────────────────────
+
+/// Risk classification for a task step or the task as a whole.
+/// `Destructive > Moderate > Safe` — operators approve a ceiling once and the
+/// agent runs autonomously within it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    Safe,
+    Moderate,
+    Destructive,
+}
+
+impl Default for RiskLevel {
+    fn default() -> Self {
+        RiskLevel::Safe
+    }
+}
+
+/// Lifecycle state of a `UserTask`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Planning,
+    AwaitingApproval,
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Execution state of one step within a `UserTask`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStepStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+/// A single step in a `UserTask` plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStep {
+    pub idx: usize,
+    pub description: String,
+    pub risk: RiskLevel,
+    pub status: TaskStepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+}
+
+/// A durable, user-visible multi-step task owned by the agent.
+///
+/// Stored in the hotel context graph as `kind = "user_task"` so it survives
+/// hotel restarts and can be queried at any time via `/tasks`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTask {
+    pub task_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub chat_id: String,
+    pub goal: String,
+    pub steps: Vec<TaskStep>,
+    pub status: TaskStatus,
+    pub approved_risk_ceiling: RiskLevel,
+    /// `0` = cloud model (full autonomy within ceiling); `1+` = local model
+    /// (always requires explicit approval for `Destructive` steps).
+    pub planning_model_tier: u8,
+    pub quiet: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    pub next_step_idx: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_note: Option<String>,
+}
+
