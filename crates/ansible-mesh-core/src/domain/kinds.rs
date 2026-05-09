@@ -28,3 +28,4 @@ pub const NODE_KIND_CONFIG: &str = "config";
 pub const NODE_KIND_APARTMENT: &str = "apartment";
 pub const NODE_KIND_CRON_JOB: &str = "cron_job";
 pub const NODE_KIND_USER_PROFILE: &str = "user_profile";
+pub const NODE_KIND_USER_TASK: &str = "user_task";

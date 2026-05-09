@@ -1265,6 +1265,56 @@ pub enum IpcRequest {
     GetHotelLogs {
         lines: u32,
     },
+    // ── User Task Engine IPC ──────────────────────────────────────────────────
+    /// Create a new durable user task in the hotel context graph.
+    /// Responds with [`IpcResponse::UserTaskCreated`].
+    CreateUserTask {
+        task_id: String,
+        session_id: String,
+        agent_id: String,
+        chat_id: String,
+        goal: String,
+        approved_risk_ceiling: String,
+        planning_model_tier: u8,
+        #[serde(default)]
+        quiet: bool,
+    },
+    /// Update the top-level status and optional plan fields of a user task.
+    /// Responds with [`IpcResponse::UserTaskUpdated`].
+    UpdateUserTask {
+        task_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        steps_json: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_step_idx: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_note: Option<String>,
+    },
+    /// Update a single step within a user task (status, output, error).
+    /// Responds with [`IpcResponse::UserTaskUpdated`].
+    UpdateUserTaskStep {
+        task_id: String,
+        step_idx: usize,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Retrieve a single user task by ID.
+    /// Responds with [`IpcResponse::UserTaskData`].
+    GetUserTask {
+        task_id: String,
+    },
+    /// List user tasks, optionally filtered by session_id and/or agent_id.
+    /// Responds with [`IpcResponse::UserTaskList`].
+    ListUserTasks {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+    },
 }
 
 /// Payload for [`IpcResponse::UserProfileData`].
@@ -1539,6 +1589,19 @@ pub enum IpcResponse {
     /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
     /// This prevents this variant from swallowing `MemoryConfig` responses.
     UserProfileData(UserProfileDataPayload),
+    UserTaskCreated {
+        user_task_id: String,
+    },
+    UserTaskUpdated {
+        user_task_id: String,
+        user_task_updated: bool,
+    },
+    UserTaskData {
+        user_task_json: String,
+    },
+    UserTaskList {
+        user_tasks: Vec<serde_json::Value>,
+    },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
