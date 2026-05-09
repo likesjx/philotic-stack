@@ -34,6 +34,8 @@ cargo build --release --bins \
   -p graph-runner \
   -p graph-datasource \
   -p graph-intelligence \
+  -p table-datasource \
+  -p router-listener \
   -p philotic-web
 
 echo "▶ Preparing remote staging directory on ${REMOTE}..."
@@ -61,7 +63,11 @@ while IFS= read -r bin_path; do
   ssh "${REMOTE}" "chmod +x '${STAGE_DIR}/${bin}'"
 
   if ! ssh "${REMOTE}" "test -f '${AIUA_CELLAR}/${bin}'"; then
-    echo "  – ${bin} (not in remote Cellar, skipping)"
+    # New binary not yet in Cellar — install it and create the symlink
+    ssh "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
+    ssh "${REMOTE}" "chmod 555 '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
+    ssh "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
+    echo "  + ${bin} (new)"
     continue
   fi
 

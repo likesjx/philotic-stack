@@ -468,7 +468,13 @@ local-push:
         if [ ! -f "${AIUA_CELLAR}/$bin" ]; then
             cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
             chmod 555 "${AIUA_CELLAR}/$bin"
-            echo "  + $bin (new)"
+            # Create /opt/homebrew/bin symlink for new binaries
+            if [ ! -e "/opt/homebrew/bin/$bin" ]; then
+                ln -s "../Cellar/aiua/0.1.0-alpha/bin/$bin" "/opt/homebrew/bin/$bin"
+                echo "  + $bin (new + symlinked)"
+            else
+                echo "  + $bin (new)"
+            fi
             continue
         fi
         rm -f "${AIUA_CELLAR}/$bin"
@@ -503,7 +509,7 @@ remote-homebrew-status remote hotel:
     @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
 
 jane-push:
-    just remote-homebrew-push mbp-jane mbp-jane MacBookPro
+    just remote-homebrew-push mbp-jane mbp-jane Jareds-MacBook-Pro
 
 # Stop Jane on mbp-jane without pushing new binaries.
 jane-stop:
