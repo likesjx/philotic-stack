@@ -2914,6 +2914,104 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             class: "asr".into(),
             tool_markers: Vec::new(),
         },
+        // ── Cron scheduler tools ──────────────────────────────────────────────
+        AbstractToolRecord {
+            tool_name: "cron.register".into(),
+            description: "Register or update a cron job on the hotel. The job fires on a 7-field \
+                          cron schedule and delivers a JSON payload to a target role's inbox. \
+                          Use cron.list first to avoid duplicates. Responds with the assigned job_id."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "schedule": {
+                        "type": "string",
+                        "description": "7-field cron expression: <sec> <min> <hour> <dom> <month> <dow> <year>. Example: \"0 */5 * * * * *\" for every 5 minutes."
+                    },
+                    "target_role": {
+                        "type": "string",
+                        "description": "Role name whose inbox receives the trigger payload."
+                    },
+                    "payload": {
+                        "type": "string",
+                        "description": "JSON payload string delivered to the role. Supports {timestamp}, {iso_timestamp}, {job_id}, {node_id}, {target_role} interpolation."
+                    },
+                    "guaranteed": {
+                        "type": "boolean",
+                        "description": "Mesh-coordinated delivery (future feature, currently ignored). Default false."
+                    }
+                },
+                "required": ["schedule", "target_role", "payload"]
+            }),
+            class: "cron".into(),
+            tool_markers: vec!["high_agency".into()],
+        },
+        AbstractToolRecord {
+            tool_name: "cron.list".into(),
+            description: "List all cron jobs registered on this hotel, including their schedule, \
+                          target role, enabled state, and next fire time."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: "cron".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "cron.enable".into(),
+            description: "Re-enable a previously disabled cron job. The job resumes firing on its \
+                          schedule from the next occurrence after now."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The cron job UUID to enable."
+                    }
+                },
+                "required": ["job_id"]
+            }),
+            class: "cron".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "cron.disable".into(),
+            description: "Disable a cron job without removing it. The job record is preserved and \
+                          can be re-enabled with cron.enable."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The cron job UUID to disable."
+                    }
+                },
+                "required": ["job_id"]
+            }),
+            class: "cron".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "cron.remove".into(),
+            description: "Permanently remove a cron job from the hotel. This cannot be undone. \
+                          Use cron.disable instead if you may want to resume the job later."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The cron job UUID to remove."
+                    }
+                },
+                "required": ["job_id"]
+            }),
+            class: "cron".into(),
+            tool_markers: vec!["high_agency".into()],
+        },
     ];
 
     for tool in &catalog {
@@ -3180,6 +3278,130 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             ..Default::default()
         },
+        AbstractSkillRecord {
+            skill_name: "session.recover".into(),
+            description: "Diagnose and recover from a stuck, failed, or confused session state. \
+                          Classify the failure class (transient IPC, tool not found, context drift, \
+                          loop detected, approval blocked, model confusion), choose the minimal \
+                          recovery path, and resume work or escalate to the operator with a \
+                          structured report. Never retry a failed tool more than once without \
+                          reclassifying."
+                .into(),
+            implied_tools: vec![
+                "session.status".into(),
+                "hotel.status".into(),
+                "hotel.logs".into(),
+                "role.list".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "failure_classes": [
+                    "tool_not_found",
+                    "transient_ipc",
+                    "context_drift",
+                    "loop_detected",
+                    "approval_blocked",
+                    "model_confusion"
+                ],
+                "repo_skill_path": "skills/session-recover/SKILL.md",
+                "workflow": "session.status → classify → recover or escalate"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "agent.initiate".into(),
+            description: "Send a proactive, unsolicited message to a user or peer agent when \
+                          a concrete system event authorizes it (cron job fired, threshold crossed, \
+                          task completed, delegation received). Never initiate without a traceable \
+                          trigger. Route via delegate.whisper for operator-facing outreach, or \
+                          delegate.to_peer for inter-agent coordination."
+                .into(),
+            implied_tools: vec![
+                "session.status".into(),
+                "hotel.status".into(),
+                "delegate.whisper".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "required_fields": ["trigger_reason", "recipient", "message_intent"],
+                "repo_skill_path": "skills/agent-initiate/SKILL.md",
+                "workflow": "verify trigger → compose message → route"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "cron.manage".into(),
+            description: "Create, inspect, enable, disable, and remove scheduled cron jobs on \
+                          the hotel. Use cron.list before registering to prevent duplicates. \
+                          Choose schedules in 7-field cron format. Write payloads that the target \
+                          role can act on without additional context injection. Use cron.disable \
+                          instead of cron.remove when you may want to resume the job later."
+                .into(),
+            implied_tools: vec![
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
+                "session.status".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "required_fields": ["schedule", "target_role", "payload"],
+                "repo_skill_path": "skills/cron-manage/SKILL.md",
+                "workflow": "cron.list → compose job → cron.register → verify with cron.list"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "context.synthesize".into(),
+            description: "Restore session continuity at the start of a new conversation or after \
+                          context compaction. Pull current state from hotel (session.status, \
+                          hotel.status, role.list, skill.list) and form a working mental model \
+                          before acting. Do not start substantive work until you have a current \
+                          picture of the live system state. Complements Muninn recall: verify \
+                          recalled facts against live hotel state before acting on them."
+                .into(),
+            implied_tools: vec![
+                "session.status".into(),
+                "hotel.status".into(),
+                "role.list".into(),
+                "skill.list".into(),
+                "graph.query".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "repo_skill_path": "skills/context-synthesize/SKILL.md",
+                "workflow": "session.status → hotel.status → role.list → skill.list → synthesize"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "profile.manage".into(),
+            description: "Understand, audit, and grow your own capability profile. \
+                          Call role.list to see toolset profiles and skill.list to see assigned \
+                          skills. When you've identified a recurring delegation pattern (3+ times), \
+                          register a new skill with skill.register and assign it with skill.assign. \
+                          When you need a tool not in your allowed_tools, use capability.request \
+                          to ask the orchestrator to expand your profile — do not attempt to modify \
+                          allowed_tools directly. Update role_identity_addendum via role.configure \
+                          when your responsibilities have materially changed."
+                .into(),
+            implied_tools: vec![
+                "role.list".into(),
+                "skill.list".into(),
+                "skill.register".into(),
+                "skill.assign".into(),
+                "role.configure".into(),
+                "session.status".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "repo_skill_path": "skills/profile-manage/SKILL.md",
+                "workflow": "role.list → skill.list → identify gap → register or request → assign"
+            }),
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -3221,8 +3443,13 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "table.stats".into(),
                 "table.schema".into(),
                 "table.add_listener".into(),
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "graph".into(), "table".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "graph".into(), "table".into(), "cron".into()],
             allowed_skills: vec![
                 "handoff.to_role".into(),
                 "handoff.back".into(),
@@ -3233,6 +3460,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
                 "observability.pipeline".into(),
+                "session.recover".into(),
+                "agent.initiate".into(),
+                "cron.manage".into(),
+                "context.synthesize".into(),
+                "profile.manage".into(),
             ],
             description: Some("Default orchestrator role profile.".into()),
         },
@@ -3242,6 +3474,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "echo".into(),
                 "skill.list".into(),
+                "role.list".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "graph.query".into(),
@@ -3249,7 +3482,12 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.list".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "workspace".into()],
-            allowed_skills: vec!["handoff.back".into(), "capability.request".into()],
+            allowed_skills: vec![
+                "handoff.back".into(),
+                "capability.request".into(),
+                "context.synthesize".into(),
+                "session.recover".into(),
+            ],
             description: Some("Codex specialist role profile — workspace read access.".into()),
         },
         ToolsetProfileRecord {
@@ -3258,12 +3496,18 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "echo".into(),
                 "skill.list".into(),
+                "role.list".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into()],
-            allowed_skills: vec!["handoff.back".into(), "capability.request".into()],
+            allowed_skills: vec![
+                "handoff.back".into(),
+                "capability.request".into(),
+                "context.synthesize".into(),
+                "session.recover".into(),
+            ],
             description: Some("Research specialist role profile — minimal tool surface.".into()),
         },
         ToolsetProfileRecord {
@@ -3272,12 +3516,17 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "echo".into(),
                 "skill.list".into(),
+                "role.list".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into()],
-            allowed_skills: vec!["capability.request".into()],
+            allowed_skills: vec![
+                "capability.request".into(),
+                "context.synthesize".into(),
+                "session.recover".into(),
+            ],
             description: Some("Bare utility profile — session and echo only.".into()),
         },
         ToolsetProfileRecord {
@@ -3319,6 +3568,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "table.stats".into(),
                 "table.schema".into(),
                 "table.add_listener".into(),
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -3329,6 +3583,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "asr".into(),
                 "graph".into(),
                 "table".into(),
+                "cron".into(),
             ],
             allowed_skills: vec![
                 "skill.crafting".into(),
@@ -3342,9 +3597,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "inference.scripting".into(),
                 "asr.admin".into(),
                 "vision.admin".into(),
+                "session.recover".into(),
+                "agent.initiate".into(),
+                "cron.manage".into(),
+                "context.synthesize".into(),
+                "profile.manage".into(),
             ],
             description: Some(
-                "Admin role profile — full skill crafting, role governance, training data authority, ASR provisioning, and vision model provisioning.".into(),
+                "Admin role profile — full skill crafting, role governance, training data authority, ASR provisioning, vision model provisioning, and cron scheduling.".into(),
             ),
         },
         ToolsetProfileRecord {
@@ -3364,7 +3624,13 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.list".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "graph".into()],
-            allowed_skills: vec!["handoff.back".into(), "capability.request".into(), "memory.fix".into()],
+            allowed_skills: vec![
+                "handoff.back".into(),
+                "capability.request".into(),
+                "memory.fix".into(),
+                "context.synthesize".into(),
+                "session.recover".into(),
+            ],
             description: Some(
                 "Architect specialist role profile — systems, infrastructure, debugging. \
                  bash.exec requires operator approval."
@@ -3377,12 +3643,17 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "echo".into(),
                 "skill.list".into(),
+                "role.list".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into()],
-            allowed_skills: vec!["handoff.back".into()],
+            allowed_skills: vec![
+                "handoff.back".into(),
+                "context.synthesize".into(),
+                "session.recover".into(),
+            ],
             description: Some(
                 "Virtuoso specialist role profile — creative and expressive. \
                  Minimal tools, focused on reflection and lyrical output."

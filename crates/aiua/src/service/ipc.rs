@@ -10895,6 +10895,11 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "training.status"
             | "asr.setup"
             | "asr.status"
+            | "cron.register"
+            | "cron.list"
+            | "cron.enable"
+            | "cron.disable"
+            | "cron.remove"
     )
 }
 
