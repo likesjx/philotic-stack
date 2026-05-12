@@ -1182,14 +1182,15 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - no browser-direct remote `aiua` protocol
   - no local mutation simulation standing in for target execution
 - [ ] Define the first desktop-aware operator session posture flow for mesh-wide admin work.
-- [ ] Define the first hotel-owned user identity and operator auth slice.
-  - canonical `UserRecord`, `RootUserKeyRefRecord`, and `OperatorSessionRecord`
-  - hotel-local authority for root-user key refs and vault bindings
-  - mesh-visible ghost mirror projection for non-secret user identity and audit attribution
-  - philote-visible bounded user context projection instead of raw root-user secret access
-  - secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
-  - no-view-before-auth rule for the always-on desktop: render only bootstrap/login shell until hotel-issued operator session exists
-  - step-up-friendly login/bootstrap path for the long-running desktop server
+- [~] Define the first hotel-owned user identity and operator auth slice.
+  - [x] canonical `UserRecord`, `RootUserKeyRefRecord`, and `OperatorSessionRecord` tables created in the hotel context DB
+  - [x] no-view-before-auth rule for the always-on desktop: render only bootstrap/login shell until hotel-issued operator session exists
+  - [x] first login/bootstrap path: hotel-issued startup bootstrap token exchanged for a bounded operator session cookie
+  - [ ] hotel-local authority for root-user key refs and real vault bindings beyond bootstrap schema
+  - [ ] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
+  - [ ] philote-visible bounded user context projection instead of raw root-user secret access
+  - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
+  - [ ] step-up-friendly login/bootstrap path beyond the startup bootstrap token
 - [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.
 - [ ] Define the first high-trust remote action ceremonies for:
   - secret rotation

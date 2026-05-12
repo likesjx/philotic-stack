@@ -77,7 +77,7 @@ Philotic currently operates as a hotel-centered runtime:
 - the hotel perimeter now has a first explicit mesh membership ceremony through `phil mesh invite` and `phil mesh accept`, with accepted peers persisted in the graph; this is still transitional trust because revocation, scoped authorization, and non-PSK hotel identity are not finished.
 - intended mesh transport boundaries are now explicit: UDP is the state-sync/control plane only, routed execution belongs on reliable point-to-point transport, WebRTC is an optional peer session plane after signaling, and mesh-shared graph sync is selective projected state rather than blind full-database replication.
 - operator-facing canonical hotel naming should converge on `mac-jane`, `mbp-jane`, and `vps-jane`; legacy runtime names such as local `default` and VPS `beacon-test-hotel` are explicit migration debt, and deploy paths should clean stale previous-name graph records instead of letting old hotel identities linger as undead peers.
-- the long-running desktop server direction is now explicit: `vps-jane` may host a durable operator ingress, but it should reveal only a hotel-auth bootstrap shell until a bounded operator session is issued.
+- the long-running desktop server direction is now explicit: `vps-jane` may host a durable operator ingress, and the first hotel-auth bootstrap/session slice is now real in `philotic-web`: startup bootstrap token, persisted operator session record, no-view-before-auth shell, and explicit logout.
 
 ## Implemented Foundations
 

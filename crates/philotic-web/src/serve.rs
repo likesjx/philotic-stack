@@ -1,11 +1,13 @@
 //! `philotic-web serve` — local management HTTP + WebSocket server.
 //!
-//! Generates a random session token on startup, binds it to a same-origin
-//! session cookie for the embedded UI, and still accepts
-//! `Authorization: Bearer <token>` as an explicit transitional compatibility
-//! path.
+//! Generates a hotel-issued bootstrap token on startup and requires an
+//! explicit bootstrap/login ceremony before issuing a bounded same-origin
+//! operator session cookie for the embedded UI.
 //!
 //! REST endpoints:
+//!   GET  /api/auth/status
+//!   POST /api/auth/bootstrap
+//!   POST /api/auth/logout
 //!   GET  /api/status
 //!   GET  /api/guests
 //!   GET  /api/agents
@@ -59,7 +61,7 @@ use axum::{
     Router,
 };
 use rand::Rng;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
@@ -88,7 +90,7 @@ const HEADER_CORP: &str = "cross-origin-resource-policy";
 
 #[derive(Clone)]
 struct AppState {
-    token: Arc<String>,
+    bootstrap_token: Arc<String>,
     db_path: PathBuf,
     hotel: Arc<String>,
     /// IPC socket path for the connected hotel
@@ -240,6 +242,48 @@ struct EventLogEntry {
     details: Value,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+struct OperatorSessionRecord {
+    session_id: String,
+    session_token: String,
+    user_id: String,
+    display_name: String,
+    issuing_hotel: String,
+    surface_kind: String,
+    posture: String,
+    issued_at: i64,
+    expires_at: i64,
+    status: String,
+    auth_method: String,
+    bootstrap_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BootstrapAuthBody {
+    bootstrap_token: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AuthStatusView {
+    authenticated: bool,
+    hotel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<OperatorSessionStatusView>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OperatorSessionStatusView {
+    session_id: String,
+    user_id: String,
+    display_name: String,
+    posture: String,
+    issued_at: i64,
+    expires_at: i64,
+    auth_method: String,
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -262,8 +306,8 @@ pub async fn run(
     let lease_key = desktop_membrane_lease_key(&hotel);
     let lease_handle = acquire_desktop_membrane_lease(&socket, &lease_key, port).await?;
 
-    // Generate session token
-    let token: String = {
+    // Generate bootstrap token for the first login ceremony.
+    let bootstrap_token: String = {
         let bytes: [u8; 24] = rand::thread_rng().gen();
         format!("philotic-{}", hex::encode(bytes))
     };
@@ -272,18 +316,23 @@ pub async fn run(
     let (tx, _) = broadcast::channel::<String>(256);
 
     let state = AppState {
-        token: Arc::new(token.clone()),
+        bootstrap_token: Arc::new(bootstrap_token.clone()),
         db_path,
         hotel: Arc::new(hotel),
         socket: Arc::new(socket),
         tx,
     };
 
+    ensure_operator_auth_tables(&state.db_path, &state.hotel)?;
+
     // CORS — localhost only; UI is embedded and served from the same origin
     let cors = build_cors(allow_origins.as_deref());
 
     let app = Router::new()
         // API routes
+        .route("/api/auth/status", get(handle_auth_status))
+        .route("/api/auth/bootstrap", post(handle_auth_bootstrap))
+        .route("/api/auth/logout", post(handle_auth_logout))
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
@@ -397,7 +446,7 @@ pub async fn run(
     println!("──────────────────────────────────────────");
     println!("  http://127.0.0.1:{port}");
     println!();
-    println!("  Debug token: {token}");
+    println!("  Bootstrap token: {bootstrap_token}");
     println!();
     println!("  Press Ctrl-C to stop.");
 
@@ -617,8 +666,16 @@ async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
 
 // ── Embedded UI handlers ──────────────────────────────────────────────────────
 
-/// Serve `index.html` and bind the session token as a same-origin cookie.
-async fn handle_index(State(state): State<AppState>) -> Response {
+/// Serve `index.html` only after a bounded operator session exists.
+async fn handle_index(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(session) = current_operator_session(&headers, &state) {
+        return serve_index_for_session(&state, &session).await;
+    }
+
+    serve_auth_bootstrap_shell(&state)
+}
+
+async fn serve_index_for_session(_state: &AppState, session: &OperatorSessionRecord) -> Response {
     let html = match UiAssets::get("index.html") {
         Some(f) => String::from_utf8_lossy(f.data.as_ref()).into_owned(),
         None => return (StatusCode::NOT_FOUND, "UI not built").into_response(),
@@ -631,7 +688,10 @@ async fn handle_index(State(state): State<AppState>) -> Response {
     )
         .into_response();
     let headers = response.headers_mut();
-    headers.insert(header::SET_COOKIE, auth_cookie_header(&state));
+    headers.insert(
+        header::SET_COOKIE,
+        session_cookie_header(&session.session_token),
+    );
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(no_store_header_value()),
@@ -655,6 +715,180 @@ async fn handle_index(State(state): State<AppState>) -> Response {
         HeaderValue::from_static(
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
         ),
+    );
+    response
+}
+
+fn serve_auth_bootstrap_shell(state: &AppState) -> Response {
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Philotic Operator Login</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #131314;
+      --panel: rgba(31, 32, 35, 0.96);
+      --border: rgba(255,255,255,0.08);
+      --text: #f5f5f5;
+      --muted: #a3a3a3;
+      --accent: #4f8cff;
+      --danger: #ffb366;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top right, rgba(79,140,255,0.18), transparent 30%),
+        linear-gradient(180deg, #111214 0%, var(--bg) 100%);
+      color: var(--text);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }}
+    .panel {{
+      width: min(560px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      padding: 32px;
+      box-shadow: 0 30px 90px rgba(0,0,0,0.35);
+    }}
+    .eyebrow {{
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 700;
+      margin: 0 0 12px;
+    }}
+    h1 {{
+      margin: 0 0 12px;
+      font-size: clamp(30px, 5vw, 46px);
+      line-height: 0.98;
+    }}
+    p {{
+      color: var(--muted);
+      line-height: 1.6;
+    }}
+    form {{
+      margin-top: 24px;
+      display: grid;
+      gap: 12px;
+    }}
+    input {{
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      padding: 14px 16px;
+      font-size: 16px;
+    }}
+    button {{
+      border: 0;
+      border-radius: 999px;
+      background: var(--accent);
+      color: white;
+      padding: 14px 18px;
+      font-weight: 700;
+      font-size: 16px;
+      cursor: pointer;
+    }}
+    .meta {{
+      margin-top: 18px;
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+    }}
+    .error {{
+      color: var(--danger);
+      min-height: 1.4em;
+      font-size: 14px;
+    }}
+    code {{
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      background: rgba(255,255,255,0.06);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }}
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <p class="eyebrow">Operator Bootstrap</p>
+    <h1>Authenticate to this hotel first.</h1>
+    <p>
+      This desktop membrane is reachable, but it will not reveal mesh state, hotel inventory,
+      or operator controls until the hotel issues a bounded operator session.
+    </p>
+    <form id="auth-form">
+      <input id="display-name" type="text" placeholder="Display name (optional)" autocomplete="name" />
+      <input id="bootstrap-token" type="password" placeholder="Bootstrap token" autocomplete="one-time-code" required />
+      <button type="submit">Start Operator Session</button>
+      <div class="error" id="auth-error" aria-live="polite"></div>
+    </form>
+    <section class="meta">
+      <p><strong>Hotel:</strong> <code>{hotel}</code></p>
+      <p><strong>Surface health:</strong> desktop membrane reachable</p>
+      <p><strong>Rule:</strong> no view before auth</p>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById('auth-form');
+    const error = document.getElementById('auth-error');
+    form.addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      error.textContent = '';
+      const bootstrapToken = document.getElementById('bootstrap-token').value;
+      const displayName = document.getElementById('display-name').value.trim();
+      const response = await fetch('/api/auth/bootstrap', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          bootstrap_token: bootstrapToken,
+          display_name: displayName || null
+        }})
+      }});
+      if (!response.ok) {{
+        let message = 'Login failed';
+        try {{
+          const body = await response.json();
+          message = body.error || message;
+        }} catch (_err) {{}}
+        error.textContent = message;
+        return;
+      }}
+      window.location.reload();
+    }});
+  </script>
+</body>
+</html>"#,
+        hotel = state.hotel
+    );
+
+    let mut response = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(no_store_header_value()),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     response
 }
@@ -865,7 +1099,11 @@ async fn handle_setup_guide() -> Response {
 
 /// Serve any other embedded asset (JS, CSS, icons, etc.).
 /// Falls back to `index.html` for SPA client-side routes.
-async fn handle_static(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+async fn handle_static(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+) -> Response {
     let path = uri.path().trim_start_matches('/');
 
     if let Some(asset) = UiAssets::get(path) {
@@ -893,17 +1131,103 @@ async fn handle_static(State(state): State<AppState>, uri: axum::http::Uri) -> R
         response
     } else {
         // SPA fallback — let the client-side router handle it
-        handle_index(State(state)).await
+        handle_index(headers, State(state)).await
     }
 }
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
+async fn handle_auth_status(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let session = current_operator_session(&headers, &state);
+    Json(AuthStatusView {
+        authenticated: session.is_some(),
+        hotel: (*state.hotel).clone(),
+        session: session.map(|session| OperatorSessionStatusView {
+            session_id: session.session_id,
+            user_id: session.user_id,
+            display_name: session.display_name,
+            posture: session.posture,
+            issued_at: session.issued_at,
+            expires_at: session.expires_at,
+            auth_method: session.auth_method,
+        }),
+    })
+    .into_response()
+}
+
+async fn handle_auth_bootstrap(
+    State(state): State<AppState>,
+    Json(body): Json<BootstrapAuthBody>,
+) -> Response {
+    if body.bootstrap_token != *state.bootstrap_token {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid bootstrap token"})),
+        )
+            .into_response();
+    }
+
+    let display_name = body
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Operator");
+
+    let session = match issue_operator_session(
+        &state.db_path,
+        &state.hotel,
+        display_name,
+        "bootstrap_token",
+        Some("startup-bootstrap".into()),
+    ) {
+        Ok(session) => session,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut response = Json(AuthStatusView {
+        authenticated: true,
+        hotel: (*state.hotel).clone(),
+        session: Some(OperatorSessionStatusView {
+            session_id: session.session_id.clone(),
+            user_id: session.user_id.clone(),
+            display_name: session.display_name.clone(),
+            posture: session.posture.clone(),
+            issued_at: session.issued_at,
+            expires_at: session.expires_at,
+            auth_method: session.auth_method.clone(),
+        }),
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie_header(&session.session_token),
+    );
+    response
+}
+
+async fn handle_auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(token) =
+        header_bearer_token(&headers).or_else(|| cookie_token(&headers, AUTH_COOKIE_NAME))
+    {
+        let _ = revoke_operator_session(&state.db_path, token);
+    }
+
+    let mut response = Json(json!({"ok": true})).into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, clear_session_cookie_header());
+    response
+}
+
 fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
-    header_bearer_token(headers)
-        .or_else(|| cookie_token(headers, AUTH_COOKIE_NAME))
-        .map(|token| token == state.token.as_str())
-        .unwrap_or(false)
+    current_operator_session(headers, state).is_some()
 }
 
 fn header_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -921,12 +1245,19 @@ fn cookie_token<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str
     })
 }
 
-fn auth_cookie_header(state: &AppState) -> HeaderValue {
+fn session_cookie_header(session_token: &str) -> HeaderValue {
     HeaderValue::from_str(&format!(
         "{AUTH_COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={AUTH_COOKIE_MAX_AGE_SECS}",
-        state.token
+        session_token
     ))
     .expect("session cookie should be a valid header value")
+}
+
+fn clear_session_cookie_header() -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+    ))
+    .expect("cleared session cookie should be a valid header value")
 }
 
 fn no_store_header_value() -> &'static str {
@@ -4030,11 +4361,7 @@ async fn handle_ws(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    let cookie_authed = cookie_token(&headers, AUTH_COOKIE_NAME)
-        .map(|t| t == state.token.as_str())
-        .unwrap_or(false);
-
-    if !cookie_authed {
+    if current_operator_session(&headers, &state).is_none() {
         return unauthorized();
     }
 
@@ -4102,6 +4429,183 @@ fn read_hotel_name(config_path: &PathBuf) -> String {
                 .and_then(|m| m.keys().next().cloned())
         })
         .unwrap_or_else(|| "default".to_string())
+}
+
+fn current_operator_session(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<OperatorSessionRecord> {
+    let token = header_bearer_token(headers).or_else(|| cookie_token(headers, AUTH_COOKIE_NAME))?;
+    resolve_operator_session(&state.db_path, token)
+        .ok()
+        .flatten()
+}
+
+fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS operator_users (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            home_hotel TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS root_user_key_refs (
+            user_id TEXT NOT NULL,
+            key_purpose TEXT NOT NULL,
+            vault_ref TEXT,
+            public_fingerprint TEXT,
+            rotation_state TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, key_purpose)
+        );
+
+        CREATE TABLE IF NOT EXISTS operator_sessions (
+            session_id TEXT PRIMARY KEY,
+            session_token TEXT NOT NULL UNIQUE,
+            user_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            issuing_hotel TEXT NOT NULL,
+            surface_kind TEXT NOT NULL,
+            posture TEXT NOT NULL,
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            auth_method TEXT NOT NULL,
+            bootstrap_id TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_operator_sessions_token
+        ON operator_sessions(session_token);
+        ",
+    )?;
+
+    let now = now_epoch_secs();
+    conn.execute(
+        "INSERT INTO operator_users (user_id, display_name, home_hotel, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'active', ?4, ?4)
+         ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, home_hotel=excluded.home_hotel, updated_at=excluded.updated_at",
+        rusqlite::params![
+            default_operator_user_id(hotel),
+            default_operator_display_name(),
+            hotel,
+            now,
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn issue_operator_session(
+    db_path: &PathBuf,
+    hotel: &str,
+    display_name: &str,
+    auth_method: &str,
+    bootstrap_id: Option<String>,
+) -> Result<OperatorSessionRecord> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    let expires_at = now + AUTH_COOKIE_MAX_AGE_SECS as i64;
+    let session = OperatorSessionRecord {
+        session_id: new_operator_chat_id("operator-session"),
+        session_token: new_operator_chat_id("operator-token"),
+        user_id: default_operator_user_id(hotel),
+        display_name: display_name.to_string(),
+        issuing_hotel: hotel.to_string(),
+        surface_kind: "desktop_membrane".into(),
+        posture: "admin".into(),
+        issued_at: now,
+        expires_at,
+        status: "active".into(),
+        auth_method: auth_method.into(),
+        bootstrap_id,
+    };
+    conn.execute(
+        "INSERT INTO operator_sessions
+        (session_id, session_token, user_id, display_name, issuing_hotel, surface_kind, posture, issued_at, expires_at, status, auth_method, bootstrap_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            &session.session_id,
+            &session.session_token,
+            &session.user_id,
+            &session.display_name,
+            &session.issuing_hotel,
+            &session.surface_kind,
+            &session.posture,
+            session.issued_at,
+            session.expires_at,
+            &session.status,
+            &session.auth_method,
+            &session.bootstrap_id,
+        ],
+    )?;
+
+    Ok(session)
+}
+
+fn resolve_operator_session(
+    db_path: &PathBuf,
+    token: &str,
+) -> Result<Option<OperatorSessionRecord>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT session_id, session_token, user_id, display_name, issuing_hotel, surface_kind, posture,
+                issued_at, expires_at, status, auth_method, bootstrap_id
+         FROM operator_sessions
+         WHERE session_token = ?1",
+    )?;
+    let maybe = stmt
+        .query_row([token], |row| {
+            Ok(OperatorSessionRecord {
+                session_id: row.get(0)?,
+                session_token: row.get(1)?,
+                user_id: row.get(2)?,
+                display_name: row.get(3)?,
+                issuing_hotel: row.get(4)?,
+                surface_kind: row.get(5)?,
+                posture: row.get(6)?,
+                issued_at: row.get(7)?,
+                expires_at: row.get(8)?,
+                status: row.get(9)?,
+                auth_method: row.get(10)?,
+                bootstrap_id: row.get(11)?,
+            })
+        })
+        .optional()?;
+
+    Ok(maybe.filter(|session| session.status == "active" && session.expires_at > now_epoch_secs()))
+}
+
+fn revoke_operator_session(db_path: &PathBuf, token: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute(
+        "UPDATE operator_sessions SET status = 'revoked' WHERE session_token = ?1",
+        [token],
+    )?;
+    Ok(())
+}
+
+fn default_operator_user_id(hotel: &str) -> String {
+    format!("root-user:{hotel}")
+}
+
+fn default_operator_display_name() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Operator".into())
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -4191,5 +4695,48 @@ mod tests {
 
         let _ = fs::remove_file(&context_path);
         let _ = fs::remove_file(&router_path);
+    }
+
+    #[test]
+    fn issue_operator_session_persists_and_resolves_active_session() {
+        let context_path = temp_db_path("operator-session");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let session = issue_operator_session(
+            &context_path,
+            "mac-jane",
+            "Jared",
+            "bootstrap_token",
+            Some("startup-bootstrap".into()),
+        )
+        .unwrap();
+
+        let resolved = resolve_operator_session(&context_path, &session.session_token)
+            .unwrap()
+            .expect("session should resolve");
+        assert_eq!(resolved.display_name, "Jared");
+        assert_eq!(resolved.issuing_hotel, "mac-jane");
+        assert_eq!(resolved.posture, "admin");
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn revoked_operator_session_stops_resolving() {
+        let context_path = temp_db_path("operator-session-revoked");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let session = issue_operator_session(
+            &context_path,
+            "mac-jane",
+            "Jared",
+            "bootstrap_token",
+            Some("startup-bootstrap".into()),
+        )
+        .unwrap();
+        revoke_operator_session(&context_path, &session.session_token).unwrap();
+
+        let resolved = resolve_operator_session(&context_path, &session.session_token).unwrap();
+        assert!(resolved.is_none());
+
+        let _ = fs::remove_file(&context_path);
     }
 }

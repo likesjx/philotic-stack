@@ -96,17 +96,18 @@ This slice has started landing in code, but the boundary is still transitional i
 Current behavior in `crates/philotic-web/src/serve.rs`:
 
 - binds an HTTP + WebSocket server on `127.0.0.1`
-- generates a random bearer token at startup
+- generates a hotel-issued bootstrap token at startup
 - acquires and renews a dedicated desktop membrane lease before serving
-- binds the embedded desktop to a same-origin `HttpOnly` session cookie instead of JS token injection
-- uses same-session cookie auth for websocket attach
+- renders only a hotel-auth bootstrap shell before auth
+- exchanges the bootstrap token for a hotel-issued same-origin `HttpOnly` operator session cookie
+- uses that operator session for websocket attach
 - now routes local status, guest summaries, and redacted agent summaries through explicit hotel-owned IPC view models
 - now exposes a first typed mesh target inventory view from the hotel-owned registry with source-hotel, target-hotel, reachability, and freshness attribution
 - now exposes a first target-status view that is `local-canonical` for the local hotel, attempts a direct target-hotel query for remote targets, and falls back to `remote-heartbeat-observed` when that query path does not complete
 - now exposes a first target-guest inventory contract that is local-canonical for the local hotel and attempts a direct target-hotel management query for remote targets, with explicit fallback when that path cannot complete
 - denies apartment inspection on the default desktop membrane surface
 - routes guest restart/stop actions to the hotel over local IPC
-- still allows a pre-auth disconnected shell shape that needs to evolve into an explicit hotel-auth bootstrap surface for the always-on desktop-server model
+- now has the first explicit hotel-auth bootstrap surface for the always-on desktop-server model
 
 Current embedded desktop behavior in `jaredlikes-desktop`:
 

@@ -50,7 +50,7 @@ This proposal answers:
 
 ## Disposition
 
-`proposed`
+`accepted for current slice`
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
@@ -181,6 +181,23 @@ Suggested first record families:
 - `issued_at`
 - `expires_at`
 - `status`
+
+## Current Slice
+
+The first concrete bootstrap/session slice is now real in `philotic-web`:
+
+- `operator_users`, `root_user_key_refs`, and `operator_sessions` tables are created in the hotel context DB
+- `philotic-web serve` now generates a startup bootstrap token instead of auto-granting the desktop a live operator cookie on page load
+- the desktop root route now renders only a hotel-auth bootstrap shell until the hotel issues an `OperatorSessionRecord`
+- `POST /api/auth/bootstrap` exchanges the bootstrap token for a bounded operator session cookie
+- `GET /api/auth/status` reports whether the current browser session is authenticated
+- `POST /api/auth/logout` revokes the current operator session and clears the cookie
+
+This is intentionally a first slice, not a final auth model:
+
+- auth still uses a hotel-issued bootstrap token rather than passkey or local-device mediation
+- `root_user_key_refs` exists as canonical schema but is not yet populated from a stronger secret-store backed login path
+- operator posture is still a simple `admin` session default rather than a richer elevation flow
 
 ## Desktop Auth Recommendation
 
