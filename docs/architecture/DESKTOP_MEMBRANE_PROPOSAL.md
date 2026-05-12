@@ -99,9 +99,10 @@ Current behavior in `crates/philotic-web/src/serve.rs`:
 - binds an HTTP + WebSocket server on `127.0.0.1`
 - generates a hotel-issued bootstrap token at startup
 - acquires and renews a dedicated desktop membrane lease before serving
-- renders only a hotel-auth bootstrap shell before auth
+- always serves the embedded desktop shell, even before auth
 - exchanges the bootstrap token for a hotel-issued same-origin `HttpOnly` operator session cookie
 - uses that operator session for websocket attach
+- now defers the actual bootstrap/login UX to `System Settings > Aiua Membrane`, while unauthenticated Aiua workspace surfaces stay locked
 - now routes local status, guest summaries, and redacted agent summaries through explicit hotel-owned IPC view models
 - now exposes a first typed mesh target inventory view from the hotel-owned registry with source-hotel, target-hotel, reachability, and freshness attribution
 - now exposes a first target-status view that is `local-canonical` for the local hotel, attempts a direct target-hotel query for remote targets, and falls back to `remote-heartbeat-observed` when that query path does not complete

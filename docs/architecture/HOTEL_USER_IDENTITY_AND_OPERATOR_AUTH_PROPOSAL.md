@@ -188,9 +188,9 @@ The first concrete bootstrap/session slice is now real in `philotic-web`:
 
 - `operator_users`, `root_user_key_refs`, and `operator_sessions` tables are created in the hotel context DB
 - `philotic-web serve` now generates a startup bootstrap token instead of auto-granting the desktop a live operator cookie on page load
-- the desktop root route now renders only a hotel-auth bootstrap shell until the hotel issues an `OperatorSessionRecord`
+- the desktop root route now always serves the embedded desktop shell, while unauthenticated operator UX is pushed into `System Settings > Aiua Membrane`
 - `POST /api/auth/bootstrap` exchanges the bootstrap token for a bounded operator session cookie
-- `GET /api/auth/status` reports whether the current browser session is authenticated
+- `GET /api/auth/status` reports whether the current browser session is authenticated so the desktop can stay locked until the hotel issues a session
 - `POST /api/auth/logout` revokes the current operator session and clears the cookie
 
 This is intentionally a first slice, not a final auth model:

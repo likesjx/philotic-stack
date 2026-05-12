@@ -666,16 +666,20 @@ async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
 
 // ── Embedded UI handlers ──────────────────────────────────────────────────────
 
-/// Serve `index.html` only after a bounded operator session exists.
+/// Serve the embedded desktop shell for both locked and unlocked states.
+///
+/// The desktop itself is responsible for presenting a locked posture and
+/// routing bootstrap/auth workflows into System Settings. The server remains
+/// the authority on session issuance and API access, but it should not replace
+/// the desktop with a parallel HTML login applet.
 async fn handle_index(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Some(session) = current_operator_session(&headers, &state) {
-        return serve_index_for_session(&state, &session).await;
-    }
-
-    serve_auth_bootstrap_shell(&state)
+    serve_index_for_session(&state, current_operator_session(&headers, &state).as_ref()).await
 }
 
-async fn serve_index_for_session(_state: &AppState, session: &OperatorSessionRecord) -> Response {
+async fn serve_index_for_session(
+    _state: &AppState,
+    session: Option<&OperatorSessionRecord>,
+) -> Response {
     let html = match UiAssets::get("index.html") {
         Some(f) => String::from_utf8_lossy(f.data.as_ref()).into_owned(),
         None => return (StatusCode::NOT_FOUND, "UI not built").into_response(),
@@ -688,10 +692,12 @@ async fn serve_index_for_session(_state: &AppState, session: &OperatorSessionRec
     )
         .into_response();
     let headers = response.headers_mut();
-    headers.insert(
-        header::SET_COOKIE,
-        session_cookie_header(&session.session_token),
-    );
+    if let Some(session) = session {
+        headers.insert(
+            header::SET_COOKIE,
+            session_cookie_header(&session.session_token),
+        );
+    }
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(no_store_header_value()),
@@ -715,180 +721,6 @@ async fn serve_index_for_session(_state: &AppState, session: &OperatorSessionRec
         HeaderValue::from_static(
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
         ),
-    );
-    response
-}
-
-fn serve_auth_bootstrap_shell(state: &AppState) -> Response {
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Philotic Operator Login</title>
-  <style>
-    :root {{
-      color-scheme: dark;
-      --bg: #131314;
-      --panel: rgba(31, 32, 35, 0.96);
-      --border: rgba(255,255,255,0.08);
-      --text: #f5f5f5;
-      --muted: #a3a3a3;
-      --accent: #4f8cff;
-      --danger: #ffb366;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      background:
-        radial-gradient(circle at top right, rgba(79,140,255,0.18), transparent 30%),
-        linear-gradient(180deg, #111214 0%, var(--bg) 100%);
-      color: var(--text);
-      font-family: "Avenir Next", "Segoe UI", sans-serif;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-    }}
-    .panel {{
-      width: min(560px, 100%);
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 28px;
-      padding: 32px;
-      box-shadow: 0 30px 90px rgba(0,0,0,0.35);
-    }}
-    .eyebrow {{
-      text-transform: uppercase;
-      letter-spacing: 0.14em;
-      font-size: 12px;
-      color: var(--accent);
-      font-weight: 700;
-      margin: 0 0 12px;
-    }}
-    h1 {{
-      margin: 0 0 12px;
-      font-size: clamp(30px, 5vw, 46px);
-      line-height: 0.98;
-    }}
-    p {{
-      color: var(--muted);
-      line-height: 1.6;
-    }}
-    form {{
-      margin-top: 24px;
-      display: grid;
-      gap: 12px;
-    }}
-    input {{
-      width: 100%;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: rgba(255,255,255,0.04);
-      color: var(--text);
-      padding: 14px 16px;
-      font-size: 16px;
-    }}
-    button {{
-      border: 0;
-      border-radius: 999px;
-      background: var(--accent);
-      color: white;
-      padding: 14px 18px;
-      font-weight: 700;
-      font-size: 16px;
-      cursor: pointer;
-    }}
-    .meta {{
-      margin-top: 18px;
-      padding: 14px 16px;
-      border-radius: 16px;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid var(--border);
-    }}
-    .error {{
-      color: var(--danger);
-      min-height: 1.4em;
-      font-size: 14px;
-    }}
-    code {{
-      font-family: "SFMono-Regular", "Menlo", monospace;
-      background: rgba(255,255,255,0.06);
-      padding: 2px 6px;
-      border-radius: 6px;
-    }}
-  </style>
-</head>
-<body>
-  <main class="panel">
-    <p class="eyebrow">Operator Bootstrap</p>
-    <h1>Authenticate to this hotel first.</h1>
-    <p>
-      This desktop membrane is reachable, but it will not reveal mesh state, hotel inventory,
-      or operator controls until the hotel issues a bounded operator session.
-    </p>
-    <form id="auth-form">
-      <input id="display-name" type="text" placeholder="Display name (optional)" autocomplete="name" />
-      <input id="bootstrap-token" type="password" placeholder="Bootstrap token" autocomplete="one-time-code" required />
-      <button type="submit">Start Operator Session</button>
-      <div class="error" id="auth-error" aria-live="polite"></div>
-    </form>
-    <section class="meta">
-      <p><strong>Hotel:</strong> <code>{hotel}</code></p>
-      <p><strong>Surface health:</strong> desktop membrane reachable</p>
-      <p><strong>Rule:</strong> no view before auth</p>
-    </section>
-  </main>
-  <script>
-    const form = document.getElementById('auth-form');
-    const error = document.getElementById('auth-error');
-    form.addEventListener('submit', async (event) => {{
-      event.preventDefault();
-      error.textContent = '';
-      const bootstrapToken = document.getElementById('bootstrap-token').value;
-      const displayName = document.getElementById('display-name').value.trim();
-      const response = await fetch('/api/auth/bootstrap', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{
-          bootstrap_token: bootstrapToken,
-          display_name: displayName || null
-        }})
-      }});
-      if (!response.ok) {{
-        let message = 'Login failed';
-        try {{
-          const body = await response.json();
-          message = body.error || message;
-        }} catch (_err) {{}}
-        error.textContent = message;
-        return;
-      }}
-      window.location.reload();
-    }});
-  </script>
-</body>
-</html>"#,
-        hotel = state.hotel
-    );
-
-    let mut response = (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response();
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(no_store_header_value()),
-    );
-    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
     );
     response
 }
