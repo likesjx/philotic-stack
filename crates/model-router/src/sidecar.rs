@@ -208,7 +208,10 @@ async fn synthesize(
         }
         Err(e) => {
             error!(err = %e, "Kokoro blocking task panicked");
-            (StatusCode::INTERNAL_SERVER_ERROR, "synthesis task panicked".to_string())
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "synthesis task panicked".to_string(),
+            )
                 .into_response()
         }
     }

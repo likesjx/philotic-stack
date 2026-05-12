@@ -150,9 +150,7 @@ pub struct ToolCallResult {
 impl ToolCallResult {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            content: vec![ToolContent::Text {
-                text: text.into(),
-            }],
+            content: vec![ToolContent::Text { text: text.into() }],
             is_error: None,
         }
     }

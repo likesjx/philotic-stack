@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-04-24
+last_updated: 2026-05-08
 tags:
 - source-of-truth
 - current-state
@@ -21,7 +21,9 @@ related_docs:
 - COMPUTER_USE_TASK_RUNNER_PROPOSAL.md
 - OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
 - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md
 - MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
+- HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md
 - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
 task_refs:
 - docs/task.md
@@ -73,6 +75,9 @@ Philotic currently operates as a hotel-centered runtime:
 - `phil` now owns the launchd service lifecycle surface for `aiua` on macOS through `phil service install`, `start`, `stop`, `restart`, `uninstall`, and `status`; interactive onboarding can optionally hand off to service install immediately after config generation and now captures the agent workspace/import path plus initial skillset for runner setup.
 - the primitives split is now implemented in repo truth: `philotic-primitives-mesh` owns envelope and node identity types, `philotic-primitives-hotel` owns hotel/runtime capability records, `philotic-primitives-data` owns generic graph/storage primitives, `philotic-primitives-agent` owns agent/session/memory primitives, `philotic-primitives-tool` owns tool/skill governance and tool runner route/config envelopes, and `philotic-primitives-model` owns model-routing DTOs while `ansible-mesh-core` remains a transitional compatibility shim for reexports and legacy module paths; `model-router` now owns the `model_manager` runtime wiring.
 - the hotel perimeter now has a first explicit mesh membership ceremony through `phil mesh invite` and `phil mesh accept`, with accepted peers persisted in the graph; this is still transitional trust because revocation, scoped authorization, and non-PSK hotel identity are not finished.
+- intended mesh transport boundaries are now explicit: UDP is the state-sync/control plane only, routed execution belongs on reliable point-to-point transport, WebRTC is an optional peer session plane after signaling, and mesh-shared graph sync is selective projected state rather than blind full-database replication.
+- operator-facing canonical hotel naming should converge on `mac-jane`, `mbp-jane`, and `vps-jane`; legacy runtime names such as local `default` and VPS `beacon-test-hotel` are explicit migration debt, and deploy paths should clean stale previous-name graph records instead of letting old hotel identities linger as undead peers.
+- the long-running desktop server direction is now explicit: `vps-jane` may host a durable operator ingress, but it should reveal only a hotel-auth bootstrap shell until a bounded operator session is issued.
 
 ## Implemented Foundations
 
@@ -94,6 +99,7 @@ Primary references:
 - session timeline/progress events persist through the IPC plane
 - approval policy, preapproval, and session status/bindings are included in session snapshots
 - approval interrupts and slash-command steering are implemented in the current agent loop
+- the desktop/operator event log should consume hotel-owned projected router traces and mesh events through `philotic-web`, rather than reading local runtime stores directly from the browser surface
 
 Primary references:
 - [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md)
@@ -210,11 +216,11 @@ These are the most clearly active seams as of 2026-03-13:
 | Domain | Status | Source of truth | Active work |
 | --- | --- | --- | --- |
 | Runtime and sessions | implemented, still evolving | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) and code in `aiua`, `philote`, `ansible-mesh-core` | session ownership semantics, compaction policy, bounded loop follow-through, and role context-shift semantics |
-| Membrane and transport | implemented, still evolving | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md), [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md), [DESKTOP_MEMBRANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_MEMBRANE_PROPOSAL.md), and [MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md) | delegated poll authority, desktop/operator membrane hardening, broader transport surfaces, and external membrane trust/edge-defense contracts |
+| Membrane and transport | implemented, still evolving | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md), [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md), [DESKTOP_MEMBRANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_MEMBRANE_PROPOSAL.md), [MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md), and [MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md) | delegated poll authority, desktop/operator membrane hardening, explicit UDP state-sync boundaries, broader transport surfaces, and external membrane trust/edge-defense contracts |
 | Mesh and placement | partially implemented | [INTER_HOTEL_ROUTING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/INTER_HOTEL_ROUTING_PROPOSAL.md), [MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md) | placement policy, trust boundaries, overlay evolution, and mesh-visible state classification |
 | Memory and context | partially implemented | [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md), [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md), and [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | typed context projection path is now smoke-green for the current cognitive request path through `philote` and `model-router`; the first typed `role_activation` object now flows into session/context projection, and next pressure is expanding role addendum/toolset/skillset and hook-backed refresh |
 | Tooling and execution | partially implemented | [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md) and [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | structured model envelope and initial `request_class` routing are now smoke-green for the current cognitive path; next pressure is broader structured failures, embedding support, and role-scoped toolsets |
-| Operator and control plane | proposed to early transitional | [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md), [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md) | elevation, admin workflows, perimeter trust and egress |
+| Operator and control plane | proposed to early transitional | [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md), [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md), [HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md) | elevation, hotel-owned operator identity, desktop auth, secure always-on operator desktop posture on `vps-jane`, perimeter trust, and egress |
 | Deployment and distribution | implemented boundary, incomplete rollout | [RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md) | real VPS smoke, secret handling hardening, artifact distribution |
 | Migration and parity | in planning | [OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md) | explicit parity matrix and migration-critical seams |
 

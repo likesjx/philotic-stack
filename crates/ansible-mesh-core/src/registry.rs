@@ -82,9 +82,15 @@ impl NodeRegistry {
     /// Returns true if the node is fresh AND has not reported degraded vitals.
     /// A node with no health data is considered healthy (old build / first boot).
     pub fn is_node_healthy(&self, node_id: &str) -> bool {
-        let Some(status) = self.nodes.get(node_id) else { return false };
-        if !Self::is_fresh(status) { return false; }
-        let Some(ref h) = status.node_health else { return true };
+        let Some(status) = self.nodes.get(node_id) else {
+            return false;
+        };
+        if !Self::is_fresh(status) {
+            return false;
+        }
+        let Some(ref h) = status.node_health else {
+            return true;
+        };
         h.disk_free_pct.map_or(true, |v| v > 10.0)
             && h.mem_free_pct.map_or(true, |v| v > 5.0)
             && h.load_avg_1m.map_or(true, |v| v < 16.0)

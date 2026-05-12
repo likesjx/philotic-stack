@@ -20,6 +20,7 @@
 //!   GET  /api/mesh/targets/:target_node_id/guests
 //!   GET  /api/mesh/targets/:target_node_id/agents
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
+//!   GET  /api/event-log
 //!   GET  /api/config
 //!   GET  /api/config/telegram
 //!   GET  /api/config/gemini
@@ -50,7 +51,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
@@ -221,6 +222,24 @@ struct DeleteComponentBody {
     confirm_guest_id: String,
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct EventLogQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+struct EventLogEntry {
+    id: String,
+    timestamp: u64,
+    source: String,
+    event_type: String,
+    summary: String,
+    details: Value,
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -327,6 +346,7 @@ pub async fn run(
         .route("/api/secrets", get(handle_secrets))
         .route("/api/secrets/rotate", post(handle_secret_rotate))
         .route("/api/vault", post(handle_vault_add))
+        .route("/api/event-log", get(handle_event_log))
         .route("/api/config/:key", put(handle_config_put))
         .route(
             "/api/agents/:agent_id/roles/:role_name/skills",
@@ -1183,6 +1203,28 @@ async fn handle_mesh_target_agent_chat(
     (StatusCode::ACCEPTED, Json(json!(accepted))).into_response()
 }
 
+// ── GET /api/event-log ────────────────────────────────────────────────────────
+
+async fn handle_event_log(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<EventLogQuery>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    match query_event_log(&state.db_path, limit, query.source.as_deref()) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn stream_operator_chat_turn(
     socket: String,
     tx: broadcast::Sender<String>,
@@ -1413,6 +1455,175 @@ fn query_apartment(db_path: &PathBuf, agent_id: &str) -> Result<Option<Value>> {
     }
 
     Ok(Some(Value::Object(result)))
+}
+
+fn query_event_log(
+    db_path: &PathBuf,
+    limit: usize,
+    source_filter: Option<&str>,
+) -> Result<Vec<EventLogEntry>> {
+    let normalized_source = source_filter.map(|value| value.trim().to_ascii_lowercase());
+    let router_limit = limit.max(20);
+    let mesh_limit = limit.max(20);
+    let mut entries = Vec::new();
+
+    if normalized_source
+        .as_deref()
+        .map(|value| value == "router")
+        .unwrap_or(true)
+    {
+        let router_path = router_trace_path(db_path);
+        entries.extend(query_router_event_log(&router_path, router_limit)?);
+    }
+
+    if normalized_source
+        .as_deref()
+        .map(|value| value == "mesh")
+        .unwrap_or(true)
+    {
+        entries.extend(query_mesh_event_log(db_path, mesh_limit)?);
+    }
+
+    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.id.cmp(&b.id)));
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+fn router_trace_path(db_path: &PathBuf) -> PathBuf {
+    db_path
+        .parent()
+        .map(|dir| dir.join("router_traces.db"))
+        .unwrap_or_else(|| PathBuf::from("router_traces.db"))
+}
+
+fn query_router_event_log(path: &PathBuf, limit: usize) -> Result<Vec<EventLogEntry>> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT trace_id, agent_id, session_id, turn_id, provider_id, model_id,
+                task_kind, outcome, failure_code, latency_ms, token_count, timestamp
+         FROM router_traces ORDER BY timestamp DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        let trace_id: String = row.get(0)?;
+        let agent_id: String = row.get(1)?;
+        let session_id: String = row.get(2)?;
+        let turn_id: String = row.get(3)?;
+        let provider_id: String = row.get(4)?;
+        let model_id: Option<String> = row.get(5)?;
+        let task_kind: String = row.get(6)?;
+        let outcome: String = row.get(7)?;
+        let failure_code: Option<String> = row.get(8)?;
+        let latency_ms: Option<i64> = row.get(9)?;
+        let token_count: Option<i64> = row.get(10)?;
+        let timestamp: i64 = row.get(11)?;
+        Ok(EventLogEntry {
+            id: trace_id,
+            timestamp: timestamp as u64,
+            source: "router".into(),
+            event_type: format!("router.{outcome}"),
+            summary: summarize_router_event(
+                &task_kind,
+                &provider_id,
+                &outcome,
+                failure_code.as_deref(),
+            ),
+            details: json!({
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "task_kind": task_kind,
+                "outcome": outcome,
+                "failure_code": failure_code,
+                "latency_ms": latency_ms.map(|value| value as u64),
+                "token_count": token_count.map(|value| value as u64),
+            }),
+        })
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+fn query_mesh_event_log(path: &PathBuf, limit: usize) -> Result<Vec<EventLogEntry>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT event_id, source_node_id, target_node_id, source_agent_id, target_agent_id,
+                kind, corr_id, attempt, created_at, expires_at, payload_type, payload_json
+         FROM mesh_events ORDER BY created_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        let event_id: String = row.get(0)?;
+        let source_node_id: String = row.get(1)?;
+        let target_node_id: Option<String> = row.get(2)?;
+        let source_agent_id: String = row.get(3)?;
+        let target_agent_id: Option<String> = row.get(4)?;
+        let kind: String = row.get(5)?;
+        let corr_id: String = row.get(6)?;
+        let attempt: i64 = row.get(7)?;
+        let created_at: i64 = row.get(8)?;
+        let expires_at: Option<i64> = row.get(9)?;
+        let payload_type: String = row.get(10)?;
+        let payload_json: String = row.get(11)?;
+        let parsed_payload =
+            serde_json::from_str::<Value>(&payload_json).unwrap_or(Value::String(payload_json));
+        Ok(EventLogEntry {
+            id: event_id,
+            timestamp: created_at as u64,
+            source: "mesh".into(),
+            event_type: format!("mesh.{kind}"),
+            summary: summarize_mesh_event(&kind, &source_node_id, target_node_id.as_deref()),
+            details: json!({
+                "source_node_id": source_node_id,
+                "target_node_id": target_node_id,
+                "source_agent_id": source_agent_id,
+                "target_agent_id": target_agent_id,
+                "kind": kind,
+                "corr_id": corr_id,
+                "attempt": attempt as u64,
+                "expires_at": expires_at.map(|value| value as u64),
+                "payload_type": payload_type,
+                "payload": parsed_payload,
+            }),
+        })
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+fn summarize_router_event(
+    task_kind: &str,
+    provider_id: &str,
+    outcome: &str,
+    failure_code: Option<&str>,
+) -> String {
+    match (outcome, failure_code) {
+        ("failure", Some(code)) if !code.is_empty() => {
+            format!("{task_kind} via {provider_id} failed ({code})")
+        }
+        ("failure", _) => format!("{task_kind} via {provider_id} failed"),
+        ("tool_call", _) => format!("{task_kind} via {provider_id} requested tool call"),
+        _ => format!("{task_kind} via {provider_id} {outcome}"),
+    }
+}
+
+fn summarize_mesh_event(kind: &str, source_node_id: &str, target_node_id: Option<&str>) -> String {
+    match target_node_id {
+        Some(target) if !target.is_empty() => format!("{kind} {source_node_id} -> {target}"),
+        _ => format!("{kind} from {source_node_id}"),
+    }
 }
 
 // ── POST /api/guests/:guest_id/restart ────────────────────────────────────────
@@ -2230,10 +2441,7 @@ async fn handle_agent_patch(
 
 // ── GET /api/user-profile ─────────────────────────────────────────────────────
 
-async fn handle_user_profile_get(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-) -> Response {
+async fn handle_user_profile_get(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
@@ -2267,8 +2475,7 @@ async fn handle_user_profile_patch(
         return unauthorized();
     }
     let hotel_name = state.hotel.as_ref().clone();
-    match ipc_patch_user_profile(&state.socket, &hotel_name, body.timezone, body.display_name)
-        .await
+    match ipc_patch_user_profile(&state.socket, &hotel_name, body.timezone, body.display_name).await
     {
         Ok(profile) => {
             let event = json!({ "type": "user_profile:updated" });
@@ -2291,7 +2498,9 @@ async fn ipc_get_user_profile(socket: &str, hotel_name: &str) -> Result<Value> {
         })
         .await?
     {
-        IpcResponse::UserProfileData(p) => Ok(json!({ "timezone": p.timezone, "display_name": p.display_name })),
+        IpcResponse::UserProfileData(p) => {
+            Ok(json!({ "timezone": p.timezone, "display_name": p.display_name }))
+        }
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected get_user_profile response: {other:?}")),
     }
@@ -2312,7 +2521,9 @@ async fn ipc_patch_user_profile(
         })
         .await?
     {
-        IpcResponse::UserProfileData(p) => Ok(json!({ "timezone": p.timezone, "display_name": p.display_name })),
+        IpcResponse::UserProfileData(p) => {
+            Ok(json!({ "timezone": p.timezone, "display_name": p.display_name }))
+        }
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected patch_user_profile response: {other:?}")),
     }
@@ -3891,4 +4102,94 @@ fn read_hotel_name(config_path: &PathBuf) -> String {
                 .and_then(|m| m.keys().next().cloned())
         })
         .unwrap_or_else(|| "default".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("philotic-web-{name}-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn summarize_router_event_includes_failure_code() {
+        assert_eq!(
+            summarize_router_event("text.generate", "gemini", "failure", Some("RATE_LIMIT")),
+            "text.generate via gemini failed (RATE_LIMIT)"
+        );
+    }
+
+    #[test]
+    fn query_event_log_merges_router_and_mesh_entries_newest_first() {
+        let context_path = temp_db_path("context");
+        let router_path = context_path.parent().unwrap().join("router_traces.db");
+
+        {
+            let conn = Connection::open(&context_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE mesh_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    source_node_id TEXT NOT NULL,
+                    target_node_id TEXT,
+                    source_agent_id TEXT NOT NULL,
+                    target_agent_id TEXT,
+                    kind TEXT NOT NULL,
+                    corr_id TEXT NOT NULL,
+                    attempt INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    payload_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    trace_json TEXT NOT NULL
+                );
+                INSERT INTO mesh_events
+                    (event_id, source_node_id, target_node_id, source_agent_id, target_agent_id, kind, corr_id, attempt, created_at, expires_at, payload_type, payload_json, trace_json)
+                VALUES
+                    ('mesh-1', 'mac-jane-aiua-01', 'mbp-jane-aiua-01', 'agent-jane-01', 'agent-aria-01', 'session.handoff', 'corr-1', 0, 100, NULL, 'json', '{\"state\":\"ok\"}', '{}');
+                ",
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&router_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE router_traces (
+                    trace_id     TEXT PRIMARY KEY,
+                    agent_id     TEXT NOT NULL,
+                    session_id   TEXT NOT NULL DEFAULT '',
+                    turn_id      TEXT NOT NULL DEFAULT '',
+                    provider_id  TEXT NOT NULL,
+                    model_id     TEXT,
+                    task_kind    TEXT NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    failure_code TEXT,
+                    latency_ms   INTEGER,
+                    token_count  INTEGER,
+                    timestamp    INTEGER NOT NULL
+                );
+                INSERT INTO router_traces
+                    (trace_id, agent_id, session_id, turn_id, provider_id, model_id, task_kind, outcome, failure_code, latency_ms, token_count, timestamp)
+                VALUES
+                    ('trace-1', 'agent-jane-01', 'session-1', 'turn-1', 'gemini', 'gemini-flash', 'text.generate', 'success', NULL, 42, 77, 200);
+                ",
+            )
+            .unwrap();
+        }
+
+        let entries = query_event_log(&context_path, 10, None).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "trace-1");
+        assert_eq!(entries[0].source, "router");
+        assert_eq!(entries[1].id, "mesh-1");
+        assert_eq!(entries[1].source, "mesh");
+
+        let _ = fs::remove_file(&context_path);
+        let _ = fs::remove_file(&router_path);
+    }
 }

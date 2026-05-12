@@ -1,6 +1,9 @@
 ---
-# jane-vps — beacon-test-hotel
-philotic_hotel_name: "beacon-test-hotel"
+# jane-vps — canonical hotel name
+philotic_hotel_name: "vps-jane"
+philotic_hotel_canonical_name: "vps-jane"
+philotic_hotel_previous_names:
+  - "beacon-test-hotel"
 philotic_default_model: "gemini-flash-latest"
 philotic_repo_branch: "codex/hegemon-membrane-slice"
 
@@ -36,11 +39,16 @@ philotic_artifacts_dir: "/opt/philotic/src/target/release"
 
 # Mesh
 philotic_backbone_peers:
-  - name: "default"
+  - name: "mac-jane"
     host: "100.64.230.106"
     beacon_port: 24849
     blob_port: 24850
     execution_port: 24851
+  - name: "local-telegram"
+    host: "100.64.230.106"
+    beacon_port: 16370
+    blob_port: 16370
+    execution_port: 16371
   - name: "mbp-jane"
     host: "100.79.239.64"
     beacon_port: 13104

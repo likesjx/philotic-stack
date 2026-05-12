@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use std::fs;
 use std::path::PathBuf;

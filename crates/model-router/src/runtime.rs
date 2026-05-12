@@ -79,7 +79,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     // Open the router training-tap trace store (always-on; path from env or default).
     let trace_store: Option<Arc<dyn RouterTraceStorage>> = {
         let path = std::env::var("PHILOTIC_ROUTER_TRACE_DB").unwrap_or_else(|_| {
-            let profile = std::env::var("PHILOTIC_PROFILE").unwrap_or_else(|_| "default".to_string());
+            let profile =
+                std::env::var("PHILOTIC_PROFILE").unwrap_or_else(|_| "default".to_string());
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             format!("{home}/.philotic/{profile}/router_traces.db")
         });
@@ -286,14 +287,24 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     let provider = match providers.resolve(&controller_task) {
                         Ok(provider) => provider,
                         Err(err) => {
-                            // This controller has no provider for this task kind. Skip silently —
-                            // another controller on the same role inbox may support it.
-                            info!(
-                                "Controller [{}] skipping {} task: {}",
+                            // No provider for this task kind. Emit an immediate failure so the
+                            // session is not left hanging waiting for a response that will never
+                            // come. If multiple controllers share the role inbox, the philote will
+                            // take the first successful response and ignore subsequent failures.
+                            warn!(
+                                "Controller [{}] has no provider for {} task — emitting failure: {}",
                                 config.guest_id,
                                 controller_task.kind.as_str(),
                                 err
                             );
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                None,
+                                format!("no_provider: {}", err),
+                            )
+                            .await?;
                             continue;
                         }
                     };
@@ -312,8 +323,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     // background task that forwards tokens to philote via EmitTask.
                     // The main await still receives the final ProviderOutput.
                     let provider_result = if provider.supports_streaming(&controller_task) {
-                        let (token_tx, mut token_rx) =
-                            tokio::sync::mpsc::channel::<String>(128);
+                        let (token_tx, mut token_rx) = tokio::sync::mpsc::channel::<String>(128);
 
                         // Connect the stream IPC client BEFORE starting the SSE fetch so
                         // the forwarding task is ready to drain tokens the moment they
@@ -405,8 +415,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             // After a successful AudioTranscribe, fire a capture
                             // envelope to role=router-listener (if enabled).
                             if controller_task.kind == TaskKind::AudioTranscribe {
-                                if let ProviderOutput::Text { ref content, ref model_gen, .. } = output {
-                                    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref() == Ok("true") {
+                                if let ProviderOutput::Text {
+                                    ref content,
+                                    ref model_gen,
+                                    ..
+                                } = output
+                                {
+                                    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref()
+                                        == Ok("true")
+                                    {
                                         let blob_url = controller_task
                                             .media_attachments()
                                             .first()
@@ -433,7 +450,9 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                             supported_tools: Vec::new(),
                                         };
                                         tokio::spawn(async move {
-                                            if let Ok(mut fanout_ipc) = PhiloticClient::connect(fanout_identity).await {
+                                            if let Ok(mut fanout_ipc) =
+                                                PhiloticClient::connect(fanout_identity).await
+                                            {
                                                 let _ = fanout_ipc
                                                     .send_request(IpcRequest::EmitTask {
                                                         target_node: local_node_id(),

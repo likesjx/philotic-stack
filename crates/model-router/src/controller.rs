@@ -594,12 +594,14 @@ impl ControllerTask {
             return ResponseRouteBucket::RealtimeWebsocket;
         }
 
-        if matches!(self.provider_option_str("response_mode"), Some("native_audio"))
-            || self
-                .response_contract
-                .modalities
-                .iter()
-                .any(|modality| modality == "audio")
+        if matches!(
+            self.provider_option_str("response_mode"),
+            Some("native_audio")
+        ) || self
+            .response_contract
+            .modalities
+            .iter()
+            .any(|modality| modality == "audio")
         {
             return ResponseRouteBucket::AudioMultimodal;
         }
@@ -1437,10 +1439,16 @@ impl ProviderConfigs {
             .await?,
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
-            ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL")
-                .or(fetch_config_string(ipc_client, "ollama_base_url").await?),
-            ollama_model: env_override("PHILOTIC_OLLAMA_MODEL")
-                .or(fetch_config_string(ipc_client, "ollama_model").await?),
+            ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL").or(fetch_config_string(
+                ipc_client,
+                "ollama_base_url",
+            )
+            .await?),
+            ollama_model: env_override("PHILOTIC_OLLAMA_MODEL").or(fetch_config_string(
+                ipc_client,
+                "ollama_model",
+            )
+            .await?),
             openai_oauth_access_token: load_env_or_config_secret_string(
                 ipc_client,
                 "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
@@ -1455,10 +1463,16 @@ impl ProviderConfigs {
                 "openai_api_key_ref",
             )
             .await?,
-            openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL")
-                .or(fetch_config_string(ipc_client, "openai_base_url").await?),
-            openai_project_id: env_override("PHILOTIC_OPENAI_PROJECT_ID")
-                .or(fetch_config_string(ipc_client, "openai_project_id").await?),
+            openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL").or(fetch_config_string(
+                ipc_client,
+                "openai_base_url",
+            )
+            .await?),
+            openai_project_id: env_override("PHILOTIC_OPENAI_PROJECT_ID").or(fetch_config_string(
+                ipc_client,
+                "openai_project_id",
+            )
+            .await?),
             openai_default_model: env_override("PHILOTIC_OPENAI_DEFAULT_MODEL")
                 .or(fetch_config_string(ipc_client, "openai_default_model").await?),
             openai_default_embedding_model: env_override("PHILOTIC_OPENAI_DEFAULT_EMBEDDING_MODEL")

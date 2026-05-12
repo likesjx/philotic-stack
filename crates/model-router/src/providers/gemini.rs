@@ -1428,10 +1428,8 @@ impl ModelProvider for GeminiProvider {
         let has_tools = !task.tools.is_empty();
         let wants_concept = task.wants_channel("memory_concept");
         let wants_plan = task.wants_channel("active_plan");
-        let use_structured = has_tools
-            || task.wants_channel("spoken_text")
-            || wants_concept
-            || wants_plan;
+        let use_structured =
+            has_tools || task.wants_channel("spoken_text") || wants_concept || wants_plan;
 
         let payload = {
             let prompt = task

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
 use rusqlite::{Connection, types::ValueRef};
@@ -68,10 +68,9 @@ impl DatasourceProvider for SqliteTableProvider {
 // ── table.configure ──────────────────────────────────────────────────────────
 
 fn configure_table(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutput> {
-    let ddl = task
-        .query
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("table.configure requires query field with CREATE TABLE SQL"))?;
+    let ddl = task.query.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("table.configure requires query field with CREATE TABLE SQL")
+    })?;
 
     if !ddl.trim_start().to_uppercase().starts_with("CREATE TABLE") {
         bail!("table.configure query must be a CREATE TABLE statement");
@@ -97,11 +96,7 @@ fn query_table(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
         .unwrap_or(200) as usize;
 
     let mut stmt = conn.prepare(sql)?;
-    let col_names: Vec<String> = stmt
-        .column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
 
     // Build owned boxed params from task.parameters (skip "limit" — that's our meta key).
     let owned_params: Vec<Box<dyn rusqlite::types::ToSql>> = task
@@ -245,18 +240,14 @@ fn table_stats(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
         .unwrap_or("timestamp");
     validate_identifier(ts_col)?;
 
-    let count: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM {table}"),
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
 
     let latest: Option<i64> = conn
-        .query_row(
-            &format!("SELECT MAX({ts_col}) FROM {table}"),
-            [],
-            |row| row.get(0),
-        )
+        .query_row(&format!("SELECT MAX({ts_col}) FROM {table}"), [], |row| {
+            row.get(0)
+        })
         .ok();
 
     Ok(ProviderOutput::ResultSet(json!({
@@ -275,13 +266,17 @@ fn table_schema(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutp
         .ok_or_else(|| anyhow::anyhow!("table.schema requires graph_id (table name)"))?;
     validate_identifier(table)?;
 
-    let sql: String = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
-        rusqlite::params![table],
-        |row| row.get(0),
-    ).map_err(|_| anyhow::anyhow!("table '{table}' not found"))?;
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            rusqlite::params![table],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("table '{table}' not found"))?;
 
-    Ok(ProviderOutput::ResultSet(json!({ "table": table, "schema_sql": sql })))
+    Ok(ProviderOutput::ResultSet(
+        json!({ "table": table, "schema_sql": sql }),
+    ))
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -338,7 +333,12 @@ mod tests {
         (p, f)
     }
 
-    fn make_task(kind: &str, graph_id: Option<&str>, query: Option<&str>, params: Value) -> DatasourceTask {
+    fn make_task(
+        kind: &str,
+        graph_id: Option<&str>,
+        query: Option<&str>,
+        params: Value,
+    ) -> DatasourceTask {
         DatasourceTask {
             kind: datasource::controller::TaskKind::Custom(kind.to_string()),
             provider: Some("table".to_string()),
@@ -365,23 +365,32 @@ mod tests {
             Some("signals"),
             None,
             json!({"provider": "gemini", "latency_ms": 120, "timestamp": 1_000_000}),
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
         p.invoke(&make_task(
             "table.insert",
             Some("signals"),
             None,
             json!({"provider": "ollama", "latency_ms": 45, "timestamp": 1_000_001}),
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
-        let out = p.invoke(&make_task(
-            "table.query",
-            None,
-            Some("SELECT provider, latency_ms FROM signals ORDER BY timestamp ASC"),
-            json!({}),
-        )).await.unwrap();
+        let out = p
+            .invoke(&make_task(
+                "table.query",
+                None,
+                Some("SELECT provider, latency_ms FROM signals ORDER BY timestamp ASC"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
 
-        let ProviderOutput::ResultSet(Value::Array(rows)) = out else { panic!("expected ResultSet") };
+        let ProviderOutput::ResultSet(Value::Array(rows)) = out else {
+            panic!("expected ResultSet")
+        };
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["provider"], "gemini");
         assert_eq!(rows[1]["provider"], "ollama");
@@ -404,7 +413,9 @@ mod tests {
                 Some("events"),
                 None,
                 json!({"ts": i, "val": format!("row-{i}")}),
-            )).await.unwrap();
+            ))
+            .await
+            .unwrap();
         }
 
         p.invoke(&make_task(
@@ -412,29 +423,58 @@ mod tests {
             Some("events"),
             None,
             json!({"max_rows": 5, "ts_column": "ts"}),
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
-        let out = p.invoke(&make_task(
-            "table.stats",
-            Some("events"),
-            None,
-            json!({"ts_column": "ts"}),
-        )).await.unwrap();
+        let out = p
+            .invoke(&make_task(
+                "table.stats",
+                Some("events"),
+                None,
+                json!({"ts_column": "ts"}),
+            ))
+            .await
+            .unwrap();
 
-        let ProviderOutput::ResultSet(stats) = out else { panic!() };
+        let ProviderOutput::ResultSet(stats) = out else {
+            panic!()
+        };
         assert_eq!(stats["row_count"], 5);
     }
 
     #[tokio::test]
     async fn stats_returns_count_and_latest_ts() {
         let (p, _f) = open_tmp();
-        p.invoke(&make_task("table.configure", None, Some(
-            "CREATE TABLE IF NOT EXISTS t (ts INTEGER NOT NULL)"
-        ), json!({}))).await.unwrap();
-        p.invoke(&make_task("table.insert", Some("t"), None, json!({"ts": 999}))).await.unwrap();
+        p.invoke(&make_task(
+            "table.configure",
+            None,
+            Some("CREATE TABLE IF NOT EXISTS t (ts INTEGER NOT NULL)"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+        p.invoke(&make_task(
+            "table.insert",
+            Some("t"),
+            None,
+            json!({"ts": 999}),
+        ))
+        .await
+        .unwrap();
 
-        let out = p.invoke(&make_task("table.stats", Some("t"), None, json!({"ts_column":"ts"}))).await.unwrap();
-        let ProviderOutput::ResultSet(s) = out else { panic!() };
+        let out = p
+            .invoke(&make_task(
+                "table.stats",
+                Some("t"),
+                None,
+                json!({"ts_column":"ts"}),
+            ))
+            .await
+            .unwrap();
+        let ProviderOutput::ResultSet(s) = out else {
+            panic!()
+        };
         assert_eq!(s["row_count"], 1);
         assert_eq!(s["latest_ts"], 999);
     }
@@ -442,24 +482,36 @@ mod tests {
     #[tokio::test]
     async fn schema_returns_ddl() {
         let (p, _f) = open_tmp();
-        p.invoke(&make_task("table.configure", None, Some(
-            "CREATE TABLE IF NOT EXISTS meta (id TEXT PRIMARY KEY, val TEXT)"
-        ), json!({}))).await.unwrap();
+        p.invoke(&make_task(
+            "table.configure",
+            None,
+            Some("CREATE TABLE IF NOT EXISTS meta (id TEXT PRIMARY KEY, val TEXT)"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
 
-        let out = p.invoke(&make_task("table.schema", Some("meta"), None, json!({}))).await.unwrap();
-        let ProviderOutput::ResultSet(s) = out else { panic!() };
+        let out = p
+            .invoke(&make_task("table.schema", Some("meta"), None, json!({})))
+            .await
+            .unwrap();
+        let ProviderOutput::ResultSet(s) = out else {
+            panic!()
+        };
         assert!(s["schema_sql"].as_str().unwrap().contains("CREATE TABLE"));
     }
 
     #[tokio::test]
     async fn rejects_invalid_identifier() {
         let (p, _f) = open_tmp();
-        let result = p.invoke(&make_task(
-            "table.rolloff",
-            Some("bad\"table"),
-            None,
-            json!({"max_rows": 1}),
-        )).await;
+        let result = p
+            .invoke(&make_task(
+                "table.rolloff",
+                Some("bad\"table"),
+                None,
+                json!({"max_rows": 1}),
+            ))
+            .await;
         assert!(result.is_err());
     }
 }

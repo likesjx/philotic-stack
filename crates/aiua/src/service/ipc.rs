@@ -853,8 +853,7 @@ pub(crate) struct ParkedInboundTask {
     activate_session_id: Option<String>,
 }
 
-pub(crate) type ParkedInboundRegistry =
-    Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
+pub(crate) type ParkedInboundRegistry = Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRouteResolution {
@@ -2385,7 +2384,9 @@ impl IpcServer {
         registry: Arc<RwLock<NodeRegistry>>,
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
-        training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
+        training_storage: Option<
+            Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        >,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
         socket_path: String,
@@ -2454,7 +2455,11 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
                     }
-                    Ok(IpcRequest::ListTrainingSamples { agent_id, limit, filter }) => {
+                    Ok(IpcRequest::ListTrainingSamples {
+                        agent_id,
+                        limit,
+                        filter,
+                    }) => {
                         let resp = Self::handle_list_training_samples(
                             training_storage.as_deref(),
                             agent_id.as_deref(),
@@ -2463,7 +2468,10 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(resp);
                     }
-                    Ok(IpcRequest::CorrectTrainingSample { turn_id, corrected_transcript }) => {
+                    Ok(IpcRequest::CorrectTrainingSample {
+                        turn_id,
+                        corrected_transcript,
+                    }) => {
                         let resp = Self::handle_correct_training_sample(
                             training_storage.as_deref(),
                             &turn_id,
@@ -2471,7 +2479,11 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(resp);
                     }
-                    Ok(IpcRequest::ExportTrainingSamples { format, output_path, limit }) => {
+                    Ok(IpcRequest::ExportTrainingSamples {
+                        format,
+                        output_path,
+                        limit,
+                    }) => {
                         let resp = Self::handle_export_training_samples(
                             training_storage.as_deref(),
                             &format,
@@ -2487,7 +2499,11 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(resp);
                     }
-                    Ok(IpcRequest::AsrSetup { python_path, model_name, auto_install }) => {
+                    Ok(IpcRequest::AsrSetup {
+                        python_path,
+                        model_name,
+                        auto_install,
+                    }) => {
                         let graph_clone = Arc::clone(&graph);
                         let local_node_id_clone = local_node_id.clone();
                         let socket_path_clone = socket_path.clone();
@@ -2511,10 +2527,7 @@ impl IpcServer {
                         let graph_clone = Arc::clone(&graph);
                         let local_node_id_clone = local_node_id.clone();
                         let resp = tokio::task::spawn_blocking(move || {
-                            Self::handle_asr_status(
-                                &graph_clone,
-                                &local_node_id_clone,
-                            )
+                            Self::handle_asr_status(&graph_clone, &local_node_id_clone)
                         })
                         .await
                         .unwrap_or_else(|e| {
@@ -4061,9 +4074,7 @@ impl IpcServer {
             .await
             {
                 Ok(data) => IpcResponse::success("mesh_invite", Some(data)),
-                Err(err) => {
-                    IpcResponse::error("mesh_invite", "MESH_INVITE_ERROR", err.to_string())
-                }
+                Err(err) => IpcResponse::error("mesh_invite", "MESH_INVITE_ERROR", err.to_string()),
             },
             IpcRequest::AcceptMeshInvite {
                 hotel_name,
@@ -4079,9 +4090,7 @@ impl IpcServer {
             .await
             {
                 Ok(data) => IpcResponse::success("mesh_accept", Some(data)),
-                Err(err) => {
-                    IpcResponse::error("mesh_accept", "MESH_ACCEPT_ERROR", err.to_string())
-                }
+                Err(err) => IpcResponse::error("mesh_accept", "MESH_ACCEPT_ERROR", err.to_string()),
             },
             IpcRequest::PublishMessage {
                 target_role,
@@ -6372,14 +6381,18 @@ impl IpcServer {
             }
             IpcRequest::GetUserProfile { hotel_name } => {
                 match graph.get_user_profile(&hotel_name) {
-                    Ok(Some(p)) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
-                        timezone: p.timezone,
-                        display_name: p.display_name,
-                    }),
-                    Ok(None) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
-                        timezone: None,
-                        display_name: None,
-                    }),
+                    Ok(Some(p)) => {
+                        IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                            timezone: p.timezone,
+                            display_name: p.display_name,
+                        })
+                    }
+                    Ok(None) => {
+                        IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                            timezone: None,
+                            display_name: None,
+                        })
+                    }
                     Err(e) => IpcResponse::error(
                         "get_user_profile",
                         "GET_USER_PROFILE_ERROR",
@@ -6407,10 +6420,12 @@ impl IpcServer {
                     display_name: display_name.or(existing.display_name),
                 };
                 match graph.upsert_user_profile(&hotel_name, &updated) {
-                    Ok(()) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
-                        timezone: updated.timezone,
-                        display_name: updated.display_name,
-                    }),
+                    Ok(()) => {
+                        IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                            timezone: updated.timezone,
+                            display_name: updated.display_name,
+                        })
+                    }
                     Err(e) => IpcResponse::error(
                         "patch_user_profile",
                         "PATCH_USER_PROFILE_ERROR",
@@ -7250,7 +7265,10 @@ impl IpcServer {
                     active_jobs: 0,
                     queue_depth: 0,
                 };
-                registry.write().await.update_node(caps, vec![ad], None, None);
+                registry
+                    .write()
+                    .await
+                    .update_node(caps, vec![ad], None, None);
                 if let Some(path) = socket_path {
                     peer_sockets.write().await.insert(node_id, path);
                 }
@@ -7578,10 +7596,7 @@ impl IpcServer {
                         let all_lines: Vec<&str> = content.lines().collect();
                         let start = all_lines.len().saturating_sub(lines as usize);
                         let tail = all_lines[start..].join("\n");
-                        IpcResponse::success(
-                            "hotel_logs",
-                            Some(serde_json::json!({ "log": tail })),
-                        )
+                        IpcResponse::success("hotel_logs", Some(serde_json::json!({ "log": tail })))
                     }
                     None => IpcResponse::error(
                         "hotel_logs",
@@ -7592,7 +7607,6 @@ impl IpcServer {
             }
 
             // ── MCP membrane lease ─────────────────────────────────────────
-
             IpcRequest::AcquireMcpMembraneLease { lease_key, port } => {
                 let Some(identity) = current_identity.as_ref() else {
                     return IpcResponse::error(
@@ -7648,7 +7662,10 @@ impl IpcServer {
                 }
             }
 
-            IpcRequest::RenewMcpMembraneLease { lease_key, lease_epoch } => {
+            IpcRequest::RenewMcpMembraneLease {
+                lease_key,
+                lease_epoch,
+            } => {
                 let mut guard = mcp_membrane_leases.lock().await;
                 let mut observer = LoggingMcpMembraneLeaseObserver;
                 match guard.renew(
@@ -7678,7 +7695,6 @@ impl IpcServer {
             }
 
             // ── MCP route table management ────────────────────────────────
-
             IpcRequest::UpdateMcpRoutes { agent_id, routes } => {
                 let route_count = routes.len();
                 // Serialize and push to any active MCP membrane subscriber.
@@ -7725,7 +7741,6 @@ impl IpcServer {
             }
 
             // ── MCP endpoint provisioning ──────────────────────────────────
-
             IpcRequest::ProvisionMcpEndpoint { config } => {
                 let endpoint_id = config.endpoint_id.clone();
                 let port = config.port;
@@ -7746,11 +7761,7 @@ impl IpcServer {
                 };
 
                 if let Err(e) = graph.set_config_value(&config_key, &config_json) {
-                    return IpcResponse::error(
-                        "mcp_endpoint",
-                        "CONFIG_STORE_ERROR",
-                        e.to_string(),
-                    );
+                    return IpcResponse::error("mcp_endpoint", "CONFIG_STORE_ERROR", e.to_string());
                 }
 
                 // Persist pre-approval rules separately for fast lookup.
@@ -7818,16 +7829,18 @@ impl IpcServer {
                         return IpcResponse::error(
                             "mcp_endpoint",
                             "FORBIDDEN",
-                            format!(
-                                "endpoint {endpoint_id} is not owned by {owner_agent_id}"
-                            ),
+                            format!("endpoint {endpoint_id} is not owned by {owner_agent_id}"),
                         );
                     }
                 }
 
                 // Read port before clearing (needed for response).
                 let port = serde_json::from_str::<serde_json::Value>(
-                    &graph.get_config_value(&config_key).ok().flatten().unwrap_or_default(),
+                    &graph
+                        .get_config_value(&config_key)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
                 )
                 .ok()
                 .and_then(|v| v["port"].as_u64())
@@ -7835,10 +7848,8 @@ impl IpcServer {
 
                 // Clear stored state.
                 let _ = graph.set_config_value(&config_key, "null");
-                let _ = graph.set_config_value(
-                    &format!("__mcp_preapproval__:{endpoint_id}"),
-                    "null",
-                );
+                let _ =
+                    graph.set_config_value(&format!("__mcp_preapproval__:{endpoint_id}"), "null");
 
                 // Signal the membrane-mcp guest to shut down.
                 let guest_id = format!("mcp-membrane-{endpoint_id}");
@@ -8199,8 +8210,9 @@ impl IpcServer {
     }
 
     fn local_hotel_record(graph: &GraphDomain, local_node_id: &str) -> anyhow::Result<HotelRecord> {
-        let hotel_name = Self::local_hotel_name(graph, local_node_id)
-            .ok_or_else(|| anyhow::anyhow!("local hotel record missing for node [{local_node_id}]"))?;
+        let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
         graph
             .get_hotel(&hotel_name)?
             .ok_or_else(|| anyhow::anyhow!("hotel record missing for hotel [{hotel_name}]"))
@@ -9772,10 +9784,9 @@ impl IpcServer {
 
         // Upsert role_record into local graph so ensure_role_materialized can find it.
         if let Some(role_val) = payload.get("role_record") {
-            if let Ok(mut role_record) =
-                serde_json::from_value::<ansible_mesh_core::graph::RoleIncarnationRecord>(
-                    role_val.clone(),
-                )
+            if let Ok(mut role_record) = serde_json::from_value::<
+                ansible_mesh_core::graph::RoleIncarnationRecord,
+            >(role_val.clone())
             {
                 // Clear readiness — the remote hotel owns that state, not us.
                 role_record.readiness_state =
@@ -9792,10 +9803,9 @@ impl IpcServer {
         // Upsert toolset_record if provided.
         if let Some(ts_val) = payload.get("toolset_record") {
             if ts_val.is_object() {
-                if let Ok(profile) =
-                    serde_json::from_value::<ansible_mesh_core::graph::ToolsetProfileRecord>(
-                        ts_val.clone(),
-                    )
+                if let Ok(profile) = serde_json::from_value::<
+                    ansible_mesh_core::graph::ToolsetProfileRecord,
+                >(ts_val.clone())
                 {
                     let _ = graph.upsert_toolset_profile(&profile);
                 }
@@ -9902,7 +9912,8 @@ impl IpcServer {
         let capped = limit.min(200);
         match storage.list_filtered(filter, agent_id, capped) {
             Ok(samples) => {
-                let samples_json = serde_json::to_value(&samples).unwrap_or(serde_json::Value::Null);
+                let samples_json =
+                    serde_json::to_value(&samples).unwrap_or(serde_json::Value::Null);
                 IpcResponse::success(
                     "training_list",
                     Some(serde_json::json!({ "samples": samples_json, "count": samples.len() })),
@@ -9979,13 +9990,16 @@ impl IpcServer {
                         })
                     })
                     .collect();
-                std::fs::write(output_path, serde_json::to_vec_pretty(&records).unwrap_or_default())
+                std::fs::write(
+                    output_path,
+                    serde_json::to_vec_pretty(&records).unwrap_or_default(),
+                )
             }
             TrainingExportFormat::Nemo => {
                 let mut file = match std::fs::File::create(output_path) {
                     Ok(f) => f,
                     Err(e) => {
-                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string())
+                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
                     }
                 };
                 for s in &samples {
@@ -10013,7 +10027,10 @@ impl IpcServer {
         let ids: Vec<String> = samples.iter().map(|s| s.sample_id.clone()).collect();
         let count = ids.len();
         if let Err(e) = storage.mark_exported_at(&ids, exported_at) {
-            warn!("training_export: failed to mark {} samples exported: {}", count, e);
+            warn!(
+                "training_export: failed to mark {} samples exported: {}",
+                count, e
+            );
         }
 
         IpcResponse::success(
@@ -10035,9 +10052,11 @@ impl IpcServer {
         };
         match storage.count_status(agent_id) {
             Ok(counts) => {
-                let status_json =
-                    serde_json::to_value(&counts).unwrap_or(serde_json::Value::Null);
-                IpcResponse::success("training_status", Some(serde_json::json!({ "status": status_json })))
+                let status_json = serde_json::to_value(&counts).unwrap_or(serde_json::Value::Null);
+                IpcResponse::success(
+                    "training_status",
+                    Some(serde_json::json!({ "status": status_json })),
+                )
             }
             Err(e) => IpcResponse::error("training_status", "QUERY_FAILED", &e.to_string()),
         }
@@ -10101,7 +10120,11 @@ impl IpcServer {
 
         // Step 2: write component config to hotel context graph.
         let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
-            return IpcResponse::error("asr_setup", "HOTEL_NOT_FOUND", "could not resolve hotel name");
+            return IpcResponse::error(
+                "asr_setup",
+                "HOTEL_NOT_FOUND",
+                "could not resolve hotel name",
+            );
         };
         let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
         let config = parakeet_runner::ParakeetConfig {
@@ -10161,14 +10184,15 @@ impl IpcServer {
         )
     }
 
-    fn handle_asr_status(
-        graph: &GraphDomain,
-        local_node_id: &str,
-    ) -> IpcResponse {
+    fn handle_asr_status(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
         use std::process::Command;
 
         let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
-            return IpcResponse::error("asr_status", "HOTEL_NOT_FOUND", "could not resolve hotel name");
+            return IpcResponse::error(
+                "asr_status",
+                "HOTEL_NOT_FOUND",
+                "could not resolve hotel name",
+            );
         };
         let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
 
@@ -11313,8 +11337,8 @@ mod tests {
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord,
-        SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord, SessionEventRecord,
+        SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
     use philotic_client::{
@@ -22462,9 +22486,11 @@ mod tests {
             // accept it and verify the inner lease_type is correct.
             IpcResponse::TelegramPollLease { granted, lease } => {
                 if let Some(ref l) = lease {
-                    assert_eq!(l.lease_type, "discord_gateway",
+                    assert_eq!(
+                        l.lease_type, "discord_gateway",
                         "received TelegramPollLease but inner lease_type was '{}', not 'discord_gateway'",
-                        l.lease_type);
+                        l.lease_type
+                    );
                 }
                 (granted, lease)
             }
@@ -22474,9 +22500,9 @@ mod tests {
 
     fn expect_config_data(response: IpcResponse) -> Option<serde_json::Value> {
         match response {
-            IpcResponse::ConfigData { value_json, .. } => {
-                value_json.as_deref().map(|s| serde_json::from_str(s).expect("config data must be valid JSON"))
-            }
+            IpcResponse::ConfigData { value_json, .. } => value_json
+                .as_deref()
+                .map(|s| serde_json::from_str(s).expect("config data must be valid JSON")),
             other => panic!("expected ConfigData, got: {other:?}"),
         }
     }
@@ -22522,10 +22548,17 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _rx) = mpsc::channel(16);
         let graph = make_hotel_graph(&socket_path, "agent-jane-01");
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
         let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut membrane = PhiloticClient::connect(GuestIdentity {
             guest_id: "membrane-telegram-01".into(),
@@ -22560,7 +22593,11 @@ mod tests {
             .and_then(|b| b.as_array())
             .expect("reflex_context.membrane_bindings must be present");
 
-        assert_eq!(bindings.len(), 1, "exactly one binding after one lease grant");
+        assert_eq!(
+            bindings.len(),
+            1,
+            "exactly one binding after one lease grant"
+        );
         assert_eq!(
             bindings[0].get("kind").and_then(|k| k.as_str()),
             Some("telegram"),
@@ -22591,11 +22628,14 @@ mod tests {
             .and_then(|b| b.as_array())
             .expect("bindings after re-acquire");
         assert_eq!(
-            bindings2.len(), 1,
+            bindings2.len(),
+            1,
             "idempotent re-acquire must not duplicate binding (got: {bindings2:?})"
         );
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -22611,10 +22651,17 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _rx) = mpsc::channel(16);
         let graph = make_hotel_graph(&socket_path, "agent-jane-01");
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
         let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut membrane = PhiloticClient::connect(GuestIdentity {
             guest_id: "membrane-discord-01".into(),
@@ -22649,7 +22696,11 @@ mod tests {
             .and_then(|b| b.as_array())
             .expect("reflex_context.membrane_bindings must be present");
 
-        assert_eq!(bindings.len(), 1, "exactly one binding after discord lease grant");
+        assert_eq!(
+            bindings.len(),
+            1,
+            "exactly one binding after discord lease grant"
+        );
         assert_eq!(
             bindings[0].get("kind").and_then(|k| k.as_str()),
             Some("discord_text"),
@@ -22680,11 +22731,14 @@ mod tests {
             .and_then(|b| b.as_array())
             .expect("bindings after re-acquire");
         assert_eq!(
-            bindings2.len(), 1,
+            bindings2.len(),
+            1,
             "idempotent re-acquire must not duplicate discord binding (got: {bindings2:?})"
         );
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {

@@ -570,10 +570,15 @@ impl VoiceResponsePolicy {
     /// Switches provider, updating `voice_ids` and returning the resolved voice ID.
     /// When `new_voice_id` is given it is persisted for this provider.
     /// When omitted the previously stored ID for the provider is used if available.
-    pub fn switch_provider(&mut self, new_provider: &str, new_voice_id: Option<&str>) -> Option<String> {
+    pub fn switch_provider(
+        &mut self,
+        new_provider: &str,
+        new_voice_id: Option<&str>,
+    ) -> Option<String> {
         self.provider = Some(new_provider.to_string());
         if let Some(vid) = new_voice_id {
-            self.voice_ids.insert(new_provider.to_string(), vid.to_string());
+            self.voice_ids
+                .insert(new_provider.to_string(), vid.to_string());
         }
         self.voice_ids.get(new_provider).cloned()
     }
@@ -982,4 +987,3 @@ pub struct SpawnedSubagentRef {
     pub lease_epoch: u64,
     pub lease_expires_at: u64,
 }
-

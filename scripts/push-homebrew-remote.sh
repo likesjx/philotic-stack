@@ -52,6 +52,26 @@ fi
 echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
 ssh "${REMOTE}" "pkill -f 'aiua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f 'aiua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
 
+echo "▶ Verifying local binary signatures before push..."
+UNSIGNED=()
+while IFS= read -r bin_path; do
+  bin="$(basename "${bin_path}")"
+  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" ]]; then
+    continue
+  fi
+  if ! codesign -dv "${bin_path}" 2>&1 | grep -q "adhoc"; then
+    UNSIGNED+=("${bin}")
+  fi
+done < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
+
+if [[ ${#UNSIGNED[@]} -gt 0 ]]; then
+  echo "❌ Unsigned binaries detected (macOS will SIGKILL these on remote):"
+  for b in "${UNSIGNED[@]}"; do echo "   - ${b}"; done
+  echo "   Run 'cargo build --release' again or sign with: codesign -s - target/release/<bin>"
+  exit 1
+fi
+echo "  ✓ All local binaries have adhoc signatures"
+
 echo "▶ Staging and installing runtime binaries on ${REMOTE}..."
 while IFS= read -r bin_path; do
   bin="$(basename "${bin_path}")"

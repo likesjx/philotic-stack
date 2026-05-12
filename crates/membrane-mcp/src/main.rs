@@ -5,21 +5,21 @@ mod routing;
 mod server;
 mod transform;
 
-use anyhow::Result;
 use ansible_mesh_core::mcp_endpoint::McpEndpointConfig;
 use ansible_mesh_core::mcp_route::McpRouteRecord;
+use anyhow::Result;
 use async_trait::async_trait;
 use auth::{AllotmentTracker, VaultHashCache, VaultResolver};
 use clap::Parser;
 use membrane::{LeaseRenewResult, MembraneGuest, OutboundReply};
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
-use tracing::info;
 use routing::{new_shared_endpoint_table, new_shared_table};
 use server::{MembraneState, build_router};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
+use tracing::info;
 use tracing::{error, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -49,7 +49,10 @@ struct IpcVaultResolver;
 
 impl VaultResolver for IpcVaultResolver {
     fn resolve(&self, vault_ref: &str) -> Result<[u8; 32]> {
-        warn!(vault_ref, "vault resolver stub — Slice 2 wires real IPC lookup");
+        warn!(
+            vault_ref,
+            "vault resolver stub — Slice 2 wires real IPC lookup"
+        );
         Ok([0u8; 32])
     }
 }
@@ -89,10 +92,14 @@ impl MembraneGuest for McpMembrane {
             port: self.port,
         };
         match client.send_request(req).await {
-            Ok(IpcResponse::McpMembraneLease { mcp_granted: true, .. }) => {
+            Ok(IpcResponse::McpMembraneLease {
+                mcp_granted: true, ..
+            }) => {
                 info!("MCP membrane lease acquired");
             }
-            Ok(IpcResponse::McpMembraneLease { mcp_granted: false, .. }) => {
+            Ok(IpcResponse::McpMembraneLease {
+                mcp_granted: false, ..
+            }) => {
                 anyhow::bail!("MCP membrane lease denied — another instance may be running");
             }
             Ok(other) => {
@@ -105,7 +112,8 @@ impl MembraneGuest for McpMembrane {
 
         // Start HTTP server (detached task).
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        let router = build_router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        let router =
+            build_router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move {
             info!(%addr, "MCP membrane HTTP server starting");
             match tokio::net::TcpListener::bind(addr).await {
@@ -129,7 +137,10 @@ impl MembraneGuest for McpMembrane {
                 // Philote acknowledged the approval gate — the HTTP caller continues
                 // to wait. The oneshot stays parked; it fires when the operator
                 // resolves and the philote sends the final Text/Error reply.
-                info!(turn_id, "approval required acknowledged — oneshot remains parked");
+                info!(
+                    turn_id,
+                    "approval required acknowledged — oneshot remains parked"
+                );
                 return Ok(());
             }
             OutboundReply::StreamingToken { .. } => {
@@ -149,9 +160,7 @@ impl MembraneGuest for McpMembrane {
                 let _ = tx.send(content);
             }
             (OutboundReply::Error { message, .. }, Some(tx)) => {
-                let _ = tx.send(
-                    serde_json::json!({ "error": message }).to_string(),
-                );
+                let _ = tx.send(serde_json::json!({ "error": message }).to_string());
             }
             (_, None) => {
                 warn!(turn_id, "deliver: no pending receiver for turn");
@@ -236,12 +245,12 @@ impl MembraneGuest for McpMembrane {
             port: self.port,
         };
         match client.send_request(req).await {
-            Ok(IpcResponse::McpMembraneLease { mcp_granted: true, .. }) => {
-                Ok(LeaseRenewResult::Ok { epoch: 0 })
-            }
-            Ok(IpcResponse::McpMembraneLease { mcp_granted: false, .. }) => {
-                Ok(LeaseRenewResult::NeedsReacquire)
-            }
+            Ok(IpcResponse::McpMembraneLease {
+                mcp_granted: true, ..
+            }) => Ok(LeaseRenewResult::Ok { epoch: 0 }),
+            Ok(IpcResponse::McpMembraneLease {
+                mcp_granted: false, ..
+            }) => Ok(LeaseRenewResult::NeedsReacquire),
             Ok(_) => Ok(LeaseRenewResult::Ok { epoch: 0 }),
             Err(e) => Err(e),
         }
@@ -281,7 +290,10 @@ async fn main() -> Result<()> {
         let mut by_agent: std::collections::HashMap<String, Vec<McpRouteRecord>> =
             std::collections::HashMap::new();
         for record in records {
-            by_agent.entry(record.agent_id.clone()).or_default().push(record);
+            by_agent
+                .entry(record.agent_id.clone())
+                .or_default()
+                .push(record);
         }
         for (agent_id, routes) in by_agent {
             t.upsert_agent_routes(&agent_id, routes);
@@ -318,8 +330,8 @@ async fn main() -> Result<()> {
         // Inbound envelopes go nowhere in this mode; pending responses will time out.
         info!("running in static-only mode (no IPC socket)");
         let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-        let router = build_router(guest.state.clone())
-            .into_make_service_with_connect_info::<SocketAddr>();
+        let router =
+            build_router(guest.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
         let listener = tokio::net::TcpListener::bind(addr).await?;
         info!(%addr, "MCP membrane listening");
         axum::serve(listener, router).await?;

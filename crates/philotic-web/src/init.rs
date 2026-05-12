@@ -124,7 +124,6 @@ fn key_fingerprint(key: &VerifyingKey) -> String {
         .join(":")
 }
 
-
 // ── Config template ────────────────────────────────────────────────────────
 
 static CONFIG_TEMPLATE: &str = r#"{

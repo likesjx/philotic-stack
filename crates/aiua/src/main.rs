@@ -1097,11 +1097,15 @@ fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapsh
             let avail: u64 = cols.get(3)?.parse().ok()?;
             let used: u64 = cols.get(2)?.parse().ok()?;
             let total = used + avail;
-            if total == 0 { return None; }
+            if total == 0 {
+                return None;
+            }
             Some(avail as f32 / total as f32 * 100.0)
         }
         #[cfg(not(target_os = "macos"))]
-        { None }
+        {
+            None
+        }
     })();
 
     // Memory: percentage free from /proc/meminfo (Linux) or vm_stat (macOS).
@@ -1119,19 +1123,25 @@ fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapsh
             let mut total_pages: u64 = 0;
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.splitn(2, ':').collect();
-                if parts.len() != 2 { continue; }
+                if parts.len() != 2 {
+                    continue;
+                }
                 let val: u64 = parts[1].trim().trim_end_matches('.').parse().unwrap_or(0);
                 total_pages += val;
                 if parts[0].contains("Pages free") || parts[0].contains("Pages speculative") {
                     free_pages += val;
                 }
             }
-            if total_pages == 0 { return None; }
+            if total_pages == 0 {
+                return None;
+            }
             let _ = page_size;
             Some(free_pages as f32 / total_pages as f32 * 100.0)
         }
         #[cfg(not(target_os = "macos"))]
-        { None }
+        {
+            None
+        }
     })();
 
     // Load average from /proc/loadavg (Linux) or sysctl (macOS).
@@ -1291,7 +1301,6 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
 
     {
         let dispatcher_inbound_tx = ctx.dispatcher_tx.clone();
-        let inbound_socket = daemon.socket();
         let inbound_graph = ctx.graph_domain.clone();
         let inbound_inboxes = ctx.ipc_inboxes.clone();
         let inbound_parked = ctx.ipc_parked_inbound.clone();
@@ -1301,7 +1310,8 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
         tokio::spawn(async move {
             while let Some(msg) = inbox_rx.recv().await {
                 match msg.msg_type {
-                    ansible_mesh_core::MsgType::MeshEventBatch => {
+                    ansible_mesh_core::MsgType::MeshEventBatch
+                    | ansible_mesh_core::MsgType::ExecutionEventBatch => {
                         if let Ok(events) =
                             serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload)
                         {
@@ -1412,28 +1422,24 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                         msg_id,
                                         src_node: inbound_local_node_id.clone(),
                                         dest_node: msg.src_node.clone(),
-                                        msg_type: ansible_mesh_core::MsgType::MeshEventAck,
+                                        msg_type: ansible_mesh_core::MsgType::ExecutionEventAck,
                                         seq,
                                         total: 1,
                                         payload,
                                         timestamp,
                                         hmac,
                                     };
-                                    match serde_json::to_vec(&ack) {
-                                        Ok(packet) => {
-                                            if let Err(err) =
-                                                inbound_socket.send_to(&packet, &target_addr).await
-                                            {
-                                                warn!(
-                                                    "Failed to return mesh ACK to {} at {}: {}",
-                                                    msg.src_node, target_addr, err
-                                                );
-                                            }
-                                        }
-                                        Err(err) => warn!(
-                                            "Failed to serialize mesh ACK for {}: {}",
-                                            msg.src_node, err
-                                        ),
+                                    if let Err(err) =
+                                        crate::service::execution_transport::send_execution_message(
+                                            &target_addr,
+                                            &ack,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            "Failed to return execution ACK to {} at {}: {}",
+                                            msg.src_node, target_addr, err
+                                        );
                                     }
                                 } else {
                                     warn!(
@@ -1444,7 +1450,8 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                             }
                         }
                     }
-                    ansible_mesh_core::MsgType::MeshEventAck => {
+                    ansible_mesh_core::MsgType::MeshEventAck
+                    | ansible_mesh_core::MsgType::ExecutionEventAck => {
                         debug!("Received MeshEventAck from {}", msg.src_node);
                         if let Ok(ack_payload) =
                             serde_json::from_slice::<serde_json::Value>(&msg.payload)
@@ -1642,7 +1649,7 @@ fn local_capability_advertisements(
     Ok(advertisements)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct AgentProfile {
     agent_key: String,
     agent_id: String,
@@ -1651,6 +1658,9 @@ struct AgentProfile {
     /// When true, the seeded orchestrator role incarnation will have is_admin = true,
     /// granting this agent the ability to modify orchestrator and admin roles.
     is_admin: bool,
+    /// Operator-supplied turn loop config for the orchestrator role.
+    /// When present, overrides the default (empty) TurnLoopConfig on every seed.
+    orchestrator_turn_loop_config: Option<ansible_mesh_core::graph::TurnLoopConfig>,
 }
 
 fn title_case_agent_name(agent_key: &str) -> String {
@@ -1684,6 +1694,7 @@ fn default_agent_profile_for_hotel(hotel_name: &str) -> AgentProfile {
         agent_key,
         import_workspace: None,
         is_admin: false,
+        orchestrator_turn_loop_config: None,
     }
 }
 
@@ -1776,7 +1787,10 @@ fn merge_configured_peer_hotels(
     }
 }
 
-fn configured_peer_hotels(config_json: &serde_json::Value, hotel_name: &str) -> Vec<ConfiguredPeerHotel> {
+fn configured_peer_hotels(
+    config_json: &serde_json::Value,
+    hotel_name: &str,
+) -> Vec<ConfiguredPeerHotel> {
     let mut merged = std::collections::BTreeMap::new();
 
     if let Some(default_hotel) = hotel_object(config_json, "default") {
@@ -1905,12 +1919,17 @@ fn agent_profile_from_config(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    let orchestrator_turn_loop_config = agent
+        .get("turn_loop_config")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
     Some(AgentProfile {
         agent_key,
         agent_id,
         persona_name,
         import_workspace,
         is_admin,
+        orchestrator_turn_loop_config,
     })
 }
 
@@ -1954,12 +1973,16 @@ fn all_agent_profiles_from_config(
                 .get("is_admin")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+            let orchestrator_turn_loop_config = agent
+                .get("turn_loop_config")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
             Some(AgentProfile {
                 agent_key,
                 agent_id,
                 persona_name,
                 import_workspace,
                 is_admin,
+                orchestrator_turn_loop_config,
             })
         })
         .collect()
@@ -2371,14 +2394,12 @@ fn merge_agent_entries(
     // Promote the ElevenLabs-specific voice_id to elevenlabs_voice_id so model-router
     // ProviderConfigs can pick it up without knowing about VoiceResponsePolicy.
     // Prefer voice_ids.elevenlabs over the top-level voice_id (which belongs to onnx).
-    let elevenlabs_id = agent
-        .get("voice_response_policy")
-        .and_then(|p| {
-            p.get("voice_ids")
-                .and_then(|m| m.get("elevenlabs"))
-                .filter(|v| v.is_string())
-                .or_else(|| p.get("voice_id").filter(|v| v.is_string()))
-        });
+    let elevenlabs_id = agent.get("voice_response_policy").and_then(|p| {
+        p.get("voice_ids")
+            .and_then(|m| m.get("elevenlabs"))
+            .filter(|v| v.is_string())
+            .or_else(|| p.get("voice_id").filter(|v| v.is_string()))
+    });
     if let Some(voice_id) = elevenlabs_id {
         merged
             .entry("elevenlabs_voice_id".to_string())
@@ -3752,17 +3773,30 @@ Approval posture:
 /// after a role exists.
 fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> anyhow::Result<()> {
     for profile in profiles {
+        // Preserve operator-customized fields (turn_loop_config, role_identity_addendum)
+        // from the existing record so that `aiua load` doesn't wipe them.
+        let existing = graph
+            .get_role_incarnation(&profile.agent_id, "orchestrator")
+            .ok()
+            .flatten();
+        let turn_loop_config = profile
+            .orchestrator_turn_loop_config
+            .clone()
+            .or_else(|| existing.as_ref().map(|r| r.turn_loop_config.clone()))
+            .unwrap_or_default();
+        let role_identity_addendum = existing.and_then(|r| r.role_identity_addendum);
+
         let record = ansible_mesh_core::graph::RoleIncarnationRecord {
             agent_id: profile.agent_id.clone(),
             role_name: "orchestrator".into(),
             guest_id: format!("{}:orchestrator", profile.agent_id),
             toolset_profile: "orchestrator".into(),
-            role_identity_addendum: None,
+            role_identity_addendum,
             role_manifest: Some(ORCHESTRATOR_MANIFEST.into()),
             is_admin: profile.is_admin,
             readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
-            turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
+            turn_loop_config,
             home_node: None,
         };
         // Always upsert — the hotel seed is the canonical source for the orchestrator manifest.
@@ -5850,7 +5884,10 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
 
     let seeded_peer_hotels = seed_peer_hotels_from_config(&graph_domain, &config_json, hotel_name)?;
     if seeded_peer_hotels > 0 {
-        info!("Seeded {} peer hotel record(s) from config.", seeded_peer_hotels);
+        info!(
+            "Seeded {} peer hotel record(s) from config.",
+            seeded_peer_hotels
+        );
     }
 
     // Provision MuninnDB vaults if configured.

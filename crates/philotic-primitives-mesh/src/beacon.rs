@@ -1,6 +1,6 @@
+use crate::event::NodeId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::event::NodeId;
 
 /// Point-in-time environment snapshot self-reported by a hotel in each heartbeat.
 /// All fields are optional so older nodes remain wire-compatible.
@@ -71,8 +71,34 @@ pub enum MsgType {
     MeshEventBatch,
     /// An acknowledgment of durably received mesh events
     MeshEventAck,
+    /// A batch of EventEnvelopes sent over the reliable execution plane
+    ExecutionEventBatch,
+    /// An acknowledgment of durably received execution-plane events
+    ExecutionEventAck,
     /// A membership acceptance packet emitted after an invite is accepted
     MeshMembershipAccept,
     /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
     WebRtcSignal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MsgType;
+
+    #[test]
+    fn execution_plane_msg_types_serialize_with_stable_names() {
+        let batch = serde_json::to_string(&MsgType::ExecutionEventBatch).expect("serialize batch");
+        let ack = serde_json::to_string(&MsgType::ExecutionEventAck).expect("serialize ack");
+
+        assert_eq!(batch, "\"EXECUTION_EVENT_BATCH\"");
+        assert_eq!(ack, "\"EXECUTION_EVENT_ACK\"");
+        assert_eq!(
+            serde_json::from_str::<MsgType>(&batch).expect("deserialize batch"),
+            MsgType::ExecutionEventBatch
+        );
+        assert_eq!(
+            serde_json::from_str::<MsgType>(&ack).expect("deserialize ack"),
+            MsgType::ExecutionEventAck
+        );
+    }
 }

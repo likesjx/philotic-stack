@@ -33,7 +33,12 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
         "handoff.back" => &["session.status", "handoff.back"],
-        "role.governance" => &["session.status", "agent.configure", "role.create_or_update", "role.set_home"],
+        "role.governance" => &[
+            "session.status",
+            "agent.configure",
+            "role.create_or_update",
+            "role.set_home",
+        ],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &["memory.recall", "memory.remember"],
         "routing.refinement" => &[
@@ -296,8 +301,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "graph.grant_access".into(),
         ToolDefinition {
             tool_name: "graph.grant_access".into(),
-            description: "Grant another agent read or write access to one of your graph partitions."
-                .into(),
+            description:
+                "Grant another agent read or write access to one of your graph partitions.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -461,8 +466,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "table.schema".into(),
         ToolDefinition {
             tool_name: "table.schema".into(),
-            description: "Return the CREATE TABLE DDL for a table in the local table store."
-                .into(),
+            description: "Return the CREATE TABLE DDL for a table in the local table store.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

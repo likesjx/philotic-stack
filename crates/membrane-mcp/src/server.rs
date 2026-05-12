@@ -83,9 +83,7 @@ async fn handle_mcp(
 ) -> axum::Json<JsonRpcResponse> {
     let id = req.id.clone().unwrap_or(Value::Null);
     let is_loopback = addr.ip().is_loopback();
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
 
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id, req.params),
@@ -95,9 +93,7 @@ async fn handle_mcp(
         }
         "ping" => JsonRpcResponse::ok(id, json!({})),
         "tools/list" => handle_tools_list(&state, id, auth_header).await,
-        "tools/call" => {
-            handle_tools_call(&state, id, req.params, auth_header, is_loopback).await
-        }
+        "tools/call" => handle_tools_call(&state, id, req.params, auth_header, is_loopback).await,
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
 
@@ -110,7 +106,11 @@ fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
     let _params: InitializeParams = match params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
-            return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, "invalid initialize params");
+            return JsonRpcResponse::err(
+                id,
+                error_code::INVALID_PARAMS,
+                "invalid initialize params",
+            );
         }
     };
 
@@ -123,7 +123,9 @@ fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             capabilities: ServerCapabilities {
-                tools: ToolsCapability { list_changed: false },
+                tools: ToolsCapability {
+                    list_changed: false,
+                },
             },
         })
         .unwrap(),
@@ -146,10 +148,7 @@ async fn handle_tools_list(
         table.visible_descriptors(caller_id)
     };
 
-    JsonRpcResponse::ok(
-        id,
-        serde_json::to_value(ToolsListResult { tools }).unwrap(),
-    )
+    JsonRpcResponse::ok(id, serde_json::to_value(ToolsListResult { tools }).unwrap())
 }
 
 async fn handle_tools_call(
@@ -162,7 +161,11 @@ async fn handle_tools_call(
     let params: ToolCallParams = match params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
-            return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, "invalid tools/call params");
+            return JsonRpcResponse::err(
+                id,
+                error_code::INVALID_PARAMS,
+                "invalid tools/call params",
+            );
         }
     };
 
@@ -195,7 +198,11 @@ async fn handle_tools_call(
         drop(endpoint);
 
         let requires_approval = !preapproved && !is_loopback;
-        let timeout = if requires_approval { APPROVAL_TIMEOUT } else { DISPATCH_TIMEOUT };
+        let timeout = if requires_approval {
+            APPROVAL_TIMEOUT
+        } else {
+            DISPATCH_TIMEOUT
+        };
 
         let turn_id = Uuid::new_v4().to_string();
         let session_id = format!("mcp-{}-{}", tool_spec.name, &turn_id[..8]);
@@ -257,8 +264,8 @@ async fn handle_tools_call(
         return match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(content)) => {
                 let transformed = transform::apply_outbound(&tool_spec, &content);
-                let result_value = serde_json::from_str(&transformed)
-                    .unwrap_or(json!({ "text": transformed }));
+                let result_value =
+                    serde_json::from_str(&transformed).unwrap_or(json!({ "text": transformed }));
                 JsonRpcResponse::ok(
                     id,
                     serde_json::to_value(ToolCallResult::json(result_value)).unwrap(),
@@ -309,7 +316,11 @@ async fn handle_tools_call(
     };
 
     let requires_approval = route.record.security.require_approval;
-    let timeout = if requires_approval { APPROVAL_TIMEOUT } else { DISPATCH_TIMEOUT };
+    let timeout = if requires_approval {
+        APPROVAL_TIMEOUT
+    } else {
+        DISPATCH_TIMEOUT
+    };
 
     let session_id = format!("mcp-{}", caller.token_id);
     let turn_id = Uuid::new_v4().to_string();

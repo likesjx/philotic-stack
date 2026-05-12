@@ -62,7 +62,10 @@ async fn wait_for_ollama(client: &reqwest::Client, base_url: &str) -> Result<()>
             Ok(r) if r.status().is_success() => {
                 let body: serde_json::Value = r.json().await.unwrap_or_default();
                 tracing::info!(
-                    version = body.get("version").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                    version = body
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
                     "Ollama is ready"
                 );
                 return Ok(());
@@ -77,7 +80,11 @@ async fn wait_for_ollama(client: &reqwest::Client, base_url: &str) -> Result<()>
         tokio::time::sleep(interval).await;
     }
 
-    anyhow::bail!("Ollama did not become ready at {} after {}s", base_url, max_attempts * 3)
+    anyhow::bail!(
+        "Ollama did not become ready at {} after {}s",
+        base_url,
+        max_attempts * 3
+    )
 }
 
 #[tokio::main]
@@ -97,7 +104,12 @@ async fn main() -> Result<()> {
         match resp {
             Ok(r) if r.status().is_success() => {
                 let body: serde_json::Value = r.json().await.unwrap_or_default();
-                println!("Ollama OK — version: {}", body.get("version").and_then(|v| v.as_str()).unwrap_or("unknown"));
+                println!(
+                    "Ollama OK — version: {}",
+                    body.get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                );
                 return Ok(());
             }
             Ok(r) => anyhow::bail!("Ollama check failed: HTTP {}", r.status()),
@@ -110,7 +122,11 @@ async fn main() -> Result<()> {
     let base_url = args.base_url.as_deref().unwrap_or("http://localhost:11434");
     wait_for_ollama(&http_client, base_url).await?;
 
-    let chat_model = args.chat_model.as_deref().unwrap_or("gemma4:e4b").to_string();
+    let chat_model = args
+        .chat_model
+        .as_deref()
+        .unwrap_or("gemma4:e4b")
+        .to_string();
     let provider = Arc::new(OllamaProvider::new(
         http_client,
         args.base_url,
@@ -131,7 +147,9 @@ async fn main() -> Result<()> {
         guest_id,
         role,
         allow_inline_audio: false,
-        providers: Box::new(move |_client, _configs| vec![provider.clone() as Arc<dyn ModelProvider>]),
+        providers: Box::new(move |_client, _configs| {
+            vec![provider.clone() as Arc<dyn ModelProvider>]
+        }),
         live_providers: Box::new(|_client, _configs| vec![]),
     })
     .await

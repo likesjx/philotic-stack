@@ -1,9 +1,9 @@
-use crate::transpiler::{transpile_cypher, TranslatedQuery};
-use anyhow::{bail, Result};
+use crate::transpiler::{TranslatedQuery, transpile_cypher};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput, TaskKind};
-use rusqlite::{params, Connection};
-use serde_json::{json, Value};
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -53,7 +53,11 @@ impl SqliteCypherProvider {
     fn execute_cypher(&self, conn: &Connection, query: &str, _params: &Value) -> Result<Value> {
         let translated = transpile_cypher(query)?;
         match translated {
-            TranslatedQuery::InsertNode { id, label, properties } => {
+            TranslatedQuery::InsertNode {
+                id,
+                label,
+                properties,
+            } => {
                 let props_json = serde_json::to_string(&properties)?;
                 conn.execute(
                     "INSERT OR REPLACE INTO ag_node (id, label, properties) VALUES (?, ?, ?)",
@@ -61,7 +65,13 @@ impl SqliteCypherProvider {
                 )?;
                 Ok(json!({"status": "created", "id": id}))
             }
-            TranslatedQuery::InsertEdge { id, source_id, target_id, label, properties } => {
+            TranslatedQuery::InsertEdge {
+                id,
+                source_id,
+                target_id,
+                label,
+                properties,
+            } => {
                 let props_json = serde_json::to_string(&properties)?;
                 conn.execute(
                     "INSERT OR REPLACE INTO ag_edge (id, source_id, target_id, label, properties) VALUES (?, ?, ?, ?, ?)",

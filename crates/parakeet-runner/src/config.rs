@@ -39,17 +39,15 @@ impl ParakeetConfig {
                 value_json: Some(json),
                 ..
             } => {
-                let config: Self = serde_json::from_str(&json)
-                    .map_err(|e| anyhow::anyhow!("failed to parse parakeet config from hotel: {e}"))?;
+                let config: Self = serde_json::from_str(&json).map_err(|e| {
+                    anyhow::anyhow!("failed to parse parakeet config from hotel: {e}")
+                })?;
                 Ok(Some(config))
             }
             IpcResponse::ConfigData {
                 value_json: None, ..
             } => Ok(None),
-            other => anyhow::bail!(
-                "unexpected response from hotel for GetConfig: {:?}",
-                other
-            ),
+            other => anyhow::bail!("unexpected response from hotel for GetConfig: {:?}", other),
         }
     }
 }

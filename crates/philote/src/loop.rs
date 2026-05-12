@@ -53,13 +53,17 @@ impl TurnPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
-    Respond { content: String },
+    Respond {
+        content: String,
+    },
     ToolCall(ToolCall),
     RequestApproval(ApprovalRequest),
     /// The model is proposing a plan before executing any tools. The runtime
     /// surfaces the plan to the operator and parks the turn until they confirm.
     PlanProposal(PlanProposalAction),
-    Fail { message: String },
+    Fail {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

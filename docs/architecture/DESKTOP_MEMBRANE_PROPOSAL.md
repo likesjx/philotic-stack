@@ -3,7 +3,7 @@ title: Desktop Membrane Proposal
 doc_type: proposal
 domain: membrane-transport
 status: proposed
-last_updated: 2026-03-31
+last_updated: 2026-05-12
 tags:
 - desktop
 - membrane
@@ -19,6 +19,7 @@ related_docs:
 - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
 - PHILOTIC_WEB_PROPOSAL.md
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md
 - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
 task_refs:
 - docs/task.md
@@ -69,6 +70,7 @@ Recommended shape:
 5. the desktop membrane must acquire and renew a hotel-governed authority lease while it is serving a live operator session
 6. mesh-wide actions flow through explicit control-plane routing, remote management transport, and target-scoped grants rather than ambient trust
 7. losing the lease must fail closed: privileged reads stop, mutating routes stop, websocket clients are disconnected, and session credentials are invalidated
+8. before hotel auth succeeds, the membrane may expose only a bootstrap/login shell and basic surface reachability
 
 Those operator surfaces should eventually be reusable by agents and automation too, with caller-aware redaction and posture/grant checks.
 
@@ -104,6 +106,7 @@ Current behavior in `crates/philotic-web/src/serve.rs`:
 - now exposes a first target-guest inventory contract that is local-canonical for the local hotel and attempts a direct target-hotel management query for remote targets, with explicit fallback when that path cannot complete
 - denies apartment inspection on the default desktop membrane surface
 - routes guest restart/stop actions to the hotel over local IPC
+- still allows a pre-auth disconnected shell shape that needs to evolve into an explicit hotel-auth bootstrap surface for the always-on desktop-server model
 
 Current embedded desktop behavior in `jaredlikes-desktop`:
 
@@ -596,6 +599,8 @@ Recommended direction:
 - websocket/event-stream attach should be bound to the same operator session rather than a second leaked credential path
 - remote mesh operations should derive from the authenticated operator session and then be narrowed through per-target authorization checks and grants
 
+The desktop membrane should therefore authenticate to hotel-owned user identity/session authority rather than becoming its own accidental auth server; see [HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md).
+
 The desktop membrane's local operator session should become the parent context for remote actions, but not a substitute for remote authorization.
 
 This proposal does not require choosing cookie-versus-header immediately, but it does require ending the current "page load implies credential disclosure" pattern.
@@ -826,11 +831,12 @@ After the first slice, likely next slices are:
 2. desktop-aware operator posture and elevation UX
 3. explicit target-scoped action-grant ceremonies for high-trust remote operations
 4. mesh-wide inventory and topology panels
-5. cross-node action progress/audit views
-6. guest migration and mesh topology mutation flows
-7. explicit UI asset manifest/provenance embedding
-8. release gating that rejects placeholder or unverifiable embedded assets
-9. integrated frontend dev mode with honest membrane bootstrap semantics
+5. hotel-owned event-log views that project local router traces and mesh events into the desktop without turning the browser into a direct SQLite spelunker
+6. cross-node action progress/audit views
+7. guest migration and mesh topology mutation flows
+8. explicit UI asset manifest/provenance embedding
+9. release gating that rejects placeholder or unverifiable embedded assets
+10. integrated frontend dev mode with honest membrane bootstrap semantics
 
 ## Open Questions
 

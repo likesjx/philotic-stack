@@ -172,6 +172,58 @@
     mode: "0600"
   notify: Restart philotic-hotel
 
+- name: Seed hotel graph/config from mesh-config.json
+  command:
+    argv:
+      - runuser
+      - -u
+      - "{{ philotic_user }}"
+      - --
+      - sh
+      - -lc
+      - "cd {{ philotic_data_dir | quote }} && {{ philotic_bin_dir | quote }}/aiua load --file {{ philotic_etc_dir | quote }}/mesh-config.json --hotel {{ philotic_hotel_runtime_name | quote }}"
+  environment:
+    PHILOTIC_BIN_DIR: "{{ philotic_bin_dir }}"
+    PHILOTIC_HOTEL_SOCKET: "{{ philotic_hotel_socket }}"
+    PHILOTIC_ENABLE_RUST_AUTH: "{{ philotic_enable_rust_auth }}"
+    PHILOTIC_ENABLE_RUST_DISPATCHER: "{{ philotic_enable_rust_dispatcher }}"
+    PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE: "{{ philotic_enable_rust_task_lifecycle }}"
+  changed_when: false
+
+- name: Remove stale records for previous hotel identities
+  shell: |
+    set -e
+    sqlite3 {{ (philotic_data_dir ~ '/aiua_context.db') | quote }} <<'SQL'
+    DELETE FROM graph_edges
+      WHERE src_node_key = 'hotel:{{ item }}'
+         OR dst_node_key = 'hotel:{{ item }}'
+         OR src_node_key LIKE 'guest:{{ item }}:%'
+         OR dst_node_key LIKE 'guest:{{ item }}:%'
+         OR src_node_key LIKE 'config:%:{{ item }}'
+         OR dst_node_key LIKE 'config:%:{{ item }}';
+    DELETE FROM graph_nodes
+      WHERE node_key = 'hotel:{{ item }}'
+         OR node_key LIKE 'guest:{{ item }}:%'
+         OR node_key LIKE 'config:%:{{ item }}'
+         OR (kind = 'secret' AND data_json LIKE '%"scope":"hotel:{{ item }}"%')
+         OR (kind = 'config' AND data_json LIKE '%"hotel_name":"{{ item }}"%');
+    DELETE FROM materialized_guests
+      WHERE hotel_name = '{{ item }}'
+         OR guest_id LIKE '{{ item }}:%';
+    DELETE FROM hotels
+      WHERE hotel_name = '{{ item }}';
+    DELETE FROM vault_secrets
+      WHERE scope = 'hotel:{{ item }}';
+    DELETE FROM mesh_events
+      WHERE source_node_id = '{{ item }}-aiua-01'
+         OR target_node_id = '{{ item }}-aiua-01';
+    SQL
+  args:
+    executable: /bin/bash
+  loop: "{{ philotic_hotel_previous_names }}"
+  when: philotic_hotel_previous_names | length > 0
+  changed_when: false
+
 # ── systemd service ────────────────────────────────────────────────────────────
 
 - name: Deploy philotic-hotel systemd unit

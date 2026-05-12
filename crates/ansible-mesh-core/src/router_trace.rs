@@ -137,7 +137,10 @@ impl SqliteRouterTraceStorage {
             ",
         )?;
         // Idempotent migration for existing databases.
-        let _ = conn.execute("ALTER TABLE router_traces ADD COLUMN token_count INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE router_traces ADD COLUMN token_count INTEGER",
+            [],
+        );
         Ok(())
     }
 }

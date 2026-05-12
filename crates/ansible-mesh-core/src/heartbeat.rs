@@ -1,5 +1,5 @@
-use crate::registry::{CapabilityAdvertisement, ExecutionReachability};
 use crate::authz::MeshAuth;
+use crate::registry::{CapabilityAdvertisement, ExecutionReachability};
 use crate::{BeaconMessage, MsgType, NodeCapabilities, NodeHealthSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

@@ -50,7 +50,10 @@ impl ModelProvider for OllamaProvider {
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
         if task.kind != TaskKind::TextGenerate {
-            bail!("OllamaProvider only supports TextGenerate, got {:?}", task.kind);
+            bail!(
+                "OllamaProvider only supports TextGenerate, got {:?}",
+                task.kind
+            );
         }
 
         // Pull model override from task, fall back to configured default.
@@ -149,6 +152,9 @@ mod tests {
             Some("http://localhost:11434/".into()),
             None,
         );
-        assert_eq!(provider.chat_url(), "http://localhost:11434/v1/chat/completions");
+        assert_eq!(
+            provider.chat_url(),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 }

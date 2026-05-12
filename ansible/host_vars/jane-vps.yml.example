@@ -2,17 +2,25 @@
 # host_vars/jane-vps.yml — copy to jane-vps.yml and fill in real values
 # Sensitive fields (bot_token, api keys) should be stored in Ansible vault.
 
-philotic_hotel_name: "default"
+philotic_hotel_name: "vps-jane"
+philotic_hotel_canonical_name: "vps-jane"
+philotic_hotel_previous_names:
+  - "beacon-test-hotel"
 philotic_default_model: "gemini-pro"
 
 # Backbone peers — other hotels this node should announce to.
 # host is Tailscale MagicDNS name (transitional; will become explicit address).
 philotic_backbone_peers:
-  - name: "default"
+  - name: "mac-jane"
     host: "100.64.230.106"
     beacon_port: 24849
     blob_port: 24850
     execution_port: 24851
+  - name: "local-telegram"
+    host: "100.64.230.106"
+    beacon_port: 16370
+    blob_port: 16370
+    execution_port: 16371
   - name: "mbp-jane"
     host: "100.79.239.64"
     beacon_port: 13104

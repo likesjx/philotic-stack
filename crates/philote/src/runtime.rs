@@ -86,7 +86,10 @@ fn is_content_error(error: &TaskErrorPayload) -> bool {
 fn should_escalate_tier(error: &TaskErrorPayload) -> bool {
     matches!(
         error.sub_kind.as_deref(),
-        Some("network_error") | Some("streaming_timeout") | Some("rate_limit") | Some("provider_error")
+        Some("network_error")
+            | Some("streaming_timeout")
+            | Some("rate_limit")
+            | Some("provider_error")
     ) || (error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
         && !is_content_error(error))
@@ -102,9 +105,17 @@ fn role_for_tier<'a>(configured_tiers: &'a [String], tier: u8) -> &'a str {
         configured_tiers
             .get(idx)
             .map(String::as_str)
-            .unwrap_or_else(|| configured_tiers.last().map(String::as_str).unwrap_or("model.local"))
+            .unwrap_or_else(|| {
+                configured_tiers
+                    .last()
+                    .map(String::as_str)
+                    .unwrap_or("model.local")
+            })
     } else {
-        DEFAULT_FALLBACK_TIERS.get(idx).copied().unwrap_or("model.local")
+        DEFAULT_FALLBACK_TIERS
+            .get(idx)
+            .copied()
+            .unwrap_or("model.local")
     }
 }
 
@@ -1079,7 +1090,9 @@ impl AgentRuntime {
                     return r;
                 }
                 Ok(_) => {}
-                Err(e) => warn!(key = %key, err = %e, "Ignoring malformed operator MCP route override."),
+                Err(e) => {
+                    warn!(key = %key, err = %e, "Ignoring malformed operator MCP route override.")
+                }
             }
         }
 
@@ -1485,7 +1498,10 @@ impl AgentRuntime {
                     );
 
                     if let Ok(peek) = serde_json::from_str::<serde_json::Value>(&task_json) {
-                        let peeked_action = peek.get("action").and_then(|v| v.as_str()).unwrap_or("<none>");
+                        let peeked_action = peek
+                            .get("action")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<none>");
                         let snippet: String = task_json.chars().take(300).collect();
                         info!(
                             task_id = %task_id,
@@ -2066,10 +2082,14 @@ impl AgentRuntime {
             // treat this user message as operator confirmation of the plan rather
             // than starting a fresh turn. Any non-/deny, non-/cancel message confirms.
             let is_slash_deny_or_cancel = parse_slash_command(&content)
-                .map(|cmd| matches!(cmd, SlashCommand::Deny { .. } | SlashCommand::Abandon { .. }))
+                .map(|cmd| {
+                    matches!(
+                        cmd,
+                        SlashCommand::Deny { .. } | SlashCommand::Abandon { .. }
+                    )
+                })
                 .unwrap_or(false);
-            if state.has_parked_plan_turn() && !state.is_turn_active() && !is_slash_deny_or_cancel
-            {
+            if state.has_parked_plan_turn() && !state.is_turn_active() && !is_slash_deny_or_cancel {
                 let operator_note = {
                     let lower = content.trim().to_lowercase();
                     if lower == "yes" || lower == "proceed" || lower == "go" || lower == "ok" {
@@ -2086,14 +2106,28 @@ impl AgentRuntime {
                 );
                 // Re-enter via build_reentry_context_envelope and return — skip new turn creation.
                 let reentry = state.build_reentry_context_envelope();
-                let (prompt, context, context_projection, tools, restored_task_id,
-                     restored_user_content, restored_chat_id, restored_reply_to,
-                     restored_reply_role, restored_reply_guest_id,
-                     checkpoint_memory_type, checkpoint_json, index_state) = match reentry {
+                let (
+                    prompt,
+                    context,
+                    context_projection,
+                    tools,
+                    restored_task_id,
+                    restored_user_content,
+                    restored_chat_id,
+                    restored_reply_to,
+                    restored_reply_role,
+                    restored_reply_guest_id,
+                    checkpoint_memory_type,
+                    checkpoint_json,
+                    index_state,
+                ) = match reentry {
                     Some((p, c, cp, t)) => {
                         let turn = state.active_turn.as_ref().expect("just restored");
                         let out = (
-                            p, c, cp, t,
+                            p,
+                            c,
+                            cp,
+                            t,
                             turn.task_id,
                             turn.user_content.clone(),
                             turn.chat_id.clone(),
@@ -2107,7 +2141,10 @@ impl AgentRuntime {
                         out
                     }
                     None => {
-                        warn!("Session [{}] plan resume: no reentry envelope; aborting.", session_id);
+                        warn!(
+                            "Session [{}] plan resume: no reentry envelope; aborting.",
+                            session_id
+                        );
                         drop(state);
                         return Ok(());
                     }
@@ -2149,12 +2186,11 @@ impl AgentRuntime {
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
                 };
-                let (target_node, target_role, target_guest_id) =
-                    resolve_model_execution_target(
-                        self.sessions.get(&session_id),
-                        "text.generate",
-                        DEFAULT_TEXT_MODEL_ROLE,
-                    );
+                let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+                    self.sessions.get(&session_id),
+                    "text.generate",
+                    DEFAULT_TEXT_MODEL_ROLE,
+                );
                 self.ipc_client
                     .send_request(IpcRequest::EmitTask {
                         target_node,
@@ -2621,9 +2657,17 @@ impl AgentRuntime {
                     .map(|c| c.turn_loop_config.fallback_tiers.clone())
                     .unwrap_or_default();
                 let local_role = if !offline_tiers.is_empty() {
-                    offline_tiers.last().map(String::as_str).unwrap_or("model.local").to_string()
+                    offline_tiers
+                        .last()
+                        .map(String::as_str)
+                        .unwrap_or("model.local")
+                        .to_string()
                 } else {
-                    DEFAULT_FALLBACK_TIERS.last().copied().unwrap_or("model.local").to_string()
+                    DEFAULT_FALLBACK_TIERS
+                        .last()
+                        .copied()
+                        .unwrap_or("model.local")
+                        .to_string()
                 };
                 warn!(
                     session_id = %session_id,
@@ -3018,14 +3062,25 @@ impl AgentRuntime {
         turn_id: String,
         proposal: PlanProposalAction,
     ) -> Result<()> {
-        let (task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
-             checkpoint_memory_type, checkpoint_json, index_state) = {
+        let (
+            task_id,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Received plan_proposal for unknown session {}", session_id);
                 return Ok(());
             };
             let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!("Received plan_proposal for session {} with no active turn", session_id);
+                warn!(
+                    "Received plan_proposal for session {} with no active turn",
+                    session_id
+                );
                 return Ok(());
             };
             let task_id = active_turn.task_id;
@@ -3502,22 +3557,28 @@ impl AgentRuntime {
             // re-enter the model without dispatching the tool again. This prevents
             // spin loops where the model calls an idempotent tool (e.g. role.create_or_update)
             // repeatedly after it already succeeded.
-            let canonical_args =
-                serde_json::to_string(&tool_call.arguments).unwrap_or_default();
-            let (already_succeeded, dedup_chat_id, dedup_reply_to, dedup_reply_role,
-                 dedup_reply_guest_id) = {
+            let canonical_args = serde_json::to_string(&tool_call.arguments).unwrap_or_default();
+            let (
+                already_succeeded,
+                dedup_chat_id,
+                dedup_reply_to,
+                dedup_reply_role,
+                dedup_reply_guest_id,
+            ) = {
                 let state = self.sessions.get(&session_id);
                 let prev_success = state
                     .and_then(|s| s.active_turn.as_ref())
                     .map(|turn| {
-                        turn.working_tool_history.iter().any(|(prev_call, prev_result)| {
-                            prev_call.tool_name == tool_call.tool_name
-                                && serde_json::to_string(&prev_call.arguments)
-                                    .unwrap_or_default()
-                                    == canonical_args
-                                && !prev_result.content.to_lowercase().contains("error")
-                                && !prev_result.content.to_lowercase().contains("failed")
-                        })
+                        turn.working_tool_history
+                            .iter()
+                            .any(|(prev_call, prev_result)| {
+                                prev_call.tool_name == tool_call.tool_name
+                                    && serde_json::to_string(&prev_call.arguments)
+                                        .unwrap_or_default()
+                                        == canonical_args
+                                    && !prev_result.content.to_lowercase().contains("error")
+                                    && !prev_result.content.to_lowercase().contains("failed")
+                            })
                     })
                     .unwrap_or(false);
                 let (chat_id, reply_to, reply_role, reply_guest) = state
@@ -6132,7 +6193,10 @@ impl AgentRuntime {
             .iter()
             .filter_map(|node| {
                 let label = node.get("label").and_then(|v| v.as_str())?;
-                let props = node.get("properties").cloned().unwrap_or(serde_json::json!({}));
+                let props = node
+                    .get("properties")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 Some(format!("{label}: {props}"))
             })
             .collect::<Vec<_>>()
@@ -6992,7 +7056,9 @@ impl AgentRuntime {
                                 format!("Switched to {p} voice, using stored ID {stored}.")
                             }
                             (None, None) => {
-                                format!("Switched to {p} voice. No voice ID stored for {p} — use `/voice {p} <id>` to set one.")
+                                format!(
+                                    "Switched to {p} voice. No voice ID stored for {p} — use `/voice {p} <id>` to set one."
+                                )
                             }
                         }
                     }
@@ -8818,8 +8884,10 @@ impl AgentRuntime {
                                 roles.len()
                             )];
                             for role in &roles {
-                                let name =
-                                    role.get("role_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                let name = role
+                                    .get("role_name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
                                 let profile = role
                                     .get("toolset_profile")
                                     .and_then(|v| v.as_str())
@@ -8875,8 +8943,8 @@ impl AgentRuntime {
             }
 
             "training.list" => {
-                use philotic_client::IpcRequest;
                 use ansible_mesh_core::whisper_training::TrainingFilter;
+                use philotic_client::IpcRequest;
                 let args = payload.arguments.as_object();
                 let limit = args
                     .and_then(|a| a.get("limit"))
@@ -8906,7 +8974,11 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
                         let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
                         let samples = data
                             .get("samples")
@@ -8914,27 +8986,54 @@ impl AgentRuntime {
                             .cloned()
                             .unwrap_or_default();
                         if samples.is_empty() {
-                            (format!("No training samples found (filter: {filter_str})."), None)
-                        } else {
-                            let lines: Vec<String> = std::iter::once(
-                                format!("{count} training sample(s) (filter: {filter_str}):")
+                            (
+                                format!("No training samples found (filter: {filter_str})."),
+                                None,
                             )
+                        } else {
+                            let lines: Vec<String> = std::iter::once(format!(
+                                "{count} training sample(s) (filter: {filter_str}):"
+                            ))
                             .chain(samples.iter().map(|s| {
-                                let sid = s.get("sample_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let sid =
+                                    s.get("sample_id").and_then(|v| v.as_str()).unwrap_or("?");
                                 let turn = s.get("turn_id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let raw = s.get("raw_transcript").and_then(|v| v.as_str()).unwrap_or("");
-                                let corrected = s.get("corrected_transcript").and_then(|v| v.as_str());
-                                let eligible = s.get("training_eligible").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let exported = s.get("exported_at").and_then(|v| v.as_u64()).is_some();
-                                let state = if exported { "exported" } else if eligible { "eligible" } else if corrected.is_some() { "corrected" } else { "uncorrected" };
+                                let raw = s
+                                    .get("raw_transcript")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let corrected =
+                                    s.get("corrected_transcript").and_then(|v| v.as_str());
+                                let eligible = s
+                                    .get("training_eligible")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let exported =
+                                    s.get("exported_at").and_then(|v| v.as_u64()).is_some();
+                                let state = if exported {
+                                    "exported"
+                                } else if eligible {
+                                    "eligible"
+                                } else if corrected.is_some() {
+                                    "corrected"
+                                } else {
+                                    "uncorrected"
+                                };
                                 let transcript = corrected.unwrap_or(raw);
-                                format!("  [{state}] {sid}  turn={turn}  transcript={transcript:.80}")
+                                format!(
+                                    "  [{state}] {sid}  turn={turn}  transcript={transcript:.80}"
+                                )
                             }))
                             .collect();
                             (lines.join("\n"), None)
                         }
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -8975,27 +9074,29 @@ impl AgentRuntime {
                     .and_then(|a| a.get("corrected_transcript"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                let (Some(turn_id), Some(corrected_transcript)) = (turn_id, corrected_transcript) else {
+                let (Some(turn_id), Some(corrected_transcript)) = (turn_id, corrected_transcript)
+                else {
                     let err = TaskErrorPayload::ipc_failure(
                         "philote",
                         "MISSING_ARGS",
                         "training.correct requires 'turn_id' and 'corrected_transcript'",
                     );
-                    return self.handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        source: Some("agent".into()),
-                        session_id: Some(payload.session_id),
-                        turn_id: Some(payload.turn_id),
-                        chat_id: Some(payload.chat_id),
-                        content: Some(err.display_message()),
-                        error: Some(err),
-                        tool_name: Some(payload.tool_name),
-                        final_reply_to: Some(payload.final_reply_to),
-                        final_reply_role: Some(payload.final_reply_role),
-                        final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await;
+                    return self
+                        .handle_tool_result(InboundTaskPayload {
+                            action: Some("tool_result".into()),
+                            source: Some("agent".into()),
+                            session_id: Some(payload.session_id),
+                            turn_id: Some(payload.turn_id),
+                            chat_id: Some(payload.chat_id),
+                            content: Some(err.display_message()),
+                            error: Some(err),
+                            tool_name: Some(payload.tool_name),
+                            final_reply_to: Some(payload.final_reply_to),
+                            final_reply_role: Some(payload.final_reply_role),
+                            final_reply_guest_id: payload.final_reply_guest_id,
+                            ..Default::default()
+                        })
+                        .await;
                 };
                 let (content, tool_err) = match self
                     .ipc_client
@@ -9005,10 +9106,18 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        (format!("Correction applied to turn '{turn_id}'. Sample marked training_eligible."), None)
-                    }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => (
+                        format!(
+                            "Correction applied to turn '{turn_id}'. Sample marked training_eligible."
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9039,8 +9148,8 @@ impl AgentRuntime {
             }
 
             "training.export" => {
-                use philotic_client::IpcRequest;
                 use ansible_mesh_core::whisper_training::TrainingExportFormat;
+                use philotic_client::IpcRequest;
                 let args = payload.arguments.as_object();
                 let format_str = args
                     .and_then(|a| a.get("format"))
@@ -9060,21 +9169,22 @@ impl AgentRuntime {
                         "MISSING_ARGS",
                         "training.export requires 'format' and 'output_path'",
                     );
-                    return self.handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        source: Some("agent".into()),
-                        session_id: Some(payload.session_id),
-                        turn_id: Some(payload.turn_id),
-                        chat_id: Some(payload.chat_id),
-                        content: Some(err.display_message()),
-                        error: Some(err),
-                        tool_name: Some(payload.tool_name),
-                        final_reply_to: Some(payload.final_reply_to),
-                        final_reply_role: Some(payload.final_reply_role),
-                        final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await;
+                    return self
+                        .handle_tool_result(InboundTaskPayload {
+                            action: Some("tool_result".into()),
+                            source: Some("agent".into()),
+                            session_id: Some(payload.session_id),
+                            turn_id: Some(payload.turn_id),
+                            chat_id: Some(payload.chat_id),
+                            content: Some(err.display_message()),
+                            error: Some(err),
+                            tool_name: Some(payload.tool_name),
+                            final_reply_to: Some(payload.final_reply_to),
+                            final_reply_role: Some(payload.final_reply_role),
+                            final_reply_guest_id: payload.final_reply_guest_id,
+                            ..Default::default()
+                        })
+                        .await;
                 };
                 let format = if format_str == "nemo" {
                     TrainingExportFormat::Nemo
@@ -9096,9 +9206,19 @@ impl AgentRuntime {
                             .and_then(|d| d.get("exported_count"))
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        (format!("Exported {count} sample(s) ({format_str} format) → {output_path}"), None)
+                        (
+                            format!(
+                                "Exported {count} sample(s) ({format_str} format) → {output_path}"
+                            ),
+                            None,
+                        )
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9142,10 +9262,17 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
                         let status = data.get("status").cloned().unwrap_or_default();
                         let total = status.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let uncorrected = status.get("uncorrected").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let uncorrected = status
+                            .get("uncorrected")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         let eligible = status.get("eligible").and_then(|v| v.as_u64()).unwrap_or(0);
                         let exported = status.get("exported").and_then(|v| v.as_u64()).unwrap_or(0);
                         let content = format!(
@@ -9153,7 +9280,12 @@ impl AgentRuntime {
                         );
                         (content, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9207,7 +9339,11 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
                         let msg = data
                             .get("message")
                             .and_then(|v| v.as_str())
@@ -9215,7 +9351,12 @@ impl AgentRuntime {
                             .to_string();
                         (msg, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9252,18 +9393,36 @@ impl AgentRuntime {
                     .send_request(IpcRequest::AsrStatus {})
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
-                        let registered = data.get("registered").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let active = data.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let registered = data
+                            .get("registered")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let active = data
+                            .get("active")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let pid = data.get("pid").and_then(|v| v.as_str()).unwrap_or("none");
-                        let nemo = data.get("nemo_available").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let nemo = data
+                            .get("nemo_available")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let guest_id = data.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?");
                         let content = format!(
                             "Parakeet ASR status:\n  guest: {guest_id}\n  registered: {registered}\n  active: {active}\n  pid: {pid}\n  nemo_available: {nemo}"
                         );
                         (content, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9309,18 +9468,22 @@ impl AgentRuntime {
                                 .map(|j| {
                                     format!(
                                         "- id={} role={} schedule={} enabled={} next_fire={}",
-                                        j.id,
-                                        j.target_role,
-                                        j.schedule,
-                                        j.enabled,
-                                        j.next_fire_at,
+                                        j.id, j.target_role, j.schedule, j.enabled, j.next_fire_at,
                                     )
                                 })
                                 .collect();
-                            (format!("Cron jobs ({}):\n{}", jobs.len(), lines.join("\n")), None)
+                            (
+                                format!("Cron jobs ({}):\n{}", jobs.len(), lines.join("\n")),
+                                None,
+                            )
                         }
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9351,8 +9514,8 @@ impl AgentRuntime {
             }
 
             "cron.register" => {
-                use philotic_client::IpcRequest;
                 use ansible_mesh_core::cron::{CronJob, CronJobSource};
+                use philotic_client::IpcRequest;
                 let args = &payload.arguments;
                 let schedule = match args.get("schedule").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
@@ -9436,7 +9599,12 @@ impl AgentRuntime {
                     Ok(IpcResponse::Standard { ok: true, .. }) => {
                         (format!("Cron job registered. id={job_id}"), None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9482,13 +9650,20 @@ impl AgentRuntime {
                 };
                 let (content, tool_err) = match self
                     .ipc_client
-                    .send_request(IpcRequest::EnableCronJob { job_id: job_id.clone() })
+                    .send_request(IpcRequest::EnableCronJob {
+                        job_id: job_id.clone(),
+                    })
                     .await
                 {
                     Ok(IpcResponse::Standard { ok: true, .. }) => {
                         (format!("Cron job {job_id} enabled."), None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9534,13 +9709,20 @@ impl AgentRuntime {
                 };
                 let (content, tool_err) = match self
                     .ipc_client
-                    .send_request(IpcRequest::DisableCronJob { job_id: job_id.clone() })
+                    .send_request(IpcRequest::DisableCronJob {
+                        job_id: job_id.clone(),
+                    })
                     .await
                 {
                     Ok(IpcResponse::Standard { ok: true, .. }) => {
                         (format!("Cron job {job_id} disabled."), None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9586,13 +9768,20 @@ impl AgentRuntime {
                 };
                 let (content, tool_err) = match self
                     .ipc_client
-                    .send_request(IpcRequest::RemoveCronJob { job_id: job_id.clone() })
+                    .send_request(IpcRequest::RemoveCronJob {
+                        job_id: job_id.clone(),
+                    })
                     .await
                 {
                     Ok(IpcResponse::Standard { ok: true, .. }) => {
                         (format!("Cron job {job_id} removed."), None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -10806,7 +10995,8 @@ impl AgentRuntime {
                         .fail_active_turn(
                             session_id,
                             turn_id,
-                            "approval.request_standing: missing required argument 'tool_name'".into(),
+                            "approval.request_standing: missing required argument 'tool_name'"
+                                .into(),
                         )
                         .await;
                 }
@@ -10896,17 +11086,24 @@ impl AgentRuntime {
 
                 let preapproval_rules: Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule> =
                     args.get("preapproval_rules")
-                        .and_then(|v| serde_json::from_value::<Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule>>(v.clone()).ok())
+                        .and_then(|v| {
+                            serde_json::from_value::<
+                                Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule>,
+                            >(v.clone())
+                            .ok()
+                        })
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|mut rule: ansible_mesh_core::mcp_endpoint::McpPreapprovalRule| {
-                            rule.approved_by_turn = turn_id.clone();
-                            rule.approved_at = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            rule
-                        })
+                        .map(
+                            |mut rule: ansible_mesh_core::mcp_endpoint::McpPreapprovalRule| {
+                                rule.approved_by_turn = turn_id.clone();
+                                rule.approved_at = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                rule
+                            },
+                        )
                         .collect();
 
                 let updated_at = std::time::SystemTime::now()
@@ -10951,15 +11148,21 @@ impl AgentRuntime {
                             None,
                         )
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", &*code, message,
-                        );
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
                         let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", "IPC_ERROR", msg,
+                            "aiua",
+                            "IPC_ERROR",
+                            msg,
                         );
                         (e.display_message(), Some(e))
                     }
@@ -11040,19 +11243,30 @@ impl AgentRuntime {
                     .await;
 
                 let (content, tool_err) = match response {
-                    Ok(IpcResponse::McpEndpointProvisioned { endpoint_id: ref eid, .. }) => (
-                        format!("MCP endpoint '{eid}' revoked. The membrane-mcp guest has been signalled to shut down."),
+                    Ok(IpcResponse::McpEndpointProvisioned {
+                        endpoint_id: ref eid,
+                        ..
+                    }) => (
+                        format!(
+                            "MCP endpoint '{eid}' revoked. The membrane-mcp guest has been signalled to shut down."
+                        ),
                         None,
                     ),
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", &*code, message,
-                        );
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
                         let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", "IPC_ERROR", msg,
+                            "aiua",
+                            "IPC_ERROR",
+                            msg,
                         );
                         (e.display_message(), Some(e))
                     }
@@ -11164,12 +11378,13 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::ConfigData { value_json: Some(raw), .. }) => {
-                        serde_json::from_str(&raw).unwrap_or(serde_json::json!({
-                            "filter_keys": {},
-                            "event_kinds": {}
-                        }))
-                    }
+                    Ok(IpcResponse::ConfigData {
+                        value_json: Some(raw),
+                        ..
+                    }) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({
+                        "filter_keys": {},
+                        "event_kinds": {}
+                    })),
                     _ => serde_json::json!({ "filter_keys": {}, "event_kinds": {} }),
                 };
 
@@ -11201,8 +11416,9 @@ impl AgentRuntime {
                     handler["adapter_script"] = serde_json::Value::String(script);
                 }
 
-                if let Some(kinds) =
-                    config.get_mut("event_kinds").and_then(|v| v.as_object_mut())
+                if let Some(kinds) = config
+                    .get_mut("event_kinds")
+                    .and_then(|v| v.as_object_mut())
                 {
                     kinds.insert(event_kind.clone(), handler);
                 }
@@ -11226,10 +11442,14 @@ impl AgentRuntime {
                         ),
                         None,
                     ),
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", &*code, message,
-                        );
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => ("table.add_listener: unexpected hotel response".into(), None),

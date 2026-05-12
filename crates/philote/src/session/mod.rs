@@ -99,7 +99,8 @@ pub struct SessionState {
     /// The payload preserves session_id, chat_id, and exosome context so the
     /// correct Telegram session/chat is restored when the task is dispatched.
     /// Voice tasks are queued raw and will be transcribed when they reach the front.
-    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload, std::time::Instant)>,
+    pub pending_user_tasks:
+        std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload, std::time::Instant)>,
     /// Optional role name of the queue arbiter.
     /// When set, TEXT tasks queued while a turn is active are routed to this specialist
     /// role via paracrine dispatch for priority evaluation. The arbiter may call
@@ -187,24 +188,29 @@ impl SessionState {
 
     /// Enqueue a user task for deferred processing after the current turn completes.
     pub fn enqueue_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_back((task_id, task, std::time::Instant::now()));
+        self.pending_user_tasks
+            .push_back((task_id, task, std::time::Instant::now()));
     }
 
     /// Prepend a user task to the front of the queue (high priority, arbiter-promoted).
     pub fn prepend_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_front((task_id, task, std::time::Instant::now()));
+        self.pending_user_tasks
+            .push_front((task_id, task, std::time::Instant::now()));
     }
 
     /// Pop the next pending user task, if any. Strips the enqueue timestamp.
     pub fn dequeue_user_task(&mut self) -> Option<(uuid::Uuid, InboundTaskPayload)> {
-        self.pending_user_tasks.pop_front().map(|(id, task, _)| (id, task))
+        self.pending_user_tasks
+            .pop_front()
+            .map(|(id, task, _)| (id, task))
     }
 
     /// Drop any queued tasks older than `max_age_secs`. Returns the number evicted.
     pub fn evict_stale_queued_tasks(&mut self, max_age_secs: u64) -> usize {
         let cutoff = std::time::Duration::from_secs(max_age_secs);
         let before = self.pending_user_tasks.len();
-        self.pending_user_tasks.retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
+        self.pending_user_tasks
+            .retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
         before - self.pending_user_tasks.len()
     }
 
@@ -535,27 +541,44 @@ impl SessionState {
     pub fn register_standing_preapproval(&mut self, tool_name: &str, required_successes: u32) {
         let current = *self.tool_success_streak.get(tool_name).unwrap_or(&0);
         if current >= required_successes {
-            if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
-                self.approval_policy.preapproved_tools.push(tool_name.to_string());
+            if !self
+                .approval_policy
+                .preapproved_tools
+                .contains(&tool_name.to_string())
+            {
+                self.approval_policy
+                    .preapproved_tools
+                    .push(tool_name.to_string());
             }
         } else {
-            self.pending_preapproval_thresholds.insert(tool_name.to_string(), required_successes);
+            self.pending_preapproval_thresholds
+                .insert(tool_name.to_string(), required_successes);
         }
     }
 
     /// Record a successful tool execution for streak tracking.
     /// If the streak hits a registered threshold, grants standing preapproval.
     pub fn record_tool_streak_success(&mut self, tool_name: &str) {
-        let streak = self.tool_success_streak.entry(tool_name.to_string()).or_insert(0);
+        let streak = self
+            .tool_success_streak
+            .entry(tool_name.to_string())
+            .or_insert(0);
         *streak += 1;
         if let Some(&threshold) = self.pending_preapproval_thresholds.get(tool_name) {
             if *streak >= threshold {
                 self.pending_preapproval_thresholds.remove(tool_name);
-                if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
-                    self.approval_policy.preapproved_tools.push(tool_name.to_string());
+                if !self
+                    .approval_policy
+                    .preapproved_tools
+                    .contains(&tool_name.to_string())
+                {
+                    self.approval_policy
+                        .preapproved_tools
+                        .push(tool_name.to_string());
                     tracing::info!(
                         "ConditionalPreapproval: '{}' earned standing approval after {} successive successes.",
-                        tool_name, *streak
+                        tool_name,
+                        *streak
                     );
                 }
             }
@@ -1690,7 +1713,11 @@ impl SessionState {
             );
         }
 
-        if let Some(graph_content) = self.agent_graph_snapshot.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(graph_content) = self
+            .agent_graph_snapshot
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             self.push_layer(
                 &mut layers,
                 &mut contributions,
@@ -2404,7 +2431,11 @@ impl SessionState {
         }
 
         if !turn.working_tool_history.is_empty() {
-            let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
+            let max_result_chars = self
+                .settings
+                .context_window
+                .max_tool_result_chars
+                .max(1_000);
             lines.push(format!(
                 "Tool history entries in local working state: {}.",
                 turn.working_tool_history.len()
@@ -2823,7 +2854,10 @@ impl SessionState {
             // Discard non-restorable turns — after a restart, in-flight model/tool/voice
             // calls are gone. Restoring them leaves is_turn_active()=true forever.
             // Only waiting_approval is worth keeping (operator may still resolve it).
-            let phase_str = turn.get("phase").and_then(serde_json::Value::as_str).unwrap_or("queued");
+            let phase_str = turn
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("queued");
             if !matches!(phase_str, "waiting_approval") {
                 return None;
             }
@@ -3292,7 +3326,12 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
 
     // Always include observer and meta-approval tools — every philote can inspect its own
     // session/hotel and request standing approval for tools it uses regularly.
-    for always in ["session.status", "hotel.status", "hotel.logs", "approval.request_standing"] {
+    for always in [
+        "session.status",
+        "hotel.status",
+        "hotel.logs",
+        "approval.request_standing",
+    ] {
         let always = always.to_string();
         if !toolset.contains(&always) {
             toolset.push(always);
@@ -5993,7 +6032,11 @@ mod tests {
         // Other capabilities are unaffected.
         assert_eq!(
             state.preferred_component_implementation("voice.synthesize"),
-            state.agent_profile.voice_response_policy.provider.as_deref()
+            state
+                .agent_profile
+                .voice_response_policy
+                .provider
+                .as_deref()
         );
         assert_eq!(
             state.preferred_component_implementation("text.generate"),
@@ -6003,8 +6046,11 @@ mod tests {
 
     #[test]
     fn transcription_provider_none_when_not_configured() {
-        let state =
-            SessionState::new("sess-tx2".into(), "agent-bjork-01".into(), "telegram".into());
+        let state = SessionState::new(
+            "sess-tx2".into(),
+            "agent-bjork-01".into(),
+            "telegram".into(),
+        );
         // Default MediaRoutingPolicy has no transcription_provider.
         assert_eq!(
             state.preferred_component_implementation("voice.transcribe"),
@@ -6025,16 +6071,24 @@ mod tests {
         assert_eq!(json["transcription_provider"], "onnx");
 
         let round_tripped: MediaRoutingPolicy = serde_json::from_value(json).unwrap();
-        assert_eq!(round_tripped.transcription_provider.as_deref(), Some("onnx"));
+        assert_eq!(
+            round_tripped.transcription_provider.as_deref(),
+            Some("onnx")
+        );
     }
 
     #[test]
     fn component_route_assembly_takes_precedence_over_transcription_provider() {
-        use crate::session::types::{ComponentExecutionRoute, ComponentRouteAssembly, MediaRoutingPolicy};
+        use crate::session::types::{
+            ComponentExecutionRoute, ComponentRouteAssembly, MediaRoutingPolicy,
+        };
         use std::collections::BTreeMap;
 
-        let mut state =
-            SessionState::new("sess-tx3".into(), "agent-bjork-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-tx3".into(),
+            "agent-bjork-01".into(),
+            "telegram".into(),
+        );
         state.agent_profile.media_routing_policy = MediaRoutingPolicy {
             transcription_provider: Some("onnx".into()),
             ..MediaRoutingPolicy::default()
@@ -6058,7 +6112,11 @@ mod tests {
         // returns None because the route assembly takes the component_route_for_capability path.
         // Callers use resolve_model_execution_target which checks route assembly before falling
         // back to preferred_component_implementation — just assert both APIs are consistent.
-        assert!(state.resolve_component_execution_route("voice.transcribe").is_some());
+        assert!(
+            state
+                .resolve_component_execution_route("voice.transcribe")
+                .is_some()
+        );
     }
 
     fn make_turn_with_plan(plan: ActivePlan) -> WorkingTurn {
