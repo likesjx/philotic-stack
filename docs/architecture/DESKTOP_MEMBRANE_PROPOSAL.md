@@ -20,6 +20,7 @@ related_docs:
 - PHILOTIC_WEB_PROPOSAL.md
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
 - HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md
+- DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md
 - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
 task_refs:
 - docs/task.md
@@ -115,6 +116,8 @@ Current embedded desktop behavior in `jaredlikes-desktop`:
 - relies on cookie-backed membrane session probing instead of injected startup credentials
 - keeps explicit bearer-token `connect(token, baseUrl)` only as a remote/debug path
 - leaves broader desktop/OS components in source, but does not load them in the default membrane entrypoint
+
+The actual desktop substrate and the system-settings vs workspace-app split are now documented explicitly in [DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md). That document is the right home for how the desktop itself is structured; this membrane proposal stays focused on authority and transport boundaries.
 
 This proves the direction, but it is still transitional rather than a finished membrane boundary because the first remote status and guest query paths are narrow and still rely on a daemon-owned management worker plus reply delivery over the existing task transport, guest inventory still falls back to an explicit error state when that remote path is unavailable, any future apartment-style diagnostic surface still needs a shaped hotel-owned design, and bearer compatibility fallbacks still exist.
 

@@ -1206,6 +1206,12 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - `jaredlikes-desktop` source ownership
   - `philotic-web` embedding/runtime ownership
   - release pipeline provenance ownership
+- [~] Define the desktop workspace component model.
+  - [x] document the current desktop substrate: application registry/manager, window manager, desktop manager, event bus, widget manager
+  - [x] document the system-settings vs workspace-app split
+  - [x] document the philote-published app/customization direction and artifact/catalog boundary
+  - [ ] formalize the first graph-canonical desktop app schema for philote-published apps
+  - [ ] define widget/app publication permissions and artifact verification rules
 - [ ] Define the frontend development workflow for:
   - frontend-first local iteration
   - integrated membrane development
