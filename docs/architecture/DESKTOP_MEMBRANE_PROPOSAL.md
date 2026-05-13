@@ -72,6 +72,7 @@ Recommended shape:
 6. mesh-wide actions flow through explicit control-plane routing, remote management transport, and target-scoped grants rather than ambient trust
 7. losing the lease must fail closed: privileged reads stop, mutating routes stop, websocket clients are disconnected, and session credentials are invalidated
 8. before hotel auth succeeds, the membrane may expose only a bootstrap/login shell and basic surface reachability
+9. the desktop shell should carry an explicit locked/unlocked operator posture at the system level so non-settings apps do not improvise their own auth policy
 
 Those operator surfaces should eventually be reusable by agents and automation too, with caller-aware redaction and posture/grant checks.
 
@@ -103,6 +104,7 @@ Current behavior in `crates/philotic-web/src/serve.rs`:
 - exchanges the bootstrap token for a hotel-issued same-origin `HttpOnly` operator session cookie
 - uses that operator session for websocket attach
 - now defers the actual bootstrap/login UX to `System Settings > Aiua Membrane`, while unauthenticated Aiua workspace surfaces stay locked
+- now carries the first shell-level operator-session gate: unauthenticated app launches are blocked through the desktop event bus, `System Settings` remains allowlisted as the bootstrap authority surface, and the desktop renders an explicit locked-state overlay instead of hoping each workspace app remembers to be responsible
 - now routes local status, guest summaries, and redacted agent summaries through explicit hotel-owned IPC view models
 - now exposes a first typed mesh target inventory view from the hotel-owned registry with source-hotel, target-hotel, reachability, and freshness attribution
 - now exposes a first target-status view that is `local-canonical` for the local hotel, attempts a direct target-hotel query for remote targets, and falls back to `remote-heartbeat-observed` when that query path does not complete
@@ -116,11 +118,13 @@ Current embedded desktop behavior in `jaredlikes-desktop`:
 - defaults the membrane client to `window.location.origin` for embedded same-origin use
 - relies on cookie-backed membrane session probing instead of injected startup credentials
 - keeps explicit bearer-token `connect(token, baseUrl)` only as a remote/debug path
-- leaves broader desktop/OS components in source, but does not load them in the default membrane entrypoint
+- now treats `System Settings > Aiua Membrane` as the system-owned bootstrap panel
+- now carries a first `operator-session-gate` service that gates non-settings app launch/focus until the hotel reports an authenticated operator session
+- now uses desktop event-bus transitions (`desktop:open-auth-settings`, `desktop:auth-gate-blocked`, `aiua:auth-required`, `aiua:auth-succeeded`, `aiua:logout`) so auth posture is coordinated at the shell layer instead of by ad hoc app-local DOM glue
 
 The actual desktop substrate and the system-settings vs workspace-app split are now documented explicitly in [DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md). That document is the right home for how the desktop itself is structured; this membrane proposal stays focused on authority and transport boundaries.
 
-This proves the direction, but it is still transitional rather than a finished membrane boundary because the first remote status and guest query paths are narrow and still rely on a daemon-owned management worker plus reply delivery over the existing task transport, guest inventory still falls back to an explicit error state when that remote path is unavailable, any future apartment-style diagnostic surface still needs a shaped hotel-owned design, and bearer compatibility fallbacks still exist.
+This proves the direction, but it is still transitional rather than a finished membrane boundary because the first remote status and guest query paths are narrow and still rely on a daemon-owned management worker plus reply delivery over the existing task transport, guest inventory still falls back to an explicit error state when that remote path is unavailable, any future apartment-style diagnostic surface still needs a shaped hotel-owned design, bearer compatibility fallbacks still exist, and the shell-wide locked visual posture is still a first slice rather than the final environment-wide policy model.
 
 One more boundary correction became explicit while exploring remote agent inventory and operator chat: continuing to add `desktop_membrane.*` actions and desktop-shaped reply contracts directly inside `aiua` core would undermine the intended plug-and-play membrane model. That correction is now tracked in [OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md).
 

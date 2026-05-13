@@ -1187,6 +1187,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [x] no-view-before-auth rule for the always-on desktop: keep operator work surfaces locked until a hotel-issued operator session exists
   - [x] first login/bootstrap path: hotel-issued startup bootstrap token exchanged for a bounded operator session cookie
   - [x] move the bootstrap UX into `System Settings > Aiua Membrane` while the embedded desktop shell stays live before auth
+  - [x] shell-level operator-session gate: before auth, non-settings workspace app launch/focus is blocked and redirected through the desktop event bus into `System Settings > Aiua Membrane`
   - [ ] hotel-local authority for root-user key refs and real vault bindings beyond bootstrap schema
   - [ ] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
   - [ ] philote-visible bounded user context projection instead of raw root-user secret access

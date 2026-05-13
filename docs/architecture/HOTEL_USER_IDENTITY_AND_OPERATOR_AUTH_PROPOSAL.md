@@ -192,6 +192,7 @@ The first concrete bootstrap/session slice is now real in `philotic-web`:
 - `POST /api/auth/bootstrap` exchanges the bootstrap token for a bounded operator session cookie
 - `GET /api/auth/status` reports whether the current browser session is authenticated so the desktop can stay locked until the hotel issues a session
 - `POST /api/auth/logout` revokes the current operator session and clears the cookie
+- the desktop shell now carries the first system-level lock gate: non-settings workspace apps are blocked and redirected into `System Settings > Aiua Membrane` until the hotel issues a session
 
 This is intentionally a first slice, not a final auth model:
 
@@ -234,6 +235,7 @@ Allowed unauthenticated surface:
 - login / step-up ceremony
 - session-expired notice
 - basic surface health such as “desktop membrane reachable”
+- desktop shell frame plus lock-state explanation
 
 This keeps “always on” from quietly becoming “always visible.”
 
