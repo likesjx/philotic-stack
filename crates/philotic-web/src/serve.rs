@@ -60,10 +60,12 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use base64::Engine;
 use rand::Rng;
 use rusqlite::{Connection, OptionalExtension};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -269,6 +271,8 @@ struct BootstrapAuthBody {
 struct AuthStatusView {
     authenticated: bool,
     hotel: String,
+    #[serde(default)]
+    root_user_key_refs: Vec<RootUserKeyRefStatusView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<OperatorSessionStatusView>,
 }
@@ -282,6 +286,18 @@ struct OperatorSessionStatusView {
     issued_at: i64,
     expires_at: i64,
     auth_method: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct RootUserKeyRefStatusView {
+    user_id: String,
+    key_purpose: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vault_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_fingerprint: Option<String>,
+    rotation_state: String,
+    source_kind: String,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -971,9 +987,12 @@ async fn handle_static(
 
 async fn handle_auth_status(headers: HeaderMap, State(state): State<AppState>) -> Response {
     let session = current_operator_session(&headers, &state);
+    let root_user_key_refs =
+        list_root_user_key_refs(&state.db_path, &state.hotel).unwrap_or_default();
     Json(AuthStatusView {
         authenticated: session.is_some(),
         hotel: (*state.hotel).clone(),
+        root_user_key_refs,
         session: session.map(|session| OperatorSessionStatusView {
             session_id: session.session_id,
             user_id: session.user_id,
@@ -1026,6 +1045,8 @@ async fn handle_auth_bootstrap(
     let mut response = Json(AuthStatusView {
         authenticated: true,
         hotel: (*state.hotel).clone(),
+        root_user_key_refs: list_root_user_key_refs(&state.db_path, &state.hotel)
+            .unwrap_or_default(),
         session: Some(OperatorSessionStatusView {
             session_id: session.session_id.clone(),
             user_id: session.user_id.clone(),
@@ -4329,7 +4350,54 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
         ],
     )?;
 
+    let root_ref = detect_root_user_key_ref(hotel);
+    conn.execute(
+        "INSERT INTO root_user_key_refs
+         (user_id, key_purpose, vault_ref, public_fingerprint, rotation_state, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(user_id, key_purpose) DO UPDATE SET
+            vault_ref=excluded.vault_ref,
+            public_fingerprint=excluded.public_fingerprint,
+            rotation_state=excluded.rotation_state,
+            updated_at=excluded.updated_at",
+        rusqlite::params![
+            default_operator_user_id(hotel),
+            root_ref.key_purpose,
+            root_ref.vault_ref,
+            root_ref.public_fingerprint,
+            root_ref.rotation_state,
+            now,
+        ],
+    )?;
+
     Ok(())
+}
+
+fn list_root_user_key_refs(
+    db_path: &PathBuf,
+    hotel: &str,
+) -> Result<Vec<RootUserKeyRefStatusView>> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT user_id, key_purpose, vault_ref, public_fingerprint, rotation_state
+         FROM root_user_key_refs
+         WHERE user_id = ?1
+         ORDER BY key_purpose",
+    )?;
+    let rows = stmt.query_map([default_operator_user_id(hotel)], |row| {
+        let vault_ref: Option<String> = row.get(2)?;
+        Ok(RootUserKeyRefStatusView {
+            user_id: row.get(0)?,
+            key_purpose: row.get(1)?,
+            source_kind: root_user_key_source_kind(&vault_ref),
+            vault_ref,
+            public_fingerprint: row.get(3)?,
+            rotation_state: row.get(4)?,
+        })
+    })?;
+
+    Ok(rows.filter_map(Result::ok).collect())
 }
 
 fn issue_operator_session(
@@ -4431,6 +4499,125 @@ fn default_operator_display_name() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Operator".into())
+}
+
+fn detect_root_user_key_ref(hotel: &str) -> RootUserKeyRefStatusView {
+    let account = vault_root_key_account();
+    if cfg!(target_os = "macos") {
+        let keychain_ref = format!("keychain://ai.philotic.hotel-vault/{account}");
+        match load_root_key_from_keychain(&account) {
+            Ok(Some(key_bytes)) => {
+                return RootUserKeyRefStatusView {
+                    user_id: default_operator_user_id(hotel),
+                    key_purpose: "vault-root-key".into(),
+                    vault_ref: Some(keychain_ref),
+                    public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
+                    rotation_state: "active".into(),
+                    source_kind: "keychain".into(),
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return RootUserKeyRefStatusView {
+                    user_id: default_operator_user_id(hotel),
+                    key_purpose: "vault-root-key".into(),
+                    vault_ref: Some(keychain_ref),
+                    public_fingerprint: None,
+                    rotation_state: "unavailable".into(),
+                    source_kind: "keychain-error".into(),
+                };
+            }
+        }
+    }
+
+    match load_root_key_from_env() {
+        Ok(key_bytes) => RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: Some(format!(
+                "env://PHILOTIC_VAULT_MASTER_KEY/{}",
+                vault_root_key_account()
+            )),
+            public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
+            rotation_state: "active".into(),
+            source_kind: "env".into(),
+        },
+        Err(_) => RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: None,
+            public_fingerprint: None,
+            rotation_state: "unavailable".into(),
+            source_kind: "missing".into(),
+        },
+    }
+}
+
+fn load_root_key_from_env() -> Result<Vec<u8>> {
+    let raw = std::env::var("PHILOTIC_VAULT_MASTER_KEY")?;
+    decode_root_key(raw.trim(), "PHILOTIC_VAULT_MASTER_KEY")
+}
+
+fn load_root_key_from_keychain(account: &str) -> Result<Option<Vec<u8>>> {
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "ai.philotic.hotel-vault",
+            "-a",
+            account,
+            "-w",
+        ])
+        .output()?;
+
+    if output.status.success() {
+        let raw = String::from_utf8(output.stdout)?;
+        return decode_root_key(raw.trim(), "macOS Keychain").map(Some);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("could not be found")
+        || stderr.contains("The specified item could not be found")
+    {
+        return Ok(None);
+    }
+
+    anyhow::bail!(
+        "failed to read Philotic vault root key from macOS Keychain: {}",
+        stderr.trim()
+    )
+}
+
+fn decode_root_key(raw: &str, source: &str) -> Result<Vec<u8>> {
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|err| anyhow!("failed to decode {source} as base64: {err}"))?;
+    if key_bytes.len() != 32 {
+        anyhow::bail!("{source} must decode to exactly 32 bytes");
+    }
+    Ok(key_bytes)
+}
+
+fn vault_root_key_account() -> String {
+    std::env::var("PHILOTIC_VAULT_KEY_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default-root-key".to_string())
+}
+
+fn root_key_fingerprint(key_bytes: &[u8]) -> String {
+    let digest = Sha256::digest(key_bytes);
+    format!("sha256:{}", hex::encode(&digest[..8]))
+}
+
+fn root_user_key_source_kind(vault_ref: &Option<String>) -> String {
+    match vault_ref.as_deref() {
+        Some(value) if value.starts_with("keychain://") => "keychain".into(),
+        Some(value) if value.starts_with("env://") => "env".into(),
+        Some(_) => "opaque".into(),
+        None => "missing".into(),
+    }
 }
 
 fn now_epoch_secs() -> i64 {
@@ -4549,6 +4736,37 @@ mod tests {
         assert_eq!(resolved.issuing_hotel, "mac-jane");
         assert_eq!(resolved.posture, "admin");
 
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn ensure_operator_auth_tables_seeds_root_user_key_ref_from_env() {
+        let context_path = temp_db_path("root-user-key-ref");
+        let key_id = format!("test-key-{}", uuid::Uuid::new_v4());
+        let root_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+
+        unsafe {
+            std::env::set_var("PHILOTIC_VAULT_KEY_ID", &key_id);
+            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", &root_key);
+        }
+
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let refs = list_root_user_key_refs(&context_path, "mac-jane").unwrap();
+        let root_ref = refs
+            .iter()
+            .find(|entry| entry.key_purpose == "vault-root-key")
+            .expect("root key ref should exist");
+        assert_eq!(root_ref.user_id, "root-user:mac-jane");
+        assert_eq!(root_ref.rotation_state, "active");
+        assert_eq!(root_ref.source_kind, "env");
+        let expected_ref = format!("env://PHILOTIC_VAULT_MASTER_KEY/{key_id}");
+        assert_eq!(root_ref.vault_ref.as_deref(), Some(expected_ref.as_str()));
+        assert!(root_ref.public_fingerprint.is_some());
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_VAULT_KEY_ID");
+            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
+        }
         let _ = fs::remove_file(&context_path);
     }
 

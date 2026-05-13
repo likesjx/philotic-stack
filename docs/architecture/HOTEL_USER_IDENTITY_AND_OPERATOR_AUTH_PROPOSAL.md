@@ -193,11 +193,12 @@ The first concrete bootstrap/session slice is now real in `philotic-web`:
 - `GET /api/auth/status` reports whether the current browser session is authenticated so the desktop can stay locked until the hotel issues a session
 - `POST /api/auth/logout` revokes the current operator session and clears the cookie
 - the desktop shell now carries the first system-level lock gate: non-settings workspace apps are blocked and redirected into `System Settings > Aiua Membrane` until the hotel issues a session
+- `root_user_key_refs` is now seeded as a real hotel-local projection: `philotic-web` records the local vault-root-key locator plus a non-secret fingerprint and exposes that metadata through auth status for the desktop/bootstrap surface
 
 This is intentionally a first slice, not a final auth model:
 
 - auth still uses a hotel-issued bootstrap token rather than passkey or local-device mediation
-- `root_user_key_refs` exists as canonical schema but is not yet populated from a stronger secret-store backed login path
+- root-user key refs are now materially populated, but only from the current key source inspection path (keychain/env), not yet from a richer login or step-up identity ceremony
 - operator posture is still a simple `admin` session default rather than a richer elevation flow
 
 ## Desktop Auth Recommendation

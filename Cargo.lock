@@ -3109,6 +3109,7 @@ dependencies = [
  "ansible-mesh-core",
  "anyhow",
  "axum 0.7.9",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "dirs 5.0.1",

@@ -1188,7 +1188,8 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [x] first login/bootstrap path: hotel-issued startup bootstrap token exchanged for a bounded operator session cookie
   - [x] move the bootstrap UX into `System Settings > Aiua Membrane` while the embedded desktop shell stays live before auth
   - [x] shell-level operator-session gate: before auth, non-settings workspace app launch/focus is blocked and redirected through the desktop event bus into `System Settings > Aiua Membrane`
-  - [ ] hotel-local authority for root-user key refs and real vault bindings beyond bootstrap schema
+  - [x] seed and project hotel-local `root_user_key_refs` from the current vault key source (keychain/env) with non-secret fingerprint metadata
+  - [ ] move from current root-key source inspection to a richer hotel-local identity/step-up authority path with real vault-backed login ceremony
   - [ ] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
   - [ ] philote-visible bounded user context projection instead of raw root-user secret access
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
