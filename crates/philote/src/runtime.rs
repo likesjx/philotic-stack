@@ -952,6 +952,15 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
 
+                let turn_loop_config = rec
+                    .get("turn_loop_config")
+                    .and_then(|v| {
+                        serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(
+                            v.clone(),
+                        )
+                        .ok()
+                    });
+
                 Some(crate::session::RoleActivation {
                     role_name: role_name.to_string(),
                     active_incarnation_id: None,
@@ -968,7 +977,7 @@ impl AgentRuntime {
                     effective_skill_guidance: vec![],
                     working_memory_policy: None,
                     memory_projection_policy: None,
-                    turn_loop_config: None,
+                    turn_loop_config,
                 })
             }
             _ => {
@@ -4255,10 +4264,20 @@ impl AgentRuntime {
             .get(&session_id)
             .and_then(|s| s.role_activation.as_ref())
             .map(|ra| ra.role_name.clone());
+        // Prefer configured_roles (set via ConfigureRole tool calls); fall back to the
+        // turn_loop_config embedded in the active role_activation (set at session load
+        // from the DB record via fetch_role_activation).
         let configured_tiers: Vec<String> = active_role_name
             .as_deref()
             .and_then(|rn| self.configured_roles.get(rn))
             .map(|c| c.turn_loop_config.fallback_tiers.clone())
+            .or_else(|| {
+                self.sessions
+                    .get(&session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .and_then(|ra| ra.turn_loop_config.as_ref())
+                    .map(|tlc| tlc.fallback_tiers.clone())
+            })
             .unwrap_or_default();
 
         // Check tier boundaries before any mutable borrow.
@@ -6144,7 +6163,7 @@ impl AgentRuntime {
         };
 
         let task_json = serde_json::to_string(&serde_json::json!({
-            "action": "streaming_token",
+            "action": "partial_reply",
             "session_id": session_id,
             "turn_id": turn_id,
             "chat_id": chat_id,

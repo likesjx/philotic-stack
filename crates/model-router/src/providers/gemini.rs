@@ -1355,6 +1355,15 @@ impl ModelProvider for GeminiProvider {
         let status = response.status();
         let body = response.json::<Value>().await?;
 
+        if !status.is_success() {
+            let message = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            bail!("Gemini API error ({}): {}", status.as_u16(), message);
+        }
+
         if use_structured {
             if has_tools {
                 if let Some(tool_call) = Self::parse_native_function_call(task, &body)? {
@@ -1450,22 +1459,15 @@ impl ModelProvider for GeminiProvider {
         let status = response.status();
 
         if !status.is_success() {
-            // On HTTP error, read the full body and return an error response.
+            // On HTTP error, read the full body and propagate as a failure so
+            // the philote tier-escalation logic can route to a fallback provider.
             let body = response.json::<Value>().await.unwrap_or_default();
-            let content = Self::parse_response_text(status, body);
-            return Ok(ProviderOutput::Text {
-                display_text: Some(content.clone()),
-                content,
-                spoken_text: None,
-                partial_replies: Vec::new(),
-                working_memory_delta: None,
-                follow_up_questions: Vec::new(),
-                intent_summary: None,
-                memory_concept: None,
-                memory_candidate: None,
-                active_plan: None,
-                model_gen: None,
-            });
+            let message = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            bail!("Gemini API error ({}): {}", status.as_u16(), message);
         }
 
         // Read the SSE byte stream, splitting on newlines.

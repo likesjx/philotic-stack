@@ -42,10 +42,12 @@ impl OpenAIProvider {
         Self {
             http_client,
             auth,
-            base_url: base_url
-                .unwrap_or_else(|| "https://api.openai.com".into())
-                .trim_end_matches('/')
-                .to_string(),
+            base_url: {
+                let b = base_url.unwrap_or_else(|| "https://api.openai.com".into());
+                let b = b.trim_end_matches('/');
+                let b = b.trim_end_matches("/v1");
+                b.trim_end_matches('/').to_string()
+            },
             project_id,
             default_model: default_model.unwrap_or_else(|| "gpt-4.1-mini".into()),
             default_embedding_model: default_embedding_model
@@ -285,6 +287,7 @@ impl OpenAIProvider {
         let mut body = json!({
             "model": self.default_model(task),
             "messages": [Self::user_message(task)?],
+            "stream": false,
         });
 
         if Self::native_audio_requested(task) {
@@ -977,6 +980,24 @@ mod tests {
             axum::serve(listener, handler).await.unwrap();
         });
         (format!("http://{}", addr), handle)
+    }
+
+    #[test]
+    fn base_url_strips_trailing_v1() {
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            None,
+            Some("http://localhost:11434/v1".into()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(provider.base_url, "http://localhost:11434");
+        // endpoint_url must not double-append /v1
+        assert_eq!(
+            provider.endpoint_url("/v1/chat/completions"),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 
     #[test]

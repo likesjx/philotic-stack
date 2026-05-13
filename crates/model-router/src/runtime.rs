@@ -900,6 +900,19 @@ fn classify_provider_failure(
         return payload;
     }
 
+    // Auth/key errors (4xx) — the provider is broken for this tier; escalate.
+    if message.contains("401")
+        || message.contains("403")
+        || message.contains("API key not valid")
+        || message.contains("API key")
+        || message.contains("Unauthorized")
+        || message.contains("Unauthenticated")
+    {
+        payload.sub_kind = Some("provider_error".into());
+        payload.retryable = Some(true);
+        return payload;
+    }
+
     // Generic provider-side HTTP error (5xx or non-retryable 4xx).
     if message.contains("500")
         || message.contains("502")
