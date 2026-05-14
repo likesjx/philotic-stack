@@ -2,8 +2,8 @@
 title: Hotel User Identity And Operator Auth Proposal
 doc_type: proposal
 domain: operator-control-plane
-status: proposed
-last_updated: 2026-05-12
+status: accepted for current slice
+last_updated: 2026-05-13
 tags:
 - operator
 - identity
@@ -203,6 +203,7 @@ This is intentionally a first slice, not a final auth model:
 - operator posture is still a simple `admin` session default rather than a richer elevation flow
 - the next accepted bootstrap direction is now explicit in [OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md): OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
 - `philotic-web` now has a first provider-backed OIDC ceremony seam: provider discovery in auth status, `/api/auth/oidc/start` for PKCE-backed challenge issuance, and `/auth/oidc/:provider/callback` for code exchange and hotel-issued operator session issuance
+- OIDC settings are now moving under hotel authority too: the intended canonical split is hotel-config-backed public base URL and provider client IDs plus vault-backed provider `*_secret_ref` config keys, with env values retained only as transitional fallback while operator config catches up
 
 ## Desktop Auth Recommendation
 

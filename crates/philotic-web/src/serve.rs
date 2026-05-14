@@ -360,6 +360,40 @@ struct OidcProviderStatusView {
     callback_url: String,
 }
 
+#[derive(Debug, Clone)]
+struct OidcProviderSettings {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    client_secret_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OidcResolvedConfig {
+    public_base_url: String,
+    public_base_source: String,
+    google: OidcProviderSettings,
+    github: OidcProviderSettings,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OidcProviderConfigView {
+    provider: String,
+    label: String,
+    client_id: Option<String>,
+    client_id_source: String,
+    secret_ref: Option<String>,
+    secret_ref_source: String,
+    secret_configured: bool,
+    callback_url: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OidcConfigView {
+    public_base_url: String,
+    public_base_source: String,
+    providers: Vec<OidcProviderConfigView>,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct OperatorSessionStatusView {
     session_id: String,
@@ -468,6 +502,7 @@ pub async fn run(
         .route("/api/config", get(handle_config))
         .route("/api/config/telegram", get(handle_config_telegram))
         .route("/api/config/gemini", get(handle_config_gemini))
+        .route("/api/config/oidc", get(handle_config_oidc))
         .route(
             "/api/components",
             get(handle_components).post(handle_component_create),
@@ -1078,7 +1113,7 @@ async fn handle_auth_status(headers: HeaderMap, State(state): State<AppState>) -
     let session = current_operator_session(&headers, &state);
     let root_user_key_refs =
         list_root_user_key_refs(&state.db_path, &state.hotel).unwrap_or_default();
-    let oidc_providers = list_oidc_provider_statuses(Some(&headers));
+    let oidc_providers = list_oidc_provider_statuses(&state.socket, Some(&headers)).await;
     Json(AuthStatusView {
         authenticated: session.is_some(),
         hotel: (*state.hotel).clone(),
@@ -1133,10 +1168,11 @@ async fn handle_auth_bootstrap(
         }
     };
 
+    let oidc_providers = list_oidc_provider_statuses(&state.socket, None).await;
     let mut response = Json(AuthStatusView {
         authenticated: true,
         hotel: (*state.hotel).clone(),
-        oidc_providers: list_oidc_provider_statuses(None),
+        oidc_providers,
         root_user_key_refs: list_root_user_key_refs(&state.db_path, &state.hotel)
             .unwrap_or_default(),
         session: Some(OperatorSessionStatusView {
@@ -1163,7 +1199,7 @@ async fn handle_auth_oidc_start(
     Json(body): Json<OidcStartBody>,
 ) -> Response {
     let provider_key = body.provider.trim().to_ascii_lowercase();
-    let provider = match oidc_provider_config(&provider_key, Some(&headers)) {
+    let provider = match oidc_provider_config(&state.socket, &provider_key, Some(&headers)).await {
         Ok(Some(provider)) => provider,
         Ok(None) => {
             return (
@@ -1351,7 +1387,7 @@ async fn handle_auth_oidc_callback(
     };
 
     let provider_key = provider.trim().to_ascii_lowercase();
-    let provider = match oidc_provider_config(&provider_key, Some(&headers)) {
+    let provider = match oidc_provider_config(&state.socket, &provider_key, Some(&headers)).await {
         Ok(Some(provider)) if provider.configured => provider,
         Ok(Some(_)) => {
             return oidc_callback_error_response(
@@ -2658,6 +2694,73 @@ async fn handle_config_gemini(headers: HeaderMap, State(state): State<AppState>)
     .into_response()
 }
 
+// ── GET /api/config/oidc ──────────────────────────────────────────────────────
+
+async fn handle_config_oidc(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    let resolved = match load_oidc_resolved_config(&state.socket, Some(&headers)).await {
+        Ok(config) => config,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    Json(OidcConfigView {
+        public_base_url: resolved.public_base_url.clone(),
+        public_base_source: resolved.public_base_source.clone(),
+        providers: vec![
+            OidcProviderConfigView {
+                provider: "google".into(),
+                label: "Google".into(),
+                client_id: resolved.google.client_id.clone(),
+                client_id_source: oidc_value_source(
+                    oidc_config_string(&state.socket, "oidc_google_client_id")
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some(),
+                    env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_ID").is_some(),
+                ),
+                secret_ref: resolved.google.client_secret_ref.clone(),
+                secret_ref_source: oidc_value_source(
+                    resolved.google.client_secret_ref.is_some(),
+                    env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_SECRET").is_some(),
+                ),
+                secret_configured: resolved.google.client_secret.is_some(),
+                callback_url: format!("{}/auth/oidc/google/callback", resolved.public_base_url),
+            },
+            OidcProviderConfigView {
+                provider: "github".into(),
+                label: "GitHub".into(),
+                client_id: resolved.github.client_id.clone(),
+                client_id_source: oidc_value_source(
+                    oidc_config_string(&state.socket, "oidc_github_client_id")
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some(),
+                    env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_ID").is_some(),
+                ),
+                secret_ref: resolved.github.client_secret_ref.clone(),
+                secret_ref_source: oidc_value_source(
+                    resolved.github.client_secret_ref.is_some(),
+                    env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_SECRET").is_some(),
+                ),
+                secret_configured: resolved.github.client_secret.is_some(),
+                callback_url: format!("{}/auth/oidc/github/callback", resolved.public_base_url),
+            },
+        ],
+    })
+    .into_response()
+}
+
 // ── GET /api/graphs ───────────────────────────────────────────────────────────
 
 async fn handle_graphs(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -2745,6 +2848,8 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
             "gemini_oauth_refresh_token",
             "gemini_oauth_refresh_token_ref",
         ),
+        ("oidc_google_client_secret", "oidc_google_client_secret_ref"),
+        ("oidc_github_client_secret", "oidc_github_client_secret_ref"),
         ("telegram_bot_token", "telegram_bot_token"),
     ];
     let mut named_entries: Vec<Value> = Vec::new();
@@ -2768,7 +2873,16 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
 // ── PUT /api/config/:key ──────────────────────────────────────────────────────
 //
 // Allowed keys for operator mutation (prevents arbitrary config overwrites).
-const MUTABLE_CONFIG_KEYS: &[&str] = &["telegram_bot_token", "execution_host", "vault_registry"];
+const MUTABLE_CONFIG_KEYS: &[&str] = &[
+    "telegram_bot_token",
+    "execution_host",
+    "vault_registry",
+    "oidc_public_base_url",
+    "oidc_google_client_id",
+    "oidc_google_client_secret_ref",
+    "oidc_github_client_id",
+    "oidc_github_client_secret_ref",
+];
 
 #[derive(serde::Deserialize)]
 struct SetConfigBody {
@@ -3914,6 +4028,32 @@ async fn ipc_set_config(socket: &str, key: &str, value_json: &str) -> Result<()>
             ok: false, message, ..
         } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected set_config response: {other:?}")),
+    }
+}
+
+async fn ipc_get_secret(socket: &str, secret_ref: &str) -> Result<Option<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-secret-read").await?;
+    match client
+        .send_request(IpcRequest::GetSecret {
+            secret_ref: secret_ref.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::SecretData {
+            value_json: Some(raw),
+            ..
+        } => {
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| Value::String(raw));
+            Ok(Some(parsed))
+        }
+        IpcResponse::SecretData {
+            value_json: None, ..
+        } => Ok(None),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected get_secret response: {other:?}")),
     }
 }
 
@@ -5218,62 +5358,112 @@ struct OidcIdentity {
     display_name: String,
 }
 
-fn list_oidc_provider_statuses(headers: Option<&HeaderMap>) -> Vec<OidcProviderStatusView> {
-    ["google", "github"]
-        .into_iter()
-        .filter_map(|provider| oidc_provider_config(provider, headers).ok().flatten())
-        .map(|provider| OidcProviderStatusView {
-            provider: provider.id,
-            label: provider.label,
-            configured: provider.configured,
-            callback_url: provider.redirect_uri,
-        })
-        .collect()
+async fn list_oidc_provider_statuses(
+    socket: &str,
+    headers: Option<&HeaderMap>,
+) -> Vec<OidcProviderStatusView> {
+    let mut providers = Vec::new();
+    for provider in ["google", "github"] {
+        if let Ok(Some(provider)) = oidc_provider_config(socket, provider, headers).await {
+            providers.push(OidcProviderStatusView {
+                provider: provider.id,
+                label: provider.label,
+                configured: provider.configured,
+                callback_url: provider.redirect_uri,
+            });
+        }
+    }
+    providers
 }
 
-fn oidc_provider_config(
+async fn oidc_provider_config(
+    socket: &str,
     provider: &str,
     headers: Option<&HeaderMap>,
 ) -> Result<Option<OidcProviderConfig>> {
-    let public_base = operator_auth_public_base_url(headers)?;
+    let resolved = load_oidc_resolved_config(socket, headers).await?;
+    oidc_provider_config_from_resolved(provider, resolved)
+}
+
+fn oidc_provider_config_from_resolved(
+    provider: &str,
+    resolved: OidcResolvedConfig,
+) -> Result<Option<OidcProviderConfig>> {
     match provider {
-        "google" => {
-            let client_id = env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_ID");
-            Ok(Some(OidcProviderConfig {
-                id: "google".into(),
-                label: "Google".into(),
-                configured: client_id.is_some(),
-                client_id,
-                client_secret: env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_SECRET"),
-                auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
-                token_url: "https://oauth2.googleapis.com/token".into(),
-                userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".into(),
-                scopes: vec!["openid".into(), "profile".into(), "email".into()],
-                extra_auth_params: vec![
-                    ("access_type".into(), "offline".into()),
-                    ("prompt".into(), "consent".into()),
-                ],
-                redirect_uri: format!("{public_base}/auth/oidc/google/callback"),
-            }))
-        }
-        "github" => {
-            let client_id = env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_ID");
-            Ok(Some(OidcProviderConfig {
-                id: "github".into(),
-                label: "GitHub".into(),
-                configured: client_id.is_some(),
-                client_id,
-                client_secret: env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_SECRET"),
-                auth_url: "https://github.com/login/oauth/authorize".into(),
-                token_url: "https://github.com/login/oauth/access_token".into(),
-                userinfo_url: "https://api.github.com/user".into(),
-                scopes: vec!["read:user".into(), "user:email".into()],
-                extra_auth_params: Vec::new(),
-                redirect_uri: format!("{public_base}/auth/oidc/github/callback"),
-            }))
-        }
+        "google" => Ok(Some(OidcProviderConfig {
+            id: "google".into(),
+            label: "Google".into(),
+            configured: resolved.google.client_id.is_some()
+                && resolved.google.client_secret.is_some(),
+            client_id: resolved.google.client_id,
+            client_secret: resolved.google.client_secret,
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".into(),
+            scopes: vec!["openid".into(), "profile".into(), "email".into()],
+            extra_auth_params: vec![
+                ("access_type".into(), "offline".into()),
+                ("prompt".into(), "consent".into()),
+            ],
+            redirect_uri: format!("{}/auth/oidc/google/callback", resolved.public_base_url),
+        })),
+        "github" => Ok(Some(OidcProviderConfig {
+            id: "github".into(),
+            label: "GitHub".into(),
+            configured: resolved.github.client_id.is_some()
+                && resolved.github.client_secret.is_some(),
+            client_id: resolved.github.client_id,
+            client_secret: resolved.github.client_secret,
+            auth_url: "https://github.com/login/oauth/authorize".into(),
+            token_url: "https://github.com/login/oauth/access_token".into(),
+            userinfo_url: "https://api.github.com/user".into(),
+            scopes: vec!["read:user".into(), "user:email".into()],
+            extra_auth_params: Vec::new(),
+            redirect_uri: format!("{}/auth/oidc/github/callback", resolved.public_base_url),
+        })),
         _ => Ok(None),
     }
+}
+
+async fn load_oidc_resolved_config(
+    socket: &str,
+    headers: Option<&HeaderMap>,
+) -> Result<OidcResolvedConfig> {
+    let (public_base_url, public_base_source) =
+        operator_auth_public_base_url(socket, headers).await?;
+    let google_client_id = oidc_config_string(socket, "oidc_google_client_id")
+        .await?
+        .or_else(|| env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_ID"));
+    let github_client_id = oidc_config_string(socket, "oidc_github_client_id")
+        .await?
+        .or_else(|| env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_ID"));
+    let (google_client_secret_ref, google_client_secret) = oidc_secret_from_ref_or_env(
+        socket,
+        "oidc_google_client_secret_ref",
+        "PHILOTIC_OIDC_GOOGLE_CLIENT_SECRET",
+    )
+    .await?;
+    let (github_client_secret_ref, github_client_secret) = oidc_secret_from_ref_or_env(
+        socket,
+        "oidc_github_client_secret_ref",
+        "PHILOTIC_OIDC_GITHUB_CLIENT_SECRET",
+    )
+    .await?;
+
+    Ok(OidcResolvedConfig {
+        public_base_url,
+        public_base_source,
+        google: OidcProviderSettings {
+            client_id: google_client_id,
+            client_secret: google_client_secret,
+            client_secret_ref: google_client_secret_ref,
+        },
+        github: OidcProviderSettings {
+            client_id: github_client_id,
+            client_secret: github_client_secret,
+            client_secret_ref: github_client_secret_ref,
+        },
+    })
 }
 
 impl OidcProviderConfig {
@@ -5298,24 +5488,66 @@ impl OidcProviderConfig {
     }
 }
 
-fn operator_auth_public_base_url(headers: Option<&HeaderMap>) -> Result<String> {
+async fn operator_auth_public_base_url(
+    socket: &str,
+    headers: Option<&HeaderMap>,
+) -> Result<(String, String)> {
+    if let Some(value) = oidc_config_string(socket, "oidc_public_base_url").await? {
+        return Ok((
+            value.trim_end_matches('/').to_string(),
+            "hotel-config".into(),
+        ));
+    }
     if let Some(value) = env_trimmed("PHILOTIC_OIDC_PUBLIC_BASE_URL")
         .or_else(|| env_trimmed("PHILOTIC_AUTH_PUBLIC_BASE_URL"))
     {
-        return Ok(value.trim_end_matches('/').to_string());
+        return Ok((value.trim_end_matches('/').to_string(), "env".into()));
     }
 
-    let headers =
-        headers.context("missing host headers and no PHILOTIC_OIDC_PUBLIC_BASE_URL configured")?;
+    let headers = headers.context("missing host headers and no OIDC public base URL configured")?;
     let scheme = header_string(headers, "x-forwarded-proto")
         .or_else(|| header_string(headers, "x-forwarded-scheme"))
         .unwrap_or_else(|| "http".into());
     let host = header_string(headers, "x-forwarded-host")
         .or_else(|| header_string(headers, "host"))
         .context("missing host header for auth public base URL derivation")?;
-    Ok(format!("{}://{}", scheme, host)
-        .trim_end_matches('/')
-        .to_string())
+    Ok((
+        format!("{}://{}", scheme, host)
+            .trim_end_matches('/')
+            .to_string(),
+        "request-headers".into(),
+    ))
+}
+
+async fn oidc_config_string(socket: &str, key: &str) -> Result<Option<String>> {
+    Ok(ipc_get_config(socket, key)
+        .await?
+        .and_then(|value| value.as_str().map(|value| value.trim().to_string()))
+        .filter(|value| !value.is_empty()))
+}
+
+async fn oidc_secret_from_ref_or_env(
+    socket: &str,
+    ref_key: &str,
+    env_key: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    if let Some(secret_ref) = oidc_config_string(socket, ref_key).await? {
+        let secret = ipc_get_secret(socket, &secret_ref)
+            .await?
+            .and_then(|value| value.as_str().map(|value| value.to_string()));
+        return Ok((Some(secret_ref), secret));
+    }
+    Ok((None, env_trimmed(env_key)))
+}
+
+fn oidc_value_source(hotel_config_present: bool, env_fallback_present: bool) -> String {
+    if hotel_config_present {
+        "hotel-config".into()
+    } else if env_fallback_present {
+        "env".into()
+    } else {
+        "unset".into()
+    }
 }
 
 fn header_string(headers: &HeaderMap, key: &str) -> Option<String> {
@@ -5629,42 +5861,54 @@ mod tests {
     }
 
     #[test]
-    fn oidc_provider_status_reports_google_callback_from_env_base() {
-        unsafe {
-            std::env::set_var(
-                "PHILOTIC_OIDC_PUBLIC_BASE_URL",
-                "https://desktop.jaredlikes.com",
-            );
-            std::env::set_var("PHILOTIC_OIDC_GOOGLE_CLIENT_ID", "google-client");
-        }
-        let providers = list_oidc_provider_statuses(None);
-        let google = providers
-            .iter()
-            .find(|provider| provider.provider == "google")
-            .expect("google provider should exist");
-        assert!(google.configured);
+    fn oidc_provider_status_reports_google_callback_from_resolved_config() {
+        let provider = oidc_provider_config_from_resolved(
+            "google",
+            OidcResolvedConfig {
+                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_source: "hotel-config".into(),
+                google: OidcProviderSettings {
+                    client_id: Some("google-client".into()),
+                    client_secret: Some("google-secret".into()),
+                    client_secret_ref: Some("vault:google".into()),
+                },
+                github: OidcProviderSettings {
+                    client_id: None,
+                    client_secret: None,
+                    client_secret_ref: None,
+                },
+            },
+        )
+        .unwrap()
+        .expect("google provider");
+        assert!(provider.configured);
         assert_eq!(
-            google.callback_url,
+            provider.redirect_uri,
             "https://desktop.jaredlikes.com/auth/oidc/google/callback"
         );
-        unsafe {
-            std::env::remove_var("PHILOTIC_OIDC_PUBLIC_BASE_URL");
-            std::env::remove_var("PHILOTIC_OIDC_GOOGLE_CLIENT_ID");
-        }
     }
 
     #[test]
     fn google_auth_url_contains_state_pkce_and_redirect_uri() {
-        unsafe {
-            std::env::set_var(
-                "PHILOTIC_OIDC_PUBLIC_BASE_URL",
-                "https://desktop.jaredlikes.com",
-            );
-            std::env::set_var("PHILOTIC_OIDC_GOOGLE_CLIENT_ID", "google-client");
-        }
-        let provider = oidc_provider_config("google", None)
-            .unwrap()
-            .expect("google provider");
+        let provider = oidc_provider_config_from_resolved(
+            "google",
+            OidcResolvedConfig {
+                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_source: "hotel-config".into(),
+                google: OidcProviderSettings {
+                    client_id: Some("google-client".into()),
+                    client_secret: Some("google-secret".into()),
+                    client_secret_ref: Some("vault:google".into()),
+                },
+                github: OidcProviderSettings {
+                    client_id: None,
+                    client_secret: None,
+                    client_secret_ref: None,
+                },
+            },
+        )
+        .unwrap()
+        .expect("google provider");
         let url = provider
             .authorization_url("state-123", "challenge-456")
             .unwrap();
@@ -5674,10 +5918,6 @@ mod tests {
         assert!(url.contains(
             "redirect_uri=https%3A%2F%2Fdesktop.jaredlikes.com%2Fauth%2Foidc%2Fgoogle%2Fcallback"
         ));
-        unsafe {
-            std::env::remove_var("PHILOTIC_OIDC_PUBLIC_BASE_URL");
-            std::env::remove_var("PHILOTIC_OIDC_GOOGLE_CLIENT_ID");
-        }
     }
 
     #[test]

@@ -187,6 +187,7 @@ This slice accepts and implements the first groundwork seam:
 - `POST /api/auth/challenges` now issues a bounded pending challenge record with nonce, verifier metadata, and TTL
 - `POST /api/auth/oidc/start` now issues a provider-bound OIDC challenge plus PKCE verifier and returns a provider authorization URL
 - `GET /auth/oidc/:provider/callback` now exchanges the authorization code, fetches provider identity, consumes the hotel-local challenge, and issues the hotel-owned operator session cookie
+- OIDC provider settings are now intended to live in hotel config truth: public callback base URL and provider client IDs in operator config, provider client secrets as vault-backed `*_secret_ref` config entries, with env-based settings retained only as transitional fallback
 
 This is intentionally **not** yet:
 

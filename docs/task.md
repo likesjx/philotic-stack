@@ -1191,7 +1191,8 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [x] seed and project hotel-local `root_user_key_refs` from the current vault key source (keychain/env) with non-secret fingerprint metadata
   - [x] define canonical bootstrap direction: OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
   - [x] persist hotel-local `operator_auth_challenges` and expose first challenge issuance endpoint for membrane/OIDC ceremony groundwork
-  - [x] implement first OIDC start/callback flow for hotel-issued operator sessions, with env-driven public callback base URL support for port-specific routing
+- [x] implement first OIDC start/callback flow for hotel-issued operator sessions, with hotel-config-backed public callback base URL / provider client IDs and vault-backed provider secret refs as the intended canonical configuration path (env fallback remains transitional)
+- [ ] wire the desktop System Settings auth surface to read and mutate the bounded OIDC config surface (`/api/config/oidc`, `oidc_*` keys) instead of relying on env-era operator folklore
   - [ ] move from current root-key source inspection to a richer hotel-local identity/step-up authority path with real vault-backed login ceremony
   - [ ] implement membrane proof verification and single-use challenge redemption into operator sessions
   - [ ] persist normalized provider identity linkage on the hotel-local root user record instead of treating provider login as display-name-only proof
