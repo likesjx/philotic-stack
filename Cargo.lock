@@ -3121,6 +3121,7 @@ dependencies = [
  "philotic-client",
  "philotic-graph",
  "rand 0.8.5",
+ "reqwest",
  "rusqlite",
  "rust-embed",
  "serde",

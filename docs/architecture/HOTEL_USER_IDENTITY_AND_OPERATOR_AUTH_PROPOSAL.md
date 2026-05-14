@@ -202,6 +202,7 @@ This is intentionally a first slice, not a final auth model:
 - root-user key refs are now materially populated, but only from the current key source inspection path (keychain/env), not yet from a richer login or step-up identity ceremony
 - operator posture is still a simple `admin` session default rather than a richer elevation flow
 - the next accepted bootstrap direction is now explicit in [OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md): OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
+- `philotic-web` now has a first provider-backed OIDC ceremony seam: provider discovery in auth status, `/api/auth/oidc/start` for PKCE-backed challenge issuance, and `/auth/oidc/:provider/callback` for code exchange and hotel-issued operator session issuance
 
 ## Desktop Auth Recommendation
 

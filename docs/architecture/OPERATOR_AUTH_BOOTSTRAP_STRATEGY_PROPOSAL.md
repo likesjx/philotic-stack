@@ -185,19 +185,20 @@ This slice accepts and implements the first groundwork seam:
 - membrane-assisted single-use challenge is now the accepted step-up/recovery model
 - `philotic-web` now persists hotel-local `operator_auth_challenges`
 - `POST /api/auth/challenges` now issues a bounded pending challenge record with nonce, verifier metadata, and TTL
+- `POST /api/auth/oidc/start` now issues a provider-bound OIDC challenge plus PKCE verifier and returns a provider authorization URL
+- `GET /auth/oidc/:provider/callback` now exchanges the authorization code, fetches provider identity, consumes the hotel-local challenge, and issues the hotel-owned operator session cookie
 
 This is intentionally **not** yet:
 
-- full OIDC callback handling
 - Telegram proof verification
 - passkey support
-- challenge redemption into an operator session
+- mesh-visible operator identity projection
 
 ## Follow-On Slices
 
-1. implement OIDC start/callback flow in `philotic-web`
-2. define trusted membrane proof shape for Telegram-assisted auth
-3. consume verified challenges into bounded operator sessions
+1. define trusted membrane proof shape for Telegram-assisted auth
+2. consume verified membrane challenges into bounded operator sessions
+3. add provider/claim normalization and persistence for hotel-local root user identity linkage
 4. add passkey-backed login as a stronger local-first auth factor
 5. project non-secret operator identity/audit metadata across the mesh
 

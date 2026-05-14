@@ -28,6 +28,7 @@ axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 tokio-tungstenite = "0.24"
 rust-embed = { version = "8", features = ["mime-guess"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 philotic-client = { path = "../philotic-client" }
 philotic-graph = { path = "../philotic-graph" }
 graph-intelligence = { path = "../graph-intelligence" }

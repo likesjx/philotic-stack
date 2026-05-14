@@ -8,7 +8,9 @@
 //!   GET  /api/auth/status
 //!   POST /api/auth/bootstrap
 //!   POST /api/auth/challenges
+//!   POST /api/auth/oidc/start
 //!   POST /api/auth/logout
+//!   GET  /auth/oidc/:provider/callback
 //!   GET  /api/status
 //!   GET  /api/guests
 //!   GET  /api/agents
@@ -61,8 +63,10 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::Rng;
+use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
@@ -268,6 +272,20 @@ struct BootstrapAuthBody {
     display_name: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct OidcStartBody {
+    provider: String,
+    #[serde(default)]
+    return_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OidcCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct OperatorAuthChallengeRecord {
     challenge_id: String,
@@ -278,6 +296,7 @@ struct OperatorAuthChallengeRecord {
     verifier_hint: Option<String>,
     bind_label: Option<String>,
     challenge_nonce: String,
+    exchange_secret: Option<String>,
     issued_at: i64,
     expires_at: i64,
     status: String,
@@ -312,13 +331,33 @@ struct OperatorAuthChallengeView {
 }
 
 #[derive(Debug, serde::Serialize)]
+struct OidcStartView {
+    provider: String,
+    authorization_url: String,
+    challenge_id: String,
+    state: String,
+    redirect_uri: String,
+    expires_at: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
 struct AuthStatusView {
     authenticated: bool,
     hotel: String,
     #[serde(default)]
+    oidc_providers: Vec<OidcProviderStatusView>,
+    #[serde(default)]
     root_user_key_refs: Vec<RootUserKeyRefStatusView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<OperatorSessionStatusView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct OidcProviderStatusView {
+    provider: String,
+    label: String,
+    configured: bool,
+    callback_url: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -393,7 +432,12 @@ pub async fn run(
         .route("/api/auth/status", get(handle_auth_status))
         .route("/api/auth/bootstrap", post(handle_auth_bootstrap))
         .route("/api/auth/challenges", post(handle_create_auth_challenge))
+        .route("/api/auth/oidc/start", post(handle_auth_oidc_start))
         .route("/api/auth/logout", post(handle_auth_logout))
+        .route(
+            "/auth/oidc/:provider/callback",
+            get(handle_auth_oidc_callback),
+        )
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
@@ -1034,9 +1078,11 @@ async fn handle_auth_status(headers: HeaderMap, State(state): State<AppState>) -
     let session = current_operator_session(&headers, &state);
     let root_user_key_refs =
         list_root_user_key_refs(&state.db_path, &state.hotel).unwrap_or_default();
+    let oidc_providers = list_oidc_provider_statuses(Some(&headers));
     Json(AuthStatusView {
         authenticated: session.is_some(),
         hotel: (*state.hotel).clone(),
+        oidc_providers,
         root_user_key_refs,
         session: session.map(|session| OperatorSessionStatusView {
             session_id: session.session_id,
@@ -1090,6 +1136,7 @@ async fn handle_auth_bootstrap(
     let mut response = Json(AuthStatusView {
         authenticated: true,
         hotel: (*state.hotel).clone(),
+        oidc_providers: list_oidc_provider_statuses(None),
         root_user_key_refs: list_root_user_key_refs(&state.db_path, &state.hotel)
             .unwrap_or_default(),
         session: Some(OperatorSessionStatusView {
@@ -1108,6 +1155,84 @@ async fn handle_auth_bootstrap(
         session_cookie_header(&session.session_token),
     );
     response
+}
+
+async fn handle_auth_oidc_start(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<OidcStartBody>,
+) -> Response {
+    let provider_key = body.provider.trim().to_ascii_lowercase();
+    let provider = match oidc_provider_config(&provider_key, Some(&headers)) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unsupported provider [{}]", provider_key)})),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if !provider.configured {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("provider [{}] is not configured", provider.id)})),
+        )
+            .into_response();
+    }
+
+    let return_path = sanitize_return_path(body.return_path.as_deref());
+    let code_verifier = oidc_code_verifier();
+    let code_challenge = pkce_code_challenge(&code_verifier);
+    let challenge = match issue_operator_auth_challenge(
+        &state.db_path,
+        &state.hotel,
+        "desktop_membrane",
+        "oidc",
+        &provider.id,
+        Some(provider.redirect_uri.clone()),
+        return_path.clone(),
+        Some(code_verifier),
+    ) {
+        Ok(challenge) => challenge,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let authorization_url =
+        match provider.authorization_url(&challenge.challenge_nonce, &code_challenge) {
+            Ok(url) => url,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+
+    Json(OidcStartView {
+        provider: provider.id,
+        authorization_url,
+        challenge_id: challenge.challenge_id,
+        state: challenge.challenge_nonce,
+        redirect_uri: provider.redirect_uri,
+        expires_at: challenge.expires_at,
+    })
+    .into_response()
 }
 
 async fn handle_create_auth_challenge(
@@ -1152,6 +1277,7 @@ async fn handle_create_auth_challenge(
         &verifier_kind,
         verifier_hint,
         bind_label,
+        None,
     ) {
         Ok(challenge) => challenge,
         Err(err) => {
@@ -1180,6 +1306,169 @@ async fn handle_create_auth_challenge(
         }),
     )
         .into_response()
+}
+
+async fn handle_auth_oidc_callback(
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+    Query(query): Query<OidcCallbackQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Some(error) = query.error.as_deref() {
+        return oidc_callback_error_response(
+            StatusCode::BAD_REQUEST,
+            format!("OIDC callback failed: {error}"),
+        );
+    }
+
+    let state_token = match query
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                "OIDC callback missing state.".into(),
+            );
+        }
+    };
+    let code = match query
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                "OIDC callback missing authorization code.".into(),
+            );
+        }
+    };
+
+    let provider_key = provider.trim().to_ascii_lowercase();
+    let provider = match oidc_provider_config(&provider_key, Some(&headers)) {
+        Ok(Some(provider)) if provider.configured => provider,
+        Ok(Some(_)) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("OIDC provider [{}] is not configured.", provider_key),
+            );
+        }
+        Ok(None) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Unsupported OIDC provider [{}].", provider_key),
+            );
+        }
+        Err(err) => return oidc_callback_error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let pending = match resolve_operator_auth_challenge_by_nonce(&state.db_path, state_token) {
+        Ok(Some(challenge)) => challenge,
+        Ok(None) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                "OIDC state was not recognized.".into(),
+            );
+        }
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            );
+        }
+    };
+
+    if pending.auth_path != "oidc"
+        || pending.verifier_kind != provider.id
+        || pending.status != "pending"
+        || pending.expires_at <= now_epoch_secs()
+    {
+        return oidc_callback_error_response(
+            StatusCode::BAD_REQUEST,
+            "OIDC callback did not match a valid pending challenge.".into(),
+        );
+    }
+
+    let code_verifier = match pending.exchange_secret.as_deref() {
+        Some(value) => value,
+        None => {
+            return oidc_callback_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "OIDC challenge was missing PKCE verifier state.".into(),
+            );
+        }
+    };
+
+    let token = match exchange_oidc_code(&provider, code, code_verifier).await {
+        Ok(token) => token,
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("OIDC token exchange failed: {err}"),
+            );
+        }
+    };
+
+    let identity = match fetch_oidc_identity(&provider, &token.access_token).await {
+        Ok(identity) => identity,
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("OIDC identity fetch failed: {err}"),
+            );
+        }
+    };
+
+    let challenge = match consume_operator_auth_challenge(&state.db_path, &pending.challenge_id) {
+        Ok(Some(challenge)) => challenge,
+        Ok(None) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                "OIDC challenge was already consumed or expired.".into(),
+            );
+        }
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            );
+        }
+    };
+
+    let session = match issue_operator_session(
+        &state.db_path,
+        &state.hotel,
+        &identity.display_name,
+        &format!("oidc_{}", provider.id),
+        Some(challenge.challenge_id.clone()),
+    ) {
+        Ok(session) => session,
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            );
+        }
+    };
+
+    let redirect_path = challenge.bind_label.unwrap_or_else(|| "/".into());
+    let mut response = (
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, redirect_path.as_str())],
+        "",
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie_header(&session.session_token),
+    );
+    response
 }
 
 async fn handle_auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -4461,6 +4750,7 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
             verifier_hint TEXT,
             bind_label TEXT,
             challenge_nonce TEXT NOT NULL UNIQUE,
+            exchange_secret TEXT,
             issued_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
             status TEXT NOT NULL,
@@ -4591,6 +4881,7 @@ fn issue_operator_auth_challenge(
     verifier_kind: &str,
     verifier_hint: Option<String>,
     bind_label: Option<String>,
+    exchange_secret: Option<String>,
 ) -> Result<OperatorAuthChallengeRecord> {
     ensure_operator_auth_tables(db_path, hotel)?;
     let conn = Connection::open(db_path)?;
@@ -4605,6 +4896,7 @@ fn issue_operator_auth_challenge(
         verifier_hint,
         bind_label,
         challenge_nonce: new_operator_chat_id("challenge-nonce"),
+        exchange_secret,
         issued_at: now,
         expires_at,
         status: "pending".into(),
@@ -4612,8 +4904,8 @@ fn issue_operator_auth_challenge(
     };
     conn.execute(
         "INSERT INTO operator_auth_challenges
-        (challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint, bind_label, challenge_nonce, issued_at, expires_at, status, consumed_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        (challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint, bind_label, challenge_nonce, exchange_secret, issued_at, expires_at, status, consumed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             &challenge.challenge_id,
             &challenge.user_id,
@@ -4623,6 +4915,7 @@ fn issue_operator_auth_challenge(
             &challenge.verifier_hint,
             &challenge.bind_label,
             &challenge.challenge_nonce,
+            &challenge.exchange_secret,
             challenge.issued_at,
             challenge.expires_at,
             &challenge.status,
@@ -4640,7 +4933,7 @@ fn resolve_operator_auth_challenge(
     let conn = Connection::open(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint,
-                bind_label, challenge_nonce, issued_at, expires_at, status, consumed_at
+                bind_label, challenge_nonce, exchange_secret, issued_at, expires_at, status, consumed_at
          FROM operator_auth_challenges
          WHERE challenge_id = ?1",
     )?;
@@ -4655,10 +4948,45 @@ fn resolve_operator_auth_challenge(
                 verifier_hint: row.get(5)?,
                 bind_label: row.get(6)?,
                 challenge_nonce: row.get(7)?,
-                issued_at: row.get(8)?,
-                expires_at: row.get(9)?,
-                status: row.get(10)?,
-                consumed_at: row.get(11)?,
+                exchange_secret: row.get(8)?,
+                issued_at: row.get(9)?,
+                expires_at: row.get(10)?,
+                status: row.get(11)?,
+                consumed_at: row.get(12)?,
+            })
+        })
+        .optional()?;
+    Ok(maybe)
+}
+
+#[allow(dead_code)]
+fn resolve_operator_auth_challenge_by_nonce(
+    db_path: &PathBuf,
+    nonce: &str,
+) -> Result<Option<OperatorAuthChallengeRecord>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint,
+                bind_label, challenge_nonce, exchange_secret, issued_at, expires_at, status, consumed_at
+         FROM operator_auth_challenges
+         WHERE challenge_nonce = ?1",
+    )?;
+    let maybe = stmt
+        .query_row([nonce], |row| {
+            Ok(OperatorAuthChallengeRecord {
+                challenge_id: row.get(0)?,
+                user_id: row.get(1)?,
+                intended_surface: row.get(2)?,
+                auth_path: row.get(3)?,
+                verifier_kind: row.get(4)?,
+                verifier_hint: row.get(5)?,
+                bind_label: row.get(6)?,
+                challenge_nonce: row.get(7)?,
+                exchange_secret: row.get(8)?,
+                issued_at: row.get(9)?,
+                expires_at: row.get(10)?,
+                status: row.get(11)?,
+                consumed_at: row.get(12)?,
             })
         })
         .optional()?;
@@ -4865,6 +5193,273 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Debug)]
+struct OidcProviderConfig {
+    id: String,
+    label: String,
+    configured: bool,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    auth_url: String,
+    token_url: String,
+    userinfo_url: String,
+    scopes: Vec<String>,
+    extra_auth_params: Vec<(String, String)>,
+    redirect_uri: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OidcTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug)]
+struct OidcIdentity {
+    display_name: String,
+}
+
+fn list_oidc_provider_statuses(headers: Option<&HeaderMap>) -> Vec<OidcProviderStatusView> {
+    ["google", "github"]
+        .into_iter()
+        .filter_map(|provider| oidc_provider_config(provider, headers).ok().flatten())
+        .map(|provider| OidcProviderStatusView {
+            provider: provider.id,
+            label: provider.label,
+            configured: provider.configured,
+            callback_url: provider.redirect_uri,
+        })
+        .collect()
+}
+
+fn oidc_provider_config(
+    provider: &str,
+    headers: Option<&HeaderMap>,
+) -> Result<Option<OidcProviderConfig>> {
+    let public_base = operator_auth_public_base_url(headers)?;
+    match provider {
+        "google" => {
+            let client_id = env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_ID");
+            Ok(Some(OidcProviderConfig {
+                id: "google".into(),
+                label: "Google".into(),
+                configured: client_id.is_some(),
+                client_id,
+                client_secret: env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_SECRET"),
+                auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+                token_url: "https://oauth2.googleapis.com/token".into(),
+                userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".into(),
+                scopes: vec!["openid".into(), "profile".into(), "email".into()],
+                extra_auth_params: vec![
+                    ("access_type".into(), "offline".into()),
+                    ("prompt".into(), "consent".into()),
+                ],
+                redirect_uri: format!("{public_base}/auth/oidc/google/callback"),
+            }))
+        }
+        "github" => {
+            let client_id = env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_ID");
+            Ok(Some(OidcProviderConfig {
+                id: "github".into(),
+                label: "GitHub".into(),
+                configured: client_id.is_some(),
+                client_id,
+                client_secret: env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_SECRET"),
+                auth_url: "https://github.com/login/oauth/authorize".into(),
+                token_url: "https://github.com/login/oauth/access_token".into(),
+                userinfo_url: "https://api.github.com/user".into(),
+                scopes: vec!["read:user".into(), "user:email".into()],
+                extra_auth_params: Vec::new(),
+                redirect_uri: format!("{public_base}/auth/oidc/github/callback"),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+impl OidcProviderConfig {
+    fn authorization_url(&self, state: &str, code_challenge: &str) -> Result<String> {
+        let client_id = self
+            .client_id
+            .as_deref()
+            .context("OIDC client id is not configured")?;
+        let mut url = Url::parse(&self.auth_url).context("failed to build OIDC auth URL")?;
+        url.query_pairs_mut()
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", &self.redirect_uri)
+            .append_pair("response_type", "code")
+            .append_pair("scope", &self.scopes.join(" "))
+            .append_pair("state", state)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256");
+        for (key, value) in &self.extra_auth_params {
+            url.query_pairs_mut().append_pair(key, value);
+        }
+        Ok(url.into())
+    }
+}
+
+fn operator_auth_public_base_url(headers: Option<&HeaderMap>) -> Result<String> {
+    if let Some(value) = env_trimmed("PHILOTIC_OIDC_PUBLIC_BASE_URL")
+        .or_else(|| env_trimmed("PHILOTIC_AUTH_PUBLIC_BASE_URL"))
+    {
+        return Ok(value.trim_end_matches('/').to_string());
+    }
+
+    let headers =
+        headers.context("missing host headers and no PHILOTIC_OIDC_PUBLIC_BASE_URL configured")?;
+    let scheme = header_string(headers, "x-forwarded-proto")
+        .or_else(|| header_string(headers, "x-forwarded-scheme"))
+        .unwrap_or_else(|| "http".into());
+    let host = header_string(headers, "x-forwarded-host")
+        .or_else(|| header_string(headers, "host"))
+        .context("missing host header for auth public base URL derivation")?;
+    Ok(format!("{}://{}", scheme, host)
+        .trim_end_matches('/')
+        .to_string())
+}
+
+fn header_string(headers: &HeaderMap, key: &str) -> Option<String> {
+    headers
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn env_trimmed(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn sanitize_return_path(input: Option<&str>) -> Option<String> {
+    input
+        .map(str::trim)
+        .filter(|value| value.starts_with('/'))
+        .filter(|value| !value.starts_with("//"))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn oidc_code_verifier() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn pkce_code_challenge(code_verifier: &str) -> String {
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+async fn exchange_oidc_code(
+    provider: &OidcProviderConfig,
+    code: &str,
+    code_verifier: &str,
+) -> Result<OidcTokenResponse> {
+    let client_id = provider
+        .client_id
+        .as_deref()
+        .context("OIDC client id is not configured")?;
+    let mut form = vec![
+        ("client_id", client_id.to_string()),
+        ("code", code.to_string()),
+        ("code_verifier", code_verifier.to_string()),
+        ("grant_type", "authorization_code".into()),
+        ("redirect_uri", provider.redirect_uri.clone()),
+    ];
+    if let Some(client_secret) = provider.client_secret.as_deref() {
+        form.push(("client_secret", client_secret.to_string()));
+    }
+
+    let response = reqwest::Client::new()
+        .post(&provider.token_url)
+        .header("accept", "application/json")
+        .header("user-agent", "philotic-web/0.1")
+        .form(&form)
+        .send()
+        .await
+        .context("failed to exchange OIDC authorization code")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "token exchange failed ({}): {}",
+            status.as_u16(),
+            body.trim()
+        );
+    }
+
+    response
+        .json::<OidcTokenResponse>()
+        .await
+        .context("failed to decode OIDC token response")
+}
+
+async fn fetch_oidc_identity(
+    provider: &OidcProviderConfig,
+    access_token: &str,
+) -> Result<OidcIdentity> {
+    let response = reqwest::Client::new()
+        .get(&provider.userinfo_url)
+        .header("accept", "application/json")
+        .header("user-agent", "philotic-web/0.1")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("failed to fetch OIDC userinfo")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "userinfo fetch failed ({}): {}",
+            status.as_u16(),
+            body.trim()
+        );
+    }
+
+    let body: Value = response
+        .json()
+        .await
+        .context("failed to decode OIDC userinfo response")?;
+    let display_name = match provider.id.as_str() {
+        "google" => body
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("email").and_then(Value::as_str))
+            .unwrap_or("Operator"),
+        "github" => body
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("login").and_then(Value::as_str))
+            .unwrap_or("Operator"),
+        _ => "Operator",
+    };
+
+    Ok(OidcIdentity {
+        display_name: display_name.to_string(),
+    })
+}
+
+fn oidc_callback_error_response(status: StatusCode, message: String) -> Response {
+    let html = format!(
+        "<!doctype html><html><body><h1>Philotic operator auth failed</h1><p>{}</p></body></html>",
+        message
+    );
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4989,6 +5584,7 @@ mod tests {
             "telegram",
             Some("@jaredlikes".into()),
             Some("desktop.jaredlikes.com".into()),
+            None,
         )
         .unwrap();
 
@@ -5015,6 +5611,7 @@ mod tests {
             "google",
             None,
             Some("desktop.jaredlikes.com".into()),
+            Some("pkce-verifier".into()),
         )
         .unwrap();
 
@@ -5029,6 +5626,58 @@ mod tests {
         assert!(second.is_none());
 
         let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn oidc_provider_status_reports_google_callback_from_env_base() {
+        unsafe {
+            std::env::set_var(
+                "PHILOTIC_OIDC_PUBLIC_BASE_URL",
+                "https://desktop.jaredlikes.com",
+            );
+            std::env::set_var("PHILOTIC_OIDC_GOOGLE_CLIENT_ID", "google-client");
+        }
+        let providers = list_oidc_provider_statuses(None);
+        let google = providers
+            .iter()
+            .find(|provider| provider.provider == "google")
+            .expect("google provider should exist");
+        assert!(google.configured);
+        assert_eq!(
+            google.callback_url,
+            "https://desktop.jaredlikes.com/auth/oidc/google/callback"
+        );
+        unsafe {
+            std::env::remove_var("PHILOTIC_OIDC_PUBLIC_BASE_URL");
+            std::env::remove_var("PHILOTIC_OIDC_GOOGLE_CLIENT_ID");
+        }
+    }
+
+    #[test]
+    fn google_auth_url_contains_state_pkce_and_redirect_uri() {
+        unsafe {
+            std::env::set_var(
+                "PHILOTIC_OIDC_PUBLIC_BASE_URL",
+                "https://desktop.jaredlikes.com",
+            );
+            std::env::set_var("PHILOTIC_OIDC_GOOGLE_CLIENT_ID", "google-client");
+        }
+        let provider = oidc_provider_config("google", None)
+            .unwrap()
+            .expect("google provider");
+        let url = provider
+            .authorization_url("state-123", "challenge-456")
+            .unwrap();
+        assert!(url.contains("client_id=google-client"));
+        assert!(url.contains("state=state-123"));
+        assert!(url.contains("code_challenge=challenge-456"));
+        assert!(url.contains(
+            "redirect_uri=https%3A%2F%2Fdesktop.jaredlikes.com%2Fauth%2Foidc%2Fgoogle%2Fcallback"
+        ));
+        unsafe {
+            std::env::remove_var("PHILOTIC_OIDC_PUBLIC_BASE_URL");
+            std::env::remove_var("PHILOTIC_OIDC_GOOGLE_CLIENT_ID");
+        }
     }
 
     #[test]
