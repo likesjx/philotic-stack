@@ -952,14 +952,10 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
 
-                let turn_loop_config = rec
-                    .get("turn_loop_config")
-                    .and_then(|v| {
-                        serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(
-                            v.clone(),
-                        )
+                let turn_loop_config = rec.get("turn_loop_config").and_then(|v| {
+                    serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(v.clone())
                         .ok()
-                    });
+                });
 
                 Some(crate::session::RoleActivation {
                     role_name: role_name.to_string(),
@@ -3508,7 +3504,13 @@ impl AgentRuntime {
             // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
             let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
 
-            if is_admin_role_creation || is_rule_propose || force_approval {
+            // routing.policy.propose requires the same live-approval gate: proposals are stored
+            // durably in the hotel graph and influence future routing decisions, so they must
+            // not be silently submitted without operator visibility.
+            let is_routing_policy_propose =
+                !bypass_approval && tool_call.tool_name == "routing.policy.propose";
+
+            if is_admin_role_creation || is_rule_propose || is_routing_policy_propose || force_approval {
                 // Set pending_tool_call so the approval handler can read it for class lookup.
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     state.set_pending_tool_call(tool_call.clone());
@@ -3537,6 +3539,11 @@ impl AgentRuntime {
                         "Rule proposal requires your explicit live approval.".to_string(),
                         "Rule proposal approved.".to_string(),
                     )
+                } else if is_routing_policy_propose {
+                    (
+                        "Routing policy proposal requires your explicit live approval.".to_string(),
+                        "Routing policy proposal approved.".to_string(),
+                    )
                 } else {
                     (
                         format!(
@@ -3556,7 +3563,7 @@ impl AgentRuntime {
                         session_id,
                         turn_id,
                         synthetic,
-                        is_admin_role_creation || is_rule_propose,
+                        is_admin_role_creation || is_rule_propose || is_routing_policy_propose,
                     )
                     .await;
             }
@@ -11490,6 +11497,147 @@ impl AgentRuntime {
                     content: Some(content_str),
                     error: tool_err,
                     tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.policy.propose ───────────────────────────────────────
+            "routing.policy.propose" => {
+                let args = payload.arguments.as_object();
+                let problem = args
+                    .and_then(|a| a.get("problem"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let proposed_change = args
+                    .and_then(|a| a.get("proposed_change"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let evidence = args
+                    .and_then(|a| a.get("evidence"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let affected_stage = args
+                    .and_then(|a| a.get("affected_stage"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let affected_capability = args
+                    .and_then(|a| a.get("affected_capability"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let learned_reflex_preference_key = args
+                    .and_then(|a| a.get("learned_reflex_preference_key"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                if problem.is_empty() || proposed_change.is_empty() {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "routing.policy.propose: 'problem' and 'proposed_change' are required."
+                                .into(),
+                        )
+                        .await;
+                }
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                        agent_id: self.agent_id.clone(),
+                        problem: problem.clone(),
+                        proposed_change,
+                        evidence,
+                        affected_stage,
+                        affected_capability,
+                        learned_reflex_preference_key,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RoutingPolicyRecorded { proposal_id }) => {
+                        format!(
+                            "Routing policy proposal recorded (id: {proposal_id}). \
+                             An operator will review and approve or reject the proposed change."
+                        )
+                    }
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
+                        format!("routing.policy.propose: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.policy.propose: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.policy.propose: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.policy.propose".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── desktop.observe ──────────────────────────────────────────────
+            "desktop.observe" => {
+                // Observe-only: returns desktop runner metadata. No screenshot or interaction.
+                // A real desktop guest is not required — this tool describes what would be observed.
+                let result_text = serde_json::json!({
+                    "status": "no_desktop_guest",
+                    "message": "No desktop guest is currently materialised on this hotel. \
+                                Desktop observation requires a desktop runner guest to be active.",
+                    "tool": "desktop.observe",
+                })
+                .to_string();
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("desktop.observe".into()),
+                    arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,

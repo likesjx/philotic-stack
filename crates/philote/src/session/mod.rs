@@ -3232,6 +3232,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         .map(|tool_name| {
             let execution_mode = if is_local_agent_tool(tool_name) {
                 "local_agent"
+            } else if is_agent_graph_tool(tool_name) {
+                "agent_graph"
             } else if is_graph_datasource_tool(tool_name) {
                 "datasource"
             } else if is_table_datasource_tool(tool_name) {
@@ -3247,6 +3249,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     target_node: local_node_id.clone(),
                     target_role: if execution_mode == "local_agent" {
                         "agent".into()
+                    } else if execution_mode == "agent_graph" {
+                        "agent-graph".into()
                     } else if execution_mode == "datasource" {
                         "graph-datasource".into()
                     } else if execution_mode == "table_datasource" {
@@ -3254,13 +3258,15 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     } else {
                         format!("tool.{tool_name}")
                     },
-                    runner_id: if execution_mode == "local_agent" {
+                    runner_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
+                    {
                         None
                     } else {
                         Some("tool-runner-01".into())
                     },
                     incarnation_id: None,
-                    hotel_id: if execution_mode == "local_agent" {
+                    hotel_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
+                    {
                         None
                     } else {
                         Some(local_node_id.clone())
@@ -3272,6 +3278,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
                         "agent_local_tool".into()
+                    } else if execution_mode == "agent_graph" {
+                        "agent_graph_route".into()
                     } else if execution_mode == "datasource" {
                         "graph_datasource_route".into()
                     } else if execution_mode == "table_datasource" {
@@ -3351,6 +3359,10 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "memory.recall"
             | "memory.remember"
             | "rule.propose"
+            | "routing.policy.propose"
+            | "mcp.provision"
+            | "mcp.revoke"
+            | "desktop.observe"
             | "skill.register"
             | "skill.list"
             | "skill.assign"
@@ -3365,6 +3377,17 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "delegate.whisper"
             | "approval.request_standing"
             | "table.add_listener"
+    )
+}
+
+fn is_agent_graph_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "agent.graph.read"
+            | "agent.graph.write"
+            | "agent.graph.declare"
+            | "agent.graph.recall"
+            | "agent.graph.sync"
     )
 }
 
@@ -3390,11 +3413,7 @@ fn is_table_datasource_tool(tool_name: &str) -> bool {
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list"
-            | "workspace.read"
-            | "workspace.search"
-            | "workspace.write"
-            | "desktop.observe"
+        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
     )
 }
 
@@ -5362,7 +5381,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_observe_gets_pinned_desktop_route() {
+    fn desktop_observe_gets_local_agent_route() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.clear_tool_bindings();
@@ -5373,12 +5392,32 @@ mod tests {
             .resolve_tool_route("desktop.observe")
             .expect("desktop.observe route should exist");
 
-        assert_eq!(route.execution_mode, "pinned");
-        assert_eq!(route.task_runner_kind.as_deref(), Some("desktop"));
-        assert_eq!(route.target_role, "tool.desktop.observe");
+        assert_eq!(route.execution_mode, "local_agent");
+        assert_eq!(route.target_role, "agent");
         assert_eq!(
             route.selection_reason.as_deref(),
-            Some("default_pinned_route")
+            Some("agent_local_tool")
+        );
+    }
+
+    #[test]
+    fn agent_graph_tools_route_to_agent_graph_role() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("agent.graph.read");
+        state.rebuild_default_tool_assembly();
+
+        let route = state
+            .resolve_tool_route("agent.graph.read")
+            .expect("agent.graph.read route should exist");
+
+        assert_eq!(route.execution_mode, "agent_graph");
+        assert_eq!(route.target_role, "agent-graph");
+        assert_eq!(route.runner_id, None);
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("agent_graph_route")
         );
     }
 

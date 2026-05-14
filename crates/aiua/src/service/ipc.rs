@@ -7436,6 +7436,17 @@ impl IpcServer {
                                 let hotel_guest_id =
                                     format!("{}:philote-{}", hotel_name, inc.role_name);
 
+                                // Derive socket path from hotel record (shared by philote + companion).
+                                let socket_path = graph
+                                    .list_hotels()
+                                    .ok()
+                                    .and_then(|hs| {
+                                        hs.into_iter()
+                                            .find(|h| h.capabilities.node_id == local_node_id)
+                                            .map(|h| h.ipc_socket_path)
+                                    })
+                                    .unwrap_or_default();
+
                                 // Create the guest record if it doesn't already exist.
                                 if graph
                                     .get_guest(&hotel_name, &hotel_guest_id)
@@ -7443,17 +7454,6 @@ impl IpcServer {
                                     .flatten()
                                     .is_none()
                                 {
-                                    // Derive socket path from hotel record.
-                                    let socket_path = graph
-                                        .list_hotels()
-                                        .ok()
-                                        .and_then(|hs| {
-                                            hs.into_iter()
-                                                .find(|h| h.capabilities.node_id == local_node_id)
-                                                .map(|h| h.ipc_socket_path)
-                                        })
-                                        .unwrap_or_default();
-
                                     let config_json = serde_json::json!({
                                         "command": "philote",
                                         "args": [],
@@ -7486,7 +7486,47 @@ impl IpcServer {
                                     }
                                 }
 
-                                // Trigger materialization.
+                                // Ensure companion agent-graph-runner guest exists.
+                                let graph_runner_id =
+                                    format!("{}:agent-graph-{}", hotel_name, inc.agent_id);
+                                if graph
+                                    .get_guest(&hotel_name, &graph_runner_id)
+                                    .ok()
+                                    .flatten()
+                                    .is_none()
+                                {
+                                    let runner_config = serde_json::json!({
+                                        "command": "agent-graph-runner",
+                                        "args": [],
+                                        "env": {
+                                            "PHILOTIC_AGENT_ID": inc.agent_id,
+                                            "PHILOTIC_GRAPH_RUNNER_ID": graph_runner_id,
+                                            "PHILOTIC_IPC_SOCKET": socket_path,
+                                        }
+                                    });
+                                    let runner_rec = ansible_mesh_core::storage::GuestRecord {
+                                        hotel_name: hotel_name.clone(),
+                                        guest_id: graph_runner_id.clone(),
+                                        role: "agent-graph".into(),
+                                        config_json: runner_config.to_string(),
+                                        is_active: true,
+                                        active_pid: None,
+                                        last_active_at: None,
+                                    };
+                                    if let Err(e) = graph.seed_guests(&hotel_name, &[runner_rec]) {
+                                        warn!(
+                                            "Failed to seed agent-graph-runner guest [{}]: {e}",
+                                            graph_runner_id
+                                        );
+                                    } else {
+                                        info!(
+                                            "Created agent-graph-runner guest: {}",
+                                            graph_runner_id
+                                        );
+                                    }
+                                }
+
+                                // Trigger materialization of philote.
                                 if let Some(requester) = materialization_requester {
                                     match requester.ensure_guest_active(&hotel_guest_id).await {
                                         Ok(true) => info!(
@@ -7500,6 +7540,21 @@ impl IpcServer {
                                         Err(e) => warn!(
                                             "Role-philote [{}] materialization error: {e}",
                                             hotel_guest_id
+                                        ),
+                                    }
+                                    // Trigger materialization of companion agent-graph-runner.
+                                    match requester.ensure_guest_active(&graph_runner_id).await {
+                                        Ok(true) => info!(
+                                            "Agent-graph-runner [{}] materialization triggered.",
+                                            graph_runner_id
+                                        ),
+                                        Ok(false) => warn!(
+                                            "Agent-graph-runner [{}] could not be materialized.",
+                                            graph_runner_id
+                                        ),
+                                        Err(e) => warn!(
+                                            "Agent-graph-runner [{}] materialization error: {e}",
+                                            graph_runner_id
                                         ),
                                     }
                                 }

@@ -2035,6 +2035,32 @@ fn agent_guests_for_profile(hotel_name: &str, profile: &AgentProfile) -> GuestRe
     }
 }
 
+/// Companion agent-graph-runner guest for a philote agent.
+/// One per agent; stores per-agent cognitive graph at ~/.philotic/agent-graph-{id}.db.
+fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRecord {
+    let hotel = default_hotel_record(hotel_name);
+    let socket_path = hotel.ipc_socket_path;
+    let guest_id = format!("{hotel_name}:agent-graph-{}", profile.agent_id);
+    GuestRecord {
+        hotel_name: hotel_name.to_string(),
+        guest_id: guest_id.clone(),
+        role: "agent-graph".into(),
+        config_json: serde_json::json!({
+            "command": "agent-graph-runner",
+            "args": [],
+            "env": {
+                "PHILOTIC_AGENT_ID": profile.agent_id,
+                "PHILOTIC_GRAPH_RUNNER_ID": guest_id,
+                "PHILOTIC_IPC_SOCKET": socket_path
+            }
+        })
+        .to_string(),
+        is_active: true,
+        active_pid: None,
+        last_active_at: None,
+    }
+}
+
 /// Hotel-level shared guests: one membrane for all agents, plus model controllers.
 fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<GuestRecord> {
     let hotel = default_hotel_record(hotel_name);
@@ -2207,8 +2233,27 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
                 "command": "router-listener",
                 "args": [],
                 "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:membrane-mcp"),
+            role: "mcp-membrane".into(),
+            config_json: serde_json::json!({
+                "command": "membrane-mcp",
+                "args": [],
+                "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path,
-                    "PHILOTIC_NODE_ID": node_id
+                    "PHILOTIC_NODE_ID": node_id,
+                    "PHILOTIC_GUEST_ID": format!("{hotel_name}:membrane-mcp"),
+                    "MCP_PORT": "9100"
                 }
             })
             .to_string(),
@@ -2224,6 +2269,7 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
 fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<GuestRecord> {
     let mut guests = hotel_shared_guests(hotel_name, std::slice::from_ref(profile));
     guests.push(agent_guests_for_profile(hotel_name, profile));
+    guests.push(agent_graph_runner_guest(hotel_name, profile));
     guests
 }
 
@@ -3444,6 +3490,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "role.configure".into(),
                 "role.list".into(),
                 "role.set_home".into(),
+                "rule.propose".into(),
+                "routing.policy.propose".into(),
+                "mcp.provision".into(),
+                "mcp.revoke".into(),
+                "desktop.observe".into(),
                 "skill.register".into(),
                 "skill.list".into(),
                 "skill.assign".into(),
@@ -3454,6 +3505,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "delegate.whisper".into(),
                 "memory.recall".into(),
                 "memory.remember".into(),
+                "agent.graph.read".into(),
+                "agent.graph.write".into(),
+                "agent.graph.recall".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
@@ -3472,7 +3526,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.disable".into(),
                 "cron.remove".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "memory".into(), "graph".into(), "table".into(), "cron".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "memory".into(), "graph".into(), "agent_graph".into(), "table".into(), "cron".into(), "mcp".into(), "desktop".into()],
             allowed_skills: vec![
                 "handoff.to_role".into(),
                 "handoff.back".into(),
@@ -3569,12 +3623,19 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "role.create_or_update".into(),
                 "role.list".into(),
                 "role.set_home".into(),
+                "rule.propose".into(),
+                "routing.policy.propose".into(),
+                "mcp.provision".into(),
+                "mcp.revoke".into(),
+                "desktop.observe".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
                 "delegate.whisper".into(),
                 "memory.recall".into(),
                 "memory.remember".into(),
+                "agent.graph.read".into(),
+                "agent.graph.write".into(),
                 "training.list".into(),
                 "training.correct".into(),
                 "training.export".into(),
@@ -3608,8 +3669,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "training".into(),
                 "asr".into(),
                 "graph".into(),
+                "agent_graph".into(),
                 "table".into(),
                 "cron".into(),
+                "mcp".into(),
+                "desktop".into(),
             ],
             allowed_skills: vec![
                 "skill.crafting".into(),
@@ -3647,11 +3711,12 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "bash.exec".into(),
                 "memory.recall".into(),
                 "memory.remember".into(),
+                "agent.graph.read".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into(), "agent_graph".into()],
             allowed_skills: vec![
                 "handoff.back".into(),
                 "capability.request".into(),
@@ -5944,6 +6009,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     let mut all_desired_guests: Vec<GuestRecord> = Vec::new();
     for profile in &all_profiles {
         all_desired_guests.push(agent_guests_for_profile(hotel_name, profile));
+        all_desired_guests.push(agent_graph_runner_guest(hotel_name, profile));
     }
     all_desired_guests.extend(hotel_shared_guests(hotel_name, &all_profiles));
 
