@@ -7,6 +7,7 @@
 //! REST endpoints:
 //!   GET  /api/auth/status
 //!   POST /api/auth/bootstrap
+//!   POST /api/auth/challenges
 //!   POST /api/auth/logout
 //!   GET  /api/status
 //!   GET  /api/guests
@@ -267,6 +268,49 @@ struct BootstrapAuthBody {
     display_name: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct OperatorAuthChallengeRecord {
+    challenge_id: String,
+    user_id: String,
+    intended_surface: String,
+    auth_path: String,
+    verifier_kind: String,
+    verifier_hint: Option<String>,
+    bind_label: Option<String>,
+    challenge_nonce: String,
+    issued_at: i64,
+    expires_at: i64,
+    status: String,
+    consumed_at: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateAuthChallengeBody {
+    auth_path: String,
+    verifier_kind: String,
+    #[serde(default)]
+    verifier_hint: Option<String>,
+    #[serde(default)]
+    bind_label: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OperatorAuthChallengeView {
+    challenge_id: String,
+    user_id: String,
+    intended_surface: String,
+    auth_path: String,
+    verifier_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bind_label: Option<String>,
+    challenge_nonce: String,
+    issued_at: i64,
+    expires_at: i64,
+    status: String,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct AuthStatusView {
     authenticated: bool,
@@ -348,6 +392,7 @@ pub async fn run(
         // API routes
         .route("/api/auth/status", get(handle_auth_status))
         .route("/api/auth/bootstrap", post(handle_auth_bootstrap))
+        .route("/api/auth/challenges", post(handle_create_auth_challenge))
         .route("/api/auth/logout", post(handle_auth_logout))
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
@@ -1063,6 +1108,78 @@ async fn handle_auth_bootstrap(
         session_cookie_header(&session.session_token),
     );
     response
+}
+
+async fn handle_create_auth_challenge(
+    State(state): State<AppState>,
+    Json(body): Json<CreateAuthChallengeBody>,
+) -> Response {
+    let auth_path = body.auth_path.trim().to_ascii_lowercase();
+    let verifier_kind = body.verifier_kind.trim().to_ascii_lowercase();
+    if !matches!(auth_path.as_str(), "membrane_challenge" | "oidc") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "auth_path must be one of: membrane_challenge, oidc"})),
+        )
+            .into_response();
+    }
+    if verifier_kind.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "verifier_kind must not be empty"})),
+        )
+            .into_response();
+    }
+
+    let verifier_hint = body
+        .verifier_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let bind_label = body
+        .bind_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let challenge = match issue_operator_auth_challenge(
+        &state.db_path,
+        &state.hotel,
+        "desktop_membrane",
+        &auth_path,
+        &verifier_kind,
+        verifier_hint,
+        bind_label,
+    ) {
+        Ok(challenge) => challenge,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(OperatorAuthChallengeView {
+            challenge_id: challenge.challenge_id,
+            user_id: challenge.user_id,
+            intended_surface: challenge.intended_surface,
+            auth_path: challenge.auth_path,
+            verifier_kind: challenge.verifier_kind,
+            verifier_hint: challenge.verifier_hint,
+            bind_label: challenge.bind_label,
+            challenge_nonce: challenge.challenge_nonce,
+            issued_at: challenge.issued_at,
+            expires_at: challenge.expires_at,
+            status: challenge.status,
+        }),
+    )
+        .into_response()
 }
 
 async fn handle_auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -4334,6 +4451,24 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_operator_sessions_token
         ON operator_sessions(session_token);
+
+        CREATE TABLE IF NOT EXISTS operator_auth_challenges (
+            challenge_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            intended_surface TEXT NOT NULL,
+            auth_path TEXT NOT NULL,
+            verifier_kind TEXT NOT NULL,
+            verifier_hint TEXT,
+            bind_label TEXT,
+            challenge_nonce TEXT NOT NULL UNIQUE,
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            consumed_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_operator_auth_challenges_nonce
+        ON operator_auth_challenges(challenge_nonce);
         ",
     )?;
 
@@ -4446,6 +4581,109 @@ fn issue_operator_session(
     )?;
 
     Ok(session)
+}
+
+fn issue_operator_auth_challenge(
+    db_path: &PathBuf,
+    hotel: &str,
+    intended_surface: &str,
+    auth_path: &str,
+    verifier_kind: &str,
+    verifier_hint: Option<String>,
+    bind_label: Option<String>,
+) -> Result<OperatorAuthChallengeRecord> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    let expires_at = now + 60 * 5;
+    let challenge = OperatorAuthChallengeRecord {
+        challenge_id: new_operator_chat_id("operator-auth-challenge"),
+        user_id: default_operator_user_id(hotel),
+        intended_surface: intended_surface.into(),
+        auth_path: auth_path.into(),
+        verifier_kind: verifier_kind.into(),
+        verifier_hint,
+        bind_label,
+        challenge_nonce: new_operator_chat_id("challenge-nonce"),
+        issued_at: now,
+        expires_at,
+        status: "pending".into(),
+        consumed_at: None,
+    };
+    conn.execute(
+        "INSERT INTO operator_auth_challenges
+        (challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint, bind_label, challenge_nonce, issued_at, expires_at, status, consumed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            &challenge.challenge_id,
+            &challenge.user_id,
+            &challenge.intended_surface,
+            &challenge.auth_path,
+            &challenge.verifier_kind,
+            &challenge.verifier_hint,
+            &challenge.bind_label,
+            &challenge.challenge_nonce,
+            challenge.issued_at,
+            challenge.expires_at,
+            &challenge.status,
+            challenge.consumed_at,
+        ],
+    )?;
+    Ok(challenge)
+}
+
+#[allow(dead_code)]
+fn resolve_operator_auth_challenge(
+    db_path: &PathBuf,
+    challenge_id: &str,
+) -> Result<Option<OperatorAuthChallengeRecord>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint,
+                bind_label, challenge_nonce, issued_at, expires_at, status, consumed_at
+         FROM operator_auth_challenges
+         WHERE challenge_id = ?1",
+    )?;
+    let maybe = stmt
+        .query_row([challenge_id], |row| {
+            Ok(OperatorAuthChallengeRecord {
+                challenge_id: row.get(0)?,
+                user_id: row.get(1)?,
+                intended_surface: row.get(2)?,
+                auth_path: row.get(3)?,
+                verifier_kind: row.get(4)?,
+                verifier_hint: row.get(5)?,
+                bind_label: row.get(6)?,
+                challenge_nonce: row.get(7)?,
+                issued_at: row.get(8)?,
+                expires_at: row.get(9)?,
+                status: row.get(10)?,
+                consumed_at: row.get(11)?,
+            })
+        })
+        .optional()?;
+    Ok(maybe)
+}
+
+#[allow(dead_code)]
+fn consume_operator_auth_challenge(
+    db_path: &PathBuf,
+    challenge_id: &str,
+) -> Result<Option<OperatorAuthChallengeRecord>> {
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    let changed = conn.execute(
+        "UPDATE operator_auth_challenges
+         SET status = 'consumed', consumed_at = ?2
+         WHERE challenge_id = ?1
+           AND status = 'pending'
+           AND expires_at > ?2",
+        rusqlite::params![challenge_id, now],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    resolve_operator_auth_challenge(db_path, challenge_id)
 }
 
 fn resolve_operator_session(
@@ -4735,6 +4973,60 @@ mod tests {
         assert_eq!(resolved.display_name, "Jared");
         assert_eq!(resolved.issuing_hotel, "mac-jane");
         assert_eq!(resolved.posture, "admin");
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn issue_operator_auth_challenge_persists_pending_record() {
+        let context_path = temp_db_path("operator-auth-challenge");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let challenge = issue_operator_auth_challenge(
+            &context_path,
+            "mac-jane",
+            "desktop_membrane",
+            "membrane_challenge",
+            "telegram",
+            Some("@jaredlikes".into()),
+            Some("desktop.jaredlikes.com".into()),
+        )
+        .unwrap();
+
+        let resolved = resolve_operator_auth_challenge(&context_path, &challenge.challenge_id)
+            .unwrap()
+            .expect("challenge should resolve");
+        assert_eq!(resolved.status, "pending");
+        assert_eq!(resolved.verifier_kind, "telegram");
+        assert_eq!(resolved.auth_path, "membrane_challenge");
+        assert_eq!(resolved.user_id, "root-user:mac-jane");
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn consumed_operator_auth_challenge_cannot_be_consumed_twice() {
+        let context_path = temp_db_path("operator-auth-challenge-consume");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let challenge = issue_operator_auth_challenge(
+            &context_path,
+            "mac-jane",
+            "desktop_membrane",
+            "oidc",
+            "google",
+            None,
+            Some("desktop.jaredlikes.com".into()),
+        )
+        .unwrap();
+
+        let first = consume_operator_auth_challenge(&context_path, &challenge.challenge_id)
+            .unwrap()
+            .expect("first consume should succeed");
+        assert_eq!(first.status, "consumed");
+        assert!(first.consumed_at.is_some());
+
+        let second =
+            consume_operator_auth_challenge(&context_path, &challenge.challenge_id).unwrap();
+        assert!(second.is_none());
 
         let _ = fs::remove_file(&context_path);
     }

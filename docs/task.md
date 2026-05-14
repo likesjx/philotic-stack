@@ -1189,11 +1189,15 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [x] move the bootstrap UX into `System Settings > Aiua Membrane` while the embedded desktop shell stays live before auth
   - [x] shell-level operator-session gate: before auth, non-settings workspace app launch/focus is blocked and redirected through the desktop event bus into `System Settings > Aiua Membrane`
   - [x] seed and project hotel-local `root_user_key_refs` from the current vault key source (keychain/env) with non-secret fingerprint metadata
+  - [x] define canonical bootstrap direction: OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
+  - [x] persist hotel-local `operator_auth_challenges` and expose first challenge issuance endpoint for membrane/OIDC ceremony groundwork
   - [ ] move from current root-key source inspection to a richer hotel-local identity/step-up authority path with real vault-backed login ceremony
+  - [ ] implement OIDC start/callback flow for hotel-issued operator sessions
+  - [ ] implement membrane proof verification and single-use challenge redemption into operator sessions
   - [ ] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
   - [ ] philote-visible bounded user context projection instead of raw root-user secret access
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
-  - [ ] step-up-friendly login/bootstrap path beyond the startup bootstrap token
+  - [ ] passkey-backed local-first operator login after OIDC and membrane step-up are landed
 - [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.
 - [ ] Define the first high-trust remote action ceremonies for:
   - secret rotation

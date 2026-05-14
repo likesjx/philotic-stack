@@ -16,6 +16,7 @@ related_docs:
 - ARCHITECTURE_STATUS.md
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
 - DESKTOP_MEMBRANE_PROPOSAL.md
+- OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md
 - ROLE_POSTURE_AND_ADMIN_PROPOSAL.md
 - HOTEL_PERIMETER_TRUST_PROPOSAL.md
 - KEY_VAULT_PROPOSAL.md
@@ -200,6 +201,7 @@ This is intentionally a first slice, not a final auth model:
 - auth still uses a hotel-issued bootstrap token rather than passkey or local-device mediation
 - root-user key refs are now materially populated, but only from the current key source inspection path (keychain/env), not yet from a richer login or step-up identity ceremony
 - operator posture is still a simple `admin` session default rather than a richer elevation flow
+- the next accepted bootstrap direction is now explicit in [OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md): OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
 
 ## Desktop Auth Recommendation
 
@@ -370,16 +372,17 @@ Current accepted direction for this proposal is:
 ## Follow-On Slices
 
 1. persist hotel-owned user records and root-user key refs in graph + vault-backed form
-2. add a first login/bootstrap flow for desktop auth
-3. replace ambient desktop debug token assumptions with bounded operator sessions
-4. gate all desktop read models behind authenticated operator session issuance
-5. project bounded user context into philote/session activation
-6. define cross-hotel operator session continuity and audit attribution
-7. define multi-user support once the single-root-user model is stable
+2. add a first real OIDC login/bootstrap path for desktop auth
+3. add hotel-local single-use auth challenges for membrane-assisted step-up/recovery
+4. replace ambient desktop debug token assumptions with bounded operator sessions
+5. gate all desktop read models behind authenticated operator session issuance
+6. project bounded user context into philote/session activation
+7. define cross-hotel operator session continuity and audit attribution
+8. define multi-user support once the single-root-user model is stable
 
 ## Open Questions
 
-1. Should the first login be local-device mediated, passkey-shaped, or hotel-generated bootstrap token based?
+1. Which OIDC provider should be enabled first on the hotel-owned callback path: GitHub, Google, or both together?
 2. Should one hotel be the canonical home for a user while others hold mirrored operator identity projections, or should each hotel have equal local authority for the same user record?
 3. Which parts of operator session state should be mesh-visible versus strictly target-hotel local?
 4. How should role/philote transport preserve user linkage without smuggling reusable auth?
