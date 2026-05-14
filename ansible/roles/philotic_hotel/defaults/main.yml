@@ -27,6 +27,7 @@ philotic_binaries:
   - philote-worker
   - membrane
   - membrane-telegram
+  - membrane-mcp
   - graph-runner
   - tool-runner
   - agent-core

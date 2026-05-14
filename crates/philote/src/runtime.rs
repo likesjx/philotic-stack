@@ -1591,6 +1591,13 @@ impl AgentRuntime {
                                 warn!("Failed to handle datasource_response: {}", err);
                             }
                         }
+                        Ok(task) if task.command.as_deref() == Some("context.capture") => {
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_context_capture(task, task_id).await {
+                                error!("Failed to handle context.capture: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
+                            }
+                        }
                         Ok(task) => {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_user_message(task, task_id).await {
@@ -2384,6 +2391,7 @@ impl AgentRuntime {
                 plan_confirmed: false,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
+                streaming_retry_attempts: 0,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -2880,12 +2888,37 @@ impl AgentRuntime {
                     .retry_active_turn_after_provider_failure(
                         session_id,
                         turn_id,
-                        provider_repair_note(&error_payload),
+                        Some(provider_repair_note(&error_payload)),
                     )
                     .await;
             }
             // Network / timeout / rate-limit errors: escalate to next fallback tier.
             if should_escalate_tier(&error_payload) {
+                // For streaming_timeout specifically, allow one same-tier retry before
+                // escalating — handles transient empty SSE responses from Gemini.
+                if error_payload.sub_kind.as_deref() == Some("streaming_timeout") {
+                    let attempts = self
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.streaming_retry_attempts())
+                        .unwrap_or(0);
+                    if attempts < 1 {
+                        if let Some(state) = self.sessions.get_mut(&session_id) {
+                            state.increment_streaming_retry_attempts();
+                        }
+                        warn!(
+                            session_id = %session_id,
+                            "Retrying same tier after streaming_timeout (attempt 1)"
+                        );
+                        return self
+                            .retry_active_turn_after_provider_failure(
+                                session_id,
+                                turn_id,
+                                None,
+                            )
+                            .await;
+                    }
+                }
                 warn!(
                     session_id = %session_id,
                     sub_kind = %sub_kind,
@@ -3510,7 +3543,11 @@ impl AgentRuntime {
             let is_routing_policy_propose =
                 !bypass_approval && tool_call.tool_name == "routing.policy.propose";
 
-            if is_admin_role_creation || is_rule_propose || is_routing_policy_propose || force_approval {
+            if is_admin_role_creation
+                || is_rule_propose
+                || is_routing_policy_propose
+                || force_approval
+            {
                 // Set pending_tool_call so the approval handler can read it for class lookup.
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     state.set_pending_tool_call(tool_call.clone());
@@ -4132,13 +4169,15 @@ impl AgentRuntime {
         &mut self,
         session_id: String,
         turn_id: String,
-        note: String,
+        note: Option<String>,
     ) -> Result<()> {
         let retry_plan = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 return Ok(());
             };
-            state.set_provider_repair_note(note);
+            if let Some(n) = note {
+                state.set_provider_repair_note(n);
+            }
             state.increment_provider_repair_attempts();
 
             match state.build_reentry_context_envelope() {
@@ -4596,6 +4635,112 @@ impl AgentRuntime {
             turn_id,
             chat_id,
             content,
+            audio_artifact: None,
+            send_text_caption: false,
+            reply_markup: None,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: final_reply_to,
+                target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
+                task_json: serde_json::to_string(&payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Handles a `context.capture` tool call arriving from membrane-mcp.
+    ///
+    /// Bypasses the LLM: parses the capture payload, stores it in Muninn, and
+    /// emits a `send_reply` back to the mcp-membrane so the HTTP caller gets a
+    /// response.
+    async fn handle_context_capture(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        use memory_core::MemoryEngine as _;
+
+        // Content is JSON: {"tool": "context.capture", "args": {...}}
+        let args: serde_json::Value = task
+            .content
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.get("args").cloned())
+            .unwrap_or_default();
+
+        let capture_text = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let category = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("note")
+            .to_string();
+
+        let mut tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tags.push("perplexity".to_string());
+        if !tags.contains(&category) {
+            tags.push(category.clone());
+        }
+
+        let first_line: String = capture_text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(50)
+            .collect();
+        let concept = format!("perplexity.{}: {}", category, first_line);
+
+        let result_text = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
+            None => "Captured (Muninn not configured on this node).".to_string(),
+            Some(engine) => {
+                match engine
+                    .remember(MemoryScope::SelfOnly, &concept, &capture_text, tags)
+                    .await
+                {
+                    Ok(engram_ref) => format!("Captured to memory (id: {}).", engram_ref.id),
+                    Err(e) => format!("context.capture: memory error — {e}"),
+                }
+            }
+        };
+
+        info!(turn_id = ?task.turn_id, result = %result_text, "context.capture handled");
+
+        let final_reply_to = task
+            .final_reply_to
+            .clone()
+            .unwrap_or_else(|| local_node_id());
+        let final_reply_role = task
+            .final_reply_role
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REPLY_ROLE.to_string());
+        let final_reply_guest_id = task.final_reply_guest_id.clone();
+        let session_id = task.session_id_or_default(&self.agent_id);
+        let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
+        let chat_id = task.chat_id.clone().unwrap_or_default();
+
+        let payload = FinalReplyPayload {
+            action: "send_reply",
+            session_id,
+            turn_id,
+            chat_id,
+            content: result_text,
             audio_artifact: None,
             send_text_caption: false,
             reply_markup: None,
@@ -11566,7 +11711,9 @@ impl AgentRuntime {
                              An operator will review and approve or reject the proposed change."
                         )
                     }
-                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => message,
                     Ok(IpcResponse::Standard {
                         ok: false, message, ..
                     }) => {
@@ -12389,6 +12536,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));

@@ -1175,6 +1175,39 @@ impl GeminiProvider {
             .map(str::to_string)
     }
 
+    /// Parse one SSE line and return the full chunk Value if it contains a `functionCall`
+    /// part in `candidates[0].content.parts`. Gemini emits function calls via streaming
+    /// without any accompanying text, which causes `parse_sse_text_chunk` to return None
+    /// and `full_text` to stay empty. This helper detects those chunks so `invoke_streaming`
+    /// can return them correctly instead of bailing with a streaming_timeout error.
+    fn parse_sse_function_call_chunk(line: &str) -> Option<Value> {
+        let json_str = if let Some(rest) = line.strip_prefix("data: ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            rest
+        } else {
+            return None;
+        };
+        if json_str.trim() == "[DONE]" {
+            return None;
+        }
+        let chunk: Value = serde_json::from_str(json_str).ok()?;
+        let has_fc = chunk
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .any(|p| p.get("functionCall").is_some() || p.get("function_call").is_some())
+            })
+            .unwrap_or(false);
+        if has_fc { Some(chunk) } else { None }
+    }
+
     /// Scan `accumulated` for the display_text JSON string value, starting where we left off.
     /// Appends any newly revealed display_text characters to `out` and calls `on_token`.
     /// Returns the updated extraction cursor.
@@ -1486,6 +1519,10 @@ impl ModelProvider for GeminiProvider {
         let mut _display_text_out = String::new();
 
         let idle_dur = Duration::from_secs(STREAMING_IDLE_SECS);
+        // Stash a function-call response found in SSE chunks. Gemini delivers tool
+        // calls via streaming without any text content; we capture them here so the
+        // empty-full_text check below can return them instead of bailing.
+        let mut pending_function_call: Option<ProviderOutput> = None;
         loop {
             match timeout(idle_dur, byte_stream.next()).await {
                 Ok(Some(chunk_result)) => {
@@ -1510,6 +1547,19 @@ impl ModelProvider for GeminiProvider {
                                     }
                                 } else {
                                     let _ = token_tx.send(text_chunk).await;
+                                }
+                            } else if has_tools && pending_function_call.is_none() {
+                                if let Some(fc_chunk) =
+                                    Self::parse_sse_function_call_chunk(&line)
+                                {
+                                    match Self::parse_native_function_call(task, &fc_chunk) {
+                                        Ok(Some(tc)) => pending_function_call = Some(tc),
+                                        Ok(None) => {}
+                                        Err(e) => warn!(
+                                            "Failed to parse SSE function call chunk: {}",
+                                            e
+                                        ),
+                                    }
                                 }
                             }
                         } else {
@@ -1536,6 +1586,16 @@ impl ModelProvider for GeminiProvider {
             if !line.is_empty() {
                 if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                     full_text.push_str(&text_chunk);
+                } else if has_tools && pending_function_call.is_none() {
+                    if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
+                        match Self::parse_native_function_call(task, &fc_chunk) {
+                            Ok(Some(tc)) => pending_function_call = Some(tc),
+                            Ok(None) => {}
+                            Err(e) => {
+                                warn!("Failed to parse SSE function call chunk: {}", e)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1543,6 +1603,10 @@ impl ModelProvider for GeminiProvider {
         drop(token_tx);
 
         if full_text.trim().is_empty() {
+            // Gemini delivered a function call via SSE without any text — return it directly.
+            if let Some(fc) = pending_function_call {
+                return Ok(fc);
+            }
             // Stream completed without delivering text content (safety block, quota, etc.).
             // Do NOT fall back to batch — that path has no timeout and caused a 27-minute hang.
             // Return a streaming_timeout error so philote escalates to the next fallback tier.

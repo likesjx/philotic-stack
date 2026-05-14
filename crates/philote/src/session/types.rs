@@ -372,6 +372,10 @@ pub struct WorkingTurn {
     /// Incremented each time the loop escalates to a lower-tier provider.
     #[serde(default)]
     pub fallback_tier: u8,
+    /// Number of same-tier retries attempted for streaming_timeout errors.
+    /// Allows one automatic retry before escalating to the next fallback tier.
+    #[serde(default)]
+    pub streaming_retry_attempts: u8,
 }
 
 #[derive(Debug, Clone)]

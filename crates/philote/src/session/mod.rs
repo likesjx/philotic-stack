@@ -361,6 +361,22 @@ impl SessionState {
         }
     }
 
+    pub fn streaming_retry_attempts(&self) -> u8 {
+        self.active_turn
+            .as_ref()
+            .map(|turn| turn.streaming_retry_attempts)
+            .unwrap_or(0)
+    }
+
+    pub fn increment_streaming_retry_attempts(&mut self) -> u8 {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.streaming_retry_attempts += 1;
+            turn.streaming_retry_attempts
+        } else {
+            0
+        }
+    }
+
     pub fn set_pending_text_reply(&mut self, text: String) {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.pending_text_reply = Some(text);
@@ -2678,6 +2694,7 @@ impl SessionState {
                 "provider_repair_note": turn.provider_repair_note,
                 "provider_repair_attempts": turn.provider_repair_attempts,
                 "fallback_tier": turn.fallback_tier,
+                "streaming_retry_attempts": turn.streaming_retry_attempts,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
@@ -3004,6 +3021,10 @@ impl SessionState {
                     .map(str::to_string),
                 fallback_tier: turn
                     .get("fallback_tier")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u8,
+                streaming_retry_attempts: turn
+                    .get("streaming_retry_attempts")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u8,
             })
@@ -3759,6 +3780,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         }
     }
 
@@ -3796,6 +3818,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3952,6 +3975,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.complete_active_turn("hi".into());
@@ -3998,6 +4022,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4752,6 +4777,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let projection = state.build_context_projection("status");
@@ -4841,6 +4867,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let prompt = state.build_prompt("status");
@@ -4924,6 +4951,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -5004,6 +5032,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5394,10 +5423,7 @@ mod tests {
 
         assert_eq!(route.execution_mode, "local_agent");
         assert_eq!(route.target_role, "agent");
-        assert_eq!(
-            route.selection_reason.as_deref(),
-            Some("agent_local_tool")
-        );
+        assert_eq!(route.selection_reason.as_deref(), Some("agent_local_tool"));
     }
 
     #[test]
@@ -5415,10 +5441,7 @@ mod tests {
         assert_eq!(route.execution_mode, "agent_graph");
         assert_eq!(route.target_role, "agent-graph");
         assert_eq!(route.runner_id, None);
-        assert_eq!(
-            route.selection_reason.as_deref(),
-            Some("agent_graph_route")
-        );
+        assert_eq!(route.selection_reason.as_deref(), Some("agent_graph_route"));
     }
 
     #[test]
@@ -5568,6 +5591,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5621,6 +5645,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.push_tool_history(
@@ -5689,6 +5714,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.push_tool_history(
@@ -5758,6 +5784,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let reentry = state
@@ -6035,6 +6062,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -6189,6 +6217,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         }
     }
 
@@ -6310,6 +6339,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         };
         state.start_turn(turn);
         state.push_tool_history(
