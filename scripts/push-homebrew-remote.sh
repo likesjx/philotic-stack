@@ -52,6 +52,15 @@ fi
 echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
 ssh "${REMOTE}" "pkill -f 'aiua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f 'aiua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
 
+echo "▶ Signing release binaries with ad-hoc identity..."
+while IFS= read -r bin_path; do
+  bin="$(basename "${bin_path}")"
+  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" ]]; then
+    continue
+  fi
+  codesign -s - --force "${bin_path}" 2>/dev/null || true
+done < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
+
 echo "▶ Verifying local binary signatures before push..."
 UNSIGNED=()
 while IFS= read -r bin_path; do
