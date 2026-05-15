@@ -5182,6 +5182,29 @@ impl IpcServer {
                     &task_json,
                 )
                 .await;
+                // If the caller targeted this node but the guest isn't configured here,
+                // look up the live node via the registry so the mesh dispatcher forwards
+                // the task to the correct hotel automatically.
+                let target_node = if target_node == local_node_id {
+                    if let Some(ref guest_id) = target_guest_id {
+                        if !Self::configured_local_guest_exists(graph, local_node_id, guest_id) {
+                            let reg = registry.read().await;
+                            if let Some(status) = reg.find_node_for_incarnation(guest_id) {
+                                let remote = status.capabilities.node_id.clone();
+                                info!(guest_id, remote, "EmitTask: auto-routing to mesh peer");
+                                remote
+                            } else {
+                                target_node
+                            }
+                        } else {
+                            target_node
+                        }
+                    } else {
+                        target_node
+                    }
+                } else {
+                    target_node
+                };
                 let resolved_target_guest_id = match &route_resolution {
                     AgentRouteResolution::Deliver(guest_id) => guest_id.clone(),
                     AgentRouteResolution::Park { guest_id } => Some(guest_id.clone()),

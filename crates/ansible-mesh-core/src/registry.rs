@@ -139,6 +139,14 @@ impl NodeRegistry {
                 .filter(move |advertisement| advertisement.target_role == target_role)
         })
     }
+
+    /// Find the fresh node currently hosting a specific guest by incarnation_id (guest_id).
+    pub fn find_node_for_incarnation(&self, guest_id: &str) -> Option<&NodeStatus> {
+        self.nodes.values().find(|status| {
+            Self::is_fresh(status)
+                && status.advertisements.iter().any(|ad| ad.incarnation_id == guest_id)
+        })
+    }
 }
 
 #[cfg(test)]
