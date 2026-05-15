@@ -52,31 +52,23 @@ fi
 echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
 ssh "${REMOTE}" "pkill -f 'aiua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f 'aiua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
 
-echo "▶ Signing release binaries with ad-hoc identity..."
-while IFS= read -r bin_path; do
-  bin="$(basename "${bin_path}")"
-  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" ]]; then
-    continue
-  fi
-  codesign -s - --force "${bin_path}" 2>/dev/null || true
-done < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
-
-echo "▶ Verifying local binary signatures before push..."
+echo "▶ Signing and verifying local binaries before push..."
 UNSIGNED=()
 while IFS= read -r bin_path; do
   bin="$(basename "${bin_path}")"
   if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" ]]; then
     continue
   fi
-  if ! codesign -dv "${bin_path}" 2>&1 | grep -q "adhoc"; then
+  codesign -s - --force "${bin_path}" 2>/dev/null || true
+  sig_info=$(codesign -dv "${bin_path}" 2>&1 || true)
+  if ! grep -q "adhoc" <<<"${sig_info}"; then
     UNSIGNED+=("${bin}")
   fi
 done < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
 
 if [[ ${#UNSIGNED[@]} -gt 0 ]]; then
-  echo "❌ Unsigned binaries detected (macOS will SIGKILL these on remote):"
+  echo "❌ Binaries that could not be signed (macOS will SIGKILL these on remote):"
   for b in "${UNSIGNED[@]}"; do echo "   - ${b}"; done
-  echo "   Run 'cargo build --release' again or sign with: codesign -s - target/release/<bin>"
   exit 1
 fi
 echo "  ✓ All local binaries have adhoc signatures"
