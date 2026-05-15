@@ -1316,6 +1316,70 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "routing.reflex.set".into(),
+        ToolDefinition {
+            tool_name: "routing.reflex.set".into(),
+            description: "Set a durable routing reflex that takes effect immediately on the \
+                          next turn. Use to self-administer low-level dispatch preferences \
+                          without operator approval. Currently supports \
+                          `preferred_generation_capability` (values: `text.generate` for \
+                          standard Gemini, `response.generate` for Gemini Live native audio). \
+                          Setting a reflex overrides any prior value for the same key."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "preference_key": {
+                        "type": "string",
+                        "description": "Stable identifier for this reflex, e.g. 'generation_capability_preference'. Used to update or clear the reflex later."
+                    },
+                    "reflexes": {
+                        "type": "object",
+                        "description": "Reflex fields to set. Supported keys: 'preferred_generation_capability' ('text.generate' or 'response.generate').",
+                        "properties": {
+                            "preferred_generation_capability": {
+                                "type": "string",
+                                "enum": ["text.generate", "response.generate"],
+                                "description": "Which generation capability to dispatch cognitive turns to."
+                            }
+                        }
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief reason for the change — stored in the config alongside the reflex for observability."
+                    }
+                },
+                "required": ["preference_key", "reflexes"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.reflex.get".into(),
+        ToolDefinition {
+            tool_name: "routing.reflex.get".into(),
+            description: "Read the agent's current routing reflexes from the agent graph. \
+                          Returns all stored reflex preference rows including their keys, \
+                          precedences, and current reflex values. Use to inspect what \
+                          generation capability or routing posture is active before deciding \
+                          whether to change it."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "preference_key": {
+                        "type": "string",
+                        "description": "Optional — if provided, returns only the row with this key. If omitted, returns all rows."
+                    }
+                },
+                "required": []
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
         "memory.recall".into(),
         ToolDefinition {
             tool_name: "memory.recall".into(),

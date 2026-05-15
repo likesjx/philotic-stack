@@ -1023,6 +1023,11 @@ pub enum IpcRequest {
         reflexes_json: serde_json::Value,
         config_json: serde_json::Value,
     },
+    GetAgentReflexPreferences {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preference_key: Option<String>,
+    },
     /// Record one successful same-self role handoff observation and let the hotel
     /// fold it into agent-owned reflex posture without making philote read/modify/write
     /// the agent graph directly.
@@ -1539,6 +1544,10 @@ pub enum IpcResponse {
     /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
     /// This prevents this variant from swallowing `MemoryConfig` responses.
     UserProfileData(UserProfileDataPayload),
+    /// Response to [`IpcRequest::GetAgentReflexPreferences`].
+    AgentReflexPreferences {
+        rows: Vec<serde_json::Value>,
+    },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.

@@ -6890,6 +6890,50 @@ impl IpcServer {
                     }
                 }
             }
+            IpcRequest::GetAgentReflexPreferences {
+                agent_id,
+                preference_key,
+            } => {
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<Vec<serde_json::Value>> {
+                    if !path.exists() {
+                        return Ok(vec![]);
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    let preferences = if let Some(key) = preference_key {
+                        storage
+                            .get_reflex_preference(&key)?
+                            .map(|r| vec![r])
+                            .unwrap_or_default()
+                    } else {
+                        storage.list_reflex_preferences()?
+                    };
+                    Ok(preferences
+                        .into_iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "agent_id": p.agent_id,
+                                "preference_key": p.preference_key,
+                                "precedence": p.precedence,
+                                "reflexes": p.reflexes_json,
+                                "config": p.config_json,
+                                "updated_at": p.updated_at,
+                            })
+                        })
+                        .collect())
+                })();
+                match result {
+                    Ok(rows) => IpcResponse::AgentReflexPreferences { rows },
+                    Err(err) => {
+                        error!("Failed to read reflex preferences: {err}");
+                        IpcResponse::error(
+                            "get_agent_reflex_preferences",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
             IpcRequest::RecordRoleHandoffReflexEvidence {
                 agent_id,
                 role_name,
@@ -10407,6 +10451,30 @@ fn compose_component_route_assembly(
     registry: &NodeRegistry,
     local_node_id: &str,
 ) -> serde_json::Value {
+    // Find the highest-precedence `preferred_generation_capability` from agent reflex layers.
+    // This lets a philote self-promote text.generate turns to response.generate (Gemini Live)
+    // by storing a routing reflex via routing.reflex.set.
+    let preferred_gen_cap: Option<String> = bindings
+        .get("reflex_policy_agent_layers")
+        .and_then(|v| v.as_array())
+        .and_then(|layers| {
+            layers
+                .iter()
+                .filter_map(|layer| {
+                    let cap = layer
+                        .get("reflexes")
+                        .and_then(|r| r.get("preferred_generation_capability"))
+                        .and_then(|v| v.as_str())?;
+                    let precedence = layer
+                        .get("precedence")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    Some((precedence, cap.to_string()))
+                })
+                .max_by_key(|(p, _)| *p)
+                .map(|(_, cap)| cap)
+        });
+
     let execution_routes = default_component_capabilities(bindings)
         .into_iter()
         .filter_map(|capability| {
@@ -10418,7 +10486,19 @@ fn compose_component_route_assembly(
                 registry,
                 local_node_id,
             )
-            .map(|route| (capability, route))
+            .map(|mut route| {
+                if capability == "text.generate" {
+                    if let Some(cap) = &preferred_gen_cap {
+                        if let Some(obj) = route.as_object_mut() {
+                            obj.insert(
+                                "target_capability".to_string(),
+                                serde_json::json!(cap),
+                            );
+                        }
+                    }
+                }
+                (capability, route)
+            })
         })
         .collect::<serde_json::Map<_, _>>();
 
@@ -22799,5 +22879,43 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[test]
+    fn compose_route_assembly_stamps_target_capability_from_reflex_layer() {
+        // Given bindings with a reflex layer that sets preferred_generation_capability to
+        // "response.generate", the assembled text.generate route must carry
+        // target_capability = "response.generate".
+        let bindings = serde_json::json!({
+            "reflex_policy_agent_layers": [
+                {
+                    "precedence": 70,
+                    "reflexes": {
+                        "preferred_generation_capability": "response.generate"
+                    }
+                }
+            ]
+        });
+        let registry = NodeRegistry::new();
+        let result = compose_component_route_assembly(&bindings, &[], &[], &registry, "local-node");
+        let target_cap = &result["execution_routes"]["text.generate"]["target_capability"];
+        assert_eq!(
+            target_cap,
+            "response.generate",
+            "text.generate route must carry target_capability=response.generate when reflex is set"
+        );
+    }
+
+    #[test]
+    fn compose_route_assembly_no_target_capability_without_reflex() {
+        // Without a reflex layer, text.generate must NOT have a target_capability field.
+        let bindings = serde_json::json!({});
+        let registry = NodeRegistry::new();
+        let result = compose_component_route_assembly(&bindings, &[], &[], &registry, "local-node");
+        let route = &result["execution_routes"]["text.generate"];
+        assert!(
+            route.get("target_capability").is_none() || route["target_capability"].is_null(),
+            "text.generate route must not have target_capability when no reflex is set"
+        );
     }
 }

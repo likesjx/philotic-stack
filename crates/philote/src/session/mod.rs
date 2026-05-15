@@ -3381,6 +3381,8 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "memory.remember"
             | "rule.propose"
             | "routing.policy.propose"
+            | "routing.reflex.set"
+            | "routing.reflex.get"
             | "mcp.provision"
             | "mcp.revoke"
             | "desktop.observe"
@@ -3923,6 +3925,7 @@ mod tests {
                     execution_mode: "capability".into(),
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
+                    target_capability: None,
                 },
             )]),
         };

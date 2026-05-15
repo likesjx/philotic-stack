@@ -959,6 +959,8 @@ pub struct ComponentExecutionRoute {
     pub availability_state: String,
     #[serde(default)]
     pub selection_reason: Option<String>,
+    #[serde(default)]
+    pub target_capability: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

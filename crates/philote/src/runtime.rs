@@ -180,6 +180,10 @@ fn implementation_to_model_role(implementation: &str) -> String {
         "model.elevenlabs".into()
     } else if matches!(normalized, "onnx" | "kokoro" | "local") {
         "model.local".into()
+    } else if normalized == "ollama" {
+        "model.ollama".into()
+    } else if normalized == "mlx" {
+        "model.mlx".into()
     } else {
         "model".into()
     }
@@ -414,6 +418,27 @@ fn resolve_model_execution_target(
         .unwrap_or_else(|| fallback_role.into());
 
     (local_node_id(), target_role, None)
+}
+
+/// Returns `(action, effective_capability)` for model dispatch.
+///
+/// When the session has a `target_capability` reflex on the resolved route,
+/// that capability drives both the `action` field sent to model-router and the
+/// route lookup. Callers that previously hardcoded `"generate_text"` /
+/// `"text.generate"` should use this helper instead so that the philote can
+/// self-promote a turn to `"response.generate"` (Gemini Live) via its routing
+/// reflexes.
+fn resolve_dispatch(state: Option<&SessionState>, base_capability: &str) -> (String, String) {
+    let effective = state
+        .and_then(|s| s.resolve_component_execution_route(base_capability))
+        .and_then(|r| r.target_capability.as_deref())
+        .unwrap_or(base_capability);
+
+    let action = match effective {
+        "response.generate" => "response.generate".to_string(),
+        _ => "generate_text".to_string(),
+    };
+    (action, effective.to_string())
 }
 
 /// Returns true if the task is from a Telegram group or supergroup.
@@ -2615,8 +2640,13 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let (action, prompt, attachments, tools_for_model, capability) =
-            if let Some(routing) = media_routing {
+        let (action, prompt, attachments, tools_for_model, capability): (
+            String,
+            String,
+            Vec<TransportAttachment>,
+            Vec<ToolDefinition>,
+            String,
+        ) = if let Some(routing) = media_routing {
                 let prompt = if routing.action == "transcribe" {
                     transcription_prompt(&content)
                 } else {
@@ -2632,15 +2662,17 @@ impl AgentRuntime {
                     prompt,
                     routing.attachments,
                     effective_tools,
-                    routing.capability,
+                    routing.capability.to_string(),
                 )
             } else {
+                let (dispatch_action, dispatch_cap) =
+                    resolve_dispatch(self.sessions.get(&session_id), "text.generate");
                 (
-                    "generate_text".to_string(),
+                    dispatch_action,
                     model_prompt,
                     Vec::new(),
                     tools_for_model,
-                    "text.generate",
+                    dispatch_cap,
                 )
             };
         let (response_contract, provider_options) = voice_delivery_envelope(
@@ -2652,13 +2684,13 @@ impl AgentRuntime {
         let (target_node, target_role, target_guest_id) = {
             let (node, role, guest_id) = resolve_model_execution_target(
                 self.sessions.get(&session_id),
-                capability,
+                &capability,
                 DEFAULT_TEXT_MODEL_ROLE,
             );
             // Network-offline fast-path: skip cloud tiers entirely and go straight
             // to the local model. Uses the last entry in the configured fallback
             // tiers, falling back to DEFAULT_FALLBACK_TIERS.
-            if self.network_offline && capability == "text.generate" {
+            if self.network_offline && matches!(capability.as_str(), "text.generate" | "response.generate") {
                 let offline_role_name: Option<String> = self
                     .sessions
                     .get(&session_id)
@@ -2732,7 +2764,7 @@ impl AgentRuntime {
         let model_req = ModelRequestPayload {
             action,
             request_class: Some(
-                if capability == "text.generate" {
+                if matches!(capability.as_str(), "text.generate" | "response.generate") {
                     "cognitive"
                 } else {
                     "transform"
@@ -2759,7 +2791,7 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
-        if debug_model_requests_enabled() && capability == "text.generate" {
+        if debug_model_requests_enabled() && matches!(capability.as_str(), "text.generate" | "response.generate") {
             match serde_json::to_string_pretty(&model_req) {
                 Ok(json) => info!(
                     "PHILOTIC_DEBUG_MODEL_REQUESTS philote outbound model request session={} turn={}:\n{}",
@@ -11752,6 +11784,127 @@ impl AgentRuntime {
                 .await
             }
 
+            // ── routing.reflex.set ───────────────────────────────────────────
+            "routing.reflex.set" => {
+                let args = payload.arguments.as_object();
+                let preference_key = args
+                    .and_then(|a| a.get("preference_key"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("generation_capability_preference")
+                    .to_string();
+                let reflexes_json = args
+                    .and_then(|a| a.get("reflexes"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let reason = args
+                    .and_then(|a| a.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::UpsertAgentReflexPreference {
+                        agent_id: self.agent_id.clone(),
+                        preference_key: preference_key.clone(),
+                        precedence: 70,
+                        reflexes_json,
+                        config_json: serde_json::json!({ "reason": reason }),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        format!("Routing reflex '{preference_key}' stored. Takes effect on the next turn.")
+                    }
+                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                        format!("routing.reflex.set: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.reflex.set: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.reflex.set: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.reflex.set".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.reflex.get ───────────────────────────────────────────
+            "routing.reflex.get" => {
+                let args = payload.arguments.as_object();
+                let filter_key = args
+                    .and_then(|a| a.get("preference_key"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetAgentReflexPreferences {
+                        agent_id: self.agent_id.clone(),
+                        preference_key: filter_key,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::AgentReflexPreferences { rows }) => {
+                        serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+                    }
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(_) => "routing.reflex.get: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.reflex.get: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.reflex.get".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             // ── desktop.observe ──────────────────────────────────────────────
             "desktop.observe" => {
                 // Observe-only: returns desktop runner metadata. No screenshot or interaction.
@@ -12281,6 +12434,20 @@ mod tests {
             super::implementation_to_model_role("elevenlabs-v1"),
             "model.elevenlabs"
         );
+        assert_eq!(super::implementation_to_model_role("ollama"), "model.ollama");
+        assert_eq!(
+            super::implementation_to_model_role("ollama-llama3"),
+            "model.ollama"
+        );
+        assert_eq!(super::implementation_to_model_role("mlx"), "model.mlx");
+        assert_eq!(
+            super::implementation_to_model_role("mlx-community/llama"),
+            "model.mlx"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("onnx"),
+            "model.local"
+        );
     }
 
     #[test]
@@ -12319,6 +12486,7 @@ mod tests {
                     execution_mode: "capability".into(),
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
+                    target_capability: None,
                 },
             )]),
         };
@@ -12367,6 +12535,39 @@ mod tests {
         assert_eq!(route.hotel_id.as_deref(), Some("default"));
         assert_eq!(state.bindings.effective_toolset, vec!["echo"]);
         assert_eq!(state.bindings.effective_skillset, vec!["planning"]);
+    }
+
+    #[test]
+    fn resolve_dispatch_defaults_to_generate_text() {
+        let (action, cap) = super::resolve_dispatch(None, "text.generate");
+        assert_eq!(action, "generate_text");
+        assert_eq!(cap, "text.generate");
+    }
+
+    #[test]
+    fn resolve_dispatch_promotes_to_response_generate_when_reflex_set() {
+        let mut state =
+            SessionState::new("sess-reflex".into(), "agent-01".into(), "telegram".into());
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: "local".into(),
+                    target_role: "model".into(),
+                    incarnation_id: None,
+                    hotel_id: None,
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: None,
+                    target_capability: Some("response.generate".into()),
+                },
+            )]),
+        };
+
+        let (action, cap) = super::resolve_dispatch(Some(&state), "text.generate");
+        assert_eq!(action, "response.generate");
+        assert_eq!(cap, "response.generate");
     }
 
     #[test]
