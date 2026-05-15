@@ -257,7 +257,7 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
     });
 
     let req = IpcRequest::CreateTask {
-        target_role: "philote".into(),
+        target_role: "agent".into(),
         payload,
     };
     client.send_request(req).await?;

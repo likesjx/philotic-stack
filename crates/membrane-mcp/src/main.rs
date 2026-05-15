@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use auth::{AllotmentTracker, VaultHashCache, VaultResolver};
 use clap::Parser;
 use membrane::{LeaseRenewResult, MembraneGuest, OutboundReply};
-use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use routing::{new_shared_endpoint_table, new_shared_table};
 use server::{MembraneState, build_router};
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ struct Args {
     #[arg(long, env = "MCP_STATIC_ROUTES")]
     static_routes: Option<std::path::PathBuf>,
 
-    #[arg(long, env = "PHILOTIC_IPC_SOCKET")]
+    #[arg(long, env = "PHILOTIC_HOTEL_SOCKET")]
     ipc_socket: Option<String>,
 
     #[arg(long, env = "PHILOTIC_GUEST_ID", default_value = "membrane-mcp-01")]
@@ -43,17 +43,62 @@ struct Args {
     node_id: String,
 }
 
-// ── Vault stub (Slice 1) ──────────────────────────────────────────────────────
+// ── Vault resolver ────────────────────────────────────────────────────────────
 
-struct IpcVaultResolver;
+struct IpcVaultResolver {
+    socket_path: String,
+}
 
 impl VaultResolver for IpcVaultResolver {
     fn resolve(&self, vault_ref: &str) -> Result<[u8; 32]> {
-        warn!(
-            vault_ref,
-            "vault resolver stub — Slice 2 wires real IPC lookup"
-        );
-        Ok([0u8; 32])
+        let socket_path = self.socket_path.clone();
+        let vault_ref = vault_ref.to_string();
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut client = PhiloticClient::connect_at(
+                    &socket_path,
+                    GuestIdentity {
+                        guest_id: "membrane-mcp-vault".into(),
+                        role: "mcp-membrane".into(),
+                        supported_tools: vec![],
+                    },
+                )
+                .await?;
+
+                let resp = client
+                    .send_request(IpcRequest::GetSecret {
+                        secret_ref: vault_ref.clone(),
+                    })
+                    .await?;
+
+                match resp {
+                    IpcResponse::SecretData {
+                        value_json: Some(json),
+                        ..
+                    } => {
+                        // value_json may be double-encoded (stored plaintext is itself JSON).
+                        let step1: String = serde_json::from_str(&json)
+                            .unwrap_or_else(|_| json.trim_matches('"').to_string());
+                        let hex: String = if step1.starts_with('"') {
+                            serde_json::from_str(&step1)
+                                .unwrap_or_else(|_| step1.trim_matches('"').to_string())
+                        } else {
+                            step1
+                        };
+                        let bytes = hex::decode(&hex)
+                            .map_err(|e| anyhow::anyhow!("bad hex in vault: {}", e))?;
+                        bytes
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("vault hash must be 32 bytes"))
+                    }
+                    IpcResponse::SecretData { value_json: None, .. } => {
+                        anyhow::bail!("vault_ref '{}' not found", vault_ref)
+                    }
+                    other => anyhow::bail!("unexpected vault response: {:?}", other),
+                }
+            })
+        })
     }
 }
 
@@ -312,7 +357,12 @@ async fn main() -> Result<()> {
         endpoint_table,
         vault_cache: VaultHashCache::new(),
         allotment: AllotmentTracker::new(),
-        vault: Box::new(IpcVaultResolver),
+        vault: Box::new(IpcVaultResolver {
+            socket_path: args.ipc_socket.clone().unwrap_or_else(|| {
+                std::env::var("PHILOTIC_HOTEL_SOCKET")
+                    .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string())
+            }),
+        }),
         node_id: args.node_id.clone(),
         inbound_tx,
         pending_responses,
