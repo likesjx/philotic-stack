@@ -866,7 +866,11 @@ struct PendingPipeline {
     original_task_id: Uuid,
     original_task_json: String,
     rule_id: String,
+    // Retained for Slice 4 multi-stage logging; not read by single-stage delivery or watchdog.
+    #[allow(dead_code)]
     capability_role: String,
+    /// Unix timestamp (seconds) when this entry was inserted; used by the TTL watchdog.
+    created_at: u64,
 }
 
 pub(crate) type PendingPipelineRegistry = Arc<Mutex<HashMap<String, PendingPipeline>>>;
@@ -2326,6 +2330,26 @@ impl IpcServer {
         let listener = UnixListener::bind(path)?;
         info!("Hotel Front Desk (UDS) listening on: {}", self.socket_path);
 
+        // Golgi pipeline TTL watchdog — evicts entries that never received a capability reply.
+        {
+            let pending_pipelines = self.pending_pipelines.clone();
+            let inboxes = self.inboxes.clone();
+            let local_node_id = self.local_node_id.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    Self::golgi_pipeline_watchdog(
+                        &pending_pipelines,
+                        &inboxes,
+                        &local_node_id,
+                    )
+                    .await;
+                }
+            });
+        }
+
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -3136,6 +3160,7 @@ impl IpcServer {
                         original_task_json: task_json.to_string(),
                         rule_id: rule.rule_id.clone(),
                         capability_role: capability_role.to_string(),
+                        created_at: unix_ts(),
                     },
                 );
             }
@@ -3224,6 +3249,53 @@ impl IpcServer {
             obj.insert("golgi_stage_output".into(), cap_output);
         }
         serde_json::to_string(&original).ok()
+    }
+
+    /// Sweeps `pending_pipelines` for entries older than [`GOLGI_PIPELINE_TTL_SECS`].
+    ///
+    /// For each expired entry the original task is delivered to the original target
+    /// (`on_failure` passthrough), ensuring the agent is never permanently blocked
+    /// by a capability that never replied.
+    async fn golgi_pipeline_watchdog(
+        pending_pipelines: &PendingPipelineRegistry,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+    ) {
+        const GOLGI_PIPELINE_TTL_SECS: u64 = 120;
+
+        let now = unix_ts();
+        let expired: Vec<(String, PendingPipeline)> = {
+            let mut guard = pending_pipelines.lock().await;
+            let keys: Vec<String> = guard
+                .iter()
+                .filter(|(_, p)| now.saturating_sub(p.created_at) >= GOLGI_PIPELINE_TTL_SECS)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| guard.remove(&k).map(|p| (k, p)))
+                .collect()
+        };
+
+        for (corr_key, pending) in expired {
+            warn!(
+                "Golgi: pipeline '{}' (corr_key='{}') timed out after {}s — \
+                 delivering original task {} to '{}' (on_failure passthrough)",
+                pending.rule_id,
+                corr_key,
+                GOLGI_PIPELINE_TTL_SECS,
+                pending.original_task_id,
+                pending.original_target_role,
+            );
+            Self::deliver_inbound_task(
+                inboxes,
+                local_node_id,
+                &pending.original_target_role,
+                pending.original_target_guest_id.as_deref(),
+                pending.original_task_id,
+                pending.original_task_json,
+            )
+            .await;
+        }
     }
 
     // ── end Golgi routing pipeline ────────────────────────────────────────────
@@ -23695,6 +23767,131 @@ mod tests {
         server_task.abort();
         let _ = server_task.await;
         let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Verify that the TTL watchdog delivers the original task to the original target
+    /// when a pending pipeline entry has expired (created_at far in the past).
+    ///
+    /// Test strategy:
+    /// 1. Start the IPC server.
+    /// 2. Subscribe an agent guest to observe its inbox.
+    /// 3. Inject a `PendingPipeline` with `created_at = 0` directly via the registry.
+    /// 4. Call `golgi_pipeline_watchdog` directly — does not wait 30s.
+    /// 5. Assert the agent's inbox received the original task as-is (on_failure passthrough).
+    #[tokio::test]
+    async fn golgi_pipeline_watchdog_delivers_original_task_on_ttl_expiry() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let agent_id = "agent-golgi-slice3-watchdog";
+        let graph = make_hotel_graph(&socket_path, agent_id);
+
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-watchdog",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        // Grab references before moving server into the spawn.
+        let pending_pipelines = server.pending_pipelines();
+        let inboxes = server.inboxes();
+
+        let server_task =
+            tokio::spawn(async move { server.run().await.expect("ipc server should run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        // Subscribe agent guest so its inbox exists.
+        let agent_guest_id = "watchdog-agent-guest-01";
+        let mut agent_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: agent_guest_id.into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        // ── Inject an expired PendingPipeline entry ──────────────────────────
+        let original_task_id = Uuid::new_v4();
+        let original_task_json = serde_json::json!({
+            "action": "audio_input",
+            "session_id": "sess-watchdog-01",
+            "turn_id": "turn-watchdog-01",
+            "payload": "raw audio bytes here",
+        })
+        .to_string();
+
+        {
+            let mut guard = pending_pipelines.lock().await;
+            guard.insert(
+                "sess-watchdog-01:turn-watchdog-01".into(),
+                PendingPipeline {
+                    original_target_role: "agent".into(),
+                    original_target_guest_id: Some(agent_guest_id.into()),
+                    original_task_id,
+                    original_task_json: original_task_json.clone(),
+                    rule_id: "watchdog-test-rule".into(),
+                    capability_role: "voice.transcribe".into(),
+                    created_at: 0, // epoch — guaranteed expired
+                },
+            );
+        }
+
+        // ── Drive the watchdog directly (no 30s wait) ───────────────────────
+        IpcServer::golgi_pipeline_watchdog(&pending_pipelines, &inboxes, "local-aiua-watchdog")
+            .await;
+
+        // ── Assert pending_pipelines is now empty ────────────────────────────
+        {
+            let guard = pending_pipelines.lock().await;
+            assert!(
+                guard.is_empty(),
+                "watchdog must evict the expired entry: {:?}",
+                guard.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // ── Assert agent inbox received the original task ────────────────────
+        let received = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            agent_client.recv_task(),
+        )
+        .await
+        .expect("watchdog delivery must arrive within 2s")
+        .expect("recv_task error");
+
+        let philotic_client::IpcResponse::InboundTask { task_json, .. } = received else {
+            panic!("expected InboundTask from watchdog delivery, got {:?}", received);
+        };
+
+        let payload: serde_json::Value = serde_json::from_str(&task_json).unwrap_or_default();
+        assert_eq!(
+            payload.get("action").and_then(serde_json::Value::as_str),
+            Some("audio_input"),
+            "on_failure delivery must carry original action"
+        );
+        assert_eq!(
+            payload.get("session_id").and_then(serde_json::Value::as_str),
+            Some("sess-watchdog-01"),
+        );
+        // No golgi_stage_output — this is the raw original task, no capability ran.
+        assert!(
+            payload.get("golgi_stage_output").is_none(),
+            "on_failure passthrough must NOT include golgi_stage_output"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
