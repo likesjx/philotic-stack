@@ -509,7 +509,7 @@ remote-homebrew-status remote hotel:
     @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
 
 jane-push:
-    just remote-homebrew-push mbp-jane mbp-jane Jareds-MacBook-Pro
+    just remote-homebrew-push mbp-jane mbp-jane MacBookPro
 
 # Stop Jane on mbp-jane without pushing new binaries.
 jane-stop:

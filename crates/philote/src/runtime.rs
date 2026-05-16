@@ -1173,6 +1173,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::UpdateMcpRoutes {
                 agent_id: self.agent_id.clone(),
                 routes,
+                vault_ref: None,
             })
             .await
         {
