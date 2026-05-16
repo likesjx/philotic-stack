@@ -98,24 +98,34 @@ async fn handle_mcp(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::Json(req): axum::Json<JsonRpcRequest>,
-) -> axum::Json<JsonRpcResponse> {
+) -> axum::response::Response {
+    let is_notification = req.id.is_none();
     let id = req.id.clone().unwrap_or(Value::Null);
     let is_loopback = addr.ip().is_loopback();
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
 
+    match req.method.as_str() {
+        // Notifications — JSON-RPC spec: MUST NOT send a response.
+        "initialized" | "notifications/cancelled" | "notifications/progress" => {
+            return (StatusCode::ACCEPTED, "").into_response();
+        }
+        _ => {}
+    }
+
+    // If id is absent this is a notification we don't explicitly handle; still no response.
+    if is_notification {
+        return (StatusCode::ACCEPTED, "").into_response();
+    }
+
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id, req.params),
-        "initialized" => {
-            // Notification — no response required per spec, but we ack.
-            JsonRpcResponse::ok(id, json!({}))
-        }
         "ping" => JsonRpcResponse::ok(id, json!({})),
         "tools/list" => handle_tools_list(&state, id, auth_header).await,
         "tools/call" => handle_tools_call(&state, id, req.params, auth_header, is_loopback).await,
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
 
-    axum::Json(resp)
+    axum::Json(resp).into_response()
 }
 
 // ── Method handlers ───────────────────────────────────────────────────────────
