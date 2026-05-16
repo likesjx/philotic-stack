@@ -1548,7 +1548,7 @@ impl ModelProvider for GeminiProvider {
                                 } else {
                                     let _ = token_tx.send(text_chunk).await;
                                 }
-                            } else if has_tools && pending_function_call.is_none() {
+                            } else if pending_function_call.is_none() {
                                 if let Some(fc_chunk) =
                                     Self::parse_sse_function_call_chunk(&line)
                                 {
@@ -1586,7 +1586,7 @@ impl ModelProvider for GeminiProvider {
             if !line.is_empty() {
                 if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                     full_text.push_str(&text_chunk);
-                } else if has_tools && pending_function_call.is_none() {
+                } else if pending_function_call.is_none() {
                     if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
                         match Self::parse_native_function_call(task, &fc_chunk) {
                             Ok(Some(tc)) => pending_function_call = Some(tc),
