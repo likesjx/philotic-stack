@@ -3,7 +3,7 @@ title: Hotel User Identity And Operator Auth Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: accepted for current slice
-last_updated: 2026-05-13
+last_updated: 2026-05-16
 tags:
 - operator
 - identity
@@ -77,6 +77,8 @@ Philotes should receive a **projected user context**, not raw root-user secret m
 
 The mesh should carry a **ghost mirror projection** of user identity records that are needed for routing, audit, and cross-hotel operator continuity, while private key material and local secret bindings remain hotel-local.
 
+Identity authority lives in the hotel graph. Identity understanding lives in the agent graph.
+
 ## Why This Boundary Matters
 
 Without a hotel-owned user authority:
@@ -96,6 +98,7 @@ That is efficient right up until the operator asks who actually approved a dange
 The hotel should own these records canonically:
 
 - `UserRecord`
+- `ExternalIdentityLinkRecord`
 - `OperatorSessionRecord`
 - `OperatorPostureRecord`
 - `ActionGrantRecord`
@@ -103,6 +106,8 @@ The hotel should own these records canonically:
 - local vault bindings for user-scoped secrets and key material
 
 These are hotel-local because they govern local authentication, local vault access, and dangerous action execution.
+
+`ExternalIdentityLinkRecord` is where Google / GitHub / Apple linkage belongs. It is not agent-memory and it is not mesh-global secret material.
 
 ### Mesh-projected shared truth
 
@@ -134,6 +139,27 @@ Philotes should not receive:
 - vault master keys
 - reusable operator session credentials
 - plaintext secrets just because they asked nicely in a new role
+
+### Agent-graph versus hotel-graph split
+
+The hotel graph should own:
+
+- canonical local user identity
+- onboarding state
+- linked external identities
+- operator sessions
+- auth challenges
+- root-user key references
+- security posture and trusted membranes/devices
+
+The agent graph may own:
+
+- the philote's relationship model for that user
+- inferred interaction preferences
+- task-specific working assumptions
+- memory about prior collaboration
+
+The agent graph must not become the authority for login identity. Charming anthropomorphism is not a security model.
 
 ## Root User Model
 
@@ -172,6 +198,19 @@ Suggested first record families:
 - `rotation_state`
 - `updated_at`
 
+### `ExternalIdentityLinkRecord`
+
+- `user_id`
+- `provider`
+- `provider_subject`
+- `email`
+- `login`
+- `display_name`
+- `verified_at`
+- `last_seen_at`
+- `created_at`
+- `updated_at`
+
 ### `OperatorSessionRecord`
 
 - `session_id`
@@ -204,6 +243,8 @@ This is intentionally a first slice, not a final auth model:
 - the next accepted bootstrap direction is now explicit in [OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md): OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
 - `philotic-web` now has a first provider-backed OIDC ceremony seam: provider discovery in auth status, `/api/auth/oidc/start` for PKCE-backed challenge issuance, and `/auth/oidc/:provider/callback` for code exchange and hotel-issued operator session issuance
 - OIDC settings are now moving under hotel authority too: the intended canonical split is hotel-config-backed public base URL and provider client IDs plus vault-backed provider `*_secret_ref` config keys, with env values retained only as transitional fallback while operator config catches up
+- the hotel auth store now persists first real `external_identity_links` records keyed by provider subject, so successful OIDC logins stop being display-name-only proof and start attaching durable Google/GitHub identity linkage to the canonical hotel-local operator user
+- `GET /api/auth/status` now exposes that non-secret external identity linkage so the future `User Settings` surface has a real hotel-owned user graph seam to build on
 
 ## Desktop Auth Recommendation
 

@@ -1195,7 +1195,8 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [ ] wire the desktop System Settings auth surface to read and mutate the bounded OIDC config surface (`/api/config/oidc`, `oidc_*` keys) instead of relying on env-era operator folklore
   - [ ] move from current root-key source inspection to a richer hotel-local identity/step-up authority path with real vault-backed login ceremony
   - [ ] implement membrane proof verification and single-use challenge redemption into operator sessions
-  - [ ] persist normalized provider identity linkage on the hotel-local root user record instead of treating provider login as display-name-only proof
+  - [x] persist the first normalized provider identity linkage on the hotel-local root user record using provider subject as the canonical link key and email/login as aliases
+  - [ ] expand hotel-local user onboarding beyond the first root-user link so local-first `User Settings` can curate a richer canonical user graph
   - [ ] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
   - [ ] philote-visible bounded user context projection instead of raw root-user secret access
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source

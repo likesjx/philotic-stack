@@ -3,7 +3,7 @@ title: Operator Auth Bootstrap Strategy Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: accepted for current slice
-last_updated: 2026-05-13
+last_updated: 2026-05-16
 tags:
 - operator
 - auth
@@ -164,6 +164,8 @@ OIDC should be modeled as:
 
 The hotel should persist linkage metadata locally, but the session itself still comes from hotel authority rather than directly from the provider.
 
+Provider `subject` should be the canonical external identity match key. Email and login are helpful aliases, not a safe root identity key to build the whole user graph on top of.
+
 That keeps the external identity provider useful without letting it quietly replace the hotel as the system that knows who is actually operating the mesh right now.
 
 ## Always-On Desktop Recommendation
@@ -188,6 +190,7 @@ This slice accepts and implements the first groundwork seam:
 - `POST /api/auth/oidc/start` now issues a provider-bound OIDC challenge plus PKCE verifier and returns a provider authorization URL
 - `GET /auth/oidc/:provider/callback` now exchanges the authorization code, fetches provider identity, consumes the hotel-local challenge, and issues the hotel-owned operator session cookie
 - OIDC provider settings are now intended to live in hotel config truth: public callback base URL and provider client IDs in operator config, provider client secrets as vault-backed `*_secret_ref` config entries, with env-based settings retained only as transitional fallback
+- successful OIDC callbacks now persist the first hotel-local `external_identity_links` records keyed by provider subject, with email/login retained as supporting aliases
 
 This is intentionally **not** yet:
 
@@ -199,7 +202,7 @@ This is intentionally **not** yet:
 
 1. define trusted membrane proof shape for Telegram-assisted auth
 2. consume verified membrane challenges into bounded operator sessions
-3. add provider/claim normalization and persistence for hotel-local root user identity linkage
+3. expand provider/claim normalization beyond the first persisted subject/email/login slice and map those links onto richer local-first onboarding
 4. add passkey-backed login as a stronger local-first auth factor
 5. project non-secret operator identity/audit metadata across the mesh
 

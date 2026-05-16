@@ -348,6 +348,8 @@ struct AuthStatusView {
     oidc_providers: Vec<OidcProviderStatusView>,
     #[serde(default)]
     root_user_key_refs: Vec<RootUserKeyRefStatusView>,
+    #[serde(default)]
+    external_identity_links: Vec<ExternalIdentityLinkStatusView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<OperatorSessionStatusView>,
 }
@@ -415,6 +417,36 @@ struct RootUserKeyRefStatusView {
     public_fingerprint: Option<String>,
     rotation_state: String,
     source_kind: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ExternalIdentityLinkRecord {
+    link_id: String,
+    user_id: String,
+    provider: String,
+    provider_subject: String,
+    email: Option<String>,
+    login: Option<String>,
+    display_name: Option<String>,
+    verified_at: i64,
+    last_seen_at: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExternalIdentityLinkStatusView {
+    user_id: String,
+    provider: String,
+    provider_subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    login: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    verified_at: i64,
+    last_seen_at: i64,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -1113,12 +1145,15 @@ async fn handle_auth_status(headers: HeaderMap, State(state): State<AppState>) -
     let session = current_operator_session(&headers, &state);
     let root_user_key_refs =
         list_root_user_key_refs(&state.db_path, &state.hotel).unwrap_or_default();
+    let external_identity_links =
+        list_external_identity_links(&state.db_path, &state.hotel).unwrap_or_default();
     let oidc_providers = list_oidc_provider_statuses(&state.socket, Some(&headers)).await;
     Json(AuthStatusView {
         authenticated: session.is_some(),
         hotel: (*state.hotel).clone(),
         oidc_providers,
         root_user_key_refs,
+        external_identity_links,
         session: session.map(|session| OperatorSessionStatusView {
             session_id: session.session_id,
             user_id: session.user_id,
@@ -1174,6 +1209,8 @@ async fn handle_auth_bootstrap(
         hotel: (*state.hotel).clone(),
         oidc_providers,
         root_user_key_refs: list_root_user_key_refs(&state.db_path, &state.hotel)
+            .unwrap_or_default(),
+        external_identity_links: list_external_identity_links(&state.db_path, &state.hotel)
             .unwrap_or_default(),
         session: Some(OperatorSessionStatusView {
             session_id: session.session_id.clone(),
@@ -1460,6 +1497,12 @@ async fn handle_auth_oidc_callback(
             );
         }
     };
+
+    if let Err(err) =
+        upsert_operator_external_identity_link(&state.db_path, &state.hotel, &identity)
+    {
+        return oidc_callback_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
 
     let challenge = match consume_operator_auth_challenge(&state.db_path, &pending.challenge_id) {
         Ok(Some(challenge)) => challenge,
@@ -4899,6 +4942,24 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_operator_auth_challenges_nonce
         ON operator_auth_challenges(challenge_nonce);
+
+        CREATE TABLE IF NOT EXISTS external_identity_links (
+            link_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_subject TEXT NOT NULL,
+            email TEXT,
+            login TEXT,
+            display_name TEXT,
+            verified_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(provider, provider_subject)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_external_identity_links_user
+        ON external_identity_links(user_id);
         ",
     )?;
 
@@ -4959,6 +5020,34 @@ fn list_root_user_key_refs(
             vault_ref,
             public_fingerprint: row.get(3)?,
             rotation_state: row.get(4)?,
+        })
+    })?;
+
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn list_external_identity_links(
+    db_path: &PathBuf,
+    hotel: &str,
+) -> Result<Vec<ExternalIdentityLinkStatusView>> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT user_id, provider, provider_subject, email, login, display_name, verified_at, last_seen_at
+         FROM external_identity_links
+         WHERE user_id = ?1
+         ORDER BY provider, provider_subject",
+    )?;
+    let rows = stmt.query_map([default_operator_user_id(hotel)], |row| {
+        Ok(ExternalIdentityLinkStatusView {
+            user_id: row.get(0)?,
+            provider: row.get(1)?,
+            provider_subject: row.get(2)?,
+            email: row.get(3)?,
+            login: row.get(4)?,
+            display_name: row.get(5)?,
+            verified_at: row.get(6)?,
+            last_seen_at: row.get(7)?,
         })
     })?;
 
@@ -5063,6 +5152,88 @@ fn issue_operator_auth_challenge(
         ],
     )?;
     Ok(challenge)
+}
+
+fn upsert_operator_external_identity_link(
+    db_path: &PathBuf,
+    hotel: &str,
+    identity: &OidcIdentity,
+) -> Result<ExternalIdentityLinkRecord> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    let user_id = default_operator_user_id(hotel);
+    let display_name = identity.display_name.trim();
+    if !display_name.is_empty() {
+        conn.execute(
+            "UPDATE operator_users
+             SET display_name = ?2, updated_at = ?3
+             WHERE user_id = ?1",
+            rusqlite::params![&user_id, display_name, now],
+        )?;
+    }
+
+    let link_id = format!(
+        "external-identity:{}:{}",
+        identity.provider, identity.provider_subject
+    );
+    conn.execute(
+        "INSERT INTO external_identity_links
+        (link_id, user_id, provider, provider_subject, email, login, display_name, verified_at, last_seen_at, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, ?8)
+        ON CONFLICT(provider, provider_subject) DO UPDATE SET
+            user_id=excluded.user_id,
+            email=excluded.email,
+            login=excluded.login,
+            display_name=excluded.display_name,
+            verified_at=excluded.verified_at,
+            last_seen_at=excluded.last_seen_at,
+            updated_at=excluded.updated_at",
+        rusqlite::params![
+            &link_id,
+            &user_id,
+            &identity.provider,
+            &identity.provider_subject,
+            &identity.email,
+            &identity.login,
+            &identity.display_name,
+            now,
+        ],
+    )?;
+
+    resolve_external_identity_link(db_path, &identity.provider, &identity.provider_subject)?
+        .context("external identity link disappeared after upsert")
+}
+
+fn resolve_external_identity_link(
+    db_path: &PathBuf,
+    provider: &str,
+    provider_subject: &str,
+) -> Result<Option<ExternalIdentityLinkRecord>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT link_id, user_id, provider, provider_subject, email, login, display_name,
+                verified_at, last_seen_at, created_at, updated_at
+         FROM external_identity_links
+         WHERE provider = ?1 AND provider_subject = ?2",
+    )?;
+    stmt.query_row(rusqlite::params![provider, provider_subject], |row| {
+        Ok(ExternalIdentityLinkRecord {
+            link_id: row.get(0)?,
+            user_id: row.get(1)?,
+            provider: row.get(2)?,
+            provider_subject: row.get(3)?,
+            email: row.get(4)?,
+            login: row.get(5)?,
+            display_name: row.get(6)?,
+            verified_at: row.get(7)?,
+            last_seen_at: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    })
+    .optional()
+    .map_err(Into::into)
 }
 
 #[allow(dead_code)]
@@ -5355,7 +5526,11 @@ struct OidcTokenResponse {
 
 #[derive(Debug)]
 struct OidcIdentity {
+    provider: String,
+    provider_subject: String,
     display_name: String,
+    email: Option<String>,
+    login: Option<String>,
 }
 
 async fn list_oidc_provider_statuses(
@@ -5660,23 +5835,67 @@ async fn fetch_oidc_identity(
         .json()
         .await
         .context("failed to decode OIDC userinfo response")?;
-    let display_name = match provider.id.as_str() {
-        "google" => body
-            .get("name")
-            .and_then(Value::as_str)
-            .or_else(|| body.get("email").and_then(Value::as_str))
-            .unwrap_or("Operator"),
-        "github" => body
-            .get("name")
-            .and_then(Value::as_str)
-            .or_else(|| body.get("login").and_then(Value::as_str))
-            .unwrap_or("Operator"),
-        _ => "Operator",
+    oidc_identity_from_userinfo(provider, &body)
+}
+
+fn oidc_identity_from_userinfo(
+    provider: &OidcProviderConfig,
+    body: &Value,
+) -> Result<OidcIdentity> {
+    let identity = match provider.id.as_str() {
+        "google" => OidcIdentity {
+            provider: provider.id.clone(),
+            provider_subject: body
+                .get("sub")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("google userinfo response missing subject")?
+                .to_string(),
+            display_name: body
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("email").and_then(Value::as_str))
+                .unwrap_or("Operator")
+                .to_string(),
+            email: body
+                .get("email")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            login: None,
+        },
+        "github" => OidcIdentity {
+            provider: provider.id.clone(),
+            provider_subject: body
+                .get("id")
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string())
+                .context("github userinfo response missing id")?,
+            display_name: body
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| body.get("login").and_then(Value::as_str))
+                .unwrap_or("Operator")
+                .to_string(),
+            email: body
+                .get("email")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            login: body
+                .get("login")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        },
+        other => bail!("unsupported OIDC provider [{other}]"),
     };
 
-    Ok(OidcIdentity {
-        display_name: display_name.to_string(),
-    })
+    Ok(identity)
 }
 
 fn oidc_callback_error_response(status: StatusCode, message: String) -> Response {
@@ -5832,6 +6051,38 @@ mod tests {
     }
 
     #[test]
+    fn upsert_operator_external_identity_link_persists_google_subject_and_email() {
+        let context_path = temp_db_path("external-identity-link");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+
+        let link = upsert_operator_external_identity_link(
+            &context_path,
+            "mac-jane",
+            &OidcIdentity {
+                provider: "google".into(),
+                provider_subject: "google-subject-123".into(),
+                display_name: "Jared Likes".into(),
+                email: Some("jared@example.com".into()),
+                login: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(link.user_id, "root-user:mac-jane");
+        assert_eq!(link.provider, "google");
+        assert_eq!(link.provider_subject, "google-subject-123");
+        assert_eq!(link.email.as_deref(), Some("jared@example.com"));
+
+        let listed = list_external_identity_links(&context_path, "mac-jane").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].provider, "google");
+        assert_eq!(listed[0].provider_subject, "google-subject-123");
+        assert_eq!(listed[0].display_name.as_deref(), Some("Jared Likes"));
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
     fn consumed_operator_auth_challenge_cannot_be_consumed_twice() {
         let context_path = temp_db_path("operator-auth-challenge-consume");
         ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
@@ -5918,6 +6169,88 @@ mod tests {
         assert!(url.contains(
             "redirect_uri=https%3A%2F%2Fdesktop.jaredlikes.com%2Fauth%2Foidc%2Fgoogle%2Fcallback"
         ));
+    }
+
+    #[test]
+    fn oidc_identity_from_google_userinfo_uses_subject_and_email() {
+        let provider = oidc_provider_config_from_resolved(
+            "google",
+            OidcResolvedConfig {
+                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_source: "hotel-config".into(),
+                google: OidcProviderSettings {
+                    client_id: Some("google-client".into()),
+                    client_secret: Some("google-secret".into()),
+                    client_secret_ref: Some("vault:google".into()),
+                },
+                github: OidcProviderSettings {
+                    client_id: None,
+                    client_secret: None,
+                    client_secret_ref: None,
+                },
+            },
+        )
+        .unwrap()
+        .expect("google provider");
+
+        let identity = oidc_identity_from_userinfo(
+            &provider,
+            &json!({
+                "sub": "google-subject-1",
+                "name": "Jared Likes",
+                "email": "jared@example.com"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(identity.provider, "google");
+        assert_eq!(identity.provider_subject, "google-subject-1");
+        assert_eq!(identity.display_name, "Jared Likes");
+        assert_eq!(identity.email.as_deref(), Some("jared@example.com"));
+        assert!(identity.login.is_none());
+    }
+
+    #[test]
+    fn oidc_identity_from_github_userinfo_uses_numeric_id_and_login() {
+        let provider = oidc_provider_config_from_resolved(
+            "github",
+            OidcResolvedConfig {
+                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_source: "hotel-config".into(),
+                google: OidcProviderSettings {
+                    client_id: None,
+                    client_secret: None,
+                    client_secret_ref: None,
+                },
+                github: OidcProviderSettings {
+                    client_id: Some("github-client".into()),
+                    client_secret: Some("github-secret".into()),
+                    client_secret_ref: Some("vault:github".into()),
+                },
+            },
+        )
+        .unwrap()
+        .expect("github provider");
+
+        let identity = oidc_identity_from_userinfo(
+            &provider,
+            &json!({
+                "id": 42,
+                "login": "jaredlikes",
+                "name": "Jared Likes",
+                "email": "jared@users.noreply.github.com"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(identity.provider, "github");
+        assert_eq!(identity.provider_subject, "42");
+        assert_eq!(identity.display_name, "Jared Likes");
+        assert_eq!(identity.login.as_deref(), Some("jaredlikes"));
+        assert_eq!(
+            identity.email.as_deref(),
+            Some("jared@users.noreply.github.com")
+        );
     }
 
     #[test]
