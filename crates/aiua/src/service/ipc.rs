@@ -855,6 +855,22 @@ pub(crate) struct ParkedInboundTask {
 
 pub(crate) type ParkedInboundRegistry = Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
+/// Special sink role: capabilities reply here when dispatched by the Golgi pipeline.
+const GOLGI_SINK_ROLE: &str = "hotel:golgi";
+
+/// A task intercepted by the Golgi routing pipeline, awaiting capability-stage completion.
+/// Keyed by `"session_id:turn_id"` in [`PendingPipelineRegistry`].
+struct PendingPipeline {
+    original_target_role: String,
+    original_target_guest_id: Option<String>,
+    original_task_id: Uuid,
+    original_task_json: String,
+    rule_id: String,
+    capability_role: String,
+}
+
+pub(crate) type PendingPipelineRegistry = Arc<Mutex<HashMap<String, PendingPipeline>>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRouteResolution {
     Deliver(Option<String>),
@@ -868,6 +884,7 @@ pub struct IpcServer {
     graph: Arc<GraphDomain>,
     inboxes: InboxRegistry,
     parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+    pending_pipelines: PendingPipelineRegistry,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -2227,6 +2244,7 @@ impl IpcServer {
             graph,
             inboxes: Arc::new(Mutex::new(HashMap::new())),
             parked_inbound: Arc::new(Mutex::new(HashMap::new())),
+            pending_pipelines: Arc::new(Mutex::new(HashMap::new())),
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             desktop_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
@@ -2288,6 +2306,10 @@ impl IpcServer {
         self.parked_inbound.clone()
     }
 
+    pub(crate) fn pending_pipelines(&self) -> PendingPipelineRegistry {
+        self.pending_pipelines.clone()
+    }
+
     pub(crate) fn materialization_requester_arc(
         &self,
     ) -> Option<Arc<dyn GuestMaterializationRequester>> {
@@ -2312,6 +2334,7 @@ impl IpcServer {
                     let graph = self.graph.clone();
                     let inboxes = self.inboxes.clone();
                     let parked_inbound = self.parked_inbound.clone();
+                    let pending_pipelines = self.pending_pipelines.clone();
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
                     let desktop_membrane_leases = self.desktop_membrane_leases.clone();
@@ -2334,6 +2357,7 @@ impl IpcServer {
                             graph,
                             inboxes,
                             parked_inbound,
+                            pending_pipelines,
                             materialization_requester,
                             telegram_poll_leases,
                             desktop_membrane_leases,
@@ -2374,6 +2398,7 @@ impl IpcServer {
         graph: Arc<GraphDomain>,
         inboxes: InboxRegistry,
         parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        pending_pipelines: PendingPipelineRegistry,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -2544,6 +2569,7 @@ impl IpcServer {
                             graph.as_ref(),
                             &inboxes,
                             &parked_inbound,
+                            &pending_pipelines,
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
                             &desktop_membrane_leases,
@@ -3013,6 +3039,194 @@ impl IpcServer {
             }
         }
     }
+
+    // ── Golgi routing pipeline ───────────────────────────────────────────────
+
+    /// Checks whether the inbound task matches any Golgi pipeline rule for the target agent.
+    ///
+    /// Returns `(capability_role, capability_task_id, capability_task_json)` when intercepted;
+    /// stores a [`PendingPipeline`] entry keyed by `"session_id:turn_id"`.
+    ///
+    /// Only fires on `target_role == "agent"` tasks (via `infer_agent_context_for_task`).
+    /// The Park branch is out of scope for Slice 2 — pipeline only applies on Deliver.
+    async fn try_golgi_intercept(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_role: &str,
+        target_guest_id: Option<&str>,
+        original_task_id: Uuid,
+        task_json: &str,
+        pending_pipelines: &PendingPipelineRegistry,
+    ) -> Option<(String, Uuid, String)> {
+        use ansible_mesh_core::agent_graph_storage::AgentGraphStorage as _;
+
+        let ctx =
+            infer_agent_context_for_task(graph, target_role, target_guest_id, task_json)?;
+
+        let path = agent_graph_db_path(&ctx.agent_id);
+        if !path.exists() {
+            return None;
+        }
+        let storage = SqliteAgentGraphStorage::open(&ctx.agent_id, &path).ok()?;
+        let rules = storage.list_pipeline_rules().ok()?;
+        if rules.is_empty() {
+            return None;
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(task_json).ok()?;
+        let task_action = payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let session_id = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        for rule in &rules {
+            let rule_json = &rule.rule_json;
+
+            // Match on `rule_json.match.action` — skip rules without explicit action match.
+            let match_action = rule_json
+                .get("match")
+                .and_then(|m| m.get("action"))
+                .and_then(serde_json::Value::as_str)?;
+            if match_action != task_action {
+                continue;
+            }
+
+            // Only single-stage supported in Slice 2; take the first stage.
+            let stages = rule_json.get("stages").and_then(serde_json::Value::as_array)?;
+            let stage = stages.first()?;
+            let capability_role = stage
+                .get("capability")
+                .and_then(serde_json::Value::as_str)?;
+
+            // Correlation key: session_id:turn_id (unique per in-flight turn).
+            let corr_key = format!("{}:{}", session_id, turn_id);
+
+            // Build the capability task: forward the original payload but redirect the
+            // reply back to the Golgi sink so the hotel can finalize delivery.
+            let mut cap_payload = payload.clone();
+            if let Some(obj) = cap_payload.as_object_mut() {
+                obj.insert(
+                    "reply_role".into(),
+                    serde_json::Value::String(GOLGI_SINK_ROLE.into()),
+                );
+                obj.insert(
+                    "reply_to".into(),
+                    serde_json::Value::String(local_node_id.into()),
+                );
+            }
+            let cap_json = serde_json::to_string(&cap_payload).ok()?;
+            let cap_task_id = Uuid::new_v4();
+
+            {
+                let mut guard = pending_pipelines.lock().await;
+                guard.insert(
+                    corr_key,
+                    PendingPipeline {
+                        original_target_role: target_role.to_string(),
+                        original_target_guest_id: target_guest_id.map(str::to_string),
+                        original_task_id,
+                        original_task_json: task_json.to_string(),
+                        rule_id: rule.rule_id.clone(),
+                        capability_role: capability_role.to_string(),
+                    },
+                );
+            }
+
+            return Some((capability_role.to_string(), cap_task_id, cap_json));
+        }
+
+        None
+    }
+
+    /// Handles a capability result arriving at `GOLGI_SINK_ROLE`.
+    ///
+    /// Correlates via `session_id:turn_id`, merges the capability output into the
+    /// original intercepted task JSON, then delivers to the original target.
+    async fn handle_golgi_capability_response(
+        pending_pipelines: &PendingPipelineRegistry,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+        task_json: &str,
+    ) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+            warn!("Golgi: received non-JSON response at hotel:golgi sink");
+            return;
+        };
+
+        let session_id = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let corr_key = format!("{}:{}", session_id, turn_id);
+
+        let pending = {
+            let mut guard = pending_pipelines.lock().await;
+            guard.remove(&corr_key)
+        };
+
+        let Some(pending) = pending else {
+            warn!(
+                "Golgi: no pending pipeline for correlation key '{}' — capability response dropped",
+                corr_key
+            );
+            return;
+        };
+
+        let merged_json =
+            Self::merge_golgi_stage_output(&pending.original_task_json, task_json)
+                .unwrap_or(pending.original_task_json.clone());
+
+        info!(
+            "Golgi: pipeline rule '{}' complete — delivering merged task {} to '{}'",
+            pending.rule_id, pending.original_task_id, pending.original_target_role
+        );
+
+        Self::deliver_inbound_task(
+            inboxes,
+            local_node_id,
+            &pending.original_target_role,
+            pending.original_target_guest_id.as_deref(),
+            pending.original_task_id,
+            merged_json,
+        )
+        .await;
+    }
+
+    /// Merges a capability stage's output into the original intercepted task JSON.
+    ///
+    /// Embeds the full capability output under `golgi_stage_output` for traceability,
+    /// and promotes `content` to `transcript` if present (voice.transcribe result).
+    fn merge_golgi_stage_output(original_json: &str, cap_output_json: &str) -> Option<String> {
+        let mut original: serde_json::Value = serde_json::from_str(original_json).ok()?;
+        let cap_output: serde_json::Value = serde_json::from_str(cap_output_json).ok()?;
+        if let Some(obj) = original.as_object_mut() {
+            if let Some(content) = cap_output
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+            {
+                obj.insert(
+                    "transcript".into(),
+                    serde_json::Value::String(content.to_string()),
+                );
+            }
+            obj.insert("golgi_stage_output".into(), cap_output);
+        }
+        serde_json::to_string(&original).ok()
+    }
+
+    // ── end Golgi routing pipeline ────────────────────────────────────────────
 
     fn configured_local_guest_exists(
         graph: &GraphDomain,
@@ -3808,6 +4022,7 @@ impl IpcServer {
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        pending_pipelines: &PendingPipelineRegistry,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -5153,6 +5368,17 @@ impl IpcServer {
                         };
                     }
                 }
+                // Short-circuit Golgi capability responses — skip agent-context enrichment.
+                if target_role == GOLGI_SINK_ROLE {
+                    Self::handle_golgi_capability_response(
+                        &pending_pipelines,
+                        &inboxes,
+                        local_node_id,
+                        &task_json,
+                    )
+                    .await;
+                    return IpcResponse::success("golgi", None);
+                }
                 let task_json = match (
                     infer_agent_context_for_task(
                         graph,
@@ -5301,15 +5527,43 @@ impl IpcServer {
                 if target_node == local_node_id {
                     match route_resolution {
                         AgentRouteResolution::Deliver(target_guest_id) => {
-                            Self::deliver_inbound_task(
-                                inboxes,
-                                local_node_id,
-                                &target_role,
-                                target_guest_id.as_deref(),
-                                task_id,
-                                task_json,
-                            )
-                            .await;
+                            // Golgi trans hook: intercept if a pipeline rule matches.
+                            if let Some((cap_role, cap_id, cap_json)) =
+                                Self::try_golgi_intercept(
+                                    graph,
+                                    local_node_id,
+                                    &target_role,
+                                    target_guest_id.as_deref(),
+                                    task_id,
+                                    &task_json,
+                                    &pending_pipelines,
+                                )
+                                .await
+                            {
+                                info!(
+                                    "Golgi: intercepting task {} → capability '{}'",
+                                    task_id, cap_role
+                                );
+                                Self::deliver_inbound_task(
+                                    inboxes,
+                                    local_node_id,
+                                    &cap_role,
+                                    None,
+                                    cap_id,
+                                    cap_json,
+                                )
+                                .await;
+                            } else {
+                                Self::deliver_inbound_task(
+                                    inboxes,
+                                    local_node_id,
+                                    &target_role,
+                                    target_guest_id.as_deref(),
+                                    task_id,
+                                    task_json,
+                                )
+                                .await;
+                            }
                         }
                         AgentRouteResolution::Park { guest_id } => {
                             {
@@ -6957,6 +7211,114 @@ impl IpcServer {
                     }
                 }
             }
+            // ── routing pipeline rule CRUD ───────────────────────────────────
+            IpcRequest::UpsertRoutingPipelineRule {
+                agent_id,
+                rule_id,
+                rule_json,
+            } => {
+                use ansible_mesh_core::agent_graph_storage::RoutingPipelineRule;
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<()> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    storage.upsert_pipeline_rule(&RoutingPipelineRule {
+                        agent_id: agent_id.clone(),
+                        rule_id: rule_id.clone(),
+                        rule_json,
+                        updated_at: 0,
+                    })?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => IpcResponse::success(
+                        "routing_pipeline_rule",
+                        Some(serde_json::json!({
+                            "message": format!("Routing pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn.")
+                        })),
+                    ),
+                    Err(err) => {
+                        error!("Failed to store routing pipeline rule: {err}");
+                        IpcResponse::error(
+                            "upsert_routing_pipeline_rule",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::RemoveRoutingPipelineRule { agent_id, rule_id } => {
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<bool> {
+                    if !path.exists() {
+                        return Ok(false);
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    storage.remove_pipeline_rule(&rule_id)
+                })();
+                match result {
+                    Ok(deleted) => IpcResponse::success(
+                        "routing_pipeline_rule",
+                        Some(serde_json::json!({
+                            "message": if deleted {
+                                format!("Routing pipeline rule '{rule_id}' removed.")
+                            } else {
+                                format!("Routing pipeline rule '{rule_id}' not found.")
+                            }
+                        })),
+                    ),
+                    Err(err) => {
+                        error!("Failed to remove routing pipeline rule: {err}");
+                        IpcResponse::error(
+                            "remove_routing_pipeline_rule",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::GetRoutingPipelineRules { agent_id, rule_id } => {
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<Vec<serde_json::Value>> {
+                    if !path.exists() {
+                        return Ok(vec![]);
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    let rules = if let Some(id) = rule_id {
+                        storage
+                            .get_pipeline_rule(&id)?
+                            .map(|r| vec![r])
+                            .unwrap_or_default()
+                    } else {
+                        storage.list_pipeline_rules()?
+                    };
+                    Ok(rules
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "agent_id": r.agent_id,
+                                "rule_id": r.rule_id,
+                                "rule": r.rule_json,
+                                "updated_at": r.updated_at,
+                            })
+                        })
+                        .collect())
+                })();
+                match result {
+                    Ok(pipeline_rules) => IpcResponse::RoutingPipelineRules { pipeline_rules },
+                    Err(err) => {
+                        error!("Failed to read routing pipeline rules: {err}");
+                        IpcResponse::error(
+                            "get_routing_pipeline_rules",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+
             IpcRequest::RecordRoleHandoffReflexEvidence {
                 agent_id,
                 role_name,
@@ -22981,5 +23343,360 @@ mod tests {
             route.get("target_capability").is_none() || route["target_capability"].is_null(),
             "text.generate route must not have target_capability when no reflex is set"
         );
+    }
+
+    #[tokio::test]
+    async fn routing_pipeline_rule_upsert_get_remove_roundtrip() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-pipeline-rule-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        // Upsert a pipeline rule.
+        let upsert_resp = client
+            .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "voice-transcribe".into(),
+                rule_json: serde_json::json!({
+                    "match": { "frame_kind": ["audio", "voice"] },
+                    "stages": [{ "capability": "voice.transcribe", "mode": "blob" }],
+                    "deliver_as": "user_message"
+                }),
+            })
+            .await
+            .expect("upsert request");
+        assert!(
+            matches!(upsert_resp, IpcResponse::Standard { ok: true, .. }),
+            "upsert should succeed: {upsert_resp:?}"
+        );
+
+        // Retrieve by rule_id.
+        let get_resp = client
+            .send_request(IpcRequest::GetRoutingPipelineRules {
+                agent_id: agent_id.into(),
+                rule_id: Some("voice-transcribe".into()),
+            })
+            .await
+            .expect("get request");
+        let IpcResponse::RoutingPipelineRules { pipeline_rules } = get_resp else {
+            panic!("expected RoutingPipelineRules, got {get_resp:?}");
+        };
+        assert_eq!(pipeline_rules.len(), 1);
+        assert_eq!(pipeline_rules[0]["rule_id"], "voice-transcribe");
+        assert_eq!(pipeline_rules[0]["rule"]["deliver_as"], "user_message");
+
+        // Pipeline rules must NOT appear in reflex preferences.
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        assert!(
+            storage.list_reflex_preferences().unwrap().is_empty(),
+            "pipeline rules must not bleed into reflex_preferences"
+        );
+
+        // Remove the rule.
+        let remove_resp = client
+            .send_request(IpcRequest::RemoveRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "voice-transcribe".into(),
+            })
+            .await
+            .expect("remove request");
+        assert!(
+            matches!(remove_resp, IpcResponse::Standard { ok: true, .. }),
+            "remove should succeed"
+        );
+
+        // Confirm gone.
+        let get_after = client
+            .send_request(IpcRequest::GetRoutingPipelineRules {
+                agent_id: agent_id.into(),
+                rule_id: None,
+            })
+            .await
+            .expect("get-all after remove");
+        let IpcResponse::RoutingPipelineRules { pipeline_rules: after } = get_after else {
+            panic!("expected RoutingPipelineRules");
+        };
+        assert!(after.is_empty(), "rule should be gone after remove");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Golgi Slice 2 end-to-end:
+    ///
+    /// 1. Configure a pipeline rule (`match.action == "audio_input"` → capability `"voice.transcribe"`)
+    /// 2. Send EmitTask to agent role with matching action — verify agent does NOT receive it (intercepted)
+    /// 3. Verify capability (`"voice.transcribe"`) received the modified task with `reply_role: "hotel:golgi"`
+    /// 4. Simulate capability reply to `"hotel:golgi"` with `content: "hello world"`
+    /// 5. Verify agent finally receives the merged task with `transcript: "hello world"`
+    #[tokio::test]
+    async fn golgi_pipeline_intercepts_and_routes_to_capability_then_delivers_merged_to_agent() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-golgi-slice2-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = make_hotel_graph(&socket_path, agent_id);
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task =
+            tokio::spawn(async move { server.run().await.expect("ipc server should run") });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        // ── Step 1: configure the pipeline rule ──────────────────────────────
+        let mut admin_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "admin-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("admin connect");
+
+        let rule_resp = admin_client
+            .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "golgi-test-rule".into(),
+                rule_json: serde_json::json!({
+                    "match": { "action": "audio_input" },
+                    "stages": [{ "capability": "voice.transcribe" }],
+                }),
+            })
+            .await
+            .expect("upsert pipeline rule");
+        assert!(
+            matches!(rule_resp, IpcResponse::Standard { ok: true, .. }),
+            "rule upsert should succeed: {rule_resp:?}"
+        );
+
+        // ── Step 2: subscribe the agent and the mock capability ───────────────
+        let agent_outbound: Arc<Mutex<Vec<IpcResponse>>> = Arc::new(Mutex::new(Vec::new()));
+        let capability_outbound: Arc<Mutex<Vec<IpcResponse>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Agent subscriber
+        let agent_capture = agent_outbound.clone();
+        let agent_socket = socket_path.clone();
+        let agent_task = tokio::spawn(async move {
+            let mut agent = PhiloticClient::connect_at(
+                &agent_socket,
+                GuestIdentity {
+                    guest_id: agent_id.into(),
+                    role: "agent".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await
+            .expect("agent connect");
+            // Drain up to 3 inbound tasks within 500ms
+            for _ in 0..3 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    agent.recv_task(),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => {
+                        let mut guard = agent_capture.lock().await;
+                        guard.push(resp);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Mock capability subscriber (voice.transcribe)
+        let cap_capture = capability_outbound.clone();
+        let cap_socket = socket_path.clone();
+        let cap_task = tokio::spawn(async move {
+            let mut capability = PhiloticClient::connect_at(
+                &cap_socket,
+                GuestIdentity {
+                    guest_id: "voice-transcribe-mock".into(),
+                    role: "voice.transcribe".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await
+            .expect("capability connect");
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                capability.recv_task(),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => {
+                    let mut guard = cap_capture.lock().await;
+                    guard.push(resp);
+                }
+                _ => {}
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+
+        // ── Step 3: emit a task targeting the agent with matching action ──────
+        let emit_resp = admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some(agent_id.into()),
+                task_json: serde_json::json!({
+                    "action": "audio_input",
+                    "blob_id": "blob-abc-123",
+                    "session_id": "sess-golgi-test",
+                    "turn_id": "turn-golgi-001",
+                    "agent_id": agent_id,
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+        assert!(
+            matches!(emit_resp, IpcResponse::Standard { ok: true, .. }),
+            "emit should succeed: {emit_resp:?}"
+        );
+
+        // Wait for capability to receive the intercepted task
+        let _ = cap_task.await;
+
+        // ── Step 4: assert agent received nothing yet (intercepted) ──────────
+        // Give the agent a brief window to receive something unexpected
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        {
+            let guard = agent_outbound.lock().await;
+            assert!(
+                guard.is_empty(),
+                "agent must NOT receive task before pipeline completes; got: {guard:?}"
+            );
+        }
+
+        // ── Step 5: assert capability received the modified task ──────────────
+        {
+            let guard = capability_outbound.lock().await;
+            assert_eq!(
+                guard.len(),
+                1,
+                "capability must receive exactly one intercepted task; got: {guard:?}"
+            );
+            if let IpcResponse::InboundTask { task_json, .. } = &guard[0] {
+                let payload: serde_json::Value =
+                    serde_json::from_str(task_json).expect("capability task must be valid JSON");
+                assert_eq!(
+                    payload["reply_role"],
+                    serde_json::Value::String(GOLGI_SINK_ROLE.into()),
+                    "capability task must have reply_role = hotel:golgi"
+                );
+                assert_eq!(
+                    payload["action"],
+                    serde_json::Value::String("audio_input".into()),
+                    "capability task must forward original action"
+                );
+            } else {
+                panic!("expected InboundTask for capability, got {:?}", guard[0]);
+            }
+        }
+
+        // ── Step 6: simulate capability reply to hotel:golgi ─────────────────
+        let golgi_resp = admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: GOLGI_SINK_ROLE.into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "model_response",
+                    "content": "hello world",
+                    "session_id": "sess-golgi-test",
+                    "turn_id": "turn-golgi-001",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("golgi sink emit");
+        assert!(
+            matches!(golgi_resp, IpcResponse::Standard { ok: true, .. }),
+            "golgi sink emit should succeed: {golgi_resp:?}"
+        );
+
+        // ── Step 7: verify agent receives merged task ─────────────────────────
+        let _ = agent_task.await;
+        let guard = agent_outbound.lock().await;
+        assert_eq!(
+            guard.len(),
+            1,
+            "agent must receive exactly one merged task after pipeline completes; got: {guard:?}"
+        );
+        if let IpcResponse::InboundTask { task_json, .. } = &guard[0] {
+            let payload: serde_json::Value =
+                serde_json::from_str(task_json).expect("merged task must be valid JSON");
+            assert_eq!(
+                payload["transcript"],
+                serde_json::Value::String("hello world".into()),
+                "merged task must contain transcript from capability output"
+            );
+            assert_eq!(
+                payload["blob_id"],
+                serde_json::Value::String("blob-abc-123".into()),
+                "original blob_id must be preserved in merged task"
+            );
+            assert!(
+                payload.get("golgi_stage_output").is_some(),
+                "merged task must contain golgi_stage_output for traceability"
+            );
+        } else {
+            panic!("expected InboundTask for agent, got {:?}", guard[0]);
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
     }
 }

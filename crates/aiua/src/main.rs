@@ -6834,7 +6834,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 10); // membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, graph-datasource, table-datasource, router-listener, agent
+        assert_eq!(guests.len(), 12); // shared: membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, graph-datasource, table-datasource, router-listener, mcp-membrane; profile: agent, agent-graph-runner
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
@@ -6870,6 +6870,7 @@ mod tests {
                 persona_name: "Beacon".into(),
                 import_workspace: None,
                 is_admin: false,
+                orchestrator_turn_loop_config: None,
             },
         );
         let membrane_guest = guests
@@ -7130,6 +7131,7 @@ mod tests {
             persona_name: "Aria".into(),
             import_workspace: None,
             is_admin: false,
+            orchestrator_turn_loop_config: None,
         };
         let guests = guest_seed_for_profile("default", &profile);
         let membrane = guests
@@ -7156,6 +7158,7 @@ mod tests {
             persona_name: "Beacon".into(),
             import_workspace: None,
             is_admin: false,
+            orchestrator_turn_loop_config: None,
         };
         let mut agent_config = serde_json::Map::new();
         agent_config.insert(
@@ -7177,6 +7180,7 @@ mod tests {
             // Workspace path that doesn't exist — bundle will be empty
             import_workspace: None,
             is_admin: false,
+            orchestrator_turn_loop_config: None,
         };
         let mut agent_config = serde_json::Map::new();
         agent_config.insert("system_prompt".into(), "Fallback prompt.".into());
