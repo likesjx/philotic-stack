@@ -1,6 +1,6 @@
 use crate::authz::{MeshAuth, NonceTracker};
 use crate::domain::GraphDomain;
-use crate::heartbeat::HeartbeatPayload;
+use crate::heartbeat::{CapabilitySyncPayload, HeartbeatPayload};
 use crate::registry::NodeRegistry;
 use crate::{BeaconMessage, MsgType, NodeCapabilities};
 use anyhow::{Context, Result};
@@ -183,11 +183,24 @@ impl BeaconDaemon {
                         payload.capabilities.node_id, payload.capabilities.roles
                     );
                     let mut registry = self.registry.write().await;
-                    registry.update_node(
+                    registry.observe_heartbeat(
                         payload.capabilities,
-                        payload.advertisements,
                         payload.execution_reachability,
                         payload.node_health,
+                    );
+                }
+            }
+            MsgType::CapabilitySync => {
+                if let Ok(payload) = serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload) {
+                    let mut registry = self.registry.write().await;
+                    registry.observe_capability_sync_chunk(
+                        payload.capabilities,
+                        payload.execution_reachability,
+                        None,
+                        payload.sync_id,
+                        payload.chunk_index,
+                        payload.chunk_total,
+                        payload.advertisements,
                     );
                 }
             }

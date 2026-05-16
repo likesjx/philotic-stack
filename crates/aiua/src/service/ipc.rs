@@ -53,7 +53,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
@@ -887,7 +887,7 @@ pub struct IpcServer {
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
     graph: Arc<GraphDomain>,
     inboxes: InboxRegistry,
-    parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+    parked_inbound: ParkedInboundRegistry,
     pending_pipelines: PendingPipelineRegistry,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,

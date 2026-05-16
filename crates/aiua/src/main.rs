@@ -1,6 +1,6 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
-use ansible_mesh_core::heartbeat::emit_heartbeat;
+use ansible_mesh_core::heartbeat::{emit_capability_sync, emit_heartbeat};
 use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
     now_epoch_secs, verify_join_request,
@@ -1057,6 +1057,13 @@ fn execution_reachability_for_hotel(
         .flatten()
         .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            hotel
+                .mesh_host
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "127.0.0.1".into());
     let protocol = graph
         .get_config_value("execution_protocol")
@@ -1078,7 +1085,7 @@ fn execution_reachability_for_hotel(
 /// read never blocks the heartbeat loop.
 fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapshot {
     let guest_count = graph
-        .list_guests(hotel_name, true)
+        .list_guests(hotel_name, false)
         .ok()
         .map(|gs| gs.len() as u32);
 
@@ -1241,7 +1248,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
     {
         let heartbeat_socket = daemon.socket();
         let heartbeat_graph = ctx.graph_domain.clone();
-        let heartbeat_hotel = ctx.hotel.clone();
+        let heartbeat_hotel_name = ctx.hotel_name.clone();
         let heartbeat_caps = ctx.caps.clone();
         let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1259,16 +1266,21 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         if targets.is_empty() {
                             continue;
                         }
-                        let advertisements = match local_capability_advertisements(heartbeat_graph.as_ref(), &heartbeat_hotel) {
-                            Ok(advertisements) => advertisements,
+                        let heartbeat_hotel = match heartbeat_graph.get_hotel(&heartbeat_hotel_name) {
+                            Ok(Some(hotel)) => hotel,
+                            Ok(None) => {
+                                warn!("Skipping heartbeat: hotel record [{}] missing", heartbeat_hotel_name);
+                                continue;
+                            }
                             Err(err) => {
-                                warn!("Failed to build local capability advertisements: {}", err);
+                                warn!("Failed to load current hotel record [{}] for heartbeat: {}", heartbeat_hotel_name, err);
                                 continue;
                             }
                         };
                         let execution_reachability =
                             execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
-                        let node_health = sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name);
+                        let node_health =
+                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name);
                         for (_target_node_id, target_addr) in targets {
                             let Ok(target) = target_addr.parse::<SocketAddr>() else {
                                 warn!("Skipping invalid heartbeat target address {}", target_addr);
@@ -1282,7 +1294,6 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                 &heartbeat_socket,
                                 target,
                                 &heartbeat_caps,
-                                &advertisements,
                                 Some(execution_reachability.clone()),
                                 &auth_key,
                                 Some(node_health.clone()),
@@ -1294,6 +1305,99 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         }
                     }
                     _ = heartbeat_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
+    {
+        let capability_socket = daemon.socket();
+        let capability_graph = ctx.graph_domain.clone();
+        let capability_hotel_name = ctx.hotel_name.clone();
+        let capability_caps = ctx.caps.clone();
+        let mut capability_shutdown = ctx.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            let mut last_sync_fingerprint: Option<String> = None;
+            let mut last_full_sync =
+                std::time::Instant::now() - std::time::Duration::from_secs(3600);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let targets = match mesh_targets_for_graph(capability_graph.as_ref(), &capability_caps.node_id) {
+                            Ok(targets) => targets,
+                            Err(err) => {
+                                warn!("Failed to resolve mesh capability-sync targets: {}", err);
+                                continue;
+                            }
+                        };
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        let capability_hotel = match capability_graph.get_hotel(&capability_hotel_name) {
+                            Ok(Some(hotel)) => hotel,
+                            Ok(None) => {
+                                warn!(
+                                    "Skipping capability sync: hotel record [{}] missing",
+                                    capability_hotel_name
+                                );
+                                continue;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Failed to load current hotel record [{}] for capability sync: {}",
+                                    capability_hotel_name,
+                                    err
+                                );
+                                continue;
+                            }
+                        };
+
+                        let advertisements = match local_capability_advertisements(capability_graph.as_ref(), &capability_hotel) {
+                            Ok(advertisements) => advertisements,
+                            Err(err) => {
+                                warn!("Failed to build local capability advertisements: {}", err);
+                                continue;
+                            }
+                        };
+                        let execution_reachability =
+                            execution_reachability_for_hotel(capability_graph.as_ref(), &capability_hotel);
+                        let sync_fingerprint = capability_sync_fingerprint(&advertisements, &execution_reachability);
+                        let should_sync =
+                            last_sync_fingerprint.as_ref() != Some(&sync_fingerprint)
+                            || last_full_sync.elapsed() >= std::time::Duration::from_secs(3600);
+                        if !should_sync {
+                            continue;
+                        }
+
+                        for (target_node_id, target_addr) in targets {
+                            let Ok(target) = target_addr.parse::<SocketAddr>() else {
+                                warn!("Skipping invalid capability-sync target address {}", target_addr);
+                                continue;
+                            };
+                            let Some(auth_key) = mesh_auth_key_for_node(capability_graph.as_ref(), &target_node_id).ok().flatten() else {
+                                debug!("Skipping capability sync to {} until mesh auth key exists", target_node_id);
+                                continue;
+                            };
+                            if let Err(err) = emit_capability_sync(
+                                &capability_socket,
+                                target,
+                                &capability_caps,
+                                &advertisements,
+                                Some(execution_reachability.clone()),
+                                &auth_key,
+                                None,
+                            )
+                            .await
+                            {
+                                warn!("Failed to emit capability sync to {}: {}", target_addr, err);
+                            }
+                        }
+
+                        last_sync_fingerprint = Some(sync_fingerprint);
+                        last_full_sync = std::time::Instant::now();
+                    }
+                    _ = capability_shutdown.recv() => break,
                 }
             }
         });
@@ -1647,6 +1751,19 @@ fn local_capability_advertisements(
         });
     }
     Ok(advertisements)
+}
+
+fn capability_sync_fingerprint(
+    advertisements: &[CapabilityAdvertisement],
+    execution_reachability: &ExecutionReachability,
+) -> String {
+    let payload = serde_json::json!({
+        "advertisements": advertisements,
+        "execution_reachability": execution_reachability,
+    });
+    let encoded = serde_json::to_vec(&payload).unwrap_or_default();
+    let digest = Sha256::digest(encoded);
+    format!("{:x}", digest)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6937,6 +7054,20 @@ mod tests {
 
         assert_eq!(reachability.protocol, "tcp-framed-v1");
         assert_eq!(reachability.host, "jane-vps");
+        assert_eq!(reachability.port, hotel.execution_port);
+    }
+
+    #[test]
+    fn execution_reachability_falls_back_to_hotel_mesh_host() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let mut hotel = default_hotel_record("default");
+        hotel.mesh_host = Some("100.64.230.106".into());
+
+        let reachability = execution_reachability_for_hotel(&graph, &hotel);
+
+        assert_eq!(reachability.protocol, "tcp-framed-v1");
+        assert_eq!(reachability.host, "100.64.230.106");
         assert_eq!(reachability.port, hotel.execution_port);
     }
 

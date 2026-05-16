@@ -59,6 +59,8 @@ pub enum MsgType {
     SecretPull,
     /// Mesh presence and health update
     Heartbeat,
+    /// A chunk of capability advertisements and reachability metadata.
+    CapabilitySync,
     /// Asynchronous result delivery
     Result,
     /// Streaming execution logs
