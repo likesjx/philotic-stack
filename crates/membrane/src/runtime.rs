@@ -132,8 +132,7 @@ impl MembraneRuntime {
             drop(ctx); // context is now held by the guest's spawned tasks
 
             // Main loop: inbound dispatch, outbound delivery, lease renewal.
-            let mut renew_tick =
-                tokio::time::interval(LEASE_RENEW_INTERVAL);
+            let mut renew_tick = tokio::time::interval(LEASE_RENEW_INTERVAL);
             renew_tick.tick().await; // consume immediate first tick
 
             let disconnect = loop {
@@ -230,10 +229,7 @@ impl MembraneRuntime {
 /// Maps `InboundEnvelope` fields to the field names that philote's
 /// `InboundTaskPayload` expects. The two structs serve different layers
 /// (protocol-agnostic vs. philote-specific) so names don't match directly.
-async fn dispatch_inbound(
-    client: &mut PhiloticClient,
-    envelope: InboundEnvelope,
-) -> Result<()> {
+async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope) -> Result<()> {
     use philotic_client::IpcRequest;
 
     // Extract transport hint from raw_transport metadata.
@@ -261,7 +257,7 @@ async fn dispatch_inbound(
     });
 
     let req = IpcRequest::CreateTask {
-        target_role: "philote".into(),
+        target_role: "agent".into(),
         payload,
     };
     client.send_request(req).await?;
@@ -280,36 +276,59 @@ fn extract_outbound_reply(msg: &IpcResponse) -> Option<OutboundReply> {
 
     let payload: serde_json::Value = serde_json::from_str(task_json).ok()?;
 
-    let action = payload.get("action").and_then(|v: &serde_json::Value| v.as_str())?;
+    let action = payload
+        .get("action")
+        .and_then(|v: &serde_json::Value| v.as_str())?;
 
     match action {
         "send_reply" | "text_reply" => {
             let session_id = payload.get("session_id")?.as_str()?.to_string();
             let turn_id = payload.get("turn_id")?.as_str()?.to_string();
             let content = payload.get("content")?.as_str()?.to_string();
-            let reply_to = payload.get("reply_to")
+            let reply_to = payload
+                .get("reply_to")
                 .and_then(|v: &serde_json::Value| v.as_str())
                 .map(str::to_string);
-            Some(OutboundReply::Text { session_id, turn_id, content, reply_to })
+            Some(OutboundReply::Text {
+                session_id,
+                turn_id,
+                content,
+                reply_to,
+            })
         }
         "streaming_token" => {
             let session_id = payload.get("session_id")?.as_str()?.to_string();
             let turn_id = payload.get("turn_id")?.as_str()?.to_string();
             let token = payload.get("token")?.as_str()?.to_string();
-            Some(OutboundReply::StreamingToken { session_id, turn_id, token })
+            Some(OutboundReply::StreamingToken {
+                session_id,
+                turn_id,
+                token,
+            })
         }
         "approval_required" => {
             let session_id = payload.get("session_id")?.as_str()?.to_string();
             let turn_id = payload.get("turn_id")?.as_str()?.to_string();
-            let description = payload.get("description")
+            let description = payload
+                .get("description")
                 .and_then(|v: &serde_json::Value| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let options = payload.get("options")
+            let options = payload
+                .get("options")
                 .and_then(|v: &serde_json::Value| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
-            Some(OutboundReply::ApprovalRequired { session_id, turn_id, description, options })
+            Some(OutboundReply::ApprovalRequired {
+                session_id,
+                turn_id,
+                description,
+                options,
+            })
         }
         _ => None,
     }

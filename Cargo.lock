@@ -2459,6 +2459,7 @@ dependencies = [
  "axum 0.7.9",
  "blake3",
  "clap",
+ "hex",
  "membrane",
  "philotic-client",
  "serde",
@@ -3076,6 +3077,7 @@ name = "philotic-primitives-mesh"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -3108,6 +3110,7 @@ dependencies = [
  "ansible-mesh-core",
  "anyhow",
  "axum 0.7.9",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "dirs 5.0.1",
@@ -3119,6 +3122,7 @@ dependencies = [
  "philotic-client",
  "philotic-graph",
  "rand 0.8.5",
+ "reqwest",
  "rusqlite",
  "rust-embed",
  "serde",
@@ -4336,6 +4340,21 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "table-datasource"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "datasource",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

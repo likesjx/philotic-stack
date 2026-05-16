@@ -12,8 +12,8 @@
 //!   sliding window. It resets on membrane restart (intentional: simple and
 //!   safe — a restart resets the budget, not a security bypass).
 
-use anyhow::{bail, Result};
 use ansible_mesh_core::mcp_route::{McpAuthScheme, McpCallAllotment, McpTokenGrant};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,7 +64,10 @@ impl VaultHashCache {
     /// Return cached hash bytes if still fresh.
     pub fn get(&self, vault_ref: &str) -> Option<[u8; 32]> {
         let guard = self.inner.lock().unwrap();
-        guard.get(vault_ref).filter(|c| c.is_fresh()).map(|c| c.hash_bytes)
+        guard
+            .get(vault_ref)
+            .filter(|c| c.is_fresh())
+            .map(|c| c.hash_bytes)
     }
 
     /// Store fetched hash bytes for the given vault_ref.
@@ -221,7 +224,10 @@ pub fn check_bearer_token(
         });
     }
 
-    bail!("no matching token grant for presented credential on tool '{}'", tool_name)
+    bail!(
+        "no matching token grant for presented credential on tool '{}'",
+        tool_name
+    )
 }
 
 /// Extract the raw bearer token from an `Authorization: Bearer <token>` header.
@@ -321,8 +327,14 @@ mod tests {
         let cache = VaultHashCache::new();
         let allotment = AllotmentTracker::new();
 
-        let result =
-            check_bearer_token("my_tool", "wrongtoken", &[grant], &cache, &vault, &allotment);
+        let result = check_bearer_token(
+            "my_tool",
+            "wrongtoken",
+            &[grant],
+            &cache,
+            &vault,
+            &allotment,
+        );
         assert!(result.is_err());
     }
 
@@ -352,7 +364,10 @@ mod tests {
 
     #[test]
     fn extract_bearer_parses_header() {
-        assert_eq!(extract_bearer(Some("Bearer mytoken123")), Some("mytoken123"));
+        assert_eq!(
+            extract_bearer(Some("Bearer mytoken123")),
+            Some("mytoken123")
+        );
         assert_eq!(extract_bearer(Some("Basic xyz")), None);
         assert_eq!(extract_bearer(None), None);
     }

@@ -1,11 +1,16 @@
 //! `philotic-web serve` — local management HTTP + WebSocket server.
 //!
-//! Generates a random session token on startup, binds it to a same-origin
-//! session cookie for the embedded UI, and still accepts
-//! `Authorization: Bearer <token>` as an explicit transitional compatibility
-//! path.
+//! Generates a hotel-issued bootstrap token on startup and requires an
+//! explicit bootstrap/login ceremony before issuing a bounded same-origin
+//! operator session cookie for the embedded UI.
 //!
 //! REST endpoints:
+//!   GET  /api/auth/status
+//!   POST /api/auth/bootstrap
+//!   POST /api/auth/challenges
+//!   POST /api/auth/oidc/start
+//!   POST /api/auth/logout
+//!   GET  /auth/oidc/:provider/callback
 //!   GET  /api/status
 //!   GET  /api/guests
 //!   GET  /api/agents
@@ -20,6 +25,7 @@
 //!   GET  /api/mesh/targets/:target_node_id/guests
 //!   GET  /api/mesh/targets/:target_node_id/agents
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
+//!   GET  /api/event-log
 //!   GET  /api/config
 //!   GET  /api/config/telegram
 //!   GET  /api/config/gemini
@@ -50,17 +56,21 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use rand::Rng;
-use rusqlite::Connection;
+use reqwest::Url;
+use rusqlite::{Connection, OptionalExtension};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -87,7 +97,7 @@ const HEADER_CORP: &str = "cross-origin-resource-policy";
 
 #[derive(Clone)]
 struct AppState {
-    token: Arc<String>,
+    bootstrap_token: Arc<String>,
     db_path: PathBuf,
     hotel: Arc<String>,
     /// IPC socket path for the connected hotel
@@ -221,6 +231,192 @@ struct DeleteComponentBody {
     confirm_guest_id: String,
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct EventLogQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+struct EventLogEntry {
+    id: String,
+    timestamp: u64,
+    source: String,
+    event_type: String,
+    summary: String,
+    details: Value,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+struct OperatorSessionRecord {
+    session_id: String,
+    session_token: String,
+    user_id: String,
+    display_name: String,
+    issuing_hotel: String,
+    surface_kind: String,
+    posture: String,
+    issued_at: i64,
+    expires_at: i64,
+    status: String,
+    auth_method: String,
+    bootstrap_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BootstrapAuthBody {
+    bootstrap_token: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OidcStartBody {
+    provider: String,
+    #[serde(default)]
+    return_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OidcCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct OperatorAuthChallengeRecord {
+    challenge_id: String,
+    user_id: String,
+    intended_surface: String,
+    auth_path: String,
+    verifier_kind: String,
+    verifier_hint: Option<String>,
+    bind_label: Option<String>,
+    challenge_nonce: String,
+    exchange_secret: Option<String>,
+    issued_at: i64,
+    expires_at: i64,
+    status: String,
+    consumed_at: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateAuthChallengeBody {
+    auth_path: String,
+    verifier_kind: String,
+    #[serde(default)]
+    verifier_hint: Option<String>,
+    #[serde(default)]
+    bind_label: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OperatorAuthChallengeView {
+    challenge_id: String,
+    user_id: String,
+    intended_surface: String,
+    auth_path: String,
+    verifier_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bind_label: Option<String>,
+    challenge_nonce: String,
+    issued_at: i64,
+    expires_at: i64,
+    status: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OidcStartView {
+    provider: String,
+    authorization_url: String,
+    challenge_id: String,
+    state: String,
+    redirect_uri: String,
+    expires_at: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AuthStatusView {
+    authenticated: bool,
+    hotel: String,
+    #[serde(default)]
+    oidc_providers: Vec<OidcProviderStatusView>,
+    #[serde(default)]
+    root_user_key_refs: Vec<RootUserKeyRefStatusView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<OperatorSessionStatusView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct OidcProviderStatusView {
+    provider: String,
+    label: String,
+    configured: bool,
+    callback_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct OidcProviderSettings {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    client_secret_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OidcResolvedConfig {
+    public_base_url: String,
+    public_base_source: String,
+    google: OidcProviderSettings,
+    github: OidcProviderSettings,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OidcProviderConfigView {
+    provider: String,
+    label: String,
+    client_id: Option<String>,
+    client_id_source: String,
+    secret_ref: Option<String>,
+    secret_ref_source: String,
+    secret_configured: bool,
+    callback_url: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OidcConfigView {
+    public_base_url: String,
+    public_base_source: String,
+    providers: Vec<OidcProviderConfigView>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OperatorSessionStatusView {
+    session_id: String,
+    user_id: String,
+    display_name: String,
+    posture: String,
+    issued_at: i64,
+    expires_at: i64,
+    auth_method: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct RootUserKeyRefStatusView {
+    user_id: String,
+    key_purpose: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vault_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_fingerprint: Option<String>,
+    rotation_state: String,
+    source_kind: String,
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -243,8 +439,8 @@ pub async fn run(
     let lease_key = desktop_membrane_lease_key(&hotel);
     let lease_handle = acquire_desktop_membrane_lease(&socket, &lease_key, port).await?;
 
-    // Generate session token
-    let token: String = {
+    // Generate bootstrap token for the first login ceremony.
+    let bootstrap_token: String = {
         let bytes: [u8; 24] = rand::thread_rng().gen();
         format!("philotic-{}", hex::encode(bytes))
     };
@@ -253,18 +449,29 @@ pub async fn run(
     let (tx, _) = broadcast::channel::<String>(256);
 
     let state = AppState {
-        token: Arc::new(token.clone()),
+        bootstrap_token: Arc::new(bootstrap_token.clone()),
         db_path,
         hotel: Arc::new(hotel),
         socket: Arc::new(socket),
         tx,
     };
 
+    ensure_operator_auth_tables(&state.db_path, &state.hotel)?;
+
     // CORS — localhost only; UI is embedded and served from the same origin
     let cors = build_cors(allow_origins.as_deref());
 
     let app = Router::new()
         // API routes
+        .route("/api/auth/status", get(handle_auth_status))
+        .route("/api/auth/bootstrap", post(handle_auth_bootstrap))
+        .route("/api/auth/challenges", post(handle_create_auth_challenge))
+        .route("/api/auth/oidc/start", post(handle_auth_oidc_start))
+        .route("/api/auth/logout", post(handle_auth_logout))
+        .route(
+            "/auth/oidc/:provider/callback",
+            get(handle_auth_oidc_callback),
+        )
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
@@ -295,6 +502,7 @@ pub async fn run(
         .route("/api/config", get(handle_config))
         .route("/api/config/telegram", get(handle_config_telegram))
         .route("/api/config/gemini", get(handle_config_gemini))
+        .route("/api/config/oidc", get(handle_config_oidc))
         .route(
             "/api/components",
             get(handle_components).post(handle_component_create),
@@ -327,6 +535,7 @@ pub async fn run(
         .route("/api/secrets", get(handle_secrets))
         .route("/api/secrets/rotate", post(handle_secret_rotate))
         .route("/api/vault", post(handle_vault_add))
+        .route("/api/event-log", get(handle_event_log))
         .route("/api/config/:key", put(handle_config_put))
         .route(
             "/api/agents/:agent_id/roles/:role_name/skills",
@@ -377,7 +586,7 @@ pub async fn run(
     println!("──────────────────────────────────────────");
     println!("  http://127.0.0.1:{port}");
     println!();
-    println!("  Debug token: {token}");
+    println!("  Bootstrap token: {bootstrap_token}");
     println!();
     println!("  Press Ctrl-C to stop.");
 
@@ -597,8 +806,20 @@ async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
 
 // ── Embedded UI handlers ──────────────────────────────────────────────────────
 
-/// Serve `index.html` and bind the session token as a same-origin cookie.
-async fn handle_index(State(state): State<AppState>) -> Response {
+/// Serve the embedded desktop shell for both locked and unlocked states.
+///
+/// The desktop itself is responsible for presenting a locked posture and
+/// routing bootstrap/auth workflows into System Settings. The server remains
+/// the authority on session issuance and API access, but it should not replace
+/// the desktop with a parallel HTML login applet.
+async fn handle_index(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    serve_index_for_session(&state, current_operator_session(&headers, &state).as_ref()).await
+}
+
+async fn serve_index_for_session(
+    _state: &AppState,
+    session: Option<&OperatorSessionRecord>,
+) -> Response {
     let html = match UiAssets::get("index.html") {
         Some(f) => String::from_utf8_lossy(f.data.as_ref()).into_owned(),
         None => return (StatusCode::NOT_FOUND, "UI not built").into_response(),
@@ -611,7 +832,12 @@ async fn handle_index(State(state): State<AppState>) -> Response {
     )
         .into_response();
     let headers = response.headers_mut();
-    headers.insert(header::SET_COOKIE, auth_cookie_header(&state));
+    if let Some(session) = session {
+        headers.insert(
+            header::SET_COOKIE,
+            session_cookie_header(&session.session_token),
+        );
+    }
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(no_store_header_value()),
@@ -845,7 +1071,11 @@ async fn handle_setup_guide() -> Response {
 
 /// Serve any other embedded asset (JS, CSS, icons, etc.).
 /// Falls back to `index.html` for SPA client-side routes.
-async fn handle_static(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+async fn handle_static(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+) -> Response {
     let path = uri.path().trim_start_matches('/');
 
     if let Some(asset) = UiAssets::get(path) {
@@ -873,17 +1103,426 @@ async fn handle_static(State(state): State<AppState>, uri: axum::http::Uri) -> R
         response
     } else {
         // SPA fallback — let the client-side router handle it
-        handle_index(State(state)).await
+        handle_index(headers, State(state)).await
     }
 }
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
+async fn handle_auth_status(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let session = current_operator_session(&headers, &state);
+    let root_user_key_refs =
+        list_root_user_key_refs(&state.db_path, &state.hotel).unwrap_or_default();
+    let oidc_providers = list_oidc_provider_statuses(&state.socket, Some(&headers)).await;
+    Json(AuthStatusView {
+        authenticated: session.is_some(),
+        hotel: (*state.hotel).clone(),
+        oidc_providers,
+        root_user_key_refs,
+        session: session.map(|session| OperatorSessionStatusView {
+            session_id: session.session_id,
+            user_id: session.user_id,
+            display_name: session.display_name,
+            posture: session.posture,
+            issued_at: session.issued_at,
+            expires_at: session.expires_at,
+            auth_method: session.auth_method,
+        }),
+    })
+    .into_response()
+}
+
+async fn handle_auth_bootstrap(
+    State(state): State<AppState>,
+    Json(body): Json<BootstrapAuthBody>,
+) -> Response {
+    if body.bootstrap_token != *state.bootstrap_token {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid bootstrap token"})),
+        )
+            .into_response();
+    }
+
+    let display_name = body
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Operator");
+
+    let session = match issue_operator_session(
+        &state.db_path,
+        &state.hotel,
+        display_name,
+        "bootstrap_token",
+        Some("startup-bootstrap".into()),
+    ) {
+        Ok(session) => session,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let oidc_providers = list_oidc_provider_statuses(&state.socket, None).await;
+    let mut response = Json(AuthStatusView {
+        authenticated: true,
+        hotel: (*state.hotel).clone(),
+        oidc_providers,
+        root_user_key_refs: list_root_user_key_refs(&state.db_path, &state.hotel)
+            .unwrap_or_default(),
+        session: Some(OperatorSessionStatusView {
+            session_id: session.session_id.clone(),
+            user_id: session.user_id.clone(),
+            display_name: session.display_name.clone(),
+            posture: session.posture.clone(),
+            issued_at: session.issued_at,
+            expires_at: session.expires_at,
+            auth_method: session.auth_method.clone(),
+        }),
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie_header(&session.session_token),
+    );
+    response
+}
+
+async fn handle_auth_oidc_start(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<OidcStartBody>,
+) -> Response {
+    let provider_key = body.provider.trim().to_ascii_lowercase();
+    let provider = match oidc_provider_config(&state.socket, &provider_key, Some(&headers)).await {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unsupported provider [{}]", provider_key)})),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if !provider.configured {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("provider [{}] is not configured", provider.id)})),
+        )
+            .into_response();
+    }
+
+    let return_path = sanitize_return_path(body.return_path.as_deref());
+    let code_verifier = oidc_code_verifier();
+    let code_challenge = pkce_code_challenge(&code_verifier);
+    let challenge = match issue_operator_auth_challenge(
+        &state.db_path,
+        &state.hotel,
+        "desktop_membrane",
+        "oidc",
+        &provider.id,
+        Some(provider.redirect_uri.clone()),
+        return_path.clone(),
+        Some(code_verifier),
+    ) {
+        Ok(challenge) => challenge,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let authorization_url =
+        match provider.authorization_url(&challenge.challenge_nonce, &code_challenge) {
+            Ok(url) => url,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+
+    Json(OidcStartView {
+        provider: provider.id,
+        authorization_url,
+        challenge_id: challenge.challenge_id,
+        state: challenge.challenge_nonce,
+        redirect_uri: provider.redirect_uri,
+        expires_at: challenge.expires_at,
+    })
+    .into_response()
+}
+
+async fn handle_create_auth_challenge(
+    State(state): State<AppState>,
+    Json(body): Json<CreateAuthChallengeBody>,
+) -> Response {
+    let auth_path = body.auth_path.trim().to_ascii_lowercase();
+    let verifier_kind = body.verifier_kind.trim().to_ascii_lowercase();
+    if !matches!(auth_path.as_str(), "membrane_challenge" | "oidc") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "auth_path must be one of: membrane_challenge, oidc"})),
+        )
+            .into_response();
+    }
+    if verifier_kind.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "verifier_kind must not be empty"})),
+        )
+            .into_response();
+    }
+
+    let verifier_hint = body
+        .verifier_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let bind_label = body
+        .bind_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let challenge = match issue_operator_auth_challenge(
+        &state.db_path,
+        &state.hotel,
+        "desktop_membrane",
+        &auth_path,
+        &verifier_kind,
+        verifier_hint,
+        bind_label,
+        None,
+    ) {
+        Ok(challenge) => challenge,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(OperatorAuthChallengeView {
+            challenge_id: challenge.challenge_id,
+            user_id: challenge.user_id,
+            intended_surface: challenge.intended_surface,
+            auth_path: challenge.auth_path,
+            verifier_kind: challenge.verifier_kind,
+            verifier_hint: challenge.verifier_hint,
+            bind_label: challenge.bind_label,
+            challenge_nonce: challenge.challenge_nonce,
+            issued_at: challenge.issued_at,
+            expires_at: challenge.expires_at,
+            status: challenge.status,
+        }),
+    )
+        .into_response()
+}
+
+async fn handle_auth_oidc_callback(
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+    Query(query): Query<OidcCallbackQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Some(error) = query.error.as_deref() {
+        return oidc_callback_error_response(
+            StatusCode::BAD_REQUEST,
+            format!("OIDC callback failed: {error}"),
+        );
+    }
+
+    let state_token = match query
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                "OIDC callback missing state.".into(),
+            );
+        }
+    };
+    let code = match query
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                "OIDC callback missing authorization code.".into(),
+            );
+        }
+    };
+
+    let provider_key = provider.trim().to_ascii_lowercase();
+    let provider = match oidc_provider_config(&state.socket, &provider_key, Some(&headers)).await {
+        Ok(Some(provider)) if provider.configured => provider,
+        Ok(Some(_)) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("OIDC provider [{}] is not configured.", provider_key),
+            );
+        }
+        Ok(None) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Unsupported OIDC provider [{}].", provider_key),
+            );
+        }
+        Err(err) => return oidc_callback_error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let pending = match resolve_operator_auth_challenge_by_nonce(&state.db_path, state_token) {
+        Ok(Some(challenge)) => challenge,
+        Ok(None) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                "OIDC state was not recognized.".into(),
+            );
+        }
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            );
+        }
+    };
+
+    if pending.auth_path != "oidc"
+        || pending.verifier_kind != provider.id
+        || pending.status != "pending"
+        || pending.expires_at <= now_epoch_secs()
+    {
+        return oidc_callback_error_response(
+            StatusCode::BAD_REQUEST,
+            "OIDC callback did not match a valid pending challenge.".into(),
+        );
+    }
+
+    let code_verifier = match pending.exchange_secret.as_deref() {
+        Some(value) => value,
+        None => {
+            return oidc_callback_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "OIDC challenge was missing PKCE verifier state.".into(),
+            );
+        }
+    };
+
+    let token = match exchange_oidc_code(&provider, code, code_verifier).await {
+        Ok(token) => token,
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("OIDC token exchange failed: {err}"),
+            );
+        }
+    };
+
+    let identity = match fetch_oidc_identity(&provider, &token.access_token).await {
+        Ok(identity) => identity,
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("OIDC identity fetch failed: {err}"),
+            );
+        }
+    };
+
+    let challenge = match consume_operator_auth_challenge(&state.db_path, &pending.challenge_id) {
+        Ok(Some(challenge)) => challenge,
+        Ok(None) => {
+            return oidc_callback_error_response(
+                StatusCode::BAD_REQUEST,
+                "OIDC challenge was already consumed or expired.".into(),
+            );
+        }
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            );
+        }
+    };
+
+    let session = match issue_operator_session(
+        &state.db_path,
+        &state.hotel,
+        &identity.display_name,
+        &format!("oidc_{}", provider.id),
+        Some(challenge.challenge_id.clone()),
+    ) {
+        Ok(session) => session,
+        Err(err) => {
+            return oidc_callback_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            );
+        }
+    };
+
+    let redirect_path = challenge.bind_label.unwrap_or_else(|| "/".into());
+    let mut response = (
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, redirect_path.as_str())],
+        "",
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie_header(&session.session_token),
+    );
+    response
+}
+
+async fn handle_auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Some(token) =
+        header_bearer_token(&headers).or_else(|| cookie_token(&headers, AUTH_COOKIE_NAME))
+    {
+        let _ = revoke_operator_session(&state.db_path, token);
+    }
+
+    let mut response = Json(json!({"ok": true})).into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, clear_session_cookie_header());
+    response
+}
+
 fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
-    header_bearer_token(headers)
-        .or_else(|| cookie_token(headers, AUTH_COOKIE_NAME))
-        .map(|token| token == state.token.as_str())
-        .unwrap_or(false)
+    current_operator_session(headers, state).is_some()
 }
 
 fn header_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -901,12 +1540,19 @@ fn cookie_token<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str
     })
 }
 
-fn auth_cookie_header(state: &AppState) -> HeaderValue {
+fn session_cookie_header(session_token: &str) -> HeaderValue {
     HeaderValue::from_str(&format!(
         "{AUTH_COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={AUTH_COOKIE_MAX_AGE_SECS}",
-        state.token
+        session_token
     ))
     .expect("session cookie should be a valid header value")
+}
+
+fn clear_session_cookie_header() -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+    ))
+    .expect("cleared session cookie should be a valid header value")
 }
 
 fn no_store_header_value() -> &'static str {
@@ -1183,6 +1829,28 @@ async fn handle_mesh_target_agent_chat(
     (StatusCode::ACCEPTED, Json(json!(accepted))).into_response()
 }
 
+// ── GET /api/event-log ────────────────────────────────────────────────────────
+
+async fn handle_event_log(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<EventLogQuery>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    match query_event_log(&state.db_path, limit, query.source.as_deref()) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn stream_operator_chat_turn(
     socket: String,
     tx: broadcast::Sender<String>,
@@ -1413,6 +2081,175 @@ fn query_apartment(db_path: &PathBuf, agent_id: &str) -> Result<Option<Value>> {
     }
 
     Ok(Some(Value::Object(result)))
+}
+
+fn query_event_log(
+    db_path: &PathBuf,
+    limit: usize,
+    source_filter: Option<&str>,
+) -> Result<Vec<EventLogEntry>> {
+    let normalized_source = source_filter.map(|value| value.trim().to_ascii_lowercase());
+    let router_limit = limit.max(20);
+    let mesh_limit = limit.max(20);
+    let mut entries = Vec::new();
+
+    if normalized_source
+        .as_deref()
+        .map(|value| value == "router")
+        .unwrap_or(true)
+    {
+        let router_path = router_trace_path(db_path);
+        entries.extend(query_router_event_log(&router_path, router_limit)?);
+    }
+
+    if normalized_source
+        .as_deref()
+        .map(|value| value == "mesh")
+        .unwrap_or(true)
+    {
+        entries.extend(query_mesh_event_log(db_path, mesh_limit)?);
+    }
+
+    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.id.cmp(&b.id)));
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+fn router_trace_path(db_path: &PathBuf) -> PathBuf {
+    db_path
+        .parent()
+        .map(|dir| dir.join("router_traces.db"))
+        .unwrap_or_else(|| PathBuf::from("router_traces.db"))
+}
+
+fn query_router_event_log(path: &PathBuf, limit: usize) -> Result<Vec<EventLogEntry>> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT trace_id, agent_id, session_id, turn_id, provider_id, model_id,
+                task_kind, outcome, failure_code, latency_ms, token_count, timestamp
+         FROM router_traces ORDER BY timestamp DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        let trace_id: String = row.get(0)?;
+        let agent_id: String = row.get(1)?;
+        let session_id: String = row.get(2)?;
+        let turn_id: String = row.get(3)?;
+        let provider_id: String = row.get(4)?;
+        let model_id: Option<String> = row.get(5)?;
+        let task_kind: String = row.get(6)?;
+        let outcome: String = row.get(7)?;
+        let failure_code: Option<String> = row.get(8)?;
+        let latency_ms: Option<i64> = row.get(9)?;
+        let token_count: Option<i64> = row.get(10)?;
+        let timestamp: i64 = row.get(11)?;
+        Ok(EventLogEntry {
+            id: trace_id,
+            timestamp: timestamp as u64,
+            source: "router".into(),
+            event_type: format!("router.{outcome}"),
+            summary: summarize_router_event(
+                &task_kind,
+                &provider_id,
+                &outcome,
+                failure_code.as_deref(),
+            ),
+            details: json!({
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "task_kind": task_kind,
+                "outcome": outcome,
+                "failure_code": failure_code,
+                "latency_ms": latency_ms.map(|value| value as u64),
+                "token_count": token_count.map(|value| value as u64),
+            }),
+        })
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+fn query_mesh_event_log(path: &PathBuf, limit: usize) -> Result<Vec<EventLogEntry>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT event_id, source_node_id, target_node_id, source_agent_id, target_agent_id,
+                kind, corr_id, attempt, created_at, expires_at, payload_type, payload_json
+         FROM mesh_events ORDER BY created_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        let event_id: String = row.get(0)?;
+        let source_node_id: String = row.get(1)?;
+        let target_node_id: Option<String> = row.get(2)?;
+        let source_agent_id: String = row.get(3)?;
+        let target_agent_id: Option<String> = row.get(4)?;
+        let kind: String = row.get(5)?;
+        let corr_id: String = row.get(6)?;
+        let attempt: i64 = row.get(7)?;
+        let created_at: i64 = row.get(8)?;
+        let expires_at: Option<i64> = row.get(9)?;
+        let payload_type: String = row.get(10)?;
+        let payload_json: String = row.get(11)?;
+        let parsed_payload =
+            serde_json::from_str::<Value>(&payload_json).unwrap_or(Value::String(payload_json));
+        Ok(EventLogEntry {
+            id: event_id,
+            timestamp: created_at as u64,
+            source: "mesh".into(),
+            event_type: format!("mesh.{kind}"),
+            summary: summarize_mesh_event(&kind, &source_node_id, target_node_id.as_deref()),
+            details: json!({
+                "source_node_id": source_node_id,
+                "target_node_id": target_node_id,
+                "source_agent_id": source_agent_id,
+                "target_agent_id": target_agent_id,
+                "kind": kind,
+                "corr_id": corr_id,
+                "attempt": attempt as u64,
+                "expires_at": expires_at.map(|value| value as u64),
+                "payload_type": payload_type,
+                "payload": parsed_payload,
+            }),
+        })
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+fn summarize_router_event(
+    task_kind: &str,
+    provider_id: &str,
+    outcome: &str,
+    failure_code: Option<&str>,
+) -> String {
+    match (outcome, failure_code) {
+        ("failure", Some(code)) if !code.is_empty() => {
+            format!("{task_kind} via {provider_id} failed ({code})")
+        }
+        ("failure", _) => format!("{task_kind} via {provider_id} failed"),
+        ("tool_call", _) => format!("{task_kind} via {provider_id} requested tool call"),
+        _ => format!("{task_kind} via {provider_id} {outcome}"),
+    }
+}
+
+fn summarize_mesh_event(kind: &str, source_node_id: &str, target_node_id: Option<&str>) -> String {
+    match target_node_id {
+        Some(target) if !target.is_empty() => format!("{kind} {source_node_id} -> {target}"),
+        _ => format!("{kind} from {source_node_id}"),
+    }
 }
 
 // ── POST /api/guests/:guest_id/restart ────────────────────────────────────────
@@ -1857,6 +2694,73 @@ async fn handle_config_gemini(headers: HeaderMap, State(state): State<AppState>)
     .into_response()
 }
 
+// ── GET /api/config/oidc ──────────────────────────────────────────────────────
+
+async fn handle_config_oidc(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    let resolved = match load_oidc_resolved_config(&state.socket, Some(&headers)).await {
+        Ok(config) => config,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    Json(OidcConfigView {
+        public_base_url: resolved.public_base_url.clone(),
+        public_base_source: resolved.public_base_source.clone(),
+        providers: vec![
+            OidcProviderConfigView {
+                provider: "google".into(),
+                label: "Google".into(),
+                client_id: resolved.google.client_id.clone(),
+                client_id_source: oidc_value_source(
+                    oidc_config_string(&state.socket, "oidc_google_client_id")
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some(),
+                    env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_ID").is_some(),
+                ),
+                secret_ref: resolved.google.client_secret_ref.clone(),
+                secret_ref_source: oidc_value_source(
+                    resolved.google.client_secret_ref.is_some(),
+                    env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_SECRET").is_some(),
+                ),
+                secret_configured: resolved.google.client_secret.is_some(),
+                callback_url: format!("{}/auth/oidc/google/callback", resolved.public_base_url),
+            },
+            OidcProviderConfigView {
+                provider: "github".into(),
+                label: "GitHub".into(),
+                client_id: resolved.github.client_id.clone(),
+                client_id_source: oidc_value_source(
+                    oidc_config_string(&state.socket, "oidc_github_client_id")
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some(),
+                    env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_ID").is_some(),
+                ),
+                secret_ref: resolved.github.client_secret_ref.clone(),
+                secret_ref_source: oidc_value_source(
+                    resolved.github.client_secret_ref.is_some(),
+                    env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_SECRET").is_some(),
+                ),
+                secret_configured: resolved.github.client_secret.is_some(),
+                callback_url: format!("{}/auth/oidc/github/callback", resolved.public_base_url),
+            },
+        ],
+    })
+    .into_response()
+}
+
 // ── GET /api/graphs ───────────────────────────────────────────────────────────
 
 async fn handle_graphs(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -1944,6 +2848,8 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
             "gemini_oauth_refresh_token",
             "gemini_oauth_refresh_token_ref",
         ),
+        ("oidc_google_client_secret", "oidc_google_client_secret_ref"),
+        ("oidc_github_client_secret", "oidc_github_client_secret_ref"),
         ("telegram_bot_token", "telegram_bot_token"),
     ];
     let mut named_entries: Vec<Value> = Vec::new();
@@ -1967,7 +2873,16 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
 // ── PUT /api/config/:key ──────────────────────────────────────────────────────
 //
 // Allowed keys for operator mutation (prevents arbitrary config overwrites).
-const MUTABLE_CONFIG_KEYS: &[&str] = &["telegram_bot_token", "execution_host", "vault_registry"];
+const MUTABLE_CONFIG_KEYS: &[&str] = &[
+    "telegram_bot_token",
+    "execution_host",
+    "vault_registry",
+    "oidc_public_base_url",
+    "oidc_google_client_id",
+    "oidc_google_client_secret_ref",
+    "oidc_github_client_id",
+    "oidc_github_client_secret_ref",
+];
 
 #[derive(serde::Deserialize)]
 struct SetConfigBody {
@@ -2230,10 +3145,7 @@ async fn handle_agent_patch(
 
 // ── GET /api/user-profile ─────────────────────────────────────────────────────
 
-async fn handle_user_profile_get(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-) -> Response {
+async fn handle_user_profile_get(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
@@ -2267,8 +3179,7 @@ async fn handle_user_profile_patch(
         return unauthorized();
     }
     let hotel_name = state.hotel.as_ref().clone();
-    match ipc_patch_user_profile(&state.socket, &hotel_name, body.timezone, body.display_name)
-        .await
+    match ipc_patch_user_profile(&state.socket, &hotel_name, body.timezone, body.display_name).await
     {
         Ok(profile) => {
             let event = json!({ "type": "user_profile:updated" });
@@ -2291,7 +3202,9 @@ async fn ipc_get_user_profile(socket: &str, hotel_name: &str) -> Result<Value> {
         })
         .await?
     {
-        IpcResponse::UserProfileData(p) => Ok(json!({ "timezone": p.timezone, "display_name": p.display_name })),
+        IpcResponse::UserProfileData(p) => {
+            Ok(json!({ "timezone": p.timezone, "display_name": p.display_name }))
+        }
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected get_user_profile response: {other:?}")),
     }
@@ -2312,7 +3225,9 @@ async fn ipc_patch_user_profile(
         })
         .await?
     {
-        IpcResponse::UserProfileData(p) => Ok(json!({ "timezone": p.timezone, "display_name": p.display_name })),
+        IpcResponse::UserProfileData(p) => {
+            Ok(json!({ "timezone": p.timezone, "display_name": p.display_name }))
+        }
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected patch_user_profile response: {other:?}")),
     }
@@ -3116,6 +4031,32 @@ async fn ipc_set_config(socket: &str, key: &str, value_json: &str) -> Result<()>
     }
 }
 
+async fn ipc_get_secret(socket: &str, secret_ref: &str) -> Result<Option<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-secret-read").await?;
+    match client
+        .send_request(IpcRequest::GetSecret {
+            secret_ref: secret_ref.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::SecretData {
+            value_json: Some(raw),
+            ..
+        } => {
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| Value::String(raw));
+            Ok(Some(parsed))
+        }
+        IpcResponse::SecretData {
+            value_json: None, ..
+        } => Ok(None),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected get_secret response: {other:?}")),
+    }
+}
+
 async fn ipc_rotate_secret(socket: &str, secret_ref: &str, plaintext: &str) -> Result<()> {
     let mut client = connect_management_client(socket, "philotic-web-vault-write").await?;
     match client
@@ -3819,11 +4760,7 @@ async fn handle_ws(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    let cookie_authed = cookie_token(&headers, AUTH_COOKIE_NAME)
-        .map(|t| t == state.token.as_str())
-        .unwrap_or(false);
-
-    if !cookie_authed {
+    if current_operator_session(&headers, &state).is_none() {
         return unauthorized();
     }
 
@@ -3891,4 +4828,1146 @@ fn read_hotel_name(config_path: &PathBuf) -> String {
                 .and_then(|m| m.keys().next().cloned())
         })
         .unwrap_or_else(|| "default".to_string())
+}
+
+fn current_operator_session(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Option<OperatorSessionRecord> {
+    let token = header_bearer_token(headers).or_else(|| cookie_token(headers, AUTH_COOKIE_NAME))?;
+    resolve_operator_session(&state.db_path, token)
+        .ok()
+        .flatten()
+}
+
+fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS operator_users (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            home_hotel TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS root_user_key_refs (
+            user_id TEXT NOT NULL,
+            key_purpose TEXT NOT NULL,
+            vault_ref TEXT,
+            public_fingerprint TEXT,
+            rotation_state TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, key_purpose)
+        );
+
+        CREATE TABLE IF NOT EXISTS operator_sessions (
+            session_id TEXT PRIMARY KEY,
+            session_token TEXT NOT NULL UNIQUE,
+            user_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            issuing_hotel TEXT NOT NULL,
+            surface_kind TEXT NOT NULL,
+            posture TEXT NOT NULL,
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            auth_method TEXT NOT NULL,
+            bootstrap_id TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_operator_sessions_token
+        ON operator_sessions(session_token);
+
+        CREATE TABLE IF NOT EXISTS operator_auth_challenges (
+            challenge_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            intended_surface TEXT NOT NULL,
+            auth_path TEXT NOT NULL,
+            verifier_kind TEXT NOT NULL,
+            verifier_hint TEXT,
+            bind_label TEXT,
+            challenge_nonce TEXT NOT NULL UNIQUE,
+            exchange_secret TEXT,
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            consumed_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_operator_auth_challenges_nonce
+        ON operator_auth_challenges(challenge_nonce);
+        ",
+    )?;
+
+    let now = now_epoch_secs();
+    conn.execute(
+        "INSERT INTO operator_users (user_id, display_name, home_hotel, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'active', ?4, ?4)
+         ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, home_hotel=excluded.home_hotel, updated_at=excluded.updated_at",
+        rusqlite::params![
+            default_operator_user_id(hotel),
+            default_operator_display_name(),
+            hotel,
+            now,
+        ],
+    )?;
+
+    let root_ref = detect_root_user_key_ref(hotel);
+    conn.execute(
+        "INSERT INTO root_user_key_refs
+         (user_id, key_purpose, vault_ref, public_fingerprint, rotation_state, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(user_id, key_purpose) DO UPDATE SET
+            vault_ref=excluded.vault_ref,
+            public_fingerprint=excluded.public_fingerprint,
+            rotation_state=excluded.rotation_state,
+            updated_at=excluded.updated_at",
+        rusqlite::params![
+            default_operator_user_id(hotel),
+            root_ref.key_purpose,
+            root_ref.vault_ref,
+            root_ref.public_fingerprint,
+            root_ref.rotation_state,
+            now,
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn list_root_user_key_refs(
+    db_path: &PathBuf,
+    hotel: &str,
+) -> Result<Vec<RootUserKeyRefStatusView>> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT user_id, key_purpose, vault_ref, public_fingerprint, rotation_state
+         FROM root_user_key_refs
+         WHERE user_id = ?1
+         ORDER BY key_purpose",
+    )?;
+    let rows = stmt.query_map([default_operator_user_id(hotel)], |row| {
+        let vault_ref: Option<String> = row.get(2)?;
+        Ok(RootUserKeyRefStatusView {
+            user_id: row.get(0)?,
+            key_purpose: row.get(1)?,
+            source_kind: root_user_key_source_kind(&vault_ref),
+            vault_ref,
+            public_fingerprint: row.get(3)?,
+            rotation_state: row.get(4)?,
+        })
+    })?;
+
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn issue_operator_session(
+    db_path: &PathBuf,
+    hotel: &str,
+    display_name: &str,
+    auth_method: &str,
+    bootstrap_id: Option<String>,
+) -> Result<OperatorSessionRecord> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    let expires_at = now + AUTH_COOKIE_MAX_AGE_SECS as i64;
+    let session = OperatorSessionRecord {
+        session_id: new_operator_chat_id("operator-session"),
+        session_token: new_operator_chat_id("operator-token"),
+        user_id: default_operator_user_id(hotel),
+        display_name: display_name.to_string(),
+        issuing_hotel: hotel.to_string(),
+        surface_kind: "desktop_membrane".into(),
+        posture: "admin".into(),
+        issued_at: now,
+        expires_at,
+        status: "active".into(),
+        auth_method: auth_method.into(),
+        bootstrap_id,
+    };
+    conn.execute(
+        "INSERT INTO operator_sessions
+        (session_id, session_token, user_id, display_name, issuing_hotel, surface_kind, posture, issued_at, expires_at, status, auth_method, bootstrap_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            &session.session_id,
+            &session.session_token,
+            &session.user_id,
+            &session.display_name,
+            &session.issuing_hotel,
+            &session.surface_kind,
+            &session.posture,
+            session.issued_at,
+            session.expires_at,
+            &session.status,
+            &session.auth_method,
+            &session.bootstrap_id,
+        ],
+    )?;
+
+    Ok(session)
+}
+
+fn issue_operator_auth_challenge(
+    db_path: &PathBuf,
+    hotel: &str,
+    intended_surface: &str,
+    auth_path: &str,
+    verifier_kind: &str,
+    verifier_hint: Option<String>,
+    bind_label: Option<String>,
+    exchange_secret: Option<String>,
+) -> Result<OperatorAuthChallengeRecord> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    let expires_at = now + 60 * 5;
+    let challenge = OperatorAuthChallengeRecord {
+        challenge_id: new_operator_chat_id("operator-auth-challenge"),
+        user_id: default_operator_user_id(hotel),
+        intended_surface: intended_surface.into(),
+        auth_path: auth_path.into(),
+        verifier_kind: verifier_kind.into(),
+        verifier_hint,
+        bind_label,
+        challenge_nonce: new_operator_chat_id("challenge-nonce"),
+        exchange_secret,
+        issued_at: now,
+        expires_at,
+        status: "pending".into(),
+        consumed_at: None,
+    };
+    conn.execute(
+        "INSERT INTO operator_auth_challenges
+        (challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint, bind_label, challenge_nonce, exchange_secret, issued_at, expires_at, status, consumed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        rusqlite::params![
+            &challenge.challenge_id,
+            &challenge.user_id,
+            &challenge.intended_surface,
+            &challenge.auth_path,
+            &challenge.verifier_kind,
+            &challenge.verifier_hint,
+            &challenge.bind_label,
+            &challenge.challenge_nonce,
+            &challenge.exchange_secret,
+            challenge.issued_at,
+            challenge.expires_at,
+            &challenge.status,
+            challenge.consumed_at,
+        ],
+    )?;
+    Ok(challenge)
+}
+
+#[allow(dead_code)]
+fn resolve_operator_auth_challenge(
+    db_path: &PathBuf,
+    challenge_id: &str,
+) -> Result<Option<OperatorAuthChallengeRecord>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint,
+                bind_label, challenge_nonce, exchange_secret, issued_at, expires_at, status, consumed_at
+         FROM operator_auth_challenges
+         WHERE challenge_id = ?1",
+    )?;
+    let maybe = stmt
+        .query_row([challenge_id], |row| {
+            Ok(OperatorAuthChallengeRecord {
+                challenge_id: row.get(0)?,
+                user_id: row.get(1)?,
+                intended_surface: row.get(2)?,
+                auth_path: row.get(3)?,
+                verifier_kind: row.get(4)?,
+                verifier_hint: row.get(5)?,
+                bind_label: row.get(6)?,
+                challenge_nonce: row.get(7)?,
+                exchange_secret: row.get(8)?,
+                issued_at: row.get(9)?,
+                expires_at: row.get(10)?,
+                status: row.get(11)?,
+                consumed_at: row.get(12)?,
+            })
+        })
+        .optional()?;
+    Ok(maybe)
+}
+
+#[allow(dead_code)]
+fn resolve_operator_auth_challenge_by_nonce(
+    db_path: &PathBuf,
+    nonce: &str,
+) -> Result<Option<OperatorAuthChallengeRecord>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT challenge_id, user_id, intended_surface, auth_path, verifier_kind, verifier_hint,
+                bind_label, challenge_nonce, exchange_secret, issued_at, expires_at, status, consumed_at
+         FROM operator_auth_challenges
+         WHERE challenge_nonce = ?1",
+    )?;
+    let maybe = stmt
+        .query_row([nonce], |row| {
+            Ok(OperatorAuthChallengeRecord {
+                challenge_id: row.get(0)?,
+                user_id: row.get(1)?,
+                intended_surface: row.get(2)?,
+                auth_path: row.get(3)?,
+                verifier_kind: row.get(4)?,
+                verifier_hint: row.get(5)?,
+                bind_label: row.get(6)?,
+                challenge_nonce: row.get(7)?,
+                exchange_secret: row.get(8)?,
+                issued_at: row.get(9)?,
+                expires_at: row.get(10)?,
+                status: row.get(11)?,
+                consumed_at: row.get(12)?,
+            })
+        })
+        .optional()?;
+    Ok(maybe)
+}
+
+#[allow(dead_code)]
+fn consume_operator_auth_challenge(
+    db_path: &PathBuf,
+    challenge_id: &str,
+) -> Result<Option<OperatorAuthChallengeRecord>> {
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    let changed = conn.execute(
+        "UPDATE operator_auth_challenges
+         SET status = 'consumed', consumed_at = ?2
+         WHERE challenge_id = ?1
+           AND status = 'pending'
+           AND expires_at > ?2",
+        rusqlite::params![challenge_id, now],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    resolve_operator_auth_challenge(db_path, challenge_id)
+}
+
+fn resolve_operator_session(
+    db_path: &PathBuf,
+    token: &str,
+) -> Result<Option<OperatorSessionRecord>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT session_id, session_token, user_id, display_name, issuing_hotel, surface_kind, posture,
+                issued_at, expires_at, status, auth_method, bootstrap_id
+         FROM operator_sessions
+         WHERE session_token = ?1",
+    )?;
+    let maybe = stmt
+        .query_row([token], |row| {
+            Ok(OperatorSessionRecord {
+                session_id: row.get(0)?,
+                session_token: row.get(1)?,
+                user_id: row.get(2)?,
+                display_name: row.get(3)?,
+                issuing_hotel: row.get(4)?,
+                surface_kind: row.get(5)?,
+                posture: row.get(6)?,
+                issued_at: row.get(7)?,
+                expires_at: row.get(8)?,
+                status: row.get(9)?,
+                auth_method: row.get(10)?,
+                bootstrap_id: row.get(11)?,
+            })
+        })
+        .optional()?;
+
+    Ok(maybe.filter(|session| session.status == "active" && session.expires_at > now_epoch_secs()))
+}
+
+fn revoke_operator_session(db_path: &PathBuf, token: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute(
+        "UPDATE operator_sessions SET status = 'revoked' WHERE session_token = ?1",
+        [token],
+    )?;
+    Ok(())
+}
+
+fn default_operator_user_id(hotel: &str) -> String {
+    format!("root-user:{hotel}")
+}
+
+fn default_operator_display_name() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Operator".into())
+}
+
+fn detect_root_user_key_ref(hotel: &str) -> RootUserKeyRefStatusView {
+    let account = vault_root_key_account();
+    if cfg!(target_os = "macos") {
+        let keychain_ref = format!("keychain://ai.philotic.hotel-vault/{account}");
+        match load_root_key_from_keychain(&account) {
+            Ok(Some(key_bytes)) => {
+                return RootUserKeyRefStatusView {
+                    user_id: default_operator_user_id(hotel),
+                    key_purpose: "vault-root-key".into(),
+                    vault_ref: Some(keychain_ref),
+                    public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
+                    rotation_state: "active".into(),
+                    source_kind: "keychain".into(),
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return RootUserKeyRefStatusView {
+                    user_id: default_operator_user_id(hotel),
+                    key_purpose: "vault-root-key".into(),
+                    vault_ref: Some(keychain_ref),
+                    public_fingerprint: None,
+                    rotation_state: "unavailable".into(),
+                    source_kind: "keychain-error".into(),
+                };
+            }
+        }
+    }
+
+    match load_root_key_from_env() {
+        Ok(key_bytes) => RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: Some(format!(
+                "env://PHILOTIC_VAULT_MASTER_KEY/{}",
+                vault_root_key_account()
+            )),
+            public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
+            rotation_state: "active".into(),
+            source_kind: "env".into(),
+        },
+        Err(_) => RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: None,
+            public_fingerprint: None,
+            rotation_state: "unavailable".into(),
+            source_kind: "missing".into(),
+        },
+    }
+}
+
+fn load_root_key_from_env() -> Result<Vec<u8>> {
+    let raw = std::env::var("PHILOTIC_VAULT_MASTER_KEY")?;
+    decode_root_key(raw.trim(), "PHILOTIC_VAULT_MASTER_KEY")
+}
+
+fn load_root_key_from_keychain(account: &str) -> Result<Option<Vec<u8>>> {
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "ai.philotic.hotel-vault",
+            "-a",
+            account,
+            "-w",
+        ])
+        .output()?;
+
+    if output.status.success() {
+        let raw = String::from_utf8(output.stdout)?;
+        return decode_root_key(raw.trim(), "macOS Keychain").map(Some);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("could not be found")
+        || stderr.contains("The specified item could not be found")
+    {
+        return Ok(None);
+    }
+
+    anyhow::bail!(
+        "failed to read Philotic vault root key from macOS Keychain: {}",
+        stderr.trim()
+    )
+}
+
+fn decode_root_key(raw: &str, source: &str) -> Result<Vec<u8>> {
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|err| anyhow!("failed to decode {source} as base64: {err}"))?;
+    if key_bytes.len() != 32 {
+        anyhow::bail!("{source} must decode to exactly 32 bytes");
+    }
+    Ok(key_bytes)
+}
+
+fn vault_root_key_account() -> String {
+    std::env::var("PHILOTIC_VAULT_KEY_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default-root-key".to_string())
+}
+
+fn root_key_fingerprint(key_bytes: &[u8]) -> String {
+    let digest = Sha256::digest(key_bytes);
+    format!("sha256:{}", hex::encode(&digest[..8]))
+}
+
+fn root_user_key_source_kind(vault_ref: &Option<String>) -> String {
+    match vault_ref.as_deref() {
+        Some(value) if value.starts_with("keychain://") => "keychain".into(),
+        Some(value) if value.starts_with("env://") => "env".into(),
+        Some(_) => "opaque".into(),
+        None => "missing".into(),
+    }
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Debug)]
+struct OidcProviderConfig {
+    id: String,
+    label: String,
+    configured: bool,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    auth_url: String,
+    token_url: String,
+    userinfo_url: String,
+    scopes: Vec<String>,
+    extra_auth_params: Vec<(String, String)>,
+    redirect_uri: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OidcTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug)]
+struct OidcIdentity {
+    display_name: String,
+}
+
+async fn list_oidc_provider_statuses(
+    socket: &str,
+    headers: Option<&HeaderMap>,
+) -> Vec<OidcProviderStatusView> {
+    let mut providers = Vec::new();
+    for provider in ["google", "github"] {
+        if let Ok(Some(provider)) = oidc_provider_config(socket, provider, headers).await {
+            providers.push(OidcProviderStatusView {
+                provider: provider.id,
+                label: provider.label,
+                configured: provider.configured,
+                callback_url: provider.redirect_uri,
+            });
+        }
+    }
+    providers
+}
+
+async fn oidc_provider_config(
+    socket: &str,
+    provider: &str,
+    headers: Option<&HeaderMap>,
+) -> Result<Option<OidcProviderConfig>> {
+    let resolved = load_oidc_resolved_config(socket, headers).await?;
+    oidc_provider_config_from_resolved(provider, resolved)
+}
+
+fn oidc_provider_config_from_resolved(
+    provider: &str,
+    resolved: OidcResolvedConfig,
+) -> Result<Option<OidcProviderConfig>> {
+    match provider {
+        "google" => Ok(Some(OidcProviderConfig {
+            id: "google".into(),
+            label: "Google".into(),
+            configured: resolved.google.client_id.is_some()
+                && resolved.google.client_secret.is_some(),
+            client_id: resolved.google.client_id,
+            client_secret: resolved.google.client_secret,
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".into(),
+            scopes: vec!["openid".into(), "profile".into(), "email".into()],
+            extra_auth_params: vec![
+                ("access_type".into(), "offline".into()),
+                ("prompt".into(), "consent".into()),
+            ],
+            redirect_uri: format!("{}/auth/oidc/google/callback", resolved.public_base_url),
+        })),
+        "github" => Ok(Some(OidcProviderConfig {
+            id: "github".into(),
+            label: "GitHub".into(),
+            configured: resolved.github.client_id.is_some()
+                && resolved.github.client_secret.is_some(),
+            client_id: resolved.github.client_id,
+            client_secret: resolved.github.client_secret,
+            auth_url: "https://github.com/login/oauth/authorize".into(),
+            token_url: "https://github.com/login/oauth/access_token".into(),
+            userinfo_url: "https://api.github.com/user".into(),
+            scopes: vec!["read:user".into(), "user:email".into()],
+            extra_auth_params: Vec::new(),
+            redirect_uri: format!("{}/auth/oidc/github/callback", resolved.public_base_url),
+        })),
+        _ => Ok(None),
+    }
+}
+
+async fn load_oidc_resolved_config(
+    socket: &str,
+    headers: Option<&HeaderMap>,
+) -> Result<OidcResolvedConfig> {
+    let (public_base_url, public_base_source) =
+        operator_auth_public_base_url(socket, headers).await?;
+    let google_client_id = oidc_config_string(socket, "oidc_google_client_id")
+        .await?
+        .or_else(|| env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_ID"));
+    let github_client_id = oidc_config_string(socket, "oidc_github_client_id")
+        .await?
+        .or_else(|| env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_ID"));
+    let (google_client_secret_ref, google_client_secret) = oidc_secret_from_ref_or_env(
+        socket,
+        "oidc_google_client_secret_ref",
+        "PHILOTIC_OIDC_GOOGLE_CLIENT_SECRET",
+    )
+    .await?;
+    let (github_client_secret_ref, github_client_secret) = oidc_secret_from_ref_or_env(
+        socket,
+        "oidc_github_client_secret_ref",
+        "PHILOTIC_OIDC_GITHUB_CLIENT_SECRET",
+    )
+    .await?;
+
+    Ok(OidcResolvedConfig {
+        public_base_url,
+        public_base_source,
+        google: OidcProviderSettings {
+            client_id: google_client_id,
+            client_secret: google_client_secret,
+            client_secret_ref: google_client_secret_ref,
+        },
+        github: OidcProviderSettings {
+            client_id: github_client_id,
+            client_secret: github_client_secret,
+            client_secret_ref: github_client_secret_ref,
+        },
+    })
+}
+
+impl OidcProviderConfig {
+    fn authorization_url(&self, state: &str, code_challenge: &str) -> Result<String> {
+        let client_id = self
+            .client_id
+            .as_deref()
+            .context("OIDC client id is not configured")?;
+        let mut url = Url::parse(&self.auth_url).context("failed to build OIDC auth URL")?;
+        url.query_pairs_mut()
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", &self.redirect_uri)
+            .append_pair("response_type", "code")
+            .append_pair("scope", &self.scopes.join(" "))
+            .append_pair("state", state)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256");
+        for (key, value) in &self.extra_auth_params {
+            url.query_pairs_mut().append_pair(key, value);
+        }
+        Ok(url.into())
+    }
+}
+
+async fn operator_auth_public_base_url(
+    socket: &str,
+    headers: Option<&HeaderMap>,
+) -> Result<(String, String)> {
+    if let Some(value) = oidc_config_string(socket, "oidc_public_base_url").await? {
+        return Ok((
+            value.trim_end_matches('/').to_string(),
+            "hotel-config".into(),
+        ));
+    }
+    if let Some(value) = env_trimmed("PHILOTIC_OIDC_PUBLIC_BASE_URL")
+        .or_else(|| env_trimmed("PHILOTIC_AUTH_PUBLIC_BASE_URL"))
+    {
+        return Ok((value.trim_end_matches('/').to_string(), "env".into()));
+    }
+
+    let headers = headers.context("missing host headers and no OIDC public base URL configured")?;
+    let scheme = header_string(headers, "x-forwarded-proto")
+        .or_else(|| header_string(headers, "x-forwarded-scheme"))
+        .unwrap_or_else(|| "http".into());
+    let host = header_string(headers, "x-forwarded-host")
+        .or_else(|| header_string(headers, "host"))
+        .context("missing host header for auth public base URL derivation")?;
+    Ok((
+        format!("{}://{}", scheme, host)
+            .trim_end_matches('/')
+            .to_string(),
+        "request-headers".into(),
+    ))
+}
+
+async fn oidc_config_string(socket: &str, key: &str) -> Result<Option<String>> {
+    Ok(ipc_get_config(socket, key)
+        .await?
+        .and_then(|value| value.as_str().map(|value| value.trim().to_string()))
+        .filter(|value| !value.is_empty()))
+}
+
+async fn oidc_secret_from_ref_or_env(
+    socket: &str,
+    ref_key: &str,
+    env_key: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    if let Some(secret_ref) = oidc_config_string(socket, ref_key).await? {
+        let secret = ipc_get_secret(socket, &secret_ref)
+            .await?
+            .and_then(|value| value.as_str().map(|value| value.to_string()));
+        return Ok((Some(secret_ref), secret));
+    }
+    Ok((None, env_trimmed(env_key)))
+}
+
+fn oidc_value_source(hotel_config_present: bool, env_fallback_present: bool) -> String {
+    if hotel_config_present {
+        "hotel-config".into()
+    } else if env_fallback_present {
+        "env".into()
+    } else {
+        "unset".into()
+    }
+}
+
+fn header_string(headers: &HeaderMap, key: &str) -> Option<String> {
+    headers
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn env_trimmed(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn sanitize_return_path(input: Option<&str>) -> Option<String> {
+    input
+        .map(str::trim)
+        .filter(|value| value.starts_with('/'))
+        .filter(|value| !value.starts_with("//"))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn oidc_code_verifier() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn pkce_code_challenge(code_verifier: &str) -> String {
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+async fn exchange_oidc_code(
+    provider: &OidcProviderConfig,
+    code: &str,
+    code_verifier: &str,
+) -> Result<OidcTokenResponse> {
+    let client_id = provider
+        .client_id
+        .as_deref()
+        .context("OIDC client id is not configured")?;
+    let mut form = vec![
+        ("client_id", client_id.to_string()),
+        ("code", code.to_string()),
+        ("code_verifier", code_verifier.to_string()),
+        ("grant_type", "authorization_code".into()),
+        ("redirect_uri", provider.redirect_uri.clone()),
+    ];
+    if let Some(client_secret) = provider.client_secret.as_deref() {
+        form.push(("client_secret", client_secret.to_string()));
+    }
+
+    let response = reqwest::Client::new()
+        .post(&provider.token_url)
+        .header("accept", "application/json")
+        .header("user-agent", "philotic-web/0.1")
+        .form(&form)
+        .send()
+        .await
+        .context("failed to exchange OIDC authorization code")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "token exchange failed ({}): {}",
+            status.as_u16(),
+            body.trim()
+        );
+    }
+
+    response
+        .json::<OidcTokenResponse>()
+        .await
+        .context("failed to decode OIDC token response")
+}
+
+async fn fetch_oidc_identity(
+    provider: &OidcProviderConfig,
+    access_token: &str,
+) -> Result<OidcIdentity> {
+    let response = reqwest::Client::new()
+        .get(&provider.userinfo_url)
+        .header("accept", "application/json")
+        .header("user-agent", "philotic-web/0.1")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("failed to fetch OIDC userinfo")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "userinfo fetch failed ({}): {}",
+            status.as_u16(),
+            body.trim()
+        );
+    }
+
+    let body: Value = response
+        .json()
+        .await
+        .context("failed to decode OIDC userinfo response")?;
+    let display_name = match provider.id.as_str() {
+        "google" => body
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("email").and_then(Value::as_str))
+            .unwrap_or("Operator"),
+        "github" => body
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("login").and_then(Value::as_str))
+            .unwrap_or("Operator"),
+        _ => "Operator",
+    };
+
+    Ok(OidcIdentity {
+        display_name: display_name.to_string(),
+    })
+}
+
+fn oidc_callback_error_response(status: StatusCode, message: String) -> Response {
+    let html = format!(
+        "<!doctype html><html><body><h1>Philotic operator auth failed</h1><p>{}</p></body></html>",
+        message
+    );
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("philotic-web-{name}-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn summarize_router_event_includes_failure_code() {
+        assert_eq!(
+            summarize_router_event("text.generate", "gemini", "failure", Some("RATE_LIMIT")),
+            "text.generate via gemini failed (RATE_LIMIT)"
+        );
+    }
+
+    #[test]
+    fn query_event_log_merges_router_and_mesh_entries_newest_first() {
+        let context_path = temp_db_path("context");
+        let router_path = context_path.parent().unwrap().join("router_traces.db");
+
+        {
+            let conn = Connection::open(&context_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE mesh_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    source_node_id TEXT NOT NULL,
+                    target_node_id TEXT,
+                    source_agent_id TEXT NOT NULL,
+                    target_agent_id TEXT,
+                    kind TEXT NOT NULL,
+                    corr_id TEXT NOT NULL,
+                    attempt INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    payload_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    trace_json TEXT NOT NULL
+                );
+                INSERT INTO mesh_events
+                    (event_id, source_node_id, target_node_id, source_agent_id, target_agent_id, kind, corr_id, attempt, created_at, expires_at, payload_type, payload_json, trace_json)
+                VALUES
+                    ('mesh-1', 'mac-jane-aiua-01', 'mbp-jane-aiua-01', 'agent-jane-01', 'agent-aria-01', 'session.handoff', 'corr-1', 0, 100, NULL, 'json', '{\"state\":\"ok\"}', '{}');
+                ",
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&router_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE router_traces (
+                    trace_id     TEXT PRIMARY KEY,
+                    agent_id     TEXT NOT NULL,
+                    session_id   TEXT NOT NULL DEFAULT '',
+                    turn_id      TEXT NOT NULL DEFAULT '',
+                    provider_id  TEXT NOT NULL,
+                    model_id     TEXT,
+                    task_kind    TEXT NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    failure_code TEXT,
+                    latency_ms   INTEGER,
+                    token_count  INTEGER,
+                    timestamp    INTEGER NOT NULL
+                );
+                INSERT INTO router_traces
+                    (trace_id, agent_id, session_id, turn_id, provider_id, model_id, task_kind, outcome, failure_code, latency_ms, token_count, timestamp)
+                VALUES
+                    ('trace-1', 'agent-jane-01', 'session-1', 'turn-1', 'gemini', 'gemini-flash', 'text.generate', 'success', NULL, 42, 77, 200);
+                ",
+            )
+            .unwrap();
+        }
+
+        let entries = query_event_log(&context_path, 10, None).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "trace-1");
+        assert_eq!(entries[0].source, "router");
+        assert_eq!(entries[1].id, "mesh-1");
+        assert_eq!(entries[1].source, "mesh");
+
+        let _ = fs::remove_file(&context_path);
+        let _ = fs::remove_file(&router_path);
+    }
+
+    #[test]
+    fn issue_operator_session_persists_and_resolves_active_session() {
+        let context_path = temp_db_path("operator-session");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let session = issue_operator_session(
+            &context_path,
+            "mac-jane",
+            "Jared",
+            "bootstrap_token",
+            Some("startup-bootstrap".into()),
+        )
+        .unwrap();
+
+        let resolved = resolve_operator_session(&context_path, &session.session_token)
+            .unwrap()
+            .expect("session should resolve");
+        assert_eq!(resolved.display_name, "Jared");
+        assert_eq!(resolved.issuing_hotel, "mac-jane");
+        assert_eq!(resolved.posture, "admin");
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn issue_operator_auth_challenge_persists_pending_record() {
+        let context_path = temp_db_path("operator-auth-challenge");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let challenge = issue_operator_auth_challenge(
+            &context_path,
+            "mac-jane",
+            "desktop_membrane",
+            "membrane_challenge",
+            "telegram",
+            Some("@jaredlikes".into()),
+            Some("desktop.jaredlikes.com".into()),
+            None,
+        )
+        .unwrap();
+
+        let resolved = resolve_operator_auth_challenge(&context_path, &challenge.challenge_id)
+            .unwrap()
+            .expect("challenge should resolve");
+        assert_eq!(resolved.status, "pending");
+        assert_eq!(resolved.verifier_kind, "telegram");
+        assert_eq!(resolved.auth_path, "membrane_challenge");
+        assert_eq!(resolved.user_id, "root-user:mac-jane");
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn consumed_operator_auth_challenge_cannot_be_consumed_twice() {
+        let context_path = temp_db_path("operator-auth-challenge-consume");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let challenge = issue_operator_auth_challenge(
+            &context_path,
+            "mac-jane",
+            "desktop_membrane",
+            "oidc",
+            "google",
+            None,
+            Some("desktop.jaredlikes.com".into()),
+            Some("pkce-verifier".into()),
+        )
+        .unwrap();
+
+        let first = consume_operator_auth_challenge(&context_path, &challenge.challenge_id)
+            .unwrap()
+            .expect("first consume should succeed");
+        assert_eq!(first.status, "consumed");
+        assert!(first.consumed_at.is_some());
+
+        let second =
+            consume_operator_auth_challenge(&context_path, &challenge.challenge_id).unwrap();
+        assert!(second.is_none());
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn oidc_provider_status_reports_google_callback_from_resolved_config() {
+        let provider = oidc_provider_config_from_resolved(
+            "google",
+            OidcResolvedConfig {
+                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_source: "hotel-config".into(),
+                google: OidcProviderSettings {
+                    client_id: Some("google-client".into()),
+                    client_secret: Some("google-secret".into()),
+                    client_secret_ref: Some("vault:google".into()),
+                },
+                github: OidcProviderSettings {
+                    client_id: None,
+                    client_secret: None,
+                    client_secret_ref: None,
+                },
+            },
+        )
+        .unwrap()
+        .expect("google provider");
+        assert!(provider.configured);
+        assert_eq!(
+            provider.redirect_uri,
+            "https://desktop.jaredlikes.com/auth/oidc/google/callback"
+        );
+    }
+
+    #[test]
+    fn google_auth_url_contains_state_pkce_and_redirect_uri() {
+        let provider = oidc_provider_config_from_resolved(
+            "google",
+            OidcResolvedConfig {
+                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_source: "hotel-config".into(),
+                google: OidcProviderSettings {
+                    client_id: Some("google-client".into()),
+                    client_secret: Some("google-secret".into()),
+                    client_secret_ref: Some("vault:google".into()),
+                },
+                github: OidcProviderSettings {
+                    client_id: None,
+                    client_secret: None,
+                    client_secret_ref: None,
+                },
+            },
+        )
+        .unwrap()
+        .expect("google provider");
+        let url = provider
+            .authorization_url("state-123", "challenge-456")
+            .unwrap();
+        assert!(url.contains("client_id=google-client"));
+        assert!(url.contains("state=state-123"));
+        assert!(url.contains("code_challenge=challenge-456"));
+        assert!(url.contains(
+            "redirect_uri=https%3A%2F%2Fdesktop.jaredlikes.com%2Fauth%2Foidc%2Fgoogle%2Fcallback"
+        ));
+    }
+
+    #[test]
+    fn ensure_operator_auth_tables_seeds_root_user_key_ref_from_env() {
+        let context_path = temp_db_path("root-user-key-ref");
+        let key_id = format!("test-key-{}", uuid::Uuid::new_v4());
+        let root_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+
+        unsafe {
+            std::env::set_var("PHILOTIC_VAULT_KEY_ID", &key_id);
+            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", &root_key);
+        }
+
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let refs = list_root_user_key_refs(&context_path, "mac-jane").unwrap();
+        let root_ref = refs
+            .iter()
+            .find(|entry| entry.key_purpose == "vault-root-key")
+            .expect("root key ref should exist");
+        assert_eq!(root_ref.user_id, "root-user:mac-jane");
+        assert_eq!(root_ref.rotation_state, "active");
+        assert_eq!(root_ref.source_kind, "env");
+        let expected_ref = format!("env://PHILOTIC_VAULT_MASTER_KEY/{key_id}");
+        assert_eq!(root_ref.vault_ref.as_deref(), Some(expected_ref.as_str()));
+        assert!(root_ref.public_fingerprint.is_some());
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_VAULT_KEY_ID");
+            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
+        }
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn revoked_operator_session_stops_resolving() {
+        let context_path = temp_db_path("operator-session-revoked");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let session = issue_operator_session(
+            &context_path,
+            "mac-jane",
+            "Jared",
+            "bootstrap_token",
+            Some("startup-bootstrap".into()),
+        )
+        .unwrap();
+        revoke_operator_session(&context_path, &session.session_token).unwrap();
+
+        let resolved = resolve_operator_session(&context_path, &session.session_token).unwrap();
+        assert!(resolved.is_none());
+
+        let _ = fs::remove_file(&context_path);
+    }
 }

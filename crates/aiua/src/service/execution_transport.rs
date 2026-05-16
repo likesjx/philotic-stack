@@ -46,7 +46,7 @@ pub async fn serve_execution_plane(
                     }
 
                     match msg.msg_type {
-                        MsgType::MeshEventBatch => {
+                        MsgType::ExecutionEventBatch | MsgType::ExecutionEventAck => {
                             if inbox_tx.send(msg).await.is_err() {
                                 warn!(
                                     "Execution transport could not forward message from {} because inbox receiver was closed",

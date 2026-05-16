@@ -6,7 +6,7 @@
     "elevenlabs_voice_id": "{{ vault_elevenlabs_voice_id }}"{% endif %}
   },
   "hotels": {
-    "{{ philotic_hotel_name }}": {
+    "{{ philotic_hotel_runtime_name }}": {
       "agents": {{ philotic_agents | to_nice_json }}{% if philotic_backbone_peers | length > 0 %},
       "backbone_peers": [
 {% for peer in philotic_backbone_peers %}

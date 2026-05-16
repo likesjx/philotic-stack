@@ -372,6 +372,10 @@ pub struct WorkingTurn {
     /// Incremented each time the loop escalates to a lower-tier provider.
     #[serde(default)]
     pub fallback_tier: u8,
+    /// Number of same-tier retries attempted for streaming_timeout errors.
+    /// Allows one automatic retry before escalating to the next fallback tier.
+    #[serde(default)]
+    pub streaming_retry_attempts: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -570,10 +574,15 @@ impl VoiceResponsePolicy {
     /// Switches provider, updating `voice_ids` and returning the resolved voice ID.
     /// When `new_voice_id` is given it is persisted for this provider.
     /// When omitted the previously stored ID for the provider is used if available.
-    pub fn switch_provider(&mut self, new_provider: &str, new_voice_id: Option<&str>) -> Option<String> {
+    pub fn switch_provider(
+        &mut self,
+        new_provider: &str,
+        new_voice_id: Option<&str>,
+    ) -> Option<String> {
         self.provider = Some(new_provider.to_string());
         if let Some(vid) = new_voice_id {
-            self.voice_ids.insert(new_provider.to_string(), vid.to_string());
+            self.voice_ids
+                .insert(new_provider.to_string(), vid.to_string());
         }
         self.voice_ids.get(new_provider).cloned()
     }
@@ -950,6 +959,8 @@ pub struct ComponentExecutionRoute {
     pub availability_state: String,
     #[serde(default)]
     pub selection_reason: Option<String>,
+    #[serde(default)]
+    pub target_capability: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -982,4 +993,3 @@ pub struct SpawnedSubagentRef {
     pub lease_epoch: u64,
     pub lease_expires_at: u64,
 }
-

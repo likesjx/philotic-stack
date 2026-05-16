@@ -23,13 +23,13 @@ pub mod model_manager;
 pub mod registry;
 pub mod resources;
 pub mod router_trace;
-pub mod whisper_training;
 pub mod runtime;
 pub mod sqlite_storage;
 pub mod storage;
 pub mod tools;
 pub mod validation;
 pub mod webrtc;
+pub mod whisper_training;
 
 /// Represents a unique identifier for a node in the mesh network.
 pub type NodeId = String;

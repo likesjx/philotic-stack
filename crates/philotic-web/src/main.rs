@@ -564,9 +564,9 @@ async fn main() -> Result<()> {
             }
         }
         Command::Role { action } => {
-            use anyhow::Context as _;
             use ansible_mesh_core::domain::GraphDomain;
             use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+            use anyhow::Context as _;
             use std::sync::Arc;
 
             fn resolve_db(db: Option<PathBuf>) -> PathBuf {

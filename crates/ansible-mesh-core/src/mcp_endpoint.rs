@@ -135,7 +135,9 @@ mod tests {
     use super::*;
     use crate::mcp_route::McpRouteTarget;
 
-    fn round_trip<T: serde::Serialize + for<'de> serde::Deserialize<'de> + std::fmt::Debug + PartialEq>(
+    fn round_trip<
+        T: serde::Serialize + for<'de> serde::Deserialize<'de> + std::fmt::Debug + PartialEq,
+    >(
         v: &T,
     ) {
         let json = serde_json::to_string(v).unwrap();

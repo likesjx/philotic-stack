@@ -86,7 +86,10 @@ fn is_content_error(error: &TaskErrorPayload) -> bool {
 fn should_escalate_tier(error: &TaskErrorPayload) -> bool {
     matches!(
         error.sub_kind.as_deref(),
-        Some("network_error") | Some("streaming_timeout") | Some("rate_limit") | Some("provider_error")
+        Some("network_error")
+            | Some("streaming_timeout")
+            | Some("rate_limit")
+            | Some("provider_error")
     ) || (error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
         && !is_content_error(error))
@@ -102,9 +105,17 @@ fn role_for_tier<'a>(configured_tiers: &'a [String], tier: u8) -> &'a str {
         configured_tiers
             .get(idx)
             .map(String::as_str)
-            .unwrap_or_else(|| configured_tiers.last().map(String::as_str).unwrap_or("model.local"))
+            .unwrap_or_else(|| {
+                configured_tiers
+                    .last()
+                    .map(String::as_str)
+                    .unwrap_or("model.local")
+            })
     } else {
-        DEFAULT_FALLBACK_TIERS.get(idx).copied().unwrap_or("model.local")
+        DEFAULT_FALLBACK_TIERS
+            .get(idx)
+            .copied()
+            .unwrap_or("model.local")
     }
 }
 
@@ -169,6 +180,10 @@ fn implementation_to_model_role(implementation: &str) -> String {
         "model.elevenlabs".into()
     } else if matches!(normalized, "onnx" | "kokoro" | "local") {
         "model.local".into()
+    } else if normalized == "ollama" {
+        "model.ollama".into()
+    } else if normalized == "mlx" {
+        "model.mlx".into()
     } else {
         "model".into()
     }
@@ -403,6 +418,27 @@ fn resolve_model_execution_target(
         .unwrap_or_else(|| fallback_role.into());
 
     (local_node_id(), target_role, None)
+}
+
+/// Returns `(action, effective_capability)` for model dispatch.
+///
+/// When the session has a `target_capability` reflex on the resolved route,
+/// that capability drives both the `action` field sent to model-router and the
+/// route lookup. Callers that previously hardcoded `"generate_text"` /
+/// `"text.generate"` should use this helper instead so that the philote can
+/// self-promote a turn to `"response.generate"` (Gemini Live) via its routing
+/// reflexes.
+fn resolve_dispatch(state: Option<&SessionState>, base_capability: &str) -> (String, String) {
+    let effective = state
+        .and_then(|s| s.resolve_component_execution_route(base_capability))
+        .and_then(|r| r.target_capability.as_deref())
+        .unwrap_or(base_capability);
+
+    let action = match effective {
+        "response.generate" => "response.generate".to_string(),
+        _ => "generate_text".to_string(),
+    };
+    (action, effective.to_string())
 }
 
 /// Returns true if the task is from a Telegram group or supergroup.
@@ -870,6 +906,38 @@ impl AgentRuntime {
                 }
             }
         }
+
+        // Apply operator-persisted policy overrides from hotel config keys.
+        // These take precedence over the bundle so /voice and agent.configure persist
+        // correctly across restarts without requiring a bundle rebuild.
+        if let Ok(IpcResponse::ConfigData {
+            value_json: Some(ref json),
+            ..
+        }) = self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig {
+                key: "config:voice_response_policy".into(),
+            })
+            .await
+        {
+            if let Ok(policy) = serde_json::from_str::<VoiceResponsePolicy>(json) {
+                self.default_agent_profile.voice_response_policy = policy;
+            }
+        }
+        if let Ok(IpcResponse::ConfigData {
+            value_json: Some(ref json),
+            ..
+        }) = self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig {
+                key: "config:media_routing_policy".into(),
+            })
+            .await
+        {
+            if let Ok(policy) = serde_json::from_str::<MediaRoutingPolicy>(json) {
+                self.default_agent_profile.media_routing_policy = policy;
+            }
+        }
     }
 
     /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.
@@ -909,6 +977,11 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
 
+                let turn_loop_config = rec.get("turn_loop_config").and_then(|v| {
+                    serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(v.clone())
+                        .ok()
+                });
+
                 Some(crate::session::RoleActivation {
                     role_name: role_name.to_string(),
                     active_incarnation_id: None,
@@ -925,7 +998,7 @@ impl AgentRuntime {
                     effective_skill_guidance: vec![],
                     working_memory_policy: None,
                     memory_projection_policy: None,
-                    turn_loop_config: None,
+                    turn_loop_config,
                 })
             }
             _ => {
@@ -1047,7 +1120,9 @@ impl AgentRuntime {
                     return r;
                 }
                 Ok(_) => {}
-                Err(e) => warn!(key = %key, err = %e, "Ignoring malformed operator MCP route override."),
+                Err(e) => {
+                    warn!(key = %key, err = %e, "Ignoring malformed operator MCP route override.")
+                }
             }
         }
 
@@ -1098,6 +1173,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::UpdateMcpRoutes {
                 agent_id: self.agent_id.clone(),
                 routes,
+                vault_ref: None,
             })
             .await
         {
@@ -1452,6 +1528,21 @@ impl AgentRuntime {
                         self.agent_id, task_id, source_node
                     );
 
+                    if let Ok(peek) = serde_json::from_str::<serde_json::Value>(&task_json) {
+                        let peeked_action = peek
+                            .get("action")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<none>");
+                        let snippet: String = task_json.chars().take(300).collect();
+                        info!(
+                            task_id = %task_id,
+                            action = %peeked_action,
+                            payload_bytes = %task_json.len(),
+                            snippet = %snippet,
+                            "Agent dispatch: action peek"
+                        );
+                    }
+
                     match serde_json::from_str::<InboundTaskPayload>(&task_json) {
                         Ok(task) if task.is_model_response() => {
                             let task_ref = task.clone();
@@ -1524,6 +1615,13 @@ impl AgentRuntime {
                         Ok(task) if task.action.as_deref() == Some("datasource_response") => {
                             if let Err(err) = self.handle_datasource_response(task).await {
                                 warn!("Failed to handle datasource_response: {}", err);
+                            }
+                        }
+                        Ok(task) if task.command.as_deref() == Some("context.capture") => {
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_context_capture(task, task_id).await {
+                                error!("Failed to handle context.capture: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
                         Ok(task) => {
@@ -2022,10 +2120,14 @@ impl AgentRuntime {
             // treat this user message as operator confirmation of the plan rather
             // than starting a fresh turn. Any non-/deny, non-/cancel message confirms.
             let is_slash_deny_or_cancel = parse_slash_command(&content)
-                .map(|cmd| matches!(cmd, SlashCommand::Deny { .. } | SlashCommand::Abandon { .. }))
+                .map(|cmd| {
+                    matches!(
+                        cmd,
+                        SlashCommand::Deny { .. } | SlashCommand::Abandon { .. }
+                    )
+                })
                 .unwrap_or(false);
-            if state.has_parked_plan_turn() && !state.is_turn_active() && !is_slash_deny_or_cancel
-            {
+            if state.has_parked_plan_turn() && !state.is_turn_active() && !is_slash_deny_or_cancel {
                 let operator_note = {
                     let lower = content.trim().to_lowercase();
                     if lower == "yes" || lower == "proceed" || lower == "go" || lower == "ok" {
@@ -2042,14 +2144,28 @@ impl AgentRuntime {
                 );
                 // Re-enter via build_reentry_context_envelope and return — skip new turn creation.
                 let reentry = state.build_reentry_context_envelope();
-                let (prompt, context, context_projection, tools, restored_task_id,
-                     restored_user_content, restored_chat_id, restored_reply_to,
-                     restored_reply_role, restored_reply_guest_id,
-                     checkpoint_memory_type, checkpoint_json, index_state) = match reentry {
+                let (
+                    prompt,
+                    context,
+                    context_projection,
+                    tools,
+                    restored_task_id,
+                    restored_user_content,
+                    restored_chat_id,
+                    restored_reply_to,
+                    restored_reply_role,
+                    restored_reply_guest_id,
+                    checkpoint_memory_type,
+                    checkpoint_json,
+                    index_state,
+                ) = match reentry {
                     Some((p, c, cp, t)) => {
                         let turn = state.active_turn.as_ref().expect("just restored");
                         let out = (
-                            p, c, cp, t,
+                            p,
+                            c,
+                            cp,
+                            t,
                             turn.task_id,
                             turn.user_content.clone(),
                             turn.chat_id.clone(),
@@ -2063,7 +2179,10 @@ impl AgentRuntime {
                         out
                     }
                     None => {
-                        warn!("Session [{}] plan resume: no reentry envelope; aborting.", session_id);
+                        warn!(
+                            "Session [{}] plan resume: no reentry envelope; aborting.",
+                            session_id
+                        );
                         drop(state);
                         return Ok(());
                     }
@@ -2105,12 +2224,11 @@ impl AgentRuntime {
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
                 };
-                let (target_node, target_role, target_guest_id) =
-                    resolve_model_execution_target(
-                        self.sessions.get(&session_id),
-                        "text.generate",
-                        DEFAULT_TEXT_MODEL_ROLE,
-                    );
+                let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+                    self.sessions.get(&session_id),
+                    "text.generate",
+                    DEFAULT_TEXT_MODEL_ROLE,
+                );
                 self.ipc_client
                     .send_request(IpcRequest::EmitTask {
                         target_node,
@@ -2299,6 +2417,7 @@ impl AgentRuntime {
                 plan_confirmed: false,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
+                streaming_retry_attempts: 0,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -2522,8 +2641,13 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let (action, prompt, attachments, tools_for_model, capability) =
-            if let Some(routing) = media_routing {
+        let (action, prompt, attachments, tools_for_model, capability): (
+            String,
+            String,
+            Vec<TransportAttachment>,
+            Vec<ToolDefinition>,
+            String,
+        ) = if let Some(routing) = media_routing {
                 let prompt = if routing.action == "transcribe" {
                     transcription_prompt(&content)
                 } else {
@@ -2539,15 +2663,17 @@ impl AgentRuntime {
                     prompt,
                     routing.attachments,
                     effective_tools,
-                    routing.capability,
+                    routing.capability.to_string(),
                 )
             } else {
+                let (dispatch_action, dispatch_cap) =
+                    resolve_dispatch(self.sessions.get(&session_id), "text.generate");
                 (
-                    "generate_text".to_string(),
+                    dispatch_action,
                     model_prompt,
                     Vec::new(),
                     tools_for_model,
-                    "text.generate",
+                    dispatch_cap,
                 )
             };
         let (response_contract, provider_options) = voice_delivery_envelope(
@@ -2559,13 +2685,13 @@ impl AgentRuntime {
         let (target_node, target_role, target_guest_id) = {
             let (node, role, guest_id) = resolve_model_execution_target(
                 self.sessions.get(&session_id),
-                capability,
+                &capability,
                 DEFAULT_TEXT_MODEL_ROLE,
             );
             // Network-offline fast-path: skip cloud tiers entirely and go straight
             // to the local model. Uses the last entry in the configured fallback
             // tiers, falling back to DEFAULT_FALLBACK_TIERS.
-            if self.network_offline && capability == "text.generate" {
+            if self.network_offline && matches!(capability.as_str(), "text.generate" | "response.generate") {
                 let offline_role_name: Option<String> = self
                     .sessions
                     .get(&session_id)
@@ -2577,9 +2703,17 @@ impl AgentRuntime {
                     .map(|c| c.turn_loop_config.fallback_tiers.clone())
                     .unwrap_or_default();
                 let local_role = if !offline_tiers.is_empty() {
-                    offline_tiers.last().map(String::as_str).unwrap_or("model.local").to_string()
+                    offline_tiers
+                        .last()
+                        .map(String::as_str)
+                        .unwrap_or("model.local")
+                        .to_string()
                 } else {
-                    DEFAULT_FALLBACK_TIERS.last().copied().unwrap_or("model.local").to_string()
+                    DEFAULT_FALLBACK_TIERS
+                        .last()
+                        .copied()
+                        .unwrap_or("model.local")
+                        .to_string()
                 };
                 warn!(
                     session_id = %session_id,
@@ -2631,7 +2765,7 @@ impl AgentRuntime {
         let model_req = ModelRequestPayload {
             action,
             request_class: Some(
-                if capability == "text.generate" {
+                if matches!(capability.as_str(), "text.generate" | "response.generate") {
                     "cognitive"
                 } else {
                     "transform"
@@ -2658,7 +2792,7 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
-        if debug_model_requests_enabled() && capability == "text.generate" {
+        if debug_model_requests_enabled() && matches!(capability.as_str(), "text.generate" | "response.generate") {
             match serde_json::to_string_pretty(&model_req) {
                 Ok(json) => info!(
                     "PHILOTIC_DEBUG_MODEL_REQUESTS philote outbound model request session={} turn={}:\n{}",
@@ -2787,12 +2921,37 @@ impl AgentRuntime {
                     .retry_active_turn_after_provider_failure(
                         session_id,
                         turn_id,
-                        provider_repair_note(&error_payload),
+                        Some(provider_repair_note(&error_payload)),
                     )
                     .await;
             }
             // Network / timeout / rate-limit errors: escalate to next fallback tier.
             if should_escalate_tier(&error_payload) {
+                // For streaming_timeout specifically, allow one same-tier retry before
+                // escalating — handles transient empty SSE responses from Gemini.
+                if error_payload.sub_kind.as_deref() == Some("streaming_timeout") {
+                    let attempts = self
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.streaming_retry_attempts())
+                        .unwrap_or(0);
+                    if attempts < 1 {
+                        if let Some(state) = self.sessions.get_mut(&session_id) {
+                            state.increment_streaming_retry_attempts();
+                        }
+                        warn!(
+                            session_id = %session_id,
+                            "Retrying same tier after streaming_timeout (attempt 1)"
+                        );
+                        return self
+                            .retry_active_turn_after_provider_failure(
+                                session_id,
+                                turn_id,
+                                None,
+                            )
+                            .await;
+                    }
+                }
                 warn!(
                     session_id = %session_id,
                     sub_kind = %sub_kind,
@@ -2974,14 +3133,25 @@ impl AgentRuntime {
         turn_id: String,
         proposal: PlanProposalAction,
     ) -> Result<()> {
-        let (task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
-             checkpoint_memory_type, checkpoint_json, index_state) = {
+        let (
+            task_id,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Received plan_proposal for unknown session {}", session_id);
                 return Ok(());
             };
             let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!("Received plan_proposal for session {} with no active turn", session_id);
+                warn!(
+                    "Received plan_proposal for session {} with no active turn",
+                    session_id
+                );
                 return Ok(());
             };
             let task_id = active_turn.task_id;
@@ -3400,7 +3570,17 @@ impl AgentRuntime {
             // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
             let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
 
-            if is_admin_role_creation || is_rule_propose || force_approval {
+            // routing.policy.propose requires the same live-approval gate: proposals are stored
+            // durably in the hotel graph and influence future routing decisions, so they must
+            // not be silently submitted without operator visibility.
+            let is_routing_policy_propose =
+                !bypass_approval && tool_call.tool_name == "routing.policy.propose";
+
+            if is_admin_role_creation
+                || is_rule_propose
+                || is_routing_policy_propose
+                || force_approval
+            {
                 // Set pending_tool_call so the approval handler can read it for class lookup.
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     state.set_pending_tool_call(tool_call.clone());
@@ -3429,6 +3609,11 @@ impl AgentRuntime {
                         "Rule proposal requires your explicit live approval.".to_string(),
                         "Rule proposal approved.".to_string(),
                     )
+                } else if is_routing_policy_propose {
+                    (
+                        "Routing policy proposal requires your explicit live approval.".to_string(),
+                        "Routing policy proposal approved.".to_string(),
+                    )
                 } else {
                     (
                         format!(
@@ -3448,7 +3633,7 @@ impl AgentRuntime {
                         session_id,
                         turn_id,
                         synthetic,
-                        is_admin_role_creation || is_rule_propose,
+                        is_admin_role_creation || is_rule_propose || is_routing_policy_propose,
                     )
                     .await;
             }
@@ -3458,22 +3643,28 @@ impl AgentRuntime {
             // re-enter the model without dispatching the tool again. This prevents
             // spin loops where the model calls an idempotent tool (e.g. role.create_or_update)
             // repeatedly after it already succeeded.
-            let canonical_args =
-                serde_json::to_string(&tool_call.arguments).unwrap_or_default();
-            let (already_succeeded, dedup_chat_id, dedup_reply_to, dedup_reply_role,
-                 dedup_reply_guest_id) = {
+            let canonical_args = serde_json::to_string(&tool_call.arguments).unwrap_or_default();
+            let (
+                already_succeeded,
+                dedup_chat_id,
+                dedup_reply_to,
+                dedup_reply_role,
+                dedup_reply_guest_id,
+            ) = {
                 let state = self.sessions.get(&session_id);
                 let prev_success = state
                     .and_then(|s| s.active_turn.as_ref())
                     .map(|turn| {
-                        turn.working_tool_history.iter().any(|(prev_call, prev_result)| {
-                            prev_call.tool_name == tool_call.tool_name
-                                && serde_json::to_string(&prev_call.arguments)
-                                    .unwrap_or_default()
-                                    == canonical_args
-                                && !prev_result.content.to_lowercase().contains("error")
-                                && !prev_result.content.to_lowercase().contains("failed")
-                        })
+                        turn.working_tool_history
+                            .iter()
+                            .any(|(prev_call, prev_result)| {
+                                prev_call.tool_name == tool_call.tool_name
+                                    && serde_json::to_string(&prev_call.arguments)
+                                        .unwrap_or_default()
+                                        == canonical_args
+                                    && !prev_result.content.to_lowercase().contains("error")
+                                    && !prev_result.content.to_lowercase().contains("failed")
+                            })
                     })
                     .unwrap_or(false);
                 let (chat_id, reply_to, reply_role, reply_guest) = state
@@ -4011,13 +4202,15 @@ impl AgentRuntime {
         &mut self,
         session_id: String,
         turn_id: String,
-        note: String,
+        note: Option<String>,
     ) -> Result<()> {
         let retry_plan = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 return Ok(());
             };
-            state.set_provider_repair_note(note);
+            if let Some(n) = note {
+                state.set_provider_repair_note(n);
+            }
             state.increment_provider_repair_attempts();
 
             match state.build_reentry_context_envelope() {
@@ -4150,10 +4343,20 @@ impl AgentRuntime {
             .get(&session_id)
             .and_then(|s| s.role_activation.as_ref())
             .map(|ra| ra.role_name.clone());
+        // Prefer configured_roles (set via ConfigureRole tool calls); fall back to the
+        // turn_loop_config embedded in the active role_activation (set at session load
+        // from the DB record via fetch_role_activation).
         let configured_tiers: Vec<String> = active_role_name
             .as_deref()
             .and_then(|rn| self.configured_roles.get(rn))
             .map(|c| c.turn_loop_config.fallback_tiers.clone())
+            .or_else(|| {
+                self.sessions
+                    .get(&session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .and_then(|ra| ra.turn_loop_config.as_ref())
+                    .map(|tlc| tlc.fallback_tiers.clone())
+            })
             .unwrap_or_default();
 
         // Check tier boundaries before any mutable borrow.
@@ -4465,6 +4668,112 @@ impl AgentRuntime {
             turn_id,
             chat_id,
             content,
+            audio_artifact: None,
+            send_text_caption: false,
+            reply_markup: None,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: final_reply_to,
+                target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
+                task_json: serde_json::to_string(&payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Handles a `context.capture` tool call arriving from membrane-mcp.
+    ///
+    /// Bypasses the LLM: parses the capture payload, stores it in Muninn, and
+    /// emits a `send_reply` back to the mcp-membrane so the HTTP caller gets a
+    /// response.
+    async fn handle_context_capture(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        use memory_core::MemoryEngine as _;
+
+        // Content is JSON: {"tool": "context.capture", "args": {...}}
+        let args: serde_json::Value = task
+            .content
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.get("args").cloned())
+            .unwrap_or_default();
+
+        let capture_text = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let category = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("note")
+            .to_string();
+
+        let mut tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tags.push("perplexity".to_string());
+        if !tags.contains(&category) {
+            tags.push(category.clone());
+        }
+
+        let first_line: String = capture_text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(50)
+            .collect();
+        let concept = format!("perplexity.{}: {}", category, first_line);
+
+        let result_text = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
+            None => "Captured (Muninn not configured on this node).".to_string(),
+            Some(engine) => {
+                match engine
+                    .remember(MemoryScope::SelfOnly, &concept, &capture_text, tags)
+                    .await
+                {
+                    Ok(engram_ref) => format!("Captured to memory (id: {}).", engram_ref.id),
+                    Err(e) => format!("context.capture: memory error — {e}"),
+                }
+            }
+        };
+
+        info!(turn_id = ?task.turn_id, result = %result_text, "context.capture handled");
+
+        let final_reply_to = task
+            .final_reply_to
+            .clone()
+            .unwrap_or_else(|| local_node_id());
+        let final_reply_role = task
+            .final_reply_role
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REPLY_ROLE.to_string());
+        let final_reply_guest_id = task.final_reply_guest_id.clone();
+        let session_id = task.session_id_or_default(&self.agent_id);
+        let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
+        let chat_id = task.chat_id.clone().unwrap_or_default();
+
+        let payload = FinalReplyPayload {
+            action: "send_reply",
+            session_id,
+            turn_id,
+            chat_id,
+            content: result_text,
             audio_artifact: None,
             send_text_caption: false,
             reply_markup: None,
@@ -4817,10 +5126,15 @@ impl AgentRuntime {
             })
             .await?;
 
+        let voice_role_fallback = policy
+            .provider
+            .as_deref()
+            .map(implementation_to_model_role)
+            .unwrap_or_else(|| DEFAULT_VOICE_MODEL_ROLE.into());
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
             "voice.synthesize",
-            DEFAULT_VOICE_MODEL_ROLE,
+            &voice_role_fallback,
         );
 
         info!(
@@ -6034,7 +6348,7 @@ impl AgentRuntime {
         };
 
         let task_json = serde_json::to_string(&serde_json::json!({
-            "action": "streaming_token",
+            "action": "partial_reply",
             "session_id": session_id,
             "turn_id": turn_id,
             "chat_id": chat_id,
@@ -6083,7 +6397,10 @@ impl AgentRuntime {
             .iter()
             .filter_map(|node| {
                 let label = node.get("label").and_then(|v| v.as_str())?;
-                let props = node.get("properties").cloned().unwrap_or(serde_json::json!({}));
+                let props = node
+                    .get("properties")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 Some(format!("{label}: {props}"))
             })
             .collect::<Vec<_>>()
@@ -6943,7 +7260,9 @@ impl AgentRuntime {
                                 format!("Switched to {p} voice, using stored ID {stored}.")
                             }
                             (None, None) => {
-                                format!("Switched to {p} voice. No voice ID stored for {p} — use `/voice {p} <id>` to set one.")
+                                format!(
+                                    "Switched to {p} voice. No voice ID stored for {p} — use `/voice {p} <id>` to set one."
+                                )
                             }
                         }
                     }
@@ -8769,8 +9088,10 @@ impl AgentRuntime {
                                 roles.len()
                             )];
                             for role in &roles {
-                                let name =
-                                    role.get("role_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                let name = role
+                                    .get("role_name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
                                 let profile = role
                                     .get("toolset_profile")
                                     .and_then(|v| v.as_str())
@@ -8826,8 +9147,8 @@ impl AgentRuntime {
             }
 
             "training.list" => {
-                use philotic_client::IpcRequest;
                 use ansible_mesh_core::whisper_training::TrainingFilter;
+                use philotic_client::IpcRequest;
                 let args = payload.arguments.as_object();
                 let limit = args
                     .and_then(|a| a.get("limit"))
@@ -8857,7 +9178,11 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
                         let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
                         let samples = data
                             .get("samples")
@@ -8865,27 +9190,54 @@ impl AgentRuntime {
                             .cloned()
                             .unwrap_or_default();
                         if samples.is_empty() {
-                            (format!("No training samples found (filter: {filter_str})."), None)
-                        } else {
-                            let lines: Vec<String> = std::iter::once(
-                                format!("{count} training sample(s) (filter: {filter_str}):")
+                            (
+                                format!("No training samples found (filter: {filter_str})."),
+                                None,
                             )
+                        } else {
+                            let lines: Vec<String> = std::iter::once(format!(
+                                "{count} training sample(s) (filter: {filter_str}):"
+                            ))
                             .chain(samples.iter().map(|s| {
-                                let sid = s.get("sample_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let sid =
+                                    s.get("sample_id").and_then(|v| v.as_str()).unwrap_or("?");
                                 let turn = s.get("turn_id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let raw = s.get("raw_transcript").and_then(|v| v.as_str()).unwrap_or("");
-                                let corrected = s.get("corrected_transcript").and_then(|v| v.as_str());
-                                let eligible = s.get("training_eligible").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let exported = s.get("exported_at").and_then(|v| v.as_u64()).is_some();
-                                let state = if exported { "exported" } else if eligible { "eligible" } else if corrected.is_some() { "corrected" } else { "uncorrected" };
+                                let raw = s
+                                    .get("raw_transcript")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let corrected =
+                                    s.get("corrected_transcript").and_then(|v| v.as_str());
+                                let eligible = s
+                                    .get("training_eligible")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let exported =
+                                    s.get("exported_at").and_then(|v| v.as_u64()).is_some();
+                                let state = if exported {
+                                    "exported"
+                                } else if eligible {
+                                    "eligible"
+                                } else if corrected.is_some() {
+                                    "corrected"
+                                } else {
+                                    "uncorrected"
+                                };
                                 let transcript = corrected.unwrap_or(raw);
-                                format!("  [{state}] {sid}  turn={turn}  transcript={transcript:.80}")
+                                format!(
+                                    "  [{state}] {sid}  turn={turn}  transcript={transcript:.80}"
+                                )
                             }))
                             .collect();
                             (lines.join("\n"), None)
                         }
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -8926,27 +9278,29 @@ impl AgentRuntime {
                     .and_then(|a| a.get("corrected_transcript"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                let (Some(turn_id), Some(corrected_transcript)) = (turn_id, corrected_transcript) else {
+                let (Some(turn_id), Some(corrected_transcript)) = (turn_id, corrected_transcript)
+                else {
                     let err = TaskErrorPayload::ipc_failure(
                         "philote",
                         "MISSING_ARGS",
                         "training.correct requires 'turn_id' and 'corrected_transcript'",
                     );
-                    return self.handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        source: Some("agent".into()),
-                        session_id: Some(payload.session_id),
-                        turn_id: Some(payload.turn_id),
-                        chat_id: Some(payload.chat_id),
-                        content: Some(err.display_message()),
-                        error: Some(err),
-                        tool_name: Some(payload.tool_name),
-                        final_reply_to: Some(payload.final_reply_to),
-                        final_reply_role: Some(payload.final_reply_role),
-                        final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await;
+                    return self
+                        .handle_tool_result(InboundTaskPayload {
+                            action: Some("tool_result".into()),
+                            source: Some("agent".into()),
+                            session_id: Some(payload.session_id),
+                            turn_id: Some(payload.turn_id),
+                            chat_id: Some(payload.chat_id),
+                            content: Some(err.display_message()),
+                            error: Some(err),
+                            tool_name: Some(payload.tool_name),
+                            final_reply_to: Some(payload.final_reply_to),
+                            final_reply_role: Some(payload.final_reply_role),
+                            final_reply_guest_id: payload.final_reply_guest_id,
+                            ..Default::default()
+                        })
+                        .await;
                 };
                 let (content, tool_err) = match self
                     .ipc_client
@@ -8956,10 +9310,18 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        (format!("Correction applied to turn '{turn_id}'. Sample marked training_eligible."), None)
-                    }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => (
+                        format!(
+                            "Correction applied to turn '{turn_id}'. Sample marked training_eligible."
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -8990,8 +9352,8 @@ impl AgentRuntime {
             }
 
             "training.export" => {
-                use philotic_client::IpcRequest;
                 use ansible_mesh_core::whisper_training::TrainingExportFormat;
+                use philotic_client::IpcRequest;
                 let args = payload.arguments.as_object();
                 let format_str = args
                     .and_then(|a| a.get("format"))
@@ -9011,21 +9373,22 @@ impl AgentRuntime {
                         "MISSING_ARGS",
                         "training.export requires 'format' and 'output_path'",
                     );
-                    return self.handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        source: Some("agent".into()),
-                        session_id: Some(payload.session_id),
-                        turn_id: Some(payload.turn_id),
-                        chat_id: Some(payload.chat_id),
-                        content: Some(err.display_message()),
-                        error: Some(err),
-                        tool_name: Some(payload.tool_name),
-                        final_reply_to: Some(payload.final_reply_to),
-                        final_reply_role: Some(payload.final_reply_role),
-                        final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await;
+                    return self
+                        .handle_tool_result(InboundTaskPayload {
+                            action: Some("tool_result".into()),
+                            source: Some("agent".into()),
+                            session_id: Some(payload.session_id),
+                            turn_id: Some(payload.turn_id),
+                            chat_id: Some(payload.chat_id),
+                            content: Some(err.display_message()),
+                            error: Some(err),
+                            tool_name: Some(payload.tool_name),
+                            final_reply_to: Some(payload.final_reply_to),
+                            final_reply_role: Some(payload.final_reply_role),
+                            final_reply_guest_id: payload.final_reply_guest_id,
+                            ..Default::default()
+                        })
+                        .await;
                 };
                 let format = if format_str == "nemo" {
                     TrainingExportFormat::Nemo
@@ -9047,9 +9410,19 @@ impl AgentRuntime {
                             .and_then(|d| d.get("exported_count"))
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        (format!("Exported {count} sample(s) ({format_str} format) → {output_path}"), None)
+                        (
+                            format!(
+                                "Exported {count} sample(s) ({format_str} format) → {output_path}"
+                            ),
+                            None,
+                        )
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9093,10 +9466,17 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
                         let status = data.get("status").cloned().unwrap_or_default();
                         let total = status.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let uncorrected = status.get("uncorrected").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let uncorrected = status
+                            .get("uncorrected")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         let eligible = status.get("eligible").and_then(|v| v.as_u64()).unwrap_or(0);
                         let exported = status.get("exported").and_then(|v| v.as_u64()).unwrap_or(0);
                         let content = format!(
@@ -9104,7 +9484,12 @@ impl AgentRuntime {
                         );
                         (content, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9158,7 +9543,11 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
                         let msg = data
                             .get("message")
                             .and_then(|v| v.as_str())
@@ -9166,7 +9555,12 @@ impl AgentRuntime {
                             .to_string();
                         (msg, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9203,18 +9597,36 @@ impl AgentRuntime {
                     .send_request(IpcRequest::AsrStatus {})
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, data: Some(data), .. }) => {
-                        let registered = data.get("registered").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let active = data.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let registered = data
+                            .get("registered")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let active = data
+                            .get("active")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let pid = data.get("pid").and_then(|v| v.as_str()).unwrap_or("none");
-                        let nemo = data.get("nemo_available").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let nemo = data
+                            .get("nemo_available")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let guest_id = data.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?");
                         let content = format!(
                             "Parakeet ASR status:\n  guest: {guest_id}\n  registered: {registered}\n  active: {active}\n  pid: {pid}\n  nemo_available: {nemo}"
                         );
                         (content, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -9223,6 +9635,365 @@ impl AgentRuntime {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
                             format!("asr.status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "cron.list" => {
+                use philotic_client::IpcRequest;
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ListCronJobs)
+                    .await
+                {
+                    Ok(IpcResponse::CronJobList { jobs }) => {
+                        if jobs.is_empty() {
+                            ("No cron jobs registered on this hotel.".into(), None)
+                        } else {
+                            let lines: Vec<String> = jobs
+                                .iter()
+                                .map(|j| {
+                                    format!(
+                                        "- id={} role={} schedule={} enabled={} next_fire={}",
+                                        j.id, j.target_role, j.schedule, j.enabled, j.next_fire_at,
+                                    )
+                                })
+                                .collect();
+                            (
+                                format!("Cron jobs ({}):\n{}", jobs.len(), lines.join("\n")),
+                                None,
+                            )
+                        }
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("cron.list: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("cron.list: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "cron.register" => {
+                use ansible_mesh_core::cron::{CronJob, CronJobSource};
+                use philotic_client::IpcRequest;
+                let args = &payload.arguments;
+                let schedule = match args.get("schedule").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "cron.register: missing required argument 'schedule'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let target_role = match args.get("target_role").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "cron.register: missing required argument 'target_role'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let payload_str = match args.get("payload").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "cron.register: missing required argument 'payload'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let guaranteed = args
+                    .get("guaranteed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let next_fire = match ansible_mesh_core::cron::next_fire_after(&schedule, now_ms) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                format!("cron.register: invalid schedule — {e}"),
+                            )
+                            .await;
+                    }
+                };
+
+                let job = CronJob {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    schedule,
+                    target_role,
+                    target_node_id: None,
+                    payload: payload_str,
+                    guaranteed,
+                    enabled: true,
+                    last_fired_epoch: None,
+                    next_fire_at: next_fire,
+                    created_at: now_ms,
+                    created_by: CronJobSource::Guest(self.agent_id.clone()),
+                };
+                let job_id = job.id.clone();
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RegisterCronJob { job })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        (format!("Cron job registered. id={job_id}"), None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("cron.register: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("cron.register: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "cron.enable" => {
+                use philotic_client::IpcRequest;
+                let job_id = match payload.arguments.get("job_id").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "cron.enable: missing required argument 'job_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::EnableCronJob {
+                        job_id: job_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        (format!("Cron job {job_id} enabled."), None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("cron.enable: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("cron.enable: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "cron.disable" => {
+                use philotic_client::IpcRequest;
+                let job_id = match payload.arguments.get("job_id").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "cron.disable: missing required argument 'job_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::DisableCronJob {
+                        job_id: job_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        (format!("Cron job {job_id} disabled."), None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("cron.disable: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("cron.disable: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "cron.remove" => {
+                use philotic_client::IpcRequest;
+                let job_id = match payload.arguments.get("job_id").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "cron.remove: missing required argument 'job_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RemoveCronJob {
+                        job_id: job_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        (format!("Cron job {job_id} removed."), None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("cron.remove: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("cron.remove: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }
@@ -10428,7 +11199,8 @@ impl AgentRuntime {
                         .fail_active_turn(
                             session_id,
                             turn_id,
-                            "approval.request_standing: missing required argument 'tool_name'".into(),
+                            "approval.request_standing: missing required argument 'tool_name'"
+                                .into(),
                         )
                         .await;
                 }
@@ -10518,17 +11290,24 @@ impl AgentRuntime {
 
                 let preapproval_rules: Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule> =
                     args.get("preapproval_rules")
-                        .and_then(|v| serde_json::from_value::<Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule>>(v.clone()).ok())
+                        .and_then(|v| {
+                            serde_json::from_value::<
+                                Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule>,
+                            >(v.clone())
+                            .ok()
+                        })
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|mut rule: ansible_mesh_core::mcp_endpoint::McpPreapprovalRule| {
-                            rule.approved_by_turn = turn_id.clone();
-                            rule.approved_at = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            rule
-                        })
+                        .map(
+                            |mut rule: ansible_mesh_core::mcp_endpoint::McpPreapprovalRule| {
+                                rule.approved_by_turn = turn_id.clone();
+                                rule.approved_at = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                rule
+                            },
+                        )
                         .collect();
 
                 let updated_at = std::time::SystemTime::now()
@@ -10573,15 +11352,21 @@ impl AgentRuntime {
                             None,
                         )
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", &*code, message,
-                        );
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
                         let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", "IPC_ERROR", msg,
+                            "aiua",
+                            "IPC_ERROR",
+                            msg,
                         );
                         (e.display_message(), Some(e))
                     }
@@ -10662,19 +11447,30 @@ impl AgentRuntime {
                     .await;
 
                 let (content, tool_err) = match response {
-                    Ok(IpcResponse::McpEndpointProvisioned { endpoint_id: ref eid, .. }) => (
-                        format!("MCP endpoint '{eid}' revoked. The membrane-mcp guest has been signalled to shut down."),
+                    Ok(IpcResponse::McpEndpointProvisioned {
+                        endpoint_id: ref eid,
+                        ..
+                    }) => (
+                        format!(
+                            "MCP endpoint '{eid}' revoked. The membrane-mcp guest has been signalled to shut down."
+                        ),
                         None,
                     ),
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", &*code, message,
-                        );
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
                         let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua", "IPC_ERROR", msg,
+                            "aiua",
+                            "IPC_ERROR",
+                            msg,
                         );
                         (e.display_message(), Some(e))
                     }
@@ -10715,6 +11511,598 @@ impl AgentRuntime {
                     raw_transport_event: None,
                     error: tool_err,
                     tool_name: Some("mcp.revoke".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── table.add_listener ───────────────────────────────────────────
+            "table.add_listener" => {
+                let args = payload.arguments.as_object();
+
+                let event_kind = match args
+                    .and_then(|a| a.get("event_kind"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "table.add_listener: missing required argument 'event_kind'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let table_name = match args
+                    .and_then(|a| a.get("table_name"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "table.add_listener: missing required argument 'table_name'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let schema_map = args
+                    .and_then(|a| a.get("schema_map"))
+                    .and_then(|v| v.as_object())
+                    .cloned();
+                let filter_keys = args
+                    .and_then(|a| a.get("filter_keys"))
+                    .and_then(|v| v.as_object())
+                    .cloned();
+                let adapter_script = args
+                    .and_then(|a| a.get("adapter_script"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let target_role = args
+                    .and_then(|a| a.get("target_role"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("table-datasource")
+                    .to_string();
+
+                // Read current listener config.
+                let mut config: serde_json::Value = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetConfig {
+                        key: "router_listener.config".into(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::ConfigData {
+                        value_json: Some(raw),
+                        ..
+                    }) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({
+                        "filter_keys": {},
+                        "event_kinds": {}
+                    })),
+                    _ => serde_json::json!({ "filter_keys": {}, "event_kinds": {} }),
+                };
+
+                // Merge filter_keys if provided.
+                if let Some(fk) = filter_keys {
+                    if let Some(obj) = config
+                        .get_mut("filter_keys")
+                        .and_then(|v| v.as_object_mut())
+                    {
+                        obj.extend(fk);
+                    }
+                }
+
+                // Ensure event_kinds map exists.
+                if config.get("event_kinds").is_none() {
+                    config["event_kinds"] = serde_json::json!({});
+                }
+
+                // Build and insert the event handler.
+                let mut handler = serde_json::json!({
+                    "mode": "table_insert",
+                    "table_name": table_name,
+                    "target_role": target_role,
+                });
+                if let Some(sm) = schema_map {
+                    handler["schema_map"] = serde_json::Value::Object(sm);
+                }
+                if let Some(script) = adapter_script {
+                    handler["adapter_script"] = serde_json::Value::String(script);
+                }
+
+                if let Some(kinds) = config
+                    .get_mut("event_kinds")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    kinds.insert(event_kind.clone(), handler);
+                }
+
+                // Write back.
+                let (content_str, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::SetConfig {
+                        key: "router_listener.config".into(),
+                        value_json: config.to_string(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => (
+                        format!(
+                            "Listener registered: event_kind='{event_kind}' → table='{table_name}'. \
+                             The router-listener applies this on its next reconnect. \
+                             Next: call graph.query to CREATE a (TableConfig {{id:'table_config:{table_name}', \
+                             name:'{table_name}'}}) node in your partition so this table appears in \
+                             your cognitive envelope on future sessions."
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("table.add_listener: unexpected hotel response".into(), None),
+                    Err(e) => {
+                        let err = philotic_client::TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("table.add_listener: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content_str),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.policy.propose ───────────────────────────────────────
+            "routing.policy.propose" => {
+                let args = payload.arguments.as_object();
+                let problem = args
+                    .and_then(|a| a.get("problem"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let proposed_change = args
+                    .and_then(|a| a.get("proposed_change"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let evidence = args
+                    .and_then(|a| a.get("evidence"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let affected_stage = args
+                    .and_then(|a| a.get("affected_stage"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let affected_capability = args
+                    .and_then(|a| a.get("affected_capability"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let learned_reflex_preference_key = args
+                    .and_then(|a| a.get("learned_reflex_preference_key"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                if problem.is_empty() || proposed_change.is_empty() {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "routing.policy.propose: 'problem' and 'proposed_change' are required."
+                                .into(),
+                        )
+                        .await;
+                }
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                        agent_id: self.agent_id.clone(),
+                        problem: problem.clone(),
+                        proposed_change,
+                        evidence,
+                        affected_stage,
+                        affected_capability,
+                        learned_reflex_preference_key,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RoutingPolicyRecorded { proposal_id }) => {
+                        format!(
+                            "Routing policy proposal recorded (id: {proposal_id}). \
+                             An operator will review and approve or reject the proposed change."
+                        )
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
+                        format!("routing.policy.propose: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.policy.propose: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.policy.propose: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.policy.propose".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.reflex.set ───────────────────────────────────────────
+            "routing.reflex.set" => {
+                let args = payload.arguments.as_object();
+                let preference_key = args
+                    .and_then(|a| a.get("preference_key"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("generation_capability_preference")
+                    .to_string();
+                let reflexes_json = args
+                    .and_then(|a| a.get("reflexes"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let reason = args
+                    .and_then(|a| a.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::UpsertAgentReflexPreference {
+                        agent_id: self.agent_id.clone(),
+                        preference_key: preference_key.clone(),
+                        precedence: 70,
+                        reflexes_json,
+                        config_json: serde_json::json!({ "reason": reason }),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        format!("Routing reflex '{preference_key}' stored. Takes effect on the next turn.")
+                    }
+                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                        format!("routing.reflex.set: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.reflex.set: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.reflex.set: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.reflex.set".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.reflex.get ───────────────────────────────────────────
+            "routing.reflex.get" => {
+                let args = payload.arguments.as_object();
+                let filter_key = args
+                    .and_then(|a| a.get("preference_key"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetAgentReflexPreferences {
+                        agent_id: self.agent_id.clone(),
+                        preference_key: filter_key,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::AgentReflexPreferences { rows }) => {
+                        serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+                    }
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(_) => "routing.reflex.get: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.reflex.get: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.reflex.get".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.pipeline.set ────────────────────────────────────────
+            "routing.pipeline.set" => {
+                let args = payload.arguments.as_object();
+                let rule_id = args
+                    .and_then(|a| a.get("rule_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string();
+                let rule_json = payload.arguments.clone();
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                        agent_id: self.agent_id.clone(),
+                        rule_id: rule_id.clone(),
+                        rule_json,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        format!("Pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn.")
+                    }
+                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                        format!("routing.pipeline.set: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.pipeline.set: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.pipeline.set: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.pipeline.set".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.pipeline.remove ──────────────────────────────────────
+            "routing.pipeline.remove" => {
+                let args = payload.arguments.as_object();
+                let rule_id = args
+                    .and_then(|a| a.get("rule_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RemoveRoutingPipelineRule {
+                        agent_id: self.agent_id.clone(),
+                        rule_id: rule_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                        format!("routing.pipeline.remove: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.pipeline.remove: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.pipeline.remove: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.pipeline.remove".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.pipeline.get ─────────────────────────────────────────
+            "routing.pipeline.get" => {
+                let args = payload.arguments.as_object();
+                let filter_id = args
+                    .and_then(|a| a.get("rule_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetRoutingPipelineRules {
+                        agent_id: self.agent_id.clone(),
+                        rule_id: filter_id,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RoutingPipelineRules { pipeline_rules }) => {
+                        serde_json::to_string_pretty(&pipeline_rules).unwrap_or_else(|_| "[]".into())
+                    }
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(_) => "routing.pipeline.get: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.pipeline.get: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.pipeline.get".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── desktop.observe ──────────────────────────────────────────────
+            "desktop.observe" => {
+                // Observe-only: returns desktop runner metadata. No screenshot or interaction.
+                // A real desktop guest is not required — this tool describes what would be observed.
+                let result_text = serde_json::json!({
+                    "status": "no_desktop_guest",
+                    "message": "No desktop guest is currently materialised on this hotel. \
+                                Desktop observation requires a desktop runner guest to be active.",
+                    "tool": "desktop.observe",
+                })
+                .to_string();
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("desktop.observe".into()),
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
@@ -11212,6 +12600,20 @@ mod tests {
             super::implementation_to_model_role("elevenlabs-v1"),
             "model.elevenlabs"
         );
+        assert_eq!(super::implementation_to_model_role("ollama"), "model.ollama");
+        assert_eq!(
+            super::implementation_to_model_role("ollama-llama3"),
+            "model.ollama"
+        );
+        assert_eq!(super::implementation_to_model_role("mlx"), "model.mlx");
+        assert_eq!(
+            super::implementation_to_model_role("mlx-community/llama"),
+            "model.mlx"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("onnx"),
+            "model.local"
+        );
     }
 
     #[test]
@@ -11250,6 +12652,7 @@ mod tests {
                     execution_mode: "capability".into(),
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
+                    target_capability: None,
                 },
             )]),
         };
@@ -11298,6 +12701,39 @@ mod tests {
         assert_eq!(route.hotel_id.as_deref(), Some("default"));
         assert_eq!(state.bindings.effective_toolset, vec!["echo"]);
         assert_eq!(state.bindings.effective_skillset, vec!["planning"]);
+    }
+
+    #[test]
+    fn resolve_dispatch_defaults_to_generate_text() {
+        let (action, cap) = super::resolve_dispatch(None, "text.generate");
+        assert_eq!(action, "generate_text");
+        assert_eq!(cap, "text.generate");
+    }
+
+    #[test]
+    fn resolve_dispatch_promotes_to_response_generate_when_reflex_set() {
+        let mut state =
+            SessionState::new("sess-reflex".into(), "agent-01".into(), "telegram".into());
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: "local".into(),
+                    target_role: "model".into(),
+                    incarnation_id: None,
+                    hotel_id: None,
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: None,
+                    target_capability: Some("response.generate".into()),
+                },
+            )]),
+        };
+
+        let (action, cap) = super::resolve_dispatch(Some(&state), "text.generate");
+        assert_eq!(action, "response.generate");
+        assert_eq!(cap, "response.generate");
     }
 
     #[test]
@@ -11467,6 +12903,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));

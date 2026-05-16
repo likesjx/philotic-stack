@@ -63,8 +63,7 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
         },
         CommandManifestEntry {
             command: "voice".into(),
-            description: "Switch voice provider (and optionally voice ID) for this session."
-                .into(),
+            description: "Switch voice provider (and optionally voice ID) for this session.".into(),
             usage_hint: Some("/voice [kokoro|elevenlabs|openai] [voice_id]".into()),
         },
         CommandManifestEntry {
@@ -79,8 +78,8 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
         },
         CommandManifestEntry {
             command: "correct".into(),
-            description: "Submit a correction for the most recent transcription (Whisper flywheel)."
-                .into(),
+            description:
+                "Submit a correction for the most recent transcription (Whisper flywheel).".into(),
             usage_hint: Some("/correct <turn_id> <corrected text>".into()),
         },
     ]
@@ -93,25 +92,45 @@ pub enum SlashCommand {
     Context,
     Pause,
     Resume,
-    Role { role_name: String },
+    Role {
+        role_name: String,
+    },
     Roles,
     Back,
-    ToolsAdd { tool: String },
+    ToolsAdd {
+        tool: String,
+    },
     ToolsClear,
-    SkillsAdd { skill: String },
+    SkillsAdd {
+        skill: String,
+    },
     SkillsClear,
-    WorkspaceSet { workspace: String },
+    WorkspaceSet {
+        workspace: String,
+    },
     WorkspaceClear,
-    Approve { note: Option<String> },
-    Deny { note: Option<String> },
-    Abandon { reason: Option<String> },
+    Approve {
+        note: Option<String>,
+    },
+    Deny {
+        note: Option<String>,
+    },
+    Abandon {
+        reason: Option<String>,
+    },
     PreapproveThisSession,
-    Preapprove { name: String },
+    Preapprove {
+        name: String,
+    },
     ApprovalStatus,
     ApprovalReset,
     /// Explicitly cancel a parked approval turn, unblocking the session and notifying the original chat.
-    ApprovalClear { reason: Option<String> },
-    Tts { mode: Option<String> },
+    ApprovalClear {
+        reason: Option<String>,
+    },
+    Tts {
+        mode: Option<String>,
+    },
     /// Switch voice provider (and optionally voice ID) for this session.
     Voice {
         provider: Option<String>,
@@ -366,6 +385,38 @@ mod tests {
             parse_slash_command("/abandon could not complete the task"),
             Some(SlashCommand::Abandon {
                 reason: Some("could not complete the task".into())
+            })
+        );
+    }
+
+    #[test]
+    fn parses_voice_command() {
+        assert_eq!(
+            parse_slash_command("/voice local"),
+            Some(SlashCommand::Voice {
+                provider: Some("onnx".into()),
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice elevenlabs"),
+            Some(SlashCommand::Voice {
+                provider: Some("elevenlabs".into()),
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice"),
+            Some(SlashCommand::Voice {
+                provider: None,
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice kokoro af_heart"),
+            Some(SlashCommand::Voice {
+                provider: Some("onnx".into()),
+                voice_id: Some("af_heart".into()),
             })
         );
     }

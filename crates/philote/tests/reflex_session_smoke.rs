@@ -8,7 +8,7 @@
 ///
 /// These tests operate entirely in-process against `SessionState` — no hotel or
 /// IPC socket required.
-use agent_core::reflex::{IngressAction, MembraneBind, MaterializationContext, ReflexEvent};
+use agent_core::reflex::{IngressAction, MaterializationContext, MembraneBind, ReflexEvent};
 use agent_core::session::{SessionState, TtsMode};
 
 fn discord_voice_context() -> MaterializationContext {
@@ -23,7 +23,11 @@ fn discord_voice_context() -> MaterializationContext {
 }
 
 fn fresh_session() -> SessionState {
-    SessionState::new("sess-reflex-smoke".into(), "agent-jane-01".into(), "discord_voice".into())
+    SessionState::new(
+        "sess-reflex-smoke".into(),
+        "agent-jane-01".into(),
+        "discord_voice".into(),
+    )
 }
 
 // ── Scenario 3a: fresh session materialization ────────────────────────────────
@@ -39,7 +43,11 @@ fn fresh_materialization_sets_voice_action_and_tts_mode() {
     state.apply_reflex_materialization();
 
     assert_eq!(
-        state.agent_profile.media_routing_policy.voice_action.as_deref(),
+        state
+            .agent_profile
+            .media_routing_policy
+            .voice_action
+            .as_deref(),
         Some("transcribe"),
         "discord_voice membrane must assert voice_action=transcribe"
     );
@@ -76,7 +84,11 @@ fn checkpoint_restore_reapplies_reflex_correctly() {
     restored.apply_reflex_materialization();
 
     assert_eq!(
-        restored.agent_profile.media_routing_policy.voice_action.as_deref(),
+        restored
+            .agent_profile
+            .media_routing_policy
+            .voice_action
+            .as_deref(),
         Some("transcribe"),
         "checkpoint-restored session must re-assert voice_action=transcribe"
     );
@@ -100,7 +112,11 @@ fn voice_dialogue_ingress_asserts_transcribe() {
     state.apply_reflex_ingress(IngressAction::VoiceDialogue);
 
     assert_eq!(
-        state.agent_profile.media_routing_policy.voice_action.as_deref(),
+        state
+            .agent_profile
+            .media_routing_policy
+            .voice_action
+            .as_deref(),
         Some("transcribe"),
         "voice.dialogue ingress must assert voice_action=transcribe regardless of binding"
     );
@@ -114,8 +130,7 @@ fn text_message_ingress_does_not_alter_voice_policy() {
     state.apply_reflex_ingress(IngressAction::TextMessage);
 
     assert_eq!(
-        state.agent_profile.media_routing_policy.voice_action,
-        None,
+        state.agent_profile.media_routing_policy.voice_action, None,
         "text message ingress must leave voice_action unset"
     );
 }
@@ -175,7 +190,11 @@ fn materialization_and_ingress_compose_without_conflict() {
     state.apply_reflex_ingress(IngressAction::VoiceDialogue);
 
     assert_eq!(
-        state.agent_profile.media_routing_policy.voice_action.as_deref(),
+        state
+            .agent_profile
+            .media_routing_policy
+            .voice_action
+            .as_deref(),
         Some("transcribe")
     );
     assert_eq!(

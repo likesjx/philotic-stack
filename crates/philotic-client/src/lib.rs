@@ -1023,6 +1023,29 @@ pub enum IpcRequest {
         reflexes_json: serde_json::Value,
         config_json: serde_json::Value,
     },
+    GetAgentReflexPreferences {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preference_key: Option<String>,
+    },
+    /// Declare or replace a routing pipeline rule for this agent.
+    /// The `rule_id` is the stable key; set with the same rule_id to update.
+    UpsertRoutingPipelineRule {
+        agent_id: String,
+        rule_id: String,
+        rule_json: serde_json::Value,
+    },
+    /// Remove a routing pipeline rule by rule_id.
+    RemoveRoutingPipelineRule {
+        agent_id: String,
+        rule_id: String,
+    },
+    /// Retrieve routing pipeline rules for this agent.
+    GetRoutingPipelineRules {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+    },
     /// Record one successful same-self role handoff observation and let the hotel
     /// fold it into agent-owned reflex posture without making philote read/modify/write
     /// the agent graph directly.
@@ -1169,15 +1192,26 @@ pub enum IpcRequest {
     /// Push an updated route set for one agent to the membrane.
     ///
     /// The membrane replaces all routes owned by `agent_id` with `routes` (LWW).
+    /// The hotel persists the route set and replays it to membrane-mcp on restart.
     /// Responds with [`IpcResponse::McpRoutesAccepted`].
     UpdateMcpRoutes {
         agent_id: String,
         routes: Vec<ansible_mesh_core::mcp_route::McpRouteRecord>,
+        /// Optional vault ref for the bearer token protecting these routes.
+        /// Stored alongside routes so provisioning survives hotel restarts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vault_ref: Option<String>,
     },
     /// Remove all routes owned by an agent from the membrane.
     RevokeMcpRoutes {
         agent_id: String,
     },
+    /// Fetch all persisted MCP route sets from the hotel's context graph.
+    ///
+    /// Returns routes that survived hotel restarts. Membrane-mcp calls this
+    /// during `setup()` to replay provisioned routes without re-provisioning.
+    /// Responds with [`IpcResponse::McpRouteState`].
+    GetMcpRoutes {},
     /// Declare or update a full MCP endpoint configuration.
     ///
     /// The hotel stores the config, fans out an `update_mcp_config` push to
@@ -1539,6 +1573,20 @@ pub enum IpcResponse {
     /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
     /// This prevents this variant from swallowing `MemoryConfig` responses.
     UserProfileData(UserProfileDataPayload),
+    /// Response to [`IpcRequest::GetAgentReflexPreferences`].
+    AgentReflexPreferences {
+        rows: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::GetRoutingPipelineRules`].
+    /// Uses `pipeline_rules` (not `rules`) to distinguish from [`RuleList`] in untagged serde.
+    RoutingPipelineRules {
+        pipeline_rules: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::GetMcpRoutes`].
+    /// Contains all persisted route sets, keyed by agent_id.
+    McpRouteState {
+        agents: Vec<PersistedMcpRouteEntry>,
+    },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
@@ -1546,6 +1594,16 @@ pub enum IpcResponse {
     MemoryConfig {
         config_json: Option<String>,
     },
+}
+
+/// One agent's persisted route set, as returned by [`IpcResponse::McpRouteState`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedMcpRouteEntry {
+    pub agent_id: String,
+    pub routes: Vec<ansible_mesh_core::mcp_route::McpRouteRecord>,
+    /// Vault ref for the bearer token, if one was supplied at provisioning time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_ref: Option<String>,
 }
 
 impl IpcResponse {

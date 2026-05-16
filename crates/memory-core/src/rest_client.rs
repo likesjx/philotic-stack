@@ -550,9 +550,7 @@ impl MemoryEngine for MuninnRestEngine {
         // Use the agent-managed enrichment REST endpoint (promoted from MCP-only).
         // GET candidates for this engram, then POST enrichment back if stages are missing.
         // Falls back gracefully — enrichment is always best-effort in the Attend phase.
-        let candidates_url = self.url(&format!(
-            "/api/enrichment/candidates?vault={vault}&limit=1"
-        ));
+        let candidates_url = self.url(&format!("/api/enrichment/candidates?vault={vault}&limit=1"));
         #[derive(serde::Deserialize)]
         struct Candidate {
             id: String,

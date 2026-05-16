@@ -855,6 +855,26 @@ pub(crate) struct ParkedInboundTask {
 
 pub(crate) type ParkedInboundRegistry = Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
+/// Special sink role: capabilities reply here when dispatched by the Golgi pipeline.
+const GOLGI_SINK_ROLE: &str = "hotel:golgi";
+
+/// A task intercepted by the Golgi routing pipeline, awaiting capability-stage completion.
+/// Keyed by `"session_id:turn_id"` in [`PendingPipelineRegistry`].
+struct PendingPipeline {
+    original_target_role: String,
+    original_target_guest_id: Option<String>,
+    original_task_id: Uuid,
+    original_task_json: String,
+    rule_id: String,
+    // Retained for Slice 4 multi-stage logging; not read by single-stage delivery or watchdog.
+    #[allow(dead_code)]
+    capability_role: String,
+    /// Unix timestamp (seconds) when this entry was inserted; used by the TTL watchdog.
+    created_at: u64,
+}
+
+pub(crate) type PendingPipelineRegistry = Arc<Mutex<HashMap<String, PendingPipeline>>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRouteResolution {
     Deliver(Option<String>),
@@ -868,6 +888,7 @@ pub struct IpcServer {
     graph: Arc<GraphDomain>,
     inboxes: InboxRegistry,
     parked_inbound: ParkedInboundRegistry,
+    pending_pipelines: PendingPipelineRegistry,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -2227,6 +2248,7 @@ impl IpcServer {
             graph,
             inboxes: Arc::new(Mutex::new(HashMap::new())),
             parked_inbound: Arc::new(Mutex::new(HashMap::new())),
+            pending_pipelines: Arc::new(Mutex::new(HashMap::new())),
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             desktop_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
@@ -2288,6 +2310,10 @@ impl IpcServer {
         self.parked_inbound.clone()
     }
 
+    pub(crate) fn pending_pipelines(&self) -> PendingPipelineRegistry {
+        self.pending_pipelines.clone()
+    }
+
     pub(crate) fn materialization_requester_arc(
         &self,
     ) -> Option<Arc<dyn GuestMaterializationRequester>> {
@@ -2304,6 +2330,26 @@ impl IpcServer {
         let listener = UnixListener::bind(path)?;
         info!("Hotel Front Desk (UDS) listening on: {}", self.socket_path);
 
+        // Golgi pipeline TTL watchdog — evicts entries that never received a capability reply.
+        {
+            let pending_pipelines = self.pending_pipelines.clone();
+            let inboxes = self.inboxes.clone();
+            let local_node_id = self.local_node_id.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    Self::golgi_pipeline_watchdog(
+                        &pending_pipelines,
+                        &inboxes,
+                        &local_node_id,
+                    )
+                    .await;
+                }
+            });
+        }
+
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -2312,6 +2358,7 @@ impl IpcServer {
                     let graph = self.graph.clone();
                     let inboxes = self.inboxes.clone();
                     let parked_inbound = self.parked_inbound.clone();
+                    let pending_pipelines = self.pending_pipelines.clone();
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
                     let desktop_membrane_leases = self.desktop_membrane_leases.clone();
@@ -2334,6 +2381,7 @@ impl IpcServer {
                             graph,
                             inboxes,
                             parked_inbound,
+                            pending_pipelines,
                             materialization_requester,
                             telegram_poll_leases,
                             desktop_membrane_leases,
@@ -2374,6 +2422,7 @@ impl IpcServer {
         graph: Arc<GraphDomain>,
         inboxes: InboxRegistry,
         parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        pending_pipelines: PendingPipelineRegistry,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -2384,7 +2433,9 @@ impl IpcServer {
         registry: Arc<RwLock<NodeRegistry>>,
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
-        training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
+        training_storage: Option<
+            Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        >,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
         socket_path: String,
@@ -2453,7 +2504,11 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
                     }
-                    Ok(IpcRequest::ListTrainingSamples { agent_id, limit, filter }) => {
+                    Ok(IpcRequest::ListTrainingSamples {
+                        agent_id,
+                        limit,
+                        filter,
+                    }) => {
                         let resp = Self::handle_list_training_samples(
                             training_storage.as_deref(),
                             agent_id.as_deref(),
@@ -2462,7 +2517,10 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(resp);
                     }
-                    Ok(IpcRequest::CorrectTrainingSample { turn_id, corrected_transcript }) => {
+                    Ok(IpcRequest::CorrectTrainingSample {
+                        turn_id,
+                        corrected_transcript,
+                    }) => {
                         let resp = Self::handle_correct_training_sample(
                             training_storage.as_deref(),
                             &turn_id,
@@ -2470,7 +2528,11 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(resp);
                     }
-                    Ok(IpcRequest::ExportTrainingSamples { format, output_path, limit }) => {
+                    Ok(IpcRequest::ExportTrainingSamples {
+                        format,
+                        output_path,
+                        limit,
+                    }) => {
                         let resp = Self::handle_export_training_samples(
                             training_storage.as_deref(),
                             &format,
@@ -2486,7 +2548,11 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(resp);
                     }
-                    Ok(IpcRequest::AsrSetup { python_path, model_name, auto_install }) => {
+                    Ok(IpcRequest::AsrSetup {
+                        python_path,
+                        model_name,
+                        auto_install,
+                    }) => {
                         let graph_clone = Arc::clone(&graph);
                         let local_node_id_clone = local_node_id.clone();
                         let socket_path_clone = socket_path.clone();
@@ -2510,10 +2576,7 @@ impl IpcServer {
                         let graph_clone = Arc::clone(&graph);
                         let local_node_id_clone = local_node_id.clone();
                         let resp = tokio::task::spawn_blocking(move || {
-                            Self::handle_asr_status(
-                                &graph_clone,
-                                &local_node_id_clone,
-                            )
+                            Self::handle_asr_status(&graph_clone, &local_node_id_clone)
                         })
                         .await
                         .unwrap_or_else(|e| {
@@ -2530,6 +2593,7 @@ impl IpcServer {
                             graph.as_ref(),
                             &inboxes,
                             &parked_inbound,
+                            &pending_pipelines,
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
                             &desktop_membrane_leases,
@@ -2999,6 +3063,242 @@ impl IpcServer {
             }
         }
     }
+
+    // ── Golgi routing pipeline ───────────────────────────────────────────────
+
+    /// Checks whether the inbound task matches any Golgi pipeline rule for the target agent.
+    ///
+    /// Returns `(capability_role, capability_task_id, capability_task_json)` when intercepted;
+    /// stores a [`PendingPipeline`] entry keyed by `"session_id:turn_id"`.
+    ///
+    /// Only fires on `target_role == "agent"` tasks (via `infer_agent_context_for_task`).
+    /// The Park branch is out of scope for Slice 2 — pipeline only applies on Deliver.
+    async fn try_golgi_intercept(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_role: &str,
+        target_guest_id: Option<&str>,
+        original_task_id: Uuid,
+        task_json: &str,
+        pending_pipelines: &PendingPipelineRegistry,
+    ) -> Option<(String, Uuid, String)> {
+        use ansible_mesh_core::agent_graph_storage::AgentGraphStorage as _;
+
+        let ctx =
+            infer_agent_context_for_task(graph, target_role, target_guest_id, task_json)?;
+
+        let path = agent_graph_db_path(&ctx.agent_id);
+        if !path.exists() {
+            return None;
+        }
+        let storage = SqliteAgentGraphStorage::open(&ctx.agent_id, &path).ok()?;
+        let rules = storage.list_pipeline_rules().ok()?;
+        if rules.is_empty() {
+            return None;
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(task_json).ok()?;
+        let task_action = payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let session_id = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        for rule in &rules {
+            let rule_json = &rule.rule_json;
+
+            // Match on `rule_json.match.action` — skip rules without explicit action match.
+            let match_action = rule_json
+                .get("match")
+                .and_then(|m| m.get("action"))
+                .and_then(serde_json::Value::as_str)?;
+            if match_action != task_action {
+                continue;
+            }
+
+            // Only single-stage supported in Slice 2; take the first stage.
+            let stages = rule_json.get("stages").and_then(serde_json::Value::as_array)?;
+            let stage = stages.first()?;
+            let capability_role = stage
+                .get("capability")
+                .and_then(serde_json::Value::as_str)?;
+
+            // Correlation key: session_id:turn_id (unique per in-flight turn).
+            let corr_key = format!("{}:{}", session_id, turn_id);
+
+            // Build the capability task: forward the original payload but redirect the
+            // reply back to the Golgi sink so the hotel can finalize delivery.
+            let mut cap_payload = payload.clone();
+            if let Some(obj) = cap_payload.as_object_mut() {
+                obj.insert(
+                    "reply_role".into(),
+                    serde_json::Value::String(GOLGI_SINK_ROLE.into()),
+                );
+                obj.insert(
+                    "reply_to".into(),
+                    serde_json::Value::String(local_node_id.into()),
+                );
+            }
+            let cap_json = serde_json::to_string(&cap_payload).ok()?;
+            let cap_task_id = Uuid::new_v4();
+
+            {
+                let mut guard = pending_pipelines.lock().await;
+                guard.insert(
+                    corr_key,
+                    PendingPipeline {
+                        original_target_role: target_role.to_string(),
+                        original_target_guest_id: target_guest_id.map(str::to_string),
+                        original_task_id,
+                        original_task_json: task_json.to_string(),
+                        rule_id: rule.rule_id.clone(),
+                        capability_role: capability_role.to_string(),
+                        created_at: unix_ts(),
+                    },
+                );
+            }
+
+            return Some((capability_role.to_string(), cap_task_id, cap_json));
+        }
+
+        None
+    }
+
+    /// Handles a capability result arriving at `GOLGI_SINK_ROLE`.
+    ///
+    /// Correlates via `session_id:turn_id`, merges the capability output into the
+    /// original intercepted task JSON, then delivers to the original target.
+    async fn handle_golgi_capability_response(
+        pending_pipelines: &PendingPipelineRegistry,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+        task_json: &str,
+    ) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+            warn!("Golgi: received non-JSON response at hotel:golgi sink");
+            return;
+        };
+
+        let session_id = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let corr_key = format!("{}:{}", session_id, turn_id);
+
+        let pending = {
+            let mut guard = pending_pipelines.lock().await;
+            guard.remove(&corr_key)
+        };
+
+        let Some(pending) = pending else {
+            warn!(
+                "Golgi: no pending pipeline for correlation key '{}' — capability response dropped",
+                corr_key
+            );
+            return;
+        };
+
+        let merged_json =
+            Self::merge_golgi_stage_output(&pending.original_task_json, task_json)
+                .unwrap_or(pending.original_task_json.clone());
+
+        info!(
+            "Golgi: pipeline rule '{}' complete — delivering merged task {} to '{}'",
+            pending.rule_id, pending.original_task_id, pending.original_target_role
+        );
+
+        Self::deliver_inbound_task(
+            inboxes,
+            local_node_id,
+            &pending.original_target_role,
+            pending.original_target_guest_id.as_deref(),
+            pending.original_task_id,
+            merged_json,
+        )
+        .await;
+    }
+
+    /// Merges a capability stage's output into the original intercepted task JSON.
+    ///
+    /// Embeds the full capability output under `golgi_stage_output` for traceability,
+    /// and promotes `content` to `transcript` if present (voice.transcribe result).
+    fn merge_golgi_stage_output(original_json: &str, cap_output_json: &str) -> Option<String> {
+        let mut original: serde_json::Value = serde_json::from_str(original_json).ok()?;
+        let cap_output: serde_json::Value = serde_json::from_str(cap_output_json).ok()?;
+        if let Some(obj) = original.as_object_mut() {
+            if let Some(content) = cap_output
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+            {
+                obj.insert(
+                    "transcript".into(),
+                    serde_json::Value::String(content.to_string()),
+                );
+            }
+            obj.insert("golgi_stage_output".into(), cap_output);
+        }
+        serde_json::to_string(&original).ok()
+    }
+
+    /// Sweeps `pending_pipelines` for entries older than [`GOLGI_PIPELINE_TTL_SECS`].
+    ///
+    /// For each expired entry the original task is delivered to the original target
+    /// (`on_failure` passthrough), ensuring the agent is never permanently blocked
+    /// by a capability that never replied.
+    async fn golgi_pipeline_watchdog(
+        pending_pipelines: &PendingPipelineRegistry,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+    ) {
+        const GOLGI_PIPELINE_TTL_SECS: u64 = 120;
+
+        let now = unix_ts();
+        let expired: Vec<(String, PendingPipeline)> = {
+            let mut guard = pending_pipelines.lock().await;
+            let keys: Vec<String> = guard
+                .iter()
+                .filter(|(_, p)| now.saturating_sub(p.created_at) >= GOLGI_PIPELINE_TTL_SECS)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| guard.remove(&k).map(|p| (k, p)))
+                .collect()
+        };
+
+        for (corr_key, pending) in expired {
+            warn!(
+                "Golgi: pipeline '{}' (corr_key='{}') timed out after {}s — \
+                 delivering original task {} to '{}' (on_failure passthrough)",
+                pending.rule_id,
+                corr_key,
+                GOLGI_PIPELINE_TTL_SECS,
+                pending.original_task_id,
+                pending.original_target_role,
+            );
+            Self::deliver_inbound_task(
+                inboxes,
+                local_node_id,
+                &pending.original_target_role,
+                pending.original_target_guest_id.as_deref(),
+                pending.original_task_id,
+                pending.original_task_json,
+            )
+            .await;
+        }
+    }
+
+    // ── end Golgi routing pipeline ────────────────────────────────────────────
 
     fn configured_local_guest_exists(
         graph: &GraphDomain,
@@ -3794,6 +4094,7 @@ impl IpcServer {
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        pending_pipelines: &PendingPipelineRegistry,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -5139,6 +5440,17 @@ impl IpcServer {
                         };
                     }
                 }
+                // Short-circuit Golgi capability responses — skip agent-context enrichment.
+                if target_role == GOLGI_SINK_ROLE {
+                    Self::handle_golgi_capability_response(
+                        &pending_pipelines,
+                        &inboxes,
+                        local_node_id,
+                        &task_json,
+                    )
+                    .await;
+                    return IpcResponse::success("golgi", None);
+                }
                 let task_json = match (
                     infer_agent_context_for_task(
                         graph,
@@ -5168,6 +5480,29 @@ impl IpcServer {
                     &task_json,
                 )
                 .await;
+                // If the caller targeted this node but the guest isn't configured here,
+                // look up the live node via the registry so the mesh dispatcher forwards
+                // the task to the correct hotel automatically.
+                let target_node = if target_node == local_node_id {
+                    if let Some(ref guest_id) = target_guest_id {
+                        if !Self::configured_local_guest_exists(graph, local_node_id, guest_id) {
+                            let reg = registry.read().await;
+                            if let Some(status) = reg.find_node_for_incarnation(guest_id) {
+                                let remote = status.capabilities.node_id.clone();
+                                info!(guest_id, remote, "EmitTask: auto-routing to mesh peer");
+                                remote
+                            } else {
+                                target_node
+                            }
+                        } else {
+                            target_node
+                        }
+                    } else {
+                        target_node
+                    }
+                } else {
+                    target_node
+                };
                 let resolved_target_guest_id = match &route_resolution {
                     AgentRouteResolution::Deliver(guest_id) => guest_id.clone(),
                     AgentRouteResolution::Park { guest_id } => Some(guest_id.clone()),
@@ -5264,15 +5599,43 @@ impl IpcServer {
                 if target_node == local_node_id {
                     match route_resolution {
                         AgentRouteResolution::Deliver(target_guest_id) => {
-                            Self::deliver_inbound_task(
-                                inboxes,
-                                local_node_id,
-                                &target_role,
-                                target_guest_id.as_deref(),
-                                task_id,
-                                task_json,
-                            )
-                            .await;
+                            // Golgi trans hook: intercept if a pipeline rule matches.
+                            if let Some((cap_role, cap_id, cap_json)) =
+                                Self::try_golgi_intercept(
+                                    graph,
+                                    local_node_id,
+                                    &target_role,
+                                    target_guest_id.as_deref(),
+                                    task_id,
+                                    &task_json,
+                                    &pending_pipelines,
+                                )
+                                .await
+                            {
+                                info!(
+                                    "Golgi: intercepting task {} → capability '{}'",
+                                    task_id, cap_role
+                                );
+                                Self::deliver_inbound_task(
+                                    inboxes,
+                                    local_node_id,
+                                    &cap_role,
+                                    None,
+                                    cap_id,
+                                    cap_json,
+                                )
+                                .await;
+                            } else {
+                                Self::deliver_inbound_task(
+                                    inboxes,
+                                    local_node_id,
+                                    &target_role,
+                                    target_guest_id.as_deref(),
+                                    task_id,
+                                    task_json,
+                                )
+                                .await;
+                            }
                         }
                         AgentRouteResolution::Park { guest_id } => {
                             {
@@ -6367,14 +6730,18 @@ impl IpcServer {
             }
             IpcRequest::GetUserProfile { hotel_name } => {
                 match graph.get_user_profile(&hotel_name) {
-                    Ok(Some(p)) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
-                        timezone: p.timezone,
-                        display_name: p.display_name,
-                    }),
-                    Ok(None) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
-                        timezone: None,
-                        display_name: None,
-                    }),
+                    Ok(Some(p)) => {
+                        IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                            timezone: p.timezone,
+                            display_name: p.display_name,
+                        })
+                    }
+                    Ok(None) => {
+                        IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                            timezone: None,
+                            display_name: None,
+                        })
+                    }
                     Err(e) => IpcResponse::error(
                         "get_user_profile",
                         "GET_USER_PROFILE_ERROR",
@@ -6402,10 +6769,12 @@ impl IpcServer {
                     display_name: display_name.or(existing.display_name),
                 };
                 match graph.upsert_user_profile(&hotel_name, &updated) {
-                    Ok(()) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
-                        timezone: updated.timezone,
-                        display_name: updated.display_name,
-                    }),
+                    Ok(()) => {
+                        IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                            timezone: updated.timezone,
+                            display_name: updated.display_name,
+                        })
+                    }
                     Err(e) => IpcResponse::error(
                         "patch_user_profile",
                         "PATCH_USER_PROFILE_ERROR",
@@ -6870,6 +7239,158 @@ impl IpcServer {
                     }
                 }
             }
+            IpcRequest::GetAgentReflexPreferences {
+                agent_id,
+                preference_key,
+            } => {
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<Vec<serde_json::Value>> {
+                    if !path.exists() {
+                        return Ok(vec![]);
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    let preferences = if let Some(key) = preference_key {
+                        storage
+                            .get_reflex_preference(&key)?
+                            .map(|r| vec![r])
+                            .unwrap_or_default()
+                    } else {
+                        storage.list_reflex_preferences()?
+                    };
+                    Ok(preferences
+                        .into_iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "agent_id": p.agent_id,
+                                "preference_key": p.preference_key,
+                                "precedence": p.precedence,
+                                "reflexes": p.reflexes_json,
+                                "config": p.config_json,
+                                "updated_at": p.updated_at,
+                            })
+                        })
+                        .collect())
+                })();
+                match result {
+                    Ok(rows) => IpcResponse::AgentReflexPreferences { rows },
+                    Err(err) => {
+                        error!("Failed to read reflex preferences: {err}");
+                        IpcResponse::error(
+                            "get_agent_reflex_preferences",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            // ── routing pipeline rule CRUD ───────────────────────────────────
+            IpcRequest::UpsertRoutingPipelineRule {
+                agent_id,
+                rule_id,
+                rule_json,
+            } => {
+                use ansible_mesh_core::agent_graph_storage::RoutingPipelineRule;
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<()> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    storage.upsert_pipeline_rule(&RoutingPipelineRule {
+                        agent_id: agent_id.clone(),
+                        rule_id: rule_id.clone(),
+                        rule_json,
+                        updated_at: 0,
+                    })?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => IpcResponse::success(
+                        "routing_pipeline_rule",
+                        Some(serde_json::json!({
+                            "message": format!("Routing pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn.")
+                        })),
+                    ),
+                    Err(err) => {
+                        error!("Failed to store routing pipeline rule: {err}");
+                        IpcResponse::error(
+                            "upsert_routing_pipeline_rule",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::RemoveRoutingPipelineRule { agent_id, rule_id } => {
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<bool> {
+                    if !path.exists() {
+                        return Ok(false);
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    storage.remove_pipeline_rule(&rule_id)
+                })();
+                match result {
+                    Ok(deleted) => IpcResponse::success(
+                        "routing_pipeline_rule",
+                        Some(serde_json::json!({
+                            "message": if deleted {
+                                format!("Routing pipeline rule '{rule_id}' removed.")
+                            } else {
+                                format!("Routing pipeline rule '{rule_id}' not found.")
+                            }
+                        })),
+                    ),
+                    Err(err) => {
+                        error!("Failed to remove routing pipeline rule: {err}");
+                        IpcResponse::error(
+                            "remove_routing_pipeline_rule",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::GetRoutingPipelineRules { agent_id, rule_id } => {
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<Vec<serde_json::Value>> {
+                    if !path.exists() {
+                        return Ok(vec![]);
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    let rules = if let Some(id) = rule_id {
+                        storage
+                            .get_pipeline_rule(&id)?
+                            .map(|r| vec![r])
+                            .unwrap_or_default()
+                    } else {
+                        storage.list_pipeline_rules()?
+                    };
+                    Ok(rules
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "agent_id": r.agent_id,
+                                "rule_id": r.rule_id,
+                                "rule": r.rule_json,
+                                "updated_at": r.updated_at,
+                            })
+                        })
+                        .collect())
+                })();
+                match result {
+                    Ok(pipeline_rules) => IpcResponse::RoutingPipelineRules { pipeline_rules },
+                    Err(err) => {
+                        error!("Failed to read routing pipeline rules: {err}");
+                        IpcResponse::error(
+                            "get_routing_pipeline_rules",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+
             IpcRequest::RecordRoleHandoffReflexEvidence {
                 agent_id,
                 role_name,
@@ -7245,7 +7766,10 @@ impl IpcServer {
                     active_jobs: 0,
                     queue_depth: 0,
                 };
-                registry.write().await.update_node(caps, vec![ad], None, None);
+                registry
+                    .write()
+                    .await
+                    .update_node(caps, vec![ad], None, None);
                 if let Some(path) = socket_path {
                     peer_sockets.write().await.insert(node_id, path);
                 }
@@ -7413,6 +7937,17 @@ impl IpcServer {
                                 let hotel_guest_id =
                                     format!("{}:philote-{}", hotel_name, inc.role_name);
 
+                                // Derive socket path from hotel record (shared by philote + companion).
+                                let socket_path = graph
+                                    .list_hotels()
+                                    .ok()
+                                    .and_then(|hs| {
+                                        hs.into_iter()
+                                            .find(|h| h.capabilities.node_id == local_node_id)
+                                            .map(|h| h.ipc_socket_path)
+                                    })
+                                    .unwrap_or_default();
+
                                 // Create the guest record if it doesn't already exist.
                                 if graph
                                     .get_guest(&hotel_name, &hotel_guest_id)
@@ -7420,17 +7955,6 @@ impl IpcServer {
                                     .flatten()
                                     .is_none()
                                 {
-                                    // Derive socket path from hotel record.
-                                    let socket_path = graph
-                                        .list_hotels()
-                                        .ok()
-                                        .and_then(|hs| {
-                                            hs.into_iter()
-                                                .find(|h| h.capabilities.node_id == local_node_id)
-                                                .map(|h| h.ipc_socket_path)
-                                        })
-                                        .unwrap_or_default();
-
                                     let config_json = serde_json::json!({
                                         "command": "philote",
                                         "args": [],
@@ -7463,7 +7987,47 @@ impl IpcServer {
                                     }
                                 }
 
-                                // Trigger materialization.
+                                // Ensure companion agent-graph-runner guest exists.
+                                let graph_runner_id =
+                                    format!("{}:agent-graph-{}", hotel_name, inc.agent_id);
+                                if graph
+                                    .get_guest(&hotel_name, &graph_runner_id)
+                                    .ok()
+                                    .flatten()
+                                    .is_none()
+                                {
+                                    let runner_config = serde_json::json!({
+                                        "command": "agent-graph-runner",
+                                        "args": [],
+                                        "env": {
+                                            "PHILOTIC_AGENT_ID": inc.agent_id,
+                                            "PHILOTIC_GRAPH_RUNNER_ID": graph_runner_id,
+                                            "PHILOTIC_IPC_SOCKET": socket_path,
+                                        }
+                                    });
+                                    let runner_rec = ansible_mesh_core::storage::GuestRecord {
+                                        hotel_name: hotel_name.clone(),
+                                        guest_id: graph_runner_id.clone(),
+                                        role: "agent-graph".into(),
+                                        config_json: runner_config.to_string(),
+                                        is_active: true,
+                                        active_pid: None,
+                                        last_active_at: None,
+                                    };
+                                    if let Err(e) = graph.seed_guests(&hotel_name, &[runner_rec]) {
+                                        warn!(
+                                            "Failed to seed agent-graph-runner guest [{}]: {e}",
+                                            graph_runner_id
+                                        );
+                                    } else {
+                                        info!(
+                                            "Created agent-graph-runner guest: {}",
+                                            graph_runner_id
+                                        );
+                                    }
+                                }
+
+                                // Trigger materialization of philote.
                                 if let Some(requester) = materialization_requester {
                                     match requester.ensure_guest_active(&hotel_guest_id).await {
                                         Ok(true) => info!(
@@ -7477,6 +8041,21 @@ impl IpcServer {
                                         Err(e) => warn!(
                                             "Role-philote [{}] materialization error: {e}",
                                             hotel_guest_id
+                                        ),
+                                    }
+                                    // Trigger materialization of companion agent-graph-runner.
+                                    match requester.ensure_guest_active(&graph_runner_id).await {
+                                        Ok(true) => info!(
+                                            "Agent-graph-runner [{}] materialization triggered.",
+                                            graph_runner_id
+                                        ),
+                                        Ok(false) => warn!(
+                                            "Agent-graph-runner [{}] could not be materialized.",
+                                            graph_runner_id
+                                        ),
+                                        Err(e) => warn!(
+                                            "Agent-graph-runner [{}] materialization error: {e}",
+                                            graph_runner_id
                                         ),
                                     }
                                 }
@@ -7584,7 +8163,6 @@ impl IpcServer {
             }
 
             // ── MCP membrane lease ─────────────────────────────────────────
-
             IpcRequest::AcquireMcpMembraneLease { lease_key, port } => {
                 let Some(identity) = current_identity.as_ref() else {
                     return IpcResponse::error(
@@ -7640,7 +8218,10 @@ impl IpcServer {
                 }
             }
 
-            IpcRequest::RenewMcpMembraneLease { lease_key, lease_epoch } => {
+            IpcRequest::RenewMcpMembraneLease {
+                lease_key,
+                lease_epoch,
+            } => {
                 let mut guard = mcp_membrane_leases.lock().await;
                 let mut observer = LoggingMcpMembraneLeaseObserver;
                 match guard.renew(
@@ -7670,10 +8251,25 @@ impl IpcServer {
             }
 
             // ── MCP route table management ────────────────────────────────
-
-            IpcRequest::UpdateMcpRoutes { agent_id, routes } => {
+            IpcRequest::UpdateMcpRoutes { agent_id, routes, vault_ref } => {
                 let route_count = routes.len();
-                // Serialize and push to any active MCP membrane subscriber.
+                // Persist so routes survive hotel restarts.
+                let entry = serde_json::json!({
+                    "agent_id": agent_id,
+                    "routes": routes,
+                    "vault_ref": vault_ref,
+                });
+                let mut all: std::collections::HashMap<String, serde_json::Value> = graph
+                    .get_config_value("__mcp_routes__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                all.insert(agent_id.clone(), entry);
+                if let Ok(json) = serde_json::to_string(&all) {
+                    let _ = graph.set_config_value("__mcp_routes__", &json);
+                }
+                // Fan-out to any connected mcp-membrane guest.
                 let task_json = serde_json::json!({
                     "action": "update_mcp_routes",
                     "agent_id": agent_id,
@@ -7696,6 +8292,17 @@ impl IpcServer {
             }
 
             IpcRequest::RevokeMcpRoutes { agent_id } => {
+                // Remove from persisted store.
+                let mut all: std::collections::HashMap<String, serde_json::Value> = graph
+                    .get_config_value("__mcp_routes__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                all.remove(&agent_id);
+                if let Ok(json) = serde_json::to_string(&all) {
+                    let _ = graph.set_config_value("__mcp_routes__", &json);
+                }
                 let task_json = serde_json::json!({
                     "action": "revoke_mcp_routes",
                     "agent_id": agent_id,
@@ -7716,8 +8323,21 @@ impl IpcServer {
                 }
             }
 
-            // ── MCP endpoint provisioning ──────────────────────────────────
+            IpcRequest::GetMcpRoutes {} => {
+                let all: std::collections::HashMap<String, serde_json::Value> = graph
+                    .get_config_value("__mcp_routes__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let agents: Vec<philotic_client::PersistedMcpRouteEntry> = all
+                    .into_values()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect();
+                IpcResponse::McpRouteState { agents }
+            }
 
+            // ── MCP endpoint provisioning ──────────────────────────────────
             IpcRequest::ProvisionMcpEndpoint { config } => {
                 let endpoint_id = config.endpoint_id.clone();
                 let port = config.port;
@@ -7738,11 +8358,7 @@ impl IpcServer {
                 };
 
                 if let Err(e) = graph.set_config_value(&config_key, &config_json) {
-                    return IpcResponse::error(
-                        "mcp_endpoint",
-                        "CONFIG_STORE_ERROR",
-                        e.to_string(),
-                    );
+                    return IpcResponse::error("mcp_endpoint", "CONFIG_STORE_ERROR", e.to_string());
                 }
 
                 // Persist pre-approval rules separately for fast lookup.
@@ -7810,16 +8426,18 @@ impl IpcServer {
                         return IpcResponse::error(
                             "mcp_endpoint",
                             "FORBIDDEN",
-                            format!(
-                                "endpoint {endpoint_id} is not owned by {owner_agent_id}"
-                            ),
+                            format!("endpoint {endpoint_id} is not owned by {owner_agent_id}"),
                         );
                     }
                 }
 
                 // Read port before clearing (needed for response).
                 let port = serde_json::from_str::<serde_json::Value>(
-                    &graph.get_config_value(&config_key).ok().flatten().unwrap_or_default(),
+                    &graph
+                        .get_config_value(&config_key)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
                 )
                 .ok()
                 .and_then(|v| v["port"].as_u64())
@@ -7827,10 +8445,8 @@ impl IpcServer {
 
                 // Clear stored state.
                 let _ = graph.set_config_value(&config_key, "null");
-                let _ = graph.set_config_value(
-                    &format!("__mcp_preapproval__:{endpoint_id}"),
-                    "null",
-                );
+                let _ =
+                    graph.set_config_value(&format!("__mcp_preapproval__:{endpoint_id}"), "null");
 
                 // Signal the membrane-mcp guest to shut down.
                 let guest_id = format!("mcp-membrane-{endpoint_id}");
@@ -9765,10 +10381,9 @@ impl IpcServer {
 
         // Upsert role_record into local graph so ensure_role_materialized can find it.
         if let Some(role_val) = payload.get("role_record") {
-            if let Ok(mut role_record) =
-                serde_json::from_value::<ansible_mesh_core::graph::RoleIncarnationRecord>(
-                    role_val.clone(),
-                )
+            if let Ok(mut role_record) = serde_json::from_value::<
+                ansible_mesh_core::graph::RoleIncarnationRecord,
+            >(role_val.clone())
             {
                 // Clear readiness — the remote hotel owns that state, not us.
                 role_record.readiness_state =
@@ -9785,10 +10400,9 @@ impl IpcServer {
         // Upsert toolset_record if provided.
         if let Some(ts_val) = payload.get("toolset_record") {
             if ts_val.is_object() {
-                if let Ok(profile) =
-                    serde_json::from_value::<ansible_mesh_core::graph::ToolsetProfileRecord>(
-                        ts_val.clone(),
-                    )
+                if let Ok(profile) = serde_json::from_value::<
+                    ansible_mesh_core::graph::ToolsetProfileRecord,
+                >(ts_val.clone())
                 {
                     let _ = graph.upsert_toolset_profile(&profile);
                 }
@@ -9895,7 +10509,8 @@ impl IpcServer {
         let capped = limit.min(200);
         match storage.list_filtered(filter, agent_id, capped) {
             Ok(samples) => {
-                let samples_json = serde_json::to_value(&samples).unwrap_or(serde_json::Value::Null);
+                let samples_json =
+                    serde_json::to_value(&samples).unwrap_or(serde_json::Value::Null);
                 IpcResponse::success(
                     "training_list",
                     Some(serde_json::json!({ "samples": samples_json, "count": samples.len() })),
@@ -9972,13 +10587,16 @@ impl IpcServer {
                         })
                     })
                     .collect();
-                std::fs::write(output_path, serde_json::to_vec_pretty(&records).unwrap_or_default())
+                std::fs::write(
+                    output_path,
+                    serde_json::to_vec_pretty(&records).unwrap_or_default(),
+                )
             }
             TrainingExportFormat::Nemo => {
                 let mut file = match std::fs::File::create(output_path) {
                     Ok(f) => f,
                     Err(e) => {
-                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string())
+                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
                     }
                 };
                 for s in &samples {
@@ -10006,7 +10624,10 @@ impl IpcServer {
         let ids: Vec<String> = samples.iter().map(|s| s.sample_id.clone()).collect();
         let count = ids.len();
         if let Err(e) = storage.mark_exported_at(&ids, exported_at) {
-            warn!("training_export: failed to mark {} samples exported: {}", count, e);
+            warn!(
+                "training_export: failed to mark {} samples exported: {}",
+                count, e
+            );
         }
 
         IpcResponse::success(
@@ -10028,9 +10649,11 @@ impl IpcServer {
         };
         match storage.count_status(agent_id) {
             Ok(counts) => {
-                let status_json =
-                    serde_json::to_value(&counts).unwrap_or(serde_json::Value::Null);
-                IpcResponse::success("training_status", Some(serde_json::json!({ "status": status_json })))
+                let status_json = serde_json::to_value(&counts).unwrap_or(serde_json::Value::Null);
+                IpcResponse::success(
+                    "training_status",
+                    Some(serde_json::json!({ "status": status_json })),
+                )
             }
             Err(e) => IpcResponse::error("training_status", "QUERY_FAILED", &e.to_string()),
         }
@@ -10094,7 +10717,11 @@ impl IpcServer {
 
         // Step 2: write component config to hotel context graph.
         let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
-            return IpcResponse::error("asr_setup", "HOTEL_NOT_FOUND", "could not resolve hotel name");
+            return IpcResponse::error(
+                "asr_setup",
+                "HOTEL_NOT_FOUND",
+                "could not resolve hotel name",
+            );
         };
         let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
         let config = parakeet_runner::ParakeetConfig {
@@ -10154,14 +10781,15 @@ impl IpcServer {
         )
     }
 
-    fn handle_asr_status(
-        graph: &GraphDomain,
-        local_node_id: &str,
-    ) -> IpcResponse {
+    fn handle_asr_status(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
         use std::process::Command;
 
         let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
-            return IpcResponse::error("asr_status", "HOTEL_NOT_FOUND", "could not resolve hotel name");
+            return IpcResponse::error(
+                "asr_status",
+                "HOTEL_NOT_FOUND",
+                "could not resolve hotel name",
+            );
         };
         let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
 
@@ -10321,6 +10949,30 @@ fn compose_component_route_assembly(
     registry: &NodeRegistry,
     local_node_id: &str,
 ) -> serde_json::Value {
+    // Find the highest-precedence `preferred_generation_capability` from agent reflex layers.
+    // This lets a philote self-promote text.generate turns to response.generate (Gemini Live)
+    // by storing a routing reflex via routing.reflex.set.
+    let preferred_gen_cap: Option<String> = bindings
+        .get("reflex_policy_agent_layers")
+        .and_then(|v| v.as_array())
+        .and_then(|layers| {
+            layers
+                .iter()
+                .filter_map(|layer| {
+                    let cap = layer
+                        .get("reflexes")
+                        .and_then(|r| r.get("preferred_generation_capability"))
+                        .and_then(|v| v.as_str())?;
+                    let precedence = layer
+                        .get("precedence")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    Some((precedence, cap.to_string()))
+                })
+                .max_by_key(|(p, _)| *p)
+                .map(|(_, cap)| cap)
+        });
+
     let execution_routes = default_component_capabilities(bindings)
         .into_iter()
         .filter_map(|capability| {
@@ -10332,7 +10984,19 @@ fn compose_component_route_assembly(
                 registry,
                 local_node_id,
             )
-            .map(|route| (capability, route))
+            .map(|mut route| {
+                if capability == "text.generate" {
+                    if let Some(cap) = &preferred_gen_cap {
+                        if let Some(obj) = route.as_object_mut() {
+                            obj.insert(
+                                "target_capability".to_string(),
+                                serde_json::json!(cap),
+                            );
+                        }
+                    }
+                }
+                (capability, route)
+            })
         })
         .collect::<serde_json::Map<_, _>>();
 
@@ -10888,6 +11552,11 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "training.status"
             | "asr.setup"
             | "asr.status"
+            | "cron.register"
+            | "cron.list"
+            | "cron.enable"
+            | "cron.disable"
+            | "cron.remove"
     )
 }
 
@@ -22698,6 +23367,524 @@ mod tests {
             bindings2.len(),
             1,
             "idempotent re-acquire must not duplicate discord binding (got: {bindings2:?})"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[test]
+    fn compose_route_assembly_stamps_target_capability_from_reflex_layer() {
+        // Given bindings with a reflex layer that sets preferred_generation_capability to
+        // "response.generate", the assembled text.generate route must carry
+        // target_capability = "response.generate".
+        let bindings = serde_json::json!({
+            "reflex_policy_agent_layers": [
+                {
+                    "precedence": 70,
+                    "reflexes": {
+                        "preferred_generation_capability": "response.generate"
+                    }
+                }
+            ]
+        });
+        let registry = NodeRegistry::new();
+        let result = compose_component_route_assembly(&bindings, &[], &[], &registry, "local-node");
+        let target_cap = &result["execution_routes"]["text.generate"]["target_capability"];
+        assert_eq!(
+            target_cap,
+            "response.generate",
+            "text.generate route must carry target_capability=response.generate when reflex is set"
+        );
+    }
+
+    #[test]
+    fn compose_route_assembly_no_target_capability_without_reflex() {
+        // Without a reflex layer, text.generate must NOT have a target_capability field.
+        let bindings = serde_json::json!({});
+        let registry = NodeRegistry::new();
+        let result = compose_component_route_assembly(&bindings, &[], &[], &registry, "local-node");
+        let route = &result["execution_routes"]["text.generate"];
+        assert!(
+            route.get("target_capability").is_none() || route["target_capability"].is_null(),
+            "text.generate route must not have target_capability when no reflex is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_pipeline_rule_upsert_get_remove_roundtrip() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-pipeline-rule-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        // Upsert a pipeline rule.
+        let upsert_resp = client
+            .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "voice-transcribe".into(),
+                rule_json: serde_json::json!({
+                    "match": { "frame_kind": ["audio", "voice"] },
+                    "stages": [{ "capability": "voice.transcribe", "mode": "blob" }],
+                    "deliver_as": "user_message"
+                }),
+            })
+            .await
+            .expect("upsert request");
+        assert!(
+            matches!(upsert_resp, IpcResponse::Standard { ok: true, .. }),
+            "upsert should succeed: {upsert_resp:?}"
+        );
+
+        // Retrieve by rule_id.
+        let get_resp = client
+            .send_request(IpcRequest::GetRoutingPipelineRules {
+                agent_id: agent_id.into(),
+                rule_id: Some("voice-transcribe".into()),
+            })
+            .await
+            .expect("get request");
+        let IpcResponse::RoutingPipelineRules { pipeline_rules } = get_resp else {
+            panic!("expected RoutingPipelineRules, got {get_resp:?}");
+        };
+        assert_eq!(pipeline_rules.len(), 1);
+        assert_eq!(pipeline_rules[0]["rule_id"], "voice-transcribe");
+        assert_eq!(pipeline_rules[0]["rule"]["deliver_as"], "user_message");
+
+        // Pipeline rules must NOT appear in reflex preferences.
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        assert!(
+            storage.list_reflex_preferences().unwrap().is_empty(),
+            "pipeline rules must not bleed into reflex_preferences"
+        );
+
+        // Remove the rule.
+        let remove_resp = client
+            .send_request(IpcRequest::RemoveRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "voice-transcribe".into(),
+            })
+            .await
+            .expect("remove request");
+        assert!(
+            matches!(remove_resp, IpcResponse::Standard { ok: true, .. }),
+            "remove should succeed"
+        );
+
+        // Confirm gone.
+        let get_after = client
+            .send_request(IpcRequest::GetRoutingPipelineRules {
+                agent_id: agent_id.into(),
+                rule_id: None,
+            })
+            .await
+            .expect("get-all after remove");
+        let IpcResponse::RoutingPipelineRules { pipeline_rules: after } = get_after else {
+            panic!("expected RoutingPipelineRules");
+        };
+        assert!(after.is_empty(), "rule should be gone after remove");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Golgi Slice 2 end-to-end:
+    ///
+    /// 1. Configure a pipeline rule (`match.action == "audio_input"` → capability `"voice.transcribe"`)
+    /// 2. Send EmitTask to agent role with matching action — verify agent does NOT receive it (intercepted)
+    /// 3. Verify capability (`"voice.transcribe"`) received the modified task with `reply_role: "hotel:golgi"`
+    /// 4. Simulate capability reply to `"hotel:golgi"` with `content: "hello world"`
+    /// 5. Verify agent finally receives the merged task with `transcript: "hello world"`
+    #[tokio::test]
+    async fn golgi_pipeline_intercepts_and_routes_to_capability_then_delivers_merged_to_agent() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-golgi-slice2-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = make_hotel_graph(&socket_path, agent_id);
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task =
+            tokio::spawn(async move { server.run().await.expect("ipc server should run") });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        // ── Step 1: configure the pipeline rule ──────────────────────────────
+        let mut admin_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "admin-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("admin connect");
+
+        let rule_resp = admin_client
+            .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "golgi-test-rule".into(),
+                rule_json: serde_json::json!({
+                    "match": { "action": "audio_input" },
+                    "stages": [{ "capability": "voice.transcribe" }],
+                }),
+            })
+            .await
+            .expect("upsert pipeline rule");
+        assert!(
+            matches!(rule_resp, IpcResponse::Standard { ok: true, .. }),
+            "rule upsert should succeed: {rule_resp:?}"
+        );
+
+        // ── Step 2: subscribe the agent and the mock capability ───────────────
+        let agent_outbound: Arc<Mutex<Vec<IpcResponse>>> = Arc::new(Mutex::new(Vec::new()));
+        let capability_outbound: Arc<Mutex<Vec<IpcResponse>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Agent subscriber
+        let agent_capture = agent_outbound.clone();
+        let agent_socket = socket_path.clone();
+        let agent_task = tokio::spawn(async move {
+            let mut agent = PhiloticClient::connect_at(
+                &agent_socket,
+                GuestIdentity {
+                    guest_id: agent_id.into(),
+                    role: "agent".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await
+            .expect("agent connect");
+            // Drain up to 3 inbound tasks within 500ms
+            for _ in 0..3 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    agent.recv_task(),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => {
+                        let mut guard = agent_capture.lock().await;
+                        guard.push(resp);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Mock capability subscriber (voice.transcribe)
+        let cap_capture = capability_outbound.clone();
+        let cap_socket = socket_path.clone();
+        let cap_task = tokio::spawn(async move {
+            let mut capability = PhiloticClient::connect_at(
+                &cap_socket,
+                GuestIdentity {
+                    guest_id: "voice-transcribe-mock".into(),
+                    role: "voice.transcribe".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await
+            .expect("capability connect");
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                capability.recv_task(),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => {
+                    let mut guard = cap_capture.lock().await;
+                    guard.push(resp);
+                }
+                _ => {}
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+
+        // ── Step 3: emit a task targeting the agent with matching action ──────
+        let emit_resp = admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some(agent_id.into()),
+                task_json: serde_json::json!({
+                    "action": "audio_input",
+                    "blob_id": "blob-abc-123",
+                    "session_id": "sess-golgi-test",
+                    "turn_id": "turn-golgi-001",
+                    "agent_id": agent_id,
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+        assert!(
+            matches!(emit_resp, IpcResponse::Standard { ok: true, .. }),
+            "emit should succeed: {emit_resp:?}"
+        );
+
+        // Wait for capability to receive the intercepted task
+        let _ = cap_task.await;
+
+        // ── Step 4: assert agent received nothing yet (intercepted) ──────────
+        // Give the agent a brief window to receive something unexpected
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        {
+            let guard = agent_outbound.lock().await;
+            assert!(
+                guard.is_empty(),
+                "agent must NOT receive task before pipeline completes; got: {guard:?}"
+            );
+        }
+
+        // ── Step 5: assert capability received the modified task ──────────────
+        {
+            let guard = capability_outbound.lock().await;
+            assert_eq!(
+                guard.len(),
+                1,
+                "capability must receive exactly one intercepted task; got: {guard:?}"
+            );
+            if let IpcResponse::InboundTask { task_json, .. } = &guard[0] {
+                let payload: serde_json::Value =
+                    serde_json::from_str(task_json).expect("capability task must be valid JSON");
+                assert_eq!(
+                    payload["reply_role"],
+                    serde_json::Value::String(GOLGI_SINK_ROLE.into()),
+                    "capability task must have reply_role = hotel:golgi"
+                );
+                assert_eq!(
+                    payload["action"],
+                    serde_json::Value::String("audio_input".into()),
+                    "capability task must forward original action"
+                );
+            } else {
+                panic!("expected InboundTask for capability, got {:?}", guard[0]);
+            }
+        }
+
+        // ── Step 6: simulate capability reply to hotel:golgi ─────────────────
+        let golgi_resp = admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: GOLGI_SINK_ROLE.into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "model_response",
+                    "content": "hello world",
+                    "session_id": "sess-golgi-test",
+                    "turn_id": "turn-golgi-001",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("golgi sink emit");
+        assert!(
+            matches!(golgi_resp, IpcResponse::Standard { ok: true, .. }),
+            "golgi sink emit should succeed: {golgi_resp:?}"
+        );
+
+        // ── Step 7: verify agent receives merged task ─────────────────────────
+        let _ = agent_task.await;
+        let guard = agent_outbound.lock().await;
+        assert_eq!(
+            guard.len(),
+            1,
+            "agent must receive exactly one merged task after pipeline completes; got: {guard:?}"
+        );
+        if let IpcResponse::InboundTask { task_json, .. } = &guard[0] {
+            let payload: serde_json::Value =
+                serde_json::from_str(task_json).expect("merged task must be valid JSON");
+            assert_eq!(
+                payload["transcript"],
+                serde_json::Value::String("hello world".into()),
+                "merged task must contain transcript from capability output"
+            );
+            assert_eq!(
+                payload["blob_id"],
+                serde_json::Value::String("blob-abc-123".into()),
+                "original blob_id must be preserved in merged task"
+            );
+            assert!(
+                payload.get("golgi_stage_output").is_some(),
+                "merged task must contain golgi_stage_output for traceability"
+            );
+        } else {
+            panic!("expected InboundTask for agent, got {:?}", guard[0]);
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Verify that the TTL watchdog delivers the original task to the original target
+    /// when a pending pipeline entry has expired (created_at far in the past).
+    ///
+    /// Test strategy:
+    /// 1. Start the IPC server.
+    /// 2. Subscribe an agent guest to observe its inbox.
+    /// 3. Inject a `PendingPipeline` with `created_at = 0` directly via the registry.
+    /// 4. Call `golgi_pipeline_watchdog` directly — does not wait 30s.
+    /// 5. Assert the agent's inbox received the original task as-is (on_failure passthrough).
+    #[tokio::test]
+    async fn golgi_pipeline_watchdog_delivers_original_task_on_ttl_expiry() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let agent_id = "agent-golgi-slice3-watchdog";
+        let graph = make_hotel_graph(&socket_path, agent_id);
+
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-watchdog",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        // Grab references before moving server into the spawn.
+        let pending_pipelines = server.pending_pipelines();
+        let inboxes = server.inboxes();
+
+        let server_task =
+            tokio::spawn(async move { server.run().await.expect("ipc server should run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        // Subscribe agent guest so its inbox exists.
+        let agent_guest_id = "watchdog-agent-guest-01";
+        let mut agent_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: agent_guest_id.into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        // ── Inject an expired PendingPipeline entry ──────────────────────────
+        let original_task_id = Uuid::new_v4();
+        let original_task_json = serde_json::json!({
+            "action": "audio_input",
+            "session_id": "sess-watchdog-01",
+            "turn_id": "turn-watchdog-01",
+            "payload": "raw audio bytes here",
+        })
+        .to_string();
+
+        {
+            let mut guard = pending_pipelines.lock().await;
+            guard.insert(
+                "sess-watchdog-01:turn-watchdog-01".into(),
+                PendingPipeline {
+                    original_target_role: "agent".into(),
+                    original_target_guest_id: Some(agent_guest_id.into()),
+                    original_task_id,
+                    original_task_json: original_task_json.clone(),
+                    rule_id: "watchdog-test-rule".into(),
+                    capability_role: "voice.transcribe".into(),
+                    created_at: 0, // epoch — guaranteed expired
+                },
+            );
+        }
+
+        // ── Drive the watchdog directly (no 30s wait) ───────────────────────
+        IpcServer::golgi_pipeline_watchdog(&pending_pipelines, &inboxes, "local-aiua-watchdog")
+            .await;
+
+        // ── Assert pending_pipelines is now empty ────────────────────────────
+        {
+            let guard = pending_pipelines.lock().await;
+            assert!(
+                guard.is_empty(),
+                "watchdog must evict the expired entry: {:?}",
+                guard.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // ── Assert agent inbox received the original task ────────────────────
+        let received = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            agent_client.recv_task(),
+        )
+        .await
+        .expect("watchdog delivery must arrive within 2s")
+        .expect("recv_task error");
+
+        let philotic_client::IpcResponse::InboundTask { task_json, .. } = received else {
+            panic!("expected InboundTask from watchdog delivery, got {:?}", received);
+        };
+
+        let payload: serde_json::Value = serde_json::from_str(&task_json).unwrap_or_default();
+        assert_eq!(
+            payload.get("action").and_then(serde_json::Value::as_str),
+            Some("audio_input"),
+            "on_failure delivery must carry original action"
+        );
+        assert_eq!(
+            payload.get("session_id").and_then(serde_json::Value::as_str),
+            Some("sess-watchdog-01"),
+        );
+        // No golgi_stage_output — this is the raw original task, no capability ran.
+        assert!(
+            payload.get("golgi_stage_output").is_none(),
+            "on_failure passthrough must NOT include golgi_stage_output"
         );
 
         unsafe {

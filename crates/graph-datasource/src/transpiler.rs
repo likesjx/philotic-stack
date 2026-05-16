@@ -1,6 +1,6 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -41,7 +41,9 @@ pub fn transpile_cypher(query: &str) -> Result<TranslatedQuery> {
     let query = query.trim();
 
     if query.to_uppercase().starts_with("MATCH") {
-        let re_match_node = Regex::new(r"(?i)MATCH\s*\((?P<var>\w+):(?P<label>\w+)\s*(?P<props>\{.*\})?\)\s*RETURN\s+(?P<ret>\w+)")?;
+        let re_match_node = Regex::new(
+            r"(?i)MATCH\s*\((?P<var>\w+):(?P<label>\w+)\s*(?P<props>\{.*\})?\)\s*RETURN\s+(?P<ret>\w+)",
+        )?;
         if let Some(caps) = re_match_node.captures(query) {
             let label = caps.name("label").map(|m| m.as_str().to_string());
             return Ok(TranslatedQuery::SelectNodes {
@@ -52,7 +54,9 @@ pub fn transpile_cypher(query: &str) -> Result<TranslatedQuery> {
     }
 
     if query.to_uppercase().starts_with("CREATE") {
-        let re_create_rel = Regex::new(r"(?i)CREATE\s*\((?P<s_var>\w+):(?P<s_label>\w+)\s*(?P<s_props>\{.*\})\)-\[:(?P<r_label>\w+)\s*(?P<r_props>\{.*\})?\]->\((?P<t_var>\w+):(?P<t_label>\w+)\s*(?P<t_props>\{.*\})\)")?;
+        let re_create_rel = Regex::new(
+            r"(?i)CREATE\s*\((?P<s_var>\w+):(?P<s_label>\w+)\s*(?P<s_props>\{.*\})\)-\[:(?P<r_label>\w+)\s*(?P<r_props>\{.*\})?\]->\((?P<t_var>\w+):(?P<t_label>\w+)\s*(?P<t_props>\{.*\})\)",
+        )?;
         if let Some(caps) = re_create_rel.captures(query) {
             let s_props = parse_cypher_props(caps.name("s_props").unwrap().as_str())?;
             let t_props = parse_cypher_props(caps.name("t_props").unwrap().as_str())?;
@@ -62,10 +66,22 @@ pub fn transpile_cypher(query: &str) -> Result<TranslatedQuery> {
                 json!({})
             };
 
-            let source_id = s_props.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
-            let target_id = t_props.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
+            let source_id = s_props
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let target_id = t_props
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
             let r_label = caps.name("r_label").unwrap().as_str().to_string();
-            let r_id = r_props.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let r_id = r_props
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
             return Ok(TranslatedQuery::InsertEdge {
                 id: r_id,
@@ -76,7 +92,8 @@ pub fn transpile_cypher(query: &str) -> Result<TranslatedQuery> {
             });
         }
 
-        let re_create_node = Regex::new(r"(?i)CREATE\s*\((?P<var>\w+):(?P<label>\w+)\s*(?P<props>\{.*\})\)")?;
+        let re_create_node =
+            Regex::new(r"(?i)CREATE\s*\((?P<var>\w+):(?P<label>\w+)\s*(?P<props>\{.*\})\)")?;
         if let Some(caps) = re_create_node.captures(query) {
             let label = caps.name("label").unwrap().as_str().to_string();
             let props_str = caps.name("props").unwrap().as_str();

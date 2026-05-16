@@ -33,7 +33,12 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
         "handoff.back" => &["session.status", "handoff.back"],
-        "role.governance" => &["session.status", "agent.configure", "role.create_or_update", "role.set_home"],
+        "role.governance" => &[
+            "session.status",
+            "agent.configure",
+            "role.create_or_update",
+            "role.set_home",
+        ],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &["memory.recall", "memory.remember"],
         "routing.refinement" => &[
@@ -41,6 +46,11 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "agent.graph.read",
             "agent.graph.write",
             "routing.policy.propose",
+            "routing.reflex.set",
+            "routing.reflex.get",
+            "routing.pipeline.set",
+            "routing.pipeline.remove",
+            "routing.pipeline.get",
         ],
         _ => &[],
     }
@@ -296,8 +306,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "graph.grant_access".into(),
         ToolDefinition {
             tool_name: "graph.grant_access".into(),
-            description: "Grant another agent read or write access to one of your graph partitions."
-                .into(),
+            description:
+                "Grant another agent read or write access to one of your graph partitions.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -318,6 +328,206 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["graph_id", "agent_id", "access"]
             }),
             class: Some("graph".into()),
+        },
+    );
+
+    // ── Table tools (table-datasource) ─────────────────────────────────────────
+
+    m.insert(
+        "table.configure".into(),
+        ToolDefinition {
+            tool_name: "table.configure".into(),
+            description: "Create a new table in the local table store using a CREATE TABLE SQL \
+                          statement. Use this to set up observability tables, event logs, or any \
+                          flat structured data that your agent-graph neighborhood should track."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "CREATE TABLE IF NOT EXISTS ... SQL DDL statement."
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.query".into(),
+        ToolDefinition {
+            tool_name: "table.query".into(),
+            description: "Run a SELECT query against a table in the local table store. \
+                          Returns rows as JSON objects. Use graph_id to specify the table name \
+                          and query for the SQL. Pass limit in parameters to cap results."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name (also set as the target table for the query context)."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "SELECT SQL query."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Optional query parameters. Include 'limit' to cap result count.",
+                        "default": {}
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.insert".into(),
+        ToolDefinition {
+            tool_name: "table.insert".into(),
+            description: "Insert a row into a table in the local table store. \
+                          Pass the table name as graph_id and the row as parameters."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Row data as column→value pairs."
+                    }
+                },
+                "required": ["graph_id", "parameters"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.rolloff".into(),
+        ToolDefinition {
+            tool_name: "table.rolloff".into(),
+            description: "Apply data retention rules to a table — delete rows older than \
+                          max_age_secs or keep only the newest max_rows rows. \
+                          Pass the table name as graph_id."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Rolloff options: max_rows (integer), max_age_secs (integer), ts_column (string, default 'timestamp').",
+                        "properties": {
+                            "max_rows": { "type": "integer" },
+                            "max_age_secs": { "type": "integer" },
+                            "ts_column": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["graph_id"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.stats".into(),
+        ToolDefinition {
+            tool_name: "table.stats".into(),
+            description: "Return row count and latest timestamp for a table in the local table store."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Options: ts_column (string, default 'timestamp').",
+                        "default": {}
+                    }
+                },
+                "required": ["graph_id"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.schema".into(),
+        ToolDefinition {
+            tool_name: "table.schema".into(),
+            description: "Return the CREATE TABLE DDL for a table in the local table store.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Table name."
+                    }
+                },
+                "required": ["graph_id"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.add_listener".into(),
+        ToolDefinition {
+            tool_name: "table.add_listener".into(),
+            description: "Register a router-listener handler that writes matching inbound events \
+                          into a local table. Merges into the hotel's router_listener.config so the \
+                          router-listener starts routing the specified event_kind to the named table \
+                          on its next reconnect. After calling this, run graph.query to store a \
+                          TableConfig node in your partition so the table appears in your cognitive \
+                          envelope on future sessions."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "event_kind": {
+                        "type": "string",
+                        "description": "The 'kind' field value on inbound envelopes to match (e.g. 'transcription_capture', 'routing_signal')."
+                    },
+                    "table_name": {
+                        "type": "string",
+                        "description": "Target table name in the local table store."
+                    },
+                    "schema_map": {
+                        "type": "object",
+                        "description": "Maps event envelope field names to table column names. Omit to pass through the full envelope."
+                    },
+                    "filter_keys": {
+                        "type": "object",
+                        "description": "Only process events where these envelope fields match these values."
+                    },
+                    "adapter_script": {
+                        "type": "string",
+                        "description": "Path to a Python adapter script. Receives raw event JSON on stdin, emits transformed row JSON on stdout."
+                    },
+                    "target_role": {
+                        "type": "string",
+                        "description": "Role to route table.insert tasks to (default: 'table-datasource')."
+                    }
+                },
+                "required": ["event_kind", "table_name"]
+            }),
+            class: Some("table".into()),
         },
     );
 
@@ -1107,6 +1317,158 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["problem", "proposed_change", "evidence"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "routing.reflex.set".into(),
+        ToolDefinition {
+            tool_name: "routing.reflex.set".into(),
+            description: "Set a durable routing reflex that takes effect immediately on the \
+                          next turn. Use to self-administer low-level dispatch preferences \
+                          without operator approval. Currently supports \
+                          `preferred_generation_capability` (values: `text.generate` for \
+                          standard Gemini, `response.generate` for Gemini Live native audio). \
+                          Setting a reflex overrides any prior value for the same key."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "preference_key": {
+                        "type": "string",
+                        "description": "Stable identifier for this reflex, e.g. 'generation_capability_preference'. Used to update or clear the reflex later."
+                    },
+                    "reflexes": {
+                        "type": "object",
+                        "description": "Reflex fields to set. Supported keys: 'preferred_generation_capability' ('text.generate' or 'response.generate').",
+                        "properties": {
+                            "preferred_generation_capability": {
+                                "type": "string",
+                                "enum": ["text.generate", "response.generate"],
+                                "description": "Which generation capability to dispatch cognitive turns to."
+                            }
+                        }
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief reason for the change — stored in the config alongside the reflex for observability."
+                    }
+                },
+                "required": ["preference_key", "reflexes"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.reflex.get".into(),
+        ToolDefinition {
+            tool_name: "routing.reflex.get".into(),
+            description: "Read the agent's current routing reflexes from the agent graph. \
+                          Returns all stored reflex preference rows including their keys, \
+                          precedences, and current reflex values. Use to inspect what \
+                          generation capability or routing posture is active before deciding \
+                          whether to change it."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "preference_key": {
+                        "type": "string",
+                        "description": "Optional — if provided, returns only the row with this key. If omitted, returns all rows."
+                    }
+                },
+                "required": []
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.set".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.set".into(),
+            description: "Declare or replace a routing pipeline rule in the agent graph. \
+                          Pipeline rules define how the hotel pre-processes inbound envelopes \
+                          before delivering them to this agent — for example, transcribing \
+                          a voice memo before the agent sees it. Setting a rule with the same \
+                          rule_id replaces the previous definition. Takes effect on the next \
+                          inbound turn."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "Stable identifier for this rule (e.g. 'voice-transcribe'). \
+                                        Used as the primary key — re-set with the same rule_id to update."
+                    },
+                    "match": {
+                        "type": "object",
+                        "description": "Envelope match criteria. Supported fields: frame_kind (array of strings), \
+                                        channel_kind (array of strings), has_text (bool)."
+                    },
+                    "stages": {
+                        "type": "array",
+                        "description": "Ordered list of transform stages. Each stage has: capability (string), \
+                                        mode ('blob'|'stream'), collect ('full'|'incremental'), \
+                                        output_as ('replace_content'|'append_content'), \
+                                        on_failure ('passthrough'|'drop'|'error')."
+                    },
+                    "deliver_as": {
+                        "type": "string",
+                        "description": "How to deliver the transformed envelope to the agent. \
+                                        One of: 'user_message' (default), 'tool_result'."
+                    }
+                },
+                "required": ["rule_id", "match", "stages"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.remove".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.remove".into(),
+            description: "Remove a routing pipeline rule from the agent graph. \
+                          After removal, inbound envelopes that previously matched this rule \
+                          will be delivered to the agent without transformation."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "The rule_id of the rule to remove."
+                    }
+                },
+                "required": ["rule_id"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.get".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.get".into(),
+            description: "Read the agent's declared routing pipeline rules from the agent graph. \
+                          Returns all stored rules or a specific rule by rule_id. \
+                          Use to inspect which pipeline transforms are currently active."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "Optional — if provided, returns only the rule with this id. \
+                                        If omitted, returns all rules."
+                    }
+                },
+                "required": []
+            }),
+            class: Some("utility".into()),
         },
     );
 

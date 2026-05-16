@@ -5,21 +5,21 @@ mod routing;
 mod server;
 mod transform;
 
-use anyhow::Result;
 use ansible_mesh_core::mcp_endpoint::McpEndpointConfig;
 use ansible_mesh_core::mcp_route::McpRouteRecord;
+use anyhow::Result;
 use async_trait::async_trait;
 use auth::{AllotmentTracker, VaultHashCache, VaultResolver};
 use clap::Parser;
 use membrane::{LeaseRenewResult, MembraneGuest, OutboundReply};
-use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
-use tracing::info;
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use routing::{new_shared_endpoint_table, new_shared_table};
 use server::{MembraneState, build_router};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
+use tracing::info;
 use tracing::{error, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -33,7 +33,7 @@ struct Args {
     #[arg(long, env = "MCP_STATIC_ROUTES")]
     static_routes: Option<std::path::PathBuf>,
 
-    #[arg(long, env = "PHILOTIC_IPC_SOCKET")]
+    #[arg(long, env = "PHILOTIC_HOTEL_SOCKET")]
     ipc_socket: Option<String>,
 
     #[arg(long, env = "PHILOTIC_GUEST_ID", default_value = "membrane-mcp-01")]
@@ -43,14 +43,62 @@ struct Args {
     node_id: String,
 }
 
-// ── Vault stub (Slice 1) ──────────────────────────────────────────────────────
+// ── Vault resolver ────────────────────────────────────────────────────────────
 
-struct IpcVaultResolver;
+struct IpcVaultResolver {
+    socket_path: String,
+}
 
 impl VaultResolver for IpcVaultResolver {
     fn resolve(&self, vault_ref: &str) -> Result<[u8; 32]> {
-        warn!(vault_ref, "vault resolver stub — Slice 2 wires real IPC lookup");
-        Ok([0u8; 32])
+        let socket_path = self.socket_path.clone();
+        let vault_ref = vault_ref.to_string();
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut client = PhiloticClient::connect_at(
+                    &socket_path,
+                    GuestIdentity {
+                        guest_id: "membrane-mcp-vault".into(),
+                        role: "mcp-membrane".into(),
+                        supported_tools: vec![],
+                    },
+                )
+                .await?;
+
+                let resp = client
+                    .send_request(IpcRequest::GetSecret {
+                        secret_ref: vault_ref.clone(),
+                    })
+                    .await?;
+
+                match resp {
+                    IpcResponse::SecretData {
+                        value_json: Some(json),
+                        ..
+                    } => {
+                        // value_json may be double-encoded (stored plaintext is itself JSON).
+                        let step1: String = serde_json::from_str(&json)
+                            .unwrap_or_else(|_| json.trim_matches('"').to_string());
+                        let hex: String = if step1.starts_with('"') {
+                            serde_json::from_str(&step1)
+                                .unwrap_or_else(|_| step1.trim_matches('"').to_string())
+                        } else {
+                            step1
+                        };
+                        let bytes = hex::decode(&hex)
+                            .map_err(|e| anyhow::anyhow!("bad hex in vault: {}", e))?;
+                        bytes
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("vault hash must be 32 bytes"))
+                    }
+                    IpcResponse::SecretData { value_json: None, .. } => {
+                        anyhow::bail!("vault_ref '{}' not found", vault_ref)
+                    }
+                    other => anyhow::bail!("unexpected vault response: {:?}", other),
+                }
+            })
+        })
     }
 }
 
@@ -89,10 +137,14 @@ impl MembraneGuest for McpMembrane {
             port: self.port,
         };
         match client.send_request(req).await {
-            Ok(IpcResponse::McpMembraneLease { mcp_granted: true, .. }) => {
+            Ok(IpcResponse::McpMembraneLease {
+                mcp_granted: true, ..
+            }) => {
                 info!("MCP membrane lease acquired");
             }
-            Ok(IpcResponse::McpMembraneLease { mcp_granted: false, .. }) => {
+            Ok(IpcResponse::McpMembraneLease {
+                mcp_granted: false, ..
+            }) => {
                 anyhow::bail!("MCP membrane lease denied — another instance may be running");
             }
             Ok(other) => {
@@ -103,9 +155,23 @@ impl MembraneGuest for McpMembrane {
             }
         }
 
+        // Replay any routes that were persisted before this restart.
+        match client.send_request(IpcRequest::GetMcpRoutes {}).await {
+            Ok(IpcResponse::McpRouteState { agents }) if !agents.is_empty() => {
+                let mut table = self.state.routing_table.write().await;
+                for entry in &agents {
+                    table.upsert_agent_routes(&entry.agent_id, entry.routes.clone());
+                }
+                info!(count = agents.len(), "replayed persisted MCP routes on startup");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),
+        }
+
         // Start HTTP server (detached task).
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        let router = build_router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        let router =
+            build_router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move {
             info!(%addr, "MCP membrane HTTP server starting");
             match tokio::net::TcpListener::bind(addr).await {
@@ -129,7 +195,10 @@ impl MembraneGuest for McpMembrane {
                 // Philote acknowledged the approval gate — the HTTP caller continues
                 // to wait. The oneshot stays parked; it fires when the operator
                 // resolves and the philote sends the final Text/Error reply.
-                info!(turn_id, "approval required acknowledged — oneshot remains parked");
+                info!(
+                    turn_id,
+                    "approval required acknowledged — oneshot remains parked"
+                );
                 return Ok(());
             }
             OutboundReply::StreamingToken { .. } => {
@@ -149,9 +218,7 @@ impl MembraneGuest for McpMembrane {
                 let _ = tx.send(content);
             }
             (OutboundReply::Error { message, .. }, Some(tx)) => {
-                let _ = tx.send(
-                    serde_json::json!({ "error": message }).to_string(),
-                );
+                let _ = tx.send(serde_json::json!({ "error": message }).to_string());
             }
             (_, None) => {
                 warn!(turn_id, "deliver: no pending receiver for turn");
@@ -236,12 +303,12 @@ impl MembraneGuest for McpMembrane {
             port: self.port,
         };
         match client.send_request(req).await {
-            Ok(IpcResponse::McpMembraneLease { mcp_granted: true, .. }) => {
-                Ok(LeaseRenewResult::Ok { epoch: 0 })
-            }
-            Ok(IpcResponse::McpMembraneLease { mcp_granted: false, .. }) => {
-                Ok(LeaseRenewResult::NeedsReacquire)
-            }
+            Ok(IpcResponse::McpMembraneLease {
+                mcp_granted: true, ..
+            }) => Ok(LeaseRenewResult::Ok { epoch: 0 }),
+            Ok(IpcResponse::McpMembraneLease {
+                mcp_granted: false, ..
+            }) => Ok(LeaseRenewResult::NeedsReacquire),
             Ok(_) => Ok(LeaseRenewResult::Ok { epoch: 0 }),
             Err(e) => Err(e),
         }
@@ -281,7 +348,10 @@ async fn main() -> Result<()> {
         let mut by_agent: std::collections::HashMap<String, Vec<McpRouteRecord>> =
             std::collections::HashMap::new();
         for record in records {
-            by_agent.entry(record.agent_id.clone()).or_default().push(record);
+            by_agent
+                .entry(record.agent_id.clone())
+                .or_default()
+                .push(record);
         }
         for (agent_id, routes) in by_agent {
             t.upsert_agent_routes(&agent_id, routes);
@@ -300,7 +370,12 @@ async fn main() -> Result<()> {
         endpoint_table,
         vault_cache: VaultHashCache::new(),
         allotment: AllotmentTracker::new(),
-        vault: Box::new(IpcVaultResolver),
+        vault: Box::new(IpcVaultResolver {
+            socket_path: args.ipc_socket.clone().unwrap_or_else(|| {
+                std::env::var("PHILOTIC_HOTEL_SOCKET")
+                    .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string())
+            }),
+        }),
         node_id: args.node_id.clone(),
         inbound_tx,
         pending_responses,
@@ -318,8 +393,8 @@ async fn main() -> Result<()> {
         // Inbound envelopes go nowhere in this mode; pending responses will time out.
         info!("running in static-only mode (no IPC socket)");
         let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-        let router = build_router(guest.state.clone())
-            .into_make_service_with_connect_info::<SocketAddr>();
+        let router =
+            build_router(guest.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
         let listener = tokio::net::TcpListener::bind(addr).await?;
         info!(%addr, "MCP membrane listening");
         axum::serve(listener, router).await?;

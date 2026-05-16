@@ -34,6 +34,18 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 - [x] Extract the `ModelManagerInvoker` wiring out of `ansible-mesh-core`.
 - [ ] Migrate downstream crates off the remaining `ansible-mesh-core` compatibility imports where direct primitive crates are now clearer.
 
+## Current Mesh / Transport Pressure
+
+- [ ] Enforce the explicit mesh transport boundary from [MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md):
+  - [ ] keep UDP limited to compact state-sync/control traffic
+  - [ ] remove any remaining routed execution or payload traffic that still leans on the beacon family
+  - [ ] keep WebRTC as optional peer session transport after signaling, not the graph or membership sync plane
+  - [ ] classify the canonical mesh-shared graph projection in code instead of relying on operator intuition
+- [ ] Recover a single known-good live mesh runtime path across `bjork`, `mbp-jane`, and `jane-vps`.
+- [ ] Redeploy `jane-vps` through Ansible with a real Linux build and re-smoke mesh visibility from Bjork.
+- [ ] Prove roaming peer auto-reconnect live by validating observed-endpoint reconciliation against stale peer graph records.
+- [ ] Feed hotel-owned router traces and mesh events into the desktop event log through `philotic-web` so mesh/routing failures are visible without live journal spelunking.
+
 ### WI 1: Session Management
 
 Seam IDs: `session-leases`
@@ -594,7 +606,13 @@ Seam IDs: `secret-handling-hardening`, `watched-live-vps-smoke`, `artifact-distr
 - [x] Define the first peer inventory/rendering contract for deployed hotels so cross-host mesh no longer depends on loopback assumptions.
 - [ ] Prove a first VPS deployment smoke for one hotel.
 - [ ] Prove a first multi-host or local-to-VPS two-hotel roundtrip.
-- [ ] Render and deploy `beacon-test-hotel` on `vps-jane` with a Beacon agent profile, VPS-local `import_workspace`, and hotel-scoped Telegram credentials so Beacon can be UATed on the VPS test stack.
+- [ ] Render and deploy the canonical `vps-jane` hotel on `jane-vps` with a Beacon agent profile, VPS-local `import_workspace`, and hotel-scoped Telegram credentials so Beacon can be UATed on the VPS test stack.
+- [ ] Standardize canonical hotel naming across the active mesh:
+  - local desktop default hotel should migrate from legacy `default` to `mac-jane`
+  - MacBook Pro hotel remains `mbp-jane`
+  - VPS hotel should migrate from transitional `beacon-test-hotel` to `vps-jane`
+  - deploy paths should clean stale previous-name graph records so old identities do not persist as phantom peers after rename
+  - complete the live graph/profile/invite migration without losing existing trust edges or operator surfaces
 
 ## New Project: Native Overlay / VPN
 
@@ -1164,6 +1182,24 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - no browser-direct remote `aiua` protocol
   - no local mutation simulation standing in for target execution
 - [ ] Define the first desktop-aware operator session posture flow for mesh-wide admin work.
+- [~] Define the first hotel-owned user identity and operator auth slice.
+  - [x] canonical `UserRecord`, `RootUserKeyRefRecord`, and `OperatorSessionRecord` tables created in the hotel context DB
+  - [x] no-view-before-auth rule for the always-on desktop: keep operator work surfaces locked until a hotel-issued operator session exists
+  - [x] first login/bootstrap path: hotel-issued startup bootstrap token exchanged for a bounded operator session cookie
+  - [x] move the bootstrap UX into `System Settings > Aiua Membrane` while the embedded desktop shell stays live before auth
+  - [x] shell-level operator-session gate: before auth, non-settings workspace app launch/focus is blocked and redirected through the desktop event bus into `System Settings > Aiua Membrane`
+  - [x] seed and project hotel-local `root_user_key_refs` from the current vault key source (keychain/env) with non-secret fingerprint metadata
+  - [x] define canonical bootstrap direction: OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
+  - [x] persist hotel-local `operator_auth_challenges` and expose first challenge issuance endpoint for membrane/OIDC ceremony groundwork
+- [x] implement first OIDC start/callback flow for hotel-issued operator sessions, with hotel-config-backed public callback base URL / provider client IDs and vault-backed provider secret refs as the intended canonical configuration path (env fallback remains transitional)
+- [ ] wire the desktop System Settings auth surface to read and mutate the bounded OIDC config surface (`/api/config/oidc`, `oidc_*` keys) instead of relying on env-era operator folklore
+  - [ ] move from current root-key source inspection to a richer hotel-local identity/step-up authority path with real vault-backed login ceremony
+  - [ ] implement membrane proof verification and single-use challenge redemption into operator sessions
+  - [ ] persist normalized provider identity linkage on the hotel-local root user record instead of treating provider login as display-name-only proof
+  - [ ] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
+  - [ ] philote-visible bounded user context projection instead of raw root-user secret access
+  - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
+  - [ ] passkey-backed local-first operator login after OIDC and membrane step-up are landed
 - [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.
 - [ ] Define the first high-trust remote action ceremonies for:
   - secret rotation
@@ -1179,6 +1215,12 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - `jaredlikes-desktop` source ownership
   - `philotic-web` embedding/runtime ownership
   - release pipeline provenance ownership
+- [~] Define the desktop workspace component model.
+  - [x] document the current desktop substrate: application registry/manager, window manager, desktop manager, event bus, widget manager
+  - [x] document the system-settings vs workspace-app split
+  - [x] document the philote-published app/customization direction and artifact/catalog boundary
+  - [ ] formalize the first graph-canonical desktop app schema for philote-published apps
+  - [ ] define widget/app publication permissions and artifact verification rules
 - [ ] Define the frontend development workflow for:
   - frontend-first local iteration
   - integrated membrane development

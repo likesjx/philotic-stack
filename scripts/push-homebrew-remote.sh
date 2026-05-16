@@ -34,6 +34,8 @@ cargo build --release --bins \
   -p graph-runner \
   -p graph-datasource \
   -p graph-intelligence \
+  -p table-datasource \
+  -p router-listener \
   -p philotic-web
 
 echo "▶ Preparing remote staging directory on ${REMOTE}..."
@@ -50,28 +52,58 @@ fi
 echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
 ssh "${REMOTE}" "pkill -f 'aiua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f 'aiua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
 
-echo "▶ Staging and installing runtime binaries on ${REMOTE}..."
+echo "▶ Signing and verifying local binaries before push..."
+UNSIGNED=()
 while IFS= read -r bin_path; do
+  bin="$(basename "${bin_path}")"
+  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" ]]; then
+    continue
+  fi
+  codesign -s - --force "${bin_path}" 2>/dev/null || true
+  sig_info=$(codesign -dv "${bin_path}" 2>&1 || true)
+  if ! grep -q "adhoc" <<<"${sig_info}"; then
+    UNSIGNED+=("${bin}")
+  fi
+done < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
+
+if [[ ${#UNSIGNED[@]} -gt 0 ]]; then
+  echo "❌ Binaries that could not be signed (macOS will SIGKILL these on remote):"
+  for b in "${UNSIGNED[@]}"; do echo "   - ${b}"; done
+  exit 1
+fi
+echo "  ✓ All local binaries have adhoc signatures"
+
+echo "▶ Staging and installing runtime binaries on ${REMOTE}..."
+# Collect paths into array first — SSH commands inside a while-read loop would otherwise
+# consume stdin from the pipe, causing all but the first binary to be silently skipped.
+BIN_PATHS=()
+while IFS= read -r _bp; do BIN_PATHS+=("${_bp}"); done \
+  < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
+for bin_path in "${BIN_PATHS[@]}"; do
   bin="$(basename "${bin_path}")"
   if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" ]]; then
     continue
   fi
 
   scp -q "${bin_path}" "${REMOTE}:${STAGE_DIR}/${bin}"
-  ssh "${REMOTE}" "chmod +x '${STAGE_DIR}/${bin}'"
+  ssh -n "${REMOTE}" "chmod +x '${STAGE_DIR}/${bin}'"
 
-  if ! ssh "${REMOTE}" "test -f '${AIUA_CELLAR}/${bin}'"; then
-    echo "  – ${bin} (not in remote Cellar, skipping)"
+  if ! ssh -n "${REMOTE}" "test -f '${AIUA_CELLAR}/${bin}'"; then
+    # New binary not yet in Cellar — install it and create the symlink
+    ssh -n "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
+    ssh -n "${REMOTE}" "chmod 555 '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
+    ssh -n "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
+    echo "  + ${bin} (new)"
     continue
   fi
 
-  ssh "${REMOTE}" "chmod u+w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
-  ssh "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
-  ssh "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
-  ssh "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
-  ssh "${REMOTE}" "chmod u-w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
+  ssh -n "${REMOTE}" "chmod u+w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
+  ssh -n "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
+  ssh -n "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
+  ssh -n "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
+  ssh -n "${REMOTE}" "chmod u-w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
   echo "  ✓ ${bin}"
-done < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
+done
 
 if [[ -n "${PHIL_CELLAR}" && -f "${ROOT_DIR}/target/release/philotic-web" ]]; then
   echo "▶ Installing phil / philotic-web..."

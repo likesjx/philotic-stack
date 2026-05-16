@@ -13,8 +13,8 @@
 //! - `Tool` — sends an IPC tool-invocation request to tool-runner and awaits reply.
 //! - `Datasource` — sends a query request to the datasource guest and awaits reply.
 
-use anyhow::Result;
 use ansible_mesh_core::mcp_route::McpRouteTarget;
+use anyhow::Result;
 use serde_json::Value;
 use tracing::info;
 

@@ -99,7 +99,8 @@ pub struct SessionState {
     /// The payload preserves session_id, chat_id, and exosome context so the
     /// correct Telegram session/chat is restored when the task is dispatched.
     /// Voice tasks are queued raw and will be transcribed when they reach the front.
-    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload, std::time::Instant)>,
+    pub pending_user_tasks:
+        std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload, std::time::Instant)>,
     /// Optional role name of the queue arbiter.
     /// When set, TEXT tasks queued while a turn is active are routed to this specialist
     /// role via paracrine dispatch for priority evaluation. The arbiter may call
@@ -187,24 +188,29 @@ impl SessionState {
 
     /// Enqueue a user task for deferred processing after the current turn completes.
     pub fn enqueue_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_back((task_id, task, std::time::Instant::now()));
+        self.pending_user_tasks
+            .push_back((task_id, task, std::time::Instant::now()));
     }
 
     /// Prepend a user task to the front of the queue (high priority, arbiter-promoted).
     pub fn prepend_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_front((task_id, task, std::time::Instant::now()));
+        self.pending_user_tasks
+            .push_front((task_id, task, std::time::Instant::now()));
     }
 
     /// Pop the next pending user task, if any. Strips the enqueue timestamp.
     pub fn dequeue_user_task(&mut self) -> Option<(uuid::Uuid, InboundTaskPayload)> {
-        self.pending_user_tasks.pop_front().map(|(id, task, _)| (id, task))
+        self.pending_user_tasks
+            .pop_front()
+            .map(|(id, task, _)| (id, task))
     }
 
     /// Drop any queued tasks older than `max_age_secs`. Returns the number evicted.
     pub fn evict_stale_queued_tasks(&mut self, max_age_secs: u64) -> usize {
         let cutoff = std::time::Duration::from_secs(max_age_secs);
         let before = self.pending_user_tasks.len();
-        self.pending_user_tasks.retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
+        self.pending_user_tasks
+            .retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
         before - self.pending_user_tasks.len()
     }
 
@@ -350,6 +356,22 @@ impl SessionState {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.provider_repair_attempts += 1;
             turn.provider_repair_attempts
+        } else {
+            0
+        }
+    }
+
+    pub fn streaming_retry_attempts(&self) -> u8 {
+        self.active_turn
+            .as_ref()
+            .map(|turn| turn.streaming_retry_attempts)
+            .unwrap_or(0)
+    }
+
+    pub fn increment_streaming_retry_attempts(&mut self) -> u8 {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.streaming_retry_attempts += 1;
+            turn.streaming_retry_attempts
         } else {
             0
         }
@@ -535,27 +557,44 @@ impl SessionState {
     pub fn register_standing_preapproval(&mut self, tool_name: &str, required_successes: u32) {
         let current = *self.tool_success_streak.get(tool_name).unwrap_or(&0);
         if current >= required_successes {
-            if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
-                self.approval_policy.preapproved_tools.push(tool_name.to_string());
+            if !self
+                .approval_policy
+                .preapproved_tools
+                .contains(&tool_name.to_string())
+            {
+                self.approval_policy
+                    .preapproved_tools
+                    .push(tool_name.to_string());
             }
         } else {
-            self.pending_preapproval_thresholds.insert(tool_name.to_string(), required_successes);
+            self.pending_preapproval_thresholds
+                .insert(tool_name.to_string(), required_successes);
         }
     }
 
     /// Record a successful tool execution for streak tracking.
     /// If the streak hits a registered threshold, grants standing preapproval.
     pub fn record_tool_streak_success(&mut self, tool_name: &str) {
-        let streak = self.tool_success_streak.entry(tool_name.to_string()).or_insert(0);
+        let streak = self
+            .tool_success_streak
+            .entry(tool_name.to_string())
+            .or_insert(0);
         *streak += 1;
         if let Some(&threshold) = self.pending_preapproval_thresholds.get(tool_name) {
             if *streak >= threshold {
                 self.pending_preapproval_thresholds.remove(tool_name);
-                if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
-                    self.approval_policy.preapproved_tools.push(tool_name.to_string());
+                if !self
+                    .approval_policy
+                    .preapproved_tools
+                    .contains(&tool_name.to_string())
+                {
+                    self.approval_policy
+                        .preapproved_tools
+                        .push(tool_name.to_string());
                     tracing::info!(
                         "ConditionalPreapproval: '{}' earned standing approval after {} successive successes.",
-                        tool_name, *streak
+                        tool_name,
+                        *streak
                     );
                 }
             }
@@ -1690,7 +1729,11 @@ impl SessionState {
             );
         }
 
-        if let Some(graph_content) = self.agent_graph_snapshot.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(graph_content) = self
+            .agent_graph_snapshot
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             self.push_layer(
                 &mut layers,
                 &mut contributions,
@@ -2404,7 +2447,11 @@ impl SessionState {
         }
 
         if !turn.working_tool_history.is_empty() {
-            let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
+            let max_result_chars = self
+                .settings
+                .context_window
+                .max_tool_result_chars
+                .max(1_000);
             lines.push(format!(
                 "Tool history entries in local working state: {}.",
                 turn.working_tool_history.len()
@@ -2647,6 +2694,7 @@ impl SessionState {
                 "provider_repair_note": turn.provider_repair_note,
                 "provider_repair_attempts": turn.provider_repair_attempts,
                 "fallback_tier": turn.fallback_tier,
+                "streaming_retry_attempts": turn.streaming_retry_attempts,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
@@ -2820,10 +2868,14 @@ impl SessionState {
             if turn.is_null() {
                 return None;
             }
-            // Discard terminal turns — a process killed mid-turn leaves phase=failed/completed
-            // in the checkpoint; restoring them would block all new messages.
-            let phase_str = turn.get("phase").and_then(serde_json::Value::as_str).unwrap_or("queued");
-            if matches!(phase_str, "failed" | "completed") {
+            // Discard non-restorable turns — after a restart, in-flight model/tool/voice
+            // calls are gone. Restoring them leaves is_turn_active()=true forever.
+            // Only waiting_approval is worth keeping (operator may still resolve it).
+            let phase_str = turn
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("queued");
+            if !matches!(phase_str, "waiting_approval") {
                 return None;
             }
             let local_node_id = local_node_id();
@@ -2969,6 +3021,10 @@ impl SessionState {
                     .map(str::to_string),
                 fallback_tier: turn
                     .get("fallback_tier")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u8,
+                streaming_retry_attempts: turn
+                    .get("streaming_retry_attempts")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u8,
             })
@@ -3197,8 +3253,12 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         .map(|tool_name| {
             let execution_mode = if is_local_agent_tool(tool_name) {
                 "local_agent"
+            } else if is_agent_graph_tool(tool_name) {
+                "agent_graph"
             } else if is_graph_datasource_tool(tool_name) {
                 "datasource"
+            } else if is_table_datasource_tool(tool_name) {
+                "table_datasource"
             } else if is_pinned_tool(tool_name) {
                 "pinned"
             } else {
@@ -3210,18 +3270,24 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     target_node: local_node_id.clone(),
                     target_role: if execution_mode == "local_agent" {
                         "agent".into()
+                    } else if execution_mode == "agent_graph" {
+                        "agent-graph".into()
                     } else if execution_mode == "datasource" {
                         "graph-datasource".into()
+                    } else if execution_mode == "table_datasource" {
+                        "table-datasource".into()
                     } else {
                         format!("tool.{tool_name}")
                     },
-                    runner_id: if execution_mode == "local_agent" {
+                    runner_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
+                    {
                         None
                     } else {
                         Some("tool-runner-01".into())
                     },
                     incarnation_id: None,
-                    hotel_id: if execution_mode == "local_agent" {
+                    hotel_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
+                    {
                         None
                     } else {
                         Some(local_node_id.clone())
@@ -3233,8 +3299,12 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
                         "agent_local_tool".into()
+                    } else if execution_mode == "agent_graph" {
+                        "agent_graph_route".into()
                     } else if execution_mode == "datasource" {
                         "graph_datasource_route".into()
+                    } else if execution_mode == "table_datasource" {
+                        "table_datasource_route".into()
                     } else if execution_mode == "pinned" {
                         "default_pinned_route".into()
                     } else {
@@ -3285,7 +3355,12 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
 
     // Always include observer and meta-approval tools — every philote can inspect its own
     // session/hotel and request standing approval for tools it uses regularly.
-    for always in ["session.status", "hotel.status", "hotel.logs", "approval.request_standing"] {
+    for always in [
+        "session.status",
+        "hotel.status",
+        "hotel.logs",
+        "approval.request_standing",
+    ] {
         let always = always.to_string();
         if !toolset.contains(&always) {
             toolset.push(always);
@@ -3305,6 +3380,15 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "memory.recall"
             | "memory.remember"
             | "rule.propose"
+            | "routing.policy.propose"
+            | "routing.reflex.set"
+            | "routing.reflex.get"
+            | "routing.pipeline.set"
+            | "routing.pipeline.remove"
+            | "routing.pipeline.get"
+            | "mcp.provision"
+            | "mcp.revoke"
+            | "desktop.observe"
             | "skill.register"
             | "skill.list"
             | "skill.assign"
@@ -3318,6 +3402,18 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "handoff.back"
             | "delegate.whisper"
             | "approval.request_standing"
+            | "table.add_listener"
+    )
+}
+
+fn is_agent_graph_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "agent.graph.read"
+            | "agent.graph.write"
+            | "agent.graph.declare"
+            | "agent.graph.recall"
+            | "agent.graph.sync"
     )
 }
 
@@ -3328,14 +3424,22 @@ fn is_graph_datasource_tool(tool_name: &str) -> bool {
     )
 }
 
+fn is_table_datasource_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "table.configure"
+            | "table.query"
+            | "table.insert"
+            | "table.rolloff"
+            | "table.stats"
+            | "table.schema"
+    )
+}
+
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list"
-            | "workspace.read"
-            | "workspace.search"
-            | "workspace.write"
-            | "desktop.observe"
+        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
     )
 }
 
@@ -3681,6 +3785,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         }
     }
 
@@ -3718,6 +3823,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3822,6 +3928,7 @@ mod tests {
                     execution_mode: "capability".into(),
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
+                    target_capability: None,
                 },
             )]),
         };
@@ -3874,6 +3981,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.complete_active_turn("hi".into());
@@ -3920,6 +4028,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4674,6 +4783,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let projection = state.build_context_projection("status");
@@ -4763,6 +4873,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let prompt = state.build_prompt("status");
@@ -4846,6 +4957,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4926,6 +5038,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5303,7 +5416,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_observe_gets_pinned_desktop_route() {
+    fn desktop_observe_gets_local_agent_route() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.clear_tool_bindings();
@@ -5314,13 +5427,27 @@ mod tests {
             .resolve_tool_route("desktop.observe")
             .expect("desktop.observe route should exist");
 
-        assert_eq!(route.execution_mode, "pinned");
-        assert_eq!(route.task_runner_kind.as_deref(), Some("desktop"));
-        assert_eq!(route.target_role, "tool.desktop.observe");
-        assert_eq!(
-            route.selection_reason.as_deref(),
-            Some("default_pinned_route")
-        );
+        assert_eq!(route.execution_mode, "local_agent");
+        assert_eq!(route.target_role, "agent");
+        assert_eq!(route.selection_reason.as_deref(), Some("agent_local_tool"));
+    }
+
+    #[test]
+    fn agent_graph_tools_route_to_agent_graph_role() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("agent.graph.read");
+        state.rebuild_default_tool_assembly();
+
+        let route = state
+            .resolve_tool_route("agent.graph.read")
+            .expect("agent.graph.read route should exist");
+
+        assert_eq!(route.execution_mode, "agent_graph");
+        assert_eq!(route.target_role, "agent-graph");
+        assert_eq!(route.runner_id, None);
+        assert_eq!(route.selection_reason.as_deref(), Some("agent_graph_route"));
     }
 
     #[test]
@@ -5470,6 +5597,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5523,6 +5651,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.push_tool_history(
@@ -5591,6 +5720,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.push_tool_history(
@@ -5660,6 +5790,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let reentry = state
@@ -5937,6 +6068,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -5973,7 +6105,11 @@ mod tests {
         // Other capabilities are unaffected.
         assert_eq!(
             state.preferred_component_implementation("voice.synthesize"),
-            state.agent_profile.voice_response_policy.provider.as_deref()
+            state
+                .agent_profile
+                .voice_response_policy
+                .provider
+                .as_deref()
         );
         assert_eq!(
             state.preferred_component_implementation("text.generate"),
@@ -5983,8 +6119,11 @@ mod tests {
 
     #[test]
     fn transcription_provider_none_when_not_configured() {
-        let state =
-            SessionState::new("sess-tx2".into(), "agent-bjork-01".into(), "telegram".into());
+        let state = SessionState::new(
+            "sess-tx2".into(),
+            "agent-bjork-01".into(),
+            "telegram".into(),
+        );
         // Default MediaRoutingPolicy has no transcription_provider.
         assert_eq!(
             state.preferred_component_implementation("voice.transcribe"),
@@ -6005,16 +6144,24 @@ mod tests {
         assert_eq!(json["transcription_provider"], "onnx");
 
         let round_tripped: MediaRoutingPolicy = serde_json::from_value(json).unwrap();
-        assert_eq!(round_tripped.transcription_provider.as_deref(), Some("onnx"));
+        assert_eq!(
+            round_tripped.transcription_provider.as_deref(),
+            Some("onnx")
+        );
     }
 
     #[test]
     fn component_route_assembly_takes_precedence_over_transcription_provider() {
-        use crate::session::types::{ComponentExecutionRoute, ComponentRouteAssembly, MediaRoutingPolicy};
+        use crate::session::types::{
+            ComponentExecutionRoute, ComponentRouteAssembly, MediaRoutingPolicy,
+        };
         use std::collections::BTreeMap;
 
-        let mut state =
-            SessionState::new("sess-tx3".into(), "agent-bjork-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-tx3".into(),
+            "agent-bjork-01".into(),
+            "telegram".into(),
+        );
         state.agent_profile.media_routing_policy = MediaRoutingPolicy {
             transcription_provider: Some("onnx".into()),
             ..MediaRoutingPolicy::default()
@@ -6038,7 +6185,11 @@ mod tests {
         // returns None because the route assembly takes the component_route_for_capability path.
         // Callers use resolve_model_execution_target which checks route assembly before falling
         // back to preferred_component_implementation — just assert both APIs are consistent.
-        assert!(state.resolve_component_execution_route("voice.transcribe").is_some());
+        assert!(
+            state
+                .resolve_component_execution_route("voice.transcribe")
+                .is_some()
+        );
     }
 
     fn make_turn_with_plan(plan: ActivePlan) -> WorkingTurn {
@@ -6072,6 +6223,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         }
     }
 
@@ -6193,6 +6345,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         };
         state.start_turn(turn);
         state.push_tool_history(

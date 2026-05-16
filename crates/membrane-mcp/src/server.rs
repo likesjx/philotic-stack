@@ -3,7 +3,7 @@
 use axum::{
     Router,
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -62,7 +62,7 @@ pub type SharedState = Arc<MembraneState>;
 
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
-        .route("/mcp", post(handle_mcp))
+        .route("/mcp", post(handle_mcp).get(handle_mcp_sse))
         .route("/health", get(handle_health))
         .with_state(state)
 }
@@ -73,6 +73,24 @@ async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "membrane-mcp ok")
 }
 
+// ── GET /mcp — Streamable HTTP SSE channel (MCP 2025-03-26) ──────────────────
+//
+// Clients using the Streamable HTTP transport open this GET endpoint to receive
+// server-initiated messages. We don't push server-initiated messages yet, so we
+// return a minimal SSE stream with a keepalive comment and then close it.
+// Clients will reconnect if they need more events.
+async fn handle_mcp_sse() -> impl IntoResponse {
+    let body = ": keepalive\n\n";
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    (StatusCode::OK, headers, body)
+}
+
 // ── MCP dispatcher ────────────────────────────────────────────────────────────
 
 async fn handle_mcp(
@@ -80,39 +98,42 @@ async fn handle_mcp(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::Json(req): axum::Json<JsonRpcRequest>,
-) -> axum::Json<JsonRpcResponse> {
+) -> axum::response::Response {
+    let is_notification = req.id.is_none();
     let id = req.id.clone().unwrap_or(Value::Null);
     let is_loopback = addr.ip().is_loopback();
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+
+    match req.method.as_str() {
+        // Notifications — JSON-RPC spec: MUST NOT send a response.
+        "initialized" | "notifications/cancelled" | "notifications/progress" => {
+            return (StatusCode::ACCEPTED, "").into_response();
+        }
+        _ => {}
+    }
+
+    // If id is absent this is a notification we don't explicitly handle; still no response.
+    if is_notification {
+        return (StatusCode::ACCEPTED, "").into_response();
+    }
 
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id, req.params),
-        "initialized" => {
-            // Notification — no response required per spec, but we ack.
-            JsonRpcResponse::ok(id, json!({}))
-        }
         "ping" => JsonRpcResponse::ok(id, json!({})),
         "tools/list" => handle_tools_list(&state, id, auth_header).await,
-        "tools/call" => {
-            handle_tools_call(&state, id, req.params, auth_header, is_loopback).await
-        }
+        "tools/call" => handle_tools_call(&state, id, req.params, auth_header, is_loopback).await,
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
 
-    axum::Json(resp)
+    axum::Json(resp).into_response()
 }
 
 // ── Method handlers ───────────────────────────────────────────────────────────
 
 fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
-    let _params: InitializeParams = match params.and_then(|p| serde_json::from_value(p).ok()) {
-        Some(p) => p,
-        None => {
-            return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, "invalid initialize params");
-        }
-    };
+    // Params are optional — tolerate clients that omit them entirely.
+    let _params: Option<InitializeParams> =
+        params.and_then(|p| serde_json::from_value(p).ok());
 
     JsonRpcResponse::ok(
         id,
@@ -123,7 +144,9 @@ fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             capabilities: ServerCapabilities {
-                tools: ToolsCapability { list_changed: false },
+                tools: ToolsCapability {
+                    list_changed: false,
+                },
             },
         })
         .unwrap(),
@@ -146,10 +169,7 @@ async fn handle_tools_list(
         table.visible_descriptors(caller_id)
     };
 
-    JsonRpcResponse::ok(
-        id,
-        serde_json::to_value(ToolsListResult { tools }).unwrap(),
-    )
+    JsonRpcResponse::ok(id, serde_json::to_value(ToolsListResult { tools }).unwrap())
 }
 
 async fn handle_tools_call(
@@ -162,7 +182,11 @@ async fn handle_tools_call(
     let params: ToolCallParams = match params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
         None => {
-            return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, "invalid tools/call params");
+            return JsonRpcResponse::err(
+                id,
+                error_code::INVALID_PARAMS,
+                "invalid tools/call params",
+            );
         }
     };
 
@@ -195,7 +219,11 @@ async fn handle_tools_call(
         drop(endpoint);
 
         let requires_approval = !preapproved && !is_loopback;
-        let timeout = if requires_approval { APPROVAL_TIMEOUT } else { DISPATCH_TIMEOUT };
+        let timeout = if requires_approval {
+            APPROVAL_TIMEOUT
+        } else {
+            DISPATCH_TIMEOUT
+        };
 
         let turn_id = Uuid::new_v4().to_string();
         let session_id = format!("mcp-{}-{}", tool_spec.name, &turn_id[..8]);
@@ -257,8 +285,8 @@ async fn handle_tools_call(
         return match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(content)) => {
                 let transformed = transform::apply_outbound(&tool_spec, &content);
-                let result_value = serde_json::from_str(&transformed)
-                    .unwrap_or(json!({ "text": transformed }));
+                let result_value =
+                    serde_json::from_str(&transformed).unwrap_or(json!({ "text": transformed }));
                 JsonRpcResponse::ok(
                     id,
                     serde_json::to_value(ToolCallResult::json(result_value)).unwrap(),
@@ -309,7 +337,11 @@ async fn handle_tools_call(
     };
 
     let requires_approval = route.record.security.require_approval;
-    let timeout = if requires_approval { APPROVAL_TIMEOUT } else { DISPATCH_TIMEOUT };
+    let timeout = if requires_approval {
+        APPROVAL_TIMEOUT
+    } else {
+        DISPATCH_TIMEOUT
+    };
 
     let session_id = format!("mcp-{}", caller.token_id);
     let turn_id = Uuid::new_v4().to_string();

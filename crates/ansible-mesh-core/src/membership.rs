@@ -1,11 +1,11 @@
 use crate::NodeCapabilities;
-use anyhow::{Context, Result, bail};
-use base64::Engine;
+use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -157,7 +157,11 @@ fn sign_canonical<T: Serialize>(value: &T, signing_key: &SigningKey) -> Result<S
     Ok(URL_SAFE_NO_PAD.encode(signature.to_bytes()))
 }
 
-fn verify_canonical<T: Serialize>(value: &T, signature_b64: &str, public_key_b64: &str) -> Result<()> {
+fn verify_canonical<T: Serialize>(
+    value: &T,
+    signature_b64: &str,
+    public_key_b64: &str,
+) -> Result<()> {
     let canonical = serde_json::to_vec(value).context("serialize signed mesh payload")?;
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature_b64)

@@ -161,6 +161,107 @@ pub fn extract_audio_artifact_json(model_result: Option<&Value>) -> Option<Strin
     Some(serialized)
 }
 
+/// Transcode any audio format (OGG, MP3, etc.) to a 16 kHz mono WAV using
+/// ffmpeg.  Returns raw WAV bytes ready for `hound::WavReader`.
+///
+/// If the source is already WAV (`mime_type` starts with `"audio/wav"` or
+/// `"audio/x-wav"`), the bytes are returned unchanged to avoid a re-encode.
+pub async fn transcode_to_wav_16k(
+    source_bytes: Vec<u8>,
+    mime_type: &str,
+    ffmpeg_bin: &str,
+) -> Result<Vec<u8>> {
+    let normalized = mime_type.trim().to_ascii_lowercase();
+    if normalized.starts_with("audio/wav") || normalized.starts_with("audio/x-wav") {
+        return Ok(source_bytes);
+    }
+    transcode_raw_to_wav_16k(source_bytes, mime_type, ffmpeg_bin).await
+}
+
+async fn transcode_raw_to_wav_16k(
+    source_bytes: Vec<u8>,
+    source_mime_type: &str,
+    ffmpeg_bin: &str,
+) -> Result<Vec<u8>> {
+    let mut child = tokio::process::Command::new(ffmpeg_bin)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-f")
+        .arg("wav")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("pipe:1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!("failed to spawn [{ffmpeg_bin}] for WAV transcode from [{source_mime_type}]")
+        })?;
+
+    let mut stdin = child.stdin.take().context("WAV transcoder missing stdin")?;
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, &source_bytes)
+        .await
+        .context("failed to stream source audio into WAV transcoder")?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to await WAV transcoder")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "WAV transcoder [{ffmpeg_bin}] failed for [{source_mime_type}]: {}",
+            stderr.trim()
+        );
+    }
+    if output.stdout.is_empty() {
+        bail!("WAV transcoder [{ffmpeg_bin}] returned empty output for [{source_mime_type}]");
+    }
+    // ffmpeg writes 0xffffffff for RIFF chunk size and data chunk size when the
+    // output is a pipe (size unknown at write time). hound validates that the
+    // data chunk size is a multiple of bytes_per_sample, which fails for
+    // 0xffffffff with 16-bit samples (odd). Patch both sizes to the real values.
+    Ok(patch_wav_streaming_sizes(output.stdout))
+}
+
+/// Patch the RIFF chunk size and the first `data` chunk size in a WAV byte
+/// vector whose sizes were written as `0xffffffff` (streaming/pipe mode).
+fn patch_wav_streaming_sizes(mut bytes: Vec<u8>) -> Vec<u8> {
+    let total = bytes.len();
+    if total < 44 {
+        return bytes;
+    }
+    // RIFF chunk size lives at bytes[4..8].
+    let riff_size = (total.saturating_sub(8)) as u32;
+    bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+    // Scan for the first "data" chunk whose stored size is 0xffffffff.
+    let mut i = 12usize;
+    while i + 8 <= total {
+        if &bytes[i..i + 4] == b"data" {
+            let stored = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap());
+            if stored == u32::MAX {
+                let data_size = (total.saturating_sub(i + 8)) as u32;
+                bytes[i + 4..i + 8].copy_from_slice(&data_size.to_le_bytes());
+            }
+            break;
+        }
+        // Skip to the next chunk: 4-byte tag + 4-byte length + chunk payload.
+        let chunk_len = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap_or([0; 4]));
+        i += 8 + chunk_len as usize;
+    }
+    bytes
+}
+
 pub async fn prepare_audio_ligand_for_pcm(
     mime_type: &str,
     bytes: Vec<u8>,

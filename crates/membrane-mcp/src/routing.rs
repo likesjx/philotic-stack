@@ -184,11 +184,7 @@ impl McpEndpointTable {
 
     /// Look up a tool spec by name.
     pub fn find_tool(&self, name: &str) -> Option<&McpToolSpec> {
-        self.config
-            .as_ref()?
-            .tools
-            .iter()
-            .find(|t| t.name == name)
+        self.config.as_ref()?.tools.iter().find(|t| t.name == name)
     }
 
     /// Returns `true` if a pre-approval rule matches the given action.

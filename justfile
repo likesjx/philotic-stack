@@ -454,9 +454,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-onnx model-controller-parakeet philote-worker tool-runner graph-runner graph-datasource graph-intelligence"
+    AIUA_BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet philote-worker tool-runner graph-runner graph-datasource graph-intelligence table-datasource router-listener agent-graph-runner"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p graph-datasource -p graph-intelligence -p philotic-web
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p graph-datasource -p graph-intelligence -p philotic-web -p table-datasource -p router-listener -p agent-graph-runner
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -466,7 +466,15 @@ local-push:
             continue
         fi
         if [ ! -f "${AIUA_CELLAR}/$bin" ]; then
-            echo "  – $bin (not in local Cellar, skipping)"
+            cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
+            chmod 555 "${AIUA_CELLAR}/$bin"
+            # Create /opt/homebrew/bin symlink for new binaries
+            if [ ! -e "/opt/homebrew/bin/$bin" ]; then
+                ln -s "../Cellar/aiua/0.1.0-alpha/bin/$bin" "/opt/homebrew/bin/$bin"
+                echo "  + $bin (new + symlinked)"
+            else
+                echo "  + $bin (new)"
+            fi
             continue
         fi
         rm -f "${AIUA_CELLAR}/$bin"

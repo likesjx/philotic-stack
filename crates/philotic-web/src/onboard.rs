@@ -8,9 +8,9 @@ use inquire::{Confirm, Password, Select, Text};
 use serde_json::{json, Map, Value};
 use std::{path::Path, process::Stdio};
 
+use crate::presets::{self, ApprovalPolicy};
 #[cfg(target_os = "macos")]
 use crate::service;
-use crate::presets::{self, ApprovalPolicy};
 
 /// Run the interactive onboarding wizard.
 ///
@@ -323,7 +323,10 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
 
     println!();
     println!("  ✓ Config written to {}", config_path.display());
-    println!("  ✓ Hotel '{}' provisioned into the Context Graph", hotel_name);
+    println!(
+        "  ✓ Hotel '{}' provisioned into the Context Graph",
+        hotel_name
+    );
     println!(
         "  ✓ {} agent{} configured",
         agent_count,
@@ -341,8 +344,14 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
     }
     println!();
     println!("  Next steps:");
-    println!("    phil status --hotel {}  inspect the daemon and agent config", hotel_name);
-    println!("    phil start --hotel {}   start the hotel daemon (if not using launchd)", hotel_name);
+    println!(
+        "    phil status --hotel {}  inspect the daemon and agent config",
+        hotel_name
+    );
+    println!(
+        "    phil start --hotel {}   start the hotel daemon (if not using launchd)",
+        hotel_name
+    );
     println!("    phil service status  inspect the launchd service");
     println!("    phil serve --open-path /setup-guide   open the management UI guide");
     println!();
