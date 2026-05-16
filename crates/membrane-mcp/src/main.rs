@@ -155,6 +155,19 @@ impl MembraneGuest for McpMembrane {
             }
         }
 
+        // Replay any routes that were persisted before this restart.
+        match client.send_request(IpcRequest::GetMcpRoutes {}).await {
+            Ok(IpcResponse::McpRouteState { agents }) if !agents.is_empty() => {
+                let mut table = self.state.routing_table.write().await;
+                for entry in &agents {
+                    table.upsert_agent_routes(&entry.agent_id, entry.routes.clone());
+                }
+                info!(count = agents.len(), "replayed persisted MCP routes on startup");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),
+        }
+
         // Start HTTP server (detached task).
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         let router =

@@ -7817,9 +7817,25 @@ impl IpcServer {
             }
 
             // ── MCP route table management ────────────────────────────────
-            IpcRequest::UpdateMcpRoutes { agent_id, routes } => {
+            IpcRequest::UpdateMcpRoutes { agent_id, routes, vault_ref } => {
                 let route_count = routes.len();
-                // Serialize and push to any active MCP membrane subscriber.
+                // Persist so routes survive hotel restarts.
+                let entry = serde_json::json!({
+                    "agent_id": agent_id,
+                    "routes": routes,
+                    "vault_ref": vault_ref,
+                });
+                let mut all: std::collections::HashMap<String, serde_json::Value> = graph
+                    .get_config_value("__mcp_routes__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                all.insert(agent_id.clone(), entry);
+                if let Ok(json) = serde_json::to_string(&all) {
+                    let _ = graph.set_config_value("__mcp_routes__", &json);
+                }
+                // Fan-out to any connected mcp-membrane guest.
                 let task_json = serde_json::json!({
                     "action": "update_mcp_routes",
                     "agent_id": agent_id,
@@ -7842,6 +7858,17 @@ impl IpcServer {
             }
 
             IpcRequest::RevokeMcpRoutes { agent_id } => {
+                // Remove from persisted store.
+                let mut all: std::collections::HashMap<String, serde_json::Value> = graph
+                    .get_config_value("__mcp_routes__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                all.remove(&agent_id);
+                if let Ok(json) = serde_json::to_string(&all) {
+                    let _ = graph.set_config_value("__mcp_routes__", &json);
+                }
                 let task_json = serde_json::json!({
                     "action": "revoke_mcp_routes",
                     "agent_id": agent_id,
@@ -7860,6 +7887,20 @@ impl IpcServer {
                     mcp_routes_agent_id: agent_id,
                     mcp_route_count: 0,
                 }
+            }
+
+            IpcRequest::GetMcpRoutes {} => {
+                let all: std::collections::HashMap<String, serde_json::Value> = graph
+                    .get_config_value("__mcp_routes__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let agents: Vec<philotic_client::PersistedMcpRouteEntry> = all
+                    .into_values()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect();
+                IpcResponse::McpRouteState { agents }
             }
 
             // ── MCP endpoint provisioning ──────────────────────────────────
