@@ -77,14 +77,17 @@ pub mod error_code {
 // ── MCP initialize ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
     pub protocol_version: String,
-    pub client_info: ClientInfo,
+    #[serde(default)]
+    pub client_info: Option<ClientInfo>,
     #[serde(default)]
     pub capabilities: Value,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientInfo {
     pub name: String,
     #[serde(default)]

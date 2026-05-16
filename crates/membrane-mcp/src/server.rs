@@ -3,7 +3,7 @@
 use axum::{
     Router,
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -62,7 +62,7 @@ pub type SharedState = Arc<MembraneState>;
 
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
-        .route("/mcp", post(handle_mcp))
+        .route("/mcp", post(handle_mcp).get(handle_mcp_sse))
         .route("/health", get(handle_health))
         .with_state(state)
 }
@@ -71,6 +71,24 @@ pub fn build_router(state: SharedState) -> Router {
 
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "membrane-mcp ok")
+}
+
+// ── GET /mcp — Streamable HTTP SSE channel (MCP 2025-03-26) ──────────────────
+//
+// Clients using the Streamable HTTP transport open this GET endpoint to receive
+// server-initiated messages. We don't push server-initiated messages yet, so we
+// return a minimal SSE stream with a keepalive comment and then close it.
+// Clients will reconnect if they need more events.
+async fn handle_mcp_sse() -> impl IntoResponse {
+    let body = ": keepalive\n\n";
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    (StatusCode::OK, headers, body)
 }
 
 // ── MCP dispatcher ────────────────────────────────────────────────────────────
@@ -103,16 +121,9 @@ async fn handle_mcp(
 // ── Method handlers ───────────────────────────────────────────────────────────
 
 fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
-    let _params: InitializeParams = match params.and_then(|p| serde_json::from_value(p).ok()) {
-        Some(p) => p,
-        None => {
-            return JsonRpcResponse::err(
-                id,
-                error_code::INVALID_PARAMS,
-                "invalid initialize params",
-            );
-        }
-    };
+    // Params are optional — tolerate clients that omit them entirely.
+    let _params: Option<InitializeParams> =
+        params.and_then(|p| serde_json::from_value(p).ok());
 
     JsonRpcResponse::ok(
         id,
