@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - recognizable-identity-continuity
+
+rectangle "recognizable-identity-continuity" as recognizable_identity_continuity #Orange {
+}
+
+
+@enduml

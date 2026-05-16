@@ -1,22 +1,22 @@
 ---
-title: "Scripted Turn Loop Variants Proposal"
+title: Scripted Turn Loop Variants Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: draft
-last_updated: 2026-03-24
+last_updated: 2026-03-31
 tags:
-  - agent-loop
-  - skills
-  - planning
-  - approval
-  - governance
-  - runtime
+- agent-loop
+- skills
+- planning
+- approval
+- governance
+- runtime
 related_docs:
-  - PHILOTIC_AGENT_LOOP_SPEC.md
-  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
-  - SKILL_LIFECYCLE_PROPOSAL.md
-  - APPROVAL_UX_PROPOSAL.md
-  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+- PHILOTIC_AGENT_LOOP_SPEC.md
+- GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+- SKILL_LIFECYCLE_PROPOSAL.md
+- APPROVAL_UX_PROPOSAL.md
+- ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
 proposal_id: scripted-turn-loop-variants
 ---
 

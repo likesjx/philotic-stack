@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mbp-jane-launchd-hardening
+
+rectangle "mbp-jane-launchd-hardening" as mbp_jane_launchd_hardening #Orange {
+}
+
+
+@enduml

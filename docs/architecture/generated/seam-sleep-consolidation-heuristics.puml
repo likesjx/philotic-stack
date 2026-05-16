@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - sleep-consolidation-heuristics
+
+rectangle "sleep-consolidation-heuristics" as sleep_consolidation_heuristics #Orange {
+}
+
+
+@enduml

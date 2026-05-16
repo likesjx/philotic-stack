@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - session-compaction
+
+rectangle "session-compaction" as session_compaction #Orange {
+}
+
+
+@enduml

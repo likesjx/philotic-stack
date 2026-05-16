@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-engine-schema
+
+rectangle "graph-engine-schema" as graph_engine_schema #Orange {
+}
+
+
+@enduml

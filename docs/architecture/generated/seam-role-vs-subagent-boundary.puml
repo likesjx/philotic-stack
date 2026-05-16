@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - role-vs-subagent-boundary
+
+rectangle "role-vs-subagent-boundary" as role_vs_subagent_boundary #Orange {
+}
+
+
+@enduml

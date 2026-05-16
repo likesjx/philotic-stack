@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-adapter-migration
+
+rectangle "graph-adapter-migration" as graph_adapter_migration #Orange {
+}
+
+
+@enduml

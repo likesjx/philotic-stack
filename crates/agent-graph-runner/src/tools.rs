@@ -5,10 +5,11 @@
 //! result to send back as the tool call reply.
 
 use ansible_mesh_core::agent_graph_storage::{
-    AgentExperienceTrace, AgentGraphSnapshot, AgentGraphStorage, AgentToolPreference,
+    AgentExperienceTrace, AgentGraphSnapshot, AgentGraphStorage, AgentReflexPreference,
+    AgentRoutingPreference, AgentToolPreference,
 };
 use ansible_mesh_core::resources::{ResourceDeclaration, ResourceType};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use ulid::Ulid;
 
 /// Dispatch an `agent.graph.*` tool call. Returns a JSON string result.
@@ -33,13 +34,11 @@ pub fn dispatch(
 
 /// Read agent graph state by entity type.
 ///
-/// Args: `{ "entity": "resource_grants" | "tool_preferences" | "resource_declarations" }`
+/// Args: `{ "entity": "resource_grants" | "tool_preferences" | "routing_preferences" | "reflex_preferences" | "resource_declarations" }`
 fn agent_graph_read(storage: &dyn AgentGraphStorage, args: &Value) -> String {
     let entity = match args.get("entity").and_then(Value::as_str) {
         Some(e) => e,
-        None => {
-            return json!({"ok": false, "error": "missing 'entity' field"}).to_string()
-        }
+        None => return json!({"ok": false, "error": "missing 'entity' field"}).to_string(),
     };
 
     match entity {
@@ -51,11 +50,21 @@ fn agent_graph_read(storage: &dyn AgentGraphStorage, args: &Value) -> String {
             Ok(prefs) => json!({"ok": true, "tool_preferences": prefs}).to_string(),
             Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
         },
+        "routing_preferences" => match storage.list_routing_preferences() {
+            Ok(prefs) => json!({"ok": true, "routing_preferences": prefs}).to_string(),
+            Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
+        },
+        "reflex_preferences" => match storage.list_reflex_preferences() {
+            Ok(prefs) => json!({"ok": true, "reflex_preferences": prefs}).to_string(),
+            Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
+        },
         "resource_declarations" => match storage.list_resource_declarations() {
             Ok(decls) => json!({"ok": true, "resource_declarations": decls}).to_string(),
             Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
         },
-        other => json!({"ok": false, "error": format!("unknown entity type '{other}'")}).to_string(),
+        other => {
+            json!({"ok": false, "error": format!("unknown entity type '{other}'")}).to_string()
+        }
     }
 }
 
@@ -75,18 +84,13 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
         "tool_preference" => {
             let tool_name = match args.get("tool_name").and_then(Value::as_str) {
                 Some(t) => t,
-                None => {
-                    return json!({"ok": false, "error": "missing 'tool_name'"}).to_string()
-                }
+                None => return json!({"ok": false, "error": "missing 'tool_name'"}).to_string(),
             };
             let preference_level = args
                 .get("preference_level")
                 .and_then(Value::as_i64)
                 .unwrap_or(0) as i32;
-            let config_json = args
-                .get("config")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let config_json = args.get("config").cloned().unwrap_or_else(|| json!({}));
             let pref = AgentToolPreference {
                 agent_id: agent_id.to_string(),
                 tool_name: tool_name.to_string(),
@@ -99,10 +103,75 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
                 Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
             }
         }
-        other => {
-            json!({"ok": false, "error": format!("write not supported for entity '{other}'")})
-                .to_string()
+        "routing_preference" => {
+            let preference_key = match args.get("preference_key").and_then(Value::as_str) {
+                Some(value) => value,
+                None => {
+                    return json!({"ok": false, "error": "missing 'preference_key'"}).to_string();
+                }
+            };
+            let pref = AgentRoutingPreference {
+                agent_id: agent_id.to_string(),
+                preference_key: preference_key.to_string(),
+                stage_kind: args
+                    .get("stage_kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                capability: args
+                    .get("capability")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                provider_hint: args
+                    .get("provider_hint")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                model_ref: args
+                    .get("model_ref")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                preference_level: args
+                    .get("preference_level")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32,
+                weight: args.get("weight").and_then(Value::as_i64).unwrap_or(0) as i32,
+                config_json: args.get("config").cloned().unwrap_or_else(|| json!({})),
+                updated_at: 0,
+            };
+            match storage.upsert_routing_preference(&pref) {
+                Ok(()) => json!({"ok": true}).to_string(),
+                Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
+            }
         }
+        "reflex_preference" => {
+            let preference_key = match args.get("preference_key").and_then(Value::as_str) {
+                Some(value) => value,
+                None => {
+                    return json!({"ok": false, "error": "missing 'preference_key'"}).to_string();
+                }
+            };
+            let reflexes_json = match args.get("reflexes") {
+                Some(value) if value.is_object() => value.clone(),
+                Some(_) => {
+                    return json!({"ok": false, "error": "'reflexes' must be an object"})
+                        .to_string()
+                }
+                None => return json!({"ok": false, "error": "missing 'reflexes'"}).to_string(),
+            };
+            let pref = AgentReflexPreference {
+                agent_id: agent_id.to_string(),
+                preference_key: preference_key.to_string(),
+                precedence: args.get("precedence").and_then(Value::as_i64).unwrap_or(70) as i32,
+                reflexes_json,
+                config_json: args.get("config").cloned().unwrap_or_else(|| json!({})),
+                updated_at: 0,
+            };
+            match storage.upsert_reflex_preference(&pref) {
+                Ok(()) => json!({"ok": true}).to_string(),
+                Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
+            }
+        }
+        other => json!({"ok": false, "error": format!("write not supported for entity '{other}'")})
+            .to_string(),
     }
 }
 
@@ -145,10 +214,7 @@ fn agent_graph_declare(storage: &dyn AgentGraphStorage, args: &Value, _agent_id:
 ///
 /// Args: `{ "limit": N, "event_type": "tool_call" }` (both optional)
 fn agent_graph_recall(storage: &dyn AgentGraphStorage, args: &Value) -> String {
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(20) as usize;
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
     let result = if let Some(et) = args.get("event_type").and_then(Value::as_str) {
         storage.list_traces_by_event_type(et, limit)
     } else {
@@ -182,6 +248,10 @@ fn agent_graph_sync(storage: &dyn AgentGraphStorage, args: &Value, _agent_id: &s
             "ok": true,
             "preferences_applied": result.preferences_applied,
             "preferences_skipped": result.preferences_skipped,
+            "routing_preferences_applied": result.routing_preferences_applied,
+            "routing_preferences_skipped": result.routing_preferences_skipped,
+            "reflex_preferences_applied": result.reflex_preferences_applied,
+            "reflex_preferences_skipped": result.reflex_preferences_skipped,
             "declarations_applied": result.declarations_applied,
             "declarations_skipped": result.declarations_skipped,
         })

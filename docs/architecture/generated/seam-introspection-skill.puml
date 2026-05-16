@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - introspection-skill
+
+rectangle "introspection-skill" as introspection_skill #Orange {
+}
+
+
+@enduml

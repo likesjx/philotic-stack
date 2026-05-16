@@ -1,27 +1,27 @@
 ---
-title: "Distributed Cron Scheduler Proposal"
+title: Distributed Cron Scheduler Proposal
 doc_type: proposal
 domain: runtime-and-sessions
 status: accepted-current-slice
-last_updated: 2026-03-26
+last_updated: 2026-03-31
 tags:
-  - cron
-  - scheduling
-  - hotel
-  - mesh
-  - guaranteed-delivery
-  - aiua
+- cron
+- scheduling
+- hotel
+- mesh
+- guaranteed-delivery
+- aiua
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
-  - TASK_RUNNER_PROPOSAL.md
-  - INTER_HOTEL_ROUTING_PROPOSAL.md
-  - TELEGRAM_POLL_LEASE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- TASK_RUNNER_PROPOSAL.md
+- INTER_HOTEL_ROUTING_PROPOSAL.md
+- TELEGRAM_POLL_LEASE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: distributed-cron-scheduler
 implements:
-  - hotel-scheduler
+- hotel-scheduler
 active_seams: []
 ---
 

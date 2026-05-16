@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
 
     let deadline = Duration::from_secs(10);
     let mut reply_content = None;
-    for _ in 0..10 {
+    for _ in 0..30 {
         let inbound = timeout(deadline, client.recv_task())
             .await
             .context("timed out waiting for final reply")??;

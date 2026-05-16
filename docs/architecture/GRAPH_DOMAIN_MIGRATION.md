@@ -1,15 +1,15 @@
 ---
-title: "GraphStorage → GraphDomain Migration Tracker"
+title: GraphStorage → GraphDomain Migration Tracker
 doc_type: task
 domain: graph-domain-layer
 status: in-progress
-last_updated: 2026-03-26
+last_updated: 2026-03-31
 tags:
-  - graph-domain
-  - migration
-  - cleanup
+- graph-domain
+- migration
+- cleanup
 related_proposals:
-  - GRAPH_LAYER_UNIFICATION_PROPOSAL.md
+- GRAPH_LAYER_UNIFICATION_PROPOSAL.md
 ---
 
 # GraphStorage → GraphDomain Migration Tracker

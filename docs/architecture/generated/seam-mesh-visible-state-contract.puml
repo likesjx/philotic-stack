@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mesh-visible-state-contract
+
+rectangle "mesh-visible-state-contract" as mesh_visible_state_contract #Orange {
+}
+
+
+@enduml

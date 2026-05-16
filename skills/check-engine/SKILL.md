@@ -15,19 +15,16 @@ This is the **E** (End) step of the SVE loop. It is the forcing function that ke
 
 ## The Five Checks
 
-### 1. Memory Sweep
+### 1. Memory Sweep (Reflex Validation)
 
-Ask: what happened in this session that isn't yet in Muninn?
+Ask: has the `mempalace_reflex_hook.sh` correctly captured the transcript of this session?
 
-Scan the conversation for:
-- bugs found and root-caused
-- architectural decisions made (with rationale)
-- deployment procedures executed or discovered
-- process gaps identified
-- user preferences or constraints stated
-- external system behaviors observed
+For coding operators (Claude Code, Antigravity, Cursor) that support lifecycle hooks, this occurs automatically on session end into the `intel-graph` broker.
 
-For anything not yet stored: call `muninn_remember_batch` directly in the main thread (not via subagent — you need confirmation before the session closes). Keep each memory atomic: one concept, 1–3 sentences.
+If your IDE runner does **not** natively support `Stop` or `PreCompact` hooks:
+Execute the bash hook directly as the final step of the session:
+`bash scripts/mempalace_reflex_hook.sh overview.txt`
+where `overview.txt` is the path to your current transcript or memory slice.
 
 ### 2. MEMORY.md Sync
 
@@ -55,9 +52,9 @@ List explicitly:
 Ask: did the SVE process fail anywhere this session?
 
 Common failure modes:
-- session bootstrap skipped (Muninn recall not done at start)
-- Muninn writes batched to end instead of during work
-- file-based memory and Muninn drifted (one updated, not the other)
+- session bootstrap skipped (Mempalace wake-up recall not done at start)
+- file-based memory and graph memory drifted (one updated, not the other)
+- Mempalace hook failed to fire or dropped payload without alerting
 - slice closed without `philotic-slice-closeout` pass
 - deployment touched both formulas but only one was updated
 
@@ -75,6 +72,28 @@ If any code was written or committed this session, confirm:
 - `just check` passes
 - relevant tests pass
 - no stale zombie processes on either machine
+
+### 6. Graph Health Check
+
+If the Intel Graph is running (`just intel-graph-status`), run the combined health check:
+
+```bash
+curl -s http://127.0.0.1:8900/api/health | jq .
+```
+
+Check for:
+- **Stale sessions**: Active sessions older than 4 hours → auto-cleanup via `just intel-graph-session-cleanup`
+- **Orphaned workstreams**: Workstreams with no active session → investigate and close
+- **Missing dispositions**: Proposals without a disposition → flag for next session
+- **Verification gaps**: High count of `verification_level: none` → prioritize in next slice
+- **Embedding gaps**: Proposals without embeddings → run `just intel-graph-embed-proposals`
+
+If the graph is not running, skip this check and note it in the output.
+
+Also check:
+- Was a `session_start` called at the beginning of this session? If not, note the gap.
+- Was `session_close` called? If not, close it now.
+- Were any test runs recorded? If code was tested, record results via `just test-and-record`.
 
 ## Output Format
 
@@ -97,6 +116,12 @@ If any code was written or committed this session, confirm:
 
 ### Green Status
 - <check result or skipped if no code changed>
+
+### Graph Health
+- Sessions: <active>/<total>, stale: <count>, cleaned: <count>
+- Proposals: <total>, missing disposition: <count>, no verification: <count>
+- Embeddings: <count> unembedded proposals
+- Session protocol: <started/closed/gap noted>
 ```
 
 ## Relationship To Retrospectives
@@ -117,10 +142,9 @@ Escalate to [$retrospective-workflow](../retrospective-workflow/SKILL.md) when t
 - a new rule-placement lesson
 - an SVE/process optimization opportunity
 
-## Muninn Write Rule at Session Close
+## Reflexive Write Rule at Session Close
 
-At session end, call `muninn_remember` / `muninn_remember_batch` **directly in the main thread**.
-
-Do not delegate to a background subagent at close-out — the session may end before the subagent completes. Direct writes give you confirmation before the session closes.
-
-The `muninn-memory-habit` subagent delegation rule applies **during active work** (non-blocking writes). At check-engine time, block and confirm.
+At session end, ensure the Mempalace broker received the latest context slice.
+If you are operating in `Claude Code`, this is handled natively by `.claude.json`.
+If you are operating directly from an operator layer without lifecycle hooks, manually wrap up the terminal loop by invoking:
+`bash scripts/mempalace_reflex_hook.sh <transcript_path>`

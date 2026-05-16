@@ -2,13 +2,17 @@ use anyhow::Result;
 use clap::Parser;
 use memory_core::{MemoryEngine as _, MemoryScope, MuninnConfig, MuninnRestEngine, VaultResolver};
 use philotic_client::{is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use philotic_sandbox::{
+    DirectShellExecutor, ExecuteCommandRequest, ExecuteCommandResponse, ExecutionStatus,
+    SandboxedShellExecutor, ShellExecutionMode, ShellExecutor,
+};
 use serde_json::json;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
-use tokio::process::Command as TokioCommand;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
@@ -81,6 +85,7 @@ impl WorkspaceRunnerConfig {
                     "workspace.list".into(),
                     "workspace.read".into(),
                     "workspace.search".into(),
+                    "desktop.observe".into(),
                 ]
             });
         let max_read_bytes = std::env::var("PHILOTIC_WORKSPACE_MAX_READ_BYTES")
@@ -331,8 +336,42 @@ fn execute_tool(
                 Err(err) => format!("workspace.search error: {err}"),
             }
         }
+        "desktop.observe" => execute_desktop_observe(arguments),
         _ => "unsupported tool".into(),
     }
+}
+
+fn execute_desktop_observe(arguments: &serde_json::Value) -> String {
+    let detail = arguments
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("summary");
+    let desktop_session_id = std::env::var("PHILOTIC_DESKTOP_SESSION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "desktop://local/default".into());
+    let current_dir = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
+
+    serde_json::to_string(&json!({
+        "tool_name": "desktop.observe",
+        "status": "observe_only_scaffold",
+        "runner_id": "tool-runner-01",
+        "incarnation_id": "tool-runner-01",
+        "hotel_id": local_node_id(),
+        "environment_id": "desktop://local/default",
+        "desktop_session_id": desktop_session_id,
+        "detail": detail,
+        "content_type": "application/vnd.philotic.desktop-observation+json",
+        "redaction_posture": "metadata_only",
+        "screenshot_available": false,
+        "input_actions_available": false,
+        "current_dir": current_dir,
+        "note": "desktop.observe is wired as an observe-only CUA scaffold; screenshot/click/type/key tools remain unavailable until approval and artifact policy land."
+    }))
+    .unwrap_or_else(|err| format!("desktop.observe error: {err}"))
 }
 
 fn search_workspace(
@@ -554,7 +593,27 @@ async fn execute_memory_tool(
 
 // ──── Shell tool helpers ──────────────────────────────────────────────────────
 
-async fn execute_bash_tool(arguments: &serde_json::Value) -> String {
+fn shell_execution_mode_from_env() -> ShellExecutionMode {
+    match std::env::var("PHILOTIC_SANDBOX_SOCKET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(socket_path) => ShellExecutionMode::Sandboxed { socket_path },
+        None => ShellExecutionMode::Direct,
+    }
+}
+
+fn shell_executor_for_mode(mode: &ShellExecutionMode) -> Box<dyn ShellExecutor> {
+    match mode {
+        ShellExecutionMode::Direct => Box::new(DirectShellExecutor),
+        ShellExecutionMode::Sandboxed { socket_path } => {
+            Box::new(SandboxedShellExecutor::new(socket_path.clone()))
+        }
+    }
+}
+
+async fn execute_bash_tool(arguments: &serde_json::Value, mode: &ShellExecutionMode) -> String {
     let command = match arguments.get("command").and_then(|v| v.as_str()) {
         Some(cmd) => cmd,
         None => return "bash.exec error: missing `command`".into(),
@@ -566,27 +625,35 @@ async fn execute_bash_tool(arguments: &serde_json::Value) -> String {
         .unwrap_or(30)
         .min(300);
 
-    let mut cmd = TokioCommand::new("sh");
-    cmd.arg("-c").arg(command);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
+    let request = ExecuteCommandRequest {
+        request_id: format!("bash.exec-{}", Uuid::new_v4()),
+        command: "sh".into(),
+        args: vec!["-c".into(), command.to_string()],
+        cwd: working_dir.map(str::to_string),
+        env: std::collections::HashMap::new(),
+        stdin: None,
+        timeout_ms: Some(timeout_secs.saturating_mul(1000)),
+    };
 
-    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-        match cmd.spawn() {
-            Ok(child) => child.wait_with_output().await,
-            Err(e) => Err(e),
-        }
+    let executor = shell_executor_for_mode(mode);
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async move {
+        executor.execute(request).await
     })
     .await;
 
     match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let exit_code = output.status.code().unwrap_or(-1);
+        Ok(Ok(response)) => format_shell_response(response),
+        Ok(Err(e)) => format!("bash.exec error: {e}"),
+        Err(_) => format!("bash.exec error: timed out after {timeout_secs}s"),
+    }
+}
+
+fn format_shell_response(response: ExecuteCommandResponse) -> String {
+    match response.status {
+        ExecutionStatus::Success | ExecutionStatus::ProcessError => {
+            let stdout = String::from_utf8_lossy(&response.stdout);
+            let stderr = String::from_utf8_lossy(&response.stderr);
+            let exit_code = response.exit_code.unwrap_or(-1);
             if stderr.is_empty() {
                 format!("exit_code: {}\n{}", exit_code, stdout.trim_end())
             } else {
@@ -598,8 +665,26 @@ async fn execute_bash_tool(arguments: &serde_json::Value) -> String {
                 )
             }
         }
-        Ok(Err(e)) => format!("bash.exec error: {e}"),
-        Err(_) => format!("bash.exec error: timed out after {timeout_secs}s"),
+        ExecutionStatus::CommandNotAllowed => response
+            .error
+            .map(|err| format!("bash.exec error: {}", err.message))
+            .unwrap_or_else(|| "bash.exec error: command not allowed".into()),
+        ExecutionStatus::PathNotAllowed => response
+            .error
+            .map(|err| format!("bash.exec error: {}", err.message))
+            .unwrap_or_else(|| "bash.exec error: path not allowed".into()),
+        ExecutionStatus::EnvNotAllowed => response
+            .error
+            .map(|err| format!("bash.exec error: {}", err.message))
+            .unwrap_or_else(|| "bash.exec error: environment not allowed".into()),
+        ExecutionStatus::Timeout => response
+            .error
+            .map(|err| format!("bash.exec error: {}", err.message))
+            .unwrap_or_else(|| "bash.exec error: timed out".into()),
+        ExecutionStatus::SandboxError => response
+            .error
+            .map(|err| format!("bash.exec error: {}", err.message))
+            .unwrap_or_else(|| "bash.exec error: sandbox error".into()),
     }
 }
 
@@ -610,6 +695,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let _args = Args::parse();
     let workspace_config = WorkspaceRunnerConfig::from_env();
+    let shell_mode = shell_execution_mode_from_env();
 
     let identity = GuestIdentity {
         guest_id: "tool-runner-01".into(),
@@ -623,6 +709,7 @@ async fn main() -> Result<()> {
             "memory.remember".into(),
             "memory.forget".into(),
             "memory.link".into(),
+            "desktop.observe".into(),
             "bash.exec".into(),
         ],
     };
@@ -633,6 +720,7 @@ async fn main() -> Result<()> {
         "tool.workspace.list",
         "tool.workspace.read",
         "tool.workspace.search",
+        "tool.desktop.observe",
         "tool.memory.recall",
         "tool.memory.remember",
         "tool.memory.forget",
@@ -759,7 +847,7 @@ async fn main() -> Result<()> {
                         None => format!("{tool_name} error: memory not configured on this hotel"),
                     }
                 } else if tool_name == "bash.exec" {
-                    execute_bash_tool(&arguments).await
+                    execute_bash_tool(&arguments, &shell_mode).await
                 } else {
                     execute_tool(&effective_config, &tool_name, &arguments)
                 };
@@ -799,12 +887,16 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_tool, parse_workspace_runner_base_config, parse_workspace_runner_overlay,
-        search_workspace, EffectiveWorkspaceRunnerConfig, WorkspaceRunnerConfig,
-        WorkspaceRunnerOverlay,
+        execute_bash_tool, execute_tool, parse_workspace_runner_base_config,
+        parse_workspace_runner_overlay, search_workspace, EffectiveWorkspaceRunnerConfig,
+        ShellExecutionMode, WorkspaceRunnerConfig, WorkspaceRunnerOverlay,
     };
+    use philotic_sandbox::ipc::{read_frame, write_frame};
+    use philotic_sandbox::{ExecuteCommandRequest, ExecuteCommandResponse, ExecutionStatus};
     use serde_json::json;
     use std::fs;
+    use tokio::net::UnixListener;
+    use tokio::sync::oneshot;
 
     #[test]
     fn workspace_list_returns_directory_entries() {
@@ -830,6 +922,37 @@ mod tests {
             config.allowed_tools.iter().any(|tool| tool == "echo"),
             "default runner config should expose echo so advertised utility tools remain executable"
         );
+    }
+
+    #[test]
+    fn default_runner_config_allows_desktop_observe_scaffold() {
+        let config = WorkspaceRunnerConfig::from_env();
+        assert!(
+            config
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "desktop.observe"),
+            "default runner config should expose the observe-only desktop scaffold"
+        );
+    }
+
+    #[test]
+    fn desktop_observe_returns_metadata_only_scaffold() {
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: None,
+            allowed_tools: vec!["desktop.observe".into()],
+            max_read_bytes: 256 * 1024,
+            max_search_results: 50,
+        };
+        let output = execute_tool(&config, "desktop.observe", &json!({ "detail": "summary" }));
+        let value: serde_json::Value = serde_json::from_str(&output).expect("json observation");
+
+        assert_eq!(value["tool_name"], "desktop.observe");
+        assert_eq!(value["status"], "observe_only_scaffold");
+        assert_eq!(value["task_runner_kind"], serde_json::Value::Null);
+        assert_eq!(value["redaction_posture"], "metadata_only");
+        assert_eq!(value["screenshot_available"], false);
+        assert_eq!(value["input_actions_available"], false);
     }
 
     #[test]
@@ -1016,5 +1139,58 @@ mod tests {
 
         let output = search_workspace(temp.path(), "hit", 256 * 1024, 2).expect("search");
         assert_eq!(output.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bash_exec_uses_sandbox_worker_when_socket_is_configured() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let socket_path = temp.path().join("sandbox.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let (mut reader, mut writer) = stream.into_split();
+            let request: ExecuteCommandRequest = read_frame(&mut reader)
+                .await
+                .expect("read request")
+                .expect("request present");
+
+            assert_eq!(request.command, "sh");
+            assert_eq!(request.args, vec!["-c", "echo sandboxed"]);
+
+            let response = ExecuteCommandResponse {
+                request_id: request.request_id,
+                status: ExecutionStatus::Success,
+                stdout: b"sandboxed\n".to_vec(),
+                stderr: Vec::new(),
+                exit_code: Some(0),
+                duration_ms: 1,
+                error: None,
+            };
+
+            write_frame(&mut writer, &response)
+                .await
+                .expect("write response");
+        });
+
+        let _ = ready_rx.await;
+
+        let output = execute_bash_tool(
+            &json!({
+                "command": "echo sandboxed",
+                "working_dir": temp.path().to_str().expect("temp path utf8"),
+                "timeout_secs": 5
+            }),
+            &ShellExecutionMode::Sandboxed {
+                socket_path: socket_path.to_str().expect("socket path utf8").to_string(),
+            },
+        )
+        .await;
+
+        server.await.expect("server task");
+        assert!(output.contains("sandboxed"));
+        assert!(output.contains("exit_code: 0"));
     }
 }

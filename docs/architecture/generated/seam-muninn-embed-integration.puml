@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - muninn-embed-integration
+
+rectangle "muninn-embed-integration" as muninn_embed_integration #Orange {
+}
+
+
+@enduml

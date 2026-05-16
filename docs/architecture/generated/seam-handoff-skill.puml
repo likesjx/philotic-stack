@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - handoff-skill
+
+rectangle "handoff-skill" as handoff_skill #Orange {
+}
+
+
+@enduml

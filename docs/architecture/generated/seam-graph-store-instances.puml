@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-store-instances
+
+rectangle "graph-store-instances" as graph_store_instances #Orange {
+}
+
+
+@enduml

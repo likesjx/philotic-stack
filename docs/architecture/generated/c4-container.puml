@@ -1,0 +1,40 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Container Diagram - philotic-stack
+
+System_Boundary(philotic_stack, "philotic-stack") {
+    Container(ansible_mesh_core, "ansible-mesh-core", "Rust", "Crate")
+    Container(datasource, "datasource", "Rust", "Crate")
+    Container(philotic_primitives_model, "philotic-primitives-model", "Rust", "Crate")
+    Container(media_prep, "media-prep", "Rust", "Crate")
+    Container(membrane_telegram, "membrane-telegram", "Rust", "Crate")
+    Container(philotic_primitives_mesh, "philotic-primitives-mesh", "Rust", "Crate")
+    Container(graph_datasource, "graph-datasource", "Rust / Graph / SQLite", "Crate")
+    Container(onnx_runner, "onnx-runner", "Rust", "Crate")
+    Container(model_router, "model-router", "Rust", "Crate")
+    Container(philotic_graph, "philotic-graph", "Rust / Graph / SQLite", "Crate")
+    Container(membrane_mcp, "membrane-mcp", "Rust / Protocol / MCP", "Crate")
+    Container(philotic_client, "philotic-client", "Rust", "Crate")
+    Container(membrane_discord, "membrane-discord", "Rust", "Crate")
+    Container(aiua, "aiua", "Rust", "Crate")
+    Container(philotic_primitives_data, "philotic-primitives-data", "Rust", "Crate")
+    Container(philotic_primitives_hotel, "philotic-primitives-hotel", "Rust", "Crate")
+    Container(graph_intelligence, "graph-intelligence", "Rust / Graph / SQLite", "Crate")
+    Container(philotic_web, "philotic-web", "Rust / HTTP / Axum", "Crate")
+    Container(mlx_runner, "mlx-runner", "Rust", "Crate")
+    Container(tool_runner, "tool-runner", "Rust", "Crate")
+    Container(philotic_sandbox, "philotic-sandbox", "Rust", "Crate")
+    Container(philote, "philote", "Rust", "Crate")
+    Container(philotic_primitives_tool, "philotic-primitives-tool", "Rust", "Crate")
+    Container(graph_runner, "graph-runner", "Rust / Graph / SQLite", "Crate")
+    Container(philotic_primitives_agent, "philotic-primitives-agent", "Rust", "Crate")
+    Container(membrane, "membrane", "Rust", "Crate")
+    Container(memory_core, "memory-core", "Rust", "Crate")
+    Container(agent_graph_runner, "agent-graph-runner", "Rust / Graph / SQLite", "Crate")
+}
+
+
+@enduml

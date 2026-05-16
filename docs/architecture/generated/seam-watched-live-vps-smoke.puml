@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - watched-live-vps-smoke
+
+rectangle "watched-live-vps-smoke" as watched_live_vps_smoke #Orange {
+}
+
+
+@enduml

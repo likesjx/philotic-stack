@@ -1,31 +1,31 @@
 ---
-title: "Philotic Deployment and Environment Model"
+title: Philotic Deployment and Environment Model
 doc_type: proposal
 domain: deployment-distribution
 status: proposed
-last_updated: 2026-03-17
+last_updated: 2026-04-11
 tags:
-  - deployment
-  - environments
-  - launchd
-  - profile
-  - mbp-jane
-  - active-seam
+- deployment
+- environments
+- launchd
+- profile
+- mbp-jane
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - HOMEBREW_DISTRIBUTION_PROPOSAL.md
-  - RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- HOMEBREW_DISTRIBUTION_PROPOSAL.md
+- RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: philotic-deployment
 implements: []
 implemented_by: []
 active_seams:
-  - philotic-profile-namespacing
-  - mbp-jane-launchd-hardening
-  - phil-service-subcommands
+- philotic-profile-namespacing
+- mbp-jane-launchd-hardening
+- phil-service-subcommands
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # PROPOSAL: Philotic Deployment and Environment Model
@@ -44,7 +44,11 @@ Treat environment isolation as a path-namespacing problem solved once by `PHILOT
 
 ## Current Slice
 
-None active. `PHILOTIC_PROFILE` path namespacing is the prerequisite for all other work in this proposal.
+`PHILOTIC_PROFILE` path namespacing is implemented, and the current slice is the `phil service` lifecycle surface plus onboarding handoff:
+
+- `phil service install`, `start`, `stop`, `restart`, `uninstall`, and `status`
+- interactive onboarding optionally hands off to `phil service install` on macOS so first-run setup can root the daemon immediately
+- interactive onboarding now captures the agent workspace/import path and initial skillset so the seeded agent bundle has the right execution root and posture from the start, and the desktop agent editor can revise the same fields later without re-running bootstrap
 
 ---
 

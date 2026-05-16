@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - management-plane-security
+
+rectangle "management-plane-security" as management_plane_security #Orange {
+}
+
+
+@enduml

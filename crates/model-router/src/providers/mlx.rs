@@ -1,9 +1,7 @@
 use crate::controller::{ControllerTask, ModelProvider, ProviderOutput, TaskKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use mlx_runner::{
-    MlxFleetConfig, MlxModelClass, MlxModelInstance, MlxWhisperHandle,
-};
+use mlx_runner::{MlxFleetConfig, MlxModelClass, MlxModelInstance, MlxWhisperHandle};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -53,32 +51,28 @@ impl MlxProvider {
         let python_path: Option<String> = config.python_path.clone();
 
         // Start text and multimodal instances in parallel.
-        let text_results = futures::future::join_all(
-            text_cfgs.into_iter().map(|cfg| {
-                let py = python_path.clone();
-                async move {
-                    let repo_id = cfg.repo_id.clone();
-                    MlxModelInstance::start(cfg, py.as_deref())
-                        .await
-                        .map(Arc::new)
-                        .map_err(|e| (repo_id, e))
-                }
-            }),
-        )
+        let text_results = futures::future::join_all(text_cfgs.into_iter().map(|cfg| {
+            let py = python_path.clone();
+            async move {
+                let repo_id = cfg.repo_id.clone();
+                MlxModelInstance::start(cfg, py.as_deref())
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| (repo_id, e))
+            }
+        }))
         .await;
 
-        let mm_results = futures::future::join_all(
-            mm_cfgs.into_iter().map(|cfg| {
-                let py = python_path.clone();
-                async move {
-                    let repo_id = cfg.repo_id.clone();
-                    MlxModelInstance::start(cfg, py.as_deref())
-                        .await
-                        .map(Arc::new)
-                        .map_err(|e| (repo_id, e))
-                }
-            }),
-        )
+        let mm_results = futures::future::join_all(mm_cfgs.into_iter().map(|cfg| {
+            let py = python_path.clone();
+            async move {
+                let repo_id = cfg.repo_id.clone();
+                MlxModelInstance::start(cfg, py.as_deref())
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| (repo_id, e))
+            }
+        }))
         .await;
 
         for result in text_results {
@@ -141,7 +135,11 @@ impl MlxProvider {
             ticker.tick().await; // skip first immediate tick
             loop {
                 ticker.tick().await;
-                for inst in provider.text_models.iter().chain(provider.multimodal_models.iter()) {
+                for inst in provider
+                    .text_models
+                    .iter()
+                    .chain(provider.multimodal_models.iter())
+                {
                     inst.run_health_check().await;
                 }
             }
@@ -267,6 +265,7 @@ impl MlxProvider {
             memory_concept: None,
             memory_candidate: None,
             active_plan: None,
+            model_gen: None,
         })
     }
 
@@ -284,10 +283,14 @@ impl MlxProvider {
             .and_then(|v| v.as_str())
             .context("AudioTranscribe task missing provider_options.audio_path")?;
 
-        let python_path = self.python_path.as_deref()
+        let python_path = self
+            .python_path
+            .as_deref()
             .context("AudioTranscribe requires python_path in fleet config")?;
         let path = std::path::Path::new(audio_path);
-        let output = handle.transcribe(python_path, path).context("mlx_whisper transcription failed")?;
+        let output = handle
+            .transcribe(python_path, path)
+            .context("mlx_whisper transcription failed")?;
 
         Ok(ProviderOutput::Text {
             content: output.text.clone(),
@@ -300,6 +303,7 @@ impl MlxProvider {
             memory_concept: None,
             memory_candidate: None,
             active_plan: None,
+            model_gen: None,
         })
     }
 }

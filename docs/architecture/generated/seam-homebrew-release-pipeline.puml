@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - homebrew-release-pipeline
+
+rectangle "homebrew-release-pipeline" as homebrew_release_pipeline #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-component-authoring-parity
+
+rectangle "desktop-component-authoring-parity" as desktop_component_authoring_parity #Orange {
+}
+
+
+@enduml

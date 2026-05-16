@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - snippet-store
+
+rectangle "snippet-store" as snippet_store #Orange {
+}
+
+
+@enduml

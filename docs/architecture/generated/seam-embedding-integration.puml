@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - embedding-integration
+
+rectangle "embedding-integration" as embedding_integration #Orange {
+}
+
+
+@enduml

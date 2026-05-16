@@ -1,32 +1,32 @@
 ---
-title: "Red Hat Ansible And VPS Deployment Proposal"
+title: Red Hat Ansible And VPS Deployment Proposal
 doc_type: proposal
 domain: deployment-distribution
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - deployment
-  - vps
-  - ansible
-  - secrets
-  - transitional
+- deployment
+- vps
+- ansible
+- secrets
+- transitional
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - GUEST_BINARY_RESOLUTION_PROPOSAL.md
-  - NATIVE_OVERLAY_VPN_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- GUEST_BINARY_RESOLUTION_PROPOSAL.md
+- NATIVE_OVERLAY_VPN_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: rh-ansible-vps-deployment
 implements: []
 implemented_by:
-  - vps-boundary-contract-slice
+- vps-boundary-contract-slice
 active_seams:
-  - secret-handling-hardening
-  - watched-live-vps-smoke
-  - artifact-distribution-rollout
+- secret-handling-hardening
+- watched-live-vps-smoke
+- artifact-distribution-rollout
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Red Hat Ansible And VPS Deployment Proposal

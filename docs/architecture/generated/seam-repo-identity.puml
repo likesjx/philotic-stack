@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - repo-identity
+
+rectangle "repo-identity" as repo_identity #Orange {
+}
+
+
+@enduml

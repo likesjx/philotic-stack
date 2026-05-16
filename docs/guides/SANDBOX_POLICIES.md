@@ -1,15 +1,15 @@
 ---
-title: "Writing Sandbox Policies"
+title: Writing Sandbox Policies
 doc_type: guide
 domain: philotic-sandbox
 status: active
-last_updated: 2026-03-23
+last_updated: 2026-03-31
 tags:
-  - sandbox
-  - policy
-  - guide
+- sandbox
+- policy
+- guide
 related_docs:
-  - ../architecture/SANDBOX_ARCHITECTURE.md
+- ../architecture/SANDBOX_ARCHITECTURE.md
 ---
 
 # Writing Sandbox Policies

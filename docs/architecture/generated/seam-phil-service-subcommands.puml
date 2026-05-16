@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - phil-service-subcommands
+
+rectangle "phil-service-subcommands" as phil_service_subcommands #Orange {
+}
+
+
+@enduml

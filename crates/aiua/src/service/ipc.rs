@@ -4,14 +4,27 @@ use crate::service::lease::{
     LeaseAcquireOutcome, LeaseObserver, LeaseObserverEvent, LeaseObserverEventKind, LeaseProvider,
     LeaseRenewOutcome, RuntimeLeaseRegistry,
 };
-use crate::vault::{SecretAccess, resolve_secret};
+use crate::vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
+use ansible_mesh_core::agent_graph_storage::{
+    AgentGraphSnapshot, AgentGraphStorage, SqliteAgentGraphStorage,
+};
+use ansible_mesh_core::catalog_rights::{
+    component_right, has_right, normalize_rights, skill_right, tool_right,
+};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
+use ansible_mesh_core::graph::{
+    AbstractSkillRecord, RoleIncarnationRecord, RoleReadinessState, SkillValidationState,
+};
+use ansible_mesh_core::membership::{
+    DEFAULT_INVITE_TTL_SECS, MeshInvite, MeshInvitePayload, MeshJoinRequestPayload,
+    derive_transport_session_key, fingerprint_from_base64url, generate_nonce,
+    generate_transport_keypair, now_epoch_secs, sign_invite, sign_join_request,
+    signing_key_from_hex, verify_invite, verifying_key_to_base64url,
+};
 use ansible_mesh_core::registry::{
     CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
 };
-use ansible_mesh_core::{NodeCapabilities, NodeConstraints};
 use ansible_mesh_core::storage::{
     ComponentManifest, GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord,
     SessionRecord, SessionTurnRecord,
@@ -19,24 +32,26 @@ use ansible_mesh_core::storage::{
 use ansible_mesh_core::validation::{
     SkillDraft, apply_validation_to_record, validate_skill_layer1,
 };
+use ansible_mesh_core::{NodeCapabilities, NodeConstraints};
+use anyhow::{Context, bail};
+use ed25519_dalek::SigningKey;
 use philotic_client::{
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
     DesktopMembraneTargetGuestInventoryView, DesktopMembraneTargetReachabilityView,
-    DesktopMembraneTargetStatusView, DesktopMembraneTargetView, GuestIdentity,
-    HookRoute, HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus,
-    OperatorAgentView, OperatorChatTurnReply, OperatorSurfaceQueryHandoff,
-    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, PhiloticClient, SubagentDelegation,
-    OPERATOR_CHAT_REPLY_ROLE,
-    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
-    OPERATOR_SURFACE_QUERY_ROLE,
+    DesktopMembraneTargetStatusView, DesktopMembraneTargetView, GuestIdentity, HookRoute,
+    HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus,
+    OPERATOR_CHAT_REPLY_ROLE, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
+    OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
+    OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
+    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
+    ResponseRoutePolicyView, SubagentDelegation,
 };
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -66,9 +81,9 @@ type SubagentHookRegistry = Arc<Mutex<HashMap<String, SubagentHookRecord>>>;
 #[derive(Clone)]
 pub(crate) struct RoleSubscriber {
     conn_id: Uuid,
-    guest_id: String,
+    pub(crate) guest_id: String,
     supported_tools: Vec<String>,
-    tx: mpsc::UnboundedSender<IpcResponse>,
+    pub(crate) tx: mpsc::UnboundedSender<IpcResponse>,
 }
 
 #[cfg(not(test))]
@@ -80,6 +95,46 @@ const TELEGRAM_POLL_LEASE_TTL_SECS: u64 = 1;
 const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 45;
 #[cfg(test)]
 const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 1;
+
+#[cfg(not(test))]
+const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 900;
+#[cfg(test)]
+const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 5;
+
+#[cfg(not(test))]
+const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 45;
+#[cfg(test)]
+const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 1;
+
+fn normalize_marker_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+}
+
+fn collect_role_receptor_markers(values: &[&str]) -> Vec<String> {
+    let mut markers = BTreeSet::new();
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "from", "that", "this", "into", "role", "focus", "uses",
+        "use", "work", "mode", "lens", "agent", "same", "self", "your", "their",
+    ];
+    for value in values {
+        let normalized = normalize_marker_text(value);
+        for token in normalized.split_whitespace() {
+            if token.len() < 4 || STOPWORDS.contains(&token) {
+                continue;
+            }
+            markers.insert(token.to_string());
+        }
+    }
+    markers.into_iter().collect()
+}
 
 #[derive(Default)]
 struct SessionEnvelope {
@@ -113,6 +168,21 @@ struct AllowedIncarnation {
     selection_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalDeliveryProvenanceHint {
+    guest_id: String,
+    updated_at: u64,
+    marker_kind: Option<String>,
+    marker_strength: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlacementMarkerPolicy {
+    ttl_secs: u64,
+    supersede_on_newer_active_incarnation_conflict: bool,
+    permit_parking_when_unregistered: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct RoutingPreferences {
     preferred_tool_runner_incarnation: Option<String>,
@@ -121,13 +191,670 @@ struct RoutingPreferences {
     preferred_environment_id: Option<String>,
 }
 
+fn agent_graph_db_path(agent_id: &str) -> PathBuf {
+    std::env::var("PHILOTIC_AGENT_GRAPH_DB")
+        .map(|value| PathBuf::from(value.replace("{agent_id}", agent_id)))
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home)
+                .join(".philotic")
+                .join(format!("agent-graph-{agent_id}.db"))
+        })
+}
+
+fn load_agent_graph_routing_preferences(agent_id: &str) -> Option<Vec<serde_json::Value>> {
+    let path = agent_graph_db_path(agent_id);
+    if !path.exists() {
+        return None;
+    }
+    let storage = SqliteAgentGraphStorage::open(agent_id, &path).ok()?;
+    let preferences = storage.list_routing_preferences().ok()?;
+    Some(
+        preferences
+            .into_iter()
+            .filter_map(|preference| serde_json::to_value(preference).ok())
+            .collect(),
+    )
+}
+
+fn load_shared_model_markers(graph: &GraphDomain) -> Option<Vec<serde_json::Value>> {
+    let mut markers = graph
+        .list_abstract_models()
+        .ok()?
+        .into_iter()
+        .filter_map(|record| serde_json::to_value(record).ok())
+        .collect::<Vec<_>>();
+    markers.sort_by(|left, right| {
+        left.get("model_ref")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("model_ref").and_then(serde_json::Value::as_str))
+    });
+    Some(markers)
+}
+
+fn load_shared_tool_markers(graph: &GraphDomain) -> Option<Vec<serde_json::Value>> {
+    let mut markers = graph
+        .list_abstract_tools()
+        .ok()?
+        .into_iter()
+        .filter_map(|record| serde_json::to_value(record).ok())
+        .collect::<Vec<_>>();
+    markers.sort_by(|left, right| {
+        left.get("tool_name")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("tool_name").and_then(serde_json::Value::as_str))
+    });
+    Some(markers)
+}
+
+fn load_shared_skill_markers(graph: &GraphDomain) -> Option<Vec<serde_json::Value>> {
+    let mut markers = graph
+        .list_abstract_skills()
+        .ok()?
+        .into_iter()
+        .filter_map(|record| serde_json::to_value(record).ok())
+        .collect::<Vec<_>>();
+    markers.sort_by(|left, right| {
+        left.get("skill_name")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("skill_name").and_then(serde_json::Value::as_str))
+    });
+    Some(markers)
+}
+
+fn latest_routing_policy_reflex_dispositions(
+    graph: &GraphDomain,
+    agent_id: &str,
+) -> HashMap<String, serde_json::Value> {
+    let mut dispositions = HashMap::new();
+    let Ok(policies) = graph.list_routing_policies(agent_id) else {
+        return dispositions;
+    };
+    for policy in policies {
+        let Some(preference_key) = policy.learned_reflex_preference_key.clone() else {
+            continue;
+        };
+        let decided_at = policy.operator_disposition.decided_at;
+        let replace = dispositions
+            .get(&preference_key)
+            .and_then(|existing| existing.get("decided_at"))
+            .and_then(|value| value.as_u64())
+            .map(|existing| decided_at >= existing)
+            .unwrap_or(true);
+        if replace {
+            dispositions.insert(
+                preference_key,
+                serde_json::json!({
+                    "proposal_id": policy.proposal_id,
+                    "state": policy.operator_disposition.state,
+                    "reason": policy.operator_disposition.reason,
+                    "decided_at": decided_at,
+                }),
+            );
+        }
+    }
+    dispositions
+}
+
+fn load_agent_graph_reflex_preferences(
+    graph: &GraphDomain,
+    agent_id: &str,
+) -> Option<(
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+)> {
+    let path = agent_graph_db_path(agent_id);
+    if !path.exists() {
+        return None;
+    }
+    let storage = SqliteAgentGraphStorage::open(agent_id, &path).ok()?;
+    let preferences = storage.list_reflex_preferences().ok()?;
+    let dispositions = latest_routing_policy_reflex_dispositions(graph, agent_id);
+    let mut layers = Vec::new();
+    let mut suppressions = Vec::new();
+    let mut rewards = Vec::new();
+    for preference in preferences {
+        let mut precedence = preference.precedence;
+        if let Some(disposition) = dispositions.get(&preference.preference_key) {
+            match disposition.get("state").and_then(|value| value.as_str()) {
+                Some("rejected") => {
+                    suppressions.push(serde_json::json!({
+                        "preference_key": preference.preference_key,
+                        "reason": "suppressed_by_rejected_routing_policy",
+                        "routing_policy": disposition,
+                    }));
+                    continue;
+                }
+                Some("approved") => {
+                    precedence += 5;
+                    rewards.push(serde_json::json!({
+                        "preference_key": preference.preference_key,
+                        "reason": "reinforced_by_approved_routing_policy",
+                        "precedence_bonus": 5,
+                        "routing_policy": disposition,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        layers.push(serde_json::json!({
+                    "policy_scope": "agent_learned",
+                    "policy_source": "agent_graph",
+                    "origin_class": "agent_learned",
+                    "precedence": precedence,
+                    "reason": preference.config_json.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+                    "preference_key": preference.preference_key,
+                    "config": preference.config_json,
+                    "regulatory_system": if precedence > preference.precedence { "reward" } else { "baseline" },
+                    "reflexes": preference.reflexes_json,
+        }));
+    }
+    Some((layers, suppressions, rewards))
+}
+
+fn infer_marker_strength(
+    explicit_strength: Option<&str>,
+    marker_kind: Option<&str>,
+) -> Option<&'static str> {
+    match explicit_strength {
+        Some("weak") => Some("weak"),
+        Some("medium") => Some("medium"),
+        Some("strong") => Some("strong"),
+        Some(_) => Some("medium"),
+        None => match marker_kind {
+            Some("receptor_ingress") | Some("membrane_ingress") => Some("weak"),
+            Some("transport_continuity") => Some("medium"),
+            Some("role_handoff") => Some("strong"),
+            None | Some(_) => Some("medium"),
+        },
+    }
+}
+
+fn infer_placement_risk_level(
+    marker_kind: Option<&str>,
+    marker_source: Option<&str>,
+    marker_strength: Option<&str>,
+) -> &'static str {
+    let inferred_strength = infer_marker_strength(marker_strength, marker_kind);
+    match (marker_kind, marker_source, inferred_strength) {
+        (Some("receptor_ingress"), _, _) | (Some("membrane_ingress"), _, _) => "elevated",
+        (Some("role_handoff"), _, Some("strong")) => "low",
+        (Some("transport_continuity"), Some("operator_chat"), Some(level))
+            if matches!(level, "strong" | "medium") =>
+        {
+            "guarded"
+        }
+        (Some("transport_continuity"), _, Some(level)) if matches!(level, "strong" | "medium") => {
+            "guarded"
+        }
+        (_, _, Some("weak")) => "elevated",
+        _ => "guarded",
+    }
+}
+
+fn placement_marker_policy(
+    marker_kind: Option<&str>,
+    marker_strength: Option<&str>,
+) -> PlacementMarkerPolicy {
+    let inferred_strength = infer_marker_strength(marker_strength, marker_kind);
+    match marker_kind {
+        Some("receptor_ingress") | Some("membrane_ingress") => PlacementMarkerPolicy {
+            ttl_secs: std::cmp::max(1, LOCAL_DELIVERY_PROVENANCE_TTL_SECS / 2),
+            supersede_on_newer_active_incarnation_conflict: true,
+            permit_parking_when_unregistered: false,
+        },
+        Some("role_handoff") => PlacementMarkerPolicy {
+            ttl_secs: LOCAL_DELIVERY_PROVENANCE_TTL_SECS.saturating_mul(2),
+            supersede_on_newer_active_incarnation_conflict: false,
+            permit_parking_when_unregistered: true,
+        },
+        Some("transport_continuity") => PlacementMarkerPolicy {
+            ttl_secs: LOCAL_DELIVERY_PROVENANCE_TTL_SECS,
+            supersede_on_newer_active_incarnation_conflict: false,
+            permit_parking_when_unregistered: !matches!(inferred_strength, Some("weak")),
+        },
+        None | Some(_) => PlacementMarkerPolicy {
+            ttl_secs: LOCAL_DELIVERY_PROVENANCE_TTL_SECS,
+            supersede_on_newer_active_incarnation_conflict: true,
+            permit_parking_when_unregistered: matches!(
+                inferred_strength,
+                Some("medium") | Some("strong")
+            ),
+        },
+    }
+}
+
+fn remote_execution_allowed(bindings: &serde_json::Value) -> bool {
+    bindings
+        .get("effective_posture")
+        .and_then(|posture| posture.get("remote_execution_allowed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn remote_tool_execution_allowed(bindings: &serde_json::Value) -> bool {
+    bindings
+        .get("effective_reflexes")
+        .and_then(|reflexes| reflexes.get("remote_tool_reflex"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value == "allow")
+        .or_else(|| {
+            bindings
+                .get("effective_right_policy")
+                .and_then(|policy| policy.get("remote_tool_execution"))
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value == "allow")
+        })
+        .unwrap_or_else(|| remote_execution_allowed(bindings))
+}
+
+fn remote_component_execution_allowed(bindings: &serde_json::Value) -> bool {
+    bindings
+        .get("effective_reflexes")
+        .and_then(|reflexes| reflexes.get("remote_component_reflex"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value == "allow")
+        .or_else(|| {
+            bindings
+                .get("effective_right_policy")
+                .and_then(|policy| policy.get("remote_component_execution"))
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value == "allow")
+        })
+        .unwrap_or_else(|| remote_execution_allowed(bindings))
+}
+
+fn credential_scope_reflex(bindings: &serde_json::Value) -> &'static str {
+    bindings
+        .get("effective_reflexes")
+        .and_then(|reflexes| reflexes.get("credential_scope_reflex"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            bindings
+                .get("effective_right_policy")
+                .and_then(|policy| policy.get("credential_scope"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .and_then(|value| match value {
+            "local_only" => Some("local_only"),
+            "local_scoped" => Some("local_scoped"),
+            "mesh_scoped" => Some("mesh_scoped"),
+            _ => None,
+        })
+        .unwrap_or("local_scoped")
+}
+
+fn effective_reflexes_from_placement_risk(placement_risk_level: &str) -> serde_json::Value {
+    match placement_risk_level {
+        "elevated" => serde_json::json!({
+            "remote_tool_reflex": "deny",
+            "remote_component_reflex": "deny",
+            "credential_scope_reflex": "local_only",
+        }),
+        "low" => serde_json::json!({
+            "remote_tool_reflex": "allow",
+            "remote_component_reflex": "allow",
+            "credential_scope_reflex": "mesh_scoped",
+        }),
+        _ => serde_json::json!({
+            "remote_tool_reflex": "deny",
+            "remote_component_reflex": "allow",
+            "credential_scope_reflex": "local_scoped",
+        }),
+    }
+}
+
+fn merge_reflex_overrides(
+    inferred_reflexes: serde_json::Value,
+    overrides: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut reflexes = inferred_reflexes;
+    let Some(overrides) = overrides.and_then(serde_json::Value::as_object) else {
+        return reflexes;
+    };
+    let Some(obj) = reflexes.as_object_mut() else {
+        return reflexes;
+    };
+    for key in [
+        "remote_tool_reflex",
+        "remote_component_reflex",
+        "credential_scope_reflex",
+    ] {
+        if let Some(value) = overrides.get(key) {
+            obj.insert(key.to_string(), value.clone());
+        }
+    }
+    reflexes
+}
+
+fn push_normalized_reflex_policy_records(
+    layers: &mut Vec<serde_json::Value>,
+    records: Option<&serde_json::Value>,
+    fallback_scope: &str,
+    fallback_source: &str,
+    fallback_origin_class: &str,
+    fallback_precedence: u64,
+) {
+    let Some(records) = records.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for record in records {
+        let Some(obj) = record.as_object() else {
+            continue;
+        };
+        let Some(reflexes) = obj.get("reflexes").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        layers.push(serde_json::json!({
+            "policy_scope": obj
+                .get("policy_scope")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(fallback_scope),
+            "policy_source": obj
+                .get("policy_source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(fallback_source),
+            "origin_class": obj
+                .get("origin_class")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(fallback_origin_class),
+            "precedence": obj
+                .get("precedence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(fallback_precedence),
+            "reason": obj.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+            "reflexes": serde_json::Value::Object(reflexes.clone()),
+        }));
+    }
+}
+
+fn normalized_reflex_policy_records(
+    summary_json: &serde_json::Value,
+    bindings: &serde_json::Value,
+    placement_risk_level: &str,
+) -> Vec<serde_json::Value> {
+    let mut layers = vec![serde_json::json!({
+        "policy_scope": "placement_inferred",
+        "policy_source": "hotel_runtime",
+        "origin_class": "inferred",
+        "precedence": 10,
+        "reason": format!(
+            "derived from placement_risk_level={placement_risk_level} runtime provenance"
+        ),
+        "reflexes": effective_reflexes_from_placement_risk(placement_risk_level),
+    })];
+
+    push_normalized_reflex_policy_records(
+        &mut layers,
+        bindings.get("reflex_policy_defaults"),
+        "hotel_default",
+        "hotel_bindings",
+        "hotel_default",
+        40,
+    );
+    push_normalized_reflex_policy_records(
+        &mut layers,
+        bindings.get("reflex_policy_agent_layers"),
+        "agent_learned",
+        "agent_graph",
+        "agent_learned",
+        70,
+    );
+    push_normalized_reflex_policy_records(
+        &mut layers,
+        summary_json.get("reflex_policy_records"),
+        "session_override",
+        "session_summary",
+        "session_override",
+        100,
+    );
+    if summary_json.get("reflex_policy_records").is_none() {
+        if let Some(overrides) = summary_json.get("reflex_overrides") {
+            layers.push(serde_json::json!({
+                "policy_scope": "session_override",
+                "policy_source": "legacy_reflex_overrides",
+                "origin_class": "legacy_bridge",
+                "precedence": 100,
+                "reason": "legacy reflex_overrides bridge",
+                "reflexes": overrides,
+            }));
+        }
+    }
+
+    layers.sort_by_key(|layer| {
+        layer
+            .get("precedence")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(100)
+    });
+    layers
+}
+
+fn effective_reflexes_from_policy_records(
+    policy_records: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut effective = serde_json::json!({});
+    for layer in policy_records {
+        let Some(reflexes) = layer.get("reflexes") else {
+            continue;
+        };
+        effective = merge_reflex_overrides(effective, Some(reflexes));
+    }
+    effective
+}
+
+fn load_agent_graph_snapshot(agent_id: &str, source_node_id: &str) -> Option<serde_json::Value> {
+    let path = agent_graph_db_path(agent_id);
+    if !path.exists() {
+        return None;
+    }
+    let storage = SqliteAgentGraphStorage::open(agent_id, &path).ok()?;
+    let snapshot = storage.export_snapshot(source_node_id).ok()?;
+    serde_json::to_value(snapshot).ok()
+}
+
+fn attach_agent_graph_snapshot(
+    task_json: &str,
+    agent_id: Option<&str>,
+    source_node_id: &str,
+) -> String {
+    let Some(agent_id) = agent_id else {
+        return task_json.to_string();
+    };
+    let Some(snapshot) = load_agent_graph_snapshot(agent_id, source_node_id) else {
+        return task_json.to_string();
+    };
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+        return task_json.to_string();
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return task_json.to_string();
+    };
+    if obj.contains_key("agent_graph_snapshot") {
+        return task_json.to_string();
+    }
+    obj.insert("agent_graph_snapshot".to_string(), snapshot);
+    serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentTaskContext {
+    agent_id: String,
+    authority_hotel: Option<String>,
+}
+
+fn infer_agent_context_for_task(
+    graph: &GraphDomain,
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: &str,
+) -> Option<AgentTaskContext> {
+    if target_role != "agent" {
+        return None;
+    }
+
+    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) {
+        if let Some(agent_id) = payload.get("agent_id").and_then(serde_json::Value::as_str) {
+            return Some(AgentTaskContext {
+                agent_id: agent_id.to_string(),
+                authority_hotel: payload
+                    .get("authority_hotel")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| lookup_agent_authority_hotel(graph, agent_id)),
+            });
+        }
+        if let Some(session_id) = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            if let Ok(Some(session)) = graph.get_session(session_id) {
+                if let Some(agent_id) = session.primary_agent_id {
+                    return Some(AgentTaskContext {
+                        authority_hotel: lookup_agent_authority_hotel(graph, &agent_id),
+                        agent_id,
+                    });
+                }
+            }
+        }
+    }
+
+    let guest_id = target_guest_id?;
+    graph
+        .list_role_incarnations_by_guest_id(guest_id)
+        .ok()
+        .and_then(|mut roles| roles.drain(..).next())
+        .map(|role| AgentTaskContext {
+            authority_hotel: lookup_agent_authority_hotel(graph, &role.agent_id),
+            agent_id: role.agent_id,
+        })
+}
+
+fn apply_embedded_agent_graph_snapshot(task_json: &str) -> anyhow::Result<Option<String>> {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+        return Ok(None);
+    };
+    let Some(snapshot_value) = payload.get("agent_graph_snapshot") else {
+        return Ok(None);
+    };
+    let snapshot: AgentGraphSnapshot = serde_json::from_value(snapshot_value.clone())?;
+    let path = agent_graph_db_path(&snapshot.agent_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let storage = SqliteAgentGraphStorage::open(&snapshot.agent_id, &path)?;
+    storage.apply_snapshot(&snapshot)?;
+    Ok(Some(snapshot.agent_id))
+}
+
+fn lookup_agent_authority_hotel(graph: &GraphDomain, agent_id: &str) -> Option<String> {
+    graph
+        .get_agent_identity(agent_id)
+        .ok()
+        .flatten()
+        .map(|identity| identity.authority_hotel)
+}
+
+fn attach_delivery_context(
+    graph: &GraphDomain,
+    local_node_id: &str,
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: &str,
+) -> String {
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+        return task_json.to_string();
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return task_json.to_string();
+    };
+    obj.entry("delivery_node_id".to_string())
+        .or_insert_with(|| serde_json::json!(local_node_id));
+    if let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) {
+        obj.entry("delivery_hotel".to_string())
+            .or_insert_with(|| serde_json::json!(hotel_name));
+    }
+    obj.entry("delivery_target_role".to_string())
+        .or_insert_with(|| serde_json::json!(target_role));
+    if let Some(target_guest_id) = target_guest_id {
+        obj.entry("delivery_target_guest_id".to_string())
+            .or_insert_with(|| serde_json::json!(target_guest_id));
+    }
+    serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
+}
+
+fn declared_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
+    let mut capabilities =
+        BTreeSet::from(["media.analyze".to_string(), "text.generate".to_string()]);
+
+    for route in bindings
+        .get("component_routes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(capability) = route.get("capability").and_then(serde_json::Value::as_str) {
+            capabilities.insert(capability.to_string());
+        }
+    }
+
+    capabilities.into_iter().collect()
+}
+
+fn project_effective_rights(bindings: &serde_json::Value) -> Vec<String> {
+    let toolset = bindings
+        .get("effective_toolset")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let skillset = bindings
+        .get("effective_skillset")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // Only project rights when there is an explicit toolset or skillset configured.
+    // When both are empty the session has no profile yet; returning empty lets
+    // downstream consumers (philote's default_visible_toolset) use their own
+    // defaults without the rights filter stripping them out.
+    if toolset.is_empty() && skillset.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rights = Vec::new();
+    rights.extend(toolset.iter().map(|tool_name| tool_right(tool_name)));
+    rights.extend(skillset.iter().map(|skill_name| skill_right(skill_name)));
+    rights.extend(
+        declared_component_capabilities(bindings)
+            .into_iter()
+            .map(|capability| component_right(&capability)),
+    );
+    normalize_rights(rights)
+}
+
 #[derive(Debug, Clone)]
-struct ParkedInboundTask {
+pub(crate) struct ParkedInboundTask {
     source_node: String,
     task_id: Uuid,
     task_json: String,
     activate_session_id: Option<String>,
 }
+
+pub(crate) type ParkedInboundRegistry =
+    Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRouteResolution {
@@ -145,6 +872,8 @@ pub struct IpcServer {
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+    mcp_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+    discord_gateway_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_hooks: SubagentHookRegistry,
     registry: Arc<RwLock<NodeRegistry>>,
@@ -152,6 +881,14 @@ pub struct IpcServer {
     /// cross-hotel task forwarding without full mesh infrastructure.
     peer_sockets: Arc<RwLock<HashMap<String, String>>>,
     muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+    training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
+    /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
+    /// The sender is cloned into each `handle_client` task for forwarding.
+    network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
+    /// In-process channel for operator surface query tasks.
+    /// When set, tasks addressed to `OPERATOR_SURFACE_QUERY_ROLE` are sent here
+    /// instead of through the UDS inbox registry, eliminating the self-connection.
+    operator_surface_tx: Option<mpsc::Sender<String>>,
 }
 
 struct LoggingLeaseObserver;
@@ -220,6 +957,39 @@ impl LeaseObserver for LoggingSubagentLeaseObserver {
     }
 }
 
+struct LoggingMcpMembraneLeaseObserver;
+
+impl LeaseObserver for LoggingMcpMembraneLeaseObserver {
+    fn on_event(&mut self, event: &LeaseObserverEvent) {
+        match event.kind {
+            LeaseObserverEventKind::Granted => info!(
+                "MCP membrane lease [{}] granted to guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::Released => info!(
+                "MCP membrane lease [{}] released by guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::Renewed => info!(
+                "MCP membrane lease [{}] renewed by guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::Expired => info!(
+                "Dropping expired MCP membrane lease [{}] for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::StaleOwnerDropped => info!(
+                "Dropping stale MCP membrane lease [{}] for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::Revoked => info!(
+                "MCP membrane lease [{}] revoked for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+        }
+    }
+}
+
 struct LoggingDesktopMembraneLeaseObserver;
 
 impl LeaseObserver for LoggingDesktopMembraneLeaseObserver {
@@ -269,6 +1039,33 @@ impl IpcServer {
             owner_guest_id: owner_guest_id.to_string(),
             owner_hotel: Some(authority_hotel.to_string()),
             owner_component_type: Some("membrane".into()),
+            lease_epoch: 0,
+            lease_expires_at: 0,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: None,
+            metadata: serde_json::json!({
+                "agent_id": agent_id,
+                "authority_node_id": local_node_id,
+            }),
+        }
+    }
+
+    fn discord_gateway_lease(
+        lease_key: &str,
+        authority_hotel: &str,
+        local_node_id: &str,
+        owner_guest_id: &str,
+        agent_id: &str,
+    ) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "discord_gateway".into(),
+            lease_scope: lease_key.to_string(),
+            authority_hotel: authority_hotel.to_string(),
+            authority_component: Some("aiua".into()),
+            owner_guest_id: owner_guest_id.to_string(),
+            owner_hotel: Some(authority_hotel.to_string()),
+            owner_component_type: Some("membrane.discord".into()),
             lease_epoch: 0,
             lease_expires_at: 0,
             last_heartbeat_at: 0,
@@ -893,6 +1690,7 @@ impl IpcServer {
             .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{target_agent_id}"));
         let turn_id = format!("operator-chat-turn-{}", Uuid::new_v4());
         let session_id = conversation_id.clone();
+        let authority_hotel = lookup_agent_authority_hotel(graph, target_agent_id);
 
         match client
             .send_request(IpcRequest::EmitTask {
@@ -900,6 +1698,8 @@ impl IpcServer {
                 target_role: "agent".into(),
                 target_guest_id: Some(target_agent_id.to_string()),
                 task_json: serde_json::json!({
+                    "agent_id": target_agent_id,
+                    "authority_hotel": authority_hotel,
                     "source": "operator_chat",
                     "transport": "operator_chat",
                     "session_id": session_id,
@@ -909,7 +1709,8 @@ impl IpcServer {
                     "final_reply_to": local_node_id,
                     "final_reply_role": reply_role,
                     "final_reply_guest_id": reply_guest_id
-                }).to_string(),
+                })
+                .to_string(),
             })
             .await?
         {
@@ -920,9 +1721,10 @@ impl IpcServer {
         let mut observed_events = Vec::new();
         let mut observed_partial_replies = Vec::new();
         let payload = loop {
-            let reply = tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
-                .await
-                .map_err(|_| anyhow::anyhow!("timed out waiting for operator chat reply"))??;
+            let reply =
+                tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("timed out waiting for operator chat reply"))??;
             let IpcResponse::InboundTask { task_json, .. } = reply else {
                 anyhow::bail!("unexpected operator chat reply envelope: {reply:?}");
             };
@@ -1056,14 +1858,37 @@ impl IpcServer {
                 })
                 .unwrap_or_default()
         };
+        let str_opt = |key: &str| {
+            identity
+                .bundle_json
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let import_workspace = str_opt("import_workspace");
+        let response_route_policy = identity
+            .bundle_json
+            .get("response_route_policy")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|policy| policy.get("default_route"))
+            .and_then(serde_json::Value::as_str)
+            .map(|default_route| ResponseRoutePolicyView {
+                default_route: default_route.to_string(),
+            });
 
         OperatorAgentView {
             agent_id: identity.agent_id,
             persona_name: identity.persona_name,
             authority_hotel: identity.authority_hotel,
+            soul_text: str_opt("soul_text"),
+            identity_text: str_opt("identity_text"),
+            user_context_text: str_opt("user_context_text"),
+            system_prompt: str_opt("system_prompt"),
+            import_workspace,
             toolset_tags: str_vec("toolset_tags"),
             default_toolset: str_vec("default_toolset"),
             default_skillset: str_vec("default_skillset"),
+            response_route_policy,
             active_session: false,
         }
     }
@@ -1146,11 +1971,7 @@ impl IpcServer {
         }
     }
 
-    fn target_hotel_name(
-        graph: &GraphDomain,
-        status: &NodeStatus,
-        source_hotel: &str,
-    ) -> String {
+    fn target_hotel_name(graph: &GraphDomain, status: &NodeStatus, source_hotel: &str) -> String {
         status
             .advertisements
             .first()
@@ -1210,6 +2031,56 @@ impl IpcServer {
             .and_then(|pid| pid.parse::<u32>().ok())
             .map(Self::pid_exists)
             .unwrap_or(false)
+    }
+
+    /// Inject a membrane binding into an agent's bundle_json reflex_context.
+    /// Called on successful lease acquisition so the agent's next bundle fetch
+    /// reflects the active membrane without any dynamic query.
+    /// Bindings are never removed on release — the agent owns its membranes until
+    /// it explicitly relinquishes them (operator-pinned by design).
+    fn inject_membrane_binding(
+        graph: &GraphDomain,
+        agent_id: &str,
+        kind: &str,
+        membrane_guest_id: &str,
+    ) {
+        let Ok(Some(mut identity)) = graph.get_agent_identity(agent_id) else {
+            return;
+        };
+        let new_binding = serde_json::json!({
+            "kind": kind,
+            "membrane_guest_id": membrane_guest_id,
+        });
+        let bindings = identity
+            .bundle_json
+            .get_mut("reflex_context")
+            .and_then(|rc| rc.get_mut("membrane_bindings"))
+            .and_then(|b| b.as_array_mut());
+        if let Some(arr) = bindings {
+            arr.retain(|b| {
+                !(b.get("kind").and_then(|k| k.as_str()) == Some(kind)
+                    && b.get("membrane_guest_id").and_then(|g| g.as_str())
+                        == Some(membrane_guest_id))
+            });
+            arr.push(new_binding);
+        } else {
+            if let Some(obj) = identity.bundle_json.as_object_mut() {
+                let rc = obj
+                    .entry("reflex_context")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(rc_obj) = rc.as_object_mut() {
+                    rc_obj.insert(
+                        "membrane_bindings".to_string(),
+                        serde_json::json!([new_binding]),
+                    );
+                }
+            }
+        }
+        if let Err(e) = graph.upsert_agent_identity(&identity) {
+            warn!(
+                "Failed to inject membrane binding [{kind}/{membrane_guest_id}] for agent [{agent_id}]: {e}"
+            );
+        }
     }
 
     fn hotel_may_poll_for_agent(
@@ -1283,6 +2154,39 @@ impl IpcServer {
         );
     }
 
+    fn drop_stale_discord_gateway_lease_if_needed(
+        guard: &mut RuntimeLeaseRegistry,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        lease_key: &str,
+    ) {
+        let mut observer = LoggingLeaseObserver;
+        let _ = guard.drop_if_stale(
+            lease_key,
+            |existing| {
+                Self::discord_gateway_lease_is_expired(existing)
+                    || !Self::discord_gateway_lease_owner_is_live(
+                        graph,
+                        local_node_id,
+                        &existing.owner_guest_id,
+                    )
+            },
+            &mut observer,
+        );
+    }
+
+    fn discord_gateway_lease_is_expired(lease: &LeaseEnvelope) -> bool {
+        lease.lease_expires_at > 0 && unix_ts() > lease.lease_expires_at
+    }
+
+    fn discord_gateway_lease_owner_is_live(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        owner_guest_id: &str,
+    ) -> bool {
+        Self::telegram_poll_lease_owner_is_live(graph, local_node_id, owner_guest_id)
+    }
+
     async fn write_frame<W: AsyncWriteExt + Unpin>(
         writer: &mut W,
         payload: &[u8],
@@ -1316,6 +2220,7 @@ impl IpcServer {
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
         graph: Arc<GraphDomain>,
     ) -> Self {
+        let (network_broadcast, _) = tokio::sync::broadcast::channel(16);
         Self {
             socket_path: socket_path.into(),
             local_node_id: local_node_id.into(),
@@ -1326,12 +2231,36 @@ impl IpcServer {
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             desktop_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
+            mcp_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
+            discord_gateway_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_hooks: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
             peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
+            training_storage: None,
+            network_broadcast,
+            operator_surface_tx: None,
         }
+    }
+
+    pub fn with_operator_surface_channel(mut self, tx: mpsc::Sender<String>) -> Self {
+        self.operator_surface_tx = Some(tx);
+        self
+    }
+
+    pub fn with_training_storage(
+        mut self,
+        storage: Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+    ) -> Self {
+        self.training_storage = Some(storage);
+        self
+    }
+
+    /// Returns a sender for the hotel-wide broadcast channel.
+    /// Clone this before spawning `run()` to push `NetworkState` events to all connected guests.
+    pub fn network_broadcast_tx(&self) -> tokio::sync::broadcast::Sender<IpcResponse> {
+        self.network_broadcast.clone()
     }
 
     pub fn with_memory_config(mut self, config: Option<Arc<memory_core::MuninnConfig>>) -> Self {
@@ -1356,6 +2285,16 @@ impl IpcServer {
         self.inboxes.clone()
     }
 
+    pub(crate) fn parked_inbound(&self) -> ParkedInboundRegistry {
+        self.parked_inbound.clone()
+    }
+
+    pub(crate) fn materialization_requester_arc(
+        &self,
+    ) -> Option<Arc<dyn GuestMaterializationRequester>> {
+        self.materialization_requester.clone()
+    }
+
     pub async fn run(&self) -> anyhow::Result<()> {
         let path = Path::new(&self.socket_path);
 
@@ -1377,11 +2316,17 @@ impl IpcServer {
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
                     let desktop_membrane_leases = self.desktop_membrane_leases.clone();
+                    let mcp_membrane_leases = self.mcp_membrane_leases.clone();
+                    let discord_gateway_leases = self.discord_gateway_leases.clone();
                     let subagent_leases = self.subagent_leases.clone();
                     let subagent_hooks = self.subagent_hooks.clone();
                     let registry = self.registry.clone();
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
+                    let training_storage = self.training_storage.clone();
+                    let network_broadcast_rx = self.network_broadcast.subscribe();
+                    let operator_surface_tx = self.operator_surface_tx.clone();
+                    let socket_path = self.socket_path.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -1393,11 +2338,17 @@ impl IpcServer {
                             materialization_requester,
                             telegram_poll_leases,
                             desktop_membrane_leases,
+                            mcp_membrane_leases,
+                            discord_gateway_leases,
                             subagent_leases,
                             subagent_hooks,
                             registry,
                             peer_sockets,
                             muninn_config,
+                            training_storage,
+                            network_broadcast_rx,
+                            operator_surface_tx,
+                            socket_path,
                         )
                         .await
                         {
@@ -1406,6 +2357,11 @@ impl IpcServer {
                     });
                 }
                 Err(e) => {
+                    // EMFILE / ENFILE: FD table is full. Back off to let existing
+                    // connections drain rather than spinning and burning CPU.
+                    if e.raw_os_error() == Some(24) || e.raw_os_error() == Some(23) {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
                     error!("IPC listener accept error: {}", e);
                 }
             }
@@ -1422,11 +2378,17 @@ impl IpcServer {
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+        mcp_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+        discord_gateway_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: SubagentHookRegistry,
         registry: Arc<RwLock<NodeRegistry>>,
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+        training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
+        network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
+        operator_surface_tx: Option<mpsc::Sender<String>>,
+        socket_path: String,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -1447,6 +2409,27 @@ impl IpcServer {
             Ok::<(), std::io::Error>(())
         });
 
+        // Forward hotel-wide broadcast events (e.g. NetworkState) to this guest.
+        {
+            let broadcast_outbound_tx = outbound_tx.clone();
+            let mut broadcast_rx = network_broadcast_rx;
+            tokio::spawn(async move {
+                loop {
+                    match broadcast_rx.recv().await {
+                        Ok(msg) => {
+                            if broadcast_outbound_tx.send(msg).is_err() {
+                                break; // guest disconnected
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Guest broadcast receiver lagged by {} messages.", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         let mut subscribed_roles = Vec::new();
         let mut current_identity: Option<GuestIdentity> = None;
         loop {
@@ -1455,6 +2438,8 @@ impl IpcServer {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     Self::remove_telegram_poll_leases(&telegram_poll_leases, conn_id).await;
                     Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
+                    Self::remove_mcp_membrane_leases(&mcp_membrane_leases, conn_id).await;
+                    Self::remove_discord_gateway_leases(&discord_gateway_leases, conn_id).await;
                     let _ = write_task.await;
                     return Ok(());
                 }
@@ -1469,6 +2454,74 @@ impl IpcServer {
                         );
                         let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
                     }
+                    Ok(IpcRequest::ListTrainingSamples { agent_id, limit, filter }) => {
+                        let resp = Self::handle_list_training_samples(
+                            training_storage.as_deref(),
+                            agent_id.as_deref(),
+                            limit,
+                            &filter,
+                        );
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::CorrectTrainingSample { turn_id, corrected_transcript }) => {
+                        let resp = Self::handle_correct_training_sample(
+                            training_storage.as_deref(),
+                            &turn_id,
+                            &corrected_transcript,
+                        );
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::ExportTrainingSamples { format, output_path, limit }) => {
+                        let resp = Self::handle_export_training_samples(
+                            training_storage.as_deref(),
+                            &format,
+                            &output_path,
+                            limit,
+                        );
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::GetTrainingStatus { agent_id }) => {
+                        let resp = Self::handle_get_training_status(
+                            training_storage.as_deref(),
+                            agent_id.as_deref(),
+                        );
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::AsrSetup { python_path, model_name, auto_install }) => {
+                        let graph_clone = Arc::clone(&graph);
+                        let local_node_id_clone = local_node_id.clone();
+                        let socket_path_clone = socket_path.clone();
+                        let resp = tokio::task::spawn_blocking(move || {
+                            Self::handle_asr_setup(
+                                &graph_clone,
+                                &local_node_id_clone,
+                                &socket_path_clone,
+                                python_path.as_deref().unwrap_or("python3"),
+                                model_name.as_deref(),
+                                auto_install,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            IpcResponse::error("asr_setup", "INTERNAL_ERROR", &e.to_string())
+                        });
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::AsrStatus {}) => {
+                        let graph_clone = Arc::clone(&graph);
+                        let local_node_id_clone = local_node_id.clone();
+                        let resp = tokio::task::spawn_blocking(move || {
+                            Self::handle_asr_status(
+                                &graph_clone,
+                                &local_node_id_clone,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            IpcResponse::error("asr_status", "INTERNAL_ERROR", &e.to_string())
+                        });
+                        let _ = outbound_tx.send(resp);
+                    }
                     Ok(req) => {
                         let mut follow_up_responses = Vec::new();
                         let response = Self::process_request(
@@ -1481,6 +2534,8 @@ impl IpcServer {
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
                             &desktop_membrane_leases,
+                            &mcp_membrane_leases,
+                            &discord_gateway_leases,
                             &subagent_leases,
                             &subagent_hooks,
                             &registry,
@@ -1490,6 +2545,7 @@ impl IpcServer {
                             &mut subscribed_roles,
                             &mut current_identity,
                             &mut follow_up_responses,
+                            operator_surface_tx.as_ref(),
                         )
                         .await;
                         let _ = outbound_tx.send(response);
@@ -1510,6 +2566,8 @@ impl IpcServer {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     Self::remove_telegram_poll_leases(&telegram_poll_leases, conn_id).await;
                     Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
+                    Self::remove_discord_gateway_leases(&discord_gateway_leases, conn_id).await;
+                    Self::remove_mcp_membrane_leases(&mcp_membrane_leases, conn_id).await;
                     let _ = write_task.await;
                     return Err(e.into());
                 }
@@ -1582,6 +2640,66 @@ impl IpcServer {
             .map(|lease| lease.lease_scope)
             .collect();
         let mut observer = LoggingDesktopMembraneLeaseObserver;
+        for scope in scopes {
+            let _ = guard.release(&scope, conn_id, &mut observer);
+        }
+    }
+
+    fn mcp_membrane_lease(
+        lease_key: &str,
+        authority_hotel: &str,
+        local_node_id: &str,
+        owner_guest_id: &str,
+        port: u16,
+    ) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "mcp_membrane".into(),
+            lease_scope: lease_key.to_string(),
+            authority_hotel: authority_hotel.to_string(),
+            authority_component: Some("aiua".into()),
+            owner_guest_id: owner_guest_id.to_string(),
+            owner_hotel: Some(authority_hotel.to_string()),
+            owner_component_type: Some("membrane.mcp".into()),
+            lease_epoch: 0,
+            lease_expires_at: 0,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: None,
+            metadata: serde_json::json!({
+                "authority_node_id": local_node_id,
+                "port": port,
+                "surface": "mcp",
+            }),
+        }
+    }
+
+    async fn remove_mcp_membrane_leases(
+        mcp_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        conn_id: Uuid,
+    ) {
+        let mut guard = mcp_membrane_leases.lock().await;
+        let scopes: Vec<String> = guard
+            .active_leases_for_connection(conn_id)
+            .into_iter()
+            .map(|lease| lease.lease_scope)
+            .collect();
+        let mut observer = LoggingMcpMembraneLeaseObserver;
+        for scope in scopes {
+            let _ = guard.release(&scope, conn_id, &mut observer);
+        }
+    }
+
+    async fn remove_discord_gateway_leases(
+        discord_gateway_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        conn_id: Uuid,
+    ) {
+        let mut guard = discord_gateway_leases.lock().await;
+        let scopes: Vec<String> = guard
+            .active_leases_for_connection(conn_id)
+            .into_iter()
+            .map(|lease| lease.lease_scope)
+            .collect();
+        let mut observer = LoggingLeaseObserver;
         for scope in scopes {
             let _ = guard.release(&scope, conn_id, &mut observer);
         }
@@ -1816,6 +2934,13 @@ impl IpcServer {
         task_id: Uuid,
         task_json: String,
     ) {
+        if let Err(err) = Self::hydrate_agent_graph_snapshot(&task_json) {
+            warn!(
+                "Failed to hydrate agent graph snapshot before delivering task {} to role='{}' guest={:?}: {}",
+                task_id, target_role, target_guest_id, err
+            );
+        }
+
         let subscribers = {
             let guard = inboxes.lock().await;
             let role_subscribers = guard.get(target_role).cloned().unwrap_or_default();
@@ -1890,6 +3015,41 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
+    fn local_delivery_provenance_hint(
+        session: &SessionRecord,
+        local_hotel_name: Option<&str>,
+    ) -> Option<LocalDeliveryProvenanceHint> {
+        let provenance = session.summary_json.get("agent_runtime_provenance")?;
+        let delivery_hotel = provenance.get("delivery_hotel")?.as_str()?;
+        let delivery_target_guest_id = provenance.get("delivery_target_guest_id")?.as_str()?;
+        let marker_kind = provenance
+            .get("marker_kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let marker_strength = provenance
+            .get("marker_strength")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| infer_marker_strength(None, marker_kind.as_deref()).map(str::to_string));
+        let policy = placement_marker_policy(marker_kind.as_deref(), marker_strength.as_deref());
+        let freshness_anchor = provenance
+            .get("updated_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(session.updated_at);
+        if Some(delivery_hotel) != local_hotel_name {
+            return None;
+        }
+        if unix_ts().saturating_sub(freshness_anchor) > policy.ttl_secs {
+            return None;
+        }
+        Some(LocalDeliveryProvenanceHint {
+            guest_id: delivery_target_guest_id.to_string(),
+            updated_at: freshness_anchor,
+            marker_kind,
+            marker_strength,
+        })
+    }
+
     async fn resolve_agent_route(
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
@@ -1914,6 +3074,7 @@ impl IpcServer {
         let Some(session) = session else {
             return AgentRouteResolution::Deliver(None);
         };
+        let local_hotel_name = Self::local_hotel_name(graph, local_node_id);
 
         let live_agent_guests: Vec<String> = {
             let guard = inboxes.lock().await;
@@ -1926,10 +3087,62 @@ impl IpcServer {
         };
 
         let is_registered = |guest_id: &str| live_agent_guests.iter().any(|live| live == guest_id);
+        let mut provenance_hint =
+            Self::local_delivery_provenance_hint(&session, local_hotel_name.as_deref());
+        if let (Some(active_guest_id), Some(hint)) = (
+            session.active_incarnation_id.as_deref(),
+            provenance_hint.as_ref(),
+        ) {
+            let policy = placement_marker_policy(
+                hint.marker_kind.as_deref(),
+                hint.marker_strength.as_deref(),
+            );
+            if policy.supersede_on_newer_active_incarnation_conflict
+                && active_guest_id != hint.guest_id
+                && session.updated_at > hint.updated_at
+            {
+                provenance_hint = None;
+            }
+        }
 
         if let Some(active_guest_id) = session.active_incarnation_id.clone() {
             if is_registered(&active_guest_id) {
                 return AgentRouteResolution::Deliver(Some(active_guest_id));
+            }
+
+            if let Some(hint) = provenance_hint.as_ref() {
+                let provenance_guest_id = hint.guest_id.as_str();
+                if provenance_guest_id != active_guest_id {
+                    if is_registered(provenance_guest_id) {
+                        warn!(
+                            "Active incarnation [{}] is not registered for session [{}]; preferring persisted local delivery guest [{}].",
+                            active_guest_id, session_id, provenance_guest_id
+                        );
+                        return AgentRouteResolution::Deliver(Some(
+                            provenance_guest_id.to_string(),
+                        ));
+                    }
+
+                    let policy = placement_marker_policy(
+                        hint.marker_kind.as_deref(),
+                        hint.marker_strength.as_deref(),
+                    );
+                    if policy.permit_parking_when_unregistered
+                        && Self::configured_local_guest_exists(
+                            graph,
+                            local_node_id,
+                            provenance_guest_id,
+                        )
+                    {
+                        info!(
+                            "Active incarnation [{}] is not registered for session [{}]; parking inbound for persisted local delivery guest [{}].",
+                            active_guest_id, session_id, provenance_guest_id
+                        );
+                        return AgentRouteResolution::Park {
+                            guest_id: provenance_guest_id.to_string(),
+                        };
+                    }
+                }
             }
 
             if let Some(orchestrator_guest_id) =
@@ -1957,6 +3170,38 @@ impl IpcServer {
                 active_guest_id, session_id
             );
             return AgentRouteResolution::Deliver(Some(active_guest_id));
+        }
+
+        if let Some(provenance_guest_id) =
+            provenance_hint.as_ref().map(|hint| hint.guest_id.as_str())
+        {
+            if is_registered(provenance_guest_id) {
+                info!(
+                    "Session [{}] has no active incarnation; routing inbound task to persisted local delivery guest [{}].",
+                    session_id, provenance_guest_id
+                );
+                return AgentRouteResolution::Deliver(Some(provenance_guest_id.to_string()));
+            }
+
+            let policy = placement_marker_policy(
+                provenance_hint
+                    .as_ref()
+                    .and_then(|hint| hint.marker_kind.as_deref()),
+                provenance_hint
+                    .as_ref()
+                    .and_then(|hint| hint.marker_strength.as_deref()),
+            );
+            if policy.permit_parking_when_unregistered
+                && Self::configured_local_guest_exists(graph, local_node_id, provenance_guest_id)
+            {
+                info!(
+                    "Session [{}] has no active incarnation; parking inbound for persisted local delivery guest [{}] while materializing.",
+                    session_id, provenance_guest_id
+                );
+                return AgentRouteResolution::Park {
+                    guest_id: provenance_guest_id.to_string(),
+                };
+            }
         }
 
         let orchestrator_guest_id =
@@ -2000,12 +3245,22 @@ impl IpcServer {
                     return Some(role_record.guest_id);
                 }
             }
+            // Single-process philote registers as the base agent_id and handles all roles
+            // internally. If the specific incarnation guest is not live but the base agent is,
+            // treat the base agent as the orchestrator.
+            if is_registered(agent_id) {
+                return Some(agent_id.to_string());
+            }
         }
 
         live_agent_guests
             .iter()
             .find(|guest_id| guest_id.ends_with(":orchestrator"))
             .cloned()
+    }
+
+    fn hydrate_agent_graph_snapshot(task_json: &str) -> anyhow::Result<Option<String>> {
+        apply_embedded_agent_graph_snapshot(task_json)
     }
 
     fn update_session_active_incarnation(
@@ -2019,14 +3274,21 @@ impl IpcServer {
         session.active_incarnation_id = Some(guest_id.to_string());
         session.updated_at = unix_ts();
         graph.upsert_session(&session)?;
+        for role_record in graph.list_role_incarnations_by_guest_id(guest_id)? {
+            graph.set_role_incarnation_readiness(
+                &role_record.agent_id,
+                &role_record.role_name,
+                RoleReadinessState::ActiveInSession,
+            )?;
+        }
         Ok(())
     }
 
-    fn resolve_role_guest_id(
+    fn resolve_role_incarnation(
         graph: &GraphDomain,
         session_id: &str,
         role_name: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<RoleIncarnationRecord> {
         let Some(session) = graph.get_session(session_id)? else {
             anyhow::bail!("session [{}] not found", session_id);
         };
@@ -2040,7 +3302,397 @@ impl IpcServer {
                 agent_id
             );
         };
-        Ok(role_record.guest_id)
+        Ok(role_record)
+    }
+
+    fn role_worker_manifest(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        role_record: &RoleIncarnationRecord,
+    ) -> anyhow::Result<ComponentManifest> {
+        let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let hotel = graph
+            .get_hotel(&hotel_name)?
+            .ok_or_else(|| anyhow::anyhow!("hotel [{hotel_name}] not found"))?;
+        let mut env = HashMap::new();
+        env.insert(
+            "PHILOTIC_HOTEL_SOCKET".into(),
+            hotel.ipc_socket_path.to_string(),
+        );
+        env.insert("PHILOTIC_HOTEL_NAME".into(), hotel_name.clone());
+        env.insert("PHILOTIC_NODE_ID".into(), local_node_id.to_string());
+        env.insert("PHILOTIC_AGENT_ID".into(), role_record.agent_id.clone());
+        env.insert("PHILOTIC_GUEST_ID".into(), role_record.guest_id.clone());
+        env.insert("PHILOTIC_ROLE_NAME".into(), role_record.role_name.clone());
+        env.insert("PHILOTIC_ROLE_INBOX".into(), role_record.routing_role());
+
+        Ok(ComponentManifest {
+            guest_id: role_record.guest_id.clone(),
+            role: "agent".into(),
+            hotel: hotel_name,
+            command: "philote".into(),
+            args: Vec::new(),
+            env,
+            component_config: serde_json::json!({
+                "component_kind": "role_worker",
+                "agent_id": role_record.agent_id,
+                "role_name": role_record.role_name,
+                "routing_role": role_record.routing_role(),
+            }),
+            auto_start: true,
+        })
+    }
+
+    async fn role_route_is_live(
+        inboxes: &InboxRegistry,
+        routing_role: &str,
+        guest_id: &str,
+    ) -> bool {
+        let guard = inboxes.lock().await;
+        guard
+            .get(routing_role)
+            .into_iter()
+            .flatten()
+            .any(|subscriber| subscriber.guest_id == guest_id)
+    }
+
+    async fn deliver_live_guest_task(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+        target_role: &str,
+        guest_id: &str,
+        task_id: Uuid,
+        task_json: String,
+        activate_session_id: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let task_json = attach_delivery_context(
+            graph,
+            local_node_id,
+            target_role,
+            Some(guest_id),
+            &task_json,
+        );
+        let is_live = {
+            let guard = inboxes.lock().await;
+            guard
+                .get(target_role)
+                .into_iter()
+                .flatten()
+                .any(|subscriber| subscriber.guest_id == guest_id)
+        };
+        if !is_live {
+            return Ok(false);
+        }
+        if let Some(session_id) = activate_session_id.as_deref() {
+            Self::update_session_active_incarnation(graph, session_id, guest_id)?;
+        }
+        Self::deliver_inbound_task(
+            inboxes,
+            local_node_id,
+            target_role,
+            Some(guest_id),
+            task_id,
+            task_json,
+        )
+        .await;
+        Ok(true)
+    }
+
+    fn role_guest_process_is_live(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        guest_id: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            return Ok(false);
+        };
+        let guest = graph
+            .list_guests(&local_hotel_name, false)?
+            .into_iter()
+            .find(|guest| guest.guest_id == guest_id);
+        Ok(guest
+            .and_then(|guest| guest.active_pid)
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(Self::pid_exists))
+    }
+
+    async fn ensure_role_materialized(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        agent_id: &str,
+        role_name: &str,
+    ) -> anyhow::Result<RoleReadinessState> {
+        let role_record = graph
+            .get_role_incarnation(agent_id, role_name)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("role [{role_name}] is not configured for agent [{agent_id}]")
+            })?;
+
+        if Self::role_route_is_live(inboxes, &role_record.routing_role(), &role_record.guest_id)
+            .await
+        {
+            let readiness = if matches!(
+                role_record.readiness_state,
+                RoleReadinessState::ActiveInSession
+            ) {
+                RoleReadinessState::ActiveInSession
+            } else {
+                RoleReadinessState::Routable
+            };
+            graph.set_role_incarnation_readiness(agent_id, role_name, readiness.clone())?;
+            return Ok(readiness);
+        }
+
+        let manifest = Self::role_worker_manifest(graph, local_node_id, &role_record)?;
+        match Self::handle_register_component(graph, materialization_requester, manifest).await {
+            IpcResponse::ComponentRegistered { .. } => {}
+            IpcResponse::Standard { ok: true, .. } => {}
+            IpcResponse::Error(msg) => anyhow::bail!(msg),
+            other => anyhow::bail!("unexpected role materialization response: {other:?}"),
+        }
+
+        let readiness = if Self::role_route_is_live(
+            inboxes,
+            &role_record.routing_role(),
+            &role_record.guest_id,
+        )
+        .await
+        {
+            RoleReadinessState::Routable
+        } else if Self::role_guest_process_is_live(graph, local_node_id, &role_record.guest_id)? {
+            RoleReadinessState::Materialized
+        } else {
+            RoleReadinessState::Materializing
+        };
+        graph.set_role_incarnation_readiness(agent_id, role_name, readiness.clone())?;
+        Ok(readiness)
+    }
+
+    async fn configure_role_record(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        current_identity: Option<&GuestIdentity>,
+        agent_id: String,
+        role_name: String,
+        guest_id: String,
+        calling_role: String,
+        toolset_profile: String,
+        role_identity_addendum: Option<String>,
+        role_manifest: Option<String>,
+        is_admin: bool,
+        inactive_ttl_seconds: Option<u64>,
+        iteration_cap: Option<u32>,
+        approval_policy: Option<String>,
+        model_profile: Option<String>,
+        context_window_policy: Option<String>,
+    ) -> IpcResponse {
+        let Some(identity) = current_identity else {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_UNREGISTERED",
+                "guest must register before configuring roles",
+            );
+        };
+        if calling_role != "orchestrator" {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_FORBIDDEN",
+                "only agents operating in the orchestrator persona may configure role incarnations",
+            );
+        }
+        if !identity.guest_id.starts_with(&agent_id) {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_FORBIDDEN",
+                "orchestrator guests may only configure roles for their own agent identity",
+            );
+        }
+        let caller_agent_id = identity
+            .guest_id
+            .strip_suffix(&format!(":{}", identity.role))
+            .unwrap_or(&identity.guest_id);
+        let caller_is_admin = graph
+            .get_role_incarnation(caller_agent_id, &identity.role)
+            .ok()
+            .flatten()
+            .map(|r| r.is_admin)
+            .unwrap_or(false);
+
+        if role_name == "orchestrator" && !caller_is_admin {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_FORBIDDEN",
+                "the orchestrator role record is operator-owned; only admin roles may update it",
+            );
+        }
+
+        if is_admin && !caller_is_admin {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_FORBIDDEN",
+                "only admin roles may create other admin roles",
+            );
+        }
+
+        let previous = graph
+            .get_role_incarnation(&agent_id, &role_name)
+            .ok()
+            .flatten();
+        let is_new_role = previous.is_none();
+        // For a new role, check if the base agent is currently live. Single-process philote
+        // registers as the base agent_id and handles all roles internally, so any new role
+        // it creates is immediately routable via the base guest.
+        let initial_readiness = if let Some(prev) = previous.as_ref() {
+            prev.readiness_state.clone()
+        } else {
+            let base_guest_live = {
+                let guard = inboxes.lock().await;
+                guard
+                    .get("agent")
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s.guest_id == agent_id)
+            };
+            if base_guest_live {
+                ansible_mesh_core::graph::RoleReadinessState::Routable
+            } else {
+                ansible_mesh_core::graph::RoleReadinessState::Configured
+            }
+        };
+        let record = ansible_mesh_core::graph::RoleIncarnationRecord {
+            agent_id: agent_id.clone(),
+            role_name: role_name.clone(),
+            guest_id,
+            toolset_profile,
+            role_identity_addendum,
+            role_manifest,
+            is_admin,
+            readiness_state: initial_readiness,
+            inactive_ttl_seconds,
+            turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
+                iteration_cap,
+                approval_policy,
+                model_profile,
+                context_window_policy,
+                loop_script: None,
+                fallback_tiers: Vec::new(),
+            },
+            home_node: None,
+        };
+
+        if let Err(e) = graph.upsert_role_incarnation(&record) {
+            warn!("Failed to persist role config [{}]: {}", role_name, e);
+            return IpcResponse::error(
+                "configure_role",
+                "ROLE_PERSIST_FAILED",
+                format!("Failed to persist role config: {e}"),
+            );
+        }
+
+        info!(
+            agent_id = %agent_id,
+            role_name = %role_name,
+            "Role incarnation configured via IPC"
+        );
+
+        let breaking_change = previous.as_ref().is_some_and(|existing| {
+            existing.guest_id != record.guest_id
+                || existing.toolset_profile != record.toolset_profile
+                || existing.role_manifest != record.role_manifest
+                || existing.turn_loop_config.model_profile != record.turn_loop_config.model_profile
+        });
+
+        if is_new_role || breaking_change {
+            if let Err(err) = graph.set_role_incarnation_readiness(
+                &agent_id,
+                &role_name,
+                RoleReadinessState::Configured,
+            ) {
+                warn!(
+                    "Failed to reset readiness for role [{}] before materialization: {}",
+                    role_name, err
+                );
+            }
+            let manifest = match Self::role_worker_manifest(graph, local_node_id, &record) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "ROLE_COMPONENT_CONFIG_FAILED",
+                        err.to_string(),
+                    );
+                }
+            };
+            match Self::handle_register_component(graph, materialization_requester, manifest).await
+            {
+                IpcResponse::ComponentRegistered { .. }
+                | IpcResponse::Standard { ok: true, .. } => {}
+                IpcResponse::Error(msg) => {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "ROLE_COMPONENT_REGISTER_FAILED",
+                        msg,
+                    );
+                }
+                other => {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "ROLE_COMPONENT_REGISTER_FAILED",
+                        format!("unexpected role worker registration response: {other:?}"),
+                    );
+                }
+            }
+            if breaking_change {
+                match Self::handle_restart_component(
+                    graph,
+                    materialization_requester,
+                    local_node_id,
+                    &record.guest_id,
+                )
+                .await
+                {
+                    IpcResponse::Standard { ok: true, .. } => {}
+                    IpcResponse::Error(msg) => {
+                        return IpcResponse::error(
+                            "configure_role",
+                            "ROLE_COMPONENT_RESTART_FAILED",
+                            msg,
+                        );
+                    }
+                    other => {
+                        return IpcResponse::error(
+                            "configure_role",
+                            "ROLE_COMPONENT_RESTART_FAILED",
+                            format!("unexpected role worker restart response: {other:?}"),
+                        );
+                    }
+                }
+            }
+            if let Err(err) = Self::ensure_role_materialized(
+                graph,
+                inboxes,
+                materialization_requester,
+                local_node_id,
+                &agent_id,
+                &role_name,
+            )
+            .await
+            {
+                warn!(
+                    "Role [{}] was configured but eager materialization failed: {}",
+                    role_name, err
+                );
+            }
+        }
+
+        IpcResponse::ConfigureRoleOk { role_name }
     }
 
     async fn queue_or_deliver_guest_task(
@@ -2055,6 +3707,13 @@ impl IpcServer {
         task_json: String,
         activate_session_id: Option<String>,
     ) -> anyhow::Result<bool> {
+        let task_json = attach_delivery_context(
+            graph,
+            local_node_id,
+            target_role,
+            Some(guest_id),
+            &task_json,
+        );
         let is_live = {
             let guard = inboxes.lock().await;
             guard
@@ -2139,6 +3798,8 @@ impl IpcServer {
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        mcp_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        discord_gateway_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: &SubagentHookRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
@@ -2148,6 +3809,7 @@ impl IpcServer {
         subscribed_roles: &mut Vec<String>,
         current_identity: &mut Option<GuestIdentity>,
         follow_up_responses: &mut Vec<IpcResponse>,
+        operator_surface_tx: Option<&mpsc::Sender<String>>,
     ) -> IpcResponse {
         match req {
             IpcRequest::Register(identity) => {
@@ -2216,13 +3878,36 @@ impl IpcServer {
                         value_json: Some(snapshot.to_string()),
                     };
                 }
-                if let Some(session_id) = key.strip_prefix("__session_snapshot__:") {
+                // Returns a JSON array of memory_type strings for all session apartments
+                // belonging to the given agent — used by philote at startup for stale-turn sweep.
+                // Key format: `__session_apartments__:{agent_id}`
+                if let Some(agent_id) = key.strip_prefix("__session_apartments__:") {
+                    let memory_types: Vec<String> = graph
+                        .list_apartments(agent_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|mt| mt.starts_with("short_session:"))
+                        .collect();
+                    let json = serde_json::to_string(&memory_types).unwrap_or_else(|_| "[]".into());
+                    return IpcResponse::ConfigData {
+                        key,
+                        value_json: Some(json),
+                    };
+                }
+
+                if let Some(rest) = key.strip_prefix("__session_snapshot__:") {
+                    // Format: `{session_id}` (orchestrator) or `{session_id}@{role_name}` (role process)
+                    let (session_id, role_name) = match rest.split_once('@') {
+                        Some((sess, role)) => (sess, Some(role)),
+                        None => (rest, None),
+                    };
                     match Self::compose_session_snapshot(
                         graph,
                         inboxes,
                         registry,
                         local_node_id,
                         session_id,
+                        role_name,
                     )
                     .await
                     {
@@ -2320,15 +4005,17 @@ impl IpcServer {
                     Err(e) => IpcResponse::error("toolset_profile", "PROFILE_ERROR", e.to_string()),
                 }
             }
-            IpcRequest::ListToolsetProfiles {} => {
-                match graph.list_toolset_profiles() {
-                    Ok(profiles) => IpcResponse::success(
-                        "list_toolset_profiles",
-                        Some(serde_json::to_value(&profiles).unwrap_or(serde_json::Value::Array(vec![]))),
+            IpcRequest::ListToolsetProfiles {} => match graph.list_toolset_profiles() {
+                Ok(profiles) => IpcResponse::success(
+                    "list_toolset_profiles",
+                    Some(
+                        serde_json::to_value(&profiles).unwrap_or(serde_json::Value::Array(vec![])),
                     ),
-                    Err(e) => IpcResponse::error("list_toolset_profiles", "PROFILES_ERROR", e.to_string()),
+                ),
+                Err(e) => {
+                    IpcResponse::error("list_toolset_profiles", "PROFILES_ERROR", e.to_string())
                 }
-            }
+            },
             IpcRequest::SetConfig { key, value_json } => {
                 info!("SetConfig requested: {}", key);
                 match graph.set_config_value(&key, &value_json) {
@@ -2336,20 +4023,66 @@ impl IpcServer {
                     Err(e) => IpcResponse::error("config", "CONFIG_ERROR", e.to_string()),
                 }
             }
-            IpcRequest::RotateSecret { secret_ref, plaintext } => {
+            IpcRequest::RotateSecret {
+                secret_ref,
+                plaintext,
+            } => {
                 info!("RotateSecret requested for ref: {}", secret_ref);
                 match crate::vault::rotate_secret(graph, &secret_ref, &plaintext) {
                     Ok(()) => IpcResponse::success("secret", None),
                     Err(e) => IpcResponse::error("secret", "SECRET_ERROR", e.to_string()),
                 }
             }
-            IpcRequest::AddVaultEntry { vault_name, plaintext, allowed_roles } => {
+            IpcRequest::AddVaultEntry {
+                vault_name,
+                plaintext,
+                allowed_roles,
+            } => {
                 info!("AddVaultEntry requested: {}", vault_name);
                 match Self::handle_add_vault_entry(graph, vault_name, plaintext, allowed_roles) {
-                    Ok(secret_ref) => IpcResponse::success("vault", Some(serde_json::json!({ "secret_ref": secret_ref }))),
+                    Ok(secret_ref) => IpcResponse::success(
+                        "vault",
+                        Some(serde_json::json!({ "secret_ref": secret_ref })),
+                    ),
                     Err(e) => IpcResponse::error("vault", "VAULT_ERROR", e.to_string()),
                 }
             }
+            IpcRequest::CreateMeshInvite {
+                hotel_name,
+                mesh_host,
+                ttl_secs,
+            } => match Self::handle_create_mesh_invite(
+                graph,
+                local_node_id,
+                hotel_name,
+                mesh_host,
+                ttl_secs,
+            )
+            .await
+            {
+                Ok(data) => IpcResponse::success("mesh_invite", Some(data)),
+                Err(err) => {
+                    IpcResponse::error("mesh_invite", "MESH_INVITE_ERROR", err.to_string())
+                }
+            },
+            IpcRequest::AcceptMeshInvite {
+                hotel_name,
+                mesh_host,
+                invite_json,
+            } => match Self::handle_accept_mesh_invite(
+                graph,
+                local_node_id,
+                hotel_name,
+                mesh_host,
+                invite_json,
+            )
+            .await
+            {
+                Ok(data) => IpcResponse::success("mesh_accept", Some(data)),
+                Err(err) => {
+                    IpcResponse::error("mesh_accept", "MESH_ACCEPT_ERROR", err.to_string())
+                }
+            },
             IpcRequest::PublishMessage {
                 target_role,
                 payload,
@@ -2578,6 +4311,26 @@ impl IpcServer {
                     subscribed_roles,
                 )
                 .await;
+                if let Some(guest_id) = guest.as_ref().map(|subscriber| subscriber.guest_id.clone())
+                {
+                    if let Ok(role_records) = graph.list_role_incarnations_by_routing_role(&role) {
+                        for role_record in role_records
+                            .into_iter()
+                            .filter(|record| record.guest_id == guest_id)
+                        {
+                            if let Err(err) = graph.set_role_incarnation_readiness(
+                                &role_record.agent_id,
+                                &role_record.role_name,
+                                RoleReadinessState::Routable,
+                            ) {
+                                warn!(
+                                    "Failed to mark role [{}] routable on SubscribeInbox: {}",
+                                    role_record.role_name, err
+                                );
+                            }
+                        }
+                    }
+                }
                 IpcResponse::success("sub", None)
             }
             IpcRequest::AcquireTelegramPollLease {
@@ -2642,10 +4395,18 @@ impl IpcServer {
                     unix_ts(),
                     &mut observer,
                 ) {
-                    LeaseAcquireOutcome::Granted(lease) => IpcResponse::TelegramPollLease {
-                        granted: true,
-                        lease: Some(lease),
-                    },
+                    LeaseAcquireOutcome::Granted(lease) => {
+                        Self::inject_membrane_binding(
+                            graph,
+                            &agent_id,
+                            "telegram",
+                            &identity.guest_id,
+                        );
+                        IpcResponse::TelegramPollLease {
+                            granted: true,
+                            lease: Some(lease),
+                        }
+                    }
                     LeaseAcquireOutcome::Denied(lease) => {
                         info!(
                             "Telegram poll lease [{}] denied for guest [{}]; held by [{}] epoch {}.",
@@ -2978,11 +4739,9 @@ impl IpcServer {
                     Ok(operator_chat_reply) => IpcResponse::OperatorChatTurnReply {
                         operator_chat_reply,
                     },
-                    Err(err) => IpcResponse::error(
-                        "operator_chat",
-                        "OPERATOR_CHAT_ERROR",
-                        err.to_string(),
-                    ),
+                    Err(err) => {
+                        IpcResponse::error("operator_chat", "OPERATOR_CHAT_ERROR", err.to_string())
+                    }
                 }
             }
             IpcRequest::ListDesktopMembraneAgents => {
@@ -3089,6 +4848,230 @@ impl IpcServer {
                     None => IpcResponse::success("desktop_membrane_lease_release", None),
                 }
             }
+            IpcRequest::AcquireDiscordGatewayLease {
+                lease_key,
+                agent_id,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before acquiring a Discord gateway lease",
+                    );
+                };
+                let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten()
+                else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AGENT_UNKNOWN",
+                        format!("no agent identity found for [{}]", agent_id),
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+                if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_FOREIGN_AUTHORITY",
+                        format!(
+                            "agent [{}] is owned by hotel [{}] and hotel [{}] is not authorized",
+                            agent_id, agent_identity.authority_hotel, local_hotel_name
+                        ),
+                    );
+                }
+
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                let candidate = Self::discord_gateway_lease(
+                    &lease_key,
+                    &local_hotel_name,
+                    local_node_id,
+                    &identity.guest_id,
+                    &agent_id,
+                );
+                let mut observer = LoggingLeaseObserver;
+                match guard.acquire(
+                    conn_id,
+                    candidate,
+                    DISCORD_GATEWAY_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseAcquireOutcome::Granted(lease) => {
+                        Self::inject_membrane_binding(
+                            graph,
+                            &agent_id,
+                            "discord_text",
+                            &identity.guest_id,
+                        );
+                        IpcResponse::DiscordGatewayLease {
+                            granted: true,
+                            lease: Some(lease),
+                        }
+                    }
+                    LeaseAcquireOutcome::Denied(lease) => {
+                        info!(
+                            "Discord gateway lease [{}] denied for guest [{}]; held by [{}] epoch {}.",
+                            lease.lease_scope,
+                            identity.guest_id,
+                            lease.owner_guest_id,
+                            lease.lease_epoch
+                        );
+                        IpcResponse::DiscordGatewayLease {
+                            granted: false,
+                            lease: Some(lease),
+                        }
+                    }
+                }
+            }
+            IpcRequest::GetDiscordGatewayLeaseOwner { lease_key } => {
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                if let Some(existing) = guard.inspect(&lease_key) {
+                    IpcResponse::DiscordGatewayLeaseStatus {
+                        active: true,
+                        lease: Some(existing),
+                    }
+                } else {
+                    IpcResponse::DiscordGatewayLeaseStatus {
+                        active: false,
+                        lease: None,
+                    }
+                }
+            }
+            IpcRequest::RenewDiscordGatewayLease {
+                lease_key,
+                agent_id,
+                lease_epoch,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before renewing a Discord gateway lease",
+                    );
+                };
+                let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten()
+                else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AGENT_UNKNOWN",
+                        format!("no agent identity found for [{}]", agent_id),
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+                if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_FOREIGN_AUTHORITY",
+                        format!(
+                            "agent [{}] is owned by hotel [{}] and hotel [{}] is not authorized",
+                            agent_id, agent_identity.authority_hotel, local_hotel_name
+                        ),
+                    );
+                }
+
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                let mut observer = LoggingLeaseObserver;
+                match guard.renew(
+                    &lease_key,
+                    conn_id,
+                    lease_epoch,
+                    DISCORD_GATEWAY_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseRenewOutcome::Renewed(lease) => IpcResponse::DiscordGatewayLease {
+                        granted: true,
+                        lease: Some(lease),
+                    },
+                    LeaseRenewOutcome::Lost(lease) => {
+                        if let Some(ref lease) = lease {
+                            info!(
+                                "Discord gateway lease [{}] renew denied for guest [{}]; held by [{}] epoch {}.",
+                                lease.lease_scope,
+                                identity.guest_id,
+                                lease.owner_guest_id,
+                                lease.lease_epoch
+                            );
+                        }
+                        IpcResponse::DiscordGatewayLease {
+                            granted: false,
+                            lease,
+                        }
+                    }
+                }
+            }
+            IpcRequest::ReleaseDiscordGatewayLease { lease_key } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before releasing a Discord gateway lease",
+                    );
+                };
+
+                let mut guard = discord_gateway_leases.lock().await;
+                let mut observer = LoggingLeaseObserver;
+                match guard.inspect(&lease_key) {
+                    Some(existing) if existing.owner_guest_id == identity.guest_id => {
+                        if guard.release(&lease_key, conn_id, &mut observer).is_some() {
+                            IpcResponse::success("discord_gateway_lease_release", None)
+                        } else {
+                            IpcResponse::error(
+                                "discord_gateway_lease_release",
+                                "LEASE_NOT_OWNER",
+                                format!(
+                                    "guest [{}] does not hold the active connection for lease [{}]",
+                                    identity.guest_id, lease_key
+                                ),
+                            )
+                        }
+                    }
+                    Some(existing) => IpcResponse::error(
+                        "discord_gateway_lease_release",
+                        "LEASE_NOT_OWNER",
+                        format!(
+                            "guest [{}] cannot release lease [{}] owned by [{}]",
+                            identity.guest_id, lease_key, existing.owner_guest_id
+                        ),
+                    ),
+                    None => IpcResponse::success("discord_gateway_lease_release", None),
+                }
+            }
             IpcRequest::ReleaseTelegramPollLease { lease_key } => {
                 let Some(identity) = current_identity.as_ref() else {
                     return IpcResponse::error(
@@ -3147,6 +5130,40 @@ impl IpcServer {
                 target_guest_id,
                 task_json,
             } => {
+                // Short-circuit operator surface queries to the in-process channel,
+                // eliminating the UDS self-connection and its socket leak.
+                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                    if let Some(tx) = operator_surface_tx {
+                        let _ = tx.try_send(task_json).ok();
+                        return IpcResponse::Standard {
+                            ok: true,
+                            code: "OK".into(),
+                            message: "operator surface query dispatched in-process".into(),
+                            corr_id: String::new(),
+                            data: None,
+                        };
+                    }
+                }
+                let task_json = match (
+                    infer_agent_context_for_task(
+                        graph,
+                        &target_role,
+                        target_guest_id.as_deref(),
+                        &task_json,
+                    ),
+                    Self::local_hotel_name(graph, local_node_id),
+                ) {
+                    (Some(context), Some(local_hotel))
+                        if context.authority_hotel.as_deref() == Some(local_hotel.as_str()) =>
+                    {
+                        attach_agent_graph_snapshot(
+                            &task_json,
+                            Some(&context.agent_id),
+                            local_node_id,
+                        )
+                    }
+                    _ => task_json,
+                };
                 let route_resolution = Self::resolve_agent_route(
                     graph,
                     inboxes,
@@ -3159,6 +5176,17 @@ impl IpcServer {
                 let resolved_target_guest_id = match &route_resolution {
                     AgentRouteResolution::Deliver(guest_id) => guest_id.clone(),
                     AgentRouteResolution::Park { guest_id } => Some(guest_id.clone()),
+                };
+                let task_json = if target_node == local_node_id {
+                    attach_delivery_context(
+                        graph,
+                        local_node_id,
+                        &target_role,
+                        resolved_target_guest_id.as_deref(),
+                        &task_json,
+                    )
+                } else {
+                    task_json
                 };
                 info!(
                     "EmitTask mapped to TaskInvoke for {}/{} guest={:?}",
@@ -3230,7 +5258,9 @@ impl IpcServer {
                                         .await;
                                 }
                                 Err(err) => {
-                                    warn!("Cross-hotel proxy failed to connect to {peer_path}: {err}");
+                                    warn!(
+                                        "Cross-hotel proxy failed to connect to {peer_path}: {err}"
+                                    );
                                 }
                             }
                         });
@@ -3299,9 +5329,9 @@ impl IpcServer {
                     );
                 }
 
-                let target_guest_id =
-                    match Self::resolve_role_guest_id(graph, &session_id, &role_name) {
-                        Ok(guest_id) => guest_id,
+                let target_role =
+                    match Self::resolve_role_incarnation(graph, &session_id, &role_name) {
+                        Ok(role_record) => role_record,
                         Err(err) => {
                             return IpcResponse::error(
                                 "handoff_to_role",
@@ -3310,14 +5340,96 @@ impl IpcServer {
                             );
                         }
                     };
+
+                // Remote role: dispatch over mesh to the role's home hotel.
+                if let Some(ref home_node) = target_role.home_node.clone() {
+                    if home_node != local_node_id {
+                        let toolset_record = graph
+                            .get_toolset_profile(&target_role.toolset_profile)
+                            .ok()
+                            .flatten();
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let task_id = Uuid::new_v4();
+                        let event = EventEnvelope {
+                            event_id: task_id,
+                            seq: 0,
+                            source_node_id: local_node_id.to_string(),
+                            target_node_id: Some(home_node.clone()),
+                            source_agent_id: identity.guest_id.clone(),
+                            target_agent_id: Some(target_role.routing_role()),
+                            kind: ansible_mesh_core::event::EventKind::SessionControl,
+                            corr_id: session_id.clone(),
+                            attempt: 0,
+                            created_at: ts,
+                            expires_at: None,
+                            payload: ansible_mesh_core::event::EventPayload::Inline {
+                                data: serde_json::json!({
+                                    "action": "session.handoff",
+                                    "session_id": session_id,
+                                    "role_name": role_name,
+                                    "handoff_bundle": handoff_bundle,
+                                    "role_record": target_role,
+                                    "toolset_record": toolset_record,
+                                })
+                                .to_string(),
+                            },
+                            trace: vec![],
+                        };
+                        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+                        info!(
+                            "Dispatched remote handoff for role '{}' to home_node '{}'",
+                            role_name, home_node
+                        );
+                        return IpcResponse::HandoffAck {
+                            handoff_guest_id: target_role.guest_id,
+                            became_active: false,
+                        };
+                    }
+                }
+
+                let readiness = match Self::ensure_role_materialized(
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    local_node_id,
+                    &target_role.agent_id,
+                    &role_name,
+                )
+                .await
+                {
+                    Ok(readiness) => readiness,
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "handoff_to_role",
+                            "HANDOFF_MATERIALIZATION_FAILED",
+                            err.to_string(),
+                        );
+                    }
+                };
+                if matches!(
+                    readiness,
+                    RoleReadinessState::Configured
+                        | RoleReadinessState::Materializing
+                        | RoleReadinessState::Materialized
+                ) {
+                    return IpcResponse::HandoffPending {
+                        role_name,
+                        readiness: readiness.as_str().into(),
+                        retry_after_ms: Some(250),
+                    };
+                }
+                let target_guest_id = target_role.guest_id.clone();
                 let task_id = Uuid::new_v4();
-                
+
                 // Construct the SessionControl envelope for durable mesh ledger tracking
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                    
+
                 let event = EventEnvelope {
                     event_id: task_id,
                     seq: 0,
@@ -3343,20 +5455,36 @@ impl IpcServer {
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
 
+                let agent_id = match graph.get_session(&session_id) {
+                    Ok(Some(session)) => session.primary_agent_id,
+                    Ok(None) => None,
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "handoff_to_role",
+                            "HANDOFF_SESSION_LOOKUP_FAILED",
+                            err.to_string(),
+                        );
+                    }
+                };
+                let authority_hotel = agent_id
+                    .as_deref()
+                    .and_then(|agent_id| lookup_agent_authority_hotel(graph, agent_id));
                 let task_json = serde_json::json!({
                     "action": "handoff_bundle",
+                    "agent_id": agent_id,
+                    "authority_hotel": authority_hotel,
                     "session_id": session_id,
                     "handoff_bundle": handoff_bundle,
                 })
                 .to_string();
-                
-                match Self::queue_or_deliver_guest_task(
+                let task_json =
+                    attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
+
+                match Self::deliver_live_guest_task(
                     graph,
                     inboxes,
-                    parked_inbound,
-                    materialization_requester,
                     local_node_id,
-                    "agent",
+                    &target_role.routing_role(),
                     &target_guest_id,
                     task_id,
                     task_json,
@@ -3364,10 +5492,34 @@ impl IpcServer {
                 )
                 .await
                 {
-                    Ok(active) => IpcResponse::HandoffAck {
-                        handoff_guest_id: target_guest_id,
-                        became_active: active,
-                    },
+                    Ok(true) => {
+                        if let Err(err) = graph.set_role_incarnation_readiness(
+                            &target_role.agent_id,
+                            &target_role.role_name,
+                            RoleReadinessState::ActiveInSession,
+                        ) {
+                            warn!(
+                                "Failed to mark role [{}] active in session: {}",
+                                target_role.role_name, err
+                            );
+                        }
+                        IpcResponse::HandoffAck {
+                            handoff_guest_id: target_guest_id,
+                            became_active: true,
+                        }
+                    }
+                    Ok(false) => {
+                        let _ = graph.set_role_incarnation_readiness(
+                            &target_role.agent_id,
+                            &target_role.role_name,
+                            RoleReadinessState::Materializing,
+                        );
+                        IpcResponse::HandoffPending {
+                            role_name,
+                            readiness: RoleReadinessState::Materializing.as_str().into(),
+                            retry_after_ms: Some(250),
+                        }
+                    }
                     Err(err) => IpcResponse::error(
                         "handoff_to_role",
                         "HANDOFF_DELIVERY_FAILED",
@@ -3395,9 +5547,9 @@ impl IpcServer {
                     );
                 }
                 let target_role = return_to.unwrap_or_else(|| "orchestrator".into());
-                let target_guest_id =
-                    match Self::resolve_role_guest_id(graph, &session_id, &target_role) {
-                        Ok(guest_id) => guest_id,
+                let target_role_record =
+                    match Self::resolve_role_incarnation(graph, &session_id, &target_role) {
+                        Ok(role_record) => role_record,
                         Err(err) => {
                             return IpcResponse::error(
                                 "handoff_back",
@@ -3406,13 +5558,14 @@ impl IpcServer {
                             );
                         }
                     };
+                let target_guest_id = target_role_record.guest_id.clone();
                 let task_id = Uuid::new_v4();
 
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                    
+
                 let event = EventEnvelope {
                     event_id: task_id,
                     seq: 0,
@@ -3438,13 +5591,31 @@ impl IpcServer {
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
 
+                let agent_id = match graph.get_session(&session_id) {
+                    Ok(Some(session)) => session.primary_agent_id,
+                    Ok(None) => None,
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "handoff_back",
+                            "HANDOFF_SESSION_LOOKUP_FAILED",
+                            err.to_string(),
+                        );
+                    }
+                };
+                let authority_hotel = agent_id
+                    .as_deref()
+                    .and_then(|agent_id| lookup_agent_authority_hotel(graph, agent_id));
                 let task_json = serde_json::json!({
                     "action": "handoff_return",
+                    "agent_id": agent_id,
+                    "authority_hotel": authority_hotel,
                     "session_id": session_id,
                     "summary": summary,
                     "from_incarnation_id": identity.guest_id,
                 })
                 .to_string();
+                let task_json =
+                    attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
                 match Self::queue_or_deliver_guest_task(
                     graph,
                     inboxes,
@@ -3468,6 +5639,81 @@ impl IpcServer {
                         "HANDOFF_DELIVERY_FAILED",
                         err.to_string(),
                     ),
+                }
+            }
+            IpcRequest::SetRoleHome {
+                agent_id,
+                role_name,
+                calling_role,
+                target_hotel,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_UNREGISTERED",
+                        "guest must register before calling set_role_home",
+                    );
+                };
+                if identity.role != "agent" {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_FORBIDDEN",
+                        "only agent guests may call set_role_home",
+                    );
+                }
+
+                // Only the orchestrator or admin roles may move roles.
+                let calling_role_record = graph.get_role_incarnation(&agent_id, &calling_role);
+                let is_admin = calling_role_record
+                    .ok()
+                    .flatten()
+                    .map(|r| r.is_admin || r.role_name == "orchestrator")
+                    .unwrap_or(false);
+                if !is_admin {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_FORBIDDEN",
+                        format!(
+                            "role '{}' does not have authority to set home_node for other roles",
+                            calling_role
+                        ),
+                    );
+                }
+
+                let mut record = match graph.get_role_incarnation(&agent_id, &role_name) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        return IpcResponse::error(
+                            "set_role_home",
+                            "SET_ROLE_HOME_UNKNOWN",
+                            format!("role '{}' not found for agent '{}'", role_name, agent_id),
+                        );
+                    }
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "set_role_home",
+                            "SET_ROLE_HOME_DB_ERROR",
+                            err.to_string(),
+                        );
+                    }
+                };
+
+                record.home_node = target_hotel.clone();
+                if let Err(err) = graph.upsert_role_incarnation(&record) {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_PERSIST_FAILED",
+                        err.to_string(),
+                    );
+                }
+
+                info!(
+                    "Role '{}' (agent '{}') home_node set to {:?} by '{}'",
+                    role_name, agent_id, target_hotel, calling_role
+                );
+                IpcResponse::RoleHomeSet {
+                    role_name,
+                    home_node: target_hotel,
                 }
             }
             IpcRequest::DelegateToPeer {
@@ -3495,6 +5741,7 @@ impl IpcServer {
 
                 // Generate a derived session_id ensuring isolation but persistence to the same chat
                 let session_id = format!("{}:peer:{}", chat_id, target_agent_id);
+                let authority_hotel = lookup_agent_authority_hotel(graph, &target_agent_id);
 
                 // Build the mesh envelope for TaskInvoke
                 let env = EventEnvelope {
@@ -3512,6 +5759,8 @@ impl IpcServer {
                     payload: ansible_mesh_core::event::EventPayload::Inline {
                         data: serde_json::json!({
                             "action": "peer.delegate",
+                            "agent_id": target_agent_id,
+                            "authority_hotel": authority_hotel,
                             "session_id": session_id,
                             "chat_id": chat_id,
                             "source": source.unwrap_or_else(|| "peer".into()),
@@ -3873,96 +6122,129 @@ impl IpcServer {
                 model_profile,
                 context_window_policy,
             } => {
-                let Some(identity) = current_identity.as_ref() else {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_UNREGISTERED",
-                        "guest must register before configuring roles",
-                    );
-                };
-                // Check the agent's active persona role, not the IPC process type.
-                // The IPC process type is always "agent" for philote — what matters
-                // is the session-level persona role ("orchestrator") passed explicitly.
-                if calling_role != "orchestrator" {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_FORBIDDEN",
-                        "only agents operating in the orchestrator persona may configure role incarnations",
-                    );
-                }
-                if !identity.guest_id.starts_with(&agent_id) {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_FORBIDDEN",
-                        "orchestrator guests may only configure roles for their own agent identity",
-                    );
-                }
-                // Determine whether the calling guest has admin authority by looking up their
-                // role incarnation record. Only admin roles may update operator-owned records.
-                let caller_agent_id = identity
-                    .guest_id
-                    .strip_suffix(&format!(":{}", identity.role))
-                    .unwrap_or(&identity.guest_id);
-                let caller_is_admin = graph
-                    .get_role_incarnation(caller_agent_id, &identity.role)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.is_admin)
-                    .unwrap_or(false);
-
-                // The orchestrator role record is operator-owned. Only admin roles may update it.
-                if role_name == "orchestrator" && !caller_is_admin {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_FORBIDDEN",
-                        "the orchestrator role record is operator-owned; only admin roles may update it",
-                    );
-                }
-
-                // Prevent privilege escalation: only admin roles may create other admin roles.
-                if is_admin && !caller_is_admin {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_FORBIDDEN",
-                        "only admin roles may create other admin roles",
-                    );
-                }
-
-                let record = ansible_mesh_core::graph::RoleIncarnationRecord {
-                    agent_id: agent_id.clone(),
-                    role_name: role_name.clone(),
+                Self::configure_role_record(
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    local_node_id,
+                    current_identity.as_ref(),
+                    agent_id,
+                    role_name,
                     guest_id,
+                    calling_role,
                     toolset_profile,
                     role_identity_addendum,
                     role_manifest,
                     is_admin,
                     inactive_ttl_seconds,
-                    turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
-                        iteration_cap,
-                        approval_policy,
-                        model_profile,
-                        context_window_policy,
-                        loop_script: None,
-                    },
-                };
-
-                if let Err(e) = graph.upsert_role_incarnation(&record) {
-                    warn!("Failed to persist role config [{}]: {}", role_name, e);
-                    return IpcResponse::error(
-                        "configure_role",
-                        "ROLE_PERSIST_FAILED",
-                        format!("Failed to persist role config: {e}"),
-                    );
-                }
-
-                info!(
-                    agent_id = %agent_id,
-                    role_name = %role_name,
-                    "Role incarnation configured via IPC"
-                );
-
-                IpcResponse::ConfigureRoleOk { role_name }
+                    iteration_cap,
+                    approval_policy,
+                    model_profile,
+                    context_window_policy,
+                )
+                .await
             }
+            IpcRequest::ExecuteWorkflow {
+                workflow_name,
+                agent_id,
+                calling_role,
+                arguments,
+            } => match workflow_name.as_str() {
+                "role.create_or_update" => {
+                    let Some(role_name) = arguments
+                        .get("role_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                    else {
+                        return IpcResponse::error(
+                            "execute_workflow",
+                            "WORKFLOW_ARGUMENT_INVALID",
+                            "role.create_or_update requires role_name",
+                        );
+                    };
+                    let Some(toolset_profile) = arguments
+                        .get("toolset_profile")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                    else {
+                        return IpcResponse::error(
+                            "execute_workflow",
+                            "WORKFLOW_ARGUMENT_INVALID",
+                            "role.create_or_update requires toolset_profile",
+                        );
+                    };
+                    if !arguments.get("reasoning").is_some_and(|v| v.is_object()) {
+                        return IpcResponse::error(
+                            "execute_workflow",
+                            "WORKFLOW_ARGUMENT_INVALID",
+                            "role.create_or_update requires reasoning object",
+                        );
+                    }
+                    let guest_id = arguments
+                        .get("guest_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{agent_id}:{role_name}"));
+                    let response = Self::configure_role_record(
+                        graph,
+                        inboxes,
+                        materialization_requester,
+                        local_node_id,
+                        current_identity.as_ref(),
+                        agent_id,
+                        role_name.clone(),
+                        guest_id,
+                        calling_role,
+                        toolset_profile,
+                        arguments
+                            .get("role_identity_addendum")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        arguments
+                            .get("role_manifest")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        arguments
+                            .get("is_admin")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        arguments
+                            .get("inactive_ttl_seconds")
+                            .and_then(|v| v.as_u64()),
+                        arguments
+                            .get("iteration_cap")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        arguments
+                            .get("approval_policy")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        arguments
+                            .get("model_profile")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        arguments
+                            .get("context_window_policy")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    )
+                    .await;
+                    match response {
+                        IpcResponse::ConfigureRoleOk { role_name } => {
+                            IpcResponse::WorkflowExecutionOk {
+                                workflow_name,
+                                result: serde_json::json!({ "role_name": role_name }),
+                            }
+                        }
+                        other => other,
+                    }
+                }
+                _ => IpcResponse::error(
+                    "execute_workflow",
+                    "WORKFLOW_UNKNOWN",
+                    format!("unknown workflow [{workflow_name}]"),
+                ),
+            },
             IpcRequest::RegisterSkill {
                 skill_name,
                 description,
@@ -4042,22 +6324,97 @@ impl IpcServer {
             IpcRequest::PatchAgentBundle {
                 agent_id,
                 persona_name,
+                soul_text,
+                identity_text,
+                user_context_text,
+                system_prompt,
+                import_workspace,
                 default_toolset,
                 default_skillset,
+                response_route_policy,
             } => {
+                let response_route_policy = match response_route_policy {
+                    Some(policy) => match serde_json::to_value(policy) {
+                        Ok(value) => Some(value),
+                        Err(err) => {
+                            return IpcResponse::Standard {
+                                ok: false,
+                                code: "serialize_error".into(),
+                                message: err.to_string(),
+                                corr_id: String::new(),
+                                data: None,
+                            };
+                        }
+                    },
+                    None => None,
+                };
                 match Self::handle_patch_agent_bundle(
                     graph,
                     local_node_id,
                     &agent_id,
                     persona_name,
+                    soul_text,
+                    identity_text,
+                    user_context_text,
+                    system_prompt,
+                    import_workspace,
                     default_toolset,
                     default_skillset,
+                    response_route_policy,
                 ) {
                     Ok(agent) => IpcResponse::AgentUpdated { agent },
                     Err(err) => IpcResponse::error(
                         "patch_agent_bundle",
                         "PATCH_AGENT_BUNDLE_ERROR",
                         err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::GetUserProfile { hotel_name } => {
+                match graph.get_user_profile(&hotel_name) {
+                    Ok(Some(p)) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                        timezone: p.timezone,
+                        display_name: p.display_name,
+                    }),
+                    Ok(None) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                        timezone: None,
+                        display_name: None,
+                    }),
+                    Err(e) => IpcResponse::error(
+                        "get_user_profile",
+                        "GET_USER_PROFILE_ERROR",
+                        e.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::PatchUserProfile {
+                hotel_name,
+                timezone,
+                display_name,
+            } => {
+                let existing = match graph.get_user_profile(&hotel_name) {
+                    Ok(profile) => profile.unwrap_or_default(),
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "patch_user_profile",
+                            "PATCH_USER_PROFILE_READ_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                };
+                let updated = ansible_mesh_core::storage::UserProfile {
+                    timezone: timezone.or(existing.timezone),
+                    display_name: display_name.or(existing.display_name),
+                };
+                match graph.upsert_user_profile(&hotel_name, &updated) {
+                    Ok(()) => IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
+                        timezone: updated.timezone,
+                        display_name: updated.display_name,
+                    }),
+                    Err(e) => IpcResponse::error(
+                        "patch_user_profile",
+                        "PATCH_USER_PROFILE_ERROR",
+                        e.to_string(),
                     ),
                 }
             }
@@ -4312,6 +6669,19 @@ impl IpcServer {
                 "UNREACHABLE",
                 "FetchMemoryConfig dispatched early",
             ),
+            IpcRequest::ListTrainingSamples { .. }
+            | IpcRequest::CorrectTrainingSample { .. }
+            | IpcRequest::ExportTrainingSamples { .. }
+            | IpcRequest::GetTrainingStatus { .. } => IpcResponse::error(
+                "training",
+                "UNREACHABLE",
+                "Training request intercepted before process_request",
+            ),
+            IpcRequest::AsrSetup { .. } | IpcRequest::AsrStatus {} => IpcResponse::error(
+                "asr",
+                "UNREACHABLE",
+                "ASR request intercepted before process_request",
+            ),
             IpcRequest::RegisterGraphInstance {
                 graph_id,
                 instance_id,
@@ -4366,6 +6736,83 @@ impl IpcServer {
                     }
                 }
             }
+            IpcRequest::RecordRoutingPolicyProposal {
+                agent_id,
+                problem,
+                proposed_change,
+                evidence,
+                affected_stage,
+                affected_capability,
+                learned_reflex_preference_key,
+            } => {
+                use ansible_mesh_core::graph::{
+                    RoutingPolicyDispositionRecord, RoutingPolicyEvaluationRecord,
+                    RoutingPolicyRecord,
+                };
+                let proposal_id = Uuid::new_v4().to_string();
+                let created_at = unix_ts();
+                let record = RoutingPolicyRecord {
+                    proposal_id: proposal_id.clone(),
+                    agent_id: agent_id.clone(),
+                    problem,
+                    proposed_change,
+                    evidence,
+                    affected_stage,
+                    affected_capability,
+                    learned_reflex_preference_key,
+                    operator_disposition: RoutingPolicyDispositionRecord {
+                        state: "approved".into(),
+                        reason: "Approved via operator-gated routing.policy.propose execution."
+                            .into(),
+                        decided_at: created_at,
+                    },
+                    evaluations: vec![RoutingPolicyEvaluationRecord {
+                        evaluation_kind: "operator_disposition".into(),
+                        decision: "approved".into(),
+                        reason: "routing.policy.propose executed after operator approval.".into(),
+                        created_at,
+                        source_tool: Some("routing.policy.propose".into()),
+                    }],
+                    created_at,
+                };
+                match graph.upsert_routing_policy(&record) {
+                    Ok(()) => {
+                        info!(
+                            agent_id = %agent_id,
+                            proposal_id = %proposal_id,
+                            "Routing policy proposal stored via IPC"
+                        );
+                        IpcResponse::RoutingPolicyRecorded { proposal_id }
+                    }
+                    Err(err) => {
+                        error!("Failed to store routing policy proposal: {err}");
+                        IpcResponse::error(
+                            "record_routing_policy_proposal",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::ListRoutingPolicies { agent_id } => match graph
+                .list_routing_policies(&agent_id)
+            {
+                Ok(policies) => {
+                    let json_policies: Vec<serde_json::Value> = policies
+                        .into_iter()
+                        .map(|policy| {
+                            serde_json::to_value(policy).unwrap_or(serde_json::Value::Null)
+                        })
+                        .collect();
+                    IpcResponse::RoutingPolicyList {
+                        policies: json_policies,
+                    }
+                }
+                Err(err) => {
+                    error!("Failed to list routing policies: {err}");
+                    IpcResponse::error("list_routing_policies", "STORAGE_ERROR", err.to_string())
+                }
+            },
             IpcRequest::ListRules { agent_id } => match graph.list_rules(&agent_id) {
                 Ok(rules) => {
                     let json_rules: Vec<serde_json::Value> = rules
@@ -4387,6 +6834,340 @@ impl IpcServer {
                     IpcResponse::error("list_rules", "STORAGE_ERROR", err.to_string())
                 }
             },
+            IpcRequest::UpsertAgentReflexPreference {
+                agent_id,
+                preference_key,
+                precedence,
+                reflexes_json,
+                config_json,
+            } => {
+                use ansible_mesh_core::agent_graph_storage::AgentReflexPreference;
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<()> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    storage.upsert_reflex_preference(&AgentReflexPreference {
+                        agent_id: agent_id.clone(),
+                        preference_key: preference_key.clone(),
+                        precedence,
+                        reflexes_json,
+                        config_json,
+                        updated_at: 0,
+                    })?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => IpcResponse::success(
+                        "agent_reflex_preference",
+                        Some(serde_json::json!({
+                            "message": format!("Stored learned reflex preference '{preference_key}'.")
+                        })),
+                    ),
+                    Err(err) => {
+                        error!("Failed to store learned reflex preference: {err}");
+                        IpcResponse::error(
+                            "upsert_agent_reflex_preference",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::RecordRoleHandoffReflexEvidence {
+                agent_id,
+                role_name,
+                legacy_trigger_class,
+                source_turn,
+            } => {
+                use ansible_mesh_core::agent_graph_storage::AgentReflexPreference;
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<serde_json::Value> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    let role_record = graph.get_role_incarnation(&agent_id, &role_name)?;
+                    let toolset_profile = role_record
+                        .as_ref()
+                        .map(|role| role.toolset_profile.clone());
+                    let toolset_record = toolset_profile.as_deref().and_then(|profile_name| {
+                        graph.get_toolset_profile(profile_name).ok().flatten()
+                    });
+                    let preference_key = format!("same-self-role-handoff:{role_name}");
+                    let existing = storage.get_reflex_preference(&preference_key)?;
+                    let previous_count = existing
+                        .as_ref()
+                        .and_then(|pref| pref.config_json.get("success_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let success_count = previous_count + 1;
+                    let reinforced = success_count >= 2;
+                    let existing_precedence =
+                        existing.as_ref().map(|pref| pref.precedence).unwrap_or(70);
+                    let updated_at = existing.as_ref().map(|pref| pref.updated_at).unwrap_or(0);
+                    let existing_config = existing
+                        .as_ref()
+                        .map(|pref| pref.config_json.clone())
+                        .unwrap_or_default();
+                    let toolset_profile = toolset_profile.or_else(|| {
+                        existing_config
+                            .get("toolset_profile")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    });
+                    let toolset_description = toolset_record
+                        .as_ref()
+                        .and_then(|profile| profile.description.clone())
+                        .or_else(|| {
+                            existing_config
+                                .get("toolset_description")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+                    let allowed_skills = toolset_record
+                        .as_ref()
+                        .map(|profile| profile.allowed_skills.clone())
+                        .filter(|skills| !skills.is_empty())
+                        .or_else(|| {
+                            existing_config
+                                .get("allowed_skills")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|skills| {
+                                    skills
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|skills| !skills.is_empty())
+                        })
+                        .unwrap_or_default();
+                    let role_identity_addendum = role_record
+                        .as_ref()
+                        .and_then(|role| role.role_identity_addendum.clone())
+                        .or_else(|| {
+                            existing_config
+                                .get("role_identity_addendum")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+                    let role_manifest_excerpt = role_record
+                        .as_ref()
+                        .and_then(|role| role.role_manifest.as_deref())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(|text| text.chars().take(180).collect::<String>())
+                        .or_else(|| {
+                            existing_config
+                                .get("role_manifest_excerpt")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+                    let manifest_instructed = role_record
+                        .as_ref()
+                        .and_then(|role| role.role_manifest.as_ref())
+                        .is_some()
+                        || existing_config
+                            .get("manifest_instructed")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                    let manifest_markers = {
+                        let mut sources = Vec::new();
+                        sources.push(role_name.as_str());
+                        if let Some(text) = role_identity_addendum.as_deref() {
+                            sources.push(text);
+                        }
+                        if let Some(text) = role_manifest_excerpt.as_deref() {
+                            sources.push(text);
+                        }
+                        let collected = collect_role_receptor_markers(&sources);
+                        if collected.is_empty() {
+                            existing_config
+                                .get("manifest_markers")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            collected
+                        }
+                    };
+                    let skill_markers = if !allowed_skills.is_empty() {
+                        collect_role_receptor_markers(
+                            &allowed_skills
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        existing_config
+                            .get("skill_markers")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    };
+                    let toolset_markers = {
+                        let mut sources = Vec::new();
+                        if let Some(text) = toolset_profile.as_deref() {
+                            sources.push(text);
+                        }
+                        if let Some(text) = toolset_description.as_deref() {
+                            sources.push(text);
+                        }
+                        let collected = collect_role_receptor_markers(&sources);
+                        if collected.is_empty() {
+                            existing_config
+                                .get("toolset_markers")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            collected
+                        }
+                    };
+
+                    storage.upsert_reflex_preference(&AgentReflexPreference {
+                        agent_id: agent_id.clone(),
+                        preference_key: preference_key.clone(),
+                        precedence: existing_precedence,
+                        reflexes_json: serde_json::json!({
+                            "role_handoff_reflex": {
+                                "target_role": role_name,
+                                "trigger_class": legacy_trigger_class,
+                                "source": "successful_same_self_handoff",
+                                "tool_name": "handoff.to_role",
+                            }
+                        }),
+                        config_json: serde_json::json!({
+                            "reason": format!("remembered successful same-self handoff to role '{role_name}'"),
+                            "role_name": role_name,
+                            "trigger_class": legacy_trigger_class,
+                            "source_tool": "handoff.to_role",
+                            "source_turn": source_turn,
+                            "toolset_profile": toolset_profile,
+                            "toolset_description": toolset_description,
+                            "allowed_skills": allowed_skills,
+                            "role_identity_addendum": role_identity_addendum,
+                            "role_manifest_excerpt": role_manifest_excerpt,
+                            "manifest_markers": manifest_markers,
+                            "skill_markers": skill_markers,
+                            "toolset_markers": toolset_markers,
+                            "workflow_skill": "handoff.to_role",
+                            "manifest_instructed": manifest_instructed,
+                            "success_count": success_count,
+                            "habit_state": if reinforced { "reinforced" } else { "candidate" },
+                        }),
+                        updated_at,
+                    })?;
+                    Ok(serde_json::json!({
+                        "preference_key": preference_key,
+                        "success_count": success_count,
+                        "habit_state": if reinforced { "reinforced" } else { "candidate" },
+                    }))
+                })();
+                match result {
+                    Ok(payload) => {
+                        IpcResponse::success("role_handoff_reflex_evidence", Some(payload))
+                    }
+                    Err(err) => {
+                        error!("Failed to record role handoff reflex evidence: {err}");
+                        IpcResponse::error(
+                            "record_role_handoff_reflex_evidence",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::AppendRoutingPolicyEvaluation {
+                proposal_id,
+                evaluation_kind,
+                decision,
+                reason,
+                source_tool,
+            } => match graph.append_routing_policy_evaluation(
+                &proposal_id,
+                ansible_mesh_core::graph::RoutingPolicyEvaluationRecord {
+                    evaluation_kind,
+                    decision,
+                    reason,
+                    created_at: unix_ts(),
+                    source_tool,
+                },
+            ) {
+                Ok(true) => IpcResponse::success(
+                    "routing_policy_evaluation",
+                    Some(serde_json::json!({
+                        "proposal_id": proposal_id,
+                    })),
+                ),
+                Ok(false) => IpcResponse::error(
+                    "routing_policy_evaluation",
+                    "NOT_FOUND",
+                    format!("unknown routing policy proposal '{}'", proposal_id),
+                ),
+                Err(err) => {
+                    error!("Failed to append routing policy evaluation: {err}");
+                    IpcResponse::error(
+                        "routing_policy_evaluation",
+                        "STORAGE_ERROR",
+                        err.to_string(),
+                    )
+                }
+            },
+            IpcRequest::SetRoutingPolicyDisposition {
+                proposal_id,
+                state,
+                reason,
+                source_tool,
+            } => match graph.set_routing_policy_disposition(
+                &proposal_id,
+                state.clone(),
+                reason.clone(),
+                unix_ts(),
+                source_tool,
+            ) {
+                Ok(true) => IpcResponse::success(
+                    "routing_policy_disposition",
+                    Some(serde_json::json!({
+                        "proposal_id": proposal_id,
+                        "state": state,
+                        "reason": reason,
+                    })),
+                ),
+                Ok(false) => IpcResponse::error(
+                    "routing_policy_disposition",
+                    "NOT_FOUND",
+                    format!("unknown routing policy proposal '{}'", proposal_id),
+                ),
+                Err(err) => {
+                    error!("Failed to set routing policy disposition: {err}");
+                    IpcResponse::error(
+                        "routing_policy_disposition",
+                        "STORAGE_ERROR",
+                        err.to_string(),
+                    )
+                }
+            },
             // Resource broker seam (agent-resource-broker). No callers yet;
             // hotel-side broker will be wired in the demand-derived-materialization seam.
             IpcRequest::ResourceRequest(_req) => IpcResponse::error(
@@ -4402,30 +7183,46 @@ impl IpcServer {
             IpcRequest::RegisterComponent { manifest } => {
                 Self::handle_register_component(graph, materialization_requester, manifest).await
             }
-            IpcRequest::ListGraphInstances {} => {
-                match graph.get_graph_runner_registry() {
-                    Ok(records) => {
-                        let instances: Vec<serde_json::Value> = records
-                            .into_iter()
-                            .map(|r| serde_json::json!({
+            IpcRequest::ListGraphInstances {} => match graph.get_graph_runner_registry() {
+                Ok(records) => {
+                    let instances: Vec<serde_json::Value> = records
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
                                 "graph_id": r.graph_id,
                                 "instance_id": r.instance_id,
                                 "registered_at": r.registered_at,
-                            }))
-                            .collect();
-                        IpcResponse::GraphInstanceList { instances }
-                    }
-                    Err(e) => IpcResponse::error("list_graph_instances", "STORAGE_ERROR", e.to_string()),
+                            })
+                        })
+                        .collect();
+                    IpcResponse::GraphInstanceList { instances }
                 }
-            }
-            IpcRequest::ListComponents {} => {
-                Self::handle_list_components(graph, local_node_id)
-            }
+                Err(e) => {
+                    IpcResponse::error("list_graph_instances", "STORAGE_ERROR", e.to_string())
+                }
+            },
+            IpcRequest::ListComponents {} => Self::handle_list_components(graph, local_node_id),
             IpcRequest::SetComponentActive { guest_id, active } => {
-                Self::handle_set_component_active(graph, materialization_requester, local_node_id, &guest_id, active).await
+                Self::handle_set_component_active(
+                    graph,
+                    materialization_requester,
+                    local_node_id,
+                    &guest_id,
+                    active,
+                )
+                .await
             }
             IpcRequest::RestartComponent { guest_id } => {
-                Self::handle_restart_component(graph, materialization_requester, local_node_id, &guest_id).await
+                Self::handle_restart_component(
+                    graph,
+                    materialization_requester,
+                    local_node_id,
+                    &guest_id,
+                )
+                .await
+            }
+            IpcRequest::RemoveComponent { guest_id } => {
+                Self::handle_remove_component(graph, local_node_id, &guest_id).await
             }
             IpcRequest::SeedRemoteIncarnation {
                 node_id,
@@ -4453,7 +7250,7 @@ impl IpcServer {
                     active_jobs: 0,
                     queue_depth: 0,
                 };
-                registry.write().await.update_node(caps, vec![ad], None);
+                registry.write().await.update_node(caps, vec![ad], None, None);
                 if let Some(path) = socket_path {
                     peer_sockets.write().await.insert(node_id, path);
                 }
@@ -4488,48 +7285,714 @@ impl IpcServer {
                 Ok(jobs) => IpcResponse::CronJobList { jobs },
                 Err(e) => IpcResponse::Error(format!("ListCronJobs failed: {e}")),
             },
-            IpcRequest::EnableCronJob { job_id } => {
-                match graph.get_cron_job(&job_id) {
-                    Ok(Some(mut job)) => {
-                        job.enabled = true;
-                        match graph.upsert_cron_job(&job) {
-                            Ok(_) => {
-                                Self::broadcast_cron_sync_upsert(
-                                    dispatcher_tx,
-                                    local_node_id,
-                                    &job,
-                                )
+            IpcRequest::EnableCronJob { job_id } => match graph.get_cron_job(&job_id) {
+                Ok(Some(mut job)) => {
+                    job.enabled = true;
+                    match graph.upsert_cron_job(&job) {
+                        Ok(_) => {
+                            Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job)
                                 .await;
-                                IpcResponse::success("enable_cron_job", None)
+                            IpcResponse::success("enable_cron_job", None)
+                        }
+                        Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                    }
+                }
+                Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+                Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+            },
+            IpcRequest::DisableCronJob { job_id } => match graph.get_cron_job(&job_id) {
+                Ok(Some(mut job)) => {
+                    job.enabled = false;
+                    match graph.upsert_cron_job(&job) {
+                        Ok(_) => {
+                            Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job)
+                                .await;
+                            IpcResponse::success("disable_cron_job", None)
+                        }
+                        Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+                    }
+                }
+                Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+                Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+            },
+            // GracefulShutdown is hotel→guest only; a guest sending it is a no-op.
+            IpcRequest::GracefulShutdown { .. } => IpcResponse::error(
+                "graceful_shutdown",
+                "NOT_APPLICABLE",
+                "GracefulShutdown is a hotel-to-guest signal; guests do not send it.",
+            ),
+
+            // Fire-and-forget paracrine dispatch.
+            // The caller does NOT wait for the specialist's response — it arrives later
+            // as a paracrine_response inbound task at reply_to_node/reply_to_role.
+            IpcRequest::ParacrineEmit {
+                role,
+                exosome,
+                reply_to_node,
+                reply_to_role,
+                ..
+            } => {
+                // Session key: paracrine:{chat_id}:{role}
+                //
+                // Keyed on chat_id (not the full source_session_id) so the specialist
+                // accumulates turn-window context per conversation. Multiple whisper calls
+                // from the same Telegram chat land in the same specialist session and are
+                // queued by the FIFO pending_user_tasks mechanism rather than overwriting
+                // each other. The role suffix keeps sessions distinct across specialists.
+                let specialist_chat_id = exosome.source_chat_id.clone().unwrap_or_default();
+                let specialist_session_id = if specialist_chat_id.is_empty() {
+                    format!("paracrine:{role}")
+                } else {
+                    format!("paracrine:{}:{role}", specialist_chat_id)
+                };
+                // Derive transport from the source_session_id prefix (e.g. "telegram" from
+                // "telegram:7898847424:agent-bjork-01") so the specialist's session tracks
+                // its origin transport even though it runs in a distinct session.
+                let specialist_transport = exosome
+                    .source_session_id
+                    .as_deref()
+                    .and_then(|s| s.split(':').next())
+                    .unwrap_or("paracrine")
+                    .to_string();
+                let paracrine_task = serde_json::json!({
+                    "action": "paracrine_request",
+                    "content": exosome.prompt,
+                    "exosome": exosome,
+                    "session_id": specialist_session_id,
+                    "chat_id": specialist_chat_id,
+                    "transport": specialist_transport,
+                    "final_reply_to": reply_to_node,
+                    "final_reply_role": reply_to_role,
+                });
+                let task_json = paracrine_task.to_string();
+                let task_id = Uuid::new_v4();
+
+                // Check if the target role has a live inbox subscriber.
+                let has_subscriber = {
+                    let guard = inboxes.lock().await;
+                    guard.get(&role).is_some_and(|subs| !subs.is_empty())
+                };
+
+                if has_subscriber {
+                    Self::deliver_inbound_task(
+                        inboxes,
+                        local_node_id,
+                        &role,
+                        None,
+                        task_id,
+                        task_json,
+                    )
+                    .await;
+                } else {
+                    // No live subscriber — look up the role incarnation, park the task
+                    // under the incarnation's guest_id, and trigger materialization of
+                    // a dedicated role-philote so it can connect and flush the park.
+                    match graph.find_role_incarnation_by_name(&role) {
+                        Ok(Some(inc)) => {
+                            // The philote that handles this role incarnation registers
+                            // with guest_id = "{agent_id}:{role_name}".
+                            let role_guest_id = inc.guest_id.clone();
+
+                            // Park the task — flushed when the role philote connects.
+                            {
+                                let mut guard = parked_inbound.lock().await;
+                                guard.entry(role_guest_id.clone()).or_default().push(
+                                    ParkedInboundTask {
+                                        source_node: local_node_id.to_string(),
+                                        task_id,
+                                        task_json,
+                                        activate_session_id: None,
+                                    },
+                                );
                             }
-                            Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                            info!(
+                                role = %role,
+                                role_guest_id = %role_guest_id,
+                                task_id = %task_id,
+                                "Parked paracrine task; will trigger role-philote materialization."
+                            );
+
+                            // Ensure the role-philote guest record exists in the graph,
+                            // then ask the materializer to spawn it.
+                            if let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) {
+                                let hotel_guest_id =
+                                    format!("{}:philote-{}", hotel_name, inc.role_name);
+
+                                // Create the guest record if it doesn't already exist.
+                                if graph
+                                    .get_guest(&hotel_name, &hotel_guest_id)
+                                    .ok()
+                                    .flatten()
+                                    .is_none()
+                                {
+                                    // Derive socket path from hotel record.
+                                    let socket_path = graph
+                                        .list_hotels()
+                                        .ok()
+                                        .and_then(|hs| {
+                                            hs.into_iter()
+                                                .find(|h| h.capabilities.node_id == local_node_id)
+                                                .map(|h| h.ipc_socket_path)
+                                        })
+                                        .unwrap_or_default();
+
+                                    let config_json = serde_json::json!({
+                                        "command": "philote",
+                                        "args": [],
+                                        "env": {
+                                            "PHILOTIC_AGENT_ID": inc.agent_id,
+                                            "PHILOTIC_ROLE_NAME": inc.role_name,
+                                            "PHILOTIC_HOTEL_SOCKET": socket_path,
+                                            "PHILOTIC_NODE_ID": local_node_id,
+                                        }
+                                    });
+                                    let rec = ansible_mesh_core::storage::GuestRecord {
+                                        hotel_name: hotel_name.clone(),
+                                        guest_id: hotel_guest_id.clone(),
+                                        role: inc.role_name.clone(),
+                                        config_json: config_json.to_string(),
+                                        is_active: true,
+                                        active_pid: None,
+                                        last_active_at: None,
+                                    };
+                                    if let Err(e) = graph.seed_guests(&hotel_name, &[rec]) {
+                                        warn!(
+                                            "Failed to seed role-philote guest record [{}]: {e}",
+                                            hotel_guest_id
+                                        );
+                                    } else {
+                                        info!(
+                                            "Created role-philote guest record: {}",
+                                            hotel_guest_id
+                                        );
+                                    }
+                                }
+
+                                // Trigger materialization.
+                                if let Some(requester) = materialization_requester {
+                                    match requester.ensure_guest_active(&hotel_guest_id).await {
+                                        Ok(true) => info!(
+                                            "Role-philote [{}] materialization triggered.",
+                                            hotel_guest_id
+                                        ),
+                                        Ok(false) => warn!(
+                                            "Role-philote [{}] could not be materialized.",
+                                            hotel_guest_id
+                                        ),
+                                        Err(e) => warn!(
+                                            "Role-philote [{}] materialization error: {e}",
+                                            hotel_guest_id
+                                        ),
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "Cannot materialize role-philote for '{}': local hotel record missing.",
+                                    role
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(
+                                role = %role,
+                                "No role incarnation found for paracrine target '{}'; task dropped.",
+                                role
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                role = %role,
+                                "Role incarnation lookup failed for '{}': {e}; task dropped.",
+                                role
+                            );
                         }
                     }
-                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
-                    Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                }
+
+                IpcResponse::success("paracrine_emit", None)
+            }
+
+            IpcRequest::GetHotelStatus => {
+                let hotel_name = Self::local_hotel_name(graph, local_node_id)
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let guests: Vec<serde_json::Value> = graph
+                    .list_guests(&hotel_name, false)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|g| {
+                        serde_json::json!({
+                            "guest_id": g.guest_id,
+                            "role": g.role,
+                            "active": g.is_active,
+                        })
+                    })
+                    .collect();
+
+                let agents: Vec<serde_json::Value> = graph
+                    .list_agent_identities()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|id| {
+                        serde_json::json!({
+                            "agent_id": id.agent_id,
+                            "persona_name": id.persona_name,
+                        })
+                    })
+                    .collect();
+
+                IpcResponse::success(
+                    "hotel_status",
+                    Some(serde_json::json!({
+                        "hotel_name": hotel_name,
+                        "node_id": local_node_id,
+                        "guests": guests,
+                        "agents": agents,
+                    })),
+                )
+            }
+
+            IpcRequest::GetHotelLogs { lines } => {
+                // Compute log path using the same PHILOTIC_PROFILE convention as the DB path.
+                let log_path = std::env::var("PHILOTIC_PROFILE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|profile| {
+                        std::env::var("HOME").ok().map(|home| {
+                            std::path::PathBuf::from(home)
+                                .join(".philotic")
+                                .join(profile)
+                                .join("aiua.log")
+                        })
+                    })
+                    .or_else(|| {
+                        std::env::var("HOME").ok().map(|home| {
+                            std::path::PathBuf::from(home)
+                                .join(".philotic")
+                                .join("aiua.log")
+                        })
+                    });
+
+                match log_path.and_then(|p| std::fs::read_to_string(&p).ok()) {
+                    Some(content) => {
+                        let all_lines: Vec<&str> = content.lines().collect();
+                        let start = all_lines.len().saturating_sub(lines as usize);
+                        let tail = all_lines[start..].join("\n");
+                        IpcResponse::success(
+                            "hotel_logs",
+                            Some(serde_json::json!({ "log": tail })),
+                        )
+                    }
+                    None => IpcResponse::error(
+                        "hotel_logs",
+                        "LOG_NOT_FOUND",
+                        "Hotel log file not found — check ~/.philotic/aiua.log",
+                    ),
                 }
             }
-            IpcRequest::DisableCronJob { job_id } => {
-                match graph.get_cron_job(&job_id) {
-                    Ok(Some(mut job)) => {
-                        job.enabled = false;
-                        match graph.upsert_cron_job(&job) {
-                            Ok(_) => {
-                                Self::broadcast_cron_sync_upsert(
-                                    dispatcher_tx,
-                                    local_node_id,
-                                    &job,
-                                )
-                                .await;
-                                IpcResponse::success("disable_cron_job", None)
-                            }
-                            Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+
+            // ── MCP membrane lease ─────────────────────────────────────────
+
+            IpcRequest::AcquireMcpMembraneLease { lease_key, port } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "mcp_membrane_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before acquiring an MCP membrane lease",
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "mcp_membrane_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+
+                let candidate = Self::mcp_membrane_lease(
+                    &lease_key,
+                    &local_hotel_name,
+                    local_node_id,
+                    &identity.guest_id,
+                    port,
+                );
+                let mut guard = mcp_membrane_leases.lock().await;
+                let mut observer = LoggingMcpMembraneLeaseObserver;
+                match guard.acquire(
+                    conn_id,
+                    candidate,
+                    DESKTOP_MEMBRANE_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseAcquireOutcome::Granted(lease) => IpcResponse::McpMembraneLease {
+                        mcp_granted: true,
+                        mcp_lease: Some(lease),
+                    },
+                    LeaseAcquireOutcome::Denied(lease) => {
+                        info!(
+                            "MCP membrane lease [{}] denied for guest [{}]; held by [{}] epoch {}.",
+                            lease.lease_scope,
+                            identity.guest_id,
+                            lease.owner_guest_id,
+                            lease.lease_epoch
+                        );
+                        IpcResponse::McpMembraneLease {
+                            mcp_granted: false,
+                            mcp_lease: Some(lease),
                         }
                     }
-                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
-                    Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
                 }
             }
+
+            IpcRequest::RenewMcpMembraneLease { lease_key, lease_epoch } => {
+                let mut guard = mcp_membrane_leases.lock().await;
+                let mut observer = LoggingMcpMembraneLeaseObserver;
+                match guard.renew(
+                    &lease_key,
+                    conn_id,
+                    lease_epoch,
+                    DESKTOP_MEMBRANE_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseRenewOutcome::Renewed(lease) => IpcResponse::McpMembraneLease {
+                        mcp_granted: true,
+                        mcp_lease: Some(lease),
+                    },
+                    LeaseRenewOutcome::Lost(lease) => IpcResponse::McpMembraneLease {
+                        mcp_granted: false,
+                        mcp_lease: lease,
+                    },
+                }
+            }
+
+            IpcRequest::ReleaseMcpMembraneLease { lease_key } => {
+                let mut guard = mcp_membrane_leases.lock().await;
+                let mut observer = LoggingMcpMembraneLeaseObserver;
+                let _ = guard.release(&lease_key, conn_id, &mut observer);
+                IpcResponse::success("release_mcp_membrane_lease", None)
+            }
+
+            // ── MCP route table management ────────────────────────────────
+
+            IpcRequest::UpdateMcpRoutes { agent_id, routes } => {
+                let route_count = routes.len();
+                // Serialize and push to any active MCP membrane subscriber.
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_routes",
+                    "agent_id": agent_id,
+                    "routes": routes,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    "mcp-membrane",
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+                IpcResponse::McpRoutesAccepted {
+                    mcp_routes_agent_id: agent_id,
+                    mcp_route_count: route_count,
+                }
+            }
+
+            IpcRequest::RevokeMcpRoutes { agent_id } => {
+                let task_json = serde_json::json!({
+                    "action": "revoke_mcp_routes",
+                    "agent_id": agent_id,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    "mcp-membrane",
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+                IpcResponse::McpRoutesAccepted {
+                    mcp_routes_agent_id: agent_id,
+                    mcp_route_count: 0,
+                }
+            }
+
+            // ── MCP endpoint provisioning ──────────────────────────────────
+
+            IpcRequest::ProvisionMcpEndpoint { config } => {
+                let endpoint_id = config.endpoint_id.clone();
+                let port = config.port;
+
+                // Persist the endpoint config in the context graph.
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let preapproval_key = format!("__mcp_preapproval__:{endpoint_id}");
+
+                let config_json = match serde_json::to_string(&config) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "SERIALIZE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                };
+
+                if let Err(e) = graph.set_config_value(&config_key, &config_json) {
+                    return IpcResponse::error(
+                        "mcp_endpoint",
+                        "CONFIG_STORE_ERROR",
+                        e.to_string(),
+                    );
+                }
+
+                // Persist pre-approval rules separately for fast lookup.
+                if !config.preapproval_rules.is_empty() {
+                    let rules_json = match serde_json::to_string(&config.preapproval_rules) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return IpcResponse::error(
+                                "mcp_endpoint",
+                                "SERIALIZE_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    };
+                    if let Err(e) = graph.set_config_value(&preapproval_key, &rules_json) {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "CONFIG_STORE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                }
+
+                // Fan out the full config to the membrane-mcp guest inbox.
+                let guest_id = format!("mcp-membrane-{endpoint_id}");
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_config",
+                    "config": config,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &guest_id,
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(
+                    endpoint_id,
+                    port, "MCP endpoint config stored and fanned out."
+                );
+
+                IpcResponse::McpEndpointProvisioned {
+                    endpoint_id,
+                    port,
+                    materialized: false, // guest spawn deferred to Phase 3
+                }
+            }
+
+            IpcRequest::RevokeMcpEndpoint {
+                endpoint_id,
+                owner_agent_id,
+            } => {
+                // Verify ownership before clearing.
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let existing = graph.get_config_value(&config_key).ok().flatten();
+                if let Some(json) = existing {
+                    let existing_owner = serde_json::from_str::<serde_json::Value>(&json)
+                        .ok()
+                        .and_then(|v| v["owner_agent_id"].as_str().map(str::to_string));
+                    if existing_owner.as_deref() != Some(&owner_agent_id) {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "FORBIDDEN",
+                            format!(
+                                "endpoint {endpoint_id} is not owned by {owner_agent_id}"
+                            ),
+                        );
+                    }
+                }
+
+                // Read port before clearing (needed for response).
+                let port = serde_json::from_str::<serde_json::Value>(
+                    &graph.get_config_value(&config_key).ok().flatten().unwrap_or_default(),
+                )
+                .ok()
+                .and_then(|v| v["port"].as_u64())
+                .unwrap_or(0) as u16;
+
+                // Clear stored state.
+                let _ = graph.set_config_value(&config_key, "null");
+                let _ = graph.set_config_value(
+                    &format!("__mcp_preapproval__:{endpoint_id}"),
+                    "null",
+                );
+
+                // Signal the membrane-mcp guest to shut down.
+                let guest_id = format!("mcp-membrane-{endpoint_id}");
+                let task_json = serde_json::json!({
+                    "action": "revoke_mcp_config",
+                    "endpoint_id": endpoint_id,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &guest_id,
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(endpoint_id, "MCP endpoint revoked.");
+
+                IpcResponse::McpEndpointProvisioned {
+                    endpoint_id,
+                    port,
+                    materialized: false,
+                }
+            }
+
+            // ── User Task Engine ──────────────────────────────────────────────
+
+            IpcRequest::CreateUserTask {
+                task_id,
+                session_id,
+                agent_id,
+                chat_id,
+                goal,
+                approved_risk_ceiling,
+                planning_model_tier,
+                quiet,
+            } => {
+                let now = unix_ts();
+                let task_data = serde_json::json!({
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "chat_id": chat_id,
+                    "goal": goal,
+                    "steps": [],
+                    "status": "planning",
+                    "approved_risk_ceiling": approved_risk_ceiling,
+                    "planning_model_tier": planning_model_tier,
+                    "quiet": quiet,
+                    "created_at": now,
+                    "updated_at": now,
+                    "completed_at": null,
+                    "next_step_idx": 0,
+                    "approval_note": null,
+                });
+                match graph.upsert_user_task(task_data, &task_id) {
+                    Ok(_) => IpcResponse::UserTaskCreated { user_task_id: task_id },
+                    Err(e) => IpcResponse::error("create_user_task", "STORAGE_ERROR", format!("{e}")),
+                }
+            }
+
+            IpcRequest::UpdateUserTask {
+                task_id,
+                status,
+                steps_json,
+                next_step_idx,
+                approval_note,
+            } => match graph.get_user_task(&task_id) {
+                Ok(Some(mut data)) => {
+                    data["status"] = serde_json::Value::String(status);
+                    data["updated_at"] = serde_json::json!(unix_ts());
+                    if let Some(steps) = steps_json {
+                        data["steps"] = serde_json::from_str(&steps)
+                            .unwrap_or(serde_json::Value::Array(vec![]));
+                    }
+                    if let Some(idx) = next_step_idx {
+                        data["next_step_idx"] = serde_json::json!(idx);
+                    }
+                    if let Some(note) = approval_note {
+                        data["approval_note"] = serde_json::Value::String(note);
+                    }
+                    match graph.upsert_user_task(data, &task_id) {
+                        Ok(_) => IpcResponse::UserTaskUpdated {
+                            user_task_id: task_id,
+                            user_task_updated: true,
+                        },
+                        Err(e) => IpcResponse::error("update_user_task", "STORAGE_ERROR", format!("{e}")),
+                    }
+                }
+                Ok(None) => IpcResponse::error(
+                    "update_user_task",
+                    "NOT_FOUND",
+                    format!("user task {task_id} not found"),
+                ),
+                Err(e) => IpcResponse::error("update_user_task", "STORAGE_ERROR", format!("{e}")),
+            },
+
+            IpcRequest::UpdateUserTaskStep {
+                task_id,
+                step_idx,
+                status,
+                output,
+                error,
+            } => match graph.get_user_task(&task_id) {
+                Ok(Some(mut data)) => {
+                    if let Some(steps) = data["steps"].as_array_mut() {
+                        if let Some(step) = steps.get_mut(step_idx) {
+                            step["status"] = serde_json::Value::String(status);
+                            if let Some(out) = output {
+                                step["output"] = serde_json::Value::String(out);
+                            }
+                            if let Some(err) = error {
+                                step["error"] = serde_json::Value::String(err);
+                            }
+                        }
+                    }
+                    data["updated_at"] = serde_json::json!(unix_ts());
+                    match graph.upsert_user_task(data, &task_id) {
+                        Ok(_) => IpcResponse::UserTaskUpdated {
+                            user_task_id: task_id,
+                            user_task_updated: true,
+                        },
+                        Err(e) => IpcResponse::error("update_user_task_step", "STORAGE_ERROR", format!("{e}")),
+                    }
+                }
+                Ok(None) => IpcResponse::error(
+                    "update_user_task_step",
+                    "NOT_FOUND",
+                    format!("user task {task_id} not found"),
+                ),
+                Err(e) => IpcResponse::error("update_user_task_step", "STORAGE_ERROR", format!("{e}")),
+            },
+
+            IpcRequest::GetUserTask { task_id } => match graph.get_user_task(&task_id) {
+                Ok(Some(data)) => IpcResponse::UserTaskData {
+                    user_task_json: data.to_string(),
+                },
+                Ok(None) => IpcResponse::error(
+                    "get_user_task",
+                    "NOT_FOUND",
+                    format!("user task {task_id} not found"),
+                ),
+                Err(e) => IpcResponse::error("get_user_task", "STORAGE_ERROR", format!("{e}")),
+            },
+
+            IpcRequest::ListUserTasks {
+                session_id,
+                agent_id,
+            } => match graph.list_user_tasks(session_id.as_deref(), agent_id.as_deref()) {
+                Ok(tasks) => IpcResponse::UserTaskList { user_tasks: tasks },
+                Err(e) => IpcResponse::error("list_user_tasks", "STORAGE_ERROR", format!("{e}")),
+            },
         }
     }
 
@@ -4619,15 +8082,23 @@ impl IpcServer {
         };
 
         if let Err(e) = graph.upsert_guest(&record) {
-            error!("RegisterComponent: failed to upsert guest {}: {}", guest_id, e);
+            error!(
+                "RegisterComponent: failed to upsert guest {}: {}",
+                guest_id, e
+            );
             return IpcResponse::error("register_component", "UPSERT_FAILED", e.to_string());
         }
 
         // Store component-specific config for readback via GetConfig.
         if !manifest.component_config.is_null() {
             let config_key = format!("component:{}", guest_id);
-            if let Err(e) = graph.set_config_value(&config_key, &manifest.component_config.to_string()) {
-                warn!("RegisterComponent: failed to store component config for {}: {}", guest_id, e);
+            if let Err(e) =
+                graph.set_config_value(&config_key, &manifest.component_config.to_string())
+            {
+                warn!(
+                    "RegisterComponent: failed to store component config for {}: {}",
+                    guest_id, e
+                );
             }
         }
 
@@ -4643,7 +8114,10 @@ impl IpcServer {
         if manifest.auto_start {
             if let Some(requester) = materialization_requester {
                 if let Err(e) = requester.ensure_guest_active(&guest_id).await {
-                    warn!("RegisterComponent: ensure_guest_active failed for {}: {}", guest_id, e);
+                    warn!(
+                        "RegisterComponent: ensure_guest_active failed for {}: {}",
+                        guest_id, e
+                    );
                 }
             }
         }
@@ -4659,8 +8133,14 @@ impl IpcServer {
         local_node_id: &str,
         agent_id: &str,
         persona_name: Option<String>,
+        soul_text: Option<String>,
+        identity_text: Option<String>,
+        user_context_text: Option<String>,
+        system_prompt: Option<String>,
+        import_workspace: Option<String>,
         default_toolset: Option<Vec<String>>,
         default_skillset: Option<Vec<String>>,
+        response_route_policy: Option<serde_json::Value>,
     ) -> anyhow::Result<DesktopMembraneAgentView> {
         let mut identity = graph
             .get_agent_identity(agent_id)?
@@ -4676,11 +8156,29 @@ impl IpcServer {
         if let Some(name) = persona_name {
             identity.persona_name = name;
         }
+        if let Some(value) = soul_text {
+            identity.bundle_json["soul_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = identity_text {
+            identity.bundle_json["identity_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = user_context_text {
+            identity.bundle_json["user_context_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = system_prompt {
+            identity.bundle_json["system_prompt"] = serde_json::json!(value);
+        }
+        if let Some(value) = import_workspace {
+            identity.bundle_json["import_workspace"] = serde_json::json!(value);
+        }
         if let Some(toolset) = default_toolset {
             identity.bundle_json["default_toolset"] = serde_json::json!(toolset);
         }
         if let Some(skillset) = default_skillset {
             identity.bundle_json["default_skillset"] = serde_json::json!(skillset);
+        }
+        if let Some(policy) = response_route_policy {
+            identity.bundle_json["response_route_policy"] = policy;
         }
 
         graph.upsert_agent_identity(&identity)?;
@@ -4693,8 +8191,6 @@ impl IpcServer {
         plaintext: String,
         allowed_roles: Vec<String>,
     ) -> anyhow::Result<String> {
-        use crate::vault::{SecretInput, store_secret};
-
         // Store the encrypted secret.
         let secret_ref = store_secret(
             graph,
@@ -4720,11 +8216,311 @@ impl IpcServer {
         Ok(secret_ref)
     }
 
+    fn mesh_private_key_ref_config_key(hotel_name: &str) -> String {
+        format!("mesh_identity_private_key_ref:{hotel_name}")
+    }
+
+    fn mesh_public_key_config_key(hotel_name: &str) -> String {
+        format!("mesh_identity_public_key:{hotel_name}")
+    }
+
+    fn mesh_transport_private_key_ref_config_key(hotel_name: &str) -> String {
+        format!("mesh_transport_private_key_ref:{hotel_name}")
+    }
+
+    fn mesh_transport_public_key_config_key(hotel_name: &str) -> String {
+        format!("mesh_transport_public_key:{hotel_name}")
+    }
+
+    fn mesh_pending_invite_config_key(nonce: &str) -> String {
+        format!("mesh_pending_invite:{nonce}")
+    }
+
+    fn mesh_auth_key_config_key(node_id: &str) -> String {
+        format!("mesh_auth_key:{node_id}")
+    }
+
+    fn read_string_config(graph: &GraphDomain, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(graph
+            .get_config_value(key)?
+            .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    }
+
+    fn resolve_internal_secret(graph: &GraphDomain, secret_ref: &str) -> anyhow::Result<String> {
+        resolve_secret(
+            graph,
+            secret_ref,
+            &SecretAccess {
+                role: "hotel.internal".into(),
+                guest_id: "aiua".into(),
+            },
+        )?
+        .ok_or_else(|| anyhow::anyhow!("vault secret not found: {secret_ref}"))
+    }
+
+    fn ensure_mesh_identity(
+        graph: &GraphDomain,
+        hotel_name: &str,
+    ) -> anyhow::Result<(SigningKey, String, String)> {
+        let private_ref_key = Self::mesh_private_key_ref_config_key(hotel_name);
+        let public_key_key = Self::mesh_public_key_config_key(hotel_name);
+
+        if let (Some(secret_ref), Some(public_key_b64)) = (
+            Self::read_string_config(graph, &private_ref_key)?,
+            Self::read_string_config(graph, &public_key_key)?,
+        ) {
+            let private_key_hex = Self::resolve_internal_secret(graph, &secret_ref)?;
+            let signing_key = signing_key_from_hex(&private_key_hex)?;
+            let fingerprint = fingerprint_from_base64url(&public_key_b64)?;
+            return Ok((signing_key, public_key_b64, fingerprint));
+        }
+
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let public_key_b64 = verifying_key_to_base64url(&signing_key.verifying_key());
+        let fingerprint = fingerprint_from_base64url(&public_key_b64)?;
+        let secret_ref = store_secret(
+            graph,
+            SecretInput {
+                secret_kind: "mesh-hotel-ed25519-private-key".into(),
+                scope: format!("hotel:{hotel_name}"),
+                allowed_roles: vec!["hotel.internal".into()],
+                allowed_guests: Vec::new(),
+                plaintext: hex::encode(signing_key.to_bytes()),
+            },
+        )?;
+        graph.set_config_value(&private_ref_key, &serde_json::to_string(&secret_ref)?)?;
+        graph.set_config_value(&public_key_key, &serde_json::to_string(&public_key_b64)?)?;
+        Ok((signing_key, public_key_b64, fingerprint))
+    }
+
+    fn ensure_mesh_transport_identity(
+        graph: &GraphDomain,
+        hotel_name: &str,
+    ) -> anyhow::Result<(String, String)> {
+        let private_ref_key = Self::mesh_transport_private_key_ref_config_key(hotel_name);
+        let public_key_key = Self::mesh_transport_public_key_config_key(hotel_name);
+
+        if let (Some(secret_ref), Some(public_key_b64)) = (
+            Self::read_string_config(graph, &private_ref_key)?,
+            Self::read_string_config(graph, &public_key_key)?,
+        ) {
+            let private_key_hex = Self::resolve_internal_secret(graph, &secret_ref)?;
+            return Ok((private_key_hex, public_key_b64));
+        }
+
+        let (private_key_hex, public_key_b64) = generate_transport_keypair();
+        let secret_ref = store_secret(
+            graph,
+            SecretInput {
+                secret_kind: "mesh-hotel-x25519-private-key".into(),
+                scope: format!("hotel:{hotel_name}"),
+                allowed_roles: vec!["hotel.internal".into()],
+                allowed_guests: Vec::new(),
+                plaintext: private_key_hex.clone(),
+            },
+        )?;
+        graph.set_config_value(&private_ref_key, &serde_json::to_string(&secret_ref)?)?;
+        graph.set_config_value(&public_key_key, &serde_json::to_string(&public_key_b64)?)?;
+        Ok((private_key_hex, public_key_b64))
+    }
+
+    fn local_hotel_record(graph: &GraphDomain, local_node_id: &str) -> anyhow::Result<HotelRecord> {
+        let hotel_name = Self::local_hotel_name(graph, local_node_id)
+            .ok_or_else(|| anyhow::anyhow!("local hotel record missing for node [{local_node_id}]"))?;
+        graph
+            .get_hotel(&hotel_name)?
+            .ok_or_else(|| anyhow::anyhow!("hotel record missing for hotel [{hotel_name}]"))
+    }
+
+    fn persist_hotel_mesh_host(
+        graph: &GraphDomain,
+        hotel_name: &str,
+        mesh_host: &str,
+    ) -> anyhow::Result<HotelRecord> {
+        let mut hotel = graph
+            .get_hotel(hotel_name)?
+            .ok_or_else(|| anyhow::anyhow!("hotel '{hotel_name}' not found"))?;
+        hotel.mesh_host = Some(mesh_host.to_string());
+        graph.upsert_hotel(&hotel)?;
+        Ok(hotel)
+    }
+
+    async fn handle_create_mesh_invite(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        hotel_name: String,
+        mesh_host: String,
+        ttl_secs: Option<u64>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let local_hotel = Self::local_hotel_record(graph, local_node_id)?;
+        if local_hotel.hotel_name != hotel_name {
+            bail!(
+                "mesh invites may only be created by the active local hotel [{}], not [{}]",
+                local_hotel.hotel_name,
+                hotel_name
+            );
+        }
+
+        let hotel = Self::persist_hotel_mesh_host(graph, &hotel_name, &mesh_host)?;
+        let (signing_key, public_key_b64, fingerprint) =
+            Self::ensure_mesh_identity(graph, &hotel_name)?;
+        let (_transport_private_key_hex, transport_public_key_b64) =
+            Self::ensure_mesh_transport_identity(graph, &hotel_name)?;
+        let now = now_epoch_secs();
+        let nonce = generate_nonce();
+        let expires_at = now + ttl_secs.unwrap_or(DEFAULT_INVITE_TTL_SECS);
+
+        let invite = sign_invite(
+            MeshInvitePayload {
+                version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
+                hotel_name: hotel.hotel_name.clone(),
+                capabilities: hotel.capabilities.clone(),
+                mesh_host: hotel
+                    .mesh_host
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".into()),
+                mesh_port: hotel.mesh_port,
+                blob_port: hotel.blob_port,
+                execution_port: hotel.execution_port,
+                inviter_pubkey_b64: public_key_b64,
+                inviter_fingerprint: fingerprint.clone(),
+                inviter_transport_pubkey_b64: transport_public_key_b64,
+                nonce: nonce.clone(),
+                created_at: now,
+                expires_at,
+            },
+            &signing_key,
+        )?;
+
+        graph.set_config_value(
+            &Self::mesh_pending_invite_config_key(&nonce),
+            &serde_json::json!({
+                "hotel_name": hotel.hotel_name,
+                "created_at": now,
+                "expires_at": expires_at,
+                "status": "pending"
+            })
+            .to_string(),
+        )?;
+
+        Ok(serde_json::json!({
+            "invite_json": serde_json::to_string_pretty(&invite)?,
+            "fingerprint": fingerprint,
+            "expires_at": expires_at,
+            "nonce": nonce
+        }))
+    }
+
+    async fn handle_accept_mesh_invite(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        hotel_name: String,
+        mesh_host: String,
+        invite_json: String,
+    ) -> anyhow::Result<serde_json::Value> {
+        let local_hotel = Self::local_hotel_record(graph, local_node_id)?;
+        if local_hotel.hotel_name != hotel_name {
+            bail!(
+                "mesh invites may only be accepted by the active local hotel [{}], not [{}]",
+                local_hotel.hotel_name,
+                hotel_name
+            );
+        }
+
+        let invite: MeshInvite =
+            serde_json::from_str(&invite_json).context("parse signed mesh invite JSON")?;
+        verify_invite(&invite, now_epoch_secs())?;
+
+        let persisted_local_hotel = Self::persist_hotel_mesh_host(graph, &hotel_name, &mesh_host)?;
+        let inviter_hotel = HotelRecord {
+            hotel_name: invite.payload.hotel_name.clone(),
+            capabilities: invite.payload.capabilities.clone(),
+            mesh_host: Some(invite.payload.mesh_host.clone()),
+            mesh_port: invite.payload.mesh_port,
+            blob_port: invite.payload.blob_port,
+            execution_port: invite.payload.execution_port,
+            ipc_socket_path: String::new(),
+            active_pid: None,
+        };
+        graph.upsert_hotel(&inviter_hotel)?;
+
+        let (signing_key, public_key_b64, fingerprint) =
+            Self::ensure_mesh_identity(graph, &hotel_name)?;
+        let (transport_private_key_hex, transport_public_key_b64) =
+            Self::ensure_mesh_transport_identity(graph, &hotel_name)?;
+        let session_key = derive_transport_session_key(
+            &invite.payload.nonce,
+            &transport_private_key_hex,
+            &invite.payload.inviter_transport_pubkey_b64,
+        )?;
+        graph.set_config_value(
+            &Self::mesh_auth_key_config_key(&invite.payload.capabilities.node_id),
+            &serde_json::to_string(&session_key)?,
+        )?;
+        let join_request = sign_join_request(
+            MeshJoinRequestPayload {
+                version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
+                invite_nonce: invite.payload.nonce.clone(),
+                hotel_name: persisted_local_hotel.hotel_name.clone(),
+                capabilities: persisted_local_hotel.capabilities.clone(),
+                mesh_host: persisted_local_hotel
+                    .mesh_host
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".into()),
+                mesh_port: persisted_local_hotel.mesh_port,
+                blob_port: persisted_local_hotel.blob_port,
+                execution_port: persisted_local_hotel.execution_port,
+                joiner_pubkey_b64: public_key_b64,
+                joiner_fingerprint: fingerprint,
+                joiner_transport_pubkey_b64: transport_public_key_b64,
+                requested_at: now_epoch_secs(),
+            },
+            &signing_key,
+        )?;
+
+        let payload = serde_json::to_vec(&join_request)?;
+        let msg_id = Uuid::new_v4();
+        let timestamp = now_epoch_secs();
+        let packet = ansible_mesh_core::BeaconMessage {
+            version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
+            msg_id,
+            src_node: persisted_local_hotel.capabilities.node_id.clone(),
+            dest_node: invite.payload.capabilities.node_id.clone(),
+            msg_type: ansible_mesh_core::MsgType::MeshMembershipAccept,
+            seq: 0,
+            total: 1,
+            payload,
+            timestamp,
+            hmac: Vec::new(),
+        };
+
+        let target_addr = format!("{}:{}", invite.payload.mesh_host, invite.payload.mesh_port);
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind local UDP socket for mesh join request")?;
+        socket
+            .send_to(&serde_json::to_vec(&packet)?, &target_addr)
+            .await
+            .with_context(|| format!("send mesh join request to {target_addr}"))?;
+
+        Ok(serde_json::json!({
+            "inviter_hotel": invite.payload.hotel_name,
+            "target_addr": target_addr,
+            "nonce": invite.payload.nonce
+        }))
+    }
+
     fn handle_list_components(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
             None => {
-                return IpcResponse::error("list_components", "HOTEL_NOT_FOUND", "local hotel record not found");
+                return IpcResponse::error(
+                    "list_components",
+                    "HOTEL_NOT_FOUND",
+                    "local hotel record not found",
+                );
             }
         };
 
@@ -4745,15 +8541,44 @@ impl IpcServer {
 
         let components: Vec<serde_json::Value> = guests
             .into_iter()
-            .filter_map(|g| {
-                // Infer component type from role prefix — only model-controllers and tool-runners
-                // are surfaced here. Agents, membrane, and other guests belong in /api/guests.
-                let component_type = if g.role == "model" || g.role.starts_with("model.") || g.role.starts_with("model-controller") {
+            .map(|g| {
+                let spawn_config = serde_json::from_str::<serde_json::Value>(&g.config_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let command = spawn_config
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let args = spawn_config
+                    .get("args")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let env = spawn_config
+                    .get("env")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+
+                // Keep the compatibility component_type hint, but stop pretending
+                // only model/tool-ish components exist on the authoring surface.
+                let component_type = if g.role == "model"
+                    || g.role.starts_with("model.")
+                    || g.role.starts_with("model-controller")
+                {
                     "model-controller"
-                } else if g.role == "tool" || g.role.starts_with("tool.") || g.role.starts_with("tool-runner") {
+                } else if g.role == "tool"
+                    || g.role.starts_with("tool.")
+                    || g.role.starts_with("tool-runner")
+                {
                     "tool-runner"
+                } else if g.role == "membrane" || g.role.starts_with("membrane.") {
+                    "membrane"
+                } else if g.role == "agent" || g.role.starts_with("agent.") {
+                    "agent"
+                } else if g.role == "graph-runner" || g.role.starts_with("graph.") {
+                    "graph-runner"
                 } else {
-                    return None;
+                    "other"
                 };
 
                 // Read per-component config blob.
@@ -4785,16 +8610,21 @@ impl IpcServer {
                     })
                     .unwrap_or_default();
 
-                Some(serde_json::json!({
+                serde_json::json!({
                     "guest_id": g.guest_id,
                     "role": g.role,
+                    "hotel": g.hotel_name,
+                    "command": command,
+                    "args": args,
+                    "env": env,
                     "component_type": component_type,
                     "is_active": g.is_active,
+                    "auto_start": g.is_active,
                     "active_pid": g.active_pid,
                     "last_active_at": g.last_active_at,
                     "component_config": component_config,
                     "capabilities": capabilities,
-                }))
+                })
             })
             .collect();
 
@@ -4811,7 +8641,11 @@ impl IpcServer {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
             None => {
-                return IpcResponse::error("set_component_active", "HOTEL_NOT_FOUND", "local hotel record not found");
+                return IpcResponse::error(
+                    "set_component_active",
+                    "HOTEL_NOT_FOUND",
+                    "local hotel record not found",
+                );
             }
         };
 
@@ -4859,7 +8693,10 @@ impl IpcServer {
             info!(guest_id = %guest_id, "component activated");
         }
 
-        IpcResponse::success("set_component_active", Some(serde_json::json!({ "guest_id": guest_id, "active": active })))
+        IpcResponse::success(
+            "set_component_active",
+            Some(serde_json::json!({ "guest_id": guest_id, "active": active })),
+        )
     }
 
     async fn handle_restart_component(
@@ -4871,7 +8708,11 @@ impl IpcServer {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
             None => {
-                return IpcResponse::error("restart_component", "HOTEL_NOT_FOUND", "local hotel record not found");
+                return IpcResponse::error(
+                    "restart_component",
+                    "HOTEL_NOT_FOUND",
+                    "local hotel record not found",
+                );
             }
         };
 
@@ -4911,11 +8752,7 @@ impl IpcServer {
         // Respawn.
         if let Some(req) = materialization_requester {
             if let Err(e) = req.ensure_guest_active(guest_id).await {
-                return IpcResponse::error(
-                    "restart_component",
-                    "SPAWN_FAILED",
-                    e.to_string(),
-                );
+                return IpcResponse::error("restart_component", "SPAWN_FAILED", e.to_string());
             }
         } else {
             return IpcResponse::error(
@@ -4926,7 +8763,64 @@ impl IpcServer {
         }
 
         info!(guest_id = %guest_id, "component restarted");
-        IpcResponse::success("restart_component", Some(serde_json::json!({ "guest_id": guest_id })))
+        IpcResponse::success(
+            "restart_component",
+            Some(serde_json::json!({ "guest_id": guest_id })),
+        )
+    }
+
+    async fn handle_remove_component(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        guest_id: &str,
+    ) -> IpcResponse {
+        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
+            Some(h) => h,
+            None => {
+                return IpcResponse::error(
+                    "remove_component",
+                    "HOTEL_NOT_FOUND",
+                    "local hotel record not found",
+                );
+            }
+        };
+
+        let guest = match graph.get_guest(&hotel_name, guest_id) {
+            Ok(Some(guest)) => guest,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "remove_component",
+                    "GUEST_NOT_FOUND",
+                    format!("No component registered with guest_id={guest_id}"),
+                );
+            }
+            Err(e) => {
+                return IpcResponse::error("remove_component", "STORAGE_ERROR", e.to_string());
+            }
+        };
+
+        if let Some(ref pid_str) = guest.active_pid {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                let _ = ProcessCommand::new("kill")
+                    .args(["-15", &pid.to_string()])
+                    .status();
+            }
+        }
+
+        if let Err(e) = graph.remove_guest(&hotel_name, guest_id) {
+            return IpcResponse::error("remove_component", "STORAGE_ERROR", e.to_string());
+        }
+
+        let config_key = format!("component:{guest_id}");
+        if let Err(e) = graph.remove_config_value(&config_key) {
+            warn!("RemoveComponent: failed to remove component config for {guest_id}: {e}");
+        }
+
+        info!(guest_id = %guest_id, "component removed");
+        IpcResponse::success(
+            "remove_component",
+            Some(serde_json::json!({ "guest_id": guest_id })),
+        )
     }
 
     fn record_apartment_checkpoint(
@@ -5073,6 +8967,156 @@ impl IpcServer {
             summary_json["tool_assembly"] = tool_assembly.clone();
             session.summary_json = summary_json;
         }
+        if let Some(reflex_overrides) = payload.get("reflex_overrides") {
+            let mut summary_json = session.summary_json.clone();
+            if !summary_json.is_object() {
+                summary_json = serde_json::json!({});
+            }
+            summary_json["reflex_overrides"] = reflex_overrides.clone();
+            session.summary_json = summary_json;
+        }
+        if let Some(reflex_evaluations) = payload.get("reflex_evaluations") {
+            let mut summary_json = session.summary_json.clone();
+            if !summary_json.is_object() {
+                summary_json = serde_json::json!({});
+            }
+            summary_json["reflex_evaluations"] = reflex_evaluations.clone();
+            session.summary_json = summary_json;
+        }
+        if let Some(reflex_policy_records) = payload.get("reflex_policy_records") {
+            let mut summary_json = session.summary_json.clone();
+            if !summary_json.is_object() {
+                summary_json = serde_json::json!({});
+            }
+            summary_json["reflex_policy_records"] = reflex_policy_records.clone();
+            session.summary_json = summary_json;
+        }
+        {
+            let marker_kind = payload
+                .get("placement_marker_kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    payload
+                        .get("transport")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|_| "transport_continuity".to_string())
+                })
+                .or_else(|| {
+                    payload
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|action| match action {
+                            "handoff_bundle" | "handoff_return" => Some("role_handoff".to_string()),
+                            _ => None,
+                        })
+                })
+                .or_else(|| {
+                    payload
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|_| "receptor_ingress".to_string())
+                });
+            let marker_source = payload
+                .get("placement_marker_source")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    payload
+                        .get("transport")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    payload
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|action| match action {
+                            "handoff_bundle" | "handoff_return" => Some(action.to_string()),
+                            _ => None,
+                        })
+                })
+                .or_else(|| {
+                    payload
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| Some(event_kind.to_string()));
+            let marker_strength = payload
+                .get("placement_marker_strength")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    infer_marker_strength(None, marker_kind.as_deref()).map(str::to_string)
+                });
+            let placement_risk_level = infer_placement_risk_level(
+                marker_kind.as_deref(),
+                marker_source.as_deref(),
+                marker_strength.as_deref(),
+            );
+            let agent_id = payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| envelope.primary_agent_id.clone());
+            let authority_hotel = payload
+                .get("authority_hotel")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let delivery_hotel = payload
+                .get("delivery_hotel")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let delivery_node_id = payload
+                .get("delivery_node_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let delivery_target_role = payload
+                .get("delivery_target_role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let delivery_target_guest_id = payload
+                .get("delivery_target_guest_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let transport = payload
+                .get("transport")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+
+            if agent_id.is_some()
+                || authority_hotel.is_some()
+                || delivery_hotel.is_some()
+                || delivery_node_id.is_some()
+                || delivery_target_role.is_some()
+                || delivery_target_guest_id.is_some()
+                || transport.is_some()
+                || marker_kind.is_some()
+                || marker_source.is_some()
+                || marker_strength.is_some()
+            {
+                let mut summary_json = session.summary_json.clone();
+                if !summary_json.is_object() {
+                    summary_json = serde_json::json!({});
+                }
+                summary_json["agent_runtime_provenance"] = serde_json::json!({
+                    "agent_id": agent_id,
+                    "authority_hotel": authority_hotel,
+                    "delivery_hotel": delivery_hotel,
+                    "delivery_node_id": delivery_node_id,
+                    "delivery_target_role": delivery_target_role,
+                    "delivery_target_guest_id": delivery_target_guest_id,
+                    "transport": transport,
+                    "marker_kind": marker_kind,
+                    "marker_source": marker_source,
+                    "marker_strength": marker_strength,
+                    "placement_risk_level": placement_risk_level,
+                    "updated_at": now,
+                });
+                session.summary_json = summary_json;
+            }
+        }
         session.updated_at = now;
         let _ = graph.upsert_session(&session);
 
@@ -5144,6 +9188,57 @@ impl IpcServer {
             payload,
             now,
         );
+        Self::append_explicit_reflex_events(
+            graph,
+            &session.session_id,
+            turn_id.as_deref(),
+            participant_role.unwrap_or("system"),
+            payload,
+            now,
+        );
+    }
+
+    fn append_explicit_reflex_events(
+        graph: &GraphDomain,
+        session_id: &str,
+        turn_id: Option<&str>,
+        component_id: &str,
+        payload: &serde_json::Value,
+        now: u64,
+    ) {
+        if let Some(reflex_overrides) = payload.get("reflex_overrides") {
+            let _ = graph.append_session_event(&SessionEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                component_id: component_id.to_string(),
+                kind: "reflex_overrides_updated".into(),
+                payload_json: reflex_overrides.clone(),
+                created_at: now,
+            });
+        }
+        if let Some(reflex_evaluations) = payload.get("reflex_evaluations") {
+            let _ = graph.append_session_event(&SessionEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                component_id: component_id.to_string(),
+                kind: "reflex_evaluations_recorded".into(),
+                payload_json: reflex_evaluations.clone(),
+                created_at: now,
+            });
+        }
+        if let Some(reflex_policy_records) = payload.get("reflex_policy_records") {
+            let _ = graph.append_session_event(&SessionEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                component_id: component_id.to_string(),
+                kind: "reflex_policy_records_updated".into(),
+                payload_json: reflex_policy_records.clone(),
+                created_at: now,
+            });
+        }
     }
 
     fn upsert_tool_runner_registry_entry(
@@ -5311,6 +9406,9 @@ impl IpcServer {
         registry: &Arc<RwLock<NodeRegistry>>,
         local_node_id: &str,
         session_id: &str,
+        // When a role process requests its snapshot, it passes its role name so we
+        // return the role-scoped checkpoint instead of the orchestrator's base one.
+        role_name: Option<&str>,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         let Some(session) = graph.get_session(session_id)? else {
             return Ok(None);
@@ -5318,7 +9416,10 @@ impl IpcServer {
 
         let turns = graph.list_session_turns(session_id, 8)?;
         let apartment_checkpoint = session.primary_agent_id.as_deref().and_then(|agent_id| {
-            let memory_type = format!("short_session:{session_id}");
+            let memory_type = match role_name {
+                Some(role) => format!("short_session:{session_id}:{role}"),
+                None => format!("short_session:{session_id}"),
+            };
             graph.get_apartment(agent_id, &memory_type).ok().flatten()
         });
 
@@ -5421,6 +9522,89 @@ impl IpcServer {
             }
         }
 
+        if let Some(agent_id) = session.primary_agent_id.as_deref() {
+            if let Some(routing_preferences) = load_agent_graph_routing_preferences(agent_id) {
+                if let Some(obj) = bindings.as_object_mut() {
+                    obj.insert(
+                        "routing_preferences".to_string(),
+                        serde_json::Value::Array(routing_preferences),
+                    );
+                } else {
+                    bindings = serde_json::json!({
+                        "routing_preferences": routing_preferences,
+                    });
+                }
+            }
+            if let Some((
+                reflex_policy_agent_layers,
+                reflex_policy_agent_suppressions,
+                reflex_policy_agent_rewards,
+            )) = load_agent_graph_reflex_preferences(graph, agent_id)
+            {
+                if let Some(obj) = bindings.as_object_mut() {
+                    obj.insert(
+                        "reflex_policy_agent_layers".to_string(),
+                        serde_json::Value::Array(reflex_policy_agent_layers),
+                    );
+                    if !reflex_policy_agent_suppressions.is_empty() {
+                        obj.insert(
+                            "reflex_policy_agent_suppressions".to_string(),
+                            serde_json::Value::Array(reflex_policy_agent_suppressions),
+                        );
+                    }
+                    if !reflex_policy_agent_rewards.is_empty() {
+                        obj.insert(
+                            "reflex_policy_agent_rewards".to_string(),
+                            serde_json::Value::Array(reflex_policy_agent_rewards),
+                        );
+                    }
+                } else {
+                    bindings = serde_json::json!({
+                        "reflex_policy_agent_layers": reflex_policy_agent_layers,
+                        "reflex_policy_agent_suppressions": reflex_policy_agent_suppressions,
+                        "reflex_policy_agent_rewards": reflex_policy_agent_rewards,
+                    });
+                }
+            }
+        }
+
+        if let Some(shared_model_markers) = load_shared_model_markers(graph) {
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "shared_model_markers".to_string(),
+                    serde_json::Value::Array(shared_model_markers),
+                );
+            } else {
+                bindings = serde_json::json!({
+                    "shared_model_markers": shared_model_markers,
+                });
+            }
+        }
+        if let Some(shared_tool_markers) = load_shared_tool_markers(graph) {
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "shared_tool_markers".to_string(),
+                    serde_json::Value::Array(shared_tool_markers),
+                );
+            } else {
+                bindings = serde_json::json!({
+                    "shared_tool_markers": shared_tool_markers,
+                });
+            }
+        }
+        if let Some(shared_skill_markers) = load_shared_skill_markers(graph) {
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "shared_skill_markers".to_string(),
+                    serde_json::Value::Array(shared_skill_markers),
+                );
+            } else {
+                bindings = serde_json::json!({
+                    "shared_skill_markers": shared_skill_markers,
+                });
+            }
+        }
+
         // Expand dynamic skill implied_tools into effective_toolset and carry prompt-facing
         // skill guidance so philote can project more than just skill names.
         // For each skill in effective_skillset, load its AbstractSkillRecord and merge
@@ -5467,10 +9651,8 @@ impl IpcServer {
                                 toolset.push(implied.clone());
                             }
                         }
-                        let guidance = format!(
-                            "{} — {}",
-                            skill_record.skill_name, skill_record.description
-                        );
+                        let guidance =
+                            format!("{} — {}", skill_record.skill_name, skill_record.description);
                         if !skill_guidance.contains(&guidance) {
                             skill_guidance.push(guidance);
                         }
@@ -5484,6 +9666,76 @@ impl IpcServer {
                         serde_json::json!(skill_guidance),
                     );
                 }
+            }
+        }
+
+        {
+            let effective_rights = project_effective_rights(&bindings);
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "effective_rights".to_string(),
+                    serde_json::json!(effective_rights),
+                );
+            }
+        }
+
+        {
+            let placement_risk_level = session
+                .summary_json
+                .get("agent_runtime_provenance")
+                .map(|provenance| {
+                    infer_placement_risk_level(
+                        provenance
+                            .get("marker_kind")
+                            .and_then(serde_json::Value::as_str),
+                        provenance
+                            .get("marker_source")
+                            .and_then(serde_json::Value::as_str),
+                        provenance
+                            .get("marker_strength")
+                            .and_then(serde_json::Value::as_str),
+                    )
+                })
+                .unwrap_or("guarded");
+            let effective_reflex_policy_layers = normalized_reflex_policy_records(
+                &session.summary_json,
+                &bindings,
+                placement_risk_level,
+            );
+            if let Some(obj) = bindings.as_object_mut() {
+                let effective_reflexes =
+                    effective_reflexes_from_policy_records(&effective_reflex_policy_layers);
+                let effective_right_policy = serde_json::json!({
+                    "remote_tool_execution": effective_reflexes["remote_tool_reflex"],
+                    "remote_component_execution": effective_reflexes["remote_component_reflex"],
+                    "credential_scope": effective_reflexes["credential_scope_reflex"],
+                });
+                obj.insert(
+                    "effective_posture".to_string(),
+                    serde_json::json!({
+                        "placement_risk_level": placement_risk_level,
+                        "remote_execution_allowed": placement_risk_level != "elevated",
+                    }),
+                );
+                obj.insert(
+                    "effective_reflex_policy".to_string(),
+                    serde_json::json!({
+                        "precedence_model": "highest_precedence_wins",
+                        "origin_classes": effective_reflex_policy_layers
+                            .iter()
+                            .filter_map(|layer| layer.get("origin_class").and_then(serde_json::Value::as_str))
+                            .collect::<Vec<_>>(),
+                        "layers": effective_reflex_policy_layers,
+                        "evaluation_count": session
+                            .summary_json
+                            .get("reflex_evaluations")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|items| items.len())
+                            .unwrap_or(0),
+                    }),
+                );
+                obj.insert("effective_reflexes".to_string(), effective_reflexes);
+                obj.insert("effective_right_policy".to_string(), effective_right_policy);
             }
         }
 
@@ -5617,6 +9869,470 @@ impl IpcServer {
             .collect::<Vec<_>>();
         serde_json::json!({ "nodes": nodes })
     }
+
+    /// Handle a `session.handoff` mesh event received from a remote hotel.
+    ///
+    /// The payload carries the `RoleIncarnationRecord` and optional `ToolsetProfileRecord`
+    /// from the authority hotel so the receiving hotel can upsert them if not already present,
+    /// then materialize the role's guest and deliver the handoff bundle.
+    pub(crate) async fn handle_remote_role_handoff(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        parked_inbound: &ParkedInboundRegistry,
+        materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
+        local_node_id: &str,
+        data: &str,
+    ) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            warn!("handle_remote_role_handoff: failed to parse payload");
+            return;
+        };
+
+        let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_role_handoff: missing session_id");
+            return;
+        };
+        let Some(role_name) = payload.get("role_name").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_role_handoff: missing role_name");
+            return;
+        };
+        let handoff_bundle = payload.get("handoff_bundle").cloned().unwrap_or_default();
+
+        // Upsert role_record into local graph so ensure_role_materialized can find it.
+        if let Some(role_val) = payload.get("role_record") {
+            if let Ok(mut role_record) =
+                serde_json::from_value::<ansible_mesh_core::graph::RoleIncarnationRecord>(
+                    role_val.clone(),
+                )
+            {
+                // Clear readiness — the remote hotel owns that state, not us.
+                role_record.readiness_state =
+                    ansible_mesh_core::graph::RoleReadinessState::Configured;
+                if let Err(err) = graph.upsert_role_incarnation(&role_record) {
+                    warn!(
+                        "handle_remote_role_handoff: failed to upsert role_record for '{}': {}",
+                        role_name, err
+                    );
+                }
+            }
+        }
+
+        // Upsert toolset_record if provided.
+        if let Some(ts_val) = payload.get("toolset_record") {
+            if ts_val.is_object() {
+                if let Ok(profile) =
+                    serde_json::from_value::<ansible_mesh_core::graph::ToolsetProfileRecord>(
+                        ts_val.clone(),
+                    )
+                {
+                    let _ = graph.upsert_toolset_profile(&profile);
+                }
+            }
+        }
+
+        let readiness = match Self::ensure_role_materialized(
+            graph,
+            inboxes,
+            materialization_requester.as_deref(),
+            local_node_id,
+            &payload
+                .get("role_record")
+                .and_then(|v| v.get("agent_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            role_name,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(
+                    "handle_remote_role_handoff: ensure_role_materialized failed for '{}': {}",
+                    role_name, err
+                );
+                return;
+            }
+        };
+
+        let agent_id = payload
+            .get("role_record")
+            .and_then(|v| v.get("agent_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let guest_id = payload
+            .get("role_record")
+            .and_then(|v| v.get("guest_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let routing_role = format!("role:{}:{}", agent_id, role_name);
+        let task_id = Uuid::new_v4();
+        let task_json = serde_json::json!({
+            "action": "handoff_bundle",
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "handoff_bundle": handoff_bundle,
+        })
+        .to_string();
+
+        if matches!(
+            readiness,
+            ansible_mesh_core::graph::RoleReadinessState::Configured
+                | ansible_mesh_core::graph::RoleReadinessState::Materializing
+                | ansible_mesh_core::graph::RoleReadinessState::Materialized
+        ) {
+            // Not yet live — park and wait for the guest to start up.
+            let mut guard = parked_inbound.lock().await;
+            guard.entry(guest_id).or_default().push(ParkedInboundTask {
+                source_node: local_node_id.to_string(),
+                task_id,
+                task_json,
+                activate_session_id: Some(session_id.to_string()),
+            });
+            return;
+        }
+
+        if let Err(err) = Self::deliver_live_guest_task(
+            graph,
+            inboxes,
+            local_node_id,
+            &routing_role,
+            &guest_id,
+            task_id,
+            task_json,
+            Some(session_id.to_string()),
+        )
+        .await
+        {
+            warn!(
+                "handle_remote_role_handoff: deliver_live_guest_task failed for '{}': {}",
+                role_name, err
+            );
+        }
+    }
+
+    // ── Training data admin handlers ──────────────────────────────────────────
+
+    fn handle_list_training_samples(
+        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        agent_id: Option<&str>,
+        limit: usize,
+        filter: &ansible_mesh_core::whisper_training::TrainingFilter,
+    ) -> IpcResponse {
+        let Some(storage) = storage else {
+            return IpcResponse::error(
+                "training_list",
+                "TRAINING_STORAGE_UNAVAILABLE",
+                "Training DB not configured for this hotel",
+            );
+        };
+        let capped = limit.min(200);
+        match storage.list_filtered(filter, agent_id, capped) {
+            Ok(samples) => {
+                let samples_json = serde_json::to_value(&samples).unwrap_or(serde_json::Value::Null);
+                IpcResponse::success(
+                    "training_list",
+                    Some(serde_json::json!({ "samples": samples_json, "count": samples.len() })),
+                )
+            }
+            Err(e) => IpcResponse::error("training_list", "QUERY_FAILED", &e.to_string()),
+        }
+    }
+
+    fn handle_correct_training_sample(
+        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        turn_id: &str,
+        corrected_transcript: &str,
+    ) -> IpcResponse {
+        let Some(storage) = storage else {
+            return IpcResponse::error(
+                "training_correct",
+                "TRAINING_STORAGE_UNAVAILABLE",
+                "Training DB not configured for this hotel",
+            );
+        };
+        match storage.update_correction(turn_id, corrected_transcript, "operator") {
+            Ok(true) => IpcResponse::success(
+                "training_correct",
+                Some(serde_json::json!({ "turn_id": turn_id, "updated": true })),
+            ),
+            Ok(false) => IpcResponse::error(
+                "training_correct",
+                "TURN_NOT_FOUND",
+                &format!("No sample found for turn_id '{turn_id}'"),
+            ),
+            Err(e) => IpcResponse::error("training_correct", "UPDATE_FAILED", &e.to_string()),
+        }
+    }
+
+    fn handle_export_training_samples(
+        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        format: &ansible_mesh_core::whisper_training::TrainingExportFormat,
+        output_path: &str,
+        limit: Option<usize>,
+    ) -> IpcResponse {
+        use ansible_mesh_core::whisper_training::TrainingExportFormat;
+        use std::io::Write;
+
+        let Some(storage) = storage else {
+            return IpcResponse::error(
+                "training_export",
+                "TRAINING_STORAGE_UNAVAILABLE",
+                "Training DB not configured for this hotel",
+            );
+        };
+        let capped = limit.unwrap_or(usize::MAX).min(10_000);
+        let samples = match storage.list_eligible(capped) {
+            Ok(s) => s,
+            Err(e) => return IpcResponse::error("training_export", "QUERY_FAILED", &e.to_string()),
+        };
+        if samples.is_empty() {
+            return IpcResponse::success(
+                "training_export",
+                Some(serde_json::json!({ "exported_count": 0, "output_path": output_path })),
+            );
+        }
+
+        let write_result = match format {
+            TrainingExportFormat::HuggingFace => {
+                let records: Vec<serde_json::Value> = samples
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "audio": s.audio_path,
+                            "sentence": s.corrected_transcript.as_deref().unwrap_or(&s.raw_transcript),
+                            "model_gen": s.model_gen,
+                            "sample_id": s.sample_id,
+                        })
+                    })
+                    .collect();
+                std::fs::write(output_path, serde_json::to_vec_pretty(&records).unwrap_or_default())
+            }
+            TrainingExportFormat::Nemo => {
+                let mut file = match std::fs::File::create(output_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string())
+                    }
+                };
+                for s in &samples {
+                    let record = serde_json::json!({
+                        "audio_filepath": s.audio_path.as_deref().unwrap_or(""),
+                        "text": s.corrected_transcript.as_deref().unwrap_or(&s.raw_transcript),
+                        "duration": 0.0,
+                    });
+                    if let Err(e) = writeln!(file, "{}", record) {
+                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
+                    }
+                }
+                Ok(())
+            }
+        };
+
+        if let Err(e) = write_result {
+            return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
+        }
+
+        let exported_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ids: Vec<String> = samples.iter().map(|s| s.sample_id.clone()).collect();
+        let count = ids.len();
+        if let Err(e) = storage.mark_exported_at(&ids, exported_at) {
+            warn!("training_export: failed to mark {} samples exported: {}", count, e);
+        }
+
+        IpcResponse::success(
+            "training_export",
+            Some(serde_json::json!({ "exported_count": count, "output_path": output_path })),
+        )
+    }
+
+    fn handle_get_training_status(
+        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
+        agent_id: Option<&str>,
+    ) -> IpcResponse {
+        let Some(storage) = storage else {
+            return IpcResponse::error(
+                "training_status",
+                "TRAINING_STORAGE_UNAVAILABLE",
+                "Training DB not configured for this hotel",
+            );
+        };
+        match storage.count_status(agent_id) {
+            Ok(counts) => {
+                let status_json =
+                    serde_json::to_value(&counts).unwrap_or(serde_json::Value::Null);
+                IpcResponse::success("training_status", Some(serde_json::json!({ "status": status_json })))
+            }
+            Err(e) => IpcResponse::error("training_status", "QUERY_FAILED", &e.to_string()),
+        }
+    }
+
+    // ── ASR provider lifecycle handlers ───────────────────────────────────────
+
+    fn handle_asr_setup(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        socket_path: &str,
+        python_path: &str,
+        model_name: Option<&str>,
+        auto_install: bool,
+    ) -> IpcResponse {
+        use std::process::Command;
+
+        let model = model_name.unwrap_or(parakeet_runner::DEFAULT_MODEL);
+
+        // Step 1: check nemo import.
+        let check_ok = Command::new(python_path)
+            .args(["-c", "import nemo.collections.asr"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let nemo_available = if !check_ok && auto_install {
+            info!("asr.setup: nemo import failed; attempting pip install nemo-toolkit[asr]");
+            let install = Command::new(python_path)
+                .args(["-m", "pip", "install", "nemo-toolkit[asr]"])
+                .output();
+            match install {
+                Ok(o) if o.status.success() => {
+                    // Re-verify after install.
+                    Command::new(python_path)
+                        .args(["-c", "import nemo.collections.asr"])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                    warn!("asr.setup: pip install failed: {stderr}");
+                    false
+                }
+                Err(e) => {
+                    warn!("asr.setup: pip install error: {e}");
+                    false
+                }
+            }
+        } else {
+            check_ok
+        };
+
+        if !nemo_available {
+            let hint = format!(
+                "nemo_asr import failed. Install manually: `{python_path} -m pip install nemo-toolkit[asr]`"
+            );
+            return IpcResponse::error("asr_setup", "NEMO_UNAVAILABLE", &hint);
+        }
+
+        // Step 2: write component config to hotel context graph.
+        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error("asr_setup", "HOTEL_NOT_FOUND", "could not resolve hotel name");
+        };
+        let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
+        let config = parakeet_runner::ParakeetConfig {
+            python_path: python_path.to_string(),
+            model_name: model.to_string(),
+            priority: 10,
+        };
+        let config_json = match serde_json::to_string(&config) {
+            Ok(j) => j,
+            Err(e) => return IpcResponse::error("asr_setup", "SERIALIZE_ERROR", &e.to_string()),
+        };
+        let key = format!("component:{guest_id}");
+        if let Err(e) = graph.set_config_value(&key, &config_json) {
+            return IpcResponse::error("asr_setup", "CONFIG_WRITE_ERROR", &e.to_string());
+        }
+
+        // Step 3: upsert the guest record so the reconcile loop spawns it.
+        let guest_record = GuestRecord {
+            hotel_name: hotel_name.clone(),
+            guest_id: guest_id.clone(),
+            role: "model.parakeet".to_string(),
+            config_json: serde_json::json!({
+                "command": "model-controller-parakeet",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path,
+                    "PHILOTIC_PARAKEET_GUEST_ID": guest_id,
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        };
+        if let Err(e) = graph.upsert_guest(&guest_record) {
+            return IpcResponse::error("asr_setup", "GUEST_REGISTER_ERROR", &e.to_string());
+        }
+
+        info!(
+            hotel = %hotel_name,
+            guest_id = %guest_id,
+            model = %model,
+            "asr.setup: parakeet guest registered; will be spawned within 5s"
+        );
+
+        IpcResponse::success(
+            "asr_setup",
+            Some(serde_json::json!({
+                "message": format!(
+                    "Parakeet ASR configured. Guest '{guest_id}' registered — will start within 5 seconds."
+                ),
+                "guest_id": guest_id,
+                "model": model,
+                "python_path": python_path,
+                "nemo_available": true,
+            })),
+        )
+    }
+
+    fn handle_asr_status(
+        graph: &GraphDomain,
+        local_node_id: &str,
+    ) -> IpcResponse {
+        use std::process::Command;
+
+        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error("asr_status", "HOTEL_NOT_FOUND", "could not resolve hotel name");
+        };
+        let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
+
+        // Read python_path from stored component config, fall back to "python3".
+        let component_key = format!("component:{guest_id}");
+        let python_path = graph
+            .get_config_value(&component_key)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<parakeet_runner::ParakeetConfig>(&json).ok())
+            .map(|cfg| cfg.python_path)
+            .unwrap_or_else(|| "python3".to_string());
+
+        let guest = graph.get_guest(&hotel_name, &guest_id).ok().flatten();
+        let guest_registered = guest.is_some();
+        let guest_active = guest.as_ref().map(|g| g.is_active).unwrap_or(false);
+        let guest_pid = guest.as_ref().and_then(|g| g.active_pid.clone());
+
+        let nemo_available = Command::new(&python_path)
+            .args(["-c", "import nemo.collections.asr"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        IpcResponse::success(
+            "asr_status",
+            Some(serde_json::json!({
+                "guest_id": guest_id,
+                "registered": guest_registered,
+                "active": guest_active,
+                "pid": guest_pid,
+                "nemo_available": nemo_available,
+                "python_path": python_path,
+            })),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5677,9 +10393,7 @@ async fn live_role_subscribers(
     subscribers
 }
 
-fn load_tool_runner_registry(
-    graph: &GraphDomain,
-) -> anyhow::Result<Vec<ToolRunnerRegistryEntry>> {
+fn load_tool_runner_registry(graph: &GraphDomain) -> anyhow::Result<Vec<ToolRunnerRegistryEntry>> {
     let Some(raw) = graph.get_config_value("tool_runner_registry")? else {
         return Ok(Vec::new());
     };
@@ -5763,23 +10477,26 @@ fn compose_component_route_assembly(
 }
 
 fn default_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
-    let mut capabilities = std::collections::BTreeSet::from([
-        "text.generate".to_string(),
-        "media.analyze".to_string(),
-    ]);
-
-    for route in bindings
-        .get("component_routes")
+    let capabilities = declared_component_capabilities(bindings);
+    let rights = bindings
+        .get("effective_rights")
         .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let Some(capability) = route.get("capability").and_then(serde_json::Value::as_str) {
-            capabilities.insert(capability.to_string());
-        }
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if rights.is_empty() {
+        return capabilities;
     }
 
-    capabilities.into_iter().collect()
+    capabilities
+        .into_iter()
+        .filter(|capability| has_right(&rights, &component_right(capability)))
+        .collect()
 }
 
 fn select_component_route(
@@ -5829,6 +10546,7 @@ fn select_component_route(
             }
         })
         .unwrap_or_else(|| default_component_role(capability).to_string());
+    let allow_remote_execution = remote_component_execution_allowed(bindings);
 
     if let Some(incarnation_id) = binding
         .and_then(|route| route.get("incarnation"))
@@ -5849,25 +10567,27 @@ fn select_component_route(
             }));
         }
 
-        if let Some(remote) = registry
-            .advertisements_for_role(&target_role)
-            .filter(|advertisement| {
-                advertisement.node_id != local_node_id
-                    && advertisement.availability_state == "live"
-                    && advertisement.incarnation_id == incarnation_id
-            })
-            .next()
-        {
-            return Some(serde_json::json!({
-                "target_node": remote.node_id,
-                "target_role": remote.target_role,
-                "incarnation_id": remote.incarnation_id,
-                "hotel_id": remote.hotel_id,
-                "environment_id": preferred_environment_id,
-                "execution_mode": "preferred",
-                "availability_state": remote.availability_state,
-                "selection_reason": "preferred_incarnation_live",
-            }));
+        if allow_remote_execution {
+            if let Some(remote) = registry
+                .advertisements_for_role(&target_role)
+                .filter(|advertisement| {
+                    advertisement.node_id != local_node_id
+                        && advertisement.availability_state == "live"
+                        && advertisement.incarnation_id == incarnation_id
+                })
+                .next()
+            {
+                return Some(serde_json::json!({
+                    "target_node": remote.node_id,
+                    "target_role": remote.target_role,
+                    "incarnation_id": remote.incarnation_id,
+                    "hotel_id": remote.hotel_id,
+                    "environment_id": preferred_environment_id,
+                    "execution_mode": "preferred",
+                    "availability_state": remote.availability_state,
+                    "selection_reason": "preferred_incarnation_live",
+                }));
+            }
         }
     }
 
@@ -5908,22 +10628,24 @@ fn select_component_route(
         }));
     }
 
-    if let Some(remote) = select_remote_component_advertisement(
-        registry,
-        &target_role,
-        preferred_hotel_id,
-        local_node_id,
-    ) {
-        return Some(serde_json::json!({
-            "target_node": remote.node_id,
-            "target_role": remote.target_role,
-            "incarnation_id": remote.incarnation_id,
-            "hotel_id": remote.hotel_id,
-            "environment_id": preferred_environment_id,
-            "execution_mode": "capability",
-            "availability_state": remote.availability_state,
-            "selection_reason": remote.selection_hint.unwrap_or_else(|| "remote_latency_capacity".into()),
-        }));
+    if allow_remote_execution {
+        if let Some(remote) = select_remote_component_advertisement(
+            registry,
+            &target_role,
+            preferred_hotel_id,
+            local_node_id,
+        ) {
+            return Some(serde_json::json!({
+                "target_node": remote.node_id,
+                "target_role": remote.target_role,
+                "incarnation_id": remote.incarnation_id,
+                "hotel_id": remote.hotel_id,
+                "environment_id": preferred_environment_id,
+                "execution_mode": "capability",
+                "availability_state": remote.availability_state,
+                "selection_reason": remote.selection_hint.unwrap_or_else(|| "remote_latency_capacity".into()),
+            }));
+        }
     }
 
     Some(serde_json::json!({
@@ -5948,16 +10670,17 @@ fn component_implementation_to_role(implementation: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
 
-    if prefix == "elevenlabs" {
-        "model.elevenlabs".into()
-    } else {
-        "model".into()
+    match prefix {
+        "elevenlabs" => "model.elevenlabs".into(),
+        "onnx" | "local" => "model.local".into(),
+        _ => "model".into(),
     }
 }
 
 fn default_component_role(capability: &str) -> &'static str {
     match capability {
         "voice.synthesize" => "model.elevenlabs",
+        "voice.transcribe" => "model.local",
         _ => "model",
     }
 }
@@ -6011,12 +10734,17 @@ fn compose_tool_assembly(
     let tools_for_model = toolset
         .iter()
         .map(|tool_name| {
+            let marker = shared_tool_receptor_record(bindings, tool_name);
             serde_json::json!({
                 "tool_name": tool_name,
-                "description": format!("Execute the {} tool.", tool_name),
-                "input_schema": {
-                    "type": "object"
-                }
+                "description": marker
+                    .and_then(|value: &serde_json::Value| value.get("description"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(format!("Execute the {} tool.", tool_name))),
+                "input_schema": marker
+                    .and_then(|value: &serde_json::Value| value.get("input_schema"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" }))
             })
         })
         .collect::<Vec<_>>();
@@ -6061,6 +10789,9 @@ fn compose_tool_assembly(
                         .any(|supported| supported == tool_name)
             });
             if registered.is_none() && live_runner.is_none() {
+                if tool_has_marker(bindings, tool_name, "local_only") {
+                    return None;
+                }
                 let remote = select_remote_tool_advertisement(remote_tool_ads, tool_name, bindings)?;
                 return Some((
                     tool_name.to_string(),
@@ -6123,11 +10854,19 @@ fn compose_tool_assembly(
     let policy_annotations = toolset
         .iter()
         .map(|tool_name| {
+            let marker = shared_tool_receptor_record(bindings, tool_name);
+            let tool_markers = tool_ligand_markers(bindings, tool_name);
             (
                 tool_name.to_string(),
                 serde_json::json!({
-                    "policy_class": format!("tool:{tool_name}"),
-                    "approval_required": false
+                    "policy_class": marker
+                        .and_then(|value: &serde_json::Value| value.get("class"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|class| format!("tool:{class}"))
+                        .unwrap_or_else(|| format!("tool:{tool_name}")),
+                    "approval_required": tool_markers.iter().any(|marker| marker == "high_agency"),
+                    "credential_scope_reflex": credential_scope_reflex(bindings),
+                    "tool_markers": tool_markers,
                 }),
             )
         })
@@ -6155,7 +10894,59 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
     if toolset.is_empty() {
         toolset.push("echo".into());
     }
+    let rights = bindings
+        .get("effective_rights")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if rights.is_empty() {
+        return toolset;
+    }
+
     toolset
+        .into_iter()
+        .filter(|tool_name| has_right(&rights, &tool_right(tool_name)))
+        .collect()
+}
+
+fn shared_tool_receptor_record<'a>(
+    bindings: &'a serde_json::Value,
+    tool_name: &str,
+) -> Option<&'a serde_json::Value> {
+    bindings
+        .get("shared_tool_markers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|marker| {
+            marker.get("tool_name").and_then(serde_json::Value::as_str) == Some(tool_name)
+        })
+}
+
+fn tool_ligand_markers(bindings: &serde_json::Value, tool_name: &str) -> Vec<String> {
+    shared_tool_receptor_record(bindings, tool_name)
+        .and_then(|marker: &serde_json::Value| marker.get("tool_markers"))
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn tool_has_marker(bindings: &serde_json::Value, tool_name: &str, marker_name: &str) -> bool {
+    tool_ligand_markers(bindings, tool_name)
+        .iter()
+        .any(|marker| marker == marker_name)
 }
 
 fn remote_tool_advertisements(
@@ -6175,6 +10966,9 @@ fn select_remote_tool_advertisement(
     tool_name: &str,
     bindings: &serde_json::Value,
 ) -> Option<CapabilityAdvertisement> {
+    if !remote_tool_execution_allowed(bindings) {
+        return None;
+    }
     let target_role = format!("tool.{tool_name}");
     let preferred_hotel_id = bindings
         .get("preferred_hotel_id")
@@ -6214,17 +11008,32 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "session.status"
+            | "hotel.status"
+            | "hotel.logs"
             | "agent.configure"
             | "skill.register"
             | "subagent.spawn"
             | "role.configure"
+            | "role.list"
+            | "role.set_home"
+            | "bash.exec"
+            | "training.list"
+            | "training.correct"
+            | "training.export"
+            | "training.status"
+            | "asr.setup"
+            | "asr.status"
     )
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
+        "workspace.list"
+            | "workspace.read"
+            | "workspace.search"
+            | "workspace.write"
+            | "desktop.observe"
     )
 }
 
@@ -6235,6 +11044,10 @@ fn task_runner_kind_for_tool(tool_name: &str) -> Option<&'static str> {
 
     if tool_name.starts_with("shell.") {
         return Some("shell");
+    }
+
+    if tool_name.starts_with("desktop.") {
+        return Some("desktop");
     }
 
     None
@@ -6390,7 +11203,18 @@ fn compose_tool_assembly_from_incarnations(
     incarnations: &[AllowedIncarnation],
 ) -> serde_json::Value {
     let preferences = parse_routing_preferences(bindings);
-    let toolset = {
+    let rights = bindings
+        .get("effective_rights")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut toolset = {
         let filtered = default_visible_toolset(bindings);
         if bindings
             .get("effective_toolset")
@@ -6407,16 +11231,24 @@ fn compose_tool_assembly_from_incarnations(
                 .collect::<Vec<_>>()
         }
     };
+    if !rights.is_empty() {
+        toolset.retain(|tool_name| has_right(&rights, &tool_right(tool_name)));
+    }
 
     let tools_for_model = toolset
         .iter()
         .map(|tool_name| {
+            let marker = shared_tool_receptor_record(bindings, tool_name);
             serde_json::json!({
                 "tool_name": tool_name,
-                "description": format!("Execute the {} tool.", tool_name),
-                "input_schema": {
-                    "type": "object"
-                }
+                "description": marker
+                    .and_then(|value: &serde_json::Value| value.get("description"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(format!("Execute the {} tool.", tool_name))),
+                "input_schema": marker
+                    .and_then(|value: &serde_json::Value| value.get("input_schema"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" }))
             })
         })
         .collect::<Vec<_>>();
@@ -6424,6 +11256,17 @@ fn compose_tool_assembly_from_incarnations(
     let execution_routes = toolset
         .iter()
         .filter_map(|tool_name| {
+            if tool_has_marker(bindings, tool_name, "local_only")
+                && incarnations.iter().all(|incarnation| {
+                    incarnation
+                        .target_node
+                        .as_deref()
+                        .map(|node| node != "local-aiua-01")
+                        .unwrap_or(true)
+                })
+            {
+                return None;
+            }
             select_allowed_incarnation(incarnations, tool_name, &preferences).map(|incarnation| {
                 (
                     tool_name.to_string(),
@@ -6448,11 +11291,18 @@ fn compose_tool_assembly_from_incarnations(
     let policy_annotations = toolset
         .iter()
         .map(|tool_name| {
+            let marker = shared_tool_receptor_record(bindings, tool_name);
+            let tool_markers = tool_ligand_markers(bindings, tool_name);
             (
                 tool_name.to_string(),
                 serde_json::json!({
-                    "policy_class": format!("tool:{tool_name}"),
-                    "approval_required": false
+                    "policy_class": marker
+                        .and_then(|value: &serde_json::Value| value.get("class"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|class| format!("tool:{class}"))
+                        .unwrap_or_else(|| format!("tool:{tool_name}")),
+                    "approval_required": tool_markers.iter().any(|marker| marker == "high_agency"),
+                    "tool_markers": tool_markers
                 }),
             )
         })
@@ -6579,16 +11429,19 @@ mod tests {
     use crate::service::guest_manager::GuestMaterializationRequester;
     use crate::vault::{SecretInput, store_secret};
     use ansible_mesh_core::NodeCapabilities;
+    use ansible_mesh_core::agent_graph_storage::{
+        AgentGraphStorage, AgentReflexPreference, AgentRoutingPreference, SqliteAgentGraphStorage,
+    };
     use ansible_mesh_core::graph::{RoleIncarnationRecord, TurnLoopConfig};
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, GraphStorage, HotelRecord, SecretRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord,
         SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
     use philotic_client::{
-        GuestIdentity, HandoffBundle, HookKind, OperatorTargetView, PhiloticClient,
+        GuestIdentity, HandoffBundle, OperatorTargetView, PhiloticClient,
         SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
     };
     use std::path::Path;
@@ -6697,9 +11550,7 @@ mod tests {
         }
     }
 
-    fn expect_operator_target_guests(
-        response: IpcResponse,
-    ) -> OperatorTargetGuestInventoryView {
+    fn expect_operator_target_guests(response: IpcResponse) -> OperatorTargetGuestInventoryView {
         match response {
             IpcResponse::OperatorTargetGuestsView {
                 operator_target_guests,
@@ -6708,15 +11559,152 @@ mod tests {
         }
     }
 
-    fn expect_operator_target_agents(
-        response: IpcResponse,
-    ) -> OperatorTargetAgentInventoryView {
+    fn expect_operator_target_agents(response: IpcResponse) -> OperatorTargetAgentInventoryView {
         match response {
             IpcResponse::OperatorTargetAgentsView {
                 operator_target_agents,
             } => operator_target_agents,
             other => panic!("unexpected operator target agents response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_components_returns_manifest_relevant_fields_for_registered_components() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/test.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: "membrane-discord-01".into(),
+                role: "membrane.discord".into(),
+                config_json: serde_json::json!({
+                    "command": "membrane-discord",
+                    "args": ["--agent-id", "agent-01"],
+                    "env": {
+                        "DISCORD_BOT_TOKEN": "token"
+                    }
+                })
+                .to_string(),
+                is_active: true,
+                active_pid: Some("4242".into()),
+                last_active_at: Some(123),
+            })
+            .expect("seed component guest");
+        graph
+            .set_config_value(
+                "component:membrane-discord-01",
+                &serde_json::json!({
+                    "guild_id": "1234"
+                })
+                .to_string(),
+            )
+            .expect("seed component config");
+
+        let response = IpcServer::handle_list_components(&graph, "local-aiua-01");
+        let components = match response {
+            IpcResponse::ComponentInventory { components } => components,
+            other => panic!("unexpected list_components response: {other:?}"),
+        };
+
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0]["guest_id"], "membrane-discord-01");
+        assert_eq!(components[0]["role"], "membrane.discord");
+        assert_eq!(components[0]["hotel"], "local-hotel");
+        assert_eq!(components[0]["command"], "membrane-discord");
+        assert_eq!(components[0]["args"][0], "--agent-id");
+        assert_eq!(components[0]["env"]["DISCORD_BOT_TOKEN"], "token");
+        assert_eq!(components[0]["component_type"], "membrane");
+        assert_eq!(components[0]["auto_start"], true);
+        assert_eq!(components[0]["component_config"]["guild_id"], "1234");
+    }
+
+    #[test]
+    fn remove_component_deletes_guest_and_component_config() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/test.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: "tool-echo-01".into(),
+                role: "tool.echo".into(),
+                config_json: serde_json::json!({
+                    "command": "tool-runner",
+                    "args": ["--help"],
+                    "env": {}
+                })
+                .to_string(),
+                is_active: false,
+                active_pid: None,
+                last_active_at: None,
+            })
+            .expect("seed component guest");
+        graph
+            .set_config_value(
+                "component:tool-echo-01",
+                &serde_json::json!({ "description": "temporary" }).to_string(),
+            )
+            .expect("seed component config");
+
+        let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+        let response = runtime.block_on(IpcServer::handle_remove_component(
+            &graph,
+            "local-aiua-01",
+            "tool-echo-01",
+        ));
+
+        match response {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => panic!("unexpected remove_component response: {other:?}"),
+        }
+
+        assert!(
+            graph
+                .get_guest("local-hotel", "tool-echo-01")
+                .expect("load guest")
+                .is_none()
+        );
+        assert!(
+            graph
+                .get_config_value("component:tool-echo-01")
+                .expect("load component config")
+                .is_none()
+        );
     }
 
     fn expect_operator_chat_reply(response: IpcResponse) -> OperatorChatTurnReply {
@@ -6732,10 +11720,7 @@ mod tests {
     struct TestGraphAdapter;
 
     impl ansible_mesh_core::storage::GraphAdapter for TestGraphAdapter {
-        fn upsert_node(
-            &self,
-            _node: &ansible_mesh_core::graph::GraphNode,
-        ) -> anyhow::Result<()> {
+        fn upsert_node(&self, _node: &ansible_mesh_core::graph::GraphNode) -> anyhow::Result<()> {
             Ok(())
         }
         fn get_node(
@@ -6753,10 +11738,7 @@ mod tests {
         ) -> anyhow::Result<Vec<ansible_mesh_core::graph::GraphNode>> {
             Ok(vec![])
         }
-        fn upsert_edge(
-            &self,
-            _edge: &ansible_mesh_core::graph::GraphEdge,
-        ) -> anyhow::Result<()> {
+        fn upsert_edge(&self, _edge: &ansible_mesh_core::graph::GraphEdge) -> anyhow::Result<()> {
             Ok(())
         }
         fn delete_edge(&self, _edge_key: &str) -> anyhow::Result<()> {
@@ -6774,281 +11756,31 @@ mod tests {
     #[derive(Default)]
     struct MockMaterializationRequester {
         calls: AtomicUsize,
+        last_guest_id: StdMutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
     impl GuestMaterializationRequester for MockMaterializationRequester {
-        async fn ensure_guest_active(&self, _guest_id: &str) -> anyhow::Result<bool> {
+        async fn ensure_guest_active(&self, guest_id: &str) -> anyhow::Result<bool> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self
+                .last_guest_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *guard = Some(guest_id.to_string());
             Ok(true)
         }
     }
 
-    #[derive(Default)]
-    struct TestGraphStorage;
-
-    impl GraphStorage for TestGraphStorage {
-        fn load_node_capabilities(&self) -> anyhow::Result<Option<NodeCapabilities>> {
-            Ok(None)
-        }
-        fn save_node_capabilities(&self, _caps: &NodeCapabilities) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_config_value(&self, _key: &str) -> anyhow::Result<Option<String>> {
-            Ok(None)
-        }
-        fn set_config_value(&self, _key: &str, _value_json: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn upsert_secret(&self, _secret: &SecretRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_secret(&self, _secret_ref: &str) -> anyhow::Result<Option<SecretRecord>> {
-            Ok(None)
-        }
-        fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> {
-            Ok(None)
-        }
-        fn list_hotels(&self) -> anyhow::Result<Vec<HotelRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_hotel(&self, _hotel: &HotelRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn set_hotel_pid(&self, _hotel_name: &str, _pid: Option<&str>) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_guests(
-            &self,
-            _hotel_name: &str,
-            _active_only: bool,
-        ) -> anyhow::Result<Vec<GuestRecord>> {
-            Ok(vec![])
-        }
-        fn set_guest_pid(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _pid: Option<&str>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn set_guest_active(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _active: bool,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn seed_guests(&self, _hotel_name: &str, _guests: &[GuestRecord]) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_agent_identities(&self) -> anyhow::Result<Vec<AgentIdentityRecord>> {
-            Ok(vec![])
-        }
-        fn get_agent_identity(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Option<AgentIdentityRecord>> {
-            Ok(None)
-        }
-        fn sync_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-            _content_json: &serde_json::Value,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-        ) -> anyhow::Result<Option<serde_json::Value>> {
-            Ok(None)
-        }
-        fn upsert_session(&self, _session: &SessionRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_session(&self, _session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
-            Ok(None)
-        }
-        fn upsert_role_incarnation(&self, _role: &RoleIncarnationRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_role_incarnation(
-            &self,
-            _agent_id: &str,
-            _role_name: &str,
-        ) -> anyhow::Result<Option<RoleIncarnationRecord>> {
-            Ok(None)
-        }
-        fn list_role_incarnations(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Vec<RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_session_participant(
-            &self,
-            _participant: &SessionParticipantRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_session_participants(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Vec<SessionParticipantRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_session_turn(
-            &self,
-            _session_id: &str,
-            _turn_id: &str,
-        ) -> anyhow::Result<Option<SessionTurnRecord>> {
-            Ok(None)
-        }
-        fn list_session_turns(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<SessionTurnRecord>> {
-            Ok(vec![])
-        }
-        fn append_session_event(&self, _event: &SessionEventRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_session_events(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<SessionEventRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_tool(
-            &self,
-            _tool: &ansible_mesh_core::graph::AbstractToolRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_tool(
-            &self,
-            _tool_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_tools(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_skill(
-            &self,
-            _skill: &ansible_mesh_core::graph::AbstractSkillRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_skill(
-            &self,
-            _skill_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_skills(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(vec![])
-        }
-
-        fn list_role_incarnations_by_guest_id(
-            &self,
-            _guest_id: &str,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-
-        fn set_guest_last_active(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _epoch: u64,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn upsert_toolset_profile(
-            &self,
-            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_toolset_profile(
-            &self,
-            _profile_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(None)
-        }
-
-        fn list_toolset_profiles(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_rule(&self, _rule: &ansible_mesh_core::graph::RuleRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_rule(
-            &self,
-            _rule_id: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(None)
-        }
-
-        fn list_rules(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_workflow_skill(
-            &self,
-            _skill: &ansible_mesh_core::graph::WorkflowSkillRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_workflow_skill(
-            &self,
-            _workflow_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::WorkflowSkillRecord>> {
-            Ok(None)
-        }
-
-        fn list_workflow_skills(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::WorkflowSkillRecord>> {
-            Ok(vec![])
-        }
-    }
     fn test_socket_path() -> String {
         format!("/tmp/ipc-e2e-{}.sock", Uuid::new_v4().simple())
+    }
+
+    fn test_agent_graph_db_template() -> String {
+        format!(
+            "/tmp/agent-graph-{}-{{agent_id}}.db",
+            Uuid::new_v4().simple()
+        )
     }
 
     static IPC_TEST_ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
@@ -7125,8 +11857,14 @@ mod tests {
                 task_json,
                 ..
             } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
                 assert_eq!(source_node, "local-aiua-01");
-                assert_eq!(task_json, task_payload);
+                assert_eq!(payload["source"], "telegram");
+                assert_eq!(payload["chat_id"], "12345");
+                assert_eq!(payload["content"], "hello from telegram");
+                assert_eq!(payload["delivery_node_id"], "local-aiua-01");
+                assert_eq!(payload["delivery_target_role"], "agent");
             }
             other => panic!("unexpected inbound response: {other:?}"),
         }
@@ -7148,6 +11886,564 @@ mod tests {
         }
         server_task.abort();
         let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_attaches_agent_graph_snapshot_from_session_primary_agent() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-jane-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Jane".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-agent-graph-carry".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some(agent_id.into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_routing_preference(&AgentRoutingPreference {
+                agent_id: agent_id.into(),
+                preference_key: "voice-ingress-elevenlabs".into(),
+                stage_kind: Some("ingress".into()),
+                capability: Some("voice.transcribe".into()),
+                provider_hint: Some("elevenlabs".into()),
+                model_ref: Some("scribe_v1".into()),
+                preference_level: 1,
+                weight: 10,
+                config_json: serde_json::json!({}),
+                updated_at: 0,
+            })
+            .expect("seed routing preference");
+        storage
+            .upsert_reflex_preference(&AgentReflexPreference {
+                agent_id: agent_id.into(),
+                preference_key: "operator-mesh-trust".into(),
+                precedence: 72,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({"reason": "learned operator trust"}),
+                updated_at: 0,
+            })
+            .expect("seed reflex preference");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-jane:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "session_id": "sess-agent-graph-carry",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let inbound = agent.recv_task().await.expect("recv task");
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            panic!("unexpected inbound response");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).expect("payload should decode");
+        assert_eq!(payload["agent_graph_snapshot"]["agent_id"], agent_id);
+        assert_eq!(
+            payload["agent_graph_snapshot"]["routing_preferences"]
+                .as_array()
+                .expect("routing preferences array")
+                .len(),
+            1
+        );
+        assert_eq!(
+            payload["agent_graph_snapshot"]["reflex_preferences"]
+                .as_array()
+                .expect("reflex preferences array")
+                .len(),
+            1
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_hydrates_embedded_agent_graph_snapshot_before_delivery() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-jane-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "codex".into(),
+                allowed_tools: vec!["session.status".into(), "workspace.read".into()],
+                allowed_classes: vec!["session".into(), "workspace".into()],
+                allowed_skills: vec!["handoff.back".into()],
+                description: Some("Codex specialist role profile — workspace read access.".into()),
+            })
+            .expect("seed toolset profile");
+        graph
+            .upsert_role_incarnation(&ansible_mesh_core::graph::RoleIncarnationRecord {
+                agent_id: agent_id.into(),
+                role_name: "developer".into(),
+                guest_id: format!("{agent_id}:developer"),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: Some("Focus on implementation and code changes.".into()),
+                role_manifest: Some(
+                    "Developer role: focus on implementation, code changes, and concrete patches."
+                        .into(),
+                ),
+                is_admin: false,
+                readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let snapshot = {
+            let storage = SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path))
+                .expect("open db");
+            storage
+                .upsert_routing_preference(&AgentRoutingPreference {
+                    agent_id: agent_id.into(),
+                    preference_key: "cognition-gemini-flash".into(),
+                    stage_kind: Some("cognition".into()),
+                    capability: Some("text.generate".into()),
+                    provider_hint: Some("gemini".into()),
+                    model_ref: Some("gemini-3.1-flash".into()),
+                    preference_level: 1,
+                    weight: 9,
+                    config_json: serde_json::json!({}),
+                    updated_at: 0,
+                })
+                .expect("seed routing preference");
+            storage
+                .upsert_reflex_preference(&AgentReflexPreference {
+                    agent_id: agent_id.into(),
+                    preference_key: "operator-mesh-trust".into(),
+                    precedence: 74,
+                    reflexes_json: serde_json::json!({
+                        "remote_tool_reflex": "allow"
+                    }),
+                    config_json: serde_json::json!({"reason": "mesh-trusted operator"}),
+                    updated_at: 0,
+                })
+                .expect("seed reflex preference");
+            storage
+                .export_snapshot("home-hotel-01")
+                .expect("export snapshot")
+        };
+        let _ = std::fs::remove_file(&graph_db_path);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-jane:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "session_id": "sess-remote-ish",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello",
+                    "agent_graph_snapshot": snapshot
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let inbound = agent.recv_task().await.expect("recv task");
+        let IpcResponse::InboundTask { .. } = inbound else {
+            panic!("unexpected inbound response");
+        };
+
+        let hydrated =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        let prefs = hydrated
+            .list_routing_preferences()
+            .expect("list routing preferences");
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].preference_key, "cognition-gemini-flash");
+        let reflex_prefs = hydrated
+            .list_reflex_preferences()
+            .expect("list reflex preferences");
+        assert_eq!(reflex_prefs.len(), 1);
+        assert_eq!(reflex_prefs[0].preference_key, "operator-mesh-trust");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_attaches_agent_graph_snapshot_from_explicit_agent_id_without_session() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-aria-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Aria".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_routing_preference(&AgentRoutingPreference {
+                agent_id: agent_id.into(),
+                preference_key: "egress-elevenlabs".into(),
+                stage_kind: Some("egress".into()),
+                capability: Some("voice.synthesize".into()),
+                provider_hint: Some("elevenlabs".into()),
+                model_ref: Some("eleven_multilingual_v2".into()),
+                preference_level: 1,
+                weight: 8,
+                config_json: serde_json::json!({}),
+                updated_at: 0,
+            })
+            .expect("seed routing preference");
+        storage
+            .upsert_reflex_preference(&AgentReflexPreference {
+                agent_id: agent_id.into(),
+                preference_key: "voice-admin-trust".into(),
+                precedence: 68,
+                reflexes_json: serde_json::json!({
+                    "remote_component_reflex": "allow"
+                }),
+                config_json: serde_json::json!({"reason": "voice session confidence"}),
+                updated_at: 0,
+            })
+            .expect("seed reflex preference");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-aria:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-aria:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "agent_id": agent_id,
+                    "authority_hotel": "local-hotel",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello without session"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let inbound = agent.recv_task().await.expect("recv task");
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            panic!("unexpected inbound response");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).expect("payload should decode");
+        assert_eq!(payload["agent_graph_snapshot"]["agent_id"], agent_id);
+        assert_eq!(
+            payload["agent_graph_snapshot"]["routing_preferences"]
+                .as_array()
+                .expect("routing preferences array")
+                .len(),
+            1
+        );
+        assert_eq!(
+            payload["agent_graph_snapshot"]["reflex_preferences"]
+                .as_array()
+                .expect("reflex preferences array")
+                .len(),
+            1
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_does_not_attach_agent_graph_snapshot_for_foreign_authority_hotel() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-foreign-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Remote".into(),
+                authority_hotel: "remote-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed remote authority agent identity");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_routing_preference(&AgentRoutingPreference {
+                agent_id: agent_id.into(),
+                preference_key: "foreign-pref".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("google".into()),
+                model_ref: Some("gemini-2.5-flash".into()),
+                preference_level: 1,
+                weight: 5,
+                config_json: serde_json::json!({}),
+                updated_at: 0,
+            })
+            .expect("seed routing preference");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-aria:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-aria:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "agent_id": agent_id,
+                    "authority_hotel": "remote-hotel",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello from foreign authority"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let inbound = agent.recv_task().await.expect("recv task");
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            panic!("unexpected inbound response");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).expect("payload should decode");
+        assert!(
+            payload.get("agent_graph_snapshot").is_none(),
+            "foreign authority should not attach local graph snapshot"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
@@ -7328,7 +12624,11 @@ mod tests {
                 .expect("developer recv should succeed");
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
-                assert_eq!(task_json, task_payload);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route to developer");
+                assert_eq!(payload["session_id"], "sess-role-route");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
         }
@@ -7369,8 +12669,10 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -7444,7 +12746,18 @@ mod tests {
         .expect("orchestrator recv should succeed");
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
-                assert_eq!(task_json, task_payload);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["session_id"], "sess-role-fallback");
+                assert_eq!(payload["source"], "telegram");
+                assert_eq!(payload["chat_id"], "123");
+                assert_eq!(payload["content"], "route to fallback orchestrator");
+                assert_eq!(payload["delivery_node_id"], "local-aiua-01");
+                assert_eq!(payload["delivery_target_role"], "agent");
+                assert_eq!(
+                    payload["delivery_target_guest_id"],
+                    "agent-jane:orchestrator"
+                );
             }
             other => panic!("unexpected orchestrator inbound response: {other:?}"),
         }
@@ -7475,8 +12788,10 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("orchestrator role should seed");
         graph
@@ -7550,10 +12865,173 @@ mod tests {
         .expect("orchestrator recv should succeed");
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
-                assert_eq!(task_json, task_payload);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["session_id"], "sess-role-default");
+                assert_eq!(payload["source"], "telegram");
+                assert_eq!(payload["chat_id"], "123");
+                assert_eq!(payload["content"], "route to default orchestrator");
+                assert_eq!(payload["delivery_node_id"], "local-aiua-01");
+                assert_eq!(payload["delivery_target_role"], "agent");
+                assert_eq!(
+                    payload["delivery_target_guest_id"],
+                    "agent-jane:orchestrator"
+                );
             }
             other => panic!("unexpected orchestrator inbound response: {other:?}"),
         }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_prefers_persisted_local_delivery_guest_when_no_active_incarnation() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("orchestrator role should seed");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-provenance-preferred".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "updated_at": now
+                    }
+                }),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-role-provenance-preferred",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "route to persisted local guest"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
+                .await
+                .expect("developer should receive provenance-directed task before timeout")
+                .expect("developer recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route to persisted local guest");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
+            }
+            other => panic!("unexpected developer inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                orchestrator.recv_task()
+            )
+            .await
+            .is_err(),
+            "orchestrator should not receive task when persisted local placement points at developer"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -7587,6 +13065,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -7677,7 +13156,16 @@ mod tests {
                 .expect("developer recv should succeed");
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
-                assert_eq!(task_json, task_payload);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["session_id"], "sess-role-park");
+                assert_eq!(payload["source"], "telegram");
+                assert_eq!(payload["chat_id"], "123");
+                assert_eq!(payload["content"], "park until developer registers");
+                assert_eq!(payload["delivery_hotel"], "local-hotel");
+                assert_eq!(payload["delivery_node_id"], "local-aiua-01");
+                assert_eq!(payload["delivery_target_role"], "agent");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
         }
@@ -7690,6 +13178,906 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[tokio::test]
+    async fn emit_task_parks_for_persisted_local_delivery_guest_and_flushes_after_register() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "agent-jane:developer".into(),
+                    role: "agent".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed developer guest");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-provenance-park".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "updated_at": now
+                    }
+                }),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("session should seed");
+
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester.clone());
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-role-provenance-park",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "park for persisted local guest"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+        assert_eq!(requester.calls.load(Ordering::SeqCst), 1);
+
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
+                .await
+                .expect("developer should receive parked provenance-directed task")
+                .expect("developer recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "park for persisted local guest");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
+            }
+            other => panic!("unexpected developer inbound response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_ignores_stale_persisted_local_delivery_guest_and_falls_back() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("orchestrator role should seed");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-provenance-stale".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "updated_at": now.saturating_sub(LOCAL_DELIVERY_PROVENANCE_TTL_SECS + 10)
+                    }
+                }),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-role-provenance-stale",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "route with stale local provenance"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            orchestrator.recv_task(),
+        )
+        .await
+        .expect("orchestrator should receive stale-provenance fallback task")
+        .expect("orchestrator recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route with stale local provenance");
+            }
+            other => panic!("unexpected orchestrator inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                developer.recv_task()
+            )
+            .await
+            .is_err(),
+            "developer should not receive task when persisted local provenance is stale"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_marker_policy_gives_receptor_ingress_a_shorter_half_life() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("orchestrator role should seed");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-marker-half-life".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "receptor_ingress",
+                        "marker_source": "telegram",
+                        "updated_at": now.saturating_sub(LOCAL_DELIVERY_PROVENANCE_TTL_SECS.saturating_sub(2))
+                    }
+                }),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-marker-half-life",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "short half-life marker should die"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            orchestrator.recv_task(),
+        )
+        .await
+        .expect("orchestrator should receive fallback task")
+        .expect("orchestrator recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "short half-life marker should die");
+            }
+            other => panic!("unexpected orchestrator inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                developer.recv_task()
+            )
+            .await
+            .is_err(),
+            "developer should not receive task when receptor_ingress marker has already undergone apoptosis"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_supersedes_older_local_provenance_when_active_incarnation_is_newer() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "agent-jane:orchestrator".into(),
+                    role: "agent".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed orchestrator guest");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-provenance-superseded".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "updated_at": now.saturating_sub(30)
+                    }
+                }),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-role-provenance-superseded",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "route with superseded local provenance"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            orchestrator.recv_task(),
+        )
+        .await
+        .expect("orchestrator should receive task after provenance supersession")
+        .expect("orchestrator recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route with superseded local provenance");
+            }
+            other => panic!("unexpected orchestrator inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                developer.recv_task()
+            )
+            .await
+            .is_err(),
+            "developer should not receive task after newer active-incarnation truth supersedes older provenance"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_route_keeps_transport_continuity_marker_under_newer_conflicting_active_incarnation()
+     {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "agent-jane:orchestrator".into(),
+                        role: "agent".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    },
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "agent-jane:developer".into(),
+                        role: "agent".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    },
+                ],
+            )
+            .expect("seed local guests");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-transport-marker-survives".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "updated_at": now.saturating_sub(1)
+                    }
+                }),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            None,
+            &serde_json::json!({
+                "session_id": "sess-transport-marker-survives",
+                "source": "telegram",
+                "chat_id": "123",
+                "content": "route with durable transport continuity"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            route,
+            AgentRouteResolution::Park {
+                guest_id: "agent-jane:developer".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_route_does_not_park_for_weak_receptor_marker_without_live_guest() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed orchestrator role");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "agent-jane:orchestrator".into(),
+                        role: "agent".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    },
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "agent-jane:developer".into(),
+                        role: "agent".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    },
+                ],
+            )
+            .expect("seed local guests");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-weak-receptor-no-park".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "receptor_ingress",
+                        "marker_source": "telegram",
+                        "marker_strength": "weak",
+                        "updated_at": now.saturating_sub(1)
+                    }
+                }),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            None,
+            &serde_json::json!({
+                "session_id": "sess-weak-receptor-no-park",
+                "source": "telegram",
+                "chat_id": "123",
+                "content": "weak receptor should not trigger developer parking"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            route,
+            AgentRouteResolution::Park {
+                guest_id: "agent-jane:orchestrator".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_route_can_park_for_strong_custom_marker_without_live_guest() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "agent-jane:developer".into(),
+                    role: "agent".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed developer guest");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-strong-marker-park".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "routing_enzyme",
+                        "marker_source": "routing_refinement",
+                        "marker_strength": "strong",
+                        "updated_at": now.saturating_sub(1)
+                    }
+                }),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            None,
+            &serde_json::json!({
+                "session_id": "sess-strong-marker-park",
+                "source": "operator_chat",
+                "chat_id": "chat-1",
+                "content": "strong custom marker should preserve developer parking"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            route,
+            AgentRouteResolution::Park {
+                guest_id: "agent-jane:developer".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -7724,8 +14112,10 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
         let server = IpcServer::new(
@@ -7758,6 +14148,12 @@ mod tests {
         })
         .await
         .expect("developer connect");
+        developer
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "role:agent-jane-01:developer".into(),
+            })
+            .await
+            .expect("developer role inbox subscribe");
 
         let response = orchestrator
             .send_request(IpcRequest::HandoffToRole {
@@ -7841,7 +14237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_to_missing_role_parks_until_register_then_switches_active_incarnation() {
+    async fn handoff_to_missing_role_returns_pending_until_role_inbox_is_routable() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
@@ -7862,6 +14258,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -7903,8 +14300,10 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
 
@@ -7963,12 +14362,16 @@ mod tests {
             .expect("handoff request");
 
         match response {
-            IpcResponse::HandoffAck {
-                handoff_guest_id,
-                became_active,
+            IpcResponse::HandoffPending {
+                role_name,
+                readiness,
+                ..
             } => {
-                assert_eq!(handoff_guest_id, "agent-jane:developer");
-                assert!(!became_active);
+                assert_eq!(role_name, "developer");
+                assert!(
+                    matches!(readiness.as_str(), "materializing" | "materialized"),
+                    "unexpected readiness: {readiness}"
+                );
             }
             other => panic!("unexpected handoff response: {other:?}"),
         }
@@ -7990,6 +14393,51 @@ mod tests {
         })
         .await
         .expect("developer connect");
+        developer
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "role:agent-jane-01:developer".into(),
+            })
+            .await
+            .expect("developer role inbox subscribe");
+
+        let response = orchestrator
+            .send_request(IpcRequest::HandoffToRole {
+                session_id: "sess-handoff-park".into(),
+                role_name: "developer".into(),
+                handoff_bundle: HandoffBundle {
+                    goal: "implement later".into(),
+                    context_excerpt: "waiting for startup".into(),
+                    session_id: "sess-handoff-park".into(),
+                    initiating_turn_id: "turn-1".into(),
+                    return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: Some("implement later".into()),
+                    active_constraints: vec!["same_identity_role_handoff".into()],
+                    relevant_session_facts: vec!["session_status=active".into()],
+                    working_summary: Some(
+                        "phase=waiting_model, iteration=1, pending_tool=false, pending_approval=false"
+                            .into(),
+                    ),
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("developer".into()),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("required".into()),
+                    cleanup_actions: vec!["switch_active_role".into()],
+                },
+            })
+            .await
+            .expect("handoff retry");
+
+        match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id,
+                became_active,
+            } => {
+                assert_eq!(handoff_guest_id, "agent-jane:developer");
+                assert!(became_active);
+            }
+            other => panic!("unexpected retry handoff response: {other:?}"),
+        }
 
         let delivered =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
@@ -8305,6 +14753,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -8444,7 +14893,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -8510,13 +14964,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_task_persists_agent_runtime_provenance_with_authority_and_delivery_context() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let agent_identity = GuestIdentity {
+            guest_id: "agent-aria:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut agent = PhiloticClient::connect(agent_identity)
+            .await
+            .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-aria:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "agent_id": "agent-aria-01",
+                    "authority_hotel": "remote-hotel",
+                    "transport": "operator_chat",
+                    "session_id": "sess-provenance",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello from elsewhere"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let session = graph
+            .get_session("sess-provenance")
+            .expect("session lookup should work")
+            .expect("session should exist");
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["agent_id"],
+            "agent-aria-01"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["authority_hotel"],
+            "remote-hotel"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_hotel"],
+            "local-hotel"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_node_id"],
+            "local-aiua-01"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_target_guest_id"],
+            "agent-aria:orchestrator"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_target_role"],
+            "agent"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["transport"],
+            "operator_chat"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["marker_kind"],
+            "transport_continuity"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["marker_source"],
+            "operator_chat"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["marker_strength"],
+            "medium"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["placement_risk_level"],
+            "guarded"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn get_config_can_return_canonical_session_snapshot() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -8568,8 +15155,10 @@ mod tests {
                 role_identity_addendum: Some("Focus on implementation and code changes.".into()),
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("developer role should seed");
 
@@ -8636,13 +15225,466 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_session_snapshot_includes_agent_runtime_provenance() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-runtime-provenance".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "agent_id": "agent-jane-01",
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_node_id": "local-aiua-01",
+                        "delivery_target_role": "agent",
+                        "delivery_target_guest_id": "agent-jane:orchestrator",
+                        "transport": "operator_chat",
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-runtime-provenance".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["authority_hotel"],
+                    "remote-hotel"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["delivery_hotel"],
+                    "local-hotel"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["delivery_target_guest_id"],
+                    "agent-jane:orchestrator"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["marker_kind"],
+                    "transport_continuity"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["marker_source"],
+                    "operator_chat"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["marker_strength"],
+                    "medium"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["placement_risk_level"],
+                    "guarded"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_posture"]["placement_risk_level"],
+                    "guarded"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_posture"]["remote_execution_allowed"],
+                    true
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_component_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["credential_scope_reflex"],
+                    "local_scoped"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_right_policy"]["remote_tool_execution"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_right_policy"]["remote_component_execution"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_right_policy"]["credential_scope"],
+                    "local_scoped"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_applies_reflex_overrides_over_inferred_reflexes() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-reflex-override".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
+                    },
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
+                    },
+                    "reflex_evaluations": [{
+                        "reflex_name": "remote_tool_reflex",
+                        "decision": "operator_override",
+                        "reason": "trusted operator session"
+                    }]
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-reflex-override".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_component_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["credential_scope_reflex"],
+                    "mesh_scoped"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_right_policy"]["remote_tool_execution"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][0]["policy_scope"],
+                    "placement_inferred"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["policy_scope"],
+                    "session_override"
+                );
+                assert_eq!(
+                    snapshot["summary"]["reflex_overrides"]["remote_tool_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["summary"]["reflex_evaluations"][0]["decision"],
+                    "operator_override"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_projects_reflex_policy_records_with_precedence() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-reflex-policy-records".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "reflex_policy_defaults": [{
+                            "policy_source": "operator_baseline",
+                            "reason": "local remote tools stay damped",
+                            "reflexes": {
+                                "remote_component_reflex": "deny"
+                            }
+                        }]
+                    },
+                    "agent_runtime_provenance": {
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
+                    },
+                    "reflex_policy_records": [{
+                        "policy_scope": "session_override",
+                        "policy_source": "operator_override",
+                        "precedence": 90,
+                        "origin_class": "session_override",
+                        "reason": "trusted human just allowed broader tool reach",
+                        "reflexes": {
+                            "remote_tool_reflex": "allow",
+                            "credential_scope_reflex": "mesh_scoped"
+                        }
+                    }],
+                    "reflex_evaluations": [{
+                        "reflex_name": "remote_tool_reflex",
+                        "decision": "operator_override",
+                        "reason": "trusted operator session"
+                    }]
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-reflex-policy-records".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_component_reflex"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["credential_scope_reflex"],
+                    "mesh_scoped"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][0]["policy_scope"],
+                    "placement_inferred"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["policy_scope"],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["origin_class"],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][2]["policy_scope"],
+                    "session_override"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][2]["origin_class"],
+                    "session_override"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["origin_classes"][0],
+                    "inferred"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["origin_classes"][1],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["origin_classes"][2],
+                    "session_override"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["evaluation_count"],
+                    1
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn session_snapshot_seeds_bindings_from_toolset_profile_on_fresh_role_session() {
         let _guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         // Seed profile with known allowed_tools and allowed_skills.
         graph
@@ -8688,8 +15730,10 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
             })
             .expect("role incarnation");
 
@@ -8740,6 +15784,21 @@ mod tests {
                     skillset.iter().any(|s| s == "handoff.back"),
                     "expected handoff.back in effective_skillset, got {skillset:?}"
                 );
+                let rights = snap["bindings"]["effective_rights"]
+                    .as_array()
+                    .expect("effective_rights should be an array");
+                assert!(
+                    rights.iter().any(|r| r == "tool.session.status"),
+                    "expected tool.session.status in effective_rights, got {rights:?}"
+                );
+                assert!(
+                    rights.iter().any(|r| r == "tool.workspace.read"),
+                    "expected tool.workspace.read in effective_rights, got {rights:?}"
+                );
+                assert!(
+                    rights.iter().any(|r| r == "skill.handoff.back"),
+                    "expected skill.handoff.back in effective_rights, got {rights:?}"
+                );
                 assert_eq!(snap["role_activation"]["toolset_profile_ref"], "codex");
             }
             other => panic!("unexpected response: {other:?}"),
@@ -8762,7 +15821,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -8838,7 +15902,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -8923,6 +15992,10 @@ mod tests {
                     snapshot["bindings"]["effective_workspace_ref"],
                     "workspace://main"
                 );
+                assert_eq!(
+                    snapshot["bindings"]["effective_rights"][0],
+                    "component.media.analyze"
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -8935,6 +16008,324 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[test]
+    fn compose_tool_assembly_does_not_widen_beyond_effective_rights() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo", "agent.configure"],
+            "effective_rights": ["tool.echo"],
+            "shared_tool_markers": [{
+                "tool_name": "echo",
+                "class": "utility",
+                "description": "Echo tool from shared catalog.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["remote_safe", "low_agency"]
+            }, {
+                "tool_name": "agent.configure",
+                "class": "config",
+                "description": "Agent configure tool from shared catalog.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["high_agency", "local_only"]
+            }],
+        });
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &[], "local-aiua-01");
+        let tools = assembly["tools_for_model"]
+            .as_array()
+            .expect("tools_for_model should be an array");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["tool_name"], "echo");
+        assert!(
+            assembly["execution_routes"]
+                .get("agent.configure")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compose_tool_assembly_uses_shared_tool_markers_for_policy_annotations() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["agent.configure"],
+            "effective_rights": ["tool.agent.configure"],
+            "shared_tool_markers": [{
+                "tool_name": "agent.configure",
+                "class": "config",
+                "description": "Agent configure tool from shared catalog.",
+                "input_schema": { "type": "object", "properties": {"config_path": {"type": "string"}} },
+                "tool_markers": ["high_agency", "local_only"]
+            }],
+        });
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &[], "local-aiua-01");
+
+        assert_eq!(
+            assembly["policy_annotations"]["agent.configure"]["policy_class"],
+            "tool:config"
+        );
+        assert_eq!(
+            assembly["policy_annotations"]["agent.configure"]["approval_required"],
+            true
+        );
+        assert_eq!(
+            assembly["tools_for_model"][0]["description"],
+            "Agent configure tool from shared catalog."
+        );
+    }
+
+    #[test]
+    fn incarnation_tool_assembly_does_not_widen_beyond_effective_rights() {
+        let bindings = serde_json::json!({
+            "effective_rights": ["tool.workspace.read"],
+            "allowed_tool_runner_incarnations": [{
+                "incarnation_id": "runner-1",
+                "runner_id": "runner-1",
+                "target_node": "local-aiua-01",
+                "target_role": "tool.workspace",
+                "supported_tools": ["workspace.read", "workspace.list"]
+            }]
+        });
+
+        let assembly = compose_tool_assembly_from_incarnations(
+            &bindings,
+            &[AllowedIncarnation {
+                incarnation_id: "runner-1".into(),
+                runner_id: Some("runner-1".into()),
+                hotel_id: None,
+                environment_id: None,
+                target_node: Some("local-aiua-01".into()),
+                target_role: Some("tool.workspace".into()),
+                supported_tools: vec!["workspace.read".into(), "workspace.list".into()],
+                execution_mode: "capability".into(),
+                availability_state: "live".into(),
+                selection_hint: None,
+            }],
+        );
+
+        let tools = assembly["tools_for_model"]
+            .as_array()
+            .expect("tools_for_model should be an array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["tool_name"], "workspace.read");
+        assert!(assembly["execution_routes"].get("workspace.read").is_some());
+        assert!(assembly["execution_routes"].get("workspace.list").is_none());
+    }
+
+    #[test]
+    fn compose_tool_assembly_routes_desktop_observe_as_pinned_desktop_runner() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["desktop.observe"],
+            "effective_rights": ["tool.desktop.observe"],
+            "shared_tool_markers": [{
+                "tool_name": "desktop.observe",
+                "class": "desktop",
+                "description": "Observe-only desktop metadata.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["desktop_bound", "local_only", "low_agency"]
+            }]
+        });
+        let registered = vec![ToolRunnerRegistryEntry {
+            guest_id: "tool-runner-01".into(),
+            supported_tools: vec!["desktop.observe".into()],
+            last_seen_at: 1,
+        }];
+        let live = vec![LiveToolRunner {
+            guest_id: "tool-runner-01".into(),
+            supported_tools: vec!["desktop.observe".into()],
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &registered, &live, &[], "local-aiua-01");
+        let route = &assembly["execution_routes"]["desktop.observe"];
+
+        assert_eq!(
+            assembly["tools_for_model"][0]["tool_name"],
+            "desktop.observe"
+        );
+        assert_eq!(route["execution_mode"], "pinned");
+        assert_eq!(route["task_runner_kind"], "desktop");
+        assert_eq!(route["target_role"], "tool.desktop.observe");
+        assert_eq!(
+            assembly["policy_annotations"]["desktop.observe"]["approval_required"],
+            false
+        );
+    }
+
+    #[test]
+    fn default_component_capabilities_follow_effective_rights() {
+        let bindings = serde_json::json!({
+            "component_routes": [
+                { "capability": "voice.synthesize" }
+            ],
+            "effective_rights": ["component.text.generate"],
+        });
+
+        let capabilities = default_component_capabilities(&bindings);
+
+        assert_eq!(capabilities, vec!["text.generate".to_string()]);
+    }
+
+    #[test]
+    fn compose_tool_assembly_suppresses_remote_execution_routes_when_placement_risk_elevated() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo"],
+            "effective_rights": ["tool.echo"],
+            "effective_posture": {
+                "placement_risk_level": "elevated",
+                "remote_execution_allowed": false
+            }
+        });
+        let remote_ads = vec![CapabilityAdvertisement {
+            hotel_id: "remote-hotel".into(),
+            node_id: "remote-node".into(),
+            incarnation_id: "remote-hotel:tool-echo".into(),
+            target_role: "tool.echo".into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_latency_capacity".into()),
+            latency_hint_ms: Some(8),
+            max_concurrent_jobs: Some(8),
+            active_jobs: 0,
+            queue_depth: 0,
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &remote_ads, "local-aiua-01");
+
+        assert_eq!(assembly["tools_for_model"][0]["tool_name"], "echo");
+        assert!(
+            assembly["execution_routes"].get("echo").is_none(),
+            "elevated placement risk should suppress remote echo route"
+        );
+    }
+
+    #[test]
+    fn compose_tool_assembly_suppresses_remote_tool_routes_when_right_policy_is_guarded() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo"],
+            "effective_rights": ["tool.echo"],
+            "shared_tool_markers": [{
+                "tool_name": "echo",
+                "class": "utility",
+                "description": "Echo tool from shared catalog.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["remote_safe", "low_agency"]
+            }],
+            "effective_posture": {
+                "placement_risk_level": "guarded",
+                "remote_execution_allowed": true
+            },
+            "effective_right_policy": {
+                "remote_tool_execution": "deny",
+                "remote_component_execution": "allow",
+                "credential_scope": "local_scoped"
+            }
+        });
+        let remote_ads = vec![CapabilityAdvertisement {
+            hotel_id: "remote-hotel".into(),
+            node_id: "remote-node".into(),
+            incarnation_id: "remote-hotel:tool-echo".into(),
+            target_role: "tool.echo".into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_latency_capacity".into()),
+            latency_hint_ms: Some(8),
+            max_concurrent_jobs: Some(8),
+            active_jobs: 0,
+            queue_depth: 0,
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &remote_ads, "local-aiua-01");
+
+        assert_eq!(assembly["tools_for_model"][0]["tool_name"], "echo");
+        assert!(
+            assembly["execution_routes"].get("echo").is_none(),
+            "guarded right policy should suppress remote echo route"
+        );
+        assert_eq!(
+            assembly["policy_annotations"]["echo"]["credential_scope_reflex"],
+            "local_scoped"
+        );
+    }
+
+    #[test]
+    fn compose_tool_assembly_suppresses_remote_route_for_local_only_tool_marker() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["workspace.read"],
+            "effective_rights": ["tool.workspace.read"],
+            "shared_tool_markers": [{
+                "tool_name": "workspace.read",
+                "class": "workspace",
+                "description": "Workspace read tool from shared catalog.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["workspace_bound", "local_only"]
+            }],
+            "effective_posture": {
+                "placement_risk_level": "low",
+                "remote_execution_allowed": true
+            },
+            "effective_right_policy": {
+                "remote_tool_execution": "allow",
+                "remote_component_execution": "allow",
+                "credential_scope": "mesh_scoped"
+            }
+        });
+        let remote_ads = vec![CapabilityAdvertisement {
+            hotel_id: "remote-hotel".into(),
+            node_id: "remote-node".into(),
+            incarnation_id: "remote-hotel:tool-workspace-read".into(),
+            target_role: "tool.workspace.read".into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_latency_capacity".into()),
+            latency_hint_ms: Some(8),
+            max_concurrent_jobs: Some(8),
+            active_jobs: 0,
+            queue_depth: 0,
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &remote_ads, "local-aiua-01");
+
+        assert!(
+            assembly["execution_routes"].get("workspace.read").is_none(),
+            "local_only marker should suppress remote-only workspace route"
+        );
+    }
+
+    #[test]
+    fn compose_tool_assembly_allows_remote_tool_routes_when_right_policy_is_low_risk() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo"],
+            "effective_rights": ["tool.echo"],
+            "effective_posture": {
+                "placement_risk_level": "low",
+                "remote_execution_allowed": true
+            },
+            "effective_right_policy": {
+                "remote_tool_execution": "allow",
+                "remote_component_execution": "allow",
+                "credential_scope": "mesh_scoped"
+            }
+        });
+        let remote_ads = vec![CapabilityAdvertisement {
+            hotel_id: "remote-hotel".into(),
+            node_id: "remote-node".into(),
+            incarnation_id: "remote-hotel:tool-echo".into(),
+            target_role: "tool.echo".into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_latency_capacity".into()),
+            latency_hint_ms: Some(8),
+            max_concurrent_jobs: Some(8),
+            active_jobs: 0,
+            queue_depth: 0,
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &remote_ads, "local-aiua-01");
+
+        assert_eq!(
+            assembly["execution_routes"]["echo"]["target_node"],
+            "remote-node"
+        );
+        assert_eq!(
+            assembly["policy_annotations"]["echo"]["credential_scope_reflex"],
+            "mesh_scoped"
+        );
     }
 
     #[tokio::test]
@@ -8971,9 +16362,15 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
-            .with_registry(registry);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
 
         graph
             .upsert_session(&SessionRecord {
@@ -9091,9 +16488,15 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
-            .with_registry(registry);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
 
         graph
             .upsert_session(&SessionRecord {
@@ -9191,6 +16594,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_snapshot_suppresses_remote_model_route_when_placement_risk_elevated() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "aria-node".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec!["gemini".into()],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "aria-architect-hotel".into(),
+                node_id: "aria-node".into(),
+                incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
+                target_role: "model".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_latency_capacity".into()),
+                latency_hint_ms: Some(8),
+                max_concurrent_jobs: Some(8),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            None,
+        );
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-elevated-risk-model".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "receptor_ingress",
+                        "marker_source": "telegram",
+                        "marker_strength": "weak",
+                        "placement_risk_level": "elevated"
+                    },
+                    "bindings": {
+                        "effective_model_controller": "gemini-flash",
+                        "preferred_hotel_id": "aria-architect-hotel"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-elevated-risk-model".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["effective_posture"]["placement_risk_level"],
+                    "elevated"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_posture"]["remote_execution_allowed"],
+                    false
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_node"],
+                    "local-aiua-01"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["availability_state"],
+                    "materialization_required"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["selection_reason"],
+                    "local_requires_materialization"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn session_snapshot_prefers_local_active_guest_when_model_subscriber_visibility_is_missing()
      {
         let _env_guard = ipc_env_guard();
@@ -9224,9 +16765,15 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
-            .with_registry(registry);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
 
         let mut hotel = crate::default_hotel_record("local");
         hotel.ipc_socket_path = socket_path.clone();
@@ -9323,7 +16870,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -9440,7 +16992,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -9455,6 +17012,8 @@ mod tests {
                 lease_expires_at: None,
                 summary_json: serde_json::json!({
                     "bindings": {
+                        "effective_toolset": ["echo"],
+                        "effective_rights": ["tool.echo"],
                         "allowed_tool_runner_incarnations": [
                             {
                                 "incarnation_id": "tool-runner-remote",
@@ -9479,6 +17038,12 @@ mod tests {
                                 "selection_hint": "local_live_preferred"
                             }
                         ]
+                    }
+                ,
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "remote_component_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
                     }
                 }),
                 created_at: 1,
@@ -9585,7 +17150,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -9601,6 +17171,8 @@ mod tests {
                 summary_json: serde_json::json!({
                     "bindings": {
                         "preferred_environment_id": "env://remote",
+                        "effective_toolset": ["echo"],
+                        "effective_rights": ["tool.echo"],
                         "allowed_tool_runner_incarnations": [
                             {
                                 "incarnation_id": "tool-runner-local",
@@ -9625,6 +17197,11 @@ mod tests {
                                 "selection_hint": "remote_fallback"
                             }
                         ]
+                    },
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "remote_component_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
                     }
                 }),
                 created_at: 1,
@@ -9757,9 +17334,15 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
-            .with_registry(registry);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
 
         graph
             .upsert_session(&SessionRecord {
@@ -9774,7 +17357,13 @@ mod tests {
                 lease_expires_at: None,
                 summary_json: serde_json::json!({
                     "bindings": {
+                        "effective_rights": ["tool.echo"],
                         "effective_toolset": ["echo"]
+                    },
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "remote_component_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
                     }
                 }),
                 created_at: 1,
@@ -9846,7 +17435,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -9891,7 +17485,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -9988,7 +17587,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         for session_id in ["sess-1", "sess-2"] {
             graph
@@ -10135,7 +17739,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10209,7 +17818,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10276,13 +17890,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_task_with_reflex_governance_updates_session_summary_and_event_log() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::UpdateTask {
+                task_id: Uuid::new_v4(),
+                state: "session_reflexes_updated".into(),
+                payload: serde_json::json!({
+                    "session_id": "sess-reflex-events",
+                    "turn_id": "turn-reflex-1",
+                    "chat_id": "123",
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
+                    },
+                    "reflex_evaluations": [{
+                        "reflex_name": "remote_tool_reflex",
+                        "decision": "operator_override",
+                        "reason": "trusted operator session"
+                    }]
+                }),
+            })
+            .await
+            .expect("update task should succeed");
+
+        let session = graph
+            .get_session("sess-reflex-events")
+            .expect("session lookup should work")
+            .expect("session should exist");
+        assert_eq!(
+            session.summary_json["reflex_overrides"]["remote_tool_reflex"],
+            "allow"
+        );
+        assert_eq!(
+            session.summary_json["reflex_evaluations"][0]["decision"],
+            "operator_override"
+        );
+
+        let events = graph
+            .list_session_events("sess-reflex-events", 20)
+            .expect("event listing should work");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "reflex_overrides_updated")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "reflex_evaluations_recorded")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn update_task_with_session_status_and_bindings_updates_session_summary_and_event_log() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10363,13 +18072,1375 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_task_with_reflex_policy_records_updates_session_summary_and_event_log() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-reflex-policy-events".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::UpdateTask {
+                task_id: Uuid::new_v4(),
+                state: "session_reflex_policy_updated".into(),
+                payload: serde_json::json!({
+                    "session_id": "sess-reflex-policy-events",
+                    "turn_id": "turn-reflex-policy-1",
+                    "chat_id": "123",
+                    "reflex_policy_records": [{
+                        "policy_scope": "session_override",
+                        "policy_source": "operator_override",
+                        "precedence": 90,
+                        "reason": "trusted operator session",
+                        "reflexes": {
+                            "remote_tool_reflex": "allow",
+                            "credential_scope_reflex": "mesh_scoped"
+                        }
+                    }]
+                }),
+            })
+            .await
+            .expect("update task should succeed");
+
+        let session = graph
+            .get_session("sess-reflex-policy-events")
+            .expect("session lookup should work")
+            .expect("session should exist");
+        assert_eq!(
+            session.summary_json["reflex_policy_records"][0]["policy_scope"],
+            "session_override"
+        );
+        assert_eq!(
+            session.summary_json["reflex_policy_records"][0]["reflexes"]["remote_tool_reflex"],
+            "allow"
+        );
+
+        let events = graph
+            .list_session_events("sess-reflex-policy-events", 20)
+            .expect("event listing should work");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "reflex_policy_records_updated")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_projects_hotel_default_reflex_policy_from_bindings() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-reflex-hotel-defaults".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "reflex_policy_defaults": [{
+                            "policy_source": "hotel_profile",
+                            "reason": "remote tools stay damped by default",
+                            "reflexes": {
+                                "remote_tool_reflex": "deny",
+                                "remote_component_reflex": "deny"
+                            }
+                        }]
+                    },
+                    "agent_runtime_provenance": {
+                        "marker_kind": "role_handoff",
+                        "marker_source": "handoff_bundle",
+                        "marker_strength": "strong",
+                        "placement_risk_level": "low"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-reflex-hotel-defaults".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["policy_scope"],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["policy_source"],
+                    "hotel_profile"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["origin_class"],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_component_reflex"],
+                    "deny"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_projects_agent_learned_reflex_policy_from_agent_graph() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-learned-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_reflex_preference(&AgentReflexPreference {
+                agent_id: agent_id.into(),
+                preference_key: "operator-mesh-trust".into(),
+                precedence: 72,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({"reason": "learned trust from prior approved sessions"}),
+                updated_at: 0,
+            })
+            .expect("seed reflex preference");
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-agent-learned-reflex".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some(agent_id.into()),
+                active_incarnation_id: Some("agent-learned:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
+                    },
+                    "bindings": {
+                        "reflex_policy_defaults": [{
+                            "policy_source": "hotel_profile",
+                            "reflexes": {
+                                "remote_component_reflex": "deny"
+                            }
+                        }]
+                    }
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-agent-learned-reflex".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["origin_class"],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][2]["origin_class"],
+                    "agent_learned"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["reflex_policy_agent_layers"][0]["config"]["reason"],
+                    "learned trust from prior approved sessions"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_component_reflex"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["credential_scope_reflex"],
+                    "mesh_scoped"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_projects_shared_model_markers_from_graph() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_abstract_model(&ansible_mesh_core::graph::AbstractModelRecord {
+                model_ref: "gemini-3.1-flash".into(),
+                provider_hint: "gemini".into(),
+                description: "Fast cognitive model marker.".into(),
+                capability_markers: vec!["text.generate".into()],
+                endpoint_stem: Some("google.generativeai".into()),
+                speed_marker: 90,
+                thinking_marker: 72,
+                tool_use_marker: 84,
+                audio_native_marker: 20,
+            })
+            .expect("seed abstract model");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-shared-model-markers".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane-01:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-shared-model-markers".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["shared_model_markers"][0]["model_ref"],
+                    "gemini-3.1-flash"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["shared_model_markers"][0]["provider_hint"],
+                    "gemini"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_projects_shared_tool_and_skill_markers_from_graph() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_abstract_tool(&ansible_mesh_core::graph::AbstractToolRecord {
+                tool_name: "agent.configure".into(),
+                description: "Agent configure tool from shared catalog.".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                class: "config".into(),
+                tool_markers: vec!["high_agency".into(), "local_only".into()],
+            })
+            .expect("seed abstract tool");
+        graph
+            .upsert_abstract_skill(&ansible_mesh_core::graph::AbstractSkillRecord {
+                skill_name: "routing.refinement".into(),
+                description: "Routing refinement skill from shared catalog.".into(),
+                implied_tools: vec!["routing.policy.propose".into()],
+                skill_markers: vec!["adaptive".into(), "governed".into()],
+                ..Default::default()
+            })
+            .expect("seed abstract skill");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-shared-tool-skill-markers".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane-01:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-shared-tool-skill-markers".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["shared_tool_markers"][0]["tool_name"],
+                    "agent.configure"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["shared_skill_markers"][0]["skill_name"],
+                    "routing.refinement"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_reflex_preference_persists_into_agent_graph() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-reflex-writeback-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::UpsertAgentReflexPreference {
+                agent_id: agent_id.into(),
+                preference_key: "operator-mesh-trust".into(),
+                precedence: 77,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({
+                    "reason": "approved routing.policy.propose write-back"
+                }),
+            })
+            .await
+            .expect("write-back request");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        let pref = storage
+            .get_reflex_preference("operator-mesh-trust")
+            .expect("read reflex pref")
+            .expect("stored reflex pref");
+        assert_eq!(pref.precedence, 77);
+        assert_eq!(pref.reflexes_json["remote_tool_reflex"], "allow");
+        assert_eq!(
+            pref.config_json["reason"],
+            "approved routing.policy.propose write-back"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn record_role_handoff_reflex_evidence_accumulates_success_count() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-role-reflex-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "codex".into(),
+                allowed_tools: vec!["workspace.read".into()],
+                allowed_classes: vec!["workflow".into()],
+                allowed_skills: vec!["handoff.back".into()],
+                description: Some("Implementation-focused role lens.".into()),
+            })
+            .expect("toolset profile should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: agent_id.into(),
+                role_name: "developer".into(),
+                guest_id: format!("{agent_id}:developer"),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: Some("Focus on implementation and code changes.".into()),
+                role_manifest: Some(
+                    "Use the developer role lens to focus on implementation, code changes, and debugging."
+                        .into(),
+                ),
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("role incarnation should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        for turn_id in ["turn-1", "turn-2"] {
+            let response = client
+                .send_request(IpcRequest::RecordRoleHandoffReflexEvidence {
+                    agent_id: agent_id.into(),
+                    role_name: "developer".into(),
+                    legacy_trigger_class: Some("implementation".into()),
+                    source_turn: Some(turn_id.into()),
+                })
+                .await
+                .expect("role reflex evidence request");
+            assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+        }
+
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        let pref = storage
+            .get_reflex_preference("same-self-role-handoff:developer")
+            .expect("read reflex pref")
+            .expect("stored role reflex pref");
+        assert_eq!(pref.config_json["success_count"], 2);
+        assert_eq!(pref.config_json["habit_state"], "reinforced");
+        assert_eq!(pref.config_json["toolset_profile"], "codex");
+        assert_eq!(pref.config_json["allowed_skills"][0], "handoff.back");
+        assert!(
+            pref.config_json["manifest_markers"]
+                .as_array()
+                .expect("manifest markers array")
+                .iter()
+                .any(|item| item == "implementation")
+        );
+        assert!(
+            pref.config_json["toolset_markers"]
+                .as_array()
+                .expect("toolset markers array")
+                .iter()
+                .any(|item| item == "codex")
+        );
+        assert_eq!(
+            pref.config_json["role_identity_addendum"],
+            "Focus on implementation and code changes."
+        );
+        assert_eq!(
+            pref.reflexes_json["role_handoff_reflex"]["trigger_class"],
+            "implementation"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_rewards_approved_agent_learned_reflex_policy() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-learned-approved-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_reflex_preference(&AgentReflexPreference {
+                agent_id: agent_id.into(),
+                preference_key: "operator-mesh-trust".into(),
+                precedence: 72,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({"reason": "learned trust from prior approved sessions"}),
+                updated_at: 0,
+            })
+            .expect("seed reflex preference");
+
+        graph
+            .upsert_routing_policy(&ansible_mesh_core::graph::RoutingPolicyRecord {
+                proposal_id: "routing-policy-approve-01".into(),
+                agent_id: agent_id.into(),
+                problem: "Approved remote tool trust after review.".into(),
+                proposed_change: "Reinforce the learned remote-tool trust reflex.".into(),
+                evidence: "Operator confirmed sustained safe usage.".into(),
+                affected_stage: Some("cognition".into()),
+                affected_capability: Some("text.generate".into()),
+                learned_reflex_preference_key: Some("operator-mesh-trust".into()),
+                operator_disposition: ansible_mesh_core::graph::RoutingPolicyDispositionRecord {
+                    state: "approved".into(),
+                    reason: "Approved after operator review.".into(),
+                    decided_at: 99,
+                },
+                evaluations: vec![ansible_mesh_core::graph::RoutingPolicyEvaluationRecord {
+                    evaluation_kind: "operator_disposition".into(),
+                    decision: "approved".into(),
+                    reason: "Approved after operator review.".into(),
+                    created_at: 99,
+                    source_tool: Some("philotic-web".into()),
+                }],
+                created_at: 98,
+            })
+            .expect("seed routing policy");
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-agent-learned-reflex-approved".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some(agent_id.into()),
+                active_incarnation_id: Some("agent-learned:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-agent-learned-reflex-approved".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                let rewarded_layer = &snapshot["bindings"]["reflex_policy_agent_layers"][0];
+                assert_eq!(rewarded_layer["precedence"], 77);
+                assert_eq!(rewarded_layer["regulatory_system"], "reward");
+                assert_eq!(
+                    snapshot["bindings"]["reflex_policy_agent_rewards"][0]["preference_key"],
+                    "operator-mesh-trust"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["reflex_policy_agent_rewards"][0]["routing_policy"]["state"],
+                    "approved"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "allow"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_suppresses_rejected_agent_learned_reflex_policy() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-learned-rejected-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_reflex_preference(&AgentReflexPreference {
+                agent_id: agent_id.into(),
+                preference_key: "operator-mesh-trust".into(),
+                precedence: 72,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({"reason": "learned trust from prior approved sessions"}),
+                updated_at: 0,
+            })
+            .expect("seed reflex preference");
+
+        graph
+            .upsert_routing_policy(&ansible_mesh_core::graph::RoutingPolicyRecord {
+                proposal_id: "routing-policy-reject-01".into(),
+                agent_id: agent_id.into(),
+                problem: "Remote tool reach proved unsafe under review.".into(),
+                proposed_change: "Reject the learned remote-tool trust reflex.".into(),
+                evidence: "Operator observed unsafe reach expansion.".into(),
+                affected_stage: Some("cognition".into()),
+                affected_capability: Some("text.generate".into()),
+                learned_reflex_preference_key: Some("operator-mesh-trust".into()),
+                operator_disposition: ansible_mesh_core::graph::RoutingPolicyDispositionRecord {
+                    state: "rejected".into(),
+                    reason: "Rejected after operator review.".into(),
+                    decided_at: 99,
+                },
+                evaluations: vec![ansible_mesh_core::graph::RoutingPolicyEvaluationRecord {
+                    evaluation_kind: "operator_disposition".into(),
+                    decision: "rejected".into(),
+                    reason: "Rejected after operator review.".into(),
+                    created_at: 99,
+                    source_tool: Some("philotic-web".into()),
+                }],
+                created_at: 98,
+            })
+            .expect("seed routing policy");
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-agent-learned-reflex-rejected".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some(agent_id.into()),
+                active_incarnation_id: Some("agent-learned:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-agent-learned-reflex-rejected".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                let layers = snapshot["bindings"]["effective_reflex_policy"]["layers"]
+                    .as_array()
+                    .expect("layers array");
+                assert!(!layers.iter().any(|layer| {
+                    layer["origin_class"] == serde_json::json!("agent_learned")
+                        && layer["preference_key"] == serde_json::json!("operator-mesh-trust")
+                }));
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["reflex_policy_agent_suppressions"][0]["preference_key"],
+                    "operator-mesh-trust"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["reflex_policy_agent_suppressions"][0]["routing_policy"]["state"],
+                    "rejected"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn record_routing_policy_proposal_persists_specific_record_with_history() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                agent_id: "agent-routing-01".into(),
+                problem: "Weak receptor ingress keeps surfacing remote tool temptations.".into(),
+                proposed_change:
+                    "Deny remote tool reflex during receptor ingress until cognition owns the turn."
+                        .into(),
+                evidence: "Observed low-intent voice turns asking for remote tool execution."
+                    .into(),
+                affected_stage: Some("ingress".into()),
+                affected_capability: Some("voice.transcribe".into()),
+                learned_reflex_preference_key: Some("operator-mesh-trust".into()),
+            })
+            .await
+            .expect("record request");
+
+        let proposal_id = match response {
+            IpcResponse::RoutingPolicyRecorded { proposal_id } => proposal_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let stored = graph
+            .get_routing_policy(&proposal_id)
+            .expect("graph read")
+            .expect("stored proposal");
+        assert_eq!(stored.agent_id, "agent-routing-01");
+        assert_eq!(stored.operator_disposition.state, "approved");
+        assert_eq!(stored.evaluations.len(), 1);
+        assert_eq!(
+            stored.evaluations[0].evaluation_kind,
+            "operator_disposition"
+        );
+        assert_eq!(
+            stored.learned_reflex_preference_key.as_deref(),
+            Some("operator-mesh-trust")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn append_routing_policy_evaluation_updates_durable_history() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let proposal_id = match client
+            .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                agent_id: "agent-routing-01".into(),
+                problem: "Remote model routes are too eager during guarded posture.".into(),
+                proposed_change: "Keep component reflex but dampen remote tools.".into(),
+                evidence: "Observed guarded sessions still seeing remote tool temptations.".into(),
+                affected_stage: Some("cognition".into()),
+                affected_capability: Some("text.generate".into()),
+                learned_reflex_preference_key: Some("guarded-remote-tool-dampening".into()),
+            })
+            .await
+            .expect("record request")
+        {
+            IpcResponse::RoutingPolicyRecorded { proposal_id } => proposal_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let append_response = client
+            .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                proposal_id: proposal_id.clone(),
+                evaluation_kind: "learned_reflex_writeback".into(),
+                decision: "approved_writeback".into(),
+                reason: "Learned reflex was persisted into the agent graph.".into(),
+                source_tool: Some("routing.policy.propose".into()),
+            })
+            .await
+            .expect("append request");
+
+        assert!(matches!(
+            append_response,
+            IpcResponse::Standard { ok: true, .. }
+        ));
+
+        let stored = graph
+            .get_routing_policy(&proposal_id)
+            .expect("graph read")
+            .expect("stored proposal");
+        assert_eq!(stored.evaluations.len(), 2);
+        assert_eq!(
+            stored.evaluations[1].evaluation_kind,
+            "learned_reflex_writeback"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_routing_policy_disposition_updates_operator_state_and_history() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let proposal_id = match client
+            .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                agent_id: "agent-routing-01".into(),
+                problem: "Remote model routes are too eager during guarded posture.".into(),
+                proposed_change: "Keep component reflex but dampen remote tools.".into(),
+                evidence: "Observed guarded sessions still seeing remote tool temptations.".into(),
+                affected_stage: Some("cognition".into()),
+                affected_capability: Some("text.generate".into()),
+                learned_reflex_preference_key: Some("guarded-remote-tool-dampening".into()),
+            })
+            .await
+            .expect("record request")
+        {
+            IpcResponse::RoutingPolicyRecorded { proposal_id } => proposal_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let response = client
+            .send_request(IpcRequest::SetRoutingPolicyDisposition {
+                proposal_id: proposal_id.clone(),
+                state: "rejected".into(),
+                reason: "Operator rejected after later review.".into(),
+                source_tool: Some("philotic-web".into()),
+            })
+            .await
+            .expect("disposition request");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let stored = graph
+            .get_routing_policy(&proposal_id)
+            .expect("graph read")
+            .expect("stored proposal");
+        assert_eq!(stored.operator_disposition.state, "rejected");
+        assert_eq!(stored.evaluations.len(), 2);
+        assert_eq!(stored.evaluations[1].decision, "rejected");
+        assert_eq!(
+            stored.evaluations[1].source_tool.as_deref(),
+            Some("philotic-web")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_routing_policies_returns_agent_scoped_records() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        for agent_id in ["agent-routing-01", "agent-routing-01", "agent-routing-02"] {
+            let _ = client
+                .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                    agent_id: agent_id.into(),
+                    problem: "Observed routing issue.".into(),
+                    proposed_change: "Change routing reflex.".into(),
+                    evidence: "Repeated operator correction.".into(),
+                    affected_stage: Some("cognition".into()),
+                    affected_capability: Some("text.generate".into()),
+                    learned_reflex_preference_key: None,
+                })
+                .await
+                .expect("record request");
+        }
+
+        let response = client
+            .send_request(IpcRequest::ListRoutingPolicies {
+                agent_id: "agent-routing-01".into(),
+            })
+            .await
+            .expect("list request");
+
+        let policies = match response {
+            IpcResponse::RoutingPolicyList { policies } => policies,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(policies.len(), 2);
+        assert!(
+            policies
+                .iter()
+                .all(|policy| policy["agent_id"] == serde_json::json!("agent-routing-01"))
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn e2e_session_round_trip_persists_and_delivers_reply() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10619,7 +19690,12 @@ mod tests {
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10902,6 +19978,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11018,6 +20095,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11099,6 +20177,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11176,6 +20255,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11263,6 +20343,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11357,6 +20438,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11457,6 +20539,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -11481,7 +20564,12 @@ mod tests {
                 }],
             )
             .expect("seed membrane guest");
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -11556,6 +20644,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -11664,6 +20753,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -11742,6 +20832,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -11848,6 +20939,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -11909,6 +21001,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12000,6 +21093,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12089,6 +21183,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -12117,6 +21212,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 0,
             }),
+            None,
         );
         registry.write().await.update_node(
             NodeCapabilities {
@@ -12143,6 +21239,7 @@ mod tests {
                 host: "remote.mesh".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -12225,6 +21322,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12242,6 +21340,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: "/tmp/remote-aiua.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -12270,6 +21369,7 @@ mod tests {
                 host: "remote.mesh".into(),
                 port: 9102,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -12355,6 +21455,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12386,6 +21487,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: "/tmp/remote-aiua.sock".into(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -12414,6 +21516,7 @@ mod tests {
                 host: "remote.mesh".into(),
                 port: 9102,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -12491,6 +21594,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         graph
@@ -12543,6 +21647,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 0,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -12642,6 +21747,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -12817,6 +21923,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: local_socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed local hotel");
         local_graph
@@ -12834,6 +21941,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: remote_socket_path.clone(),
                 active_pid: None,
+                mesh_host: None,
             })
             .expect("seed remote hotel");
         let local_registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -12862,6 +21970,7 @@ mod tests {
                 host: "remote.mesh".into(),
                 port: 9102,
             }),
+            None,
         );
 
         let remote_graph_store =
@@ -12882,6 +21991,7 @@ mod tests {
                 execution_port: 9102,
                 ipc_socket_path: remote_socket_path.clone(),
                 active_pid: Some(std::process::id().to_string()),
+                mesh_host: None,
             })
             .expect("seed remote hotel");
 
@@ -12900,10 +22010,16 @@ mod tests {
         );
 
         let local_server_task = tokio::spawn(async move {
-            local_server.run().await.expect("local ipc server should run");
+            local_server
+                .run()
+                .await
+                .expect("local ipc server should run");
         });
         let remote_server_task = tokio::spawn(async move {
-            remote_server.run().await.expect("remote ipc server should run");
+            remote_server
+                .run()
+                .await
+                .expect("remote ipc server should run");
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -13012,7 +22128,10 @@ mod tests {
         .expect("remote agent connect");
 
         let remote_agent_task = tokio::spawn(async move {
-            let inbound = remote_agent.recv_task().await.expect("remote agent recv task");
+            let inbound = remote_agent
+                .recv_task()
+                .await
+                .expect("remote agent recv task");
             let IpcResponse::InboundTask { task_json, .. } = inbound else {
                 panic!("unexpected inbound response to remote agent");
             };
@@ -13125,7 +22244,26 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _) = mpsc::channel(8);
-        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -13168,6 +22306,200 @@ mod tests {
             IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
             other => panic!("expected ConfigureRoleOk, got {:?}", other),
         }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_role_create_workflow_persists_config_successfully() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ExecuteWorkflow {
+                workflow_name: "role.create_or_update".into(),
+                agent_id: "agent-jane-01".into(),
+                calling_role: "orchestrator".into(),
+                arguments: serde_json::json!({
+                    "role_name": "developer",
+                    "toolset_profile": "developer",
+                    "role_identity_addendum": "Addendum",
+                    "inactive_ttl_seconds": 60,
+                    "iteration_cap": 10,
+                    "approval_policy": "auto",
+                    "model_profile": "fast",
+                    "context_window_policy": "standard",
+                    "reasoning": {
+                        "purpose": "Focused implementation role.",
+                        "toolset_rationale": "Use developer posture.",
+                        "handoff_posture_and_limits": "Return when done."
+                    }
+                }),
+            })
+            .await
+            .expect("workflow request");
+
+        match resp {
+            IpcResponse::WorkflowExecutionOk {
+                workflow_name,
+                result,
+            } => {
+                assert_eq!(workflow_name, "role.create_or_update");
+                assert_eq!(result["role_name"].as_str(), Some("developer"));
+            }
+            other => panic!("expected WorkflowExecutionOk, got {:?}", other),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_role_eagerly_materializes_new_role_worker() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester.clone());
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane:developer".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: Some("Addendum".into()),
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: Some(60),
+                iteration_cap: Some(10),
+                approval_policy: Some("auto".into()),
+                model_profile: Some("fast".into()),
+                context_window_policy: Some("standard".into()),
+            })
+            .await
+            .expect("configure request");
+
+        match resp {
+            IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
+            other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        assert_eq!(requester.calls.load(Ordering::SeqCst), 2);
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "developer")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(role.guest_id, "agent-jane:developer");
+        assert!(matches!(
+            role.readiness_state,
+            RoleReadinessState::Materializing
+                | RoleReadinessState::Materialized
+                | RoleReadinessState::Routable
+        ));
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -13234,6 +22566,248 @@ mod tests {
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
         }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    // ── Reflex E2E: membrane binding injection ────────────────────────────────
+
+    // NOTE: IpcResponse is #[serde(untagged)] and TelegramPollLease / DiscordGatewayLease
+    // share identical field shapes {granted, lease}, so serde always deserializes the
+    // Discord response as TelegramPollLease. Distinguish via LeaseEnvelope.lease_type instead.
+    fn expect_discord_gateway_lease(response: IpcResponse) -> (bool, Option<LeaseEnvelope>) {
+        match response {
+            IpcResponse::DiscordGatewayLease { granted, lease } => (granted, lease),
+            // Untagged serde ambiguity: TelegramPollLease matches the same shape —
+            // accept it and verify the inner lease_type is correct.
+            IpcResponse::TelegramPollLease { granted, lease } => {
+                if let Some(ref l) = lease {
+                    assert_eq!(l.lease_type, "discord_gateway",
+                        "received TelegramPollLease but inner lease_type was '{}', not 'discord_gateway'",
+                        l.lease_type);
+                }
+                (granted, lease)
+            }
+            other => panic!("unexpected discord gateway lease response: {other:?}"),
+        }
+    }
+
+    fn expect_config_data(response: IpcResponse) -> Option<serde_json::Value> {
+        match response {
+            IpcResponse::ConfigData { value_json, .. } => {
+                value_json.as_deref().map(|s| serde_json::from_str(s).expect("config data must be valid JSON"))
+            }
+            other => panic!("expected ConfigData, got: {other:?}"),
+        }
+    }
+
+    fn make_hotel_graph(socket_path: &str, agent_id: &str) -> Arc<GraphDomain> {
+        use ansible_mesh_core::storage::AgentIdentityRecord;
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.to_string(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Jane".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+    }
+
+    /// Scenario 1 — AcquireTelegramPollLease injects `kind: "telegram"` into
+    /// the agent's bundle reflex_context.membrane_bindings.
+    #[tokio::test]
+    async fn telegram_lease_injects_membrane_binding() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _rx) = mpsc::channel(16);
+        let graph = make_hotel_graph(&socket_path, "agent-jane-01");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-telegram-01".into(),
+            role: "membrane".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("connect membrane");
+
+        // Acquire lease — must be granted.
+        let lease_resp = membrane
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:bot_token:deadbeef".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("lease request");
+        let (granted, _) = expect_telegram_poll_lease(lease_resp);
+        assert!(granted, "first acquire must be granted");
+
+        // Fetch the agent bundle and assert the binding was injected.
+        let bundle_resp = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config");
+        let bundle = expect_config_data(bundle_resp).expect("bundle must be present");
+        let bindings = bundle
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("reflex_context.membrane_bindings must be present");
+
+        assert_eq!(bindings.len(), 1, "exactly one binding after one lease grant");
+        assert_eq!(
+            bindings[0].get("kind").and_then(|k| k.as_str()),
+            Some("telegram"),
+            "binding kind must be 'telegram'"
+        );
+
+        // Re-acquire (idempotent) — binding count must stay at 1.
+        let lease_resp2 = membrane
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:bot_token:deadbeef".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("re-acquire lease");
+        let (granted2, _) = expect_telegram_poll_lease(lease_resp2);
+        assert!(granted2, "re-acquire by same owner must succeed");
+
+        let bundle_resp2 = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config after re-acquire");
+        let bundle2 = expect_config_data(bundle_resp2).expect("bundle");
+        let bindings2 = bundle2
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("bindings after re-acquire");
+        assert_eq!(
+            bindings2.len(), 1,
+            "idempotent re-acquire must not duplicate binding (got: {bindings2:?})"
+        );
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Scenario 2 — AcquireDiscordGatewayLease injects `kind: "discord_text"` into
+    /// the agent's bundle reflex_context.membrane_bindings.
+    #[tokio::test]
+    async fn discord_lease_injects_membrane_binding() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _rx) = mpsc::channel(16);
+        let graph = make_hotel_graph(&socket_path, "agent-jane-01");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-discord-01".into(),
+            role: "membrane".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("connect membrane");
+
+        // Acquire Discord gateway lease.
+        let lease_resp = membrane
+            .send_request(IpcRequest::AcquireDiscordGatewayLease {
+                lease_key: "discord:bot_token:cafebabe".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("discord lease request");
+        let (granted, _) = expect_discord_gateway_lease(lease_resp);
+        assert!(granted, "first discord acquire must be granted");
+
+        // Fetch bundle and assert discord_text binding.
+        let bundle_resp = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config");
+        let bundle = expect_config_data(bundle_resp).expect("bundle must be present");
+        let bindings = bundle
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("reflex_context.membrane_bindings must be present");
+
+        assert_eq!(bindings.len(), 1, "exactly one binding after discord lease grant");
+        assert_eq!(
+            bindings[0].get("kind").and_then(|k| k.as_str()),
+            Some("discord_text"),
+            "binding kind must be 'discord_text'"
+        );
+
+        // Re-acquire — idempotent, no duplicate.
+        let lease_resp2 = membrane
+            .send_request(IpcRequest::AcquireDiscordGatewayLease {
+                lease_key: "discord:bot_token:cafebabe".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("re-acquire discord lease");
+        let (granted2, _) = expect_discord_gateway_lease(lease_resp2);
+        assert!(granted2);
+
+        let bundle_resp2 = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config after re-acquire");
+        let bundle2 = expect_config_data(bundle_resp2).expect("bundle");
+        let bindings2 = bundle2
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("bindings after re-acquire");
+        assert_eq!(
+            bindings2.len(), 1,
+            "idempotent re-acquire must not duplicate discord binding (got: {bindings2:?})"
+        );
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {

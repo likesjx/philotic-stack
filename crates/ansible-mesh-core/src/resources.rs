@@ -25,6 +25,8 @@ pub enum ResourceType {
     AgentGraph,
     /// Router observability listener (training-tap subscriber).
     RouterListener,
+    /// MCP protocol membrane (HTTP JSON-RPC gateway for external tool callers).
+    McpMembrane,
 }
 
 /// A static resource declaration stored on an agent identity record.

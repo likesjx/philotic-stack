@@ -1,35 +1,35 @@
 ---
-title: "External Agent And Event Membranes Proposal"
+title: External Agent And Event Membranes Proposal
 doc_type: proposal
 domain: membrane-transport
 status: proposed
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - membrane
-  - a2a
-  - nostr
-  - security
-  - perimeter
+- membrane
+- a2a
+- nostr
+- security
+- perimeter
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - MEMBRANE_COMPONENT_PROPOSAL.md
-  - TELEGRAM_INTEGRATION_PROPOSAL.md
-  - HOTEL_PERIMETER_TRUST_PROPOSAL.md
-  - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- MEMBRANE_COMPONENT_PROPOSAL.md
+- TELEGRAM_INTEGRATION_PROPOSAL.md
+- HOTEL_PERIMETER_TRUST_PROPOSAL.md
+- PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: external-agent-event-membranes
 implements: []
 implemented_by: []
 active_seams:
-  - a2a-membrane-contract
-  - nostr-membrane-contract
-  - transport-edge-trust-gates
-  - membrane-sentinel-checks
+- a2a-membrane-contract
+- nostr-membrane-contract
+- transport-edge-trust-gates
+- membrane-sentinel-checks
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # External Agent And Event Membranes Proposal

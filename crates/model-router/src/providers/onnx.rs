@@ -1,8 +1,10 @@
-use crate::controller::{ControllerTask, ModelProvider, ProviderOutput, TaskKind};
+use crate::controller::{AudioArtifact, ControllerTask, ModelProvider, ProviderOutput, TaskKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use media_prep::transcode_to_wav_16k;
 use onnx_runner::{
-    EmbeddingsBackend, EmbeddingsConfig, ModelCache, TranscribeConfig, WhisperBackend,
+    EmbeddingsBackend, EmbeddingsConfig, KokoroBackend, KokoroConfig, ModelCache, TranscribeConfig,
+    WhisperBackend,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -13,6 +15,7 @@ use tracing::info;
 pub struct OnnxProviderConfig {
     pub embeddings: EmbeddingsConfig,
     pub transcribe: TranscribeConfig,
+    pub kokoro: KokoroConfig,
     /// Prefer quantized ONNX variants when available.
     pub prefer_quantized: bool,
 }
@@ -22,6 +25,7 @@ impl Default for OnnxProviderConfig {
         Self {
             embeddings: EmbeddingsConfig::default(),
             transcribe: TranscribeConfig::default(),
+            kokoro: KokoroConfig::default(),
             prefer_quantized: true,
         }
     }
@@ -29,10 +33,14 @@ impl Default for OnnxProviderConfig {
 
 /// ModelProvider implementation backed by local ONNX inference via `onnx-runner`.
 ///
-/// Supports `TaskKind::Embed` (Slice 1) and `TaskKind::AudioTranscribe` (Slice 2).
+/// Supports:
+/// - `TaskKind::Embed`            (embeddings)
+/// - `TaskKind::AudioTranscribe`  (Whisper)
+/// - `TaskKind::VoiceSynthesize`  (Kokoro TTS)
 pub struct OnnxProvider {
     embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>,
     whisper: Arc<RwLock<Option<WhisperBackend>>>,
+    kokoro: Arc<RwLock<Option<KokoroBackend>>>,
     config: OnnxProviderConfig,
     http_client: reqwest::Client,
 }
@@ -44,34 +52,52 @@ impl OnnxProvider {
         let cache = ModelCache::new().context("failed to initialise HF Hub model cache")?;
 
         // ── Embeddings ──────────────────────────────────────────────────────
-        let emb_handle = cache
+        let emb_backend = cache
             .pull(&config.embeddings.repo_id, config.prefer_quantized)
-            .with_context(|| {
-                format!(
-                    "failed to pull embedding model {}",
-                    config.embeddings.repo_id
-                )
-            })?;
-        let emb_backend = EmbeddingsBackend::load(&emb_handle, config.embeddings.max_seq_len)
-            .context("failed to load EmbeddingsBackend")?;
-        info!(model_gen = %emb_backend.model_gen(), "OnnxProvider embeddings loaded");
+            .and_then(|h| EmbeddingsBackend::load(&h, config.embeddings.max_seq_len))
+            .map(|b| { info!(model_gen = %b.model_gen(), "OnnxProvider embeddings loaded"); b })
+            .map_err(|e| tracing::warn!(err = %e, "EmbeddingsBackend failed to load — Embed will be unavailable"))
+            .ok();
 
         // ── Whisper ─────────────────────────────────────────────────────────
-        let whisper_handle = cache
+        let whisper_backend = cache
             .pull_whisper(&config.transcribe.repo_id, config.prefer_quantized)
-            .with_context(|| {
-                format!(
-                    "failed to pull Whisper model {}",
-                    config.transcribe.repo_id
-                )
-            })?;
-        let whisper_backend = WhisperBackend::load(&whisper_handle, &config.transcribe)
-            .context("failed to load WhisperBackend")?;
-        info!(model_gen = %whisper_backend.model_gen(), "OnnxProvider Whisper loaded");
+            .and_then(|h| WhisperBackend::load(&h, &config.transcribe))
+            .map(|b| { info!(model_gen = %b.model_gen(), "OnnxProvider Whisper loaded"); b })
+            .map_err(|e| tracing::warn!(err = %e, "WhisperBackend failed to load — AudioTranscribe will be unavailable"))
+            .ok();
+
+        // ── Kokoro TTS ──────────────────────────────────────────────────────
+        let kokoro_voices: Vec<&str> = {
+            let mut v = vec![config.kokoro.default_voice.as_str()];
+            v.extend(config.kokoro.extra_voices.iter().map(|s| s.as_str()));
+            v
+        };
+        let kokoro_backend = match cache.pull_kokoro(
+            &config.kokoro.repo_id,
+            config.prefer_quantized,
+            &kokoro_voices,
+        ) {
+            Ok(handle) => match KokoroBackend::load(&handle, &config.kokoro) {
+                Ok(b) => {
+                    info!(model_gen = %b.model_gen(), "OnnxProvider Kokoro TTS loaded");
+                    Some(b)
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "KokoroBackend failed to load — VoiceSynthesize will be unavailable");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(err = %e, "Kokoro model pull failed — VoiceSynthesize will be unavailable");
+                None
+            }
+        };
 
         Ok(Self {
-            embeddings: Arc::new(RwLock::new(Some(emb_backend))),
-            whisper: Arc::new(RwLock::new(Some(whisper_backend))),
+            embeddings: Arc::new(RwLock::new(emb_backend)),
+            whisper: Arc::new(RwLock::new(whisper_backend)),
+            kokoro: Arc::new(RwLock::new(kokoro_backend)),
             config,
             http_client: reqwest::Client::new(),
         })
@@ -86,6 +112,11 @@ impl OnnxProvider {
     /// Returns the shared Whisper backend handle for the HTTP sidecar.
     pub fn shared_whisper(&self) -> Arc<RwLock<Option<WhisperBackend>>> {
         Arc::clone(&self.whisper)
+    }
+
+    /// Returns the shared Kokoro backend handle.
+    pub fn shared_kokoro(&self) -> Arc<RwLock<Option<KokoroBackend>>> {
+        Arc::clone(&self.kokoro)
     }
 
     /// Hot-swap the embedding model. Downloads the new revision and replaces
@@ -108,7 +139,10 @@ impl ModelProvider for OnnxProvider {
     }
 
     fn supports(&self, task: &ControllerTask) -> bool {
-        matches!(task.kind, TaskKind::Embed | TaskKind::AudioTranscribe)
+        matches!(
+            task.kind,
+            TaskKind::Embed | TaskKind::AudioTranscribe | TaskKind::VoiceSynthesize
+        )
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
@@ -166,10 +200,21 @@ impl ModelProvider for OnnxProvider {
                     );
                 }
 
-                let wav_bytes = response
+                let raw_bytes = response
                     .bytes()
                     .await
-                    .context("failed to read audio response body")?;
+                    .context("failed to read audio response body")?
+                    .to_vec();
+
+                // Telegram voice memos arrive as OGG; transcode to 16 kHz mono
+                // WAV so WhisperBackend::decode_wav can parse them.
+                let mime = attachment.mime_type.as_deref().unwrap_or("audio/ogg");
+                let wav_bytes_owned =
+                    transcode_to_wav_16k(raw_bytes, mime, "ffmpeg")
+                        .await
+                        .with_context(|| {
+                            format!("transcode [{mime}] audio attachment for Whisper")
+                        })?;
 
                 // Run Whisper in a blocking task to avoid blocking the async executor.
                 let guard = self.whisper.read().await;
@@ -180,7 +225,6 @@ impl ModelProvider for OnnxProvider {
                 // so the closure can cross the `spawn_blocking` boundary without
                 // forcing `Send` on the backend itself.
                 let backend_ptr = backend as *const WhisperBackend as usize;
-                let wav_bytes_owned = wav_bytes.to_vec();
 
                 let output = tokio::task::spawn_blocking(move || {
                     // SAFETY: the RwLock read guard is held for the full duration
@@ -202,7 +246,49 @@ impl ModelProvider for OnnxProvider {
                     memory_concept: None,
                     memory_candidate: None,
                     active_plan: None,
+                    model_gen: Some(output.model_gen),
                 })
+            }
+
+            // ── VoiceSynthesize ─────────────────────────────────────────────
+            TaskKind::VoiceSynthesize => {
+                let text = task
+                    .voice_text()
+                    .map(|s| s.to_string())
+                    .or_else(|| task.composed_prompt_text())
+                    .context("voice.synthesize task missing text")?;
+
+                let voice = task.requested_voice().map(|s| s.to_string());
+                let speed = task
+                    .provider_options
+                    .get("speed")
+                    .and_then(|v| v.as_f64())
+                    .map(|s| s as f32);
+
+                let guard = self.kokoro.read().await;
+                let backend = guard
+                    .as_ref()
+                    .context("Kokoro backend not loaded — is espeak-ng installed and the model downloaded?")?;
+
+                // Run synthesis in a blocking thread (CPU-bound ONNX + subprocess).
+                let backend_ptr = backend as *const KokoroBackend as usize;
+                let output = tokio::task::spawn_blocking(move || {
+                    // SAFETY: the RwLock read guard is held for the full duration
+                    // of the spawn_blocking call, keeping the backend alive.
+                    let backend = unsafe { &*(backend_ptr as *const KokoroBackend) };
+                    backend.synthesize(&text, voice.as_deref(), speed)
+                })
+                .await
+                .context("Kokoro blocking task panicked")??;
+
+                Ok(ProviderOutput::Audio(AudioArtifact {
+                    provider: "onnx/kokoro".into(),
+                    model: "kokoro-82m".into(),
+                    voice_id: output.voice,
+                    mime_type: "audio/wav".into(),
+                    output_format: "wav".into(),
+                    audio_bytes: output.wav_bytes,
+                }))
             }
 
             other => anyhow::bail!(

@@ -11,7 +11,10 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "philotic-sandbox-worker", about = "Sandbox worker for philotic-stack")]
+#[command(
+    name = "philotic-sandbox-worker",
+    about = "Sandbox worker for philotic-stack"
+)]
 struct Args {
     /// Path to the sandbox policy TOML file.
     #[arg(long)]
@@ -86,10 +89,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
-    policy: &SandboxPolicy,
-) -> Result<()> {
+async fn handle_connection(stream: tokio::net::UnixStream, policy: &SandboxPolicy) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
     // Read requests until the client disconnects
@@ -135,7 +135,10 @@ fn apply_os_restrictions(policy: &SandboxPolicy, strict: bool) -> Result<()> {
                 if strict {
                     return Err(e.context("failed to apply landlock restrictions"));
                 }
-                warn!("landlock failed: {}, continuing with application-level enforcement", e);
+                warn!(
+                    "landlock failed: {}, continuing with application-level enforcement",
+                    e
+                );
             }
         }
 
@@ -152,7 +155,10 @@ fn apply_os_restrictions(policy: &SandboxPolicy, strict: bool) -> Result<()> {
                 if strict {
                     return Err(e.context("failed to apply seccomp filter"));
                 }
-                warn!("seccomp failed: {}, continuing with application-level enforcement", e);
+                warn!(
+                    "seccomp failed: {}, continuing with application-level enforcement",
+                    e
+                );
             }
         }
     }

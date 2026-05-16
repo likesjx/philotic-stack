@@ -1,0 +1,21 @@
+[package]
+name = "table-datasource"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "table-datasource"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+datasource = { path = "../datasource" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = "1.0"
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

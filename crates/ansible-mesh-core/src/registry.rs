@@ -1,4 +1,4 @@
-use crate::NodeCapabilities;
+use crate::{NodeCapabilities, NodeHealthSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -33,6 +33,9 @@ pub struct NodeStatus {
     pub advertisements: Vec<CapabilityAdvertisement>,
     pub execution_reachability: Option<ExecutionReachability>,
     pub last_seen: Instant,
+    /// Latest environment vitals reported by this node; None if the node
+    /// has never sent health data or is running an older build.
+    pub node_health: Option<NodeHealthSnapshot>,
 }
 
 /// Registry for storing and querying known mesh nodes.
@@ -62,6 +65,7 @@ impl NodeRegistry {
         capabilities: NodeCapabilities,
         advertisements: Vec<CapabilityAdvertisement>,
         execution_reachability: Option<ExecutionReachability>,
+        node_health: Option<NodeHealthSnapshot>,
     ) {
         self.nodes.insert(
             capabilities.node_id.clone(),
@@ -70,8 +74,20 @@ impl NodeRegistry {
                 advertisements,
                 execution_reachability,
                 last_seen: Instant::now(),
+                node_health,
             },
         );
+    }
+
+    /// Returns true if the node is fresh AND has not reported degraded vitals.
+    /// A node with no health data is considered healthy (old build / first boot).
+    pub fn is_node_healthy(&self, node_id: &str) -> bool {
+        let Some(status) = self.nodes.get(node_id) else { return false };
+        if !Self::is_fresh(status) { return false; }
+        let Some(ref h) = status.node_health else { return true };
+        h.disk_free_pct.map_or(true, |v| v > 10.0)
+            && h.mem_free_pct.map_or(true, |v| v > 5.0)
+            && h.load_avg_1m.map_or(true, |v| v < 16.0)
     }
 
     /// Retrieve capabilities for a specific node.
@@ -162,6 +178,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
 
         let node = registry
@@ -198,6 +215,7 @@ mod tests {
                 host: "jane-vps".into(),
                 port: 9002,
             }),
+            None,
         );
         registry.update_node(
             caps("aria-node"),
@@ -218,6 +236,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
 
         let model_ads: Vec<_> = registry.advertisements_for_role("model").collect();
@@ -231,8 +250,8 @@ mod tests {
     #[test]
     fn active_nodes_filters_stale_entries() {
         let mut registry = NodeRegistry::new();
-        registry.update_node(caps("fresh-node"), vec![], None);
-        registry.update_node(caps("stale-node"), vec![], None);
+        registry.update_node(caps("fresh-node"), vec![], None, None);
+        registry.update_node(caps("stale-node"), vec![], None, None);
 
         registry
             .nodes
@@ -263,6 +282,7 @@ mod tests {
                 queue_depth: 0,
             }],
             None,
+            None,
         );
         registry.update_node(
             caps("stale-node"),
@@ -278,6 +298,7 @@ mod tests {
                 active_jobs: 1,
                 queue_depth: 1,
             }],
+            None,
             None,
         );
 

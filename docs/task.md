@@ -12,9 +12,27 @@
 - [x] Review code for communication and split points.
 - [x] Create an implementation plan for the new services architecture.
 
+## New Project: Primitives Crate Split
+
+- [ ] Review [PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md).
+- [ ] Map the current `ansible-mesh-core` modules to the target primitive crates and identify the first extraction boundary.
+- [ ] Extract the smallest safe primitive crate boundary once the interface map is stable.
+
 ## Current Work Item Split
 
 Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SEAM_REGISTRY.md).
+
+### Primitives Refactor
+
+- [x] Extract mesh envelope primitives into `philotic-primitives-mesh`.
+- [x] Extract hotel/runtime capability and registry primitives into `philotic-primitives-hotel` behind compatibility shims.
+- [x] Extract graph/storage primitives into `philotic-primitives-data` behind compatibility shims.
+- [x] Extract agent/session/memory primitives into `philotic-primitives-agent` behind compatibility shims.
+- [x] Extract tool/skill primitives into `philotic-primitives-tool` behind compatibility shims.
+- [x] Extract tool execution route/config envelopes into `philotic-primitives-tool` where they are shared by session shaping and tool routing.
+- [x] Extract model-routing DTOs into `philotic-primitives-model` behind compatibility shims.
+- [x] Extract the `ModelManagerInvoker` wiring out of `ansible-mesh-core`.
+- [ ] Migrate downstream crates off the remaining `ansible-mesh-core` compatibility imports where direct primitive crates are now clearer.
 
 ### WI 1: Session Management
 
@@ -117,7 +135,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [x] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
 - [x] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
 - [x] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes for the same agent identity.
-- [x] Define the first rigid orchestrator-only role-governance workflow skill for create/update, including required reasoning about purpose, toolset, skillset, handoff posture, and limits.
+- [x] Define the first rigid orchestrator-owned role creation/update workflow contract, with `role.authoring` narrowed to cognitive payload assembly and `role.create_or_update` seeded as the governed workflow home over the existing `role.configure` execution surface.
 - [x] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
 - [ ] Define the canonical shared-self role contract:
   - base identity and durable memory remain shared
@@ -376,6 +394,39 @@ Seam IDs: `local-admin-capability-envelope`, `onnx-admin-fallback-path`
 - [ ] Decide how ONNX fits for embeddings, tool-calling support, and local degraded-mode admin workflows.
 - [ ] Prove one local fallback path without external models.
 
+## New Project: EmbeddingGemma Swap
+
+Seam IDs: `embeddinggemma-swap-validation`
+
+- [x] Add [EMBEDDINGGEMMA_SWAP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/EMBEDDINGGEMMA_SWAP_PROPOSAL.md) and register seam.
+- [x] Start graph workstream for this session and claim the seam.
+- [ ] Switch graph embedding default from MiniLM to EmbeddingGemma in the active sidecar path.
+- [ ] Run embedding smoke validation: `graph_embed`, `graph_embed_batch(kind=proposal)`, `graph_semantic_search`.
+- [ ] Record session decision and verification status in graph before close-out.
+
+## New Project: Multi-Agent Coding Fleet
+
+Proposal: [MULTI_AGENT_CODING_FLEET_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_AGENT_CODING_FLEET_PROPOSAL.md)
+Seam IDs: `cross-agent-seam-ownership`, `role-charter-contract`, `verification-custody`, `handoff-packet-shape`
+
+- [x] Open proposal for multi-agent parallel coding topology across Codex, Claude Code, Gemini/Antigravity, and Copilot.
+- [ ] Define first role charters with explicit authority boundaries:
+  - orchestrator
+  - implementer
+  - explorer/reviewer
+  - verifier
+  - docs/state maintainer
+- [ ] Define and enforce first delegation packet schema:
+  - `seam_id`
+  - `truth_level`
+  - `in_scope`
+  - `out_of_scope`
+  - `success_condition`
+  - `output_contract`
+  - `verification_expectation`
+- [ ] Run first pilot with two parallel implementation lanes plus independent verifier lane.
+- [ ] Capture at least one observed coordination failure and codify it into a standing workflow rule.
+
 ## New Project: OpenClaw Parity And Migration
 
 - [ ] Review [OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md).
@@ -480,6 +531,7 @@ Seam IDs: `context-envelope-contract`, `memory-local-tools`, `active-plan-stream
 - [x] Add `tool_history` as a context envelope section in `model_context_from_projection` — always present, empty on initial turn, populated on re-entry.
 - [x] Add `ToolHistoryEntry` to `ContextEnvelope` in model-router; parse and render `[Tool call history]` in `composed_prompt_text()`.
 - [x] `handle_tool_result` now uses `build_reentry_context_envelope()` — model-router receives full structured envelope on every re-entry.
+- [x] Keep `build_reentry_context_envelope()` on the same cognitive tool-projection policy as initial turns, so low-intent re-entry does not bypass affordance suppression.
 - [ ] `active_plan` as context section (deferred to Slice 4).
 
 ### Slice 2 — Settings Tree
@@ -566,9 +618,12 @@ Seam IDs: `secret-handling-hardening`, `watched-live-vps-smoke`, `artifact-distr
 ## New Project: Hotel Perimeter Trust
 
 - [ ] Review [HOTEL_PERIMETER_TRUST_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_PERIMETER_TRUST_PROPOSAL.md).
-- [ ] Define hotel membership records so “inside the perimeter” is explicit rather than implied by peer discovery.
+- [x] Define hotel membership records so “inside the perimeter” is explicit rather than implied by peer discovery.
 - [ ] Define hotel identity/auth material beyond transitional dev PSK assumptions.
-- [ ] Define join / invite / revoke lifecycle for hotel membership.
+- [ ] Finish hotel identity/auth material beyond transitional mesh PSK:
+  current slice ships `phil mesh invite` / `phil mesh accept` with graph-backed membership records and HMAC-signed acceptance, but not per-hotel PKI.
+- [ ] Finish join / invite / revoke lifecycle for hotel membership:
+  invite/accept now exists; revoke, rotation, and deny-list behavior are still open.
 - [ ] Require authenticated control-plane traffic outside explicit dev mode.
 - [ ] Define authorization scope for which trusted hotels may receive which routed capability classes.
 
@@ -703,7 +758,44 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
 - [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
 - [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.
+
+### Workstream: Model Graph Decision Layer
+
+Seam IDs: `model-graph-decision-layer`, `context-1-lookup`, `capability-aware-tool-approval`
+
+- [ ] Review [MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md).
+- [ ] Map the current provider-selection and approval paths that this layer will sit on top of:
+  - `crates/model-router/src/controller.rs` `ProviderRegistry::resolve`
+  - `crates/model-router/src/controller.rs` `ControllerTask`
+  - `crates/philote/src/session.rs` `approval_policy_allows`
+  - `crates/philote/src/runtime.rs` `handle_approval_request`
+- [ ] Define the first graph record shape for models, benchmark observations, and task-fit edges.
+- [ ] Define the first `context-1` lookup request/response contract:
+  - task type
+  - request class
+  - tool/class risk
+  - context budget
+  - latency budget
+  - provider hint
+  - ranked candidates
+  - reason codes
+- [ ] Thread lookup results into model selection before provider fallback.
+- [ ] Use model capability as an advisory input for tool-call approval while keeping `philote` policy enforcement as the final authority.
+- [ ] Seed the first model facts from `llm-stats.com` plus local runtime observations.
+
+### Workstream: Provider-Native Response-Mode Routing
+
+This workstream includes a quick look at the OpenAI websocket/realtime API because it informs the same routing seam, not a separate auth story.
+
+- [x] Add the first OpenAI realtime websocket transport slice behind `response_mode=realtime_websocket`.
+- [x] Add an explicit shared response-route bucket for `text_only`, `image_multimodal`, `audio_multimodal`, and `realtime_websocket`.
+- [x] Add an explicit canonical `response_route` field to the model-call envelope and populate it from the runtime before routing.
+- [x] Add an agent-configurable `response_route_policy.default_route` surface so the runtime default can be set from `agent.configure` and the desktop onboarding/config projection.
+- [x] Expose `response_route_policy.default_route` in the desktop agent editor so it can be changed after onboarding, not just during config generation.
+- [ ] Define the provider-native response-mode routing seam so reflex routing can choose between `text_only`, `image_multimodal`, `audio_multimodal`, and `realtime_websocket` without leaking provider shape into the agent loop.
 - [ ] Define how native-audio multimodal models emit text plus audio without being forced through TTS.
+- [ ] Decide whether Ollama needs a native adapter boundary or stays in the OpenAI-compatible adapter family.
+
 - [ ] Define Gemini auth modes:
   - hotel-managed OAuth
   - API key fallback
@@ -732,7 +824,74 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Investigate splitting voice-note transcription/understanding toward ElevenLabs or another speech-specialized provider while keeping richer text reasoning in the agent/model loop.
 - [x] Add `VoiceResponsePolicy` to `AgentProfile` so the agent has its own voice identity and TTS is policy-driven, not tool-driven.
 - [ ] Make the default local Jane/Aria voice UX honest: `mode=auto` should mirror voice-input turns with voice-only replies, while `/tts on` should escalate to voice+text delivery.
-- [ ] Route `voice.transcribe` results back into the normal agent reasoning loop before `voice.synthesize`, so voice turns stop parroting the transcript and instead speak the post-reasoning answer.
+- [x] Route `voice.transcribe` results back into the normal agent reasoning loop before `voice.synthesize`, so voice turns stop parroting the transcript and instead speak the post-reasoning answer.
+- [x] Carry an explicit staged `TurnRoutingPlan` on active voice turns so ingress transcription, cognitive generation, and voice egress are visible as one session-owned execution contract instead of an ad hoc branch.
+- [x] Make staged routing operational in model request assembly: trim ingress context envelopes and forward stage-derived routing hints into model-controller requests.
+- [x] Make stage policy influence affordances and output contracts: suppress tools on non-cognitive stages and request slimmer response channels for low-intent cognitive turns.
+- [x] Extend stage-aware affordance policy into prompt/context projection: hide skill guidance and detailed approval posture on non-cognitive and low-intent turns.
+- [x] Make approval interrupts stage-aware: redirect low-intent free-form approval asks back to direct response and reject non-cognitive approval interrupts while preserving real scripted/tool gates.
+- [x] Define a governed `routing.policy.propose` tool and companion `routing.refinement` skill so the agent can reflexively suggest cognition/routing policy updates under operator approval and memory write-back.
+- [x] Add first-class agent-graph routing preferences plus active `agent.graph.read`/`agent.graph.write` tool definitions so routing posture can be stored in agent-local graph state instead of only prompt text.
+- [x] Feed stored agent-graph routing preferences into live `TurnRoutingPlan` compilation by projecting them through hotel session bindings and applying advisory provider/model hints per stage.
+- [x] Project an explicit `effective_rights` key ring through hotel session bindings and enforce it in tool/component assembly so lower execution layers stop widening visibility just because a runner or route exists.
+- [x] Add the first shared abstract-right catalog substrate and carry `effective_rights` into model-controller requests so lower execution layers can validate tool visibility against the hotel's key ring.
+- [x] Carry opportunistic `agent_graph_snapshot` continuity on transported agent-directed task payloads and hydrate it before local delivery so an agent that lands on another aiua can bring its graph with it even before background mesh sync catches up.
+- [x] Prefer explicit routed `agent_id` hints for transported graph continuity when the source hotel cannot infer ownership from a local session or guest incarnation, starting with remote operator-chat and peer-delegation paths.
+- [x] Carry `authority_hotel` alongside transported `agent_id` hints and only attach authoritative `agent_graph_snapshot` continuity when the sending hotel is the agent's actual home authority, so transport placement does not masquerade as durable identity ownership.
+- [x] Persist agent runtime provenance into session state and canonical session snapshots on the receiving hotel so `authority_hotel` and current delivery placement stay visible after transport instead of disappearing once the task is delivered.
+- [x] Add typed placement markers (`marker_kind`, `marker_source`) to runtime provenance so transport continuity, handoff, receptor ingress, and later routing enzymes can be distinguished instead of all staining the same way.
+- [x] Use persisted local delivery provenance to influence local agent routing and materialization when a session has no usable active incarnation, so foreign-owned sessions can keep executing on the intended local guest instead of immediately collapsing back to generic orchestrator fallback.
+- [x] Treat persisted local delivery provenance as a freshness-based placement hint with TTL-based apoptosis, so stale local placement dies cleanly instead of haunting routing/materialization forever.
+- [x] Supersede older local placement provenance immediately when fresher active-incarnation truth appears, so the runtime has a `p53`-style conflict kill switch instead of waiting for TTL alone.
+- [x] Differentiate placement-marker apoptosis by marker class so short-lived `receptor_ingress` continuity dies faster than transport or handoff markers instead of every marker pretending to have the same half-life.
+- [x] Differentiate placement-marker supersession posture by marker class so newer local active-incarnation truth kills weak `receptor_ingress` markers immediately but explicit `transport_continuity` and `role_handoff` markers can preserve their placement target under conflict.
+- [x] Add placement-marker strength (`marker_strength`) so weak receptor clues can still steer live delivery but cannot trigger parking/materialization on their own, while stronger continuity markers retain that authority.
+- [x] Derive `placement_risk_level` from placement provenance and project it into session posture so elevated-risk sessions suppress remote execution routes without mutating the hotel's underlying rights key ring.
+- [x] Split posture-derived right policy by class so guarded sessions can still use remote model/component execution while denying remote tool execution and shrinking credential scope instead of collapsing all remote reach into one boolean.
+- [x] Adopt `effective_reflexes` naming for fast posture-derived runtime behavior (`remote_tool_reflex`, `remote_component_reflex`, `credential_scope_reflex`) while keeping `effective_right_policy` as a transitional compatibility bridge.
+- [x] Add the first governable reflex record shape with session-level `reflex_overrides` and `reflex_evaluations`, and project overrides back onto `effective_reflexes` instead of keeping reflex behavior purely inferred.
+- [x] Give reflex governance a first-class policy stack via ordered `effective_reflex_policy` layers and explicit `reflex_policy_records` carrying scope/source/precedence metadata, instead of relying on ad hoc merge order between inferred posture and override blobs.
+- [x] Distinguish reflex policy origins so hotel-projected `reflex_policy_defaults` from bindings become `hotel_default` layers beneath explicit session `reflex_policy_records`, instead of treating all reflex policy records as the same kind of override.
+- [x] Add mesh-synced agent-graph `reflex_preferences` and project them into session bindings as `agent_learned` reflex-policy layers, so durable adaptive posture lives with the agent rather than being smuggled into hotel/session override state.
+- [x] Let approved `routing.policy.propose` calls optionally write a learned reflex payload back into agent-graph `reflex_preferences` and record a `reflex_evaluations` audit trace, so accepted refinement becomes durable posture instead of only durable prose.
+- [x] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
+- [x] Add a real operator lifecycle for routing-policy records: list them, revise disposition later, and append durable disposition evaluations instead of freezing governance at birth approval.
+- [x] Make rejected routing-policy disposition actually inhibit linked `agent_learned` reflex projection during session binding assembly, and surface suppression markers for observability.
+- [x] Add a hotel-side reward system for linked `agent_learned` reflexes: approved routing-policy disposition now reinforces projection with a precedence boost and explicit reward markers.
+- [x] Feed hotel-projected reward and immune markers into live cognition-stage turn-routing-plan ranking in `philote`, so reinforced or suppressed agent-learned reflex posture can bias explicit provider/model preference selection without becoming a second router.
+- [x] Fold shared model-catalog metadata into live turn-routing-plan ranking via hotel-projected `abstract_model` markers, so shared graph truth can bias stage-aware provider/model selection without becoming mutable preference storage.
+- [x] Project shared `abstract_tool` / `abstract_skill` markers through hotel bindings and use shared tool ligands at the runner boundary to shape tool schema, approval sensitivity, and `local_only` routing suppression without widening rights.
+- [x] Add a first explicit turn-routed capability taxonomy in `philote`, distinguishing stage-local species from collapsible native-live species like `response.generate` and `voice.dialogue`.
+- [x] Extend `model-router` controller parsing and validation so native-live species like `response.generate` and `voice.dialogue` are first-class task kinds even before providers are wired.
+- [x] Let native-live species actually influence real `TurnRoutingPlan` compilation under policy, so eligible voice turns can collapse ingress into `voice.dialogue`/`response.generate` when shared model markers and routing preferences express that ligand, and carry the chosen cognition species through outbound request assembly plus cognitive re-entry.
+- [x] Wire the first provider implementation for native-live species honestly, starting with explicit `response.generate` / `voice.dialogue` behavior instead of a magical realtime bypass.
+- [x] Add a session-shaped native-live provider seam under `model-router` for Gemini 3.1 Flash Live style execution, covering Live API connection lifecycle, streamed PCM audio I/O, sequential tool-response turns, and resumable session markers instead of pretending `ModelProvider::invoke` is already the right shape.
+- [x] Wire the actual Gemini Live session transport on that seam for the first honest slice: websocket setup, native text `response.generate`, PCM-gated `voice.dialogue`, partial text/transcription mapping, live tool-call parsing, and session-resumption markers.
+- [x] Extend the Gemini Live seam with upstream PCM conversion for transported voice blobs, using a transitional ffmpeg-backed enzyme so current OGG voice ligands can cross the Live receptor.
+- [x] Let `philote` consume cognitive-stage audio artifacts from native-live model results on voice turns, so returned audio can be delivered directly instead of reflexively invoking a second synth pass.
+- [x] Extend the Gemini Live seam further with provider-kept in-session tool-response continuation, so live `functionCall.id` survives the tool round-trip and the next `toolResponse` returns over the same websocket receptor instead of restarting the turn.
+- [x] Add a startup-driven `smoke-gemini-live` path that proves the binary-level `response.generate -> tool_call -> toolResponse -> final reply` continuity against a fake local Gemini Live websocket receptor.
+- [x] Make stage-derived provider hints update stage controller dispatch too, so an ingress `voice.transcribe` preference for ElevenLabs actually targets `model.elevenlabs` instead of asking the generic `model` controller to impersonate the wrong provider.
+- [x] Point Gemini `voice.transcribe` fallback traffic at `gemini-3-flash-preview` instead of the generic latest alias, so the Bjork voice ingress experiment can test the preview transcription receptor directly.
+- [x] Add `aiua import-config --file ... --hotel ...` as the first stable config-delta graft for long-running hotels, so operators can update graph config and agent identity bundles without reseeding guests or treating `just uat` startup like configuration management.
+- [x] Suppress approval-gated tools from generic cognitive tool projection unless they are explicitly named, so ordinary voice/text turns do not surface workflow scalpels like `handoff.to_role` by default.
+- [x] Give role incarnation workers a real readiness loop: `ConfigureRole` now eagerly materializes new role workers as separate `philote` processes, `SubscribeInbox` marks the role route `Routable`, and `HandoffToRole` returns `HandoffPending` until the role inbox is genuinely live instead of mistaking configured records for active workers.
+- [x] Reclassify same-self `handoff.to_role` / `handoff.back` out of the generic high-risk bucket and let role-shift intent project them as lower-friction workflow reflexes when authority and rights do not widen.
+- [x] Remember successful same-self role handoffs as agent-owned reflex posture so matching work can naturally surface `handoff.to_role` again without turning the hotel into the memory organ.
+- [x] Add governed habit formation for remembered same-self role handoffs: successful handoffs now accumulate evidence in the hotel-side receptor, candidate habits stay advisory, and only reinforced or explicitly rewarded role reflexes auto-project for matching work.
+- [x] Make same-self handoff explicitly workflow-skill- and manifest-informed: seed `handoff.to_role` with target-role field sourcing, preserve target role manifest/toolset lens data in remembered role reflexes, and carry that target-role lens into same-identity handoff bundles instead of treating roles as bare names.
+- [x] Replace the remaining trigger-class heuristics for remembered role handoff with role-manifest, skill-marker, and toolset-marker receptors so role shifts are learned from declared scope and abilities rather than only implementation/research substring biochemistry, while keeping legacy `trigger_class` only as a backward-compatible fallback for older reflex records.
+- [x] Make the role authoring/workflow catalog stop depending on hand-maintained duplicate seed prose: `role.authoring` and `role.create_or_update` now seed from repo-local markdown frontmatter embedded into `aiua`, so installed hotels stay self-contained while the repo files remain the actual catalog source.
+- [x] Lift `role.create_or_update` into the actual prompt-facing workflow surface: orchestrator/toolset/skill expansion now grants the workflow tool directly, `philote` projects it instead of the low-level `role.configure` alias when both are available, and execution still resolves through the existing `ConfigureRole` hotel path as a transitional enzyme.
+- [x] Add the first distinct hotel-side workflow execution plane for the role seam: `philote` now invokes `ExecuteWorkflow { workflow_name: "role.create_or_update" }`, while the hotel resolves that workflow through the current role mutation machinery instead of pretending prompt-surface workflowing is the same thing as a runtime workflow plane.
+- [x] Tighten the same-self role seam so specificity counts as approval for explicit non-admin role authoring, and role workers now carry their real guest incarnation through handoff activation plus canonical snapshot merge instead of materializing one role and locally narrating another.
+- [ ] Decide whether native-live session continuity should stay as a provider-local pool inside `model-router` or graduate into a broader governed substrate without turning session continuity into a stealth second router.
+- [x] Land the first narrow shared `media-prep` substrate for audio ligand preparation and move Gemini Live PCM adaptation onto it, so repeated provider/media pressure has a real shared enzyme without pretending we needed a giant generic interceptor framework first.
+- [x] Extend the new `media-prep` seam into the first shared artifact-interception path by standardizing the `audio_artifact` envelope across `model-router`, `philote`, and `membrane`, including legacy payload tolerance for older `data_b64` residue.
+- [ ] Extend `media-prep` further into additional artifact classes or provider/media adaptation paths only where repeated pressure proves the extra anatomy is real.
+- [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
+- [ ] Extend the hotel's projected key ring beyond `effective_rights` for tools/skills/component capabilities into scoped execution credentials and richer right classes.
+- [ ] Audit `model-router` and runner dispatch beyond current tool/component assembly so lower execution layers consume projected rights but never inject or widen them.
 - [x] Add a rebuild-first local watched-UAT workflow so stale materialized binaries and stale sockets do not masquerade as runtime regressions.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
@@ -747,30 +906,34 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
 - [ ] Wire refresh-token persistence and refresh lifecycle behind the hotel vault.
 - [x] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode, including watched-live confirmation that `voice.synthesize` produces canonical audio artifacts instead of a model-router policy refusal.
-- [ ] Add `OpenAIProvider` to `model-router` on the existing provider seam:
+- [x] Add `OpenAIProvider` to `model-router` on the existing provider seam:
   - `text.generate`
   - structured outputs
   - tool calling
   - image-aware text input where supported
   - `text.embed`
-- [ ] Extend provider config/auth loading for OpenAI:
+- [x] Extend provider config/auth loading for OpenAI:
   - API key path
-  - OAuth bearer path
-  - refreshable OAuth path owned by the hotel
-- [ ] Define hotel CLI OAuth UX for OpenAI:
-  - browser launch
-  - temporary localhost callback listener
-  - token exchange
-  - token storage/refresh
-  - guest handoff
+  - OAuth/bearer compatibility path
+  - endpoint-scoped key refs owned by the hotel vault
+- [x] Define hotel CLI key-management UX for OpenAI:
+  - endpoint-scoped API-key onboarding
+  - vault secret-ref storage
   - validation command
-- [ ] Add the first OpenAI startup smoke through the materialized model-controller guest.
-- [ ] Define provider capability overrides for specialized OpenAI model features:
+  - project ID / endpoint metadata handoff
+  - guest handoff
+- [x] Add the first OpenAI startup smoke through the materialized model-controller guest.
+- [x] Define provider capability overrides for specialized OpenAI model features:
   - reasoning effort / depth
   - verbosity
   - background mode
   - built-in tools gated behind explicit provider options
   - realtime/audio kept as a follow-on slice, not part of the first parity path
+- [x] Define the provider-family strategy for OpenAI-compatible endpoints:
+  - OpenAI remains the canonical first-class provider path
+  - OpenRouter and similar hosted endpoints should usually ride the same adapter family with different endpoint/auth settings
+  - Ollama should be treated as an adapter or compatibility mode unless its lifecycle or protocol truly requires a separate controller boundary
+  - add explicit `provider`, `base_url`, and auth-shape config for the shared adapter path
 
 ## New Project: Key Vault
 
@@ -921,7 +1084,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [x] Replace websocket query-string token auth with a bounded same-session attach mechanism.
 - [x] Stop persisting injected desktop session credentials by default.
 - [ ] Replace direct SQLite/config reads in `serve` with the first hotel-owned read models for:
-  - [x] service status
+  - [x] service lifecycle commands (`install`, `start`, `stop`, `restart`, `status`)
   - [x] guests
   - [x] redacted agents
 - [x] Decide that apartment inspection does not belong in the default desktop membrane surface; if it returns later, it should come back only as a shaped hotel-owned diagnostic view.
@@ -1043,12 +1206,20 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [x] Add graph runner instance inventory (Slice 4): `GET /api/graphs`, `GET /api/graphs/:graph_id` — via new `ListGraphInstances` IPC variant.
 - [x] Add secret refs read-only inventory (Slice 4): `GET /api/secrets` — vault registry entries + known config-key ref presence flags; no values exposed.
 - [x] Add skill assignment mutations (Slice 4): `POST /api/agents/:agent_id/roles/:role_name/skills`, `DELETE /api/agents/:agent_id/roles/:role_name/skills/:skill_name` — management-role bypass added to `AssignSkill`/`RevokeSkill` authority checks.
+- [x] Add desktop component authoring parity (Slice 5): `POST /api/components`, `PATCH /api/components/:guest_id`, backed by the canonical `ComponentManifest` contract and hotel-owned manifest-complete inventory/detail reads instead of partial desktop-only shape guessing.
+- [x] Add schema-driven component templates (Slice 6): `GET /api/component-templates`, backend-owned template metadata for known component families, structured desktop rendering for representative fields, and explicit vault-only guidance for secrets/config refs.
+- [x] Expand desktop agent editing (Slice 7): agent settings now surface editable base persona/identity fields (`identity_text`, `soul_text`, `user_context_text`, `system_prompt`), roles show richer role posture details, and the same agent editor exposes durable rules in a first-class tab instead of making the persona spine disappear behind nickname-only edits.
+- [x] Move graph-owned base agent persona editing into a dedicated desktop window launched from the agent graph/persona object, with labeled fields plus explicit Cancel/Save, instead of burying those edits inline inside the list panel.
 
 ## Next Project: Tool Assembly and Routed Execution
 
 - [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).
 - [ ] Review [TOOL_MANAGEMENT_PLANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md).
 - [ ] Review [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md).
+- [x] Define the computer-use/CUA runner boundary as a pinned desktop task-runner family rather than desktop membrane execution authority.
+- [x] CUA runner observe-only scaffold (`desktop-runner-materialization`): advertise one low-agency `desktop.observe` tool with runner/hotel/environment/desktop-session attribution.
+- [ ] CUA observation contract (`desktop-observation-contract`): define screenshot/artifact redaction, provenance fields, and shaped model-facing observation results.
+- [ ] CUA action approval policy (`desktop-action-approval-policy`): keep click/type/key/scroll unavailable until explicit approval posture and high-agency input gating are implemented.
 - [x] Introduce a first-class `ToolAssembly` model with model-facing tool definitions and runtime-facing execution routes.
 - [ ] Formalize the system tool management plane in the Context Graph:
   - known tool runners
@@ -1116,6 +1287,15 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - conversational agents
   - workers
   - subagents
+- [ ] Define the four-layer memory split and datasource boundary:
+  - working memory (turn window / role-local)
+  - heuristic memory (relevance-ranked recall)
+  - rote memory (durable references / pointers / dates / standing facts)
+  - work product (datasource truth, shareable polished records)
+- [x] Replay the smallest honest `datasource-core` slice on current `develop`:
+  - add shared `datasource` task/provider/runtime contracts
+  - add placeholder `graph-datasource` guest shell without renaming current runners yet
+- [ ] Define how agent-shared and role-scoped durable references should coexist with heuristics and work-product datasource records.
 - [ ] Keep the first implementation slice personality-first; do not try to solve the full memory backend story in the same change.
 - [ ] Build the first ZeroClaw/OpenClaw bridge slice:
   - [ ] import one agent from `openclaw.json`
@@ -1145,7 +1325,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [x] Port 9 specialized skills from `~/.codex/skills` to `skills/` and make them repo-local.
 - [x] Establish mandatory session bootstrap in `CLAUDE.md` and `AGENTS.md`.
 - [x] Implement `just engine-check` for one-command verification of Muninn, repo-local bootstrap assets, and the cargo check/test baseline.
-- [x] Implement `just session-start` as the mandatory Muninn bootstrap gate for meaningful sessions.
+- [x] Implement `just session-start` as the mandatory Muninn bootstrap gate for meaningful sessions and the graph-board claim path when the graph server is reachable.
 - [x] Require explicit user/operator approval before continuing without Muninn when the bootstrap gate fails.
 - [ ] Deploy Muninn "Truth Cache" to `vps-jane` with automated sync from local.
 - [ ] Formalize semantic "Optimization Loop" to update `AGENTS.md` rules based on recurring "Reality Gaps."
@@ -1168,6 +1348,9 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [x] Add executable workflow commands for the trusted vertical slice and operator checklist.
 - [ ] Command Center / architect continuity: define how architecture-impact work should be surfaced to Aria once the new home is ready.
 - [ ] Fresh onboarding flow: design repo/bootstrap onboarding from scratch for a new operator or agent entering Philotic.
+  - [x] Hand the interactive onboarding flow off to `phil service install` on macOS so first-run setup can root the daemon immediately.
+  - [x] Capture the agent workspace/import path and initial skillset during onboarding so tool-runner roots and skill posture start out correct.
+  - [x] Expose the agent workspace/import path in the desktop agent editor so existing agents can be retargeted to a new working directory without re-running bootstrap.
 - [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
 - [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
 - [ ] Context graph decentralization: decide how much of the graph can be replicated/federated across hotels versus kept locally authoritative.
@@ -1187,6 +1370,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [x] Telegram slash-command elevation (first slice): `/ping` handled in `membrane` before agent-core — `handle_membrane_command` short-circuits the `EmitTask` dispatch and replies directly.
 - [ ] Telegram slash-command elevation (next): `/new` resets session_id in membrane (start fresh conversation without round-trip); `/help` lists available commands from membrane directly.
 - [x] Telegram bot command registration/UI: call Telegram `setMyCommands` from `membrane` startup so supported slash commands show up in the Telegram client command UI instead of existing only as hidden transport behavior.
+- [ ] Telegram provider binary (`telegram-provider-binary`): materialize Telegram hotels with `membrane-telegram` instead of the compatibility `membrane` wrapper, and keep rollout/install recipes aware of the provider binary.
 - [x] Telegram poll ownership (first slice): add a hotel-owned poll lease per bot token fingerprint so only one local membrane long-polls `getUpdates` for a token at a time, and fail closed when lease acquisition is denied.
 - [x] Telegram poll ownership (authority slice): anchor agent identity to `authority_hotel` and deny poll-lease acquisition when the current hotel is not that agent's home authority.
 - [x] Telegram poll delegated authority (transitional slice): allow a non-home hotel to acquire the poll lease only when the agent identity bundle explicitly lists that hotel in `telegram_poll_delegate_hotels`.
@@ -1209,6 +1393,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] A2A membrane investigation (`a2a-membrane-contract`): evaluate `A2A` as an external agent interoperability membrane with explicit peer trust records, bounded capability exposure, approval semantics for privileged actions, and no inheritance of internal mesh trust.
 - [ ] Tool runner lifecycle policy (`runner-materialization-policy`): define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
+  - [x] Expose shell execution through the `tool-runner` `bash.exec` surface and back it with `philotic-sandbox` when sandbox mode is configured; a UDS smoke test proved the delegation path.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
 
 ## MVP 1: Single-Node Mesh & Basic Tools
@@ -1316,3 +1501,10 @@ Seam IDs: `active-proposal-frontmatter-rollout`, `architecture-doc-metadata-roll
 - [x] Decide that seam docs remain exception-based artifacts and only graduate from proposal + registry + task surfaces when cross-cutting complexity or repeated confusion justifies their own boundary doc.
 - [x] Tighten [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) against current execution-transport and current session-authority reality.
 - [x] Audit historical docs and clearly mark any remaining non-authoritative architecture narratives as legacy or historical.
+- [x] Add graph-native proposal management in intel-graph so proposal status/disposition updates can be recorded with mutation history and a structured `agent_work_focus` record for the agent's active stance toward the proposal.
+- [ ] Define reintegration tracking for worktrees and branches in intel-graph/SVER so operators can see:
+  - whether a slice is only on a side branch
+  - whether it is merged to `develop`
+  - whether local `develop` is behind `origin/develop`
+  - whether watched-live verification is about to run from stale local truth
+  - proposal: [docs/architecture/WORKTREE_REINTEGRATION_TRACKING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/WORKTREE_REINTEGRATION_TRACKING_PROPOSAL.md)

@@ -3,7 +3,7 @@ title: "Philotic Tool Assembly and Execution Proposal"
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-26
 tags:
   - tools
   - execution
@@ -316,8 +316,15 @@ So:
 
 - session bindings = capability intent
 - tool assembly = executable availability
+- hotel-projected effective grants = the runtime key ring that constrains what
+  may actually be assembled and executed
 
 That distinction matters because a session can ask for a tool family before a runner is online, before routing is known, or before policy/availability checks are satisfied.
+
+Shared tool/skill/right catalogs may live outside the hotel as reference
+knowledge, but the hotel still owns the effective runtime projection. A tool
+existing in the catalog is not the same thing as that tool being granted to a
+session.
 
 ## Approval Relationship
 
@@ -338,6 +345,52 @@ not:
 - “send IPC to `tool.workspace` on `local-aiua-01` with runner lease `abc123`”
 
 That would be technically rich and humanly useless.
+
+## Rights And Key-Ring Boundary
+
+The hotel is the authority that assembles the effective key ring for a session.
+
+In practical terms, that means:
+
+- the hotel projects effective grants, scoped bindings, and route eligibility
+- `philote` reasons over the abstract tool surface and policy posture derived
+  from that projection
+- routers and runners consume those effective grants as constraints
+
+Routers and runners may receive:
+
+- route-scoped credentials
+- provider auth material
+- execution eligibility metadata
+- approval posture and policy annotations
+
+They must not:
+
+- inject new rights into the model-facing envelope
+- widen the visible tool/skill set beyond the projected session bindings
+- self-authorize capabilities because a runner or provider happens to support them
+
+That would turn execution infrastructure into a stealth control plane, which is
+efficient only in the way stepping on a rake is an efficient lesson.
+
+Current implemented slice:
+
+- hotel session snapshots now project `bindings.effective_rights`
+- `philote` tool assembly filters visible tools through that key ring
+- hotel-side tool assembly and component-capability assembly also filter through
+  the same projected rights
+- allowed-incarnation tool assembly no longer widens visible tools merely
+  because a runner advertises support
+- `model-router` now receives the projected `effective_rights` envelope and
+  rejects tool surfaces that arrive without matching rights, so a bad upstream
+  projection cannot quietly reintroduce a widened tool surface below `philote`
+
+This is the first enforcement slice, not the full destination:
+
+- the right-token vocabulary is now shared
+- abstract rights now have a first shared graph catalog substrate
+- the full shared catalog layer for models, tools, skills, and rights is still
+  a follow-on seam
 
 ## Proposed Runtime Flow
 

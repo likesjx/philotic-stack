@@ -2,8 +2,8 @@
 title: "Agent-Centric Resource Model"
 doc_type: proposal
 domain: runtime-sessions
-status: proposed
-last_updated: 2026-03-22
+status: accepted-current-slice
+last_updated: 2026-03-27
 tags:
   - resource-broker
   - demand-driven-materialization
@@ -39,8 +39,9 @@ active_seams:
 
 Define an architecture where agents are active participants in their own
 resource lifecycle — declaring what they need, requesting it at runtime, and
-owning their own graph state — while the hotel remains the authority on rights,
-routing, and system-level resource management.
+owning their own graph state — while the hotel remains the authority on
+effective runtime rights, bindings, routing, and system-level resource
+management.
 
 The current model is hotel-push: the hotel decides what guests to run and what
 resources agents receive. This proposal moves to an agent-pull model: agents
@@ -72,7 +73,9 @@ Six interconnected components compose this model:
   `SqliteAgentGraphStorage` (per-agent embedded SQLite); new `agent-graph-runner`
   crate with `agent.graph.*` tool surface and experience trace auto-recording.
 - Seam 4 (`agent-graph-mesh-sync`, commit 3f2f566): LWW snapshot export/import,
-  `EventKind::AgentGraphSync`, two-tier authority invariant (grants excluded).
+  `EventKind::AgentGraphSync`, two-tier authority invariant (grants excluded),
+  and now opportunistic task-carried graph hydration for transported
+  agent-directed work when the source hotel already knows the owning agent.
 - Seam 5 (`router-training-tap`, commit 4eb153b): `RouterTrainingRecord` +
   `SqliteRouterTraceStorage`, model-router wired to `PHILOTIC_ROUTER_TRACE_DB`,
   `ResourceType::RouterListener`.
@@ -250,6 +253,7 @@ AgentGraph {
 
   // Cognitive configuration
   tool_preferences:           [...],
+  routing_preferences:        [...],
   memory_policy:              MemoryPolicy,
   context_assembly_config:    ContextAssemblyConfig,
   active_skills:              [SkillRecord],
@@ -264,6 +268,17 @@ AgentGraph {
 }
 ```
 
+The agent graph is the home for mutable agent-owned overlay state:
+
+- routing preferences
+- tool and skill preferences
+- local policy refinements
+- role-local cognitive configuration
+- learned experience and evaluation traces
+
+It is not the canonical home for shared catalog truth about what models, tools,
+skills, or rights exist in the system at large.
+
 ### Storage substrate
 
 The agent graph tool-runner uses the existing `AgentGraphStorage` trait — an
@@ -271,11 +286,12 @@ extension of the same `GraphStorage` abstraction already in use for the hotel
 CG. The implementation is a reusable middle layer that:
 
 - defines the domain operations the agent graph needs (`get_resource_grants`,
-  `upsert_tool_preference`, `record_experience_trace`, etc.)
+  `upsert_tool_preference`, `upsert_routing_preference`, `record_experience_trace`, etc.)
 - hides the backend behind the trait boundary
 - starts with the SQLite backend already in production
 - allows a backend swap (RocksDB, or anything else) later via a single impl
   swap, with no changes to callers
+- now feeds stored routing preferences back into live session snapshot bindings so `philote` can compile advisory turn-routing overrides from agent-local graph state instead of relying on prompt-only preference residue
 
 The abstraction layer is the asset. The backend is a deployment-time decision.
 
@@ -286,6 +302,238 @@ transport already used for hotel CG state. The agent graph tool-runner
 serializes its state to a snapshot (using the storage trait's export surface),
 the mesh CRDT layer carries it, and the receiving hotel's tool-runner imports
 and applies it.
+
+Current implemented pressure adds a second continuity aid on top of that
+background sync: when the source hotel already knows which agent owns an
+agent-directed transported task, it may attach the current `agent_graph_snapshot`
+directly to the task payload. The receiving hotel hydrates that snapshot into
+its local per-agent store before delivery. This does not replace mesh sync; it
+reduces the very awkward window where an agent arrives before its graph does.
+
+That ownership hint should prefer an explicit `agent_id` carried in the routed
+payload when session-derived inference is unavailable. Remote operator-chat and
+peer-delegation paths now do this so continuity does not depend on a lucky
+local session record or a guest-id shape the sending hotel cannot actually
+resolve.
+
+That continuity path is now explicitly home-hotel scoped. Routed payloads should
+carry `authority_hotel` alongside `agent_id`, and a sending hotel should only
+attach an authoritative `agent_graph_snapshot` when it is that agent's current
+home authority. Transport placement and durable identity ownership are related,
+but letting them quietly impersonate each other would be a very efficient way
+to smear agent selfhood across the mesh.
+
+Receiving hotels now also persist that provenance into session runtime state.
+When agent-directed work is delivered locally, the hotel decorates it with
+delivery context like `delivery_hotel`, `delivery_node_id`, and the concrete
+target guest/role, then records that beside `authority_hotel` in session
+summary. That makes home ownership vs current execution placement visible in
+runtime truth and canonical session snapshots instead of leaving it trapped in
+one inbound payload.
+
+Those placement records now also carry explicit marker typing. Runtime
+provenance should include at least a `marker_kind`, `marker_source`, and
+`marker_strength`, and now an inferred `placement_risk_level`, so the hotel can
+distinguish transport continuity markers from role-handoff markers, receptor
+ingress markers, or later routing enzymes, and also tell how much placement
+authority and remote-execution trust that marker should have. A marker is more
+useful when you know not just where it points, but what biological process
+expressed it, how strongly it should count, and what risk posture it implies.
+
+That provenance now influences local runtime behavior too. When a session has
+no live active incarnation, or its recorded active incarnation is stale, the
+hotel may prefer the persisted local `delivery_target_guest_id` for delivery or
+materialization before falling back to a generic orchestrator choice. In other
+words, placement is no longer just remembered; it is beginning to matter.
+
+This is a freshness-based hint, not a second lease system. Persisted local
+placement gets a bounded lifetime and should undergo apoptosis when it goes
+stale or is superseded by newer placement truth. The point is not to crown a
+new exclusive holder; it is to keep useful local continuity briefly alive
+without letting old placement memories haunt the runtime forever.
+
+Different marker classes should not all age like the same tissue. A
+`receptor_ingress` marker is usually just a short-lived clue about where an
+incoming turn happened to land, so it should have a shorter half-life than a
+`transport_continuity` marker that was expressed specifically to carry agent
+placement across hotels. `role_handoff` markers can reasonably live a little
+longer because they encode an intentional operator or workflow move rather than
+an incidental ingress stain.
+
+They should not all resolve conflict the same way either. A fresh
+`active_incarnation_id` update should kill older `receptor_ingress` placement
+markers immediately, because those are weak local hints. But explicit
+`transport_continuity` and `role_handoff` markers can remain valid under that
+same conflict and keep steering fallback or parking toward their persisted
+guest, because they encode stronger continuity or intentional movement rather
+than a transient receptor signal.
+
+Strength should also shape whether a marker can trigger parking or
+rematerialization on its own. A weak `receptor_ingress` clue is good enough to
+steer delivery to a live local guest, but not good enough to request local
+parking/materialization when no such guest is currently expressed. Medium or
+strong continuity markers can keep that placement claim longer, because they
+are closer to deliberate continuity than incidental ingress.
+
+That posture should now also constrain execution reach, not just placement.
+An elevated-risk placement marker should not cause the hotel to advertise
+remote execution paths as if the session were fully trusted mesh-local
+continuity. Rights do not change, but the projected execution posture can
+narrow: elevated-risk sessions can be forced into local-only execution until a
+stronger continuity or handoff marker is expressed.
+
+That narrowing is now beginning to split by right class rather than one blunt
+switch. A guarded session can still be allowed to use remote model/component
+execution while denying remote tool execution and shrinking credential scope.
+The hotel still owns grants; posture only narrows how far those grants may
+reach in the current session.
+
+Naming note: the fast, posture-derived behaviors should be called
+`reflexes`. In runtime projection this now shows up as `effective_reflexes`
+with fields like `remote_tool_reflex`, `remote_component_reflex`, and
+`credential_scope_reflex`. The older `effective_right_policy` projection can
+remain as a transitional compatibility bridge, but reflexes are the intended
+operator-facing language for these quick risk/posture responses.
+
+Reflexes should also be governable, not just inferred. The first honest shape
+for that is lightweight session-level reflex records:
+
+- `reflex_overrides` for explicit operator or workflow damping/amplification
+- `reflex_evaluations` for why a reflex fired, was overridden, or should later
+  be revised
+
+Those records do not replace grants. They explain and adjust the fast posture
+layer that sits downstream of grants.
+
+The next honest step is to stop treating those records like two detached JSON
+organs and give them policy shape. Runtime projection should therefore surface
+an `effective_reflex_policy` with ordered layers:
+
+- an inferred `placement_inferred` layer from runtime provenance
+- optional hotel-projected `hotel_default` layers from bindings
+- optional agent-graph `agent_learned` layers projected from durable learned
+  reflex preferences
+- optional explicit `reflex_policy_records` for session-scoped override layers
+  with `policy_scope`, `policy_source`, `origin_class`, `precedence`, and
+  `reflexes`
+- a highest-precedence-wins merge rule that projects the final
+  `effective_reflexes`
+
+That keeps hotel inference, operator damping, and future agent-learned reflexes
+in one governable stack instead of quietly relying on merge order as policy.
+
+The first durable home for learned reflex posture should be the agent graph, not
+the hotel. In the current slice that means mesh-synced `reflex_preferences`
+records in the agent graph project into session bindings as `agent_learned`
+layers inside `effective_reflex_policy`. The hotel still owns grants and
+effective key rings; it merely projects the agent-owned learned posture into the
+runtime stack it enforces.
+
+Approved routing/reflex refinement should also be able to write back into that
+agent-owned layer. The current slice now makes that bridge first-class:
+
+- `routing.policy.propose` remains approval-gated, but now stores a durable
+  `routing_policy` record in the hotel graph instead of smuggling routing
+  posture through the general `rule` substrate
+- the routing-specific record carries explicit `operator_disposition` state and
+  durable `evaluations`, so write-back and later governance no longer rely on
+  narrative prose alone
+- when the approved proposal carries an explicit learned reflex payload, hotel
+  IPC writes that payload into agent-graph `reflex_preferences`
+- the same turn still records a local `reflex_evaluations` event, but the
+  routing-policy artifact now also keeps its own durable audit trail
+
+That is still not the whole governance story, but it turns approved refinement
+into actual durable agent posture plus durable routing-policy provenance rather
+than a very literate backlog item.
+
+The next necessary refinement after first-class storage is real later-life
+governance. Routing-policy records should not be frozen at birth approval.
+The current slice therefore adds:
+
+- hotel control-plane listing of agent-scoped routing-policy records
+- explicit later disposition updates such as `approved` -> `rejected`
+- durable evaluation append on each disposition change so operator review leaves
+  the same kind of antigen marker as write-back outcomes
+
+That keeps routing policy governance from collapsing into “whatever happened at
+tool execution time must remain true forever,” which is emotionally relatable
+but architecturally terrible.
+
+The next step after later-life control is enforcement. A rejected routing-policy
+artifact linked to a learned reflex preference should actually inhibit that
+`agent_learned` layer during hotel binding assembly. The current slice now does
+that:
+
+- hotel snapshot assembly checks the latest routing-policy disposition for each
+  linked `learned_reflex_preference_key`
+- rejected disposition suppresses that `agent_learned` reflex layer from
+  `effective_reflex_policy`
+- suppression leaves a visible marker in bindings so the inhibition is
+  inspectable instead of mysteriously biochemical
+
+That gives the hotel a real immune system.
+
+The matching reward system matters too. Approved linked routing-policy
+disposition should do more than merely stop suppressing a reflex; it should
+reinforce the posture the operator is explicitly endorsing. The current slice
+therefore also adds:
+
+- approved disposition applies a small precedence boost to the linked
+  `agent_learned` reflex layer during projection
+- reward leaves an explicit marker in bindings so reinforcement is inspectable
+  too
+
+So the hotel now projects both an immune system and a reward system onto
+agent-owned learned posture, which is much healthier than either permanent
+permission or permanent suspicion.
+
+That reinforcement is no longer just decorative endocrine paperwork. The
+current slice also lets `philote` consume those reward and immune markers while
+ranking competing explicit cognition-stage routing preferences, so approved
+agent-learned reflex posture can gently bias live turn-routing-plan selection
+and rejected posture can dampen it without turning the hotel into a second
+router.
+
+The next shared-catalog step now has a first concrete expression too: the hotel
+graph carries `abstract_model` records as static reference tissue, projects
+those model markers into session bindings, and `philote` consumes them as a
+bounded catalog signal during stage-aware route ranking. That keeps model
+metadata in the shared graph where it can be reused across agents, while still
+making the routing reflex live in the consumer boundary rather than in the
+catalog itself.
+
+The same pattern should carry to tools, skills, and rights at the runner
+boundary. Shared graph records provide static markers, class hints, and policy
+affordances; hotel projection and runner assembly decide what is actually
+expressed, allowed, or dampened in the current session. Otherwise the shared
+catalog quietly turns into a self-authorizing gland, which is both efficient
+and horrifying.
+
+The current slice now makes that pattern real for tools and skills too:
+
+- `abstract_tool` records carry durable `tool_markers` as shared ligands for
+  runner/tool assembly
+- `abstract_skill` records carry `skill_markers` that hotel projection can
+  expose for later workflow and policy consumers
+- hotel snapshot assembly now projects those shared records into bindings as
+  `shared_tool_markers` and `shared_skill_markers`
+- tool assembly consumes shared tool ligands to shape model-visible tool
+  descriptions and input schemas, mark `high_agency` tools as
+  approval-sensitive, and suppress remote-only routing for `local_only` tools
+- those ligands remain advisory tissue only: they do not widen
+  `effective_rights`, mint scoped credentials, or authorize execution on their
+  own
+
+Biology note: the shared graph is acting like a ligand library here, while the
+hotel/runtime boundary is the receptor surface that decides what actually
+binds. That is much healthier than letting the catalog secrete its own
+hormones and call it governance.
+
+In practice, a fresher active-incarnation update is the `p53` check here: if
+the runtime has newer local evidence that the session now belongs on a
+different active guest, older delivery provenance should die immediately rather
+than waiting out its full TTL.
 
 This is dogfood: the mesh sync story for agent portability is proven by the
 same infrastructure everything else depends on. No second sync protocol.
@@ -318,6 +566,46 @@ Two graphs. Two authority domains. Both mesh-synced.
   Revocation flows from the hotel; the agent graph copy becomes stale on
   revocation, not authoritative.
 - When the hotel CG and agent graph disagree on a grant, the hotel CG wins.
+
+### Shared catalogs vs effective grants
+
+This proposal now assumes a third conceptual layer beside the two write
+authorities above:
+
+- a **shared catalog knowledge layer** for models, tools, skills, rights,
+  compatibility edges, and policy templates
+- an **agent overlay layer** in the agent graph for local preferences,
+  learned posture, and cognitive configuration
+- a **hotel effective-state layer** for what is actually granted, bound,
+  materialized, and enforceable right now
+
+The shared catalog layer should not quietly become hotel-owned mutable state
+just because the hotel happens to project parts of it.
+
+The hotel owns the effective key ring:
+
+- which tools/skills/rights are active for this session
+- which bindings are currently projected
+- which scoped credentials or grants are usable right now
+- which runners/controllers are allowed to execute on the agent's behalf
+
+That means lower routing/execution layers consume an already-authorized
+envelope. They do not mint rights, widen grants, or invent new effective
+capabilities mid-turn.
+
+Transitional note:
+
+- current session bindings may temporarily carry projections derived from both
+  hotel state and agent-owned overlay state
+- that relay path does not make the hotel the conceptual owner of the overlay
+- it also does not make downstream routers the owner of rights
+- the first enforcement slice is now live: hotel snapshots project an explicit
+  `effective_rights` key ring for tools, skills, and component capabilities, and
+  lower tool/component assembly paths consume that key ring instead of widening
+  visibility just because a runner or route exists
+- the first shared rights catalog slice is now live too: rights are becoming
+  shared reference knowledge in their own right, instead of existing only as
+  strings projected into session bindings
 
 ---
 
@@ -451,6 +739,11 @@ leaves the system in a working state.
 - Export surface on `AgentGraphStorage` trait: snapshot → serialized payload
 - Import surface: apply incoming snapshot with LWW conflict resolution
 - Wire into existing mesh CRDT transport (no new sync protocol)
+- Opportunistically carry `agent_graph_snapshot` on transported agent-directed
+  task payloads when the source hotel knows the owning agent, but only attach
+  that snapshot when the source hotel is the agent's `authority_hotel`; routed
+  payloads should carry both `agent_id` and `authority_hotel`, and the
+  receiving hotel hydrates the snapshot before local delivery
 - Agent portability proof: agent routed to remote hotel, graph follows via mesh
 - Two-tier authority invariant tests: hotel CG wins on grant conflicts
 

@@ -1,7 +1,10 @@
 [workspace]
 members = [
     "crates/aiua",
+    "crates/membrane-mcp",
     "crates/membrane",
+    "crates/membrane-discord",
+    "crates/membrane-telegram",
     "crates/philote",
     "crates/model-router",
     "crates/onnx-runner",
@@ -14,5 +17,13 @@ members = [
     "crates/graph-runner",
     "crates/philotic-sandbox",
     "crates/mlx-runner",
+    "crates/media-prep",
+    "crates/graph-intelligence",
+    "crates/philotic-graph",
+    "crates/datasource",
+    "crates/graph-datasource",
+    "crates/router-listener",
+    "crates/parakeet-runner",
+    "crates/table-datasource",
 ]
 resolver = "2"

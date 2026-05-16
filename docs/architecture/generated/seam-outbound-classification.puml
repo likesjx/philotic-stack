@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - outbound-classification
+
+rectangle "outbound-classification" as outbound_classification #Orange {
+}
+
+
+@enduml

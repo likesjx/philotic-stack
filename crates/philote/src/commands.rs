@@ -62,6 +62,12 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
             usage_hint: Some("/tts [on|off|auto]".into()),
         },
         CommandManifestEntry {
+            command: "voice".into(),
+            description: "Switch voice provider (and optionally voice ID) for this session."
+                .into(),
+            usage_hint: Some("/voice [kokoro|elevenlabs|openai] [voice_id]".into()),
+        },
+        CommandManifestEntry {
             command: "preapprove".into(),
             description: "Pre-approve a tool or class for this session.".into(),
             usage_hint: Some("/preapprove <tool|class> | this-session".into()),
@@ -70,6 +76,12 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
             command: "approval".into(),
             description: "Show or reset the session approval policy.".into(),
             usage_hint: Some("/approval status | reset".into()),
+        },
+        CommandManifestEntry {
+            command: "correct".into(),
+            description: "Submit a correction for the most recent transcription (Whisper flywheel)."
+                .into(),
+            usage_hint: Some("/correct <turn_id> <corrected text>".into()),
         },
     ]
 }
@@ -97,7 +109,19 @@ pub enum SlashCommand {
     Preapprove { name: String },
     ApprovalStatus,
     ApprovalReset,
+    /// Explicitly cancel a parked approval turn, unblocking the session and notifying the original chat.
+    ApprovalClear { reason: Option<String> },
     Tts { mode: Option<String> },
+    /// Switch voice provider (and optionally voice ID) for this session.
+    Voice {
+        provider: Option<String>,
+        voice_id: Option<String>,
+    },
+    /// Submit a corrected transcript for a Whisper turn — feeds the training flywheel.
+    Correct {
+        turn_id: String,
+        text: String,
+    },
 }
 
 impl SlashCommand {
@@ -123,14 +147,18 @@ impl SlashCommand {
             Self::PreapproveThisSession
             | Self::Preapprove { .. }
             | Self::ApprovalStatus
-            | Self::ApprovalReset => None,
+            | Self::ApprovalReset
+            | Self::ApprovalClear { .. } => None,
             Self::Tts { .. } => None,
+            Self::Voice { .. } => None,
+            Self::Correct { .. } => None,
         }
     }
 
     pub fn steering_note(&self) -> Option<&str> {
         match self {
             Self::Approve { note } | Self::Deny { note } => note.as_deref(),
+            Self::Correct { text, .. } => Some(text.as_str()),
             _ => None,
         }
     }
@@ -181,11 +209,39 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         }),
         ["/approval", "status", ..] => Some(SlashCommand::ApprovalStatus),
         ["/approval", "reset", ..] => Some(SlashCommand::ApprovalReset),
+        ["/approval", "clear", rest @ ..] => Some(SlashCommand::ApprovalClear {
+            reason: join_command_note(rest),
+        }),
         ["/tts"] => Some(SlashCommand::Tts { mode: None }),
         ["/tts", mode, ..] => Some(SlashCommand::Tts {
             mode: Some((*mode).to_string()),
         }),
+        ["/voice"] => Some(SlashCommand::Voice {
+            provider: None,
+            voice_id: None,
+        }),
+        ["/voice", provider] => Some(SlashCommand::Voice {
+            provider: Some(normalize_voice_provider(provider)),
+            voice_id: None,
+        }),
+        ["/voice", provider, voice_id, ..] => Some(SlashCommand::Voice {
+            provider: Some(normalize_voice_provider(provider)),
+            voice_id: Some((*voice_id).to_string()),
+        }),
+        ["/correct", turn_id, rest @ ..] if !rest.is_empty() => Some(SlashCommand::Correct {
+            turn_id: (*turn_id).to_string(),
+            text: rest.join(" "),
+        }),
         _ => None,
+    }
+}
+
+fn normalize_voice_provider(raw: &str) -> String {
+    match raw.to_lowercase().as_str() {
+        "kokoro" | "onnx" | "local" => "onnx".into(),
+        "elevenlabs" | "eleven" | "11labs" => "elevenlabs".into(),
+        "openai" | "tts" => "openai".into(),
+        other => other.to_string(),
     }
 }
 
@@ -310,6 +366,38 @@ mod tests {
             parse_slash_command("/abandon could not complete the task"),
             Some(SlashCommand::Abandon {
                 reason: Some("could not complete the task".into())
+            })
+        );
+    }
+
+    #[test]
+    fn parses_voice_command() {
+        assert_eq!(
+            parse_slash_command("/voice local"),
+            Some(SlashCommand::Voice {
+                provider: Some("onnx".into()),
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice elevenlabs"),
+            Some(SlashCommand::Voice {
+                provider: Some("elevenlabs".into()),
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice"),
+            Some(SlashCommand::Voice {
+                provider: None,
+                voice_id: None,
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/voice kokoro af_heart"),
+            Some(SlashCommand::Voice {
+                provider: Some("onnx".into()),
+                voice_id: Some("af_heart".into()),
             })
         );
     }

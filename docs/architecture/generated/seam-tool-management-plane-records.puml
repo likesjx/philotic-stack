@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - tool-management-plane-records
+
+rectangle "tool-management-plane-records" as tool_management_plane_records #Orange {
+}
+
+
+@enduml

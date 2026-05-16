@@ -19,10 +19,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use ansible_mesh_core::agent_graph_storage::SqliteAgentGraphStorage;
+use anyhow::{Context, Result};
 use clap::Parser;
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::json;
 use tracing::{error, info, warn};
 
@@ -38,8 +38,7 @@ fn guest_id() -> String {
 }
 
 fn ipc_socket() -> String {
-    std::env::var("PHILOTIC_IPC_SOCKET")
-        .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".into())
+    std::env::var("PHILOTIC_IPC_SOCKET").unwrap_or_else(|_| "/tmp/philotic-aiua.sock".into())
 }
 
 fn db_path() -> PathBuf {
@@ -87,8 +86,7 @@ async fn main() -> Result<()> {
     );
 
     if let Some(parent) = db.parent() {
-        std::fs::create_dir_all(parent)
-            .context("Failed to create agent graph db directory")?;
+        std::fs::create_dir_all(parent).context("Failed to create agent graph db directory")?;
     }
 
     let storage = Arc::new(
@@ -155,7 +153,10 @@ async fn handle_inbound_task(
     storage: &SqliteAgentGraphStorage,
     client: &mut PhiloticClient,
 ) {
-    let IpcResponse::InboundTask { task_json, task_id, .. } = msg else {
+    let IpcResponse::InboundTask {
+        task_json, task_id, ..
+    } = msg
+    else {
         return;
     };
 
@@ -175,7 +176,12 @@ async fn handle_inbound_task(
 
     let args = task.get("args").cloned().unwrap_or_else(|| json!({}));
 
-    info!(agent_id, guest_id, tool = tool_name, "agent.graph tool call");
+    info!(
+        agent_id,
+        guest_id,
+        tool = tool_name,
+        "agent.graph tool call"
+    );
 
     let result_str = tools::dispatch(storage, tool_name, &args, agent_id);
     let result_json: serde_json::Value =

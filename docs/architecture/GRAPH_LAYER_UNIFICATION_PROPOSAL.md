@@ -1,30 +1,30 @@
 ---
-title: "Graph Layer Unification"
+title: Graph Layer Unification
 doc_type: proposal
 domain: runtime-sessions
 status: proposed
-last_updated: 2026-03-22
+last_updated: 2026-03-31
 tags:
-  - graph
-  - storage
-  - refactor
-  - graph-adapter
-  - graph-domain
-  - context-graph
-  - active-seam
+- graph
+- storage
+- refactor
+- graph-adapter
+- graph-domain
+- context-graph
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - AGENT_RESOURCE_MODEL_PROPOSAL.md
-  - CONTEXT_GRAPH_RUNNER_PROPOSAL.md
-  - TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- AGENT_RESOURCE_MODEL_PROPOSAL.md
+- CONTEXT_GRAPH_RUNNER_PROPOSAL.md
+- TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: graph-layer-unification
 active_seams:
-  - graph-domain-layer
-  - graph-adapter-migration
-  - graph-store-instances
+- graph-domain-layer
+- graph-adapter-migration
+- graph-store-instances
 ---
 
 # Graph Layer Unification

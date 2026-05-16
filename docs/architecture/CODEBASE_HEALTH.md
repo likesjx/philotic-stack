@@ -1,6 +1,20 @@
+---
+title: Codebase Health Assessment
+doc_type: reference
+domain: governance
+status: active
+last_updated: 2026-03-31
+tags:
+- health
+- metrics
+- automation
+related_docs:
+- ARCHITECTURE_STATUS.md
+---
+
 # Philotic Stack — Codebase Health Assessment
 
-> **Status:** Living Document | **Last Updated:** 2026-03-10
+> **Status:** Living Document | **Last Updated:** 2026-03-26
 > Generated from full static analysis of the codebase at commit `681d892`.
 
 ---

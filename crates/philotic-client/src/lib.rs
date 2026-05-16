@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
+pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
 pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
 };
-pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
 pub use ansible_mesh_core::storage::ComponentManifest;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -45,14 +45,31 @@ pub struct OperatorAgentView {
     pub agent_id: String,
     pub persona_name: String,
     pub authority_hotel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_context_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_workspace: Option<String>,
     #[serde(default)]
     pub toolset_tags: Vec<String>,
     #[serde(default)]
     pub default_toolset: Vec<String>,
     #[serde(default)]
     pub default_skillset: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_route_policy: Option<ResponseRoutePolicyView>,
     #[serde(default)]
     pub active_session: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseRoutePolicyView {
+    pub default_route: String,
 }
 
 pub type DesktopMembraneAgentView = OperatorAgentView;
@@ -213,6 +230,11 @@ pub struct TaskErrorPayload {
     pub capability: Option<String>,
     #[serde(default)]
     pub retryable: Option<bool>,
+    /// Narrow error subtype for precise routing decisions.
+    /// Values: "network_error", "streaming_timeout", "rate_limit",
+    /// "provider_error", "content_error", "empty_response".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_kind: Option<String>,
 }
 
 impl TaskErrorPayload {
@@ -230,6 +252,7 @@ impl TaskErrorPayload {
             provider: provider.map(str::to_string),
             capability: capability.map(str::to_string),
             retryable: None,
+            sub_kind: None,
         }
     }
 
@@ -248,6 +271,7 @@ impl TaskErrorPayload {
             capability: Some(tool_name),
             provider: None,
             retryable: Some(false),
+            sub_kind: None,
         }
     }
 
@@ -265,6 +289,7 @@ impl TaskErrorPayload {
             provider: None,
             capability: None,
             retryable: Some(true),
+            sub_kind: None,
         }
     }
 
@@ -278,6 +303,7 @@ impl TaskErrorPayload {
             provider: None,
             capability: None,
             retryable: Some(true),
+            sub_kind: None,
         }
     }
 
@@ -517,6 +543,79 @@ impl LeaseEnvelope {
     }
 }
 
+/// How the receiving philote's response should be handled when it arrives
+/// back at the emitter. Declared at dispatch time by the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParacrineRouting {
+    /// Feed the response into a model cognitive re-entry. If an active turn
+    /// exists, inject as enriched context; otherwise start a synthesis turn.
+    #[default]
+    CognitiveReEntry,
+    /// Replace the "paracrine dispatched" placeholder tool result with the real
+    /// response and re-enter the model as if the tool call completed normally.
+    EnrichedToolResult,
+    /// Structured retrieval payload — inject into a named context slot on the
+    /// session. No model invocation unless explicitly requested.
+    DatasourceInjection,
+    /// Memory recall result — push into the session's memory window.
+    MemoryEnrichment,
+    /// Mid-turn progress note — emit partial content to membrane without
+    /// interrupting or closing the active turn.
+    ProgressUpdate,
+    /// Lightweight status ping. No model involvement; just ACK and update
+    /// pending lookaside state.
+    Heartbeat,
+    /// Forward the response content directly to membrane. No model loop.
+    RawForward,
+    /// Arbiter-promoted re-entry: queue at the FRONT of pending_user_tasks so the
+    /// orchestrator processes it next, ahead of any already-queued messages.
+    PriorityReEntry,
+    /// Operator approval decision for a parked turn. The receiving philote restores
+    /// the parked turn and applies the resolution (approve or deny) without re-entering
+    /// the model loop. Carries `decision` ("approved"/"denied") and optional `note`.
+    ApprovalResolution,
+}
+
+/// Paracrine message envelope — the vesicle a philote secretes when performing a
+/// paracrine dispatch. Carries the prompt and optional context to the receiving
+/// philote, which endocytoses it as a `paracrine_request` inbound task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Exosome {
+    /// The prompt or model-request content for the specialist.
+    pub prompt: String,
+    /// Optional structured context (e.g. session excerpt, tool results).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+    /// Runtime-assigned correlation ID. Ties the `paracrine_response` back to
+    /// the originating turn and threads through the full thought graph for
+    /// cross-mesh provenance. Always set by the emitting philote; never dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_id: Option<String>,
+    /// How the receiving philote's response should be handled when it arrives
+    /// back at the emitter. Declared at dispatch time by the caller.
+    /// Defaults to [`ParacrineRouting::CognitiveReEntry`] if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_routing: Option<ParacrineRouting>,
+    /// The session_id of the conversation that triggered this paracrine.
+    /// Carried through so the specialist's response can be routed back to the
+    /// correct session (e.g. a Telegram session rather than an ephemeral one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+    /// The chat_id (Telegram / membrane channel) of the originating conversation.
+    /// Used by the routing reflex to deliver the specialist's reply to the right channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<String>,
+}
+
+fn default_training_limit() -> usize {
+    20
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
@@ -618,10 +717,35 @@ pub enum IpcRequest {
     ReleaseDesktopMembraneLease {
         lease_key: String,
     },
+    AcquireDiscordGatewayLease {
+        lease_key: String,
+        agent_id: String,
+    },
+    GetDiscordGatewayLeaseOwner {
+        lease_key: String,
+    },
+    RenewDiscordGatewayLease {
+        lease_key: String,
+        agent_id: String,
+        lease_epoch: u64,
+    },
+    ReleaseDiscordGatewayLease {
+        lease_key: String,
+    },
     HandoffToRole {
         session_id: String,
         role_name: String,
         handoff_bundle: HandoffBundle,
+    },
+    /// Pin or unpin a role to a specific home hotel.
+    /// `target_hotel: None` clears the pin (role runs on authority hotel).
+    SetRoleHome {
+        agent_id: String,
+        role_name: String,
+        /// The calling role — authority check (orchestrator or admin only).
+        calling_role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_hotel: Option<String>,
     },
     HandoffBack {
         session_id: String,
@@ -724,9 +848,33 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persona_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        soul_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_context_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        import_workspace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         default_toolset: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_skillset: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_route_policy: Option<ResponseRoutePolicyView>,
+    },
+    /// Get the hotel-scoped user profile.
+    GetUserProfile {
+        hotel_name: String,
+    },
+    /// Patch the hotel-scoped user profile. Only provided fields are updated.
+    PatchUserProfile {
+        hotel_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timezone: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     /// List all registered skills with their validation states.
     ListSkills {},
@@ -786,6 +934,27 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window_policy: Option<String>,
     },
+    /// Execute a governed workflow through the hotel's workflow plane.
+    ExecuteWorkflow {
+        workflow_name: String,
+        agent_id: String,
+        /// The active persona role of the calling agent (e.g. "orchestrator").
+        calling_role: String,
+        arguments: serde_json::Value,
+    },
+    /// Ask the local hotel authority to create a signed mesh invite.
+    CreateMeshInvite {
+        hotel_name: String,
+        mesh_host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_secs: Option<u64>,
+    },
+    /// Ask the local hotel authority to verify an invite, sign a join request, and dispatch it.
+    AcceptMeshInvite {
+        hotel_name: String,
+        mesh_host: String,
+        invite_json: String,
+    },
     /// Write a config value to the hotel's context graph (operator/management only).
     SetConfig {
         key: String,
@@ -821,11 +990,64 @@ pub enum IpcRequest {
         description: String,
         rationale: String,
     },
+    RecordRoutingPolicyProposal {
+        agent_id: String,
+        problem: String,
+        proposed_change: String,
+        evidence: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affected_stage: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affected_capability: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        learned_reflex_preference_key: Option<String>,
+    },
+    ListRoutingPolicies {
+        agent_id: String,
+    },
     /// List all durable rules owned by the given agent.
     ///
     /// Responds with [`IpcResponse::RuleList`].
     ListRules {
         agent_id: String,
+    },
+    /// Upsert one learned reflex preference into the agent graph.
+    ///
+    /// Used by approved routing/reflex refinement flows to write durable
+    /// adaptive posture into agent-owned state without turning rule records
+    /// into stealth policy storage.
+    UpsertAgentReflexPreference {
+        agent_id: String,
+        preference_key: String,
+        precedence: i32,
+        reflexes_json: serde_json::Value,
+        config_json: serde_json::Value,
+    },
+    /// Record one successful same-self role handoff observation and let the hotel
+    /// fold it into agent-owned reflex posture without making philote read/modify/write
+    /// the agent graph directly.
+    RecordRoleHandoffReflexEvidence {
+        agent_id: String,
+        role_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_trigger_class: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_turn: Option<String>,
+    },
+    AppendRoutingPolicyEvaluation {
+        proposal_id: String,
+        evaluation_kind: String,
+        decision: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_tool: Option<String>,
+    },
+    SetRoutingPolicyDisposition {
+        proposal_id: String,
+        state: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_tool: Option<String>,
     },
     /// Agent declares a need for a resource; hotel responds with
     /// [`IpcResponse::ResourceGranted`], [`IpcResponse::ResourceDenied`], or
@@ -876,6 +1098,15 @@ pub enum IpcRequest {
     RestartComponent {
         guest_id: String,
     },
+    /// Remove a registered component entirely.
+    ///
+    /// The hotel terminates the running process if present, deletes the guest record,
+    /// and removes the stored `component:{guest_id}` config blob.
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    RemoveComponent {
+        guest_id: String,
+    },
     /// Inject a remote node incarnation into the local node registry.
     ///
     /// Used in smoke / integration tests to simulate mesh discovery without
@@ -918,6 +1149,184 @@ pub enum IpcRequest {
     DisableCronJob {
         job_id: CronJobId,
     },
+    // ── MCP membrane IPC ──────────────────────────────────────────────────────
+    /// Acquire the singleton MCP membrane lease for a given port.
+    ///
+    /// Responds with [`IpcResponse::McpMembraneLease`].
+    AcquireMcpMembraneLease {
+        lease_key: String,
+        port: u16,
+    },
+    /// Renew an active MCP membrane lease.
+    RenewMcpMembraneLease {
+        lease_key: String,
+        lease_epoch: u64,
+    },
+    /// Release the MCP membrane lease.
+    ReleaseMcpMembraneLease {
+        lease_key: String,
+    },
+    /// Push an updated route set for one agent to the membrane.
+    ///
+    /// The membrane replaces all routes owned by `agent_id` with `routes` (LWW).
+    /// Responds with [`IpcResponse::McpRoutesAccepted`].
+    UpdateMcpRoutes {
+        agent_id: String,
+        routes: Vec<ansible_mesh_core::mcp_route::McpRouteRecord>,
+    },
+    /// Remove all routes owned by an agent from the membrane.
+    RevokeMcpRoutes {
+        agent_id: String,
+    },
+    /// Declare or update a full MCP endpoint configuration.
+    ///
+    /// The hotel stores the config, fans out an `update_mcp_config` push to
+    /// the relevant membrane-mcp guest, and records pre-approval rules.
+    /// Responds with [`IpcResponse::McpEndpointProvisioned`].
+    ProvisionMcpEndpoint {
+        config: ansible_mesh_core::mcp_endpoint::McpEndpointConfig,
+    },
+    /// Tear down an MCP endpoint and remove its config.
+    ///
+    /// The hotel fans out a `revoke_mcp_config` push and clears stored state.
+    /// Only the `owner_agent_id` that provisioned the endpoint may revoke it.
+    RevokeMcpEndpoint {
+        endpoint_id: String,
+        owner_agent_id: String,
+    },
+    // ── Training data admin IPC ───────────────────────────────────────────────
+    /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
+    ListTrainingSamples {
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default = "default_training_limit")]
+        limit: usize,
+        #[serde(default)]
+        filter: ansible_mesh_core::whisper_training::TrainingFilter,
+    },
+    /// Apply an operator correction to a training sample. Responds with [`IpcResponse::Standard`].
+    CorrectTrainingSample {
+        turn_id: String,
+        corrected_transcript: String,
+    },
+    /// Export eligible samples to a file. Responds with [`IpcResponse::Standard`] (data.exported_count).
+    ExportTrainingSamples {
+        format: ansible_mesh_core::whisper_training::TrainingExportFormat,
+        output_path: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Return aggregate counts by state. Responds with [`IpcResponse::Standard`] (data.status).
+    GetTrainingStatus {
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    // ── ASR provider lifecycle ────────────────────────────────────────────────
+    /// Set up the Parakeet ASR provider: verify/install nemo-toolkit, write
+    /// component config, and register the guest for materialization.
+    /// Responds with [`IpcResponse::Standard`] (data.message).
+    AsrSetup {
+        /// Python interpreter path (default: "python3").
+        #[serde(default)]
+        python_path: Option<String>,
+        /// NeMo model name (default: nvidia/parakeet-tdt-0.6b-v2).
+        #[serde(default)]
+        model_name: Option<String>,
+        /// If true, attempt `pip install nemo-toolkit[asr]` when the import check fails.
+        #[serde(default = "default_true")]
+        auto_install: bool,
+    },
+    /// Return the current status of the Parakeet ASR provider (guest active, nemo available).
+    /// Responds with [`IpcResponse::Standard`] (data.status).
+    AsrStatus {},
+    /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
+    /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
+    GracefulShutdown {
+        drain_timeout_secs: u64,
+    },
+    /// Fire-and-forget paracrine dispatch from one agent to a specialist role.
+    ParacrineEmit {
+        /// Target role name (e.g. "theoretician").
+        role: String,
+        /// The message envelope to deliver.
+        exosome: Exosome,
+        /// Node to route the specialist's response to.
+        reply_to_node: String,
+        /// Role at that node ("membrane", "agent", etc.).
+        reply_to_role: String,
+        /// Materialisation timeout for the target role. `None` uses the hotel default.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// Return a safe view of hotel state: hotel name, active guests, agent identities.
+    /// No secret or credential values are included.
+    GetHotelStatus,
+    /// Return the last `lines` lines from the hotel's log file.
+    GetHotelLogs {
+        lines: u32,
+    },
+    // ── User Task Engine IPC ──────────────────────────────────────────────────
+    /// Create a new durable user task in the hotel context graph.
+    /// Responds with [`IpcResponse::UserTaskCreated`].
+    CreateUserTask {
+        task_id: String,
+        session_id: String,
+        agent_id: String,
+        chat_id: String,
+        goal: String,
+        approved_risk_ceiling: String,
+        planning_model_tier: u8,
+        #[serde(default)]
+        quiet: bool,
+    },
+    /// Update the top-level status and optional plan fields of a user task.
+    /// Responds with [`IpcResponse::UserTaskUpdated`].
+    UpdateUserTask {
+        task_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        steps_json: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_step_idx: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_note: Option<String>,
+    },
+    /// Update a single step within a user task (status, output, error).
+    /// Responds with [`IpcResponse::UserTaskUpdated`].
+    UpdateUserTaskStep {
+        task_id: String,
+        step_idx: usize,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Retrieve a single user task by ID.
+    /// Responds with [`IpcResponse::UserTaskData`].
+    GetUserTask {
+        task_id: String,
+    },
+    /// List user tasks, optionally filtered by session_id and/or agent_id.
+    /// Responds with [`IpcResponse::UserTaskList`].
+    ListUserTasks {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+    },
+}
+
+/// Payload for [`IpcResponse::UserProfileData`].
+///
+/// MUST use `deny_unknown_fields` so that `#[serde(untagged)]` deserialization rejects
+/// objects with unrecognised fields (e.g. `{ "config_json": "..." }`) instead of
+/// silently consuming them as `UserProfileData { timezone: None, display_name: None }`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UserProfileDataPayload {
+    pub timezone: Option<String>,
+    pub display_name: Option<String>,
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -988,6 +1397,12 @@ pub enum IpcResponse {
         handoff_guest_id: String,
         became_active: bool,
     },
+    HandoffPending {
+        role_name: String,
+        readiness: String,
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
+    },
     HandoffBackAck {
         handoff_guest_id: String,
         became_active: bool,
@@ -1042,6 +1457,18 @@ pub enum IpcResponse {
     ConfigureRoleOk {
         role_name: String,
     },
+    /// Response to [`IpcRequest::SetRoleHome`].
+    RoleHomeSet {
+        role_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home_node: Option<String>,
+    },
+    /// Response to [`IpcRequest::ExecuteWorkflow`].
+    WorkflowExecutionOk {
+        workflow_name: String,
+        #[serde(default)]
+        result: serde_json::Value,
+    },
     Error(String),
     Standard {
         ok: bool,
@@ -1063,6 +1490,12 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ProposeRule`].
     RuleProposed {
         rule_id: String,
+    },
+    RoutingPolicyRecorded {
+        proposal_id: String,
+    },
+    RoutingPolicyList {
+        policies: Vec<serde_json::Value>,
     },
     /// Response to [`IpcRequest::ListRules`].
     RuleList {
@@ -1107,9 +1540,68 @@ pub enum IpcResponse {
     CronJobList {
         jobs: Vec<CronJob>,
     },
+    // ── MCP membrane IPC responses ────────────────────────────────────────────
+    /// Response to [`IpcRequest::AcquireMcpMembraneLease`] /
+    /// [`IpcRequest::RenewMcpMembraneLease`].
+    McpMembraneLease {
+        mcp_granted: bool,
+        mcp_lease: Option<LeaseEnvelope>,
+    },
+    /// Response to [`IpcRequest::UpdateMcpRoutes`].
+    McpRoutesAccepted {
+        mcp_routes_agent_id: String,
+        mcp_route_count: usize,
+    },
+    /// Response to [`IpcRequest::ProvisionMcpEndpoint`] /
+    /// [`IpcRequest::RevokeMcpEndpoint`].
+    McpEndpointProvisioned {
+        endpoint_id: String,
+        port: u16,
+        /// `true` if a new membrane-mcp guest was spawned; `false` if an
+        /// existing guest's config was updated in place.
+        materialized: bool,
+    },
+    DiscordGatewayLease {
+        granted: bool,
+        lease: Option<LeaseEnvelope>,
+    },
+    DiscordGatewayLeaseStatus {
+        active: bool,
+        lease: Option<LeaseEnvelope>,
+    },
+    /// Sent from hotel to guests during graceful shutdown. Guests should drain
+    /// in-flight work and exit within `drain_timeout_secs`.
+    GracefulShutdown {
+        drain_timeout_secs: u64,
+    },
+    /// Hotel → guest: network reachability state changed.
+    /// Pushed without a corresponding request. Guests should pause outbound connections
+    /// (e.g. long-polling) when `online=false` and resume when `online=true`.
+    NetworkState {
+        online: bool,
+    },
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.
     ///
+    /// Response to [`IpcRequest::GetUserProfile`] and [`IpcRequest::PatchUserProfile`].
+    ///
+    /// NOTE: `UserProfileDataPayload` uses `#[serde(deny_unknown_fields)]`, which causes
+    /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
+    /// This prevents this variant from swallowing `MemoryConfig` responses.
+    UserProfileData(UserProfileDataPayload),
+    UserTaskCreated {
+        user_task_id: String,
+    },
+    UserTaskUpdated {
+        user_task_id: String,
+        user_task_updated: bool,
+    },
+    UserTaskData {
+        user_task_json: String,
+    },
+    UserTaskList {
+        user_tasks: Vec<serde_json::Value>,
+    },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
@@ -1309,6 +1801,13 @@ impl PhiloticClient {
         )
     }
 
+    fn is_ignorable_push(response: &IpcResponse) -> bool {
+        matches!(
+            response,
+            IpcResponse::UserProfileData(_) | IpcResponse::NetworkState { .. }
+        )
+    }
+
     /// Poll for inbound tasks routed from the Philotic Web
     pub async fn recv_task(&mut self) -> Result<IpcResponse> {
         if let Some(pending) = self.pending_push.pop_front() {
@@ -1319,6 +1818,9 @@ impl PhiloticClient {
             let resp = self.read_response().await?;
             if Self::is_push_message(&resp) {
                 return Ok(resp);
+            }
+            if Self::is_ignorable_push(&resp) {
+                continue;
             }
             anyhow::bail!(
                 "Unexpected non-push IPC response while waiting for inbound task: {:?}",
@@ -1384,6 +1886,7 @@ mod tests {
             provider: Some("elevenlabs".into()),
             capability: Some("voice.synthesize".into()),
             retryable: Some(false),
+            sub_kind: None,
         };
 
         let rendered = payload.display_message();

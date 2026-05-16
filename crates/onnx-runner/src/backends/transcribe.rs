@@ -165,10 +165,9 @@ impl WhisperBackend {
             // TODO(slice3): eliminate this per-step clone with KV-cache.
             let enc_arr = Array3::from_shape_vec((1, enc_seq, enc_hidden), enc_data.clone())
                 .context("failed to shape encoder_hidden_states")?;
-            let enc_tensor = Tensor::<f32>::from_array(enc_arr)
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to create encoder_hidden_states tensor: {}", e)
-                })?;
+            let enc_tensor = Tensor::<f32>::from_array(enc_arr).map_err(|e| {
+                anyhow::anyhow!("failed to create encoder_hidden_states tensor: {}", e)
+            })?;
 
             let logits_vec = {
                 let mut dec = self
@@ -206,10 +205,7 @@ impl WhisperBackend {
         }
 
         // Step 5 — Decode generated token ids to text (skip the prompt prefix).
-        let generated_ids: Vec<u32> = token_ids[PROMPT_LEN..]
-            .iter()
-            .map(|&t| t as u32)
-            .collect();
+        let generated_ids: Vec<u32> = token_ids[PROMPT_LEN..].iter().map(|&t| t as u32).collect();
 
         let text = self
             .tokenizer

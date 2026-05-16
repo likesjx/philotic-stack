@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - philotic-native-memory-integration
+
+rectangle "philotic-native-memory-integration" as philotic_native_memory_integration #Orange {
+}
+
+
+@enduml

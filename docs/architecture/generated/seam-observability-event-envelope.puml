@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - observability-event-envelope
+
+rectangle "observability-event-envelope" as observability_event_envelope #Orange {
+}
+
+
+@enduml

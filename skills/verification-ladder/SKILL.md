@@ -1,9 +1,13 @@
 ---
 name: verification-ladder
 description: Use this skill when deciding how deeply to validate a change or when explaining confidence in a code change. Trigger for test planning, selecting the right validation rung, or classifying confidence as test-green, smoke-green, or watched-live-green. Do not use this skill for runtime root-cause investigation or Philotic slice close-out unless validation choice is the main task.
+domain: runtime-sessions
+sver: verification-ladder-proposal
 ---
 
 # Verification Ladder
+
+**SVER Source:** [VERIFICATION_LADDER_PROPOSAL](../../docs/architecture/VERIFICATION_LADDER_PROPOSAL.md)
 
 Scope: General.
 
@@ -24,7 +28,24 @@ This skill does not own:
 Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the issue is a live runtime failure.
 Use `philotic-slice-closeout` when the main job is closing a Philotic implementation slice.
 
-## Ladder
+## SVER State Machine
+
+Defined in [VERIFICATION_LADDER_PROPOSAL](../../docs/architecture/VERIFICATION_LADDER_PROPOSAL.md):
+
+```
+PROPOSED → CODE-COMPLETE → TEST-GREEN → SMOKE-GREEN → UAT-GREEN → IMPLEMENTED
+```
+
+| State | Definition | Evidence Required |
+|-------|-----------|-------------------|
+| PROPOSED | Design approved, active seams defined | Proposal document |
+| CODE-COMPLETE | Slice landed, all code committed | Git commits, PR merged |
+| TEST-GREEN | Unit tests pass, coverage thresholds met | Test results, coverage report |
+| SMOKE-GREEN | Integration verified, live validation passes | Smoke test logs |
+| UAT-GREEN | Production validation complete | UAT sign-off |
+| IMPLEMENTED | Architecture doc updated, full traceability | Graph shows complete chain |
+
+## Ladder (Validation Depth)
 
 1. Crate or unit tests
 2. Integration or e2e tests
@@ -51,3 +72,4 @@ Report:
 - what passed
 - what remains unverified
 - the highest honest confidence level
+- current SVER state and evidence links

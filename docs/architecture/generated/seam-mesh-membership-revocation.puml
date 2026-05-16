@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mesh-membership-revocation
+
+rectangle "mesh-membership-revocation" as mesh_membership_revocation #Orange {
+}
+
+
+@enduml

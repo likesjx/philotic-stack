@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-local-tools
+
+rectangle "memory-local-tools" as memory_local_tools #Orange {
+}
+
+
+@enduml

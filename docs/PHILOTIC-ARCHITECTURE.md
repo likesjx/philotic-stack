@@ -1,18 +1,18 @@
 ---
-title: "The Philotic Web Architecture"
+title: The Philotic Web Architecture
 doc_type: historical
 domain: migration-parity
 status: historical
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - historical
-  - zeroclaw
-  - migration
-  - architecture
+- historical
+- zeroclaw
+- migration
+- architecture
 related_docs:
-  - docs/architecture/ARCHITECTURE_STATUS.md
-  - docs/architecture/ARCHITECTURE.md
-  - docs/architecture/DOMAIN_MAP.md
+- docs/architecture/ARCHITECTURE_STATUS.md
+- docs/architecture/ARCHITECTURE.md
+- docs/architecture/DOMAIN_MAP.md
 ---
 
 # The Philotic Web Architecture

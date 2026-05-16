@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - discord-gateway-session
+
+rectangle "discord-gateway-session" as discord_gateway_session #Orange {
+}
+
+
+@enduml

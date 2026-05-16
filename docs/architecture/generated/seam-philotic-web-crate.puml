@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - philotic-web-crate
+
+rectangle "philotic-web-crate" as philotic_web_crate #Orange {
+}
+
+
+@enduml

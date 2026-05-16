@@ -32,10 +32,7 @@ pub enum ScriptedLoopDecision {
         reject_action: String,
     },
     /// Dispatch the next tool in the tool_sequence.
-    ExecuteNextTool {
-        tool_name: String,
-        arguments: Value,
-    },
+    ExecuteNextTool { tool_name: String, arguments: Value },
     /// All tools in the current tool_sequence step are done — record and advance.
     ToolSequenceComplete,
     /// Force a SyncApartment checkpoint.
@@ -92,12 +89,18 @@ impl ScriptedLoopExecutor {
 
     /// The id of the step currently executing.
     pub fn current_step_id(&self) -> Option<&str> {
-        self.script.steps.get(self.step_cursor).map(|s| s.id.as_str())
+        self.script
+            .steps
+            .get(self.step_cursor)
+            .map(|s| s.id.as_str())
     }
 
     /// The type of the step currently executing.
     pub fn current_step_type(&self) -> Option<&str> {
-        self.script.steps.get(self.step_cursor).map(|s| s.step_type.as_str())
+        self.script
+            .steps
+            .get(self.step_cursor)
+            .map(|s| s.step_type.as_str())
     }
 
     /// Decide what the runtime should do for the current step.
@@ -126,7 +129,10 @@ impl ScriptedLoopExecutor {
                     .get("output_schema")
                     .and_then(Value::as_str)
                     .map(String::from);
-                ScriptedLoopDecision::EmitModelCall { phase, output_schema }
+                ScriptedLoopDecision::EmitModelCall {
+                    phase,
+                    output_schema,
+                }
             }
 
             "approval_gate" => {
@@ -200,7 +206,10 @@ impl ScriptedLoopExecutor {
                     .cloned()
                     .unwrap_or_else(|| Value::Object(Default::default()));
 
-                ScriptedLoopDecision::ExecuteNextTool { tool_name, arguments }
+                ScriptedLoopDecision::ExecuteNextTool {
+                    tool_name,
+                    arguments,
+                }
             }
 
             "checkpoint" => ScriptedLoopDecision::ForceCheckpoint,
@@ -351,7 +360,10 @@ mod tests {
         exec.record_step_output(json!({"approved": true}));
         // Advance tool cursor past the only tool
         exec.advance_tool_cursor();
-        assert!(matches!(exec.advance(), ScriptedLoopDecision::ToolSequenceComplete));
+        assert!(matches!(
+            exec.advance(),
+            ScriptedLoopDecision::ToolSequenceComplete
+        ));
     }
 
     #[test]
@@ -361,7 +373,10 @@ mod tests {
         exec.record_step_output(json!({"approved": true}));
         exec.record_step_output(json!([{"tool_name": "echo", "ok": true}]));
         exec.record_step_output(json!({"content": "done"}));
-        assert!(matches!(exec.advance(), ScriptedLoopDecision::Complete { .. }));
+        assert!(matches!(
+            exec.advance(),
+            ScriptedLoopDecision::Complete { .. }
+        ));
     }
 
     #[test]

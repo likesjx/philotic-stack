@@ -1,31 +1,31 @@
 ---
-title: "Runtime Authority Leases Proposal"
+title: Runtime Authority Leases Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - leases
-  - runtime
-  - authority
-  - supervision
-  - active-seam
+- leases
+- runtime
+- authority
+- supervision
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - SESSION_LOOP_PROPOSAL.md
-  - TELEGRAM_POLL_LEASE_PROPOSAL.md
-  - KEY_VAULT_PROPOSAL.md
-  - MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- SESSION_LOOP_PROPOSAL.md
+- TELEGRAM_POLL_LEASE_PROPOSAL.md
+- KEY_VAULT_PROPOSAL.md
+- MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: runtime-authority-leases
 implements: []
 implemented_by: []
 active_seams:
-  - runtime-authority-leases
+- runtime-authority-leases
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Runtime Authority Leases Proposal

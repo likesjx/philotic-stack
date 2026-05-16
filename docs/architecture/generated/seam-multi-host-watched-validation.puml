@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - multi-host-watched-validation
+
+rectangle "multi-host-watched-validation" as multi_host_watched_validation #Orange {
+}
+
+
+@enduml

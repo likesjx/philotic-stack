@@ -1,7 +1,7 @@
+use ansible_mesh_core::catalog_rights::{has_right, tool_right};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use media_prep::serialize_audio_artifact_envelope;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -9,8 +9,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     TextGenerate,
+    ResponseGenerate,
     MediaAnalyze,
     AudioTranscribe,
+    VoiceDialogue,
     VoiceSynthesize,
     Embed,
 }
@@ -19,11 +21,17 @@ impl TaskKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::TextGenerate => "text.generate",
+            Self::ResponseGenerate => "response.generate",
             Self::MediaAnalyze => "media.analyze",
             Self::AudioTranscribe => "voice.transcribe",
+            Self::VoiceDialogue => "voice.dialogue",
             Self::VoiceSynthesize => "voice.synthesize",
             Self::Embed => "text.embed",
         }
+    }
+
+    pub fn is_native_live(&self) -> bool {
+        matches!(self, Self::ResponseGenerate | Self::VoiceDialogue)
     }
 }
 
@@ -48,7 +56,9 @@ impl RequestClass {
 
     fn infer_from_kind(kind: TaskKind) -> Self {
         match kind {
-            TaskKind::TextGenerate => Self::Cognitive,
+            TaskKind::TextGenerate | TaskKind::ResponseGenerate | TaskKind::VoiceDialogue => {
+                Self::Cognitive
+            }
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => Self::Transform,
             TaskKind::VoiceSynthesize => Self::Synthesis,
             TaskKind::Embed => Self::Embedding,
@@ -66,6 +76,25 @@ impl RequestClass {
             "synthesis" => Ok(Self::Synthesis),
             "embedding" => Ok(Self::Embedding),
             other => bail!("unsupported request_class [{}]", other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseRouteBucket {
+    TextOnly,
+    ImageMultimodal,
+    AudioMultimodal,
+    RealtimeWebsocket,
+}
+
+impl ResponseRouteBucket {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TextOnly => "text_only",
+            Self::ImageMultimodal => "image_multimodal",
+            Self::AudioMultimodal => "audio_multimodal",
+            Self::RealtimeWebsocket => "realtime_websocket",
         }
     }
 }
@@ -138,6 +167,10 @@ pub struct AttachmentInput {
     pub url: Option<String>,
     pub blob_ref: Option<String>,
     pub transport_error: Option<String>,
+    /// Inline PCM audio — base64 i16 LE; bypasses blob store (Discord voice bridge).
+    pub inline_audio_b64: Option<String>,
+    pub inline_audio_sample_rate: Option<u32>,
+    pub inline_audio_channels: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -194,12 +227,20 @@ pub struct Affordances {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RoutingHints {
     pub implementation: Option<String>,
+    pub model_ref: Option<String>,
+    pub controller_role: Option<String>,
+    pub capability: Option<String>,
+    pub context_envelope: Option<String>,
+    pub stage: Option<String>,
+    pub streaming: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerTask {
     pub kind: TaskKind,
     pub request_class: RequestClass,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub prompt: Option<String>,
@@ -215,7 +256,9 @@ pub struct ControllerTask {
     pub context_projection: ContextProjectionEnvelope,
     pub affordances: Affordances,
     pub routing_hints: RoutingHints,
+    pub response_route: Option<ResponseRouteBucket>,
     pub provider_options: Map<String, Value>,
+    pub effective_rights: Vec<String>,
     /// Tools the agent has available this turn. Non-empty signals tool-enabled mode.
     /// Each entry is a raw JSON object with at minimum `tool_name` and `description`.
     pub tools: Vec<Value>,
@@ -228,6 +271,7 @@ impl ControllerTask {
         let context_projection = parse_context_projection(task.get("context_projection"));
         let affordances = parse_affordances(task.get("affordances"));
         let routing_hints = parse_routing_hints(task.get("routing_hints"));
+        let response_route = parse_response_route(task.get("response_route"))?;
         let top_level_attachments = parse_attachments(task.get("attachments"));
         if !top_level_attachments.is_empty() {
             context.attachments.extend(top_level_attachments);
@@ -241,12 +285,14 @@ impl ControllerTask {
             Some("generate_text") | Some("text.generate") | Some("text_generate") => {
                 TaskKind::TextGenerate
             }
+            Some("response.generate") | Some("response_generate") => TaskKind::ResponseGenerate,
             Some("media.analyze") | Some("media_analyze") | Some("analyze_media") => {
                 TaskKind::MediaAnalyze
             }
             Some("voice.transcribe") | Some("audio.transcribe") | Some("transcribe") => {
                 TaskKind::AudioTranscribe
             }
+            Some("voice.dialogue") | Some("voice_dialogue") => TaskKind::VoiceDialogue,
             Some("voice.synthesize") | Some("voice_synthesize") => TaskKind::VoiceSynthesize,
             Some("text.embed") | Some("embed") => TaskKind::Embed,
             Some(other) => bail!("unsupported task kind [{}]", other),
@@ -271,6 +317,14 @@ impl ControllerTask {
         let controller_task = Self {
             kind,
             request_class,
+            session_id: task
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            turn_id: task
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             provider: task
                 .get("provider")
                 .and_then(Value::as_str)
@@ -279,7 +333,8 @@ impl ControllerTask {
             model: task
                 .get("model")
                 .and_then(Value::as_str)
-                .map(str::to_string),
+                .map(str::to_string)
+                .or_else(|| routing_hints.model_ref.clone()),
             prompt: task
                 .get("prompt")
                 .and_then(Value::as_str)
@@ -320,7 +375,18 @@ impl ControllerTask {
             context_projection,
             affordances,
             routing_hints,
+            response_route,
             provider_options,
+            effective_rights: task
+                .get("effective_rights")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             tools: task
                 .get("tools_for_model")
                 .and_then(Value::as_array)
@@ -516,6 +582,46 @@ impl ControllerTask {
         self.provider_options.get(key).and_then(Value::as_str)
     }
 
+    pub fn response_route_bucket(&self) -> ResponseRouteBucket {
+        if let Some(route) = self.response_route {
+            return route;
+        }
+
+        if matches!(
+            self.provider_option_str("response_mode"),
+            Some("realtime_websocket" | "realtime_ws" | "realtime")
+        ) {
+            return ResponseRouteBucket::RealtimeWebsocket;
+        }
+
+        if matches!(self.provider_option_str("response_mode"), Some("native_audio"))
+            || self
+                .response_contract
+                .modalities
+                .iter()
+                .any(|modality| modality == "audio")
+        {
+            return ResponseRouteBucket::AudioMultimodal;
+        }
+
+        if self.media_attachments().iter().any(|attachment| {
+            attachment
+                .mime_type
+                .as_deref()
+                .map(|mime| mime.starts_with("image/"))
+                .unwrap_or(false)
+                || attachment
+                    .kind
+                    .as_deref()
+                    .map(|kind| kind.contains("image"))
+                    .unwrap_or(false)
+        }) {
+            return ResponseRouteBucket::ImageMultimodal;
+        }
+
+        ResponseRouteBucket::TextOnly
+    }
+
     pub fn media_attachments(&self) -> &[AttachmentInput] {
         &self.context.attachments
     }
@@ -528,13 +634,27 @@ impl ControllerTask {
     }
 
     fn validate(&self) -> Result<()> {
+        if !self.effective_rights.is_empty() {
+            for tool in &self.tools {
+                let Some(tool_name) = tool.get("tool_name").and_then(Value::as_str) else {
+                    bail!("tool entry missing tool_name");
+                };
+                if !has_right(&self.effective_rights, &tool_right(tool_name)) {
+                    bail!(
+                        "tool [{}] is present in tools_for_model without matching effective_rights",
+                        tool_name
+                    );
+                }
+            }
+        }
+
         match self.kind {
-            TaskKind::TextGenerate => {
+            TaskKind::TextGenerate | TaskKind::ResponseGenerate => {
                 let prompt = self
                     .composed_prompt_text()
-                    .context("text.generate task missing prompt")?;
+                    .with_context(|| format!("{} task missing prompt", self.kind.as_str()))?;
                 if prompt.trim().is_empty() {
-                    bail!("text.generate task prompt cannot be empty");
+                    bail!("{} task prompt cannot be empty", self.kind.as_str());
                 }
             }
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => {
@@ -548,6 +668,36 @@ impl ControllerTask {
                 if self.context.attachments.is_empty() {
                     bail!("{kind_label} task requires at least one attachment");
                 }
+                let has_usable_attachment = self.context.attachments.iter().any(|attachment| {
+                    let no_error = attachment
+                        .transport_error
+                        .as_deref()
+                        .map(|error| error.trim().is_empty())
+                        .unwrap_or(true);
+                    let has_url = attachment
+                        .url
+                        .as_deref()
+                        .map(|url| !url.trim().is_empty())
+                        .unwrap_or(false);
+                    let has_inline = attachment.inline_audio_b64.is_some();
+                    no_error && (has_url || has_inline)
+                });
+                if !has_usable_attachment {
+                    bail!(
+                        "{kind_label} task requires at least one blob-backed or inline attachment"
+                    );
+                }
+            }
+            TaskKind::VoiceDialogue => {
+                let prompt = self
+                    .media_prompt()
+                    .context("voice.dialogue task missing prompt")?;
+                if prompt.trim().is_empty() {
+                    bail!("voice.dialogue task prompt cannot be empty");
+                }
+                if self.context.attachments.is_empty() {
+                    bail!("voice.dialogue task requires at least one attachment");
+                }
                 if !self.context.attachments.iter().any(|attachment| {
                     attachment
                         .url
@@ -560,7 +710,7 @@ impl ControllerTask {
                             .map(|error| error.trim().is_empty())
                             .unwrap_or(true)
                 }) {
-                    bail!("{kind_label} task requires at least one blob-backed attachment url");
+                    bail!("voice.dialogue task requires at least one blob-backed attachment url");
                 }
             }
             TaskKind::VoiceSynthesize => {
@@ -583,7 +733,10 @@ impl ControllerTask {
 
         match self.request_class {
             RequestClass::Cognitive => {
-                if self.kind != TaskKind::TextGenerate {
+                if !matches!(
+                    self.kind,
+                    TaskKind::TextGenerate | TaskKind::ResponseGenerate | TaskKind::VoiceDialogue
+                ) {
                     bail!(
                         "request_class [{}] is not currently supported for [{}]",
                         self.request_class.as_str(),
@@ -659,6 +812,22 @@ fn parse_response_contract(value: Option<&Value>) -> ResponseContract {
             })
             .unwrap_or_default(),
     }
+}
+
+fn parse_response_route(value: Option<&Value>) -> Result<Option<ResponseRouteBucket>> {
+    let Some(raw) = value.and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    let route = match raw {
+        "text_only" => ResponseRouteBucket::TextOnly,
+        "image_multimodal" => ResponseRouteBucket::ImageMultimodal,
+        "audio_multimodal" => ResponseRouteBucket::AudioMultimodal,
+        "realtime_websocket" => ResponseRouteBucket::RealtimeWebsocket,
+        other => bail!("unsupported response_route [{}]", other),
+    };
+
+    Ok(Some(route))
 }
 
 fn parse_projection_items(value: Option<&Value>) -> Vec<ProjectionItem> {
@@ -782,6 +951,18 @@ fn parse_attachments(value: Option<&Value>) -> Vec<AttachmentInput> {
                             .and_then(|obj| obj.get("transport_error"))
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        inline_audio_b64: object
+                            .and_then(|obj| obj.get("inline_audio_b64"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        inline_audio_sample_rate: object
+                            .and_then(|obj| obj.get("inline_audio_sample_rate"))
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u32),
+                        inline_audio_channels: object
+                            .and_then(|obj| obj.get("inline_audio_channels"))
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u16),
                     }
                 })
                 .collect()
@@ -949,6 +1130,27 @@ fn parse_routing_hints(value: Option<&Value>) -> RoutingHints {
             .get("implementation")
             .and_then(Value::as_str)
             .map(str::to_string),
+        model_ref: object
+            .get("model_ref")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        controller_role: object
+            .get("controller_role")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        capability: object
+            .get("capability")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        context_envelope: object
+            .get("context_envelope")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        stage: object
+            .get("stage")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        streaming: object.get("streaming").and_then(Value::as_bool),
     }
 }
 
@@ -996,6 +1198,10 @@ pub enum ProviderOutput {
         memory_concept: Option<String>,
         memory_candidate: Option<serde_json::Value>,
         active_plan: Option<serde_json::Value>,
+        /// Provenance token for transform outputs (e.g. `"whisper-small@abc12345"`).
+        /// `None` for cognitive text generation.
+        #[allow(dead_code)]
+        model_gen: Option<String>,
     },
     Audio(AudioArtifact),
     /// Model chose to call a tool rather than produce a text response.
@@ -1056,6 +1262,7 @@ impl ControllerResponseEnvelope {
                 memory_concept,
                 memory_candidate,
                 active_plan,
+                model_gen: _,
             } => {
                 let text_result = TextResult {
                     display_text: display_text.or_else(|| Some(content.clone())),
@@ -1188,6 +1395,16 @@ pub struct ProviderConfigs {
     pub gemini_base_url: Option<String>,
     pub elevenlabs_api_key: Option<String>,
     pub elevenlabs_default_voice_id: Option<String>,
+    /// Base URL for a local Ollama server. Defaults to `http://localhost:11434`.
+    pub ollama_base_url: Option<String>,
+    /// Model tag to use for Ollama text generation. Defaults to `gemma4:e4b`.
+    pub ollama_model: Option<String>,
+    pub openai_oauth_access_token: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub openai_project_id: Option<String>,
+    pub openai_default_model: Option<String>,
+    pub openai_default_embedding_model: Option<String>,
 }
 
 impl ProviderConfigs {
@@ -1220,6 +1437,32 @@ impl ProviderConfigs {
             .await?,
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
+            ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL")
+                .or(fetch_config_string(ipc_client, "ollama_base_url").await?),
+            ollama_model: env_override("PHILOTIC_OLLAMA_MODEL")
+                .or(fetch_config_string(ipc_client, "ollama_model").await?),
+            openai_oauth_access_token: load_env_or_config_secret_string(
+                ipc_client,
+                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
+                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN_REF",
+                "openai_oauth_access_token",
+                "openai_oauth_access_token_ref",
+            )
+            .await?,
+            openai_api_key: fetch_config_or_secret_string(
+                ipc_client,
+                "openai_api_key",
+                "openai_api_key_ref",
+            )
+            .await?,
+            openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL")
+                .or(fetch_config_string(ipc_client, "openai_base_url").await?),
+            openai_project_id: env_override("PHILOTIC_OPENAI_PROJECT_ID")
+                .or(fetch_config_string(ipc_client, "openai_project_id").await?),
+            openai_default_model: env_override("PHILOTIC_OPENAI_DEFAULT_MODEL")
+                .or(fetch_config_string(ipc_client, "openai_default_model").await?),
+            openai_default_embedding_model: env_override("PHILOTIC_OPENAI_DEFAULT_EMBEDDING_MODEL")
+                .or(fetch_config_string(ipc_client, "openai_default_embedding_model").await?),
         })
     }
 }
@@ -1229,6 +1472,49 @@ pub trait ModelProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn supports(&self, task: &ControllerTask) -> bool;
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput>;
+
+    /// Whether this provider supports streaming token delivery for the given task.
+    /// When true, the runtime may call `invoke_streaming` instead of `invoke`.
+    fn supports_streaming(&self, _task: &ControllerTask) -> bool {
+        false
+    }
+
+    /// Invoke the model, streaming display-text tokens via `token_tx` as they arrive.
+    /// The channel is closed (dropped) when the method returns. Callers should drain the
+    /// channel concurrently while awaiting this future.
+    ///
+    /// Default implementation: ignores the channel and delegates to `invoke`.
+    async fn invoke_streaming(
+        &self,
+        task: &ControllerTask,
+        _token_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<ProviderOutput> {
+        self.invoke(task).await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NativeLiveSessionMarker {
+    pub provider_session_id: Option<String>,
+    pub resumption_handle: Option<String>,
+    pub protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeLiveTurnOutput {
+    pub final_output: ProviderOutput,
+    pub partial_text_deltas: Vec<String>,
+    pub session_marker: Option<NativeLiveSessionMarker>,
+    pub pending_function_call_id: Option<String>,
+    pub generation_complete: bool,
+    pub turn_complete: bool,
+}
+
+#[async_trait]
+pub trait NativeLiveProvider: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn supports_live(&self, task: &ControllerTask) -> bool;
+    async fn invoke_live(&self, task: &ControllerTask) -> Result<NativeLiveTurnOutput>;
 }
 
 #[derive(Clone)]
@@ -1265,17 +1551,54 @@ impl ProviderRegistry {
     }
 }
 
+#[derive(Clone)]
+pub struct NativeLiveRegistry {
+    providers: Vec<Arc<dyn NativeLiveProvider>>,
+}
+
+impl NativeLiveRegistry {
+    pub fn new(providers: Vec<Arc<dyn NativeLiveProvider>>) -> Self {
+        Self { providers }
+    }
+
+    pub fn resolve(&self, task: &ControllerTask) -> Result<Arc<dyn NativeLiveProvider>> {
+        if let Some(provider_id) = task.provider_hint() {
+            return self
+                .providers
+                .iter()
+                .find(|provider| provider.id() == provider_id && provider.supports_live(task))
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "requested native-live provider [{}] does not support {}",
+                        provider_id,
+                        task.kind.as_str()
+                    )
+                });
+        }
+
+        self.providers
+            .iter()
+            .find(|provider| provider.supports_live(task))
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "no native-live provider registered for {}",
+                    task.kind.as_str()
+                )
+            })
+    }
+}
+
 pub fn serialize_audio_artifact(artifact: &AudioArtifact) -> Result<String> {
-    Ok(json!({
-        "kind": "audio_artifact",
-        "provider": artifact.provider,
-        "model": artifact.model,
-        "voice_id": artifact.voice_id,
-        "mime_type": artifact.mime_type,
-        "output_format": artifact.output_format,
-        "audio_base64": BASE64_STANDARD.encode(&artifact.audio_bytes),
-    })
-    .to_string())
+    serialize_audio_artifact_envelope(
+        Some(&artifact.provider),
+        Some(&artifact.model),
+        Some(&artifact.voice_id),
+        &artifact.mime_type,
+        Some(&artifact.output_format),
+        &artifact.audio_bytes,
+    )
 }
 
 async fn fetch_config_string(ipc_client: &mut PhiloticClient, key: &str) -> Result<Option<String>> {
@@ -1378,8 +1701,9 @@ async fn fetch_secret_string(
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioArtifact, ControllerResponseEnvelope, ControllerTask, ProviderOutput,
-        ProviderRegistry, RequestClass, TaskKind, serialize_audio_artifact,
+        AudioArtifact, ControllerResponseEnvelope, ControllerTask, NativeLiveRegistry,
+        NativeLiveTurnOutput, ProviderOutput, ProviderRegistry, RequestClass, TaskKind,
+        serialize_audio_artifact,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -1387,6 +1711,11 @@ mod tests {
     use std::sync::Arc;
 
     struct FakeProvider {
+        id: &'static str,
+        kind: TaskKind,
+    }
+
+    struct FakeLiveProvider {
         id: &'static str,
         kind: TaskKind,
     }
@@ -1403,6 +1732,21 @@ mod tests {
 
         async fn invoke(&self, _task: &ControllerTask) -> Result<super::ProviderOutput> {
             unreachable!("invoke is not used in registry tests")
+        }
+    }
+
+    #[async_trait]
+    impl super::NativeLiveProvider for FakeLiveProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn supports_live(&self, task: &ControllerTask) -> bool {
+            task.kind == self.kind
+        }
+
+        async fn invoke_live(&self, _task: &ControllerTask) -> Result<NativeLiveTurnOutput> {
+            unreachable!("invoke_live is not used in registry tests")
         }
     }
 
@@ -1646,6 +1990,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_response_generate_as_cognitive_native_live_species() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "response.generate",
+            "request_class": "cognitive",
+            "prompt": "Respond with concise spoken and text output.",
+            "response_contract": {
+                "modalities": ["text", "audio"],
+                "channels": ["spoken_text"]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(task.kind, TaskKind::ResponseGenerate);
+        assert_eq!(task.request_class, RequestClass::Cognitive);
+        assert_eq!(task.kind.as_str(), "response.generate");
+    }
+
+    #[test]
+    fn parses_voice_dialogue_as_cognitive_attachment_task() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.dialogue",
+            "request_class": "cognitive",
+            "prompt": "Continue this voice conversation naturally.",
+            "attachments": [{
+                "kind": "voice",
+                "file_id": "voice-1",
+                "mime_type": "audio/ogg",
+                "blob_download_url": "http://127.0.0.1:9001/download/sha256-audio-1"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(task.kind, TaskKind::VoiceDialogue);
+        assert_eq!(task.request_class, RequestClass::Cognitive);
+        assert_eq!(task.media_attachments().len(), 1);
+    }
+
+    #[test]
+    fn rejects_voice_dialogue_without_audio_attachment() {
+        let err = ControllerTask::from_value(&json!({
+            "kind": "voice.dialogue",
+            "request_class": "cognitive",
+            "prompt": "Continue this voice conversation naturally."
+        }))
+        .expect_err("voice.dialogue should require audio attachment");
+
+        assert!(err.to_string().contains("requires at least one attachment"));
+    }
+
+    #[test]
     fn respects_explicit_request_class_on_text_tasks() {
         let task = ControllerTask::from_value(&json!({
             "kind": "text.generate",
@@ -1684,6 +2078,85 @@ mod tests {
         .unwrap();
 
         assert_eq!(task.provider_hint(), Some("elevenlabs"));
+    }
+
+    #[test]
+    fn parses_extended_stage_routing_hints() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.synthesize",
+            "text": "hello",
+            "routing_hints": {
+                "implementation": "elevenlabs",
+                "model_ref": "eleven_multilingual_v2",
+                "controller_role": "model.elevenlabs",
+                "capability": "voice.synthesize",
+                "context_envelope": "egress",
+                "stage": "egress",
+                "streaming": true
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            task.routing_hints.implementation.as_deref(),
+            Some("elevenlabs")
+        );
+        assert_eq!(
+            task.routing_hints.model_ref.as_deref(),
+            Some("eleven_multilingual_v2")
+        );
+        assert_eq!(
+            task.routing_hints.controller_role.as_deref(),
+            Some("model.elevenlabs")
+        );
+        assert_eq!(
+            task.routing_hints.capability.as_deref(),
+            Some("voice.synthesize")
+        );
+        assert_eq!(
+            task.routing_hints.context_envelope.as_deref(),
+            Some("egress")
+        );
+        assert_eq!(task.routing_hints.stage.as_deref(), Some("egress"));
+        assert_eq!(task.routing_hints.streaming, Some(true));
+        assert_eq!(task.model.as_deref(), Some("eleven_multilingual_v2"));
+    }
+
+    #[test]
+    fn parses_effective_rights() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+            "effective_rights": ["tool.echo", "component.text.generate"]
+        }))
+        .expect("task should parse");
+
+        assert_eq!(
+            task.effective_rights,
+            vec![
+                "tool.echo".to_string(),
+                "component.text.generate".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_tool_surface_without_matching_effective_right() {
+        let err = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+            "effective_rights": ["tool.echo"],
+            "tools_for_model": [{
+                "tool_name": "workspace.read",
+                "description": "Read a file",
+                "input_schema": { "type": "object" }
+            }]
+        }))
+        .expect_err("task should reject tool surface without matching right");
+
+        assert!(err.to_string().contains(
+            "tool [workspace.read] is present in tools_for_model without matching effective_rights"
+        ));
     }
 
     #[test]
@@ -1761,6 +2234,7 @@ mod tests {
                 memory_concept: None,
                 memory_candidate: None,
                 active_plan: None,
+                model_gen: None,
             },
         )
         .unwrap();
@@ -1805,12 +2279,16 @@ mod tests {
                     "tags": ["greeting", "session"]
                 })),
                 active_plan: None,
+                model_gen: None,
             },
         )
         .unwrap();
 
         assert_eq!(response.result["spoken_text"], "Hello back, warmly.");
-        assert_eq!(response.result["partial_replies"], json!(["Hello", "Hello back"]));
+        assert_eq!(
+            response.result["partial_replies"],
+            json!(["Hello", "Hello back"])
+        );
         assert_eq!(
             response.result["working_memory_delta"],
             "The user greeted the assistant."
@@ -1848,6 +2326,36 @@ mod tests {
 
         let provider = registry.resolve(&task).unwrap();
         assert_eq!(provider.id(), "elevenlabs");
+    }
+
+    #[test]
+    fn native_live_registry_prefers_matching_provider_hint() {
+        let registry = NativeLiveRegistry::new(vec![
+            Arc::new(FakeLiveProvider {
+                id: "gemini",
+                kind: TaskKind::VoiceDialogue,
+            }),
+            Arc::new(FakeLiveProvider {
+                id: "other-live",
+                kind: TaskKind::ResponseGenerate,
+            }),
+        ]);
+
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.dialogue",
+            "provider": "gemini",
+            "prompt": "Continue this voice conversation naturally.",
+            "attachments": [{
+                "kind": "voice",
+                "file_id": "voice-1",
+                "mime_type": "audio/ogg",
+                "blob_download_url": "http://127.0.0.1:9001/download/sha256-audio-1"
+            }]
+        }))
+        .unwrap();
+
+        let provider = registry.resolve(&task).unwrap();
+        assert_eq!(provider.id(), "gemini");
     }
 
     #[test]

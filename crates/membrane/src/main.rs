@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use media_prep::parse_audio_artifact_json;
 use philotic_client::{
     CommandManifestEntry, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect,
 };
@@ -40,6 +41,10 @@ struct TelegramMessageEnvelope {
     thread_id: Option<String>,
     sender_id: Option<String>,
     sender_username: Option<String>,
+    /// The chat type: "private", "group", "supergroup", or "channel".
+    chat_type: Option<String>,
+    /// The sender's first name (display name, always present for real users).
+    sender_first_name: Option<String>,
     message_kind: &'static str,
     content: String,
     attachments: Vec<Value>,
@@ -654,6 +659,10 @@ struct ActiveTurn {
     draft_message_id: Option<i64>,
     /// Telegram thread the turn belongs to, if any.
     thread_id: Option<String>,
+    /// Accumulated text from `streaming_token` fragments (LLM SSE stream).
+    streaming_draft: String,
+    /// When we last sent an `editMessageText` for streaming (throttle guard).
+    streaming_last_edit: Option<tokio::time::Instant>,
 }
 
 impl ActiveTurn {
@@ -694,6 +703,17 @@ async fn send_telegram_text(
     thread_id: Option<&str>,
     text: &str,
 ) -> Option<i64> {
+    send_telegram_text_with_markup(http_client, tg_base, chat_id, thread_id, text, None).await
+}
+
+async fn send_telegram_text_with_markup(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+    reply_markup: Option<&serde_json::Value>,
+) -> Option<i64> {
     let formatted = telegram_format_text(text);
     let send_url = format!("{tg_base}sendMessage");
     let mut payload = json!({
@@ -704,6 +724,9 @@ async fn send_telegram_text(
     });
     if let Some(tid) = thread_id {
         payload["message_thread_id"] = Value::String(tid.to_string());
+    }
+    if let Some(markup) = reply_markup {
+        payload["reply_markup"] = markup.clone();
     }
     match http_client.post(&send_url).json(&payload).send().await {
         Ok(res) => {
@@ -740,7 +763,30 @@ async fn edit_telegram_text(
     });
 
     match http_client.post(&edit_url).json(&payload).send().await {
-        Ok(res) => res.status().is_success(),
+        Ok(res) if res.status().is_success() => true,
+        Ok(res) if res.status().as_u16() == 400 => {
+            // A 400 "message is not modified" means the content is already identical to
+            // what's displayed — treat it as success so we don't send a duplicate message.
+            let body = res.json::<Value>().await.unwrap_or_default();
+            let not_modified = body
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|d| d.contains("message is not modified"))
+                .unwrap_or(false);
+            if not_modified {
+                true
+            } else {
+                warn!(
+                    "editMessageText 400: {}",
+                    body.get("description").and_then(|v| v.as_str()).unwrap_or("unknown")
+                );
+                false
+            }
+        }
+        Ok(res) => {
+            warn!("editMessageText returned status {}", res.status());
+            false
+        }
         Err(e) => {
             error!("editMessageText failed: {}", e);
             false
@@ -910,6 +956,17 @@ fn telegram_message_envelope(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|name| !name.is_empty());
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sender_first_name = message
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
     let attachments = telegram_message_attachments(message);
     let message_kind = telegram_message_kind(message);
     let explicit_text = message
@@ -934,6 +991,8 @@ fn telegram_message_envelope(
         thread_id,
         sender_id,
         sender_username,
+        chat_type,
+        sender_first_name,
         message_kind,
         content: content.clone(),
         attachments,
@@ -975,6 +1034,17 @@ fn telegram_callback_envelope(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|name| !name.is_empty());
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sender_first_name = callback
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
 
     Some(TelegramMessageEnvelope {
         session_id: telegram_session_id(&chat_id, thread_id.as_deref(), agent_id),
@@ -983,6 +1053,8 @@ fn telegram_callback_envelope(
         thread_id,
         sender_id,
         sender_username,
+        chat_type,
+        sender_first_name,
         message_kind: "callback",
         content: format!("Telegram callback action: {callback_data}"),
         attachments: Vec::new(),
@@ -1211,6 +1283,10 @@ const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
         command: "new",
         description: "Start a fresh conversation.",
     },
+    TelegramBotCommand {
+        command: "voice",
+        description: "Swap voice provider: /voice local or /voice elevenlabs",
+    },
 ];
 
 const TELEGRAM_MAX_COMMANDS: usize = 100;
@@ -1255,7 +1331,7 @@ fn normalize_telegram_menu_command_name(command: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn build_telegram_menu_commands(commands: &[TelegramBotCommand]) -> Vec<Value> {
     let mut normalized_commands = Vec::new();
     let mut seen = HashSet::new();
@@ -1487,12 +1563,23 @@ async fn acquire_telegram_poll_lease(
     }
 }
 
+/// Outcome of a poll lease renewal attempt.
+enum LeaseRenewResult {
+    /// Renewed successfully; new epoch to use for the next renewal.
+    Renewed(u64),
+    /// The lease has no current owner (e.g. after an IPC reconnect reset the
+    /// in-memory lease table). The caller should re-acquire rather than exit.
+    NeedsReacquire,
+    /// Another membrane instance holds the lease; the caller should exit.
+    Lost { owner: String, epoch: u64 },
+}
+
 async fn renew_telegram_poll_lease(
     ipc_client: &mut PhiloticClient,
     lease_key: &str,
     agent_id: &str,
     lease_epoch: u64,
-) -> Result<u64> {
+) -> Result<LeaseRenewResult> {
     match ipc_client
         .send_request(IpcRequest::RenewTelegramPollLease {
             lease_key: lease_key.to_string(),
@@ -1504,14 +1591,24 @@ async fn renew_telegram_poll_lease(
         IpcResponse::TelegramPollLease {
             granted: true,
             lease: Some(lease),
-        } => Ok(lease.lease_epoch),
+        } => Ok(LeaseRenewResult::Renewed(lease.lease_epoch)),
         IpcResponse::TelegramPollLease {
             granted: false,
-            lease,
+            lease: None,
         } => {
-            let owner = lease.as_ref().map(|entry| entry.owner_guest_id.as_str());
-            let epoch = lease.as_ref().map(|entry| entry.lease_epoch).unwrap_or(0);
-            anyhow::bail!("lease lost to {:?} at epoch {}", owner, epoch)
+            // No current owner — lease was reset (e.g. IPC reconnect after a
+            // network state change clears in-memory lease table). Re-acquire.
+            Ok(LeaseRenewResult::NeedsReacquire)
+        }
+        IpcResponse::TelegramPollLease {
+            granted: false,
+            lease: Some(other),
+        } => {
+            // Another seat holds the lease; this seat should yield.
+            Ok(LeaseRenewResult::Lost {
+                owner: other.owner_guest_id.clone(),
+                epoch: other.lease_epoch,
+            })
         }
         other => anyhow::bail!(
             "unexpected Telegram poll lease renew response for [{}]: {:?}",
@@ -1609,6 +1706,35 @@ async fn run_seat_impl(
         return Ok(());
     }
 
+    // Derive the allowed-users config key from the token key:
+    // "telegram_bot_token_{agent_key}" → "telegram_allowed_users_{agent_key}"
+    // "telegram_bot_token" (global fallback) → "telegram_allowed_users"
+    let allowed_users_key = if let Some(suffix) = telegram_token_key.strip_prefix("telegram_bot_token_") {
+        format!("telegram_allowed_users_{suffix}")
+    } else {
+        "telegram_allowed_users".to_string()
+    };
+    let operator_usernames: HashSet<String> = {
+        let config_req = IpcRequest::GetConfig { key: allowed_users_key.clone() };
+        match ipc_client.send_request(config_req).await.ok() {
+            Some(IpcResponse::ConfigData { value_json: Some(json_str), .. }) => {
+                serde_json::from_str::<Vec<String>>(&json_str)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.to_lowercase())
+                    .collect()
+            }
+            _ => HashSet::new(),
+        }
+    };
+    if !operator_usernames.is_empty() {
+        info!(
+            "Loaded {} operator username(s) for group chat gating from key [{}]",
+            operator_usernames.len(),
+            allowed_users_key
+        );
+    }
+
     let poll_lease_key = telegram_poll_lease_key(&telegram_token_key, &bot_token);
     let mut poll_lease_epoch = match acquire_telegram_poll_lease(
         &mut ipc_client,
@@ -1686,7 +1812,12 @@ async fn run_seat_impl(
             // Branch 1: Wait for Telegram Updates (Long Polling)
             // The request runs in an independent tokio task so that the IPC branch
             // (below) never cancels it mid-flight.
-            poll_result = poll_handle.as_mut().unwrap(), if poll_handle.is_some() => {
+            poll_result = async {
+                match poll_handle.as_mut() {
+                    Some(h) => h.await,
+                    None => std::future::pending().await, // unreachable due to if guard
+                }
+            }, if poll_handle.is_some() => {
                 poll_handle = None;
                 let http_result: Result<Value, reqwest::Error> = match poll_result {
                     Ok(r) => r,
@@ -1732,6 +1863,84 @@ async fn run_seat_impl(
                                                 envelope.content
                                             );
 
+                                            // Translate approval button callbacks to slash commands
+                                            // so philote handles them deterministically.
+                                            if envelope.message_kind == "callback" {
+                                                if let Some(data) = envelope.callback_data.as_deref() {
+                                                    // "trust" translates to /approve but keeps callback_data="trust"
+                                                    // so philote can also set session-level preapproval.
+                                                    let slash_cmd = if data == "approve" || data.starts_with("approve:") {
+                                                        Some("/approve")
+                                                    } else if data == "deny" || data.starts_with("deny:") {
+                                                        Some("/deny")
+                                                    } else if data == "trust" || data.starts_with("trust:") {
+                                                        Some("/approve")
+                                                    } else {
+                                                        None
+                                                    };
+                                                    if let Some(cmd) = slash_cmd {
+                                                        // Answer the callback query to dismiss the loading spinner.
+                                                        if let Some(cq_id) = envelope.raw_transport_event
+                                                            .get("callback_query")
+                                                            .and_then(|cq| cq.get("id"))
+                                                            .and_then(Value::as_str)
+                                                        {
+                                                            let answer_url = format!("{}answerCallbackQuery", tg_base);
+                                                            let _ = http_client
+                                                                .post(&answer_url)
+                                                                .json(&json!({"callback_query_id": cq_id}))
+                                                                .send()
+                                                                .await;
+                                                        }
+                                                        envelope.content = cmd.to_string();
+                                                        envelope.command = Some(cmd.to_string());
+                                                        // Do NOT modify callback_data — philote reads it to detect trust.
+                                                    }
+                                                }
+                                            }
+
+                                            // Group chat operator gate: only operators may issue
+                                            // commands or approval callbacks. Non-operators in group
+                                            // chats have their slash commands stripped so the message
+                                            // is forwarded as context-only text.
+                                            let is_group_chat = matches!(
+                                                envelope.chat_type.as_deref(),
+                                                Some("group") | Some("supergroup")
+                                            ) || envelope.chat_id.starts_with('-');
+                                            if is_group_chat && !operator_usernames.is_empty() {
+                                                let sender_lower = envelope
+                                                    .sender_username
+                                                    .as_deref()
+                                                    .map(|u| u.to_lowercase());
+                                                let is_operator = sender_lower
+                                                    .as_deref()
+                                                    .map(|u| operator_usernames.contains(u))
+                                                    .unwrap_or(false);
+                                                if !is_operator {
+                                                    if envelope.message_kind == "callback" {
+                                                        // Silently ignore approval callbacks from
+                                                        // non-operators — already answered above.
+                                                        info!(
+                                                            "Group chat: dropping callback from non-operator {:?}",
+                                                            envelope.sender_username
+                                                        );
+                                                        continue;
+                                                    }
+                                                    // Strip any slash command so the message reaches
+                                                    // the agent as plain context, not a command.
+                                                    if envelope.command.is_some() {
+                                                        info!(
+                                                            "Group chat: stripping command from non-operator {:?}",
+                                                            envelope.sender_username
+                                                        );
+                                                        envelope.command = None;
+                                                        // Restore content to the original user text
+                                                        // (the command text is in content already —
+                                                        // just let it flow as a plain message).
+                                                    }
+                                                }
+                                            }
+
                                             // Elevation: handle deterministic commands in membrane
                                             // before they reach agent-core.
                                             if handle_membrane_command(
@@ -1761,6 +1970,8 @@ async fn run_seat_impl(
                                                     "thread_id": envelope.thread_id,
                                                     "sender_id": envelope.sender_id,
                                                     "sender_username": envelope.sender_username,
+                                                    "chat_type": envelope.chat_type,
+                                                    "sender_first_name": envelope.sender_first_name,
                                                     "message_kind": envelope.message_kind,
                                                     "content": envelope.content,
                                                     "attachments": envelope.attachments,
@@ -1787,6 +1998,8 @@ async fn run_seat_impl(
                                                             cancel_typing: cancel_tx,
                                                             draft_message_id: None,
                                                             thread_id: envelope.thread_id.clone(),
+                                                            streaming_draft: String::new(),
+                                                            streaming_last_edit: None,
                                                         },
                                                     );
                                                 }
@@ -1851,7 +2064,12 @@ async fn run_seat_impl(
                                 // Turn lifecycle signal from agent-core: update delivery UX without
                                 // delivering a final reply.
                                 let event = task.get("event").and_then(Value::as_str).unwrap_or_default();
-                                info!("Turn event [{}] for session [{}]", event, session_id);
+                                let step_detail = task.get("partial_content").and_then(Value::as_str).unwrap_or("");
+                                if step_detail.is_empty() {
+                                    info!("Turn event [{}] for session [{}]", event, session_id);
+                                } else {
+                                    info!("Turn event [{}] ({}) for session [{}]", event, step_detail, session_id);
+                                }
                                 // waiting_approval stops the typing; the approval reply arrives as
                                 // a separate send_reply which will also cancel the turn entry.
                                 if event == "waiting_approval" {
@@ -1885,6 +2103,40 @@ async fn run_seat_impl(
                                         }
                                     }
                                 }
+                            } else if action == "streaming_token" {
+                                // LLM SSE token fragment — accumulate and periodically edit the
+                                // in-progress Telegram message.  Throttled to ≤1 edit/1500ms to
+                                // stay well under Telegram's editMessageText rate limit.
+                                const STREAMING_THROTTLE_MS: u64 = 1500;
+                                let token = task.get("content").and_then(Value::as_str).unwrap_or_default().to_string();
+                                if !chat_id.is_empty() && !token.is_empty() {
+                                    if let Some(active) = active_turns.get_mut(&session_id) {
+                                        active.streaming_draft.push_str(&token);
+                                        let now = tokio::time::Instant::now();
+                                        let elapsed = active
+                                            .streaming_last_edit
+                                            .map(|t| now.duration_since(t).as_millis() as u64)
+                                            .unwrap_or(u64::MAX);
+                                        if elapsed >= STREAMING_THROTTLE_MS {
+                                            let draft_snapshot = active.streaming_draft.clone();
+                                            let thread_id = active.thread_id.clone();
+                                            let draft_message_id = active.draft_message_id;
+                                            if let Some(message_id) = upsert_formatted_text(
+                                                &http_client,
+                                                &tg_base,
+                                                &chat_id,
+                                                thread_id.as_deref(),
+                                                draft_message_id,
+                                                &draft_snapshot,
+                                            ).await {
+                                                if let Some(active2) = active_turns.get_mut(&session_id) {
+                                                    active2.draft_message_id = Some(message_id);
+                                                    active2.streaming_last_edit = Some(now);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 // send_reply (or any unrecognised action): deliver to Telegram and
                                 // cancel the typing heartbeat for this session.
@@ -1901,6 +2153,7 @@ async fn run_seat_impl(
                                 let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string).or(active_thread_id);
                                 let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
                                 let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let reply_markup = task.get("reply_markup").cloned();
 
                                 if !chat_id.is_empty() {
                                     let http_client_clone = http_client.clone();
@@ -1911,12 +2164,9 @@ async fn run_seat_impl(
                                     tokio::spawn(async move {
                                         // Voice path: send audio first, then optional text caption.
                                         if let Some(artifact_json) = audio_artifact_json {
-                                            if let Ok(artifact) = serde_json::from_str::<Value>(&artifact_json) {
-                                                let mime_type = artifact.get("mime_type").and_then(Value::as_str).unwrap_or("audio/mpeg");
-                                                let audio_b64 = artifact.get("audio_base64").and_then(Value::as_str).unwrap_or_default();
-
-                                                use base64::Engine;
-                                                match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
+                                            if let Ok(artifact) = parse_audio_artifact_json(&artifact_json) {
+                                                let mime_type = artifact.mime_type.as_str();
+                                                match artifact.decode_audio_bytes() {
                                                     Ok(audio_bytes) => {
                                                         // Use sendVoice for OGG (voice notes), sendAudio for everything else.
                                                         let (endpoint, field_name, file_name) = if mime_type.contains("ogg") {
@@ -1938,10 +2188,10 @@ async fn run_seat_impl(
                                                             Err(e) => error!("Failed to send Telegram audio: {}", e),
                                                         }
                                                     }
-                                                    Err(e) => error!("Failed to decode audio_base64: {}", e),
+                                                    Err(e) => error!("Failed to decode audio artifact payload: {}", e),
                                                 }
                                             } else {
-                                                error!("Failed to parse audio_artifact JSON; skipping audio delivery.");
+                                                error!("Failed to parse shared audio artifact envelope; skipping audio delivery.");
                                             }
 
                                             // Also send text as a follow-up caption if requested.
@@ -1954,18 +2204,43 @@ async fn run_seat_impl(
                                                     draft_message_id,
                                                     &content,
                                                 ).await;
+                                            } else if let Some(msg_id) = draft_message_id {
+                                                // Voice-only response: delete any streaming draft
+                                                // that appeared while Gemini was generating so the
+                                                // chat stays clean (audio only, no leftover text).
+                                                let del_url = format!("{}deleteMessage", tg_base_clone);
+                                                let _ = http_client_clone
+                                                    .post(&del_url)
+                                                    .json(&serde_json::json!({
+                                                        "chat_id": chat_id,
+                                                        "message_id": msg_id,
+                                                    }))
+                                                    .send()
+                                                    .await;
                                             }
                                         } else if !content.is_empty() {
                                             // Text-only path.
                                             info!("Sending final response back to Telegram Chat [{}]...", chat_id);
-                                            let _ = upsert_formatted_text(
-                                                &http_client_clone,
-                                                &tg_base_clone,
-                                                &chat_id,
-                                                thread_id_clone.as_deref(),
-                                                draft_message_id,
-                                                &content,
-                                            ).await;
+                                            if let Some(ref markup) = reply_markup {
+                                                // Message includes an inline keyboard (e.g. approval buttons).
+                                                send_telegram_text_with_markup(
+                                                    &http_client_clone,
+                                                    &tg_base_clone,
+                                                    &chat_id,
+                                                    thread_id_clone.as_deref(),
+                                                    &content,
+                                                    Some(markup),
+                                                ).await;
+                                            } else {
+                                                let _ = upsert_formatted_text(
+                                                    &http_client_clone,
+                                                    &tg_base_clone,
+                                                    &chat_id,
+                                                    thread_id_clone.as_deref(),
+                                                    draft_message_id,
+                                                    &content,
+                                                ).await;
+                                            }
                                         }
                                     });
                                 } else {
@@ -1996,10 +2271,36 @@ async fn run_seat_impl(
             )
             .await
             {
-                Ok(epoch) => {
+                Ok(LeaseRenewResult::Renewed(epoch)) => {
                     poll_lease_epoch = epoch;
                     next_lease_renewal = tokio::time::Instant::now()
                         + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+                }
+                Ok(LeaseRenewResult::NeedsReacquire) => {
+                    // IPC reconnect reset the lease binding; re-acquire and continue polling.
+                    warn!("Poll lease for [{}] lost (no owner after IPC reconnect); re-acquiring...", poll_lease_key);
+                    match acquire_telegram_poll_lease(&mut ipc_client, &poll_lease_key, &target_agent_id).await {
+                        Ok(epoch) => {
+                            poll_lease_epoch = epoch;
+                            next_lease_renewal = tokio::time::Instant::now()
+                                + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to re-acquire Telegram poll lease [{}]: {}. Seat exiting.",
+                                poll_lease_key, err
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(LeaseRenewResult::Lost { owner, epoch }) => {
+                    warn!(
+                        "Telegram poll lease [{}] lost to [{}] at epoch {}. Seat exiting.",
+                        poll_lease_key, owner, epoch
+                    );
+                    let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
+                    return Ok(());
                 }
                 Err(err) => {
                     warn!(

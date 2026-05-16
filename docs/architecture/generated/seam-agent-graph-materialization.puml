@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - agent-graph-materialization
+
+rectangle "agent-graph-materialization" as agent_graph_materialization #Orange {
+}
+
+
+@enduml

@@ -1,33 +1,33 @@
 ---
-title: "Telegram Poll Lease Proposal"
+title: Telegram Poll Lease Proposal
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - telegram
-  - polling
-  - leases
-  - membrane
-  - active-seam
+- telegram
+- polling
+- leases
+- membrane
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - TELEGRAM_INTEGRATION_PROPOSAL.md
-  - MEMBRANE_COMPONENT_PROPOSAL.md
-  - SESSION_LOOP_PROPOSAL.md
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- TELEGRAM_INTEGRATION_PROPOSAL.md
+- MEMBRANE_COMPONENT_PROPOSAL.md
+- SESSION_LOOP_PROPOSAL.md
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: telegram-poll-lease
 implements:
-  - session-loop
+- session-loop
 implemented_by:
-  - poll-lease-renewal-release-slice
+- poll-lease-renewal-release-slice
 active_seams:
-  - telegram-poll-lease
-  - delegated-telegram-polling
+- telegram-poll-lease
+- delegated-telegram-polling
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Telegram Poll Lease Proposal

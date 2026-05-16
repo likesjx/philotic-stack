@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - proposal-disposition-rollout
+
+rectangle "proposal-disposition-rollout" as disposition_rollout #Orange {
+}
+
+
+@enduml

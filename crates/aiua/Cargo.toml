@@ -11,17 +11,21 @@ memory-core = { path = "../memory-core" }
 anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+parakeet-runner = { path = "../parakeet-runner" }
 philotic-client = { path = "../philotic-client" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "net", "process", "signal", "time", "sync", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.21.0", features = ["v4"] }
-axum = { version = "0.7", features = ["multipart"] }
+axum = { version = "0.7", features = ["multipart", "ws"] }
 tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 reqwest = { version = "0.12", features = ["json", "stream", "cookies"] }
 sha2 = "0.10"
 hex = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 webrtc = "0.17.1"

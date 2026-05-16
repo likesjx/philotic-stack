@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - ods-rename
+
+rectangle "ods-rename" as ods_rename #Orange {
+}
+
+
+@enduml

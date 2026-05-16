@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - voice-transcribe-reentry
+
+rectangle "voice-transcribe-reentry" as voice_transcribe_reentry #Orange {
+}
+
+
+@enduml

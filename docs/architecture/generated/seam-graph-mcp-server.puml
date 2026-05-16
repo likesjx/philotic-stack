@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-mcp-server
+
+rectangle "graph-mcp-server" as graph_mcp_server #Orange {
+}
+
+
+@enduml

@@ -1,9 +1,11 @@
 use crate::controller::{
-    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderOutput,
-    ProviderRegistry, TaskKind,
+    ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
+    NativeLiveRegistry, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
+};
+use ansible_mesh_core::router_trace::{
+    RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
 };
 use anyhow::Result;
-use ansible_mesh_core::router_trace::{RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage};
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
 };
@@ -19,6 +21,8 @@ fn local_node_id() -> String {
 
 type ProviderFactory =
     dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn ModelProvider>> + Send + Sync;
+type NativeLiveProviderFactory =
+    dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn NativeLiveProvider>> + Send + Sync;
 
 pub struct ControllerGuestConfig {
     pub guest_id: &'static str,
@@ -27,6 +31,7 @@ pub struct ControllerGuestConfig {
     /// now handled through the normal model-response artifact path, so this flag is ignored.
     pub allow_inline_audio: bool,
     pub providers: Box<ProviderFactory>,
+    pub live_providers: Box<NativeLiveProviderFactory>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +53,7 @@ enum StubResponse {
 }
 
 pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt().try_init();
     info!(
         "Starting Materialized Model Controller Guest [{}] for role [{}]...",
         config.guest_id, config.role
@@ -71,26 +76,27 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
         .build()?;
     let stub_response = std::env::var("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE").ok();
 
-    // Open the router training-tap trace store if configured.
-    let trace_store: Option<Arc<dyn RouterTraceStorage>> =
-        match std::env::var("PHILOTIC_ROUTER_TRACE_DB") {
-            Ok(path) => {
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                match SqliteRouterTraceStorage::open(&path) {
-                    Ok(store) => {
-                        info!(path = %path, "router training-tap trace store opened");
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        warn!(path = %path, "failed to open router trace store: {e}");
-                        None
-                    }
-                }
+    // Open the router training-tap trace store (always-on; path from env or default).
+    let trace_store: Option<Arc<dyn RouterTraceStorage>> = {
+        let path = std::env::var("PHILOTIC_ROUTER_TRACE_DB").unwrap_or_else(|_| {
+            let profile = std::env::var("PHILOTIC_PROFILE").unwrap_or_else(|_| "default".to_string());
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{home}/.philotic/{profile}/router_traces.db")
+        });
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match SqliteRouterTraceStorage::open(&path) {
+            Ok(store) => {
+                info!(path = %path, "router training-tap trace store opened");
+                Some(Arc::new(store))
             }
-            Err(_) => None,
-        };
+            Err(e) => {
+                warn!(path = %path, "failed to open router trace store: {e}");
+                None
+            }
+        }
+    };
 
     info!(
         "Listening for inbound model tasks on role [{}] from the Philotic Web...",
@@ -162,101 +168,322 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     http_client.clone(),
                     &provider_configs,
                 ));
-
-                let provider = match providers.resolve(&controller_task) {
-                    Ok(provider) => provider,
-                    Err(err) => {
-                        emit_failure(
-                            &mut ipc_client,
-                            &reply,
-                            Some(controller_task.kind.as_str()),
-                            None,
-                            format!("No model provider available for task: {}", err),
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-
-                info!(
-                    "Dispatching {} task from role [{}] to provider [{}]",
-                    controller_task.kind.as_str(),
-                    config.role,
-                    provider.id()
-                );
+                let live_providers = NativeLiveRegistry::new((config.live_providers)(
+                    http_client.clone(),
+                    &provider_configs,
+                ));
 
                 let dispatch_start = Instant::now();
-                let provider_id = provider.id().to_string();
                 let task_kind = controller_task.kind.as_str().to_string();
+                if controller_task.kind.is_native_live() {
+                    let provider = match live_providers.resolve(&controller_task) {
+                        Ok(provider) => provider,
+                        Err(err) => {
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                None,
+                                format!("No native-live provider available for task: {}", err),
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
 
-                match provider.invoke(&controller_task).await {
-                    Ok(ProviderOutput::ToolCall {
-                        tool_name,
-                        arguments,
-                    }) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "tool_call",
-                            None,
-                            latency_ms,
-                        );
-                        emit_tool_call_response(
-                            &mut ipc_client,
-                            &reply,
+                    info!(
+                        "Dispatching {} task from role [{}] to native-live provider [{}]",
+                        controller_task.kind.as_str(),
+                        config.role,
+                        provider.id()
+                    );
+
+                    let provider_id = provider.id().to_string();
+                    match provider.invoke_live(&controller_task).await {
+                        Ok(output) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let native_live_model_result =
+                                native_live_tool_call_model_result(&output);
+                            let live_model_id = extract_output_model_gen(&output.final_output)
+                                .or_else(|| controller_task.model.clone());
+                            match output.final_output {
+                                ProviderOutput::ToolCall {
+                                    tool_name,
+                                    arguments,
+                                } => {
+                                    record_routing_trace(
+                                        trace_store.as_deref(),
+                                        &reply,
+                                        &provider_id,
+                                        &task_kind,
+                                        "tool_call",
+                                        None,
+                                        latency_ms,
+                                        live_model_id,
+                                        None,
+                                    );
+                                    emit_tool_call_response(
+                                        &mut ipc_client,
+                                        &reply,
+                                        tool_name,
+                                        arguments,
+                                        native_live_model_result,
+                                    )
+                                    .await?;
+                                }
+                                output => {
+                                    record_routing_trace(
+                                        trace_store.as_deref(),
+                                        &reply,
+                                        &provider_id,
+                                        &task_kind,
+                                        "success",
+                                        None,
+                                        latency_ms,
+                                        live_model_id,
+                                        None,
+                                    );
+                                    let response = ControllerResponseEnvelope::from_output(
+                                        &controller_task,
+                                        provider.id(),
+                                        output,
+                                    )?;
+                                    emit_text_response(&mut ipc_client, &reply, response).await?;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let failure_code = classify_provider_failure(
+                                Some(task_kind.as_str()),
+                                Some(provider_id.as_str()),
+                                &err.to_string(),
+                            )
+                            .code;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "failure",
+                                failure_code.as_deref(),
+                                latency_ms,
+                                None,
+                                None,
+                            );
+                            error!("Native-live provider invocation failed: {}", err);
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                Some(provider.id()),
+                                format!("Native-live provider invocation failed: {}", err),
+                            )
+                            .await?;
+                        }
+                    }
+                } else {
+                    let provider = match providers.resolve(&controller_task) {
+                        Ok(provider) => provider,
+                        Err(err) => {
+                            // This controller has no provider for this task kind. Skip silently —
+                            // another controller on the same role inbox may support it.
+                            info!(
+                                "Controller [{}] skipping {} task: {}",
+                                config.guest_id,
+                                controller_task.kind.as_str(),
+                                err
+                            );
+                            continue;
+                        }
+                    };
+
+                    info!(
+                        "Dispatching {} task from role [{}] to provider [{}]",
+                        controller_task.kind.as_str(),
+                        config.role,
+                        provider.id()
+                    );
+
+                    let provider_id = provider.id().to_string();
+
+                    // ── Streaming dispatch ────────────────────────────────────
+                    // When the provider supports streaming for this task, spawn a
+                    // background task that forwards tokens to philote via EmitTask.
+                    // The main await still receives the final ProviderOutput.
+                    let provider_result = if provider.supports_streaming(&controller_task) {
+                        let (token_tx, mut token_rx) =
+                            tokio::sync::mpsc::channel::<String>(128);
+
+                        // Connect the stream IPC client BEFORE starting the SSE fetch so
+                        // the forwarding task is ready to drain tokens the moment they
+                        // arrive.  If we connected lazily (inside the spawned task) there
+                        // is a race where invoke_streaming completes and drops token_tx
+                        // before the task finishes connecting — the channel closes and no
+                        // tokens are ever forwarded.
+                        let stream_identity = GuestIdentity {
+                            guest_id: format!("model-stream-{}", Ulid::new()),
+                            role: config.guest_id.to_string(),
+                            supported_tools: Vec::new(),
+                        };
+                        let stream_ipc_opt = PhiloticClient::connect(stream_identity).await.ok();
+                        let reply_clone = reply.clone();
+                        tokio::spawn(async move {
+                            let Some(mut stream_ipc) = stream_ipc_opt else {
+                                return;
+                            };
+                            while let Some(token) = token_rx.recv().await {
+                                if token.is_empty() {
+                                    continue;
+                                }
+                                let task_json = serde_json::to_string(&json!({
+                                    "action": "streaming_token",
+                                    "session_id": reply_clone.session_id,
+                                    "turn_id": reply_clone.turn_id,
+                                    "chat_id": reply_clone.chat_id,
+                                    "content": token,
+                                }))
+                                .unwrap_or_default();
+                                let _ = stream_ipc
+                                    .send_request(IpcRequest::EmitTask {
+                                        target_node: reply_clone.reply_to.clone(),
+                                        target_role: reply_clone.reply_role.clone(),
+                                        target_guest_id: None,
+                                        task_json,
+                                    })
+                                    .await;
+                            }
+                        });
+                        provider.invoke_streaming(&controller_task, token_tx).await
+                    } else {
+                        provider.invoke(&controller_task).await
+                    };
+
+                    match provider_result {
+                        Ok(ProviderOutput::ToolCall {
                             tool_name,
                             arguments,
-                            None,
-                        )
-                        .await?;
-                    }
-                    Ok(output) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "success",
-                            None,
-                            latency_ms,
-                        );
-                        let response = ControllerResponseEnvelope::from_output(
-                            &controller_task,
-                            provider.id(),
-                            output,
-                        )?;
-                        emit_text_response(&mut ipc_client, &reply, response).await?;
-                    }
-                    Err(err) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        let failure_code = classify_provider_failure(
-                            Some(task_kind.as_str()),
-                            Some(provider_id.as_str()),
-                            &err.to_string(),
-                        )
-                        .code;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "failure",
-                            failure_code.as_deref(),
-                            latency_ms,
-                        );
-                        error!("Provider invocation failed: {}", err);
-                        emit_failure(
-                            &mut ipc_client,
-                            &reply,
-                            Some(controller_task.kind.as_str()),
-                            Some(provider.id()),
-                            format!("Provider invocation failed: {}", err),
-                        )
-                        .await?;
+                        }) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "tool_call",
+                                None,
+                                latency_ms,
+                                controller_task.model.clone(),
+                                None,
+                            );
+                            emit_tool_call_response(
+                                &mut ipc_client,
+                                &reply,
+                                tool_name,
+                                arguments,
+                                None,
+                            )
+                            .await?;
+                        }
+                        Ok(output) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let model_id = extract_output_model_gen(&output)
+                                .or_else(|| controller_task.model.clone());
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "success",
+                                None,
+                                latency_ms,
+                                model_id,
+                                None,
+                            );
+
+                            // ── Transcription flywheel fan-out ────────────────
+                            // After a successful AudioTranscribe, fire a capture
+                            // envelope to role=router-listener (if enabled).
+                            if controller_task.kind == TaskKind::AudioTranscribe {
+                                if let ProviderOutput::Text { ref content, ref model_gen, .. } = output {
+                                    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref() == Ok("true") {
+                                        let blob_url = controller_task
+                                            .media_attachments()
+                                            .first()
+                                            .and_then(|a| a.url.clone());
+
+                                        let capture_json = serde_json::to_string(&json!({
+                                            "kind": "transcription_capture",
+                                            "session_id": reply.session_id,
+                                            "turn_id": reply.turn_id,
+                                            "agent_id": config.guest_id,
+                                            "transcript": content,
+                                            "model_gen": model_gen,
+                                            "blob_download_url": blob_url,
+                                            "timestamp": SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0),
+                                        }))
+                                        .unwrap_or_default();
+
+                                        let fanout_identity = GuestIdentity {
+                                            guest_id: format!("capture-fanout-{}", Ulid::new()),
+                                            role: config.guest_id.to_string(),
+                                            supported_tools: Vec::new(),
+                                        };
+                                        tokio::spawn(async move {
+                                            if let Ok(mut fanout_ipc) = PhiloticClient::connect(fanout_identity).await {
+                                                let _ = fanout_ipc
+                                                    .send_request(IpcRequest::EmitTask {
+                                                        target_node: local_node_id(),
+                                                        target_role: "router-listener".to_string(),
+                                                        target_guest_id: None,
+                                                        task_json: capture_json,
+                                                    })
+                                                    .await;
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+
+                            let response = ControllerResponseEnvelope::from_output(
+                                &controller_task,
+                                provider.id(),
+                                output,
+                            )?;
+                            emit_text_response(&mut ipc_client, &reply, response).await?;
+                        }
+                        Err(err) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let failure_code = classify_provider_failure(
+                                Some(task_kind.as_str()),
+                                Some(provider_id.as_str()),
+                                &err.to_string(),
+                            )
+                            .code;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "failure",
+                                failure_code.as_deref(),
+                                latency_ms,
+                                None,
+                                None,
+                            );
+                            error!("Provider invocation failed: {}", err);
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                Some(provider.id()),
+                                format!("Provider invocation failed: {}", err),
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -539,6 +766,27 @@ async fn emit_tool_call_response(
     Ok(())
 }
 
+fn native_live_tool_call_model_result(
+    output: &crate::controller::NativeLiveTurnOutput,
+) -> Option<Value> {
+    if output.session_marker.is_none() && output.pending_function_call_id.is_none() {
+        return None;
+    }
+
+    Some(json!({
+        "native_live": {
+            "session_marker": output.session_marker.as_ref().map(|marker| {
+                json!({
+                    "provider_session_id": marker.provider_session_id,
+                    "resumption_handle": marker.resumption_handle,
+                    "protocol": marker.protocol,
+                })
+            }),
+            "pending_function_call_id": output.pending_function_call_id,
+        }
+    }))
+}
+
 async fn emit_failure(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
@@ -600,6 +848,48 @@ fn classify_provider_failure(
     if malformed_tool_call {
         payload.code = Some("MODEL_INVALID_TOOL_CALL".into());
         payload.retryable = Some(true);
+        payload.sub_kind = Some("content_error".into());
+        return payload;
+    }
+
+    // Network-level failures: connection refused, DNS, TLS, socket errors.
+    let is_network = message.contains("connection refused")
+        || message.contains("Connection refused")
+        || message.contains("failed to connect")
+        || message.contains("dns error")
+        || message.contains("No such host")
+        || message.contains("connection error")
+        || message.contains("error sending request");
+
+    if is_network {
+        payload.sub_kind = Some("network_error".into());
+        payload.retryable = Some(true);
+        return payload;
+    }
+
+    // Streaming idle timeout — emitted by providers when the SSE stream stalls.
+    if message.contains("streaming_timeout") {
+        payload.sub_kind = Some("streaming_timeout".into());
+        payload.retryable = Some(true);
+        return payload;
+    }
+
+    // Rate limit (HTTP 429).
+    if message.contains("429") || message.contains("rate limit") || message.contains("quota") {
+        payload.sub_kind = Some("rate_limit".into());
+        payload.retryable = Some(true);
+        return payload;
+    }
+
+    // Generic provider-side HTTP error (5xx or non-retryable 4xx).
+    if message.contains("500")
+        || message.contains("502")
+        || message.contains("503")
+        || message.contains("504")
+    {
+        payload.sub_kind = Some("provider_error".into());
+        payload.retryable = Some(true);
+        return payload;
     }
 
     payload
@@ -614,6 +904,15 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Extract the `model_gen` string from a `ProviderOutput` without consuming it.
+fn extract_output_model_gen(output: &ProviderOutput) -> Option<String> {
+    match output {
+        ProviderOutput::Text { model_gen, .. } => model_gen.clone(),
+        ProviderOutput::Embedding { model_gen, .. } => Some(model_gen.clone()),
+        ProviderOutput::Audio(_) | ProviderOutput::ToolCall { .. } => None,
+    }
+}
+
 /// Record a routing decision into the training-tap store, if one is open.
 ///
 /// Failures to write are logged as warnings and do not abort the request path.
@@ -625,19 +924,22 @@ fn record_routing_trace(
     outcome: &str,
     failure_code: Option<&str>,
     latency_ms: u64,
+    model_id: Option<String>,
+    token_count: Option<u64>,
 ) {
     let Some(store) = store else { return };
     let record = RouterTrainingRecord {
         trace_id: Ulid::new().to_string(),
-        agent_id: String::new(), // populated below if available from session context
+        agent_id: String::new(),
         session_id: reply.session_id.clone(),
         turn_id: reply.turn_id.clone(),
         provider_id: provider_id.to_string(),
-        model_id: None,
+        model_id,
         task_kind: task_kind.to_string(),
         outcome: outcome.to_string(),
         failure_code: failure_code.map(str::to_string),
         latency_ms: Some(latency_ms),
+        token_count,
         timestamp: now_epoch_secs(),
     };
     if let Err(e) = store.record_trace(&record) {
@@ -727,7 +1029,11 @@ mod failure_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{StubResponse, parse_stub_response, short_circuit_response, validate_stub_prompt};
+    use super::{
+        StubResponse, native_live_tool_call_model_result, parse_stub_response,
+        short_circuit_response, validate_stub_prompt,
+    };
+    use crate::controller::{NativeLiveSessionMarker, NativeLiveTurnOutput, ProviderOutput};
     use serde_json::json;
 
     #[test]
@@ -796,5 +1102,35 @@ mod tests {
         });
 
         validate_stub_prompt(&task, &stub).expect("composed prompt should satisfy stub checks");
+    }
+
+    #[test]
+    fn native_live_tool_call_model_result_carries_function_call_id_and_marker() {
+        let output = NativeLiveTurnOutput {
+            final_output: ProviderOutput::ToolCall {
+                tool_name: "session.status".into(),
+                arguments: json!({}),
+            },
+            partial_text_deltas: Vec::new(),
+            session_marker: Some(NativeLiveSessionMarker {
+                provider_session_id: None,
+                resumption_handle: Some("resume-123".into()),
+                protocol: Some("gemini-live-v1beta".into()),
+            }),
+            pending_function_call_id: Some("call-1".into()),
+            generation_complete: false,
+            turn_complete: false,
+        };
+
+        let model_result =
+            native_live_tool_call_model_result(&output).expect("metadata should be present");
+        assert_eq!(
+            model_result["native_live"]["pending_function_call_id"],
+            json!("call-1")
+        );
+        assert_eq!(
+            model_result["native_live"]["session_marker"]["resumption_handle"],
+            json!("resume-123")
+        );
     }
 }

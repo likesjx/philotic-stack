@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - binary-rename-ansible-to-aiua
+
+rectangle "binary-rename-ansible-to-aiua" as binary_rename_ansible_to_aiua #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - context-1-lookup
+
+rectangle "context-1-lookup" as context_1_lookup #Orange {
+}
+
+
+@enduml

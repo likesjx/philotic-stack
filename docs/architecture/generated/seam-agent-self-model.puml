@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - agent-self-model
+
+rectangle "agent-self-model" as agent_self_model #Orange {
+}
+
+
+@enduml

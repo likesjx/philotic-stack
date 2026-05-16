@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - peer-delegation-workflows
+
+rectangle "peer-delegation-workflows" as peer_delegation_workflows #Orange {
+}
+
+
+@enduml

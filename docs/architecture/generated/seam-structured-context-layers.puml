@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - structured-context-layers
+
+rectangle "structured-context-layers" as structured_context_layers #Orange {
+}
+
+
+@enduml

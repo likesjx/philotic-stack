@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-writeback
+
+rectangle "graph-writeback" as graph_writeback #Orange {
+}
+
+
+@enduml

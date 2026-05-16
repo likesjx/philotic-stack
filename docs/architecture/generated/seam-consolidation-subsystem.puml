@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - consolidation-subsystem
+
+rectangle "consolidation-subsystem" as consolidation_subsystem #Orange {
+}
+
+
+@enduml

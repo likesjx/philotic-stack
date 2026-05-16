@@ -1,32 +1,32 @@
 ---
-title: "Governed Workflow Skills Proposal"
+title: Governed Workflow Skills Proposal
 doc_type: proposal
 domain: runtime-sessions
-status: accepted — current slice
-last_updated: 2026-03-13
+status: accepted-current-slice
+last_updated: 2026-03-31
 tags:
-  - workflows
-  - roles
-  - delegation
-  - governance
-  - active-seam
+- workflows
+- roles
+- delegation
+- governance
+- active-seam
 related_docs:
-  - AGENT_INCARNATION_PROPOSAL.md
-  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
-  - ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
-  - MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
-  - SKILL_LIFECYCLE_PROPOSAL.md
+- AGENT_INCARNATION_PROPOSAL.md
+- ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+- ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- SKILL_LIFECYCLE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: governed-workflow-skills
 active_seams:
-  - governed-workflow-skills
-  - peer-delegation-workflows
+- governed-workflow-skills
+- peer-delegation-workflows
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Governed Workflow Skills Proposal
@@ -85,6 +85,15 @@ The graph now has the first `AbstractSkillRecord` substrate plus seeded entries 
 - `handoff.back`
 - `role.governance`
 
+The graph now also has its first real `WorkflowSkillRecord` seeds for:
+
+- `handoff.to_role`
+- `role.create_or_update`
+
+For the role seam, the hotel no longer keeps that catalog truth only as hand-maintained Rust literals. The `role.authoring` abstract skill and `role.create_or_update` workflow now compile from repo-local markdown frontmatter embedded into the binary, which keeps installed hotels self-contained without making runtime seeding depend on a live source checkout.
+
+`philote` now also prefers the workflow-shaped prompt surface directly: when both are available, `role.create_or_update` is projected to the model and the low-level `role.configure` tool is suppressed as compatibility residue. The role seam now also has a distinct hotel-side workflow execution plane via `ExecuteWorkflow { workflow_name: "role.create_or_update" }`, though that workflow still resolves internally through the existing role mutation machinery rather than a fully generic workflow executor.
+
 The lifecycle and validation model for delegation skills is now fully defined in [SKILL_LIFECYCLE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SKILL_LIFECYCLE_PROPOSAL.md). That document owns: the `draft → validated → registered → active → deprecated / invalid / suspended` state machine, the three validation layers, `HookKind`, `IdleBehavior`, `SubagentLeaseTerms`, the updated required `SubagentDelegation` fields, new IPC verbs and responses, the field sourcing map, and the `skill-creator` meta-skill and tool contracts.
 
 `WorkflowSkillRecord` now gains:
@@ -95,7 +104,7 @@ The lifecycle and validation model for delegation skills is now fully defined in
 
 What is still missing:
 
-- a dedicated full `WorkflowSkillRecord` persisted separately from `AbstractSkillRecord` (currently lifecycle fields extend the shared record)
+- a generic runtime invocation plane for `WorkflowSkillRecord` beyond the current role seam
 - role metadata inputs for target selection in `handoff.to_role`
 - explicit peer-delegation and external-cognitive-peer variants
 - invocation/runtime enforcement beyond current handoff IPC

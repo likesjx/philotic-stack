@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - telegram-provider-binary
+
+rectangle "telegram-provider-binary" as telegram_provider_binary #Orange {
+}
+
+
+@enduml

@@ -102,11 +102,29 @@ fn default_auto_start() -> bool {
 pub struct HotelRecord {
     pub hotel_name: String,
     pub capabilities: NodeCapabilities,
+    #[serde(default)]
+    pub mesh_host: Option<String>,
     pub mesh_port: u16,
     pub blob_port: u16,
     pub execution_port: u16,
     pub ipc_socket_path: String,
     pub active_pid: Option<String>,
+}
+
+/// Hotel-scoped profile for the human operator/user.
+///
+/// Singleton per hotel — stored under the key `user_profile:<hotel_name>`.
+/// Agents read this at session open to inherit operator context (timezone, etc.)
+/// without needing per-agent configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserProfile {
+    /// IANA timezone name (e.g. `"America/New_York"`). Injected into every
+    /// agent's cognitive header so the model interprets relative time correctly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Human-readable display name for the operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// A durable agent identity/profile bundle stored in the Context Graph.

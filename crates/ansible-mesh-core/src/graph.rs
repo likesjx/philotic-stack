@@ -66,6 +66,47 @@ pub struct AbstractToolRecord {
     pub input_schema: serde_json::Value,
     /// Approval and projection class: "session", "workspace", "utility", "capability"
     pub class: String,
+    #[serde(default)]
+    pub tool_markers: Vec<String>,
+}
+
+/// A system-wide shared model definition stored in the context graph.
+///
+/// Node kind: `abstract_model`. Node key: `abstract_model:{model_ref}`.
+/// These are static model markers used to inform routing and policy projection;
+/// they do not grant rights or declare live availability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AbstractModelRecord {
+    pub model_ref: String,
+    pub provider_hint: String,
+    pub description: String,
+    #[serde(default)]
+    pub capability_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_stem: Option<String>,
+    #[serde(default)]
+    pub speed_marker: i32,
+    #[serde(default)]
+    pub thinking_marker: i32,
+    #[serde(default)]
+    pub tool_use_marker: i32,
+    #[serde(default)]
+    pub audio_native_marker: i32,
+}
+
+/// A system-wide shared right definition stored in the context graph.
+///
+/// Node kind: `abstract_right`. Node key: `abstract_right:{right_name}`.
+/// Rights are shared reference knowledge describing a named grant the hotel may
+/// project into a session's effective key ring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbstractRightRecord {
+    pub right_name: String,
+    pub description: String,
+    /// What kind of target this right refers to: "tool", "skill", or "component".
+    pub target_kind: String,
+    /// Stable identifier for the referenced tool, skill, or component capability.
+    pub target_ref: String,
 }
 
 /// Lifecycle and validation state for a shared skill definition.
@@ -107,6 +148,8 @@ pub struct AbstractSkillRecord {
     pub description: String,
     #[serde(default)]
     pub implied_tools: Vec<String>,
+    #[serde(default)]
+    pub skill_markers: Vec<String>,
     #[serde(default)]
     pub validation_state: SkillValidationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,6 +236,34 @@ pub struct TurnLoopConfig {
     /// standard hard-coded tool re-entry loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_script: Option<LoopScript>,
+    /// Ordered list of model roles for tiered provider fallback.
+    /// Tier 0 is attempted first; on retriable failure the loop advances to the
+    /// next tier. Defaults to `["model", "model.local"]` when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_tiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleReadinessState {
+    #[default]
+    Configured,
+    Materializing,
+    Materialized,
+    Routable,
+    ActiveInSession,
+}
+
+impl RoleReadinessState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Materializing => "materializing",
+            Self::Materialized => "materialized",
+            Self::Routable => "routable",
+            Self::ActiveInSession => "active_in_session",
+        }
+    }
 }
 
 /// A long-lived named role incarnation for an agent.
@@ -215,10 +286,23 @@ pub struct RoleIncarnationRecord {
     /// Only the hotel seed or an existing admin role may create a role with is_admin: true.
     #[serde(default)]
     pub is_admin: bool,
+    #[serde(default)]
+    pub readiness_state: RoleReadinessState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inactive_ttl_seconds: Option<u64>,
     #[serde(default)]
     pub turn_loop_config: TurnLoopConfig,
+    /// The hotel (node_id) where this role's philote guest process should run.
+    /// When set to a remote hotel, `HandoffToRole` routes via the mesh instead of
+    /// materializing locally. When `None`, the role runs on the authority hotel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_node: Option<String>,
+}
+
+impl RoleIncarnationRecord {
+    pub fn routing_role(&self) -> String {
+        format!("role:{}:{}", self.agent_id, self.role_name)
+    }
 }
 
 /// A durable behavioral constraint stored in the context graph.
@@ -239,6 +323,42 @@ pub struct RuleRecord {
     /// The reasoning or observation that led to this rule being elevated.
     pub rationale: String,
     /// Unix epoch (seconds) when this rule was created.
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingPolicyDispositionRecord {
+    pub state: String,
+    pub reason: String,
+    pub decided_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingPolicyEvaluationRecord {
+    pub evaluation_kind: String,
+    pub decision: String,
+    pub reason: String,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingPolicyRecord {
+    pub proposal_id: String,
+    pub agent_id: String,
+    pub problem: String,
+    pub proposed_change: String,
+    pub evidence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected_capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_reflex_preference_key: Option<String>,
+    pub operator_disposition: RoutingPolicyDispositionRecord,
+    #[serde(default)]
+    pub evaluations: Vec<RoutingPolicyEvaluationRecord>,
     pub created_at: u64,
 }
 

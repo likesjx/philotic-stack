@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - operator-membrane-plugin-boundary
+
+rectangle "operator-membrane-plugin-boundary" as operator_membrane_plugin_boundary #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,12 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-membrane-boundary
+
+rectangle "desktop-membrane-boundary" as desktop_membrane_boundary #Orange {
+}
+
+rectangle "Desktop Component Authoring Parity Proposal [proposal]" as Desktop_Component_Authoring_Parity_Proposal #LightBlue
+Desktop_Component_Authoring_Parity_Proposal --> desktop_membrane_boundary : governs
+
+@enduml

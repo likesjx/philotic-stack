@@ -26,7 +26,9 @@
 
 use crate::LedgerCommand;
 use crate::service::ipc::InboxRegistry;
-use ansible_mesh_core::cron::{CronJob, CronInterpolationVars, interpolate_payload, next_fire_after};
+use ansible_mesh_core::cron::{
+    CronInterpolationVars, CronJob, interpolate_payload, next_fire_after,
+};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use std::sync::Arc;
@@ -79,7 +81,10 @@ impl CronTicker {
 
             // Non-guaranteed: fire-or-skip, no offset.
             let non_guaranteed = match self.graph.list_due_cron_jobs(now_ms, 0) {
-                Ok(jobs) => jobs.into_iter().filter(|j| !j.guaranteed).collect::<Vec<_>>(),
+                Ok(jobs) => jobs
+                    .into_iter()
+                    .filter(|j| !j.guaranteed)
+                    .collect::<Vec<_>>(),
                 Err(e) => {
                     error!("CronTicker: list_due_cron_jobs (non-guaranteed) failed: {e}");
                     continue;
@@ -88,7 +93,10 @@ impl CronTicker {
 
             // Guaranteed: staggered by hotel offset.
             let guaranteed = match self.graph.list_due_cron_jobs(now_ms, self.offset_ms) {
-                Ok(jobs) => jobs.into_iter().filter(|j| j.guaranteed).collect::<Vec<_>>(),
+                Ok(jobs) => jobs
+                    .into_iter()
+                    .filter(|j| j.guaranteed)
+                    .collect::<Vec<_>>(),
                 Err(e) => {
                     error!("CronTicker: list_due_cron_jobs (guaranteed) failed: {e}");
                     continue;
@@ -145,7 +153,10 @@ impl CronTicker {
             if job.last_fired_epoch == Some(job.next_fire_at) {
                 // Already handled; advance schedule.
                 if let Err(e) = self.advance_schedule(&job, job.next_fire_at) {
-                    error!("CronTicker: recovery advance failed for job {}: {e}", job.id);
+                    error!(
+                        "CronTicker: recovery advance failed for job {}: {e}",
+                        job.id
+                    );
                 }
                 continue;
             }
@@ -170,12 +181,8 @@ impl CronTicker {
         }
 
         // Slice 4: interpolate payload template variables.
-        let vars = CronInterpolationVars::new(
-            fire_epoch,
-            &job.id,
-            &self.local_node_id,
-            &job.target_role,
-        );
+        let vars =
+            CronInterpolationVars::new(fire_epoch, &job.id, &self.local_node_id, &job.target_role);
         let payload_data = interpolate_payload(&job.payload, &vars);
 
         let task_id = Uuid::new_v4();
@@ -200,11 +207,17 @@ impl CronTicker {
             attempt: 0,
             created_at: now_ms,
             expires_at: None,
-            payload: EventPayload::Inline { data: task_json.clone() },
+            payload: EventPayload::Inline {
+                data: task_json.clone(),
+            },
             trace: vec![format!("cron-ticker:{}", job.id)],
         };
 
-        if let Err(e) = self.dispatcher_tx.send(LedgerCommand::AppendLocal(task_env)).await {
+        if let Err(e) = self
+            .dispatcher_tx
+            .send(LedgerCommand::AppendLocal(task_env))
+            .await
+        {
             error!(
                 "CronTicker: failed to append TaskInvoke for job {}: {e}",
                 job.id
@@ -234,7 +247,10 @@ impl CronTicker {
         }
 
         if let Err(e) = self.advance_schedule(job, fire_epoch) {
-            error!("CronTicker: failed to advance schedule for job {}: {e}", job.id);
+            error!(
+                "CronTicker: failed to advance schedule for job {}: {e}",
+                job.id
+            );
         }
     }
 
@@ -262,8 +278,15 @@ impl CronTicker {
             trace: vec![format!("cron-ticker:{}", job.id)],
         };
 
-        if let Err(e) = self.dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await {
-            warn!("CronTicker: failed to broadcast CronFired for job {}: {e}", job.id);
+        if let Err(e) = self
+            .dispatcher_tx
+            .send(LedgerCommand::AppendLocal(env))
+            .await
+        {
+            warn!(
+                "CronTicker: failed to broadcast CronFired for job {}: {e}",
+                job.id
+            );
         }
     }
 
@@ -291,8 +314,15 @@ impl CronTicker {
             trace: vec![format!("cron-sync:{}", job.id)],
         };
 
-        if let Err(e) = self.dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await {
-            warn!("CronTicker: failed to broadcast CronJobSync upsert for {}: {e}", job.id);
+        if let Err(e) = self
+            .dispatcher_tx
+            .send(LedgerCommand::AppendLocal(env))
+            .await
+        {
+            warn!(
+                "CronTicker: failed to broadcast CronJobSync upsert for {}: {e}",
+                job.id
+            );
         }
     }
 
@@ -320,8 +350,15 @@ impl CronTicker {
             trace: vec![format!("cron-sync-remove:{}", job_id)],
         };
 
-        if let Err(e) = self.dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await {
-            warn!("CronTicker: failed to broadcast CronJobSync remove for {}: {e}", job_id);
+        if let Err(e) = self
+            .dispatcher_tx
+            .send(LedgerCommand::AppendLocal(env))
+            .await
+        {
+            warn!(
+                "CronTicker: failed to broadcast CronJobSync remove for {}: {e}",
+                job_id
+            );
         }
     }
 

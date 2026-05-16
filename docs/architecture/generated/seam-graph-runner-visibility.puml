@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-runner-visibility
+
+rectangle "graph-runner-visibility" as graph_runner_visibility #Orange {
+}
+
+
+@enduml

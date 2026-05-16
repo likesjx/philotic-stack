@@ -27,9 +27,7 @@ pub fn apply_landlock(policy: &SandboxPolicy, strict: bool) -> Result<bool> {
                     match PathFd::new(&path) {
                         Ok(fd) => {
                             let access = AccessFs::ReadFile | AccessFs::ReadDir;
-                            if let Err(e) =
-                                created.add_rule(PathBeneath::new(fd, access))
-                            {
+                            if let Err(e) = created.add_rule(PathBeneath::new(fd, access)) {
                                 warn!("landlock: failed to add read rule for {}: {}", path, e);
                             }
                         }
@@ -50,9 +48,7 @@ pub fn apply_landlock(policy: &SandboxPolicy, strict: bool) -> Result<bool> {
                                 | AccessFs::WriteFile
                                 | AccessFs::MakeDir
                                 | AccessFs::MakeReg;
-                            if let Err(e) =
-                                created.add_rule(PathBeneath::new(fd, access))
-                            {
+                            if let Err(e) = created.add_rule(PathBeneath::new(fd, access)) {
                                 warn!("landlock: failed to add write rule for {}: {}", path, e);
                             }
                         }
@@ -69,9 +65,7 @@ pub fn apply_landlock(policy: &SandboxPolicy, strict: bool) -> Result<bool> {
                     match PathFd::new(&path) {
                         Ok(fd) => {
                             let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
-                            if let Err(e) =
-                                created.add_rule(PathBeneath::new(fd, access))
-                            {
+                            if let Err(e) = created.add_rule(PathBeneath::new(fd, access)) {
                                 warn!("landlock: failed to add execute rule for {}: {}", path, e);
                             }
                         }
@@ -102,7 +96,9 @@ pub fn apply_landlock(policy: &SandboxPolicy, strict: bool) -> Result<bool> {
         }
         RulesetStatus::PartiallyEnforced => {
             if strict {
-                anyhow::bail!("landlock: only partially enforced, but --strict requires full enforcement");
+                anyhow::bail!(
+                    "landlock: only partially enforced, but --strict requires full enforcement"
+                );
             }
             warn!("landlock: only partially enforced (kernel may be too old for some features)");
             Ok(true)

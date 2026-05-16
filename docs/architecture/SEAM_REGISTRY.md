@@ -1,22 +1,22 @@
 ---
-title: "Philotic Seam Registry"
+title: Philotic Seam Registry
 doc_type: workflow
-domain: workflow-docs
+domain: '`tooling-execution`'
 status: active
-last_updated: 2026-03-24
+last_updated: 2026-04-10
 tags:
-  - seams
-  - ids
-  - docs
-  - planning
+- seams
+- ids
+- docs
+- planning
 related_docs:
-  - README.md
-  - DOMAIN_MAP.md
-  - ARCHITECTURE_STATUS.md
-  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
-  - GLOSSARY.md
-task_refs:
-  - docs/task.md
+- README.md
+- DOMAIN_MAP.md
+- ARCHITECTURE_STATUS.md
+- DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+- GRAPH_AS_SOURCE_OF_TRUTH.md
+- GLOSSARY.md
+- docs/task.md
 ---
 
 # Philotic Seam Registry
@@ -39,11 +39,11 @@ This registry makes the seam layer explicit without forcing every task bullet to
 
 ## Active Seams
 
-| Seam ID | Domain | Primary proposal | Current task surface |
-| --- | --- | --- | --- |
-| `session-leases` | `runtime-sessions` | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) | `docs/task.md` → `WI 1: Session Management` |
-| `runtime-authority-leases` | `runtime-sessions` | [RUNTIME_AUTHORITY_LEASES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNTIME_AUTHORITY_LEASES_PROPOSAL.md) | `docs/task.md` → `New Project: Runtime Authority Leases` |
-| `session-compaction` | `runtime-sessions` | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) | `docs/task.md` → `WI 2: Agent Logic` |
+| Seam ID | Domain | Primary proposal | Verification | Current task surface |
+| --- | --- | --- | --- | --- |
+| `session-leases` | `runtime-sessions` | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `WI 1: Session Management` |
+| `runtime-authority-leases` | `runtime-sessions` | [RUNTIME_AUTHORITY_LEASES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNTIME_AUTHORITY_LEASES_PROPOSAL.md) | uat-green | `docs/task.md` → `New Project: Runtime Authority Leases` |
+| `session-compaction` | `runtime-sessions` | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `WI 2: Agent Logic` |
 | `structured-context-layers` | `memory-context` | [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md) | `docs/task.md` → `Next Project: Personality and Context` |
 | `legacy-workspace-import` | `memory-context` | [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md) | `docs/task.md` → `Next Project: Personality and Context` |
 | `role-incarnation-records` | `runtime-sessions` | [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md) | `docs/task.md` → `New Project: Agent Incarnation Model / Role Incarnation Records` |
@@ -53,7 +53,7 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `peer-delegation-workflows` | `runtime-sessions` | [GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md) | `docs/task.md` → `Governed workflow skills` |
 | `approval-card-ux` | `runtime-sessions` | [APPROVAL_UX_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/APPROVAL_UX_PROPOSAL.md) | `docs/task.md` → `Telegram approval card UX` |
 | `session-preapproval-ux` | `runtime-sessions` | [APPROVAL_UX_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/APPROVAL_UX_PROPOSAL.md) | `docs/task.md` → `Approval UX evolution` |
-| `telegram-poll-lease` | `membrane-transport` | [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) | `docs/task.md` → Telegram poll ownership slices |
+| `telegram-poll-lease` | `membrane-transport` | [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) | smoke-green | `docs/task.md` → Telegram poll ownership slices |
 | `delegated-telegram-polling` | `membrane-transport` | [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) | `docs/task.md` → `Telegram poll lease mesh authority` |
 | `webhook-security-contract` | `membrane-transport` | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) | `docs/task.md` → Telegram integration follow-on work |
 | `watched-live-telegram-validation` | `membrane-transport` | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) | `docs/task.md` → Telegram watched-live follow-ons |
@@ -84,6 +84,9 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `shell-runner-split` | `tooling-execution` | [TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TASK_RUNNER_PROPOSAL.md) | `docs/task.md` → `Next Project: Tool Assembly and Routed Execution` |
 | `runner-materialization-policy` | `tooling-execution` | [TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TASK_RUNNER_PROPOSAL.md) | `docs/task.md` → `Tool runner lifecycle policy` |
 | `unreachable-runner-fallback` | `tooling-execution` | [TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TASK_RUNNER_PROPOSAL.md) | `docs/task.md` → runner fallback/materialization follow-ons |
+| `desktop-runner-materialization` | `tooling-execution` | [COMPUTER_USE_TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/COMPUTER_USE_TASK_RUNNER_PROPOSAL.md) | `docs/task.md` → CUA runner observe-only scaffold |
+| `desktop-action-approval-policy` | `tooling-execution` | [COMPUTER_USE_TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/COMPUTER_USE_TASK_RUNNER_PROPOSAL.md) | `docs/task.md` → CUA action gating before input tools |
+| `desktop-observation-contract` | `tooling-execution` | [COMPUTER_USE_TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/COMPUTER_USE_TASK_RUNNER_PROPOSAL.md) | `docs/task.md` → CUA screenshot/observe result contract |
 | `agent-hook-registry` | `tooling-execution` | [AGENT_PLUGIN_HOOKS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_PLUGIN_HOOKS_PROPOSAL.md) | `docs/task.md` → `New Project: Agent Plugin Hooks` |
 | `transcription-hook-extraction` | `tooling-execution` | [AGENT_PLUGIN_HOOKS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_PLUGIN_HOOKS_PROPOSAL.md) | `docs/task.md` → `New Project: Agent Plugin Hooks` |
 | `route-readiness-checks` | `tooling-execution` | [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md) | `docs/task.md` → `Next Project: Tool Assembly and Routed Execution` |
@@ -95,8 +98,13 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `openai-provider-contract` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
 | `hotel-openai-oauth-flow` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
 | `provider-capability-overrides` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
+| `provider-native-response-mode-routing` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
+| `model-graph-decision-layer` | `tooling-execution` | [MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller / Model Graph Decision Layer` |
+| `context-1-lookup` | `tooling-execution` | [MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller / Model Graph Decision Layer` |
+| `capability-aware-tool-approval` | `runtime-sessions` | [MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller / Model Graph Decision Layer` |
 | `context-engine-contract` | `memory-context` | [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
 | `deterministic-context-assembly` | `memory-context` | [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
+| `embeddinggemma-swap-validation` | `memory-context` | [EMBEDDINGGEMMA_SWAP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/EMBEDDINGGEMMA_SWAP_PROPOSAL.md) | `docs/task.md` → `New Project: EmbeddingGemma Swap` |
 | `wider-client-adoption` | `memory-context` | [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md) | `docs/task.md` → `Next Work Item: Muninn Heuristic Memory Experiment` |
 | `philotic-native-memory-integration` | `memory-context` | [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md) | `docs/task.md` → `Context And Memory Engines` and Muninn follow-ons |
 | `memory-engine-contract` | `memory-context` | [MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
@@ -111,6 +119,7 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `watched-live-recipe` | `workflow-docs` | [AGENT_WORKFLOW_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_WORKFLOW_PROPOSAL.md) | `docs/task.md` → watched-live recipe follow-ons |
 | `engine-bootstrap-routine` | `workflow-docs` | [DEV_ENGINE_OPTIMIZATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DEV_ENGINE_OPTIMIZATION_PROPOSAL.md) | `docs/task.md` → `New Project: Dev Engine Optimization` |
 | `reality-gap-consolidation` | `workflow-docs` | [DEV_ENGINE_OPTIMIZATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DEV_ENGINE_OPTIMIZATION_PROPOSAL.md) | `docs/task.md` → `New Project: Dev Engine Optimization` |
+| `session-start-bootstrap-slice` | `workflow-docs` | [DEV_ENGINE_OPTIMIZATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DEV_ENGINE_OPTIMIZATION_PROPOSAL.md) | `docs/task.md` → `New Project: Dev Engine Optimization` |
 | `admin-posture-model` | `operator-control-plane` | [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md) | `docs/task.md` → `New Project: Admin Role And Surfaces` |
 | `session-admin-elevation` | `operator-control-plane` | [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md) | `docs/task.md` → `New Project: Admin Role And Surfaces` |
 | `cli-tui-admin-surface` | `operator-control-plane` | [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md) | `docs/task.md` → `New Project: Admin Role And Surfaces` |
@@ -125,6 +134,7 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `elevenlabs-stt-surface` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
 | `onnx-music-analysis-surface` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
 | `midi-output-artifact` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
+| `graph-harness-control-plane` | `operator-control-plane` | [AGENT_WORKSTREAM_TRACKING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_WORKSTREAM_TRACKING_PROPOSAL.md) | `docs/task.md` → Harness desired/rendered/observed state management in intel-graph |
 
 ## Usage Rule
 

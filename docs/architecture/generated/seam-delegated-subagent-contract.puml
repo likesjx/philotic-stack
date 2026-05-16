@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - delegated-subagent-contract
+
+rectangle "delegated-subagent-contract" as delegated_subagent_contract #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,12 @@
+@startuml
+!theme plain
+
+title Seam Detail - runtime-authority-leases
+
+rectangle "runtime-authority-leases" as runtime_authority_leases #Orange {
+}
+
+rectangle "Desktop Membrane Proposal [proposal]" as Desktop_Membrane_Proposal #LightBlue
+Desktop_Membrane_Proposal --> runtime_authority_leases : governs
+
+@enduml

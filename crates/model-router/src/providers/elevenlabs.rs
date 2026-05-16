@@ -94,7 +94,10 @@ impl ModelProvider for ElevenLabsProvider {
     }
 
     fn supports(&self, task: &ControllerTask) -> bool {
-        matches!(task.kind, TaskKind::VoiceSynthesize | TaskKind::AudioTranscribe)
+        matches!(
+            task.kind,
+            TaskKind::VoiceSynthesize | TaskKind::AudioTranscribe
+        )
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
@@ -118,7 +121,7 @@ impl ModelProvider for ElevenLabsProvider {
                 let response = self
                     .http_client
                     .post(format!(
-                        "https://api.elevenlabs.io/v1/text-to-speech/{}",
+                        "https://api.elevenlabs.io/v1/text-to-speech/{}/stream",
                         voice_id
                     ))
                     .header("xi-api-key", api_key)
@@ -167,10 +170,11 @@ impl ModelProvider for ElevenLabsProvider {
                             .map(|u| !u.trim().is_empty())
                             .unwrap_or(false)
                     })
-                    .context(
-                        "audio.transcribe task has no media attachment with a download URL",
-                    )?;
-                let url = attachment.url.as_deref().context("attachment missing url")?;
+                    .context("audio.transcribe task has no media attachment with a download URL")?;
+                let url = attachment
+                    .url
+                    .as_deref()
+                    .context("attachment missing url")?;
 
                 let audio_resp = self
                     .http_client
@@ -249,6 +253,7 @@ impl ModelProvider for ElevenLabsProvider {
                     memory_concept: None,
                     memory_candidate: None,
                     active_plan: None,
+                    model_gen: None,
                 })
             }
 
