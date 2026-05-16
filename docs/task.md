@@ -1196,7 +1196,9 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [ ] move from current root-key source inspection to a richer hotel-local identity/step-up authority path with real vault-backed login ceremony
   - [ ] implement membrane proof verification and single-use challenge redemption into operator sessions
   - [x] persist the first normalized provider identity linkage on the hotel-local root user record using provider subject as the canonical link key and email/login as aliases
-  - [ ] expand hotel-local user onboarding beyond the first root-user link so local-first `User Settings` can curate a richer canonical user graph
+  - [~] expand hotel-local user onboarding beyond the first root-user link so local-first `User Settings` can curate a richer canonical user graph
+    - [x] add a first bounded `GET/PATCH /api/auth/user` surface for canonical hotel-local operator user settings and onboarding state
+    - [ ] wire desktop `User Settings` onto the canonical hotel-owned auth-user surface instead of treating `System Settings > Aiua Membrane` as the whole user story
   - [ ] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
   - [ ] philote-visible bounded user context projection instead of raw root-user secret access
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source

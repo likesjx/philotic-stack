@@ -354,6 +354,50 @@ struct AuthStatusView {
     session: Option<OperatorSessionStatusView>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct OperatorUserRecord {
+    user_id: String,
+    display_name: String,
+    preferred_name: Option<String>,
+    primary_email: Option<String>,
+    home_hotel: String,
+    status: String,
+    onboarding_state: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct OperatorUserSettingsView {
+    user_id: String,
+    display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timezone: Option<String>,
+    home_hotel: String,
+    status: String,
+    onboarding_state: String,
+    #[serde(default)]
+    external_identity_links: Vec<ExternalIdentityLinkStatusView>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PatchOperatorUserBody {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    preferred_name: Option<String>,
+    #[serde(default)]
+    primary_email: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    onboarding_state: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct OidcProviderStatusView {
     provider: String,
@@ -496,6 +540,10 @@ pub async fn run(
     let app = Router::new()
         // API routes
         .route("/api/auth/status", get(handle_auth_status))
+        .route(
+            "/api/auth/user",
+            get(handle_auth_user_get).patch(handle_auth_user_patch),
+        )
         .route("/api/auth/bootstrap", post(handle_auth_bootstrap))
         .route("/api/auth/challenges", post(handle_create_auth_challenge))
         .route("/api/auth/oidc/start", post(handle_auth_oidc_start))
@@ -1228,6 +1276,82 @@ async fn handle_auth_bootstrap(
         session_cookie_header(&session.session_token),
     );
     response
+}
+
+async fn handle_auth_user_get(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let session = match current_operator_session(&headers, &state) {
+        Some(session) => session,
+        None => return unauthorized(),
+    };
+
+    match load_operator_user_settings_view(&state, &session).await {
+        Ok(view) => Json(view).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_auth_user_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<PatchOperatorUserBody>,
+) -> Response {
+    let session = match current_operator_session(&headers, &state) {
+        Some(session) => session,
+        None => return unauthorized(),
+    };
+
+    if body.display_name.is_some() || body.timezone.is_some() {
+        let hotel_name = state.hotel.as_ref().clone();
+        if let Err(err) = ipc_patch_user_profile(
+            &state.socket,
+            &hotel_name,
+            body.timezone.clone(),
+            body.display_name.clone(),
+        )
+        .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    }
+
+    match patch_operator_user_record(
+        &state.db_path,
+        &state.hotel,
+        &session.user_id,
+        body.display_name,
+        body.preferred_name,
+        body.primary_email,
+        body.onboarding_state,
+    ) {
+        Ok(_) => {}
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    }
+
+    let event = json!({ "type": "operator_user:updated", "user_id": session.user_id });
+    let _ = state.tx.send(event.to_string());
+
+    match load_operator_user_settings_view(&state, &session).await {
+        Ok(view) => Json(view).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_auth_oidc_start(
@@ -3276,6 +3400,36 @@ async fn ipc_patch_user_profile(
     }
 }
 
+async fn load_operator_user_settings_view(
+    state: &AppState,
+    session: &OperatorSessionRecord,
+) -> Result<OperatorUserSettingsView> {
+    let user = resolve_operator_user(&state.db_path, state.hotel.as_ref(), &session.user_id)?
+        .context("operator user record missing")?;
+    let timezone = match ipc_get_user_profile(&state.socket, state.hotel.as_ref()).await {
+        Ok(profile) => profile
+            .get("timezone")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        Err(_) => None,
+    };
+    let external_identity_links =
+        list_external_identity_links_for_user(&state.db_path, &session.user_id)?;
+    Ok(OperatorUserSettingsView {
+        user_id: user.user_id,
+        display_name: user.display_name,
+        preferred_name: user.preferred_name,
+        primary_email: user.primary_email,
+        timezone,
+        home_hotel: user.home_hotel,
+        status: user.status,
+        onboarding_state: user.onboarding_state,
+        external_identity_links,
+    })
+}
+
 async fn handle_role_patch(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -4962,12 +5116,19 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
         ON external_identity_links(user_id);
         ",
     )?;
+    ensure_operator_user_column(&conn, "preferred_name", "TEXT")?;
+    ensure_operator_user_column(&conn, "primary_email", "TEXT")?;
+    ensure_operator_user_column(
+        &conn,
+        "onboarding_state",
+        "TEXT NOT NULL DEFAULT 'bootstrap'",
+    )?;
 
     let now = now_epoch_secs();
     conn.execute(
-        "INSERT INTO operator_users (user_id, display_name, home_hotel, status, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 'active', ?4, ?4)
-         ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, home_hotel=excluded.home_hotel, updated_at=excluded.updated_at",
+        "INSERT INTO operator_users (user_id, display_name, preferred_name, primary_email, home_hotel, status, onboarding_state, created_at, updated_at)
+         VALUES (?1, ?2, NULL, NULL, ?3, 'active', 'bootstrap', ?4, ?4)
+         ON CONFLICT(user_id) DO UPDATE SET home_hotel=excluded.home_hotel, updated_at=excluded.updated_at",
         rusqlite::params![
             default_operator_user_id(hotel),
             default_operator_display_name(),
@@ -4997,6 +5158,49 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+fn ensure_operator_user_column(conn: &Connection, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(operator_users)")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !names.iter().any(|name| name == column) {
+        conn.execute(
+            &format!("ALTER TABLE operator_users ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn resolve_operator_user(
+    db_path: &PathBuf,
+    hotel: &str,
+    user_id: &str,
+) -> Result<Option<OperatorUserRecord>> {
+    ensure_operator_auth_tables(db_path, hotel)?;
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT user_id, display_name, preferred_name, primary_email, home_hotel, status, onboarding_state, created_at, updated_at
+         FROM operator_users
+         WHERE user_id = ?1",
+    )?;
+    stmt.query_row([user_id], |row| {
+        Ok(OperatorUserRecord {
+            user_id: row.get(0)?,
+            display_name: row.get(1)?,
+            preferred_name: row.get(2)?,
+            primary_email: row.get(3)?,
+            home_hotel: row.get(4)?,
+            status: row.get(5)?,
+            onboarding_state: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })
+    .optional()
+    .map_err(Into::into)
 }
 
 fn list_root_user_key_refs(
@@ -5031,6 +5235,13 @@ fn list_external_identity_links(
     hotel: &str,
 ) -> Result<Vec<ExternalIdentityLinkStatusView>> {
     ensure_operator_auth_tables(db_path, hotel)?;
+    list_external_identity_links_for_user(db_path, &default_operator_user_id(hotel))
+}
+
+fn list_external_identity_links_for_user(
+    db_path: &PathBuf,
+    user_id: &str,
+) -> Result<Vec<ExternalIdentityLinkStatusView>> {
     let conn = Connection::open(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT user_id, provider, provider_subject, email, login, display_name, verified_at, last_seen_at
@@ -5038,7 +5249,7 @@ fn list_external_identity_links(
          WHERE user_id = ?1
          ORDER BY provider, provider_subject",
     )?;
-    let rows = stmt.query_map([default_operator_user_id(hotel)], |row| {
+    let rows = stmt.query_map([user_id], |row| {
         Ok(ExternalIdentityLinkStatusView {
             user_id: row.get(0)?,
             provider: row.get(1)?,
@@ -5052,6 +5263,55 @@ fn list_external_identity_links(
     })?;
 
     Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn patch_operator_user_record(
+    db_path: &PathBuf,
+    hotel: &str,
+    user_id: &str,
+    display_name: Option<String>,
+    preferred_name: Option<String>,
+    primary_email: Option<String>,
+    onboarding_state: Option<String>,
+) -> Result<OperatorUserRecord> {
+    let existing =
+        resolve_operator_user(db_path, hotel, user_id)?.context("operator user record missing")?;
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    let normalized_display_name =
+        normalize_non_empty_option(display_name).unwrap_or_else(|| existing.display_name.clone());
+    let normalized_preferred_name =
+        normalize_optional_text(preferred_name).or(existing.preferred_name.clone());
+    let normalized_primary_email =
+        normalize_optional_text(primary_email).or(existing.primary_email.clone());
+    let normalized_onboarding_state = normalize_non_empty_option(onboarding_state)
+        .unwrap_or_else(|| existing.onboarding_state.clone());
+
+    conn.execute(
+        "UPDATE operator_users
+         SET display_name = ?2,
+             preferred_name = ?3,
+             primary_email = ?4,
+             onboarding_state = ?5,
+             updated_at = ?6
+         WHERE user_id = ?1",
+        rusqlite::params![
+            user_id,
+            &normalized_display_name,
+            &normalized_preferred_name,
+            &normalized_primary_email,
+            &normalized_onboarding_state,
+            now,
+        ],
+    )?;
+    conn.execute(
+        "UPDATE operator_sessions
+         SET display_name = ?2
+         WHERE user_id = ?1 AND status = 'active'",
+        rusqlite::params![user_id, &normalized_display_name],
+    )?;
+
+    resolve_operator_user(db_path, hotel, user_id)?.context("operator user record disappeared")
 }
 
 fn issue_operator_session(
@@ -5750,6 +6010,18 @@ fn sanitize_return_path(input: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn normalize_non_empty_option(input: Option<String>) -> Option<String> {
+    input
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_optional_text(input: Option<String>) -> Option<String> {
+    input
+        .map(|value| value.trim().to_string())
+        .and_then(|value| if value.is_empty() { None } else { Some(value) })
+}
+
 fn oidc_code_verifier() -> String {
     format!(
         "{}{}",
@@ -6024,6 +6296,23 @@ mod tests {
     }
 
     #[test]
+    fn ensure_operator_auth_tables_seeds_operator_user_with_bootstrap_onboarding_state() {
+        let context_path = temp_db_path("operator-user-seed");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+
+        let user = resolve_operator_user(&context_path, "mac-jane", "root-user:mac-jane")
+            .unwrap()
+            .expect("operator user should exist");
+        assert_eq!(user.display_name, default_operator_display_name());
+        assert_eq!(user.home_hotel, "mac-jane");
+        assert_eq!(user.onboarding_state, "bootstrap");
+        assert!(user.preferred_name.is_none());
+        assert!(user.primary_email.is_none());
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
     fn issue_operator_auth_challenge_persists_pending_record() {
         let context_path = temp_db_path("operator-auth-challenge");
         ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
@@ -6078,6 +6367,43 @@ mod tests {
         assert_eq!(listed[0].provider, "google");
         assert_eq!(listed[0].provider_subject, "google-subject-123");
         assert_eq!(listed[0].display_name.as_deref(), Some("Jared Likes"));
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn patch_operator_user_record_updates_profile_fields_and_active_session_name() {
+        let context_path = temp_db_path("operator-user-patch");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        let session = issue_operator_session(
+            &context_path,
+            "mac-jane",
+            "Operator",
+            "bootstrap_token",
+            Some("startup-bootstrap".into()),
+        )
+        .unwrap();
+
+        let updated = patch_operator_user_record(
+            &context_path,
+            "mac-jane",
+            "root-user:mac-jane",
+            Some("Jared Likes".into()),
+            Some("Jared".into()),
+            Some("jared@example.com".into()),
+            Some("enriched".into()),
+        )
+        .unwrap();
+
+        assert_eq!(updated.display_name, "Jared Likes");
+        assert_eq!(updated.preferred_name.as_deref(), Some("Jared"));
+        assert_eq!(updated.primary_email.as_deref(), Some("jared@example.com"));
+        assert_eq!(updated.onboarding_state, "enriched");
+
+        let resolved_session = resolve_operator_session(&context_path, &session.session_token)
+            .unwrap()
+            .expect("session should still resolve");
+        assert_eq!(resolved_session.display_name, "Jared Likes");
 
         let _ = fs::remove_file(&context_path);
     }
