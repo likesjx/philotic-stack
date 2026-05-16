@@ -46,6 +46,11 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "agent.graph.read",
             "agent.graph.write",
             "routing.policy.propose",
+            "routing.reflex.set",
+            "routing.reflex.get",
+            "routing.pipeline.set",
+            "routing.pipeline.remove",
+            "routing.pipeline.get",
         ],
         _ => &[],
     }
@@ -1371,6 +1376,94 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "preference_key": {
                         "type": "string",
                         "description": "Optional — if provided, returns only the row with this key. If omitted, returns all rows."
+                    }
+                },
+                "required": []
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.set".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.set".into(),
+            description: "Declare or replace a routing pipeline rule in the agent graph. \
+                          Pipeline rules define how the hotel pre-processes inbound envelopes \
+                          before delivering them to this agent — for example, transcribing \
+                          a voice memo before the agent sees it. Setting a rule with the same \
+                          rule_id replaces the previous definition. Takes effect on the next \
+                          inbound turn."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "Stable identifier for this rule (e.g. 'voice-transcribe'). \
+                                        Used as the primary key — re-set with the same rule_id to update."
+                    },
+                    "match": {
+                        "type": "object",
+                        "description": "Envelope match criteria. Supported fields: frame_kind (array of strings), \
+                                        channel_kind (array of strings), has_text (bool)."
+                    },
+                    "stages": {
+                        "type": "array",
+                        "description": "Ordered list of transform stages. Each stage has: capability (string), \
+                                        mode ('blob'|'stream'), collect ('full'|'incremental'), \
+                                        output_as ('replace_content'|'append_content'), \
+                                        on_failure ('passthrough'|'drop'|'error')."
+                    },
+                    "deliver_as": {
+                        "type": "string",
+                        "description": "How to deliver the transformed envelope to the agent. \
+                                        One of: 'user_message' (default), 'tool_result'."
+                    }
+                },
+                "required": ["rule_id", "match", "stages"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.remove".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.remove".into(),
+            description: "Remove a routing pipeline rule from the agent graph. \
+                          After removal, inbound envelopes that previously matched this rule \
+                          will be delivered to the agent without transformation."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "The rule_id of the rule to remove."
+                    }
+                },
+                "required": ["rule_id"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.get".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.get".into(),
+            description: "Read the agent's declared routing pipeline rules from the agent graph. \
+                          Returns all stored rules or a specific rule by rule_id. \
+                          Use to inspect which pipeline transforms are currently active."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "Optional — if provided, returns only the rule with this id. \
+                                        If omitted, returns all rules."
                     }
                 },
                 "required": []

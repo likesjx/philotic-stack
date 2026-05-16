@@ -11906,6 +11906,171 @@ impl AgentRuntime {
                 .await
             }
 
+            // ── routing.pipeline.set ────────────────────────────────────────
+            "routing.pipeline.set" => {
+                let args = payload.arguments.as_object();
+                let rule_id = args
+                    .and_then(|a| a.get("rule_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string();
+                let rule_json = payload.arguments.clone();
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                        agent_id: self.agent_id.clone(),
+                        rule_id: rule_id.clone(),
+                        rule_json,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => {
+                        format!("Pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn.")
+                    }
+                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                        format!("routing.pipeline.set: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.pipeline.set: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.pipeline.set: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.pipeline.set".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.pipeline.remove ──────────────────────────────────────
+            "routing.pipeline.remove" => {
+                let args = payload.arguments.as_object();
+                let rule_id = args
+                    .and_then(|a| a.get("rule_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RemoveRoutingPipelineRule {
+                        agent_id: self.agent_id.clone(),
+                        rule_id: rule_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                        format!("routing.pipeline.remove: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.pipeline.remove: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.pipeline.remove: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.pipeline.remove".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── routing.pipeline.get ─────────────────────────────────────────
+            "routing.pipeline.get" => {
+                let args = payload.arguments.as_object();
+                let filter_id = args
+                    .and_then(|a| a.get("rule_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetRoutingPipelineRules {
+                        agent_id: self.agent_id.clone(),
+                        rule_id: filter_id,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RoutingPipelineRules { pipeline_rules }) => {
+                        serde_json::to_string_pretty(&pipeline_rules).unwrap_or_else(|_| "[]".into())
+                    }
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(_) => "routing.pipeline.get: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.pipeline.get: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("routing.pipeline.get".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             // ── desktop.observe ──────────────────────────────────────────────
             "desktop.observe" => {
                 // Observe-only: returns desktop runner metadata. No screenshot or interaction.

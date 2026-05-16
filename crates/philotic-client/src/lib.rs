@@ -1028,6 +1028,24 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preference_key: Option<String>,
     },
+    /// Declare or replace a routing pipeline rule for this agent.
+    /// The `rule_id` is the stable key; set with the same rule_id to update.
+    UpsertRoutingPipelineRule {
+        agent_id: String,
+        rule_id: String,
+        rule_json: serde_json::Value,
+    },
+    /// Remove a routing pipeline rule by rule_id.
+    RemoveRoutingPipelineRule {
+        agent_id: String,
+        rule_id: String,
+    },
+    /// Retrieve routing pipeline rules for this agent.
+    GetRoutingPipelineRules {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+    },
     /// Record one successful same-self role handoff observation and let the hotel
     /// fold it into agent-owned reflex posture without making philote read/modify/write
     /// the agent graph directly.
@@ -1558,6 +1576,11 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::GetAgentReflexPreferences`].
     AgentReflexPreferences {
         rows: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::GetRoutingPipelineRules`].
+    /// Uses `pipeline_rules` (not `rules`) to distinguish from [`RuleList`] in untagged serde.
+    RoutingPipelineRules {
+        pipeline_rules: Vec<serde_json::Value>,
     },
     /// Response to [`IpcRequest::GetMcpRoutes`].
     /// Contains all persisted route sets, keyed by agent_id.

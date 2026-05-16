@@ -6957,6 +6957,114 @@ impl IpcServer {
                     }
                 }
             }
+            // ── routing pipeline rule CRUD ───────────────────────────────────
+            IpcRequest::UpsertRoutingPipelineRule {
+                agent_id,
+                rule_id,
+                rule_json,
+            } => {
+                use ansible_mesh_core::agent_graph_storage::RoutingPipelineRule;
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<()> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    storage.upsert_pipeline_rule(&RoutingPipelineRule {
+                        agent_id: agent_id.clone(),
+                        rule_id: rule_id.clone(),
+                        rule_json,
+                        updated_at: 0,
+                    })?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => IpcResponse::success(
+                        "routing_pipeline_rule",
+                        Some(serde_json::json!({
+                            "message": format!("Routing pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn.")
+                        })),
+                    ),
+                    Err(err) => {
+                        error!("Failed to store routing pipeline rule: {err}");
+                        IpcResponse::error(
+                            "upsert_routing_pipeline_rule",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::RemoveRoutingPipelineRule { agent_id, rule_id } => {
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<bool> {
+                    if !path.exists() {
+                        return Ok(false);
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    storage.remove_pipeline_rule(&rule_id)
+                })();
+                match result {
+                    Ok(deleted) => IpcResponse::success(
+                        "routing_pipeline_rule",
+                        Some(serde_json::json!({
+                            "message": if deleted {
+                                format!("Routing pipeline rule '{rule_id}' removed.")
+                            } else {
+                                format!("Routing pipeline rule '{rule_id}' not found.")
+                            }
+                        })),
+                    ),
+                    Err(err) => {
+                        error!("Failed to remove routing pipeline rule: {err}");
+                        IpcResponse::error(
+                            "remove_routing_pipeline_rule",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+            IpcRequest::GetRoutingPipelineRules { agent_id, rule_id } => {
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<Vec<serde_json::Value>> {
+                    if !path.exists() {
+                        return Ok(vec![]);
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    let rules = if let Some(id) = rule_id {
+                        storage
+                            .get_pipeline_rule(&id)?
+                            .map(|r| vec![r])
+                            .unwrap_or_default()
+                    } else {
+                        storage.list_pipeline_rules()?
+                    };
+                    Ok(rules
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "agent_id": r.agent_id,
+                                "rule_id": r.rule_id,
+                                "rule": r.rule_json,
+                                "updated_at": r.updated_at,
+                            })
+                        })
+                        .collect())
+                })();
+                match result {
+                    Ok(pipeline_rules) => IpcResponse::RoutingPipelineRules { pipeline_rules },
+                    Err(err) => {
+                        error!("Failed to read routing pipeline rules: {err}");
+                        IpcResponse::error(
+                            "get_routing_pipeline_rules",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
+
             IpcRequest::RecordRoleHandoffReflexEvidence {
                 agent_id,
                 role_name,
@@ -22981,5 +23089,113 @@ mod tests {
             route.get("target_capability").is_none() || route["target_capability"].is_null(),
             "text.generate route must not have target_capability when no reflex is set"
         );
+    }
+
+    #[tokio::test]
+    async fn routing_pipeline_rule_upsert_get_remove_roundtrip() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-pipeline-rule-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        // Upsert a pipeline rule.
+        let upsert_resp = client
+            .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "voice-transcribe".into(),
+                rule_json: serde_json::json!({
+                    "match": { "frame_kind": ["audio", "voice"] },
+                    "stages": [{ "capability": "voice.transcribe", "mode": "blob" }],
+                    "deliver_as": "user_message"
+                }),
+            })
+            .await
+            .expect("upsert request");
+        assert!(
+            matches!(upsert_resp, IpcResponse::Standard { ok: true, .. }),
+            "upsert should succeed: {upsert_resp:?}"
+        );
+
+        // Retrieve by rule_id.
+        let get_resp = client
+            .send_request(IpcRequest::GetRoutingPipelineRules {
+                agent_id: agent_id.into(),
+                rule_id: Some("voice-transcribe".into()),
+            })
+            .await
+            .expect("get request");
+        let IpcResponse::RoutingPipelineRules { pipeline_rules } = get_resp else {
+            panic!("expected RoutingPipelineRules, got {get_resp:?}");
+        };
+        assert_eq!(pipeline_rules.len(), 1);
+        assert_eq!(pipeline_rules[0]["rule_id"], "voice-transcribe");
+        assert_eq!(pipeline_rules[0]["rule"]["deliver_as"], "user_message");
+
+        // Pipeline rules must NOT appear in reflex preferences.
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        assert!(
+            storage.list_reflex_preferences().unwrap().is_empty(),
+            "pipeline rules must not bleed into reflex_preferences"
+        );
+
+        // Remove the rule.
+        let remove_resp = client
+            .send_request(IpcRequest::RemoveRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "voice-transcribe".into(),
+            })
+            .await
+            .expect("remove request");
+        assert!(
+            matches!(remove_resp, IpcResponse::Standard { ok: true, .. }),
+            "remove should succeed"
+        );
+
+        // Confirm gone.
+        let get_after = client
+            .send_request(IpcRequest::GetRoutingPipelineRules {
+                agent_id: agent_id.into(),
+                rule_id: None,
+            })
+            .await
+            .expect("get-all after remove");
+        let IpcResponse::RoutingPipelineRules { pipeline_rules: after } = get_after else {
+            panic!("expected RoutingPipelineRules");
+        };
+        assert!(after.is_empty(), "rule should be gone after remove");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
     }
 }
