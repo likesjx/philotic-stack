@@ -864,11 +864,15 @@ struct PendingPipeline {
     original_target_role: String,
     original_target_guest_id: Option<String>,
     original_task_id: Uuid,
+    /// Immutable original task JSON — used only for on_failure watchdog passthrough.
     original_task_json: String,
+    /// Evolves as each stage's output is merged in; delivered to the final target.
+    current_task_json: String,
     rule_id: String,
-    // Retained for Slice 4 multi-stage logging; not read by single-stage delivery or watchdog.
-    #[allow(dead_code)]
-    capability_role: String,
+    /// Capability roles yet to execute; front = next stage.
+    remaining_stages: std::collections::VecDeque<String>,
+    /// Capability outputs collected so far; written to `golgi_stages` in the final task.
+    completed_stages: Vec<serde_json::Value>,
     /// Unix timestamp (seconds) when this entry was inserted; used by the TTL watchdog.
     created_at: u64,
 }
@@ -3123,12 +3127,20 @@ impl IpcServer {
                 continue;
             }
 
-            // Only single-stage supported in Slice 2; take the first stage.
+            // Collect all cisternae (pipeline stages) in order.
             let stages = rule_json.get("stages").and_then(serde_json::Value::as_array)?;
-            let stage = stages.first()?;
-            let capability_role = stage
+            if stages.is_empty() {
+                continue;
+            }
+            let first_capability = stages
+                .first()?
                 .get("capability")
                 .and_then(serde_json::Value::as_str)?;
+            let remaining: std::collections::VecDeque<String> = stages[1..]
+                .iter()
+                .filter_map(|s| s.get("capability").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect();
 
             // Correlation key: session_id:turn_id (unique per in-flight turn).
             let corr_key = format!("{}:{}", session_id, turn_id);
@@ -3158,14 +3170,16 @@ impl IpcServer {
                         original_target_guest_id: target_guest_id.map(str::to_string),
                         original_task_id,
                         original_task_json: task_json.to_string(),
+                        current_task_json: task_json.to_string(),
                         rule_id: rule.rule_id.clone(),
-                        capability_role: capability_role.to_string(),
+                        remaining_stages: remaining,
+                        completed_stages: Vec::new(),
                         created_at: unix_ts(),
                     },
                 );
             }
 
-            return Some((capability_role.to_string(), cap_task_id, cap_json));
+            return Some((first_capability.to_string(), cap_task_id, cap_json));
         }
 
         None
@@ -3201,7 +3215,7 @@ impl IpcServer {
             guard.remove(&corr_key)
         };
 
-        let Some(pending) = pending else {
+        let Some(mut pending) = pending else {
             warn!(
                 "Golgi: no pending pipeline for correlation key '{}' — capability response dropped",
                 corr_key
@@ -3209,34 +3223,95 @@ impl IpcServer {
             return;
         };
 
-        let merged_json =
-            Self::merge_golgi_stage_output(&pending.original_task_json, task_json)
-                .unwrap_or(pending.original_task_json.clone());
-
-        info!(
-            "Golgi: pipeline rule '{}' complete — delivering merged task {} to '{}'",
-            pending.rule_id, pending.original_task_id, pending.original_target_role
-        );
-
-        Self::deliver_inbound_task(
-            inboxes,
-            local_node_id,
-            &pending.original_target_role,
-            pending.original_target_guest_id.as_deref(),
-            pending.original_task_id,
-            merged_json,
+        // Accumulate this stage's output and merge it into the evolving task JSON.
+        let cap_output: serde_json::Value =
+            serde_json::from_str(task_json).unwrap_or(serde_json::Value::Null);
+        pending.completed_stages.push(cap_output);
+        let merged_json = Self::merge_golgi_stage_output(
+            &pending.current_task_json,
+            task_json,
+            &pending.completed_stages,
         )
-        .await;
+        .unwrap_or_else(|| pending.current_task_json.clone());
+        pending.current_task_json = merged_json.clone();
+
+        if let Some(next_capability) = pending.remaining_stages.pop_front() {
+            // More cisternae remain — dispatch to the next stage.
+            info!(
+                "Golgi: pipeline rule '{}' stage {} complete — dispatching to '{}'",
+                pending.rule_id,
+                pending.completed_stages.len(),
+                next_capability,
+            );
+
+            // Rewrite reply_role/reply_to so the next capability also replies to hotel:golgi.
+            let next_task_json = if let Ok(mut v) =
+                serde_json::from_str::<serde_json::Value>(&pending.current_task_json)
+            {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "reply_role".into(),
+                        serde_json::Value::String(GOLGI_SINK_ROLE.into()),
+                    );
+                    obj.insert(
+                        "reply_to".into(),
+                        serde_json::Value::String(local_node_id.into()),
+                    );
+                }
+                serde_json::to_string(&v).unwrap_or_else(|_| pending.current_task_json.clone())
+            } else {
+                pending.current_task_json.clone()
+            };
+
+            // Re-insert with updated state; TTL budget is shared across all stages.
+            {
+                let mut guard = pending_pipelines.lock().await;
+                guard.insert(corr_key, pending);
+            }
+
+            let next_task_id = Uuid::new_v4();
+            Self::deliver_inbound_task(
+                inboxes,
+                local_node_id,
+                &next_capability,
+                None,
+                next_task_id,
+                next_task_json,
+            )
+            .await;
+        } else {
+            // All cisternae complete — deliver final merged task to original target.
+            info!(
+                "Golgi: pipeline rule '{}' all {} stage(s) complete — delivering task {} to '{}'",
+                pending.rule_id,
+                pending.completed_stages.len(),
+                pending.original_task_id,
+                pending.original_target_role,
+            );
+            Self::deliver_inbound_task(
+                inboxes,
+                local_node_id,
+                &pending.original_target_role,
+                pending.original_target_guest_id.as_deref(),
+                pending.original_task_id,
+                merged_json,
+            )
+            .await;
+        }
     }
 
-    /// Merges a capability stage's output into the original intercepted task JSON.
+    /// Merges a capability stage's output into the current task JSON.
     ///
-    /// Embeds the full capability output under `golgi_stage_output` for traceability,
-    /// and promotes `content` to `transcript` if present (voice.transcribe result).
-    fn merge_golgi_stage_output(original_json: &str, cap_output_json: &str) -> Option<String> {
-        let mut original: serde_json::Value = serde_json::from_str(original_json).ok()?;
+    /// Writes `golgi_stages` (array of all completed stage outputs) for provenance,
+    /// and promotes `content` to `transcript` from the latest stage output (voice.transcribe).
+    fn merge_golgi_stage_output(
+        current_json: &str,
+        cap_output_json: &str,
+        all_completed_stages: &[serde_json::Value],
+    ) -> Option<String> {
+        let mut current: serde_json::Value = serde_json::from_str(current_json).ok()?;
         let cap_output: serde_json::Value = serde_json::from_str(cap_output_json).ok()?;
-        if let Some(obj) = original.as_object_mut() {
+        if let Some(obj) = current.as_object_mut() {
             if let Some(content) = cap_output
                 .get("content")
                 .and_then(serde_json::Value::as_str)
@@ -3246,9 +3321,12 @@ impl IpcServer {
                     serde_json::Value::String(content.to_string()),
                 );
             }
-            obj.insert("golgi_stage_output".into(), cap_output);
+            obj.insert(
+                "golgi_stages".into(),
+                serde_json::Value::Array(all_completed_stages.to_vec()),
+            );
         }
-        serde_json::to_string(&original).ok()
+        serde_json::to_string(&current).ok()
     }
 
     /// Sweeps `pending_pipelines` for entries older than [`GOLGI_PIPELINE_TTL_SECS`].
@@ -23753,8 +23831,8 @@ mod tests {
                 "original blob_id must be preserved in merged task"
             );
             assert!(
-                payload.get("golgi_stage_output").is_some(),
-                "merged task must contain golgi_stage_output for traceability"
+                payload.get("golgi_stages").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false),
+                "merged task must contain non-empty golgi_stages array for traceability"
             );
         } else {
             panic!("expected InboundTask for agent, got {:?}", guard[0]);
@@ -23837,15 +23915,17 @@ mod tests {
                     original_target_guest_id: Some(agent_guest_id.into()),
                     original_task_id,
                     original_task_json: original_task_json.clone(),
+                    current_task_json: original_task_json.clone(),
                     rule_id: "watchdog-test-rule".into(),
-                    capability_role: "voice.transcribe".into(),
+                    remaining_stages: std::collections::VecDeque::new(),
+                    completed_stages: Vec::new(),
                     created_at: 0, // epoch — guaranteed expired
                 },
             );
         }
 
         // ── Drive the watchdog directly (no 30s wait) ───────────────────────
-        IpcServer::golgi_pipeline_watchdog(&pending_pipelines, &inboxes, "local-aiua-watchdog")
+        IpcServer::golgi_pipeline_watchdog(&pending_pipelines, &inboxes, "local-aiua-01")
             .await;
 
         // ── Assert pending_pipelines is now empty ────────────────────────────
@@ -23881,10 +23961,10 @@ mod tests {
             payload.get("session_id").and_then(serde_json::Value::as_str),
             Some("sess-watchdog-01"),
         );
-        // No golgi_stage_output — this is the raw original task, no capability ran.
+        // No golgi_stages — this is the raw original task, no capability ran.
         assert!(
-            payload.get("golgi_stage_output").is_none(),
-            "on_failure passthrough must NOT include golgi_stage_output"
+            payload.get("golgi_stages").is_none(),
+            "on_failure passthrough must NOT include golgi_stages"
         );
 
         unsafe {
@@ -23892,6 +23972,278 @@ mod tests {
         }
         server_task.abort();
         let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Verify that a 2-stage pipeline rule dispatches through both cisternae in order
+    /// before delivering the final merged task to the agent.
+    ///
+    /// Test plan:
+    /// 1. Configure rule: action=audio_input → stages=[voice.transcribe, nlp.classify]
+    /// 2. Subscribe agent + two mock capability guests (voice.transcribe, nlp.classify).
+    /// 3. Emit audio_input task → assert voice.transcribe receives it (stage 1), agent does NOT.
+    /// 4. Simulate voice.transcribe replying to hotel:golgi with content="hello".
+    /// 5. Assert nlp.classify receives merged task (stage 2), agent still does NOT.
+    /// 6. Simulate nlp.classify replying to hotel:golgi with content="greeting".
+    /// 7. Assert agent receives final task with golgi_stages array of length 2 and transcript="greeting".
+    #[tokio::test]
+    async fn golgi_pipeline_multi_stage_chains_both_cisternae_then_delivers_to_agent() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-golgi-slice4-multi";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = make_hotel_graph(&socket_path, agent_id);
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task =
+            tokio::spawn(async move { server.run().await.expect("ipc server should run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        // ── Step 1: configure 2-stage pipeline rule ──────────────────────────
+        let mut admin_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "admin-multi".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("admin connect");
+
+        let rule_resp = admin_client
+            .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "multi-stage-rule".into(),
+                rule_json: serde_json::json!({
+                    "match": { "action": "audio_input" },
+                    "stages": [
+                        { "capability": "voice.transcribe" },
+                        { "capability": "nlp.classify" },
+                    ],
+                }),
+            })
+            .await
+            .expect("upsert pipeline rule");
+        assert!(
+            matches!(rule_resp, IpcResponse::Standard { ok: true, .. }),
+            "pipeline rule upsert must succeed: {rule_resp:?}"
+        );
+
+        // ── Step 2: subscribe agent + both capability guests ─────────────────
+        let agent_guest_id = "multi-agent-guest-01";
+        let mut agent_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: agent_guest_id.into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let cap1_guest_id = "multi-cap1-voice-01";
+        let mut cap1_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: cap1_guest_id.into(),
+            role: "voice.transcribe".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("cap1 connect");
+
+        let cap2_guest_id = "multi-cap2-nlp-01";
+        let mut cap2_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: cap2_guest_id.into(),
+            role: "nlp.classify".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("cap2 connect");
+
+        // ── Step 3: emit audio_input task targeting the agent ────────────────
+        let task_payload = serde_json::json!({
+            "action": "audio_input",
+            "session_id": "sess-multi-01",
+            "turn_id": "turn-multi-01",
+            "blob_id": "blob-multi-xyz",
+            "agent_id": agent_id,
+        });
+        let emit_resp = admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some(agent_guest_id.into()),
+                task_json: task_payload.to_string(),
+            })
+            .await
+            .expect("emit audio_input");
+        assert!(
+            matches!(emit_resp, IpcResponse::Standard { ok: true, .. }),
+            "emit must succeed: {emit_resp:?}"
+        );
+
+        // ── Step 4: voice.transcribe (cap1) must receive the task ────────────
+        let cap1_recv = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            cap1_client.recv_task(),
+        )
+        .await
+        .expect("cap1 must receive stage-1 task within 2s")
+        .expect("cap1 recv_task error");
+
+        let philotic_client::IpcResponse::InboundTask { task_json: cap1_task_json, .. } = cap1_recv else {
+            panic!("cap1 expected InboundTask, got {:?}", cap1_recv);
+        };
+        let cap1_payload: serde_json::Value =
+            serde_json::from_str(&cap1_task_json).unwrap_or_default();
+        assert_eq!(
+            cap1_payload.get("reply_role").and_then(serde_json::Value::as_str),
+            Some(GOLGI_SINK_ROLE),
+            "stage-1 task reply_role must be hotel:golgi"
+        );
+        assert_eq!(
+            cap1_payload.get("blob_id").and_then(serde_json::Value::as_str),
+            Some("blob-multi-xyz"),
+            "original blob_id must be forwarded to stage-1 capability"
+        );
+
+        // Agent must NOT have been notified yet.
+        let agent_check = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            agent_client.recv_task(),
+        )
+        .await;
+        assert!(
+            agent_check.is_err(),
+            "agent must not receive task while stage 1 is pending"
+        );
+
+        // ── Step 5: voice.transcribe replies to hotel:golgi ──────────────────
+        let golgi_reply_1 = admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: GOLGI_SINK_ROLE.into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "voice.transcribe_result",
+                    "session_id": "sess-multi-01",
+                    "turn_id": "turn-multi-01",
+                    "content": "hello",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("golgi reply 1");
+        assert!(
+            matches!(golgi_reply_1, IpcResponse::Standard { ok: true, .. }),
+            "golgi reply 1 must succeed: {golgi_reply_1:?}"
+        );
+
+        // ── Step 6: nlp.classify (cap2) must receive the merged task ─────────
+        let cap2_recv = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            cap2_client.recv_task(),
+        )
+        .await
+        .expect("cap2 must receive stage-2 task within 2s")
+        .expect("cap2 recv_task error");
+
+        let philotic_client::IpcResponse::InboundTask { task_json: cap2_task_json, .. } = cap2_recv else {
+            panic!("cap2 expected InboundTask, got {:?}", cap2_recv);
+        };
+        let cap2_payload: serde_json::Value =
+            serde_json::from_str(&cap2_task_json).unwrap_or_default();
+        assert_eq!(
+            cap2_payload.get("reply_role").and_then(serde_json::Value::as_str),
+            Some(GOLGI_SINK_ROLE),
+            "stage-2 task reply_role must be hotel:golgi"
+        );
+        assert_eq!(
+            cap2_payload.get("transcript").and_then(serde_json::Value::as_str),
+            Some("hello"),
+            "transcript from stage 1 must be present in stage-2 task"
+        );
+
+        // Agent must still NOT have been notified.
+        let agent_check2 = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            agent_client.recv_task(),
+        )
+        .await;
+        assert!(
+            agent_check2.is_err(),
+            "agent must not receive task while stage 2 is pending"
+        );
+
+        // ── Step 7: nlp.classify replies to hotel:golgi ──────────────────────
+        let golgi_reply_2 = admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: GOLGI_SINK_ROLE.into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "nlp.classify_result",
+                    "session_id": "sess-multi-01",
+                    "turn_id": "turn-multi-01",
+                    "content": "greeting",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("golgi reply 2");
+        assert!(
+            matches!(golgi_reply_2, IpcResponse::Standard { ok: true, .. }),
+            "golgi reply 2 must succeed: {golgi_reply_2:?}"
+        );
+
+        // ── Step 8: agent receives final merged task ──────────────────────────
+        let final_recv = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            agent_client.recv_task(),
+        )
+        .await
+        .expect("agent must receive final task within 2s")
+        .expect("agent recv_task error");
+
+        let philotic_client::IpcResponse::InboundTask { task_json: final_task_json, .. } = final_recv else {
+            panic!("agent expected InboundTask for final delivery, got {:?}", final_recv);
+        };
+        let final_payload: serde_json::Value =
+            serde_json::from_str(&final_task_json).unwrap_or_default();
+
+        assert_eq!(
+            final_payload.get("transcript").and_then(serde_json::Value::as_str),
+            Some("greeting"),
+            "final transcript must come from the last stage (nlp.classify)"
+        );
+        let stages = final_payload
+            .get("golgi_stages")
+            .and_then(serde_json::Value::as_array)
+            .expect("final task must contain golgi_stages array");
+        assert_eq!(stages.len(), 2, "golgi_stages must have 2 entries (one per cisterna)");
+        assert_eq!(
+            final_payload.get("blob_id").and_then(serde_json::Value::as_str),
+            Some("blob-multi-xyz"),
+            "original blob_id must survive all stages"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
