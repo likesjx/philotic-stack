@@ -1549,16 +1549,13 @@ impl ModelProvider for GeminiProvider {
                                     let _ = token_tx.send(text_chunk).await;
                                 }
                             } else if pending_function_call.is_none() {
-                                if let Some(fc_chunk) =
-                                    Self::parse_sse_function_call_chunk(&line)
-                                {
+                                if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
                                     match Self::parse_native_function_call(task, &fc_chunk) {
                                         Ok(Some(tc)) => pending_function_call = Some(tc),
                                         Ok(None) => {}
-                                        Err(e) => warn!(
-                                            "Failed to parse SSE function call chunk: {}",
-                                            e
-                                        ),
+                                        Err(e) => {
+                                            warn!("Failed to parse SSE function call chunk: {}", e)
+                                        }
                                     }
                                 }
                             }

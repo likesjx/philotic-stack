@@ -59,7 +59,7 @@ impl Dispatcher for StubDispatcher {
         );
 
         let target_label = match route.target() {
-            McpRouteTarget::Philote { agent_id } => format!("philote:{}", agent_id),
+            McpRouteTarget::Philote { agent_id, .. } => format!("philote:{}", agent_id),
             McpRouteTarget::Tool { tool_ref } => format!("tool:{}", tool_ref),
             McpRouteTarget::Datasource { datasource_id } => {
                 format!("datasource:{}", datasource_id)

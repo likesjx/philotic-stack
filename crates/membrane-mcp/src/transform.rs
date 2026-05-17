@@ -93,7 +93,7 @@ fn set_dot_path(obj: &mut serde_json::Map<String, Value>, path: &str, value: Val
 fn target_parts(target: &ansible_mesh_core::mcp_route::McpRouteTarget) -> (String, String) {
     use ansible_mesh_core::mcp_route::McpRouteTarget;
     match target {
-        McpRouteTarget::Philote { agent_id } => ("philote".into(), agent_id.clone()),
+        McpRouteTarget::Philote { agent_id, .. } => ("philote".into(), agent_id.clone()),
         McpRouteTarget::Tool { tool_ref } => ("tool".into(), tool_ref.clone()),
         McpRouteTarget::Datasource { datasource_id } => {
             ("datasource".into(), datasource_id.clone())

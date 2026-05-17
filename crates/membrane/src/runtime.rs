@@ -224,7 +224,8 @@ impl MembraneRuntime {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Forward an inbound envelope to the hotel as a `CreateTask`.
+/// Forward an inbound envelope to the hotel as a `CreateTask` (local) or
+/// `EmitTask` (cross-hotel when `raw_transport.target_node` is set).
 ///
 /// Maps `InboundEnvelope` fields to the field names that philote's
 /// `InboundTaskPayload` expects. The two structs serve different layers
@@ -237,6 +238,21 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
         .raw_transport
         .get("transport")
         .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // Cross-hotel routing: present when the MCP route target specifies a remote node.
+    let target_node = envelope
+        .raw_transport
+        .get("target_node")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let target_guest_id = envelope
+        .raw_transport
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(str::to_string);
 
     let payload = serde_json::json!({
@@ -256,9 +272,19 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
         "final_reply_guest_id":   envelope.final_reply_guest_id,
     });
 
-    let req = IpcRequest::CreateTask {
-        target_role: "agent".into(),
-        payload,
+    let req = if let Some(node) = target_node {
+        // Route to a specific remote hotel via mesh dispatch.
+        IpcRequest::EmitTask {
+            target_node: node,
+            target_role: "agent".into(),
+            target_guest_id,
+            task_json: payload.to_string(),
+        }
+    } else {
+        IpcRequest::CreateTask {
+            target_role: "agent".into(),
+            payload,
+        }
     };
     client.send_request(req).await?;
     Ok(())

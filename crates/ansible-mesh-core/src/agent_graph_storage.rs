@@ -823,8 +823,7 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
 
     fn upsert_pipeline_rule(&self, rule: &RoutingPipelineRule) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let rule_str =
-            serde_json::to_string(&rule.rule_json).unwrap_or_else(|_| "{}".to_string());
+        let rule_str = serde_json::to_string(&rule.rule_json).unwrap_or_else(|_| "{}".to_string());
         conn.execute(
             "INSERT INTO routing_pipeline_rules (agent_id, rule_id, rule_json, updated_at)
              VALUES (?1, ?2, ?3, ?4)

@@ -832,6 +832,11 @@ pub struct AgentRuntime {
     /// Reconciled on every watchdog tick — entries are added on first observation
     /// and removed when the session is no longer in a waiting phase.
     stuck_turn_first_seen: HashMap<String, std::time::Instant>,
+    /// Tracks when any active turn started, regardless of phase. Used as a
+    /// catch-all eviction budget — a turn that stays active for too long in any
+    /// phase (including InProgress) will be forcibly evicted. Separate from
+    /// stuck_turn_first_seen so per-phase timers are not disturbed.
+    total_active_since: HashMap<String, std::time::Instant>,
     /// Hotel-wide network reachability flag. Set true when the hotel broadcasts
     /// NetworkState { online: false }. When true, text.generate is routed directly
     /// to the local model tier without attempting cloud providers.
@@ -849,6 +854,7 @@ impl AgentRuntime {
             default_agent_profile: AgentProfile::default(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
+            total_active_since: HashMap::new(),
             network_offline: false,
         }
     }
@@ -1145,6 +1151,7 @@ impl AgentRuntime {
                     input_schema: def.input_schema.clone(),
                     target: McpRouteTarget::Philote {
                         agent_id: self.agent_id.clone(),
+                        target_node: None,
                     },
                     security: McpRouteSecurity {
                         auth: McpAuthScheme::None,
@@ -1292,8 +1299,23 @@ impl AgentRuntime {
         const WAITING_TOOL_SECS: u64 = 90;
         const WAITING_VOICE_SECS: u64 = 60;
         const WAITING_APPROVAL_SECS: u64 = 300; // 5 min — operator may be slow
+        // Hard ceiling: any active turn alive longer than this in ANY phase gets
+        // evicted. Prevents InProgress or unknown-phase turns from sticking forever.
+        const MAX_TOTAL_ACTIVE_SECS: u64 = 600; // 10 min overall budget
 
         let now = std::time::Instant::now();
+
+        // Step 0: maintain total_active_since — track ALL sessions with an active
+        // turn, regardless of phase, so InProgress turns are also bounded.
+        let all_session_ids: Vec<String> = self.sessions.keys().cloned().collect();
+        for sid in &all_session_ids {
+            if self.sessions.get(sid).map(|s| s.active_turn.is_some()).unwrap_or(false) {
+                self.total_active_since.entry(sid.clone()).or_insert(now);
+            } else {
+                self.total_active_since.remove(sid);
+            }
+        }
+        self.total_active_since.retain(|id, _| self.sessions.contains_key(id));
 
         // Step 1: reconcile stuck_turn_first_seen against current session state.
         // Add sessions newly in a waiting phase; remove those that are no longer waiting.
@@ -1392,6 +1414,36 @@ impl AgentRuntime {
             })
             .collect();
 
+        // Step 2b: catch-all — any active turn alive longer than MAX_TOTAL_ACTIVE_SECS
+        // in any phase (including InProgress) that wasn't already caught above.
+        let already_caught: std::collections::HashSet<String> =
+            timed_out.iter().map(|(id, ..)| id.clone()).collect();
+        let catch_all: Vec<(String, String, String, Option<String>, String, String, u64)> = self
+            .total_active_since
+            .iter()
+            .filter_map(|(session_id, &started)| {
+                if already_caught.contains(session_id) {
+                    return None;
+                }
+                let elapsed = started.elapsed().as_secs();
+                if elapsed < MAX_TOTAL_ACTIVE_SECS {
+                    return None;
+                }
+                let state = self.sessions.get(session_id)?;
+                let turn = state.active_turn.as_ref()?;
+                Some((
+                    session_id.clone(),
+                    turn.final_reply_to.clone(),
+                    turn.final_reply_role.clone(),
+                    turn.final_reply_guest_id.clone(),
+                    turn.chat_id.clone(),
+                    format!("CatchAll({:?})", turn.phase),
+                    elapsed,
+                ))
+            })
+            .collect();
+        let timed_out: Vec<_> = timed_out.into_iter().chain(catch_all).collect();
+
         // Step 3: evict.
         for (session_id, reply_to, reply_role, reply_guest_id, chat_id, phase, elapsed_secs) in
             timed_out
@@ -1404,6 +1456,7 @@ impl AgentRuntime {
             );
 
             self.stuck_turn_first_seen.remove(&session_id);
+            self.total_active_since.remove(&session_id);
 
             if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.active_turn = None;
@@ -2648,34 +2701,34 @@ impl AgentRuntime {
             Vec<ToolDefinition>,
             String,
         ) = if let Some(routing) = media_routing {
-                let prompt = if routing.action == "transcribe" {
-                    transcription_prompt(&content)
-                } else {
-                    media_analysis_prompt(&content, &routing.attachments)
-                };
-                let effective_tools = if routing.strip_tools {
-                    Vec::new()
-                } else {
-                    tools_for_model
-                };
-                (
-                    routing.action,
-                    prompt,
-                    routing.attachments,
-                    effective_tools,
-                    routing.capability.to_string(),
-                )
+            let prompt = if routing.action == "transcribe" {
+                transcription_prompt(&content)
             } else {
-                let (dispatch_action, dispatch_cap) =
-                    resolve_dispatch(self.sessions.get(&session_id), "text.generate");
-                (
-                    dispatch_action,
-                    model_prompt,
-                    Vec::new(),
-                    tools_for_model,
-                    dispatch_cap,
-                )
+                media_analysis_prompt(&content, &routing.attachments)
             };
+            let effective_tools = if routing.strip_tools {
+                Vec::new()
+            } else {
+                tools_for_model
+            };
+            (
+                routing.action,
+                prompt,
+                routing.attachments,
+                effective_tools,
+                routing.capability.to_string(),
+            )
+        } else {
+            let (dispatch_action, dispatch_cap) =
+                resolve_dispatch(self.sessions.get(&session_id), "text.generate");
+            (
+                dispatch_action,
+                model_prompt,
+                Vec::new(),
+                tools_for_model,
+                dispatch_cap,
+            )
+        };
         let (response_contract, provider_options) = voice_delivery_envelope(
             self.sessions.get(&session_id),
             Some(serde_json::json!({
@@ -2691,7 +2744,9 @@ impl AgentRuntime {
             // Network-offline fast-path: skip cloud tiers entirely and go straight
             // to the local model. Uses the last entry in the configured fallback
             // tiers, falling back to DEFAULT_FALLBACK_TIERS.
-            if self.network_offline && matches!(capability.as_str(), "text.generate" | "response.generate") {
+            if self.network_offline
+                && matches!(capability.as_str(), "text.generate" | "response.generate")
+            {
                 let offline_role_name: Option<String> = self
                     .sessions
                     .get(&session_id)
@@ -2792,7 +2847,9 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
-        if debug_model_requests_enabled() && matches!(capability.as_str(), "text.generate" | "response.generate") {
+        if debug_model_requests_enabled()
+            && matches!(capability.as_str(), "text.generate" | "response.generate")
+        {
             match serde_json::to_string_pretty(&model_req) {
                 Ok(json) => info!(
                     "PHILOTIC_DEBUG_MODEL_REQUESTS philote outbound model request session={} turn={}:\n{}",
@@ -2944,11 +3001,7 @@ impl AgentRuntime {
                             "Retrying same tier after streaming_timeout (attempt 1)"
                         );
                         return self
-                            .retry_active_turn_after_provider_failure(
-                                session_id,
-                                turn_id,
-                                None,
-                            )
+                            .retry_active_turn_after_provider_failure(session_id, turn_id, None)
                             .await;
                     }
                 }
@@ -11815,9 +11868,13 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        format!("Routing reflex '{preference_key}' stored. Takes effect on the next turn.")
+                        format!(
+                            "Routing reflex '{preference_key}' stored. Takes effect on the next turn."
+                        )
                     }
-                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
                         format!("routing.reflex.set: hotel rejected — {message}")
                     }
                     Ok(_) => "routing.reflex.set: unexpected response from hotel.".into(),
@@ -11872,7 +11929,9 @@ impl AgentRuntime {
                     Ok(IpcResponse::AgentReflexPreferences { rows }) => {
                         serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
                     }
-                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => message,
                     Ok(_) => "routing.reflex.get: unexpected response from hotel.".into(),
                     Err(e) => format!("routing.reflex.get: IPC error — {e}"),
                 };
@@ -11926,9 +11985,13 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        format!("Pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn.")
+                        format!(
+                            "Pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn."
+                        )
                     }
-                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
                         format!("routing.pipeline.set: hotel rejected — {message}")
                     }
                     Ok(_) => "routing.pipeline.set: unexpected response from hotel.".into(),
@@ -11981,8 +12044,12 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
-                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
                         format!("routing.pipeline.remove: hotel rejected — {message}")
                     }
                     Ok(_) => "routing.pipeline.remove: unexpected response from hotel.".into(),
@@ -12035,9 +12102,12 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::RoutingPipelineRules { pipeline_rules }) => {
-                        serde_json::to_string_pretty(&pipeline_rules).unwrap_or_else(|_| "[]".into())
+                        serde_json::to_string_pretty(&pipeline_rules)
+                            .unwrap_or_else(|_| "[]".into())
                     }
-                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => message,
                     Ok(_) => "routing.pipeline.get: unexpected response from hotel.".into(),
                     Err(e) => format!("routing.pipeline.get: IPC error — {e}"),
                 };
@@ -12600,7 +12670,10 @@ mod tests {
             super::implementation_to_model_role("elevenlabs-v1"),
             "model.elevenlabs"
         );
-        assert_eq!(super::implementation_to_model_role("ollama"), "model.ollama");
+        assert_eq!(
+            super::implementation_to_model_role("ollama"),
+            "model.ollama"
+        );
         assert_eq!(
             super::implementation_to_model_role("ollama-llama3"),
             "model.ollama"
@@ -12610,10 +12683,7 @@ mod tests {
             super::implementation_to_model_role("mlx-community/llama"),
             "model.mlx"
         );
-        assert_eq!(
-            super::implementation_to_model_role("onnx"),
-            "model.local"
-        );
+        assert_eq!(super::implementation_to_model_role("onnx"), "model.local");
     }
 
     #[test]

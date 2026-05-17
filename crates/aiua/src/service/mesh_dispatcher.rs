@@ -170,7 +170,12 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    fn hotel_record(hotel_name: &str, node_id: &str, mesh_host: Option<&str>, execution_port: u16) -> HotelRecord {
+    fn hotel_record(
+        hotel_name: &str,
+        node_id: &str,
+        mesh_host: Option<&str>,
+        execution_port: u16,
+    ) -> HotelRecord {
         HotelRecord {
             hotel_name: hotel_name.into(),
             capabilities: NodeCapabilities {

@@ -92,7 +92,9 @@ impl VaultResolver for IpcVaultResolver {
                             .try_into()
                             .map_err(|_| anyhow::anyhow!("vault hash must be 32 bytes"))
                     }
-                    IpcResponse::SecretData { value_json: None, .. } => {
+                    IpcResponse::SecretData {
+                        value_json: None, ..
+                    } => {
                         anyhow::bail!("vault_ref '{}' not found", vault_ref)
                     }
                     other => anyhow::bail!("unexpected vault response: {:?}", other),
@@ -162,7 +164,10 @@ impl MembraneGuest for McpMembrane {
                 for entry in &agents {
                     table.upsert_agent_routes(&entry.agent_id, entry.routes.clone());
                 }
-                info!(count = agents.len(), "replayed persisted MCP routes on startup");
+                info!(
+                    count = agents.len(),
+                    "replayed persisted MCP routes on startup"
+                );
             }
             Ok(_) => {}
             Err(e) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),

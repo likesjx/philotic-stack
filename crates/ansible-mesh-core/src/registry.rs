@@ -246,7 +246,10 @@ impl NodeRegistry {
     pub fn find_node_for_incarnation(&self, guest_id: &str) -> Option<&NodeStatus> {
         self.nodes.values().find(|status| {
             Self::is_fresh(status)
-                && status.advertisements.iter().any(|ad| ad.incarnation_id == guest_id)
+                && status
+                    .advertisements
+                    .iter()
+                    .any(|ad| ad.incarnation_id == guest_id)
         })
     }
 }

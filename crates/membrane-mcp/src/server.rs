@@ -132,8 +132,7 @@ async fn handle_mcp(
 
 fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
     // Params are optional — tolerate clients that omit them entirely.
-    let _params: Option<InitializeParams> =
-        params.and_then(|p| serde_json::from_value(p).ok());
+    let _params: Option<InitializeParams> = params.and_then(|p| serde_json::from_value(p).ok());
 
     JsonRpcResponse::ok(
         id,
@@ -352,6 +351,16 @@ async fn handle_tools_call(
         info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching via legacy route");
     }
 
+    let (route_target_id, route_target_node) = {
+        use ansible_mesh_core::mcp_route::McpRouteTarget;
+        match &route.record.target {
+            McpRouteTarget::Philote { agent_id, target_node } => {
+                (Some(agent_id.clone()), target_node.clone())
+            }
+            _ => (None, None),
+        }
+    };
+
     let envelope = InboundEnvelope {
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
@@ -369,7 +378,12 @@ async fn handle_tools_call(
         attachments: vec![],
         command: Some(tool_name.clone()),
         reply_to: Some(turn_id.clone()),
-        raw_transport: json!({ "transport": "mcp", "tool": tool_name }),
+        raw_transport: json!({
+            "transport": "mcp",
+            "tool": tool_name,
+            "target_id": route_target_id,
+            "target_node": route_target_node,
+        }),
         requires_approval,
         final_reply_to: Some(state.node_id.clone()),
         final_reply_role: Some("mcp-membrane".into()),
