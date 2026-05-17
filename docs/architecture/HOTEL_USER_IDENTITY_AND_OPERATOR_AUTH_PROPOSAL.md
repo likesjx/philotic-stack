@@ -246,6 +246,7 @@ This is intentionally a first slice, not a final auth model:
 - the hotel auth store now persists first real `external_identity_links` records keyed by provider subject, so successful OIDC logins stop being display-name-only proof and start attaching durable Google/GitHub identity linkage to the canonical hotel-local operator user
 - `GET /api/auth/status` now exposes that non-secret external identity linkage so the future `User Settings` surface has a real hotel-owned user graph seam to build on
 - `philotic-web` now exposes a first bounded `GET/PATCH /api/auth/user` surface that reads and updates the canonical hotel-local operator user record, bridges timezone/display-name through the existing hotel profile seam, and gives local-first onboarding a real home before mesh projection or agent personalization join the party
+- the embedded desktop `Aiua Membrane` settings panel is now wired onto that canonical auth-user surface, so `User Settings` can actually curate display name, preferred name, primary email, onboarding state, timezone, and linked provider identities instead of leaving hotel-local user graph authorship stranded in backend purity
 
 ## Desktop Auth Recommendation
 
