@@ -864,15 +864,19 @@ struct PendingPipeline {
     original_target_role: String,
     original_target_guest_id: Option<String>,
     original_task_id: Uuid,
-    /// Immutable original task JSON — used only for on_failure watchdog passthrough.
+    /// Immutable original task JSON — used only for on_failure passthrough.
     original_task_json: String,
     /// Evolves as each stage's output is merged in; delivered to the final target.
     current_task_json: String,
     rule_id: String,
     /// Capability roles yet to execute; front = next stage.
     remaining_stages: std::collections::VecDeque<String>,
-    /// Capability outputs collected so far; written to `golgi_stages` in the final task.
+    /// Enriched provenance records collected so far; written to `golgi_stages`.
     completed_stages: Vec<serde_json::Value>,
+    /// Zero-based index of the stage currently in flight.
+    stage_index: usize,
+    /// Unix timestamp (seconds) when the current stage was dispatched (for elapsed_ms).
+    stage_dispatched_at: u64,
     /// Unix timestamp (seconds) when this entry was inserted; used by the TTL watchdog.
     created_at: u64,
 }
@@ -3163,6 +3167,7 @@ impl IpcServer {
 
             {
                 let mut guard = pending_pipelines.lock().await;
+                let now = unix_ts();
                 guard.insert(
                     corr_key,
                     PendingPipeline {
@@ -3174,7 +3179,9 @@ impl IpcServer {
                         rule_id: rule.rule_id.clone(),
                         remaining_stages: remaining,
                         completed_stages: Vec::new(),
-                        created_at: unix_ts(),
+                        stage_index: 0,
+                        stage_dispatched_at: now,
+                        created_at: now,
                     },
                 );
             }
@@ -3223,10 +3230,48 @@ impl IpcServer {
             return;
         };
 
-        // Accumulate this stage's output and merge it into the evolving task JSON.
-        let cap_output: serde_json::Value =
-            serde_json::from_str(task_json).unwrap_or(serde_json::Value::Null);
-        pending.completed_stages.push(cap_output);
+        // Detect capability error reply — abort the pipeline and deliver original task.
+        let stage_ok = payload.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(true)
+            && payload.get("error").is_none();
+        let elapsed_ms = unix_ts()
+            .saturating_sub(pending.stage_dispatched_at)
+            .saturating_mul(1000);
+
+        // Build provenance record for this stage (enriches golgi_stages array).
+        let stage_record = serde_json::json!({
+            "capability": "",          // filled below after name is known
+            "stage": pending.stage_index,
+            "ok": stage_ok,
+            "elapsed_ms": elapsed_ms,
+            "output": serde_json::from_str::<serde_json::Value>(task_json)
+                .unwrap_or(serde_json::Value::Null),
+        });
+
+        if !stage_ok {
+            warn!(
+                "Golgi: pipeline rule '{}' stage {} returned error — aborting, delivering \
+                 original task {} to '{}' (on_failure passthrough)",
+                pending.rule_id,
+                pending.stage_index,
+                pending.original_task_id,
+                pending.original_target_role,
+            );
+            let failure_json =
+                Self::inject_on_failure_marker(&pending.original_task_json, &stage_record);
+            Self::deliver_inbound_task(
+                inboxes,
+                local_node_id,
+                &pending.original_target_role,
+                pending.original_target_guest_id.as_deref(),
+                pending.original_task_id,
+                failure_json,
+            )
+            .await;
+            return;
+        }
+
+        // Success: accumulate provenance and merge output into current task JSON.
+        pending.completed_stages.push(stage_record);
         let merged_json = Self::merge_golgi_stage_output(
             &pending.current_task_json,
             task_json,
@@ -3239,10 +3284,10 @@ impl IpcServer {
             // More cisternae remain — dispatch to the next stage.
             info!(
                 "Golgi: pipeline rule '{}' stage {} complete — dispatching to '{}'",
-                pending.rule_id,
-                pending.completed_stages.len(),
-                next_capability,
+                pending.rule_id, pending.stage_index, next_capability,
             );
+            pending.stage_index += 1;
+            pending.stage_dispatched_at = unix_ts();
 
             // Rewrite reply_role/reply_to so the next capability also replies to hotel:golgi.
             let next_task_json = if let Ok(mut v) =
@@ -3298,6 +3343,18 @@ impl IpcServer {
             )
             .await;
         }
+    }
+
+    /// Injects `golgi_on_failure: true` and the failed stage record into the passthrough JSON.
+    fn inject_on_failure_marker(task_json: &str, stage_record: &serde_json::Value) -> String {
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(task_json) else {
+            return task_json.to_string();
+        };
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("golgi_on_failure".into(), serde_json::Value::Bool(true));
+            obj.insert("golgi_failed_stage".into(), stage_record.clone());
+        }
+        serde_json::to_string(&v).unwrap_or_else(|_| task_json.to_string())
     }
 
     /// Merges a capability stage's output into the current task JSON.
@@ -3356,21 +3413,29 @@ impl IpcServer {
 
         for (corr_key, pending) in expired {
             warn!(
-                "Golgi: pipeline '{}' (corr_key='{}') timed out after {}s — \
+                "Golgi: pipeline '{}' (corr_key='{}') timed out after {}s at stage {} — \
                  delivering original task {} to '{}' (on_failure passthrough)",
                 pending.rule_id,
                 corr_key,
                 GOLGI_PIPELINE_TTL_SECS,
+                pending.stage_index,
                 pending.original_task_id,
                 pending.original_target_role,
             );
+            let timeout_record = serde_json::json!({
+                "stage": pending.stage_index,
+                "ok": false,
+                "reason": "ttl_timeout",
+            });
+            let failure_json =
+                Self::inject_on_failure_marker(&pending.original_task_json, &timeout_record);
             Self::deliver_inbound_task(
                 inboxes,
                 local_node_id,
                 &pending.original_target_role,
                 pending.original_target_guest_id.as_deref(),
                 pending.original_task_id,
-                pending.original_task_json,
+                failure_json,
             )
             .await;
         }
@@ -23919,6 +23984,8 @@ mod tests {
                     rule_id: "watchdog-test-rule".into(),
                     remaining_stages: std::collections::VecDeque::new(),
                     completed_stages: Vec::new(),
+                    stage_index: 0,
+                    stage_dispatched_at: 0,
                     created_at: 0, // epoch — guaranteed expired
                 },
             );
@@ -23961,7 +24028,16 @@ mod tests {
             payload.get("session_id").and_then(serde_json::Value::as_str),
             Some("sess-watchdog-01"),
         );
-        // No golgi_stages — this is the raw original task, no capability ran.
+        assert_eq!(
+            payload.get("golgi_on_failure").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "watchdog passthrough must carry golgi_on_failure: true"
+        );
+        assert!(
+            payload.get("golgi_failed_stage").is_some(),
+            "watchdog passthrough must include golgi_failed_stage record"
+        );
+        // No golgi_stages — no successful stage ran.
         assert!(
             payload.get("golgi_stages").is_none(),
             "on_failure passthrough must NOT include golgi_stages"
@@ -24235,6 +24311,180 @@ mod tests {
             final_payload.get("blob_id").and_then(serde_json::Value::as_str),
             Some("blob-multi-xyz"),
             "original blob_id must survive all stages"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Verify that a capability error reply aborts the pipeline and delivers the original
+    /// task to the agent with `golgi_on_failure: true` and `golgi_failed_stage` record.
+    ///
+    /// Test plan:
+    /// 1. Configure a 1-stage rule (voice.transcribe).
+    /// 2. Subscribe agent + mock capability.
+    /// 3. Emit matching task — capability receives it.
+    /// 4. Capability replies with `ok: false, error: "transcription failed"` to hotel:golgi.
+    /// 5. Assert agent receives original task (not merged) with golgi_on_failure: true.
+    #[tokio::test]
+    async fn golgi_pipeline_capability_error_aborts_and_delivers_original_task() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-golgi-slice5-err";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = make_hotel_graph(&socket_path, agent_id);
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task =
+            tokio::spawn(async move { server.run().await.expect("ipc server should run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        // ── Configure single-stage rule ──────────────────────────────────────
+        let mut admin_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "admin-err-test".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("admin connect");
+
+        admin_client
+            .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "err-test-rule".into(),
+                rule_json: serde_json::json!({
+                    "match": { "action": "audio_input" },
+                    "stages": [{ "capability": "voice.transcribe" }],
+                }),
+            })
+            .await
+            .expect("upsert rule");
+
+        // ── Subscribe agent + capability ──────────────────────────────────────
+        let agent_guest_id = "err-agent-guest-01";
+        let mut agent_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: agent_guest_id.into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let mut cap_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "err-cap-voice-01".into(),
+            role: "voice.transcribe".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("cap connect");
+
+        // ── Emit task → capability intercepts ────────────────────────────────
+        admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some(agent_guest_id.into()),
+                task_json: serde_json::json!({
+                    "action": "audio_input",
+                    "session_id": "sess-err-01",
+                    "turn_id": "turn-err-01",
+                    "blob_id": "blob-err-xyz",
+                    "agent_id": agent_id,
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        // Capability receives the task.
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            cap_client.recv_task(),
+        )
+        .await
+        .expect("cap must receive task within 2s")
+        .expect("cap recv_task error");
+
+        // ── Capability replies with error ─────────────────────────────────────
+        admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: GOLGI_SINK_ROLE.into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "voice.transcribe_result",
+                    "session_id": "sess-err-01",
+                    "turn_id": "turn-err-01",
+                    "ok": false,
+                    "error": "transcription failed",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("error reply to golgi");
+
+        // ── Agent receives original task with on_failure markers ──────────────
+        let recv = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            agent_client.recv_task(),
+        )
+        .await
+        .expect("agent must receive on_failure delivery within 2s")
+        .expect("agent recv_task error");
+
+        let philotic_client::IpcResponse::InboundTask { task_json, .. } = recv else {
+            panic!("expected InboundTask, got {:?}", recv);
+        };
+        let payload: serde_json::Value = serde_json::from_str(&task_json).unwrap_or_default();
+
+        assert_eq!(
+            payload.get("action").and_then(serde_json::Value::as_str),
+            Some("audio_input"),
+            "on_failure must deliver original action"
+        );
+        assert_eq!(
+            payload.get("blob_id").and_then(serde_json::Value::as_str),
+            Some("blob-err-xyz"),
+            "on_failure must preserve original blob_id"
+        );
+        assert_eq!(
+            payload.get("golgi_on_failure").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "on_failure delivery must carry golgi_on_failure: true"
+        );
+        assert!(
+            payload.get("golgi_failed_stage").is_some(),
+            "on_failure delivery must include golgi_failed_stage"
+        );
+        // No transcript — capability failed before producing output.
+        assert!(
+            payload.get("transcript").is_none(),
+            "on_failure delivery must not carry transcript from failed stage"
+        );
+        // No merged golgi_stages — abort path skips merge.
+        assert!(
+            payload.get("golgi_stages").is_none(),
+            "on_failure delivery must not include golgi_stages"
         );
 
         unsafe {
