@@ -16,6 +16,7 @@ related_docs:
 - DESKTOP_MEMBRANE_PROPOSAL.md
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
 - ARCHITECTURE_STATUS.md
+- ../process/OPERATOR_AUTH_ONBOARDING.md
 task_refs:
 - docs/task.md
 proposal_id: operator-auth-bootstrap-strategy
