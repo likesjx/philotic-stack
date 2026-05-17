@@ -754,7 +754,7 @@ fn mesh_target_addr_for_node(graph: &GraphDomain, target_node_id: &str) -> Resul
         .list_hotels()?
         .into_iter()
         .find(|hotel| hotel.capabilities.node_id == target_node_id)
-        .map(|hotel| format!("{}:{}", mesh_host_for_hotel(&hotel), hotel.mesh_port)))
+        .map(|hotel| format!("{}:{}", mesh_host_for_hotel(&hotel), hotel.execution_port)))
 }
 
 fn mesh_pending_invite_config_key(nonce: &str) -> String {

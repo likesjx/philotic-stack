@@ -4,13 +4,10 @@ pub use types::*;
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
 use crate::protocol::InboundTaskPayload;
-use crate::reflex::{
-    IngressAction, MaterializationContext, PolicyAssertion, ReflexEngine, ReflexEvent,
-};
+use crate::reflex::{IngressAction, PolicyAssertion, ReflexEngine, ReflexEvent};
 use philotic_client::{
     HandoffBundle, SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -2870,12 +2867,12 @@ impl SessionState {
             }
             // Discard non-restorable turns — after a restart, in-flight model/tool/voice
             // calls are gone. Restoring them leaves is_turn_active()=true forever.
-            // Only waiting_approval is worth keeping (operator may still resolve it).
+            // Only waiting_approval and waiting_tool are worth keeping across restart.
             let phase_str = turn
                 .get("phase")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("queued");
-            if !matches!(phase_str, "waiting_approval") {
+            if !matches!(phase_str, "waiting_approval" | "waiting_tool") {
                 return None;
             }
             let local_node_id = local_node_id();

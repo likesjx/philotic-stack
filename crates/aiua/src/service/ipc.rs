@@ -2340,16 +2340,11 @@ impl IpcServer {
             let inboxes = self.inboxes.clone();
             let local_node_id = self.local_node_id.clone();
             tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(tokio::time::Duration::from_secs(30));
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    Self::golgi_pipeline_watchdog(
-                        &pending_pipelines,
-                        &inboxes,
-                        &local_node_id,
-                    )
-                    .await;
+                    Self::golgi_pipeline_watchdog(&pending_pipelines, &inboxes, &local_node_id)
+                        .await;
                 }
             });
         }
@@ -3088,8 +3083,7 @@ impl IpcServer {
     ) -> Option<(String, Uuid, String)> {
         use ansible_mesh_core::agent_graph_storage::AgentGraphStorage as _;
 
-        let ctx =
-            infer_agent_context_for_task(graph, target_role, target_guest_id, task_json)?;
+        let ctx = infer_agent_context_for_task(graph, target_role, target_guest_id, task_json)?;
 
         let path = agent_graph_db_path(&ctx.agent_id);
         if !path.exists() {
@@ -3128,7 +3122,9 @@ impl IpcServer {
             }
 
             // Collect all cisternae (pipeline stages) in order.
-            let stages = rule_json.get("stages").and_then(serde_json::Value::as_array)?;
+            let stages = rule_json
+                .get("stages")
+                .and_then(serde_json::Value::as_array)?;
             if stages.is_empty() {
                 continue;
             }
@@ -5678,17 +5674,16 @@ impl IpcServer {
                     match route_resolution {
                         AgentRouteResolution::Deliver(target_guest_id) => {
                             // Golgi trans hook: intercept if a pipeline rule matches.
-                            if let Some((cap_role, cap_id, cap_json)) =
-                                Self::try_golgi_intercept(
-                                    graph,
-                                    local_node_id,
-                                    &target_role,
-                                    target_guest_id.as_deref(),
-                                    task_id,
-                                    &task_json,
-                                    &pending_pipelines,
-                                )
-                                .await
+                            if let Some((cap_role, cap_id, cap_json)) = Self::try_golgi_intercept(
+                                graph,
+                                local_node_id,
+                                &target_role,
+                                target_guest_id.as_deref(),
+                                task_id,
+                                &task_json,
+                                &pending_pipelines,
+                            )
+                            .await
                             {
                                 info!(
                                     "Golgi: intercepting task {} → capability '{}'",
@@ -8329,7 +8324,11 @@ impl IpcServer {
             }
 
             // ── MCP route table management ────────────────────────────────
-            IpcRequest::UpdateMcpRoutes { agent_id, routes, vault_ref } => {
+            IpcRequest::UpdateMcpRoutes {
+                agent_id,
+                routes,
+                vault_ref,
+            } => {
                 let route_count = routes.len();
                 // Persist so routes survive hotel restarts.
                 let entry = serde_json::json!({
@@ -10375,6 +10374,38 @@ impl IpcServer {
         let tool_runner_registry = merge_tool_runners(&registered_runners, &tool_runners);
         let mesh_registry = Self::compose_mesh_registry_snapshot(registry).await;
 
+        // Always merge baseline approval classes into whatever policy is stored so that
+        // stale sessions (which recorded an older policy before "config" was added) are
+        // fixed automatically on the next hotel restart, without losing auto_approve_all.
+        let approval_policy = {
+            let mut policy = session
+                .summary_json
+                .get("approval_policy")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"auto_approve_all": false}));
+            if let Some(obj) = policy.as_object_mut() {
+                let classes = obj
+                    .entry("preapproved_classes")
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(arr) = classes.as_array_mut() {
+                    for c in ["session", "utility", "capability", "config"] {
+                        if !arr.iter().any(|v| v.as_str() == Some(c)) {
+                            arr.push(serde_json::json!(c));
+                        }
+                    }
+                }
+                let tools = obj
+                    .entry("preapproved_tools")
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(arr) = tools.as_array_mut() {
+                    if !arr.iter().any(|v| v.as_str() == Some("agent.configure")) {
+                        arr.push(serde_json::json!("agent.configure"));
+                    }
+                }
+            }
+            policy
+        };
+
         Ok(Some(serde_json::json!({
             "session_id": session.session_id,
             "agent_id": session.primary_agent_id,
@@ -10384,20 +10415,7 @@ impl IpcServer {
             "agent_profile": agent_profile,
             "status": session.status,
             "summary": session.summary_json,
-            "approval_policy": session
-                .summary_json
-                .get("approval_policy")
-                .cloned()
-                .unwrap_or_else(|| {
-                    // Bootstrap the orchestrator approval policy: governance and self-config
-                    // tools run without per-action approval so the agent can operate
-                    // autonomously from the first turn.
-                    serde_json::json!({
-                        "auto_approve_all": false,
-                        "preapproved_classes": ["session", "utility", "capability"],
-                        "preapproved_tools": ["agent.configure"]
-                    })
-                }),
+            "approval_policy": approval_policy,
             "bindings": bindings,
             "component_route_assembly": component_route_assembly,
             "tool_assembly": tool_assembly,
@@ -11066,10 +11084,7 @@ fn compose_component_route_assembly(
                 if capability == "text.generate" {
                     if let Some(cap) = &preferred_gen_cap {
                         if let Some(obj) = route.as_object_mut() {
-                            obj.insert(
-                                "target_capability".to_string(),
-                                serde_json::json!(cap),
-                            );
+                            obj.insert("target_capability".to_string(), serde_json::json!(cap));
                         }
                     }
                 }
@@ -23476,8 +23491,7 @@ mod tests {
         let result = compose_component_route_assembly(&bindings, &[], &[], &registry, "local-node");
         let target_cap = &result["execution_routes"]["text.generate"]["target_capability"];
         assert_eq!(
-            target_cap,
-            "response.generate",
+            target_cap, "response.generate",
             "text.generate route must carry target_capability=response.generate when reflex is set"
         );
     }
@@ -23586,7 +23600,10 @@ mod tests {
             })
             .await
             .expect("get-all after remove");
-        let IpcResponse::RoutingPipelineRules { pipeline_rules: after } = get_after else {
+        let IpcResponse::RoutingPipelineRules {
+            pipeline_rules: after,
+        } = get_after
+        else {
             panic!("expected RoutingPipelineRules");
         };
         assert!(after.is_empty(), "rule should be gone after remove");
@@ -23681,11 +23698,8 @@ mod tests {
             .expect("agent connect");
             // Drain up to 3 inbound tasks within 500ms
             for _ in 0..3 {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    agent.recv_task(),
-                )
-                .await
+                match tokio::time::timeout(std::time::Duration::from_millis(500), agent.recv_task())
+                    .await
                 {
                     Ok(Ok(resp)) => {
                         let mut guard = agent_capture.lock().await;
@@ -23831,7 +23845,11 @@ mod tests {
                 "original blob_id must be preserved in merged task"
             );
             assert!(
-                payload.get("golgi_stages").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false),
+                payload
+                    .get("golgi_stages")
+                    .and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false),
                 "merged task must contain non-empty golgi_stages array for traceability"
             );
         } else {
@@ -23925,8 +23943,7 @@ mod tests {
         }
 
         // ── Drive the watchdog directly (no 30s wait) ───────────────────────
-        IpcServer::golgi_pipeline_watchdog(&pending_pipelines, &inboxes, "local-aiua-01")
-            .await;
+        IpcServer::golgi_pipeline_watchdog(&pending_pipelines, &inboxes, "local-aiua-01").await;
 
         // ── Assert pending_pipelines is now empty ────────────────────────────
         {
@@ -23948,7 +23965,10 @@ mod tests {
         .expect("recv_task error");
 
         let philotic_client::IpcResponse::InboundTask { task_json, .. } = received else {
-            panic!("expected InboundTask from watchdog delivery, got {:?}", received);
+            panic!(
+                "expected InboundTask from watchdog delivery, got {:?}",
+                received
+            );
         };
 
         let payload: serde_json::Value = serde_json::from_str(&task_json).unwrap_or_default();
@@ -23958,7 +23978,9 @@ mod tests {
             "on_failure delivery must carry original action"
         );
         assert_eq!(
-            payload.get("session_id").and_then(serde_json::Value::as_str),
+            payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str),
             Some("sess-watchdog-01"),
         );
         // No golgi_stages — this is the raw original task, no capability ran.
@@ -24093,26 +24115,32 @@ mod tests {
         );
 
         // ── Step 4: voice.transcribe (cap1) must receive the task ────────────
-        let cap1_recv = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            cap1_client.recv_task(),
-        )
-        .await
-        .expect("cap1 must receive stage-1 task within 2s")
-        .expect("cap1 recv_task error");
+        let cap1_recv =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), cap1_client.recv_task())
+                .await
+                .expect("cap1 must receive stage-1 task within 2s")
+                .expect("cap1 recv_task error");
 
-        let philotic_client::IpcResponse::InboundTask { task_json: cap1_task_json, .. } = cap1_recv else {
+        let philotic_client::IpcResponse::InboundTask {
+            task_json: cap1_task_json,
+            ..
+        } = cap1_recv
+        else {
             panic!("cap1 expected InboundTask, got {:?}", cap1_recv);
         };
         let cap1_payload: serde_json::Value =
             serde_json::from_str(&cap1_task_json).unwrap_or_default();
         assert_eq!(
-            cap1_payload.get("reply_role").and_then(serde_json::Value::as_str),
+            cap1_payload
+                .get("reply_role")
+                .and_then(serde_json::Value::as_str),
             Some(GOLGI_SINK_ROLE),
             "stage-1 task reply_role must be hotel:golgi"
         );
         assert_eq!(
-            cap1_payload.get("blob_id").and_then(serde_json::Value::as_str),
+            cap1_payload
+                .get("blob_id")
+                .and_then(serde_json::Value::as_str),
             Some("blob-multi-xyz"),
             "original blob_id must be forwarded to stage-1 capability"
         );
@@ -24150,26 +24178,32 @@ mod tests {
         );
 
         // ── Step 6: nlp.classify (cap2) must receive the merged task ─────────
-        let cap2_recv = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            cap2_client.recv_task(),
-        )
-        .await
-        .expect("cap2 must receive stage-2 task within 2s")
-        .expect("cap2 recv_task error");
+        let cap2_recv =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), cap2_client.recv_task())
+                .await
+                .expect("cap2 must receive stage-2 task within 2s")
+                .expect("cap2 recv_task error");
 
-        let philotic_client::IpcResponse::InboundTask { task_json: cap2_task_json, .. } = cap2_recv else {
+        let philotic_client::IpcResponse::InboundTask {
+            task_json: cap2_task_json,
+            ..
+        } = cap2_recv
+        else {
             panic!("cap2 expected InboundTask, got {:?}", cap2_recv);
         };
         let cap2_payload: serde_json::Value =
             serde_json::from_str(&cap2_task_json).unwrap_or_default();
         assert_eq!(
-            cap2_payload.get("reply_role").and_then(serde_json::Value::as_str),
+            cap2_payload
+                .get("reply_role")
+                .and_then(serde_json::Value::as_str),
             Some(GOLGI_SINK_ROLE),
             "stage-2 task reply_role must be hotel:golgi"
         );
         assert_eq!(
-            cap2_payload.get("transcript").and_then(serde_json::Value::as_str),
+            cap2_payload
+                .get("transcript")
+                .and_then(serde_json::Value::as_str),
             Some("hello"),
             "transcript from stage 1 must be present in stage-2 task"
         );
@@ -24215,14 +24249,23 @@ mod tests {
         .expect("agent must receive final task within 2s")
         .expect("agent recv_task error");
 
-        let philotic_client::IpcResponse::InboundTask { task_json: final_task_json, .. } = final_recv else {
-            panic!("agent expected InboundTask for final delivery, got {:?}", final_recv);
+        let philotic_client::IpcResponse::InboundTask {
+            task_json: final_task_json,
+            ..
+        } = final_recv
+        else {
+            panic!(
+                "agent expected InboundTask for final delivery, got {:?}",
+                final_recv
+            );
         };
         let final_payload: serde_json::Value =
             serde_json::from_str(&final_task_json).unwrap_or_default();
 
         assert_eq!(
-            final_payload.get("transcript").and_then(serde_json::Value::as_str),
+            final_payload
+                .get("transcript")
+                .and_then(serde_json::Value::as_str),
             Some("greeting"),
             "final transcript must come from the last stage (nlp.classify)"
         );
@@ -24230,9 +24273,15 @@ mod tests {
             .get("golgi_stages")
             .and_then(serde_json::Value::as_array)
             .expect("final task must contain golgi_stages array");
-        assert_eq!(stages.len(), 2, "golgi_stages must have 2 entries (one per cisterna)");
         assert_eq!(
-            final_payload.get("blob_id").and_then(serde_json::Value::as_str),
+            stages.len(),
+            2,
+            "golgi_stages must have 2 entries (one per cisterna)"
+        );
+        assert_eq!(
+            final_payload
+                .get("blob_id")
+                .and_then(serde_json::Value::as_str),
             Some("blob-multi-xyz"),
             "original blob_id must survive all stages"
         );

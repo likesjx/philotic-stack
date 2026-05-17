@@ -769,6 +769,7 @@ fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json::Value]) -> String {
     let active_role_name = active_incarnation_id
         .and_then(|guest_id| guest_id.rsplit(':').next())
@@ -1248,7 +1249,7 @@ impl AgentRuntime {
                 continue;
             }
 
-            let Some(mut state) = SessionState::from_checkpoint(&checkpoint) else {
+            let Some(state) = SessionState::from_checkpoint(&checkpoint) else {
                 continue;
             };
 
@@ -1309,13 +1310,19 @@ impl AgentRuntime {
         // turn, regardless of phase, so InProgress turns are also bounded.
         let all_session_ids: Vec<String> = self.sessions.keys().cloned().collect();
         for sid in &all_session_ids {
-            if self.sessions.get(sid).map(|s| s.active_turn.is_some()).unwrap_or(false) {
+            if self
+                .sessions
+                .get(sid)
+                .map(|s| s.active_turn.is_some())
+                .unwrap_or(false)
+            {
                 self.total_active_since.entry(sid.clone()).or_insert(now);
             } else {
                 self.total_active_since.remove(sid);
             }
         }
-        self.total_active_since.retain(|id, _| self.sessions.contains_key(id));
+        self.total_active_since
+            .retain(|id, _| self.sessions.contains_key(id));
 
         // Step 1: reconcile stuck_turn_first_seen against current session state.
         // Add sessions newly in a waiting phase; remove those that are no longer waiting.
@@ -1633,7 +1640,7 @@ impl AgentRuntime {
                             }
                         }
                         Ok(task) if task.action.as_deref() == Some("voice.dialogue") => {
-                            let task_ref = task.clone();
+                            let _task_ref = task.clone();
                             if let Err(err) = self.handle_voice_dialogue(task, task_id).await {
                                 error!("Failed to handle voice.dialogue: {}", err);
                             }
@@ -2236,11 +2243,11 @@ impl AgentRuntime {
                             "Session [{}] plan resume: no reentry envelope; aborting.",
                             session_id
                         );
-                        drop(state);
+
                         return Ok(());
                     }
                 };
-                drop(state);
+
                 self.ipc_client
                     .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
                     .await?;
@@ -2302,7 +2309,7 @@ impl AgentRuntime {
                     state.active_turn = Some(parked);
                 }
                 // Let fail_active_turn handle the rest.
-                drop(state);
+
                 return self
                     .fail_active_turn(
                         session_id,
@@ -2393,7 +2400,7 @@ impl AgentRuntime {
                     let busy_reply_guest_id = final_reply_guest_id.clone();
                     let busy_chat_id = chat_id.clone();
                     let busy_session_id = session_id.clone();
-                    drop(state);
+
                     let _ = self
                         .ipc_client
                         .send_request(IpcRequest::EmitTask {
@@ -5413,8 +5420,8 @@ impl AgentRuntime {
             .await?;
 
         // Capture for attend hook before moving into reply_payload.
-        let attend_turn_id = turn_id.clone();
-        let attend_content = content.clone();
+        let _attend_turn_id = turn_id.clone();
+        let _attend_content = content.clone();
         let attend_session_id = session_id.clone();
 
         // Named specialist philotes always append an @agent attribution tag so the

@@ -354,9 +354,10 @@ async fn handle_tools_call(
     let (route_target_id, route_target_node) = {
         use ansible_mesh_core::mcp_route::McpRouteTarget;
         match &route.record.target {
-            McpRouteTarget::Philote { agent_id, target_node } => {
-                (Some(agent_id.clone()), target_node.clone())
-            }
+            McpRouteTarget::Philote {
+                agent_id,
+                target_node,
+            } => (Some(agent_id.clone()), target_node.clone()),
             _ => (None, None),
         }
     };

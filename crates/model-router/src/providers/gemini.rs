@@ -502,7 +502,7 @@ impl GeminiProvider {
             "display_text": { "type": "STRING" },
             "spoken_text": { "type": "STRING" }
         });
-        let mut required = vec!["display_text", "spoken_text"];
+        let required = vec!["display_text", "spoken_text"];
 
         if wants_concept {
             properties["memory_candidate"] = json!({
