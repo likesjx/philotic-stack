@@ -1360,7 +1360,26 @@ async fn handle_auth_oidc_start(
     Json(body): Json<OidcStartBody>,
 ) -> Response {
     let provider_key = body.provider.trim().to_ascii_lowercase();
-    let provider = match oidc_provider_config(&state.socket, &provider_key, Some(&headers)).await {
+    let resolved = match load_oidc_resolved_config(&state.socket, Some(&headers)).await {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if oidc_loopback_bootstrap_only(&resolved) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "local loopback membranes should use the bootstrap/back-door path; configure oidc_public_base_url for a real public ingress if you want OIDC here"
+            })),
+        )
+            .into_response();
+    }
+    let provider = match oidc_provider_config_from_resolved(&provider_key, resolved) {
         Ok(Some(provider)) => provider,
         Ok(None) => {
             return (
@@ -6001,6 +6020,19 @@ fn env_trimmed(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn oidc_loopback_bootstrap_only(resolved: &OidcResolvedConfig) -> bool {
+    if resolved.public_base_source != "request-headers" {
+        return false;
+    }
+    let Ok(url) = Url::parse(&resolved.public_base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 fn sanitize_return_path(input: Option<&str>) -> Option<String> {
     input
         .map(str::trim)
@@ -6442,7 +6474,7 @@ mod tests {
         let provider = oidc_provider_config_from_resolved(
             "google",
             OidcResolvedConfig {
-                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_url: "https://brain.jaredlikes.com".into(),
                 public_base_source: "hotel-config".into(),
                 google: OidcProviderSettings {
                     client_id: Some("google-client".into()),
@@ -6461,7 +6493,7 @@ mod tests {
         assert!(provider.configured);
         assert_eq!(
             provider.redirect_uri,
-            "https://desktop.jaredlikes.com/auth/oidc/google/callback"
+            "https://brain.jaredlikes.com/auth/oidc/google/callback"
         );
     }
 
@@ -6470,7 +6502,7 @@ mod tests {
         let provider = oidc_provider_config_from_resolved(
             "google",
             OidcResolvedConfig {
-                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_url: "https://brain.jaredlikes.com".into(),
                 public_base_source: "hotel-config".into(),
                 google: OidcProviderSettings {
                     client_id: Some("google-client".into()),
@@ -6493,8 +6525,40 @@ mod tests {
         assert!(url.contains("state=state-123"));
         assert!(url.contains("code_challenge=challenge-456"));
         assert!(url.contains(
-            "redirect_uri=https%3A%2F%2Fdesktop.jaredlikes.com%2Fauth%2Foidc%2Fgoogle%2Fcallback"
+            "redirect_uri=https%3A%2F%2Fbrain.jaredlikes.com%2Fauth%2Foidc%2Fgoogle%2Fcallback"
         ));
+    }
+
+    #[test]
+    fn loopback_request_header_base_requires_bootstrap_instead_of_oidc() {
+        assert!(oidc_loopback_bootstrap_only(&OidcResolvedConfig {
+            public_base_url: "http://127.0.0.1:7700".into(),
+            public_base_source: "request-headers".into(),
+            google: OidcProviderSettings {
+                client_id: Some("google-client".into()),
+                client_secret: Some("google-secret".into()),
+                client_secret_ref: Some("vault:google".into()),
+            },
+            github: OidcProviderSettings {
+                client_id: Some("github-client".into()),
+                client_secret: Some("github-secret".into()),
+                client_secret_ref: Some("vault:github".into()),
+            },
+        }));
+        assert!(!oidc_loopback_bootstrap_only(&OidcResolvedConfig {
+            public_base_url: "https://brain.jaredlikes.com".into(),
+            public_base_source: "hotel-config".into(),
+            google: OidcProviderSettings {
+                client_id: Some("google-client".into()),
+                client_secret: Some("google-secret".into()),
+                client_secret_ref: Some("vault:google".into()),
+            },
+            github: OidcProviderSettings {
+                client_id: Some("github-client".into()),
+                client_secret: Some("github-secret".into()),
+                client_secret_ref: Some("vault:github".into()),
+            },
+        }));
     }
 
     #[test]
@@ -6502,7 +6566,7 @@ mod tests {
         let provider = oidc_provider_config_from_resolved(
             "google",
             OidcResolvedConfig {
-                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_url: "https://brain.jaredlikes.com".into(),
                 public_base_source: "hotel-config".into(),
                 google: OidcProviderSettings {
                     client_id: Some("google-client".into()),
@@ -6541,7 +6605,7 @@ mod tests {
         let provider = oidc_provider_config_from_resolved(
             "github",
             OidcResolvedConfig {
-                public_base_url: "https://desktop.jaredlikes.com".into(),
+                public_base_url: "https://brain.jaredlikes.com".into(),
                 public_base_source: "hotel-config".into(),
                 google: OidcProviderSettings {
                     client_id: None,

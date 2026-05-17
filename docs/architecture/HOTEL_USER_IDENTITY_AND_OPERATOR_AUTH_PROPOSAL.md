@@ -243,6 +243,7 @@ This is intentionally a first slice, not a final auth model:
 - the next accepted bootstrap direction is now explicit in [OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md): OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
 - `philotic-web` now has a first provider-backed OIDC ceremony seam: provider discovery in auth status, `/api/auth/oidc/start` for PKCE-backed challenge issuance, and `/auth/oidc/:provider/callback` for code exchange and hotel-issued operator session issuance
 - OIDC settings are now moving under hotel authority too: the intended canonical split is hotel-config-backed public base URL and provider client IDs plus vault-backed provider `*_secret_ref` config keys, with env values retained only as transitional fallback while operator config catches up
+- local loopback membranes now intentionally prefer the bootstrap/back-door path when the public base URL is only derived from request headers, instead of pretending `127.0.0.1` is a production-grade OIDC ingress and then letting Google perform redirect bureaucracy theater
 - the hotel auth store now persists first real `external_identity_links` records keyed by provider subject, so successful OIDC logins stop being display-name-only proof and start attaching durable Google/GitHub identity linkage to the canonical hotel-local operator user
 - `GET /api/auth/status` now exposes that non-secret external identity linkage so the future `User Settings` surface has a real hotel-owned user graph seam to build on
 - `philotic-web` now exposes a first bounded `GET/PATCH /api/auth/user` surface that reads and updates the canonical hotel-local operator user record, bridges timezone/display-name through the existing hotel profile seam, and gives local-first onboarding a real home before mesh projection or agent personalization join the party
@@ -326,7 +327,7 @@ The useful split is:
 
 The most plausible secure long-running shape is:
 
-1. a long-running `philotic-web serve` or successor `membrane.desktop` process on `vps-jane`
+1. a long-running `philotic-web serve` or successor `membrane.desktop` process on `vps-jane`, exposed through the public operator ingress at `brain.jaredlikes.com`
 2. bound to a stable ingress address
 3. serving only a login/bootstrap shell until operator auth completes
 4. issuing short-lived operator sessions from hotel authority

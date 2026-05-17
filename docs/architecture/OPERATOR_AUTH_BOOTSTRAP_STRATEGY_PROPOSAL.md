@@ -71,7 +71,7 @@ Membranes may help verify the human. They may not quietly become the front desk 
 
 ### 1. OIDC primary
 
-The first durable human login path should be OIDC-backed, using the already prepared identity surface at `desktop.jaredlikes.com`.
+The first durable human login path should be OIDC-backed, using the public operator ingress on `brain.jaredlikes.com`.
 
 Current preferred providers:
 
@@ -85,6 +85,12 @@ Why lead with OIDC:
 - the web-facing setup work is largely done
 - it avoids inventing a password system nobody actually wants to maintain
 - it gives the always-on desktop on `vps-jane` a trustworthy first factor quickly
+
+Loopback/local membranes are the intentional exception:
+
+- local operator surfaces should prefer the hotel-issued bootstrap/back-door path by default
+- localhost OIDC should require explicit opt-in configuration rather than silently deriving loopback callbacks from request headers
+- public ingress is where OIDC belongs by default; local ingress is where bootstrap convenience belongs by default
 
 ### 2. Membrane-assisted single-use challenge
 

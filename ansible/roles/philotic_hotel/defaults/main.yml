@@ -58,6 +58,9 @@ philotic_backbone_peers: []
 # Agent config projected into mesh-config.json — defaults to empty (no guests)
 philotic_agents: {}
 
+# Optional hotel-scoped auth/config overlays projected into mesh-config.json
+philotic_oidc_public_base_url: ""
+
 # Log level
 philotic_rust_log: "info"
 

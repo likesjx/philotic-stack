@@ -4,6 +4,7 @@ philotic_hotel_name: "vps-jane"
 philotic_hotel_canonical_name: "vps-jane"
 philotic_hotel_previous_names:
   - "beacon-test-hotel"
+philotic_oidc_public_base_url: "https://brain.jaredlikes.com"
 philotic_default_model: "gemini-flash-latest"
 philotic_repo_branch: "codex/hegemon-membrane-slice"
 
