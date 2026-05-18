@@ -27,6 +27,7 @@ use crate::storage::{
 };
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
+use tracing::warn;
 use std::sync::Arc;
 
 mod kinds;
@@ -825,14 +826,20 @@ impl GraphDomain {
     }
 
     pub fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>> {
-        self.adapter
-            .list_nodes_by_kind(NODE_KIND_ABSTRACT_SKILL)?
-            .into_iter()
-            .map(|n| {
-                serde_json::from_value(n.data)
-                    .context("GraphDomain::list_abstract_skills: deserialize AbstractSkillRecord")
-            })
-            .collect()
+        let mut skills = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_ABSTRACT_SKILL)? {
+            match serde_json::from_value::<AbstractSkillRecord>(node.data.clone()) {
+                Ok(skill) => skills.push(skill),
+                Err(err) => {
+                    warn!(
+                        node_key = %node.node_key,
+                        "Skipping incompatible abstract_skill record during list_abstract_skills: {}",
+                        err
+                    );
+                }
+            }
+        }
+        Ok(skills)
     }
 
     // ── Workflow skill methods ────────────────────────────────────────────────

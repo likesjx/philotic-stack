@@ -8255,6 +8255,53 @@ impl AgentRuntime {
                         }))
                         .unwrap_or_else(|_| "Router stats unavailable.".into());
                         (text, None)
+                        let hotel = data
+                            .get("recommended_hotel")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown");
+                        let node = data
+                            .get("recommended_node_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown");
+                        let reason = data
+                            .get("reason")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("no reason recorded");
+                        let candidate_lines = data
+                            .get("candidates")
+                            .and_then(|value| value.as_array())
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .take(5)
+                                    .map(|candidate| {
+                                        let hotel_name = candidate
+                                            .get("hotel_name")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or("unknown");
+                                        let node_id = candidate
+                                            .get("node_id")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or("unknown");
+                                        let score = candidate
+                                            .get("score")
+                                            .and_then(|value| value.as_i64())
+                                            .unwrap_or(0);
+                                        format!("- {} ({}) score={}", hotel_name, node_id, score)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        let msg = if candidate_lines.is_empty() {
+                            format!("Best placement: {} ({}).\nReason: {}", hotel, node, reason)
+                        } else {
+                            format!(
+                                "Best placement: {} ({}).\nReason: {}\nCandidates:\n{}",
+                                hotel, node, reason, candidate_lines
+                            )
+                        };
+                        (msg, None)
                     }
                     Ok(IpcResponse::Standard {
                         ok: false,

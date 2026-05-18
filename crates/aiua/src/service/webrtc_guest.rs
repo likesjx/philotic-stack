@@ -3,8 +3,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -17,7 +17,8 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
-type PendingSessionRegistry = Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>;
+type PendingSessionRegistry =
+    Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>;
 type SessionStatusRegistry = Mutex<HashMap<String, String>>;
 const SMOKE_PING_PREFIX: &str = "philotic-webrtc-ping:";
 const SMOKE_PONG_PREFIX: &str = "philotic-webrtc-pong:";
@@ -78,7 +79,10 @@ impl WebRtcGuest {
         let desc = RTCSessionDescription::answer(answer_sdp).expect("Invalid SDP Answer format");
         pc.set_remote_description(desc).await?;
         set_session_status(session_id, "answer_applied").await;
-        info!("Applied remote SDP answer for WebRTC session {}", session_id);
+        info!(
+            "Applied remote SDP answer for WebRTC session {}",
+            session_id
+        );
         Ok(true)
     }
 

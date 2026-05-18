@@ -24,7 +24,9 @@ async fn main() -> Result<()> {
 
     match mode.as_str() {
         "targets" => {
-            let response = client.send_request(IpcRequest::ListDesktopMembraneTargets).await?;
+            let response = client
+                .send_request(IpcRequest::ListDesktopMembraneTargets)
+                .await?;
             match response {
                 IpcResponse::DesktopMembraneTargetsView { membrane_targets } => {
                     println!("{}", serde_json::to_string_pretty(&membrane_targets)?);
@@ -73,9 +75,7 @@ async fn main() -> Result<()> {
             match response {
                 IpcResponse::SkillList { skills } => {
                     let found = skills.iter().any(|skill| {
-                        skill
-                            .get("skill_name")
-                            .and_then(serde_json::Value::as_str)
+                        skill.get("skill_name").and_then(serde_json::Value::as_str)
                             == Some(skill_name.as_str())
                     });
                     if !found {

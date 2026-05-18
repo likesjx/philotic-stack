@@ -50,8 +50,7 @@ mod tests {
         };
 
         let encoded = serde_json::to_vec(&msg).expect("encode signal");
-        let decoded: WebRtcSignalMessage =
-            serde_json::from_slice(&encoded).expect("decode signal");
+        let decoded: WebRtcSignalMessage = serde_json::from_slice(&encoded).expect("decode signal");
 
         assert_eq!(decoded.session_id, "session-123");
         assert_eq!(decoded.target_node_id, "mbp-jane-aiua-01");

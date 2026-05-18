@@ -61,6 +61,8 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+const OPERATOR_SURFACE_QUERY_TIMEOUT_SECS: u64 = 5;
+
 pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
 
 /// Per-subagent hook routing record stored in the hotel's in-memory registry.
@@ -1795,7 +1797,7 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote guest query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for remote guest inventory reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
@@ -1885,7 +1887,7 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote status query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for remote target status reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
@@ -1975,7 +1977,7 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote agent query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for remote target agent reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
@@ -2065,7 +2067,7 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote config query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for remote target config reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
@@ -2155,7 +2157,7 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote secret query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for remote target secret reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
@@ -2255,7 +2257,7 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote placement query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
             .await
             .map_err(|_| {
                 anyhow::anyhow!("timed out waiting for remote target placement reply")
@@ -2347,7 +2349,7 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote component query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
             .await
             .map_err(|_| {
                 anyhow::anyhow!("timed out waiting for remote target component reply")
@@ -8812,6 +8814,7 @@ impl IpcServer {
                     }
                     SkillValidationState::Draft => ("draft".to_string(), vec![]),
                     SkillValidationState::Registered => ("registered".to_string(), vec![]),
+                    SkillValidationState::Active => ("active".to_string(), vec![]),
                     SkillValidationState::Suspended { reason } => {
                         ("suspended".to_string(), vec![reason.clone()])
                     }
@@ -9220,6 +9223,7 @@ impl IpcServer {
                             SkillValidationState::Invalid { .. } => "invalid",
                             SkillValidationState::Draft => "draft",
                             SkillValidationState::Registered => "registered",
+                            SkillValidationState::Active => "active",
                             SkillValidationState::Suspended { .. } => "suspended",
                             SkillValidationState::Deprecated => "deprecated",
                         };
@@ -11488,6 +11492,8 @@ impl IpcServer {
                     "agent"
                 } else if g.role == "graph-runner" || g.role.starts_with("graph.") {
                     "graph-runner"
+                } else if g.role.contains("datasource") || g.role.contains("listener") {
+                    "data"
                 } else {
                     "other"
                 };

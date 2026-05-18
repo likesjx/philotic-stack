@@ -474,7 +474,10 @@ mod tests {
         let decoded: MeshCatalogSyncPayload =
             serde_json::from_slice(&encoded).expect("payload should decode");
         assert_eq!(decoded.mesh_id, "default");
-        assert_eq!(decoded.abstract_tools[0].tool_name, "hotel.best_place_to_run");
+        assert_eq!(
+            decoded.abstract_tools[0].tool_name,
+            "hotel.best_place_to_run"
+        );
         assert_eq!(decoded.abstract_skills[0].skill_name, "role.governance");
         assert_eq!(decoded.toolset_profiles[0].profile_name, "admin");
     }

@@ -202,6 +202,7 @@ impl NodeRegistry {
             .retain(|_, pending| pending.started_at.elapsed() <= PENDING_SYNC_TTL);
     }
 
+    /// Retrieve capabilities for a specific node.
     pub fn get_node(&self, node_id: &str) -> Option<&NodeStatus> {
         self.nodes.get(node_id)
     }

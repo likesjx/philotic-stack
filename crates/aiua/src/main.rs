@@ -38,6 +38,7 @@ mod auth;
 mod dream;
 mod graph;
 mod memory;
+mod mesh;
 mod muninn_provision;
 mod vault;
 

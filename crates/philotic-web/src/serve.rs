@@ -665,6 +665,7 @@ pub async fn run(
             "/api/agents/:agent_id/roles/:role_name/skills/:skill_name",
             delete(handle_revoke_skill),
         )
+        .route("/api/mesh/invite", post(handle_mesh_invite_create))
         .route("/api/mesh/targets", get(handle_mesh_targets))
         .route(
             "/api/mesh/targets/:target_node_id/status",
@@ -3697,6 +3698,45 @@ struct SetConfigBody {
     value: Value,
 }
 
+#[derive(serde::Deserialize)]
+struct CreateMeshInviteBody {
+    mesh_host: String,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+async fn handle_mesh_invite_create(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<CreateMeshInviteBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if body.mesh_host.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "mesh_host must not be empty"})),
+        )
+            .into_response();
+    }
+    match ipc_create_mesh_invite(&state.socket, state.hotel.as_str(), body.mesh_host.trim(), body.ttl_secs).await {
+        Ok(data) => Json(json!({
+            "ok": true,
+            "hotel_name": state.hotel.as_str(),
+            "file_name": format!("{}-mesh-invite.json", state.hotel.as_str()),
+            "mesh_host": body.mesh_host.trim(),
+            "invite": data,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn handle_config_put(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -5203,6 +5243,33 @@ async fn ipc_get_config(socket: &str, key: &str) -> Result<Option<Value>> {
         } => Ok(None),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected config data response: {other:?}")),
+    }
+}
+
+async fn ipc_create_mesh_invite(
+    socket: &str,
+    hotel_name: &str,
+    mesh_host: &str,
+    ttl_secs: Option<u64>,
+) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-mesh-invite").await?;
+    match client
+        .send_request(IpcRequest::CreateMeshInvite {
+            hotel_name: hotel_name.to_string(),
+            mesh_host: mesh_host.to_string(),
+            ttl_secs,
+        })
+        .await?
+    {
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        } => Ok(data),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected mesh invite response: {other:?}"
+        )),
     }
 }
 
