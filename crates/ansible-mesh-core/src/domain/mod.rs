@@ -1231,6 +1231,53 @@ impl GraphDomain {
             .filter(|j| j.enabled && j.next_fire_at.saturating_add(offset_ms) <= now_ms)
             .collect())
     }
+
+    // ── User task methods ─────────────────────────────────────────────────────
+
+    pub fn user_task_key(task_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_USER_TASK, task_id)
+    }
+
+    /// Upsert a user task. `task_json` is the full task document as a JSON Value.
+    pub fn upsert_user_task(&self, task_json: serde_json::Value, task_id: &str) -> Result<()> {
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::user_task_key(task_id),
+            kind: NODE_KIND_USER_TASK.to_string(),
+            label: Some(task_id.to_string()),
+            data: task_json,
+        })
+    }
+
+    /// Retrieve a user task by ID, returning its data as a JSON Value.
+    pub fn get_user_task(&self, task_id: &str) -> Result<Option<serde_json::Value>> {
+        match self.adapter.get_node(&Self::user_task_key(task_id))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(node.data)),
+        }
+    }
+
+    /// List user tasks, optionally filtered by session_id and/or agent_id.
+    pub fn list_user_tasks(
+        &self,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_USER_TASK)? {
+            if let Some(sid) = session_id {
+                if node.data.get("session_id").and_then(|v| v.as_str()) != Some(sid) {
+                    continue;
+                }
+            }
+            if let Some(aid) = agent_id {
+                if node.data.get("agent_id").and_then(|v| v.as_str()) != Some(aid) {
+                    continue;
+                }
+            }
+            out.push(node.data);
+        }
+        Ok(out)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1900,5 +1947,107 @@ mod tests {
             .unwrap()
             .expect("stored projected user identity");
         assert_eq!(loaded, identity);
+    }
+
+    #[test]
+    fn user_task_round_trip_create_and_get() {
+        let d = make_domain();
+        let task_id = "task-001";
+        let task = serde_json::json!({
+            "task_id": task_id,
+            "session_id": "session-abc",
+            "agent_id": "agent-01",
+            "chat_id": "chat-42",
+            "goal": "refactor auth module",
+            "steps": [],
+            "status": "planning",
+            "approved_risk_ceiling": "moderate",
+            "planning_model_tier": 0,
+            "quiet": false,
+            "created_at": 1_000_000u64,
+            "updated_at": 1_000_000u64,
+            "completed_at": null,
+            "next_step_idx": 0,
+            "approval_note": null,
+        });
+        d.upsert_user_task(task.clone(), task_id).unwrap();
+        let fetched = d.get_user_task(task_id).unwrap().expect("stored task");
+        assert_eq!(fetched["goal"].as_str(), Some("refactor auth module"));
+        assert_eq!(fetched["status"].as_str(), Some("planning"));
+    }
+
+    #[test]
+    fn user_task_update_preserves_existing_fields() {
+        let d = make_domain();
+        let task_id = "task-002";
+        let task = serde_json::json!({
+            "task_id": task_id,
+            "session_id": "session-abc",
+            "agent_id": "agent-01",
+            "chat_id": "chat-42",
+            "goal": "write tests",
+            "steps": [],
+            "status": "planning",
+            "approved_risk_ceiling": "safe",
+            "planning_model_tier": 0,
+            "quiet": true,
+            "created_at": 1_000_000u64,
+            "updated_at": 1_000_000u64,
+            "completed_at": null,
+            "next_step_idx": 0,
+            "approval_note": null,
+        });
+        d.upsert_user_task(task, task_id).unwrap();
+
+        let mut data = d.get_user_task(task_id).unwrap().unwrap();
+        data["status"] = serde_json::Value::String("running".into());
+        data["updated_at"] = serde_json::json!(2_000_000u64);
+        d.upsert_user_task(data, task_id).unwrap();
+
+        let updated = d.get_user_task(task_id).unwrap().unwrap();
+        assert_eq!(updated["status"].as_str(), Some("running"));
+        assert_eq!(updated["goal"].as_str(), Some("write tests")); // preserved
+    }
+
+    #[test]
+    fn list_user_tasks_filters_by_session() {
+        let d = make_domain();
+        let make_task = |id: &str, session: &str| {
+            serde_json::json!({
+                "task_id": id,
+                "session_id": session,
+                "agent_id": "agent-01",
+                "chat_id": "chat-1",
+                "goal": "do something",
+                "steps": [],
+                "status": "planning",
+                "approved_risk_ceiling": "safe",
+                "planning_model_tier": 0,
+                "quiet": false,
+                "created_at": 1u64,
+                "updated_at": 1u64,
+                "completed_at": null,
+                "next_step_idx": 0,
+                "approval_note": null,
+            })
+        };
+        d.upsert_user_task(make_task("t1", "session-A"), "t1").unwrap();
+        d.upsert_user_task(make_task("t2", "session-B"), "t2").unwrap();
+        d.upsert_user_task(make_task("t3", "session-A"), "t3").unwrap();
+
+        let all = d.list_user_tasks(None, None).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let session_a = d.list_user_tasks(Some("session-A"), None).unwrap();
+        assert_eq!(session_a.len(), 2);
+
+        let session_b = d.list_user_tasks(Some("session-B"), None).unwrap();
+        assert_eq!(session_b.len(), 1);
+    }
+
+    #[test]
+    fn get_user_task_returns_none_when_absent() {
+        let d = make_domain();
+        assert!(d.get_user_task("nonexistent").unwrap().is_none());
     }
 }

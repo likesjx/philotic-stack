@@ -8689,6 +8689,134 @@ impl IpcServer {
                     materialized: false,
                 }
             }
+
+            // ── User Task Engine ──────────────────────────────────────────────
+
+            IpcRequest::CreateUserTask {
+                task_id,
+                session_id,
+                agent_id,
+                chat_id,
+                goal,
+                approved_risk_ceiling,
+                planning_model_tier,
+                quiet,
+            } => {
+                let now = unix_ts();
+                let task_data = serde_json::json!({
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "chat_id": chat_id,
+                    "goal": goal,
+                    "steps": [],
+                    "status": "planning",
+                    "approved_risk_ceiling": approved_risk_ceiling,
+                    "planning_model_tier": planning_model_tier,
+                    "quiet": quiet,
+                    "created_at": now,
+                    "updated_at": now,
+                    "completed_at": null,
+                    "next_step_idx": 0,
+                    "approval_note": null,
+                });
+                match graph.upsert_user_task(task_data, &task_id) {
+                    Ok(_) => IpcResponse::UserTaskCreated { user_task_id: task_id },
+                    Err(e) => IpcResponse::error("create_user_task", "STORAGE_ERROR", format!("{e}")),
+                }
+            }
+
+            IpcRequest::UpdateUserTask {
+                task_id,
+                status,
+                steps_json,
+                next_step_idx,
+                approval_note,
+            } => match graph.get_user_task(&task_id) {
+                Ok(Some(mut data)) => {
+                    data["status"] = serde_json::Value::String(status);
+                    data["updated_at"] = serde_json::json!(unix_ts());
+                    if let Some(steps) = steps_json {
+                        data["steps"] = serde_json::from_str(&steps)
+                            .unwrap_or(serde_json::Value::Array(vec![]));
+                    }
+                    if let Some(idx) = next_step_idx {
+                        data["next_step_idx"] = serde_json::json!(idx);
+                    }
+                    if let Some(note) = approval_note {
+                        data["approval_note"] = serde_json::Value::String(note);
+                    }
+                    match graph.upsert_user_task(data, &task_id) {
+                        Ok(_) => IpcResponse::UserTaskUpdated {
+                            user_task_id: task_id,
+                            user_task_updated: true,
+                        },
+                        Err(e) => IpcResponse::error("update_user_task", "STORAGE_ERROR", format!("{e}")),
+                    }
+                }
+                Ok(None) => IpcResponse::error(
+                    "update_user_task",
+                    "NOT_FOUND",
+                    format!("user task {task_id} not found"),
+                ),
+                Err(e) => IpcResponse::error("update_user_task", "STORAGE_ERROR", format!("{e}")),
+            },
+
+            IpcRequest::UpdateUserTaskStep {
+                task_id,
+                step_idx,
+                status,
+                output,
+                error,
+            } => match graph.get_user_task(&task_id) {
+                Ok(Some(mut data)) => {
+                    if let Some(steps) = data["steps"].as_array_mut() {
+                        if let Some(step) = steps.get_mut(step_idx) {
+                            step["status"] = serde_json::Value::String(status);
+                            if let Some(out) = output {
+                                step["output"] = serde_json::Value::String(out);
+                            }
+                            if let Some(err) = error {
+                                step["error"] = serde_json::Value::String(err);
+                            }
+                        }
+                    }
+                    data["updated_at"] = serde_json::json!(unix_ts());
+                    match graph.upsert_user_task(data, &task_id) {
+                        Ok(_) => IpcResponse::UserTaskUpdated {
+                            user_task_id: task_id,
+                            user_task_updated: true,
+                        },
+                        Err(e) => IpcResponse::error("update_user_task_step", "STORAGE_ERROR", format!("{e}")),
+                    }
+                }
+                Ok(None) => IpcResponse::error(
+                    "update_user_task_step",
+                    "NOT_FOUND",
+                    format!("user task {task_id} not found"),
+                ),
+                Err(e) => IpcResponse::error("update_user_task_step", "STORAGE_ERROR", format!("{e}")),
+            },
+
+            IpcRequest::GetUserTask { task_id } => match graph.get_user_task(&task_id) {
+                Ok(Some(data)) => IpcResponse::UserTaskData {
+                    user_task_json: data.to_string(),
+                },
+                Ok(None) => IpcResponse::error(
+                    "get_user_task",
+                    "NOT_FOUND",
+                    format!("user task {task_id} not found"),
+                ),
+                Err(e) => IpcResponse::error("get_user_task", "STORAGE_ERROR", format!("{e}")),
+            },
+
+            IpcRequest::ListUserTasks {
+                session_id,
+                agent_id,
+            } => match graph.list_user_tasks(session_id.as_deref(), agent_id.as_deref()) {
+                Ok(tasks) => IpcResponse::UserTaskList { user_tasks: tasks },
+                Err(e) => IpcResponse::error("list_user_tasks", "STORAGE_ERROR", format!("{e}")),
+            },
         }
     }
 
