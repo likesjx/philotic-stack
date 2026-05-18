@@ -21,9 +21,9 @@ use crate::graph::{
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
-    SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
-    UserProfile, VaultRegistryEntry, CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT,
-    CONFIG_VAULT_REGISTRY,
+    ProjectedUserIdentityRecord, SecretRecord, SessionEventRecord, SessionParticipantRecord,
+    SessionRecord, SessionTurnRecord, UserProfile, VaultRegistryEntry,
+    CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT, CONFIG_VAULT_REGISTRY,
 };
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
@@ -921,6 +921,10 @@ impl GraphDomain {
         format!("{}:{}", NODE_KIND_USER_PROFILE, hotel_name)
     }
 
+    fn projected_user_identity_key(principal_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_PROJECTED_USER_IDENTITY, principal_id)
+    }
+
     pub fn upsert_user_profile(&self, hotel_name: &str, profile: &UserProfile) -> Result<()> {
         let data = serde_json::to_value(profile)
             .context("GraphDomain::upsert_user_profile: serialize UserProfile")?;
@@ -940,6 +944,47 @@ impl GraphDomain {
                     .context("GraphDomain::get_user_profile: deserialize UserProfile")
             })
             .transpose()
+    }
+
+    pub fn upsert_projected_user_identity(
+        &self,
+        identity: &ProjectedUserIdentityRecord,
+    ) -> Result<()> {
+        let data = serde_json::to_value(identity).context(
+            "GraphDomain::upsert_projected_user_identity: serialize ProjectedUserIdentityRecord",
+        )?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::projected_user_identity_key(&identity.principal_id),
+            kind: NODE_KIND_PROJECTED_USER_IDENTITY.to_string(),
+            label: Some(identity.display_name.clone()),
+            data,
+        })
+    }
+
+    pub fn get_projected_user_identity(
+        &self,
+        principal_id: &str,
+    ) -> Result<Option<ProjectedUserIdentityRecord>> {
+        self.adapter
+            .get_node(&Self::projected_user_identity_key(principal_id))?
+            .map(|n| {
+                serde_json::from_value(n.data).context(
+                    "GraphDomain::get_projected_user_identity: deserialize ProjectedUserIdentityRecord",
+                )
+            })
+            .transpose()
+    }
+
+    pub fn list_projected_user_identities(&self) -> Result<Vec<ProjectedUserIdentityRecord>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_PROJECTED_USER_IDENTITY)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data).context(
+                    "GraphDomain::list_projected_user_identities: deserialize ProjectedUserIdentityRecord",
+                )
+            })
+            .collect()
     }
 
     // ── Node capabilities ─────────────────────────────────────────────────────
@@ -1826,5 +1871,34 @@ mod tests {
         assert_eq!(record.operator_disposition.state, "rejected");
         assert_eq!(record.evaluations.len(), 2);
         assert_eq!(record.evaluations[1].decision, "rejected");
+    }
+
+    #[test]
+    fn projected_user_identity_round_trip() {
+        let d = make_domain();
+        let identity = ProjectedUserIdentityRecord {
+            principal_id: "user:google:subject-123".into(),
+            local_user_id: "root-user:mac-jane".into(),
+            home_hotel: "mac-jane".into(),
+            display_name: "Jared Likes".into(),
+            preferred_name: Some("Jared".into()),
+            primary_email: Some("jared@example.com".into()),
+            linked_identities: vec![crate::storage::ProjectedExternalIdentityRecord {
+                provider: "google".into(),
+                provider_subject: "subject-123".into(),
+                email: Some("jared@example.com".into()),
+                login: None,
+                display_name: Some("Jared Likes".into()),
+                verified_at: 123,
+                last_seen_at: 456,
+            }],
+            updated_at: 789,
+        };
+        d.upsert_projected_user_identity(&identity).unwrap();
+        let loaded = d
+            .get_projected_user_identity("user:google:subject-123")
+            .unwrap()
+            .expect("stored projected user identity");
+        assert_eq!(loaded, identity);
     }
 }

@@ -52,6 +52,7 @@ What OIDC contributes:
 - provider name (`google`, `github`, later `apple`)
 - provider subject / stable external ID
 - supporting aliases such as email or login
+- a stable projected mesh principal like `user:google:<subject>` once the first provider link is attached
 
 What it does **not** do yet:
 

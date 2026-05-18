@@ -127,6 +127,40 @@ pub struct UserProfile {
     pub display_name: Option<String>,
 }
 
+/// Non-secret user identity projection suitable for mesh continuity and audit.
+///
+/// Stored in the hotel graph and designed to survive across hotels without
+/// replicating local sessions, vault bindings, or credential-bearing state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProjectedExternalIdentityRecord {
+    pub provider: String,
+    pub provider_subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub verified_at: u64,
+    pub last_seen_at: u64,
+}
+
+/// Mesh-visible ghost mirror of a canonical hotel-local user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProjectedUserIdentityRecord {
+    pub principal_id: String,
+    pub local_user_id: String,
+    pub home_hotel: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_email: Option<String>,
+    #[serde(default)]
+    pub linked_identities: Vec<ProjectedExternalIdentityRecord>,
+    pub updated_at: u64,
+}
+
 /// A durable agent identity/profile bundle stored in the Context Graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentIdentityRecord {

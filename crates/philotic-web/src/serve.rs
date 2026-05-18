@@ -52,6 +52,9 @@
 //!   GET  /ws  — live push of guest/session state changes
 //!              auth via same-origin cookie
 
+use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+use ansible_mesh_core::storage::{ProjectedExternalIdentityRecord, ProjectedUserIdentityRecord};
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{
@@ -357,6 +360,7 @@ struct AuthStatusView {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct OperatorUserRecord {
     user_id: String,
+    mesh_principal_id: String,
     display_name: String,
     preferred_name: Option<String>,
     primary_email: Option<String>,
@@ -370,6 +374,7 @@ struct OperatorUserRecord {
 #[derive(Debug, Clone, serde::Serialize)]
 struct OperatorUserSettingsView {
     user_id: String,
+    mesh_principal_id: String,
     display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     preferred_name: Option<String>,
@@ -382,6 +387,8 @@ struct OperatorUserSettingsView {
     onboarding_state: String,
     #[serde(default)]
     external_identity_links: Vec<ExternalIdentityLinkStatusView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projected_identity: Option<ProjectedUserIdentityRecord>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3436,8 +3443,14 @@ async fn load_operator_user_settings_view(
     };
     let external_identity_links =
         list_external_identity_links_for_user(&state.db_path, &session.user_id)?;
+    let projected_identity = load_projected_user_identity_for_user(
+        &state.db_path,
+        state.hotel.as_ref(),
+        &session.user_id,
+    )?;
     Ok(OperatorUserSettingsView {
         user_id: user.user_id,
+        mesh_principal_id: user.mesh_principal_id,
         display_name: user.display_name,
         preferred_name: user.preferred_name,
         primary_email: user.primary_email,
@@ -3446,6 +3459,7 @@ async fn load_operator_user_settings_view(
         status: user.status,
         onboarding_state: user.onboarding_state,
         external_identity_links,
+        projected_identity,
     })
 }
 
@@ -5062,6 +5076,7 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
         "
         CREATE TABLE IF NOT EXISTS operator_users (
             user_id TEXT PRIMARY KEY,
+            mesh_principal_id TEXT NOT NULL,
             display_name TEXT NOT NULL,
             home_hotel TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -5135,6 +5150,7 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
         ON external_identity_links(user_id);
         ",
     )?;
+    ensure_operator_user_column(&conn, "mesh_principal_id", "TEXT NOT NULL DEFAULT ''")?;
     ensure_operator_user_column(&conn, "preferred_name", "TEXT")?;
     ensure_operator_user_column(&conn, "primary_email", "TEXT")?;
     ensure_operator_user_column(
@@ -5145,11 +5161,18 @@ fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
 
     let now = now_epoch_secs();
     conn.execute(
-        "INSERT INTO operator_users (user_id, display_name, preferred_name, primary_email, home_hotel, status, onboarding_state, created_at, updated_at)
-         VALUES (?1, ?2, NULL, NULL, ?3, 'active', 'bootstrap', ?4, ?4)
-         ON CONFLICT(user_id) DO UPDATE SET home_hotel=excluded.home_hotel, updated_at=excluded.updated_at",
+        "INSERT INTO operator_users (user_id, mesh_principal_id, display_name, preferred_name, primary_email, home_hotel, status, onboarding_state, created_at, updated_at)
+         VALUES (?1, ?2, ?3, NULL, NULL, ?4, 'active', 'bootstrap', ?5, ?5)
+         ON CONFLICT(user_id) DO UPDATE SET
+             home_hotel=excluded.home_hotel,
+             mesh_principal_id = CASE
+                 WHEN operator_users.mesh_principal_id = '' THEN excluded.mesh_principal_id
+                 ELSE operator_users.mesh_principal_id
+             END,
+             updated_at=excluded.updated_at",
         rusqlite::params![
             default_operator_user_id(hotel),
+            default_operator_principal_id(hotel),
             default_operator_display_name(),
             hotel,
             now,
@@ -5201,21 +5224,22 @@ fn resolve_operator_user(
     ensure_operator_auth_tables(db_path, hotel)?;
     let conn = Connection::open(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT user_id, display_name, preferred_name, primary_email, home_hotel, status, onboarding_state, created_at, updated_at
+        "SELECT user_id, mesh_principal_id, display_name, preferred_name, primary_email, home_hotel, status, onboarding_state, created_at, updated_at
          FROM operator_users
          WHERE user_id = ?1",
     )?;
     stmt.query_row([user_id], |row| {
         Ok(OperatorUserRecord {
             user_id: row.get(0)?,
-            display_name: row.get(1)?,
-            preferred_name: row.get(2)?,
-            primary_email: row.get(3)?,
-            home_hotel: row.get(4)?,
-            status: row.get(5)?,
-            onboarding_state: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            mesh_principal_id: row.get(1)?,
+            display_name: row.get(2)?,
+            preferred_name: row.get(3)?,
+            primary_email: row.get(4)?,
+            home_hotel: row.get(5)?,
+            status: row.get(6)?,
+            onboarding_state: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     })
     .optional()
@@ -5284,6 +5308,37 @@ fn list_external_identity_links_for_user(
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+fn list_external_identity_link_records_for_user(
+    db_path: &PathBuf,
+    user_id: &str,
+) -> Result<Vec<ExternalIdentityLinkRecord>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT link_id, user_id, provider, provider_subject, email, login, display_name,
+                verified_at, last_seen_at, created_at, updated_at
+         FROM external_identity_links
+         WHERE user_id = ?1
+         ORDER BY provider, provider_subject",
+    )?;
+    let rows = stmt.query_map([user_id], |row| {
+        Ok(ExternalIdentityLinkRecord {
+            link_id: row.get(0)?,
+            user_id: row.get(1)?,
+            provider: row.get(2)?,
+            provider_subject: row.get(3)?,
+            email: row.get(4)?,
+            login: row.get(5)?,
+            display_name: row.get(6)?,
+            verified_at: row.get(7)?,
+            last_seen_at: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    })?;
+
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
 fn patch_operator_user_record(
     db_path: &PathBuf,
     hotel: &str,
@@ -5330,7 +5385,10 @@ fn patch_operator_user_record(
         rusqlite::params![user_id, &normalized_display_name],
     )?;
 
-    resolve_operator_user(db_path, hotel, user_id)?.context("operator user record disappeared")
+    let updated = resolve_operator_user(db_path, hotel, user_id)?
+        .context("operator user record disappeared")?;
+    sync_projected_user_identity(db_path, hotel, user_id)?;
+    Ok(updated)
 }
 
 fn issue_operator_session(
@@ -5378,6 +5436,7 @@ fn issue_operator_session(
         ],
     )?;
 
+    sync_projected_user_identity(db_path, hotel, &session.user_id)?;
     Ok(session)
 }
 
@@ -5456,6 +5515,20 @@ fn upsert_operator_external_identity_link(
         "external-identity:{}:{}",
         identity.provider, identity.provider_subject
     );
+    let current_principal = resolve_operator_user(db_path, hotel, &user_id)?
+        .map(|user| user.mesh_principal_id)
+        .unwrap_or_else(|| default_operator_principal_id(hotel));
+    let next_principal = if current_principal.starts_with("local-user:") {
+        projected_principal_id_for_identity(identity)
+    } else {
+        current_principal
+    };
+    conn.execute(
+        "UPDATE operator_users
+         SET mesh_principal_id = ?2, updated_at = ?3
+         WHERE user_id = ?1",
+        rusqlite::params![&user_id, &next_principal, now],
+    )?;
     conn.execute(
         "INSERT INTO external_identity_links
         (link_id, user_id, provider, provider_subject, email, login, display_name, verified_at, last_seen_at, created_at, updated_at)
@@ -5480,8 +5553,11 @@ fn upsert_operator_external_identity_link(
         ],
     )?;
 
-    resolve_external_identity_link(db_path, &identity.provider, &identity.provider_subject)?
-        .context("external identity link disappeared after upsert")
+    let link =
+        resolve_external_identity_link(db_path, &identity.provider, &identity.provider_subject)?
+            .context("external identity link disappeared after upsert")?;
+    sync_projected_user_identity(db_path, hotel, &user_id)?;
+    Ok(link)
 }
 
 fn resolve_external_identity_link(
@@ -5513,6 +5589,53 @@ fn resolve_external_identity_link(
     })
     .optional()
     .map_err(Into::into)
+}
+
+fn projected_external_identity(
+    link: &ExternalIdentityLinkRecord,
+) -> ProjectedExternalIdentityRecord {
+    ProjectedExternalIdentityRecord {
+        provider: link.provider.clone(),
+        provider_subject: link.provider_subject.clone(),
+        email: link.email.clone(),
+        login: link.login.clone(),
+        display_name: link.display_name.clone(),
+        verified_at: link.verified_at.max(0) as u64,
+        last_seen_at: link.last_seen_at.max(0) as u64,
+    }
+}
+
+fn load_projected_user_identity_for_user(
+    db_path: &PathBuf,
+    hotel: &str,
+    user_id: &str,
+) -> Result<Option<ProjectedUserIdentityRecord>> {
+    let Some(user) = resolve_operator_user(db_path, hotel, user_id)? else {
+        return Ok(None);
+    };
+    let storage = SqliteGraphStorage::open(db_path)?;
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    graph.get_projected_user_identity(&user.mesh_principal_id)
+}
+
+fn sync_projected_user_identity(db_path: &PathBuf, hotel: &str, user_id: &str) -> Result<()> {
+    let Some(user) = resolve_operator_user(db_path, hotel, user_id)? else {
+        return Ok(());
+    };
+    let links = list_external_identity_link_records_for_user(db_path, user_id)?;
+    let projected = ProjectedUserIdentityRecord {
+        principal_id: user.mesh_principal_id.clone(),
+        local_user_id: user.user_id.clone(),
+        home_hotel: user.home_hotel.clone(),
+        display_name: user.display_name.clone(),
+        preferred_name: user.preferred_name.clone(),
+        primary_email: user.primary_email.clone(),
+        linked_identities: links.iter().map(projected_external_identity).collect(),
+        updated_at: now_epoch_secs().max(0) as u64,
+    };
+    let storage = SqliteGraphStorage::open(db_path)?;
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    graph.upsert_projected_user_identity(&projected)
 }
 
 #[allow(dead_code)]
@@ -5648,6 +5771,18 @@ fn revoke_operator_session(db_path: &PathBuf, token: &str) -> Result<()> {
 
 fn default_operator_user_id(hotel: &str) -> String {
     format!("root-user:{hotel}")
+}
+
+fn default_operator_principal_id(hotel: &str) -> String {
+    format!("local-user:{hotel}")
+}
+
+fn projected_principal_id_for_identity(identity: &OidcIdentity) -> String {
+    format!(
+        "user:{}:{}",
+        identity.provider.trim().to_ascii_lowercase(),
+        identity.provider_subject.trim()
+    )
 }
 
 fn default_operator_display_name() -> String {
@@ -6335,6 +6470,7 @@ mod tests {
         let user = resolve_operator_user(&context_path, "mac-jane", "root-user:mac-jane")
             .unwrap()
             .expect("operator user should exist");
+        assert_eq!(user.mesh_principal_id, "local-user:mac-jane");
         assert_eq!(user.display_name, default_operator_display_name());
         assert_eq!(user.home_hotel, "mac-jane");
         assert_eq!(user.onboarding_state, "bootstrap");
@@ -6399,6 +6535,20 @@ mod tests {
         assert_eq!(listed[0].provider, "google");
         assert_eq!(listed[0].provider_subject, "google-subject-123");
         assert_eq!(listed[0].display_name.as_deref(), Some("Jared Likes"));
+
+        let user = resolve_operator_user(&context_path, "mac-jane", "root-user:mac-jane")
+            .unwrap()
+            .expect("operator user should exist");
+        assert_eq!(user.mesh_principal_id, "user:google:google-subject-123");
+
+        let projected =
+            load_projected_user_identity_for_user(&context_path, "mac-jane", "root-user:mac-jane")
+                .unwrap()
+                .expect("projected identity should exist");
+        assert_eq!(projected.principal_id, "user:google:google-subject-123");
+        assert_eq!(projected.home_hotel, "mac-jane");
+        assert_eq!(projected.linked_identities.len(), 1);
+        assert_eq!(projected.linked_identities[0].provider, "google");
 
         let _ = fs::remove_file(&context_path);
     }

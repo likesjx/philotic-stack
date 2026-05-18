@@ -77,6 +77,12 @@ Philotes should receive a **projected user context**, not raw root-user secret m
 
 The mesh should carry a **ghost mirror projection** of user identity records that are needed for routing, audit, and cross-hotel operator continuity, while private key material and local secret bindings remain hotel-local.
 
+The first concrete shape of that ghost mirror is now explicit:
+
+- `ProjectedUserIdentityRecord` lives in the hotel graph
+- it carries a stable `principal_id`, the local user linkage, human display fields, and non-secret provider-link summaries
+- the first provider-backed external identity now upgrades the local fallback principal (`local-user:<hotel>`) into a stable provider principal (`user:<provider>:<subject>`)
+
 Identity authority lives in the hotel graph. Identity understanding lives in the agent graph.
 
 ## Why This Boundary Matters
@@ -245,8 +251,9 @@ This is intentionally a first slice, not a final auth model:
 - OIDC settings are now moving under hotel authority too: the intended canonical split is hotel-config-backed public base URL and provider client IDs plus vault-backed provider `*_secret_ref` config keys, with env values retained only as transitional fallback while operator config catches up
 - local loopback membranes now intentionally prefer the bootstrap/back-door path when the public base URL is only derived from request headers, instead of pretending `127.0.0.1` is a production-grade OIDC ingress and then letting Google perform redirect bureaucracy theater
 - the hotel auth store now persists first real `external_identity_links` records keyed by provider subject, so successful OIDC logins stop being display-name-only proof and start attaching durable Google/GitHub identity linkage to the canonical hotel-local operator user
+- the hotel graph now carries the first concrete `ProjectedUserIdentityRecord` ghost mirror, synced from the auth store so the user gains a stable mesh-facing `principal_id` and non-secret provider-link continuity without copying sessions or vault bindings around the organism like confetti
 - `GET /api/auth/status` now exposes that non-secret external identity linkage so the future `User Settings` surface has a real hotel-owned user graph seam to build on
-- `philotic-web` now exposes a first bounded `GET/PATCH /api/auth/user` surface that reads and updates the canonical hotel-local operator user record, bridges timezone/display-name through the existing hotel profile seam, and gives local-first onboarding a real home before mesh projection or agent personalization join the party
+- `philotic-web` now exposes a first bounded `GET/PATCH /api/auth/user` surface that reads and updates the canonical hotel-local operator user record, bridges timezone/display-name through the existing hotel profile seam, and now returns the projected identity record so local-first onboarding can see the mesh-facing principal it is authoring
 - the embedded desktop `Aiua Membrane` settings panel is now wired onto that canonical auth-user surface, so `User Settings` can actually curate display name, preferred name, primary email, onboarding state, timezone, and linked provider identities instead of leaving hotel-local user graph authorship stranded in backend purity
 - the concrete first-admin and new-operator setup flow now lives in [docs/process/OPERATOR_AUTH_ONBOARDING.md](/Users/jaredlikes/code/philotic-stack/docs/process/OPERATOR_AUTH_ONBOARDING.md), so the auth stack has a human procedure instead of a collection of correct but socially unhelpful boundaries
 
