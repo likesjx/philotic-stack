@@ -3236,7 +3236,7 @@ fn tool_name_matches_goal(tool_name: &str, normalized: &str) -> bool {
     tool_name
         .split(['.', '_', '-'])
         .filter(|part| !part.is_empty())
-        .any(|part| normalized.contains(part))
+        .all(|part| normalized.contains(part))
 }
 
 pub fn session_checkpoint_memory_type(session_id: &str) -> String {
