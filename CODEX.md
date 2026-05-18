@@ -11,8 +11,9 @@ This file provides guidance to OpenAI Codex when working with code in this repos
    - `graph_status` → node/edge counts, proposal pipeline
    - `graph_digest` → compressed domain→proposal→seam→verification overview
    - `graph_next_task` → scored work recommendation with conflict avoidance
-3. **Verify Green Status**: Run `just check` and `cargo test --workspace` to confirm the baseline is stable.
-4. **Record Decisions**: After completing work, use `graph_decide` to record what you did and why.
+3. **Orient and Recall**: Run `just session-start` or `python3 scripts/muninn_mcp.py bootstrap`, then use `$muninn-memory-habit` for the Muninn triad: self, user, topic. If Muninn cannot bootstrap, stop and require explicit operator approval before meaningful work.
+4. **Verify Green Status**: Run `just check` and `cargo test --workspace` to confirm the baseline is stable.
+5. **Record Decisions**: After completing work, use `graph_decide` for graph audit and `muninn_decide` / `muninn_remember` for the durable memory delta.
 
 ## Graph Workflow
 
@@ -40,6 +41,7 @@ See `skills/graph-intelligence/SKILL.md` for full tool reference.
 just build                  # cargo build --workspace
 just check                  # cargo check --workspace (faster)
 just format                 # cargo fmt --all
+just session-start          # require Muninn bootstrap before meaningful work
 
 # Test
 just test                   # cargo test --workspace
@@ -102,6 +104,18 @@ Trailers (additive — include what applies):
 | `Slice: codex/<slug>` | Always, when on a named workstream |
 | `Seam: <seam-id>` | When touching a known seam boundary |
 | `Verified: <level>` | Always: `test-green`, `smoke-green`, `watched-live-green`, `check-only` |
+
+## Muninn Memory Delta
+
+At the end of meaningful work, store only durable continuity handles:
+
+- decisions with rationale
+- reality gaps between assumption and observed truth
+- validation outcomes
+- next seams
+- stable operator preferences
+
+Do not store transcripts, logs, or task-list churn. Muninn answers "why this matters next time"; repo docs/code answer "what is true."
 
 ## Key References
 

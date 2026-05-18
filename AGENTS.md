@@ -90,6 +90,37 @@ Quick orientation shortcuts:
 The graph gives you structural facts. Muninn gives you cognitive context
 (learnings, preferences, patterns). Use both. See `$graph-intelligence` skill.
 
+### Muninn Memory Contract
+
+Muninn is the continuity layer, not the task tracker, source of truth, or transcript archive.
+
+Use this split:
+
+- **Repo/docs/code** store what is true.
+- **Intel graph** stores structure, work coordination, seams, decisions, and verification evidence.
+- **docs/task.md** stores active execution work.
+- **Muninn** stores why something matters, what was learned, durable preferences, reality gaps, and compact continuity handles.
+
+Default memory lanes:
+
+1. **Session orientation**: before meaningful work, run the Muninn bootstrap and recall the triad: who am I, who am I talking to, what matters about this topic right now.
+2. **Durable decisions**: use `muninn_decide` when there is a decision with rationale.
+3. **Reality gaps**: use `muninn_remember` for mismatches between assumption and observed repo/runtime truth.
+4. **Closeout bursts**: at slice/session end, store only the durable delta, not the whole story.
+
+Use this closeout prompt shape and store only filled lines:
+
+```text
+Memory delta:
+- Decision:
+- Reality gap:
+- Validation:
+- Next seam:
+- Operator preference:
+```
+
+Do not store long transcripts, command logs, proposal summaries that already live in docs, or routine task-list churn. If a memory wants to become a paragraph, split it or put it in the repo instead.
+
 ## 2. Working Principles
 
 ### 2.1 One Canonical Owner Per State Type
@@ -339,6 +370,7 @@ Before moving on, state:
 - what is intentionally incomplete
 - what the next highest-value seam is
 - what assumption-vs-reality gaps were exposed
+- the Muninn memory delta, if there was one
 
 ## 6. Commit and Push Discipline
 
@@ -496,6 +528,13 @@ When Muninn is required by protocol for meaningful work:
 Use the shared helper in [scripts/muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py).
 The helper should attempt local Muninn recovery first during session bootstrap.
 The `bootstrap` and `require` modes exist specifically to fail loudly when memory bootstrap is unavailable or unrecoverable.
+
+After bootstrap succeeds, use Muninn deliberately:
+
+- retrieve concise continuity context before decisions or resumed work
+- write back only decisions, reality gaps, validation outcomes, next seams, and operator preferences
+- prefer `muninn_decide` for explicit decisions and `muninn_remember` for atomic facts or gaps
+- keep each write short; Muninn should make future orientation faster, not recreate the transcript in another database
 
 ## 9. Parallel Workstreams
 

@@ -641,7 +641,11 @@ impl MemoryEngine for MuninnRestEngine {
             for item in &resp.activations {
                 self.cache_vault(&item.id, &vault).await;
             }
-            all_engrams.extend(resp.activations.into_iter().map(Engram::from));
+            all_engrams.extend(resp.activations.into_iter().map(|item| {
+                let mut engram: Engram = item.into();
+                engram.vault_id = vault.clone();
+                engram
+            }));
         }
 
         // If cross-scope, re-sort by confidence descending and truncate.

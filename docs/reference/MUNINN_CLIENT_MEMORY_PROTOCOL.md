@@ -16,6 +16,17 @@ The client should:
 
 Track the broader rationale in [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md).
 
+## Ownership Split
+
+Muninn is the continuity layer across cognitive clients. It is not the source of truth, the task tracker, or a transcript archive.
+
+Use the right owner:
+
+- repo docs and code store implemented truth
+- Intel Graph stores structure, seams, work coordination, decisions, and verification evidence
+- `docs/task.md` stores active execution work
+- Muninn stores why something matters next time: compact decisions, learned preferences, reality gaps, validation outcomes, and continuity handles
+
 ## Client Triad
 
 Organize retrieval around:
@@ -89,6 +100,19 @@ Write after:
 
 Do not store every conversation.
 
+At closeout, prefer a concise memory delta:
+
+```text
+Memory delta:
+- Decision:
+- Reality gap:
+- Validation:
+- Next seam:
+- Operator preference:
+```
+
+Each filled line should usually become one atomic `muninn_remember` or `muninn_decide` call. Omit empty lines.
+
 ## What To Store
 
 Store atomic memories. Prefer many small, meaningful "bursts" over a single large thought.
@@ -106,6 +130,8 @@ Bad:
 - whole transcripts
 - noisy logs
 - multiple unrelated concepts in one write
+- routine task-list churn
+- summaries of proposal/docs content already committed in the repo
 
 ## Memory Size Guidance
 

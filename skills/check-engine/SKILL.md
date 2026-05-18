@@ -26,6 +26,18 @@ Execute the bash hook directly as the final step of the session:
 `bash scripts/mempalace_reflex_hook.sh overview.txt`
 where `overview.txt` is the path to your current transcript or memory slice.
 
+Muninn write-back is separate from transcript capture. At check-engine time, write only the durable memory delta directly from the main agent thread. Do not delegate these final writes to a background subagent.
+
+Use this filter:
+
+- Decision
+- Reality gap
+- Validation
+- Next seam
+- Operator preference
+
+Do not store transcripts, noisy logs, proposal summaries already committed in docs, or routine task-list churn.
+
 ### 2. MEMORY.md Sync
 
 Check `~/.claude/projects/<project>/memory/MEMORY.md`. Does it have pointers to everything relevant? Add any new memory files to the index. Remove stale pointers.
@@ -101,7 +113,11 @@ Also check:
 ## Check Engine — <date>
 
 ### Stored to Muninn
-- <concept>: <one line>
+- Decision: <one line, or none>
+- Reality gap: <one line, or none>
+- Validation: <one line, or none>
+- Next seam: <one line, or none>
+- Operator preference: <one line, or none>
 - ...
 
 ### MEMORY.md

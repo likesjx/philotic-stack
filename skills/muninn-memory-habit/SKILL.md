@@ -17,6 +17,19 @@ The objective is to test whether regular retrieval and write-back improve:
 
 When Muninn MCP is configured and reachable, this habit is the MANDATORY BOOTSTRAP STEP defined in CLAUDE.md. It is not an optional flourish.
 
+## Ownership Split
+
+Muninn is the continuity layer. It is not the source of truth, the task tracker, or a transcript archive.
+
+Use the right owner:
+
+- repo docs and code store implemented truth
+- Intel Graph stores structure, seams, work coordination, decisions, and verification evidence
+- `docs/task.md` stores active execution work
+- Muninn stores why something matters next time: compact decisions, learned preferences, reality gaps, validation outcomes, and continuity handles
+
+This split matters because memory should make the next session sharper without becoming a second, fuzzier copy of the repository.
+
 ## The Bootstrap Sequence
 
 At the start of every session (before responding to the user):
@@ -145,6 +158,32 @@ Avoid:
 - summaries of whole proposals (the proposal file already exists)
 - long verbatim logs
 - anything that duplicates what's in a committed doc
+- routine task-list churn
+- whole transcripts
+
+## Memory Delta Closeout
+
+At closeout, write a Muninn memory delta only for durable new context.
+
+Use this shape when it helps:
+
+```text
+Memory delta:
+- Decision:
+- Reality gap:
+- Validation:
+- Next seam:
+- Operator preference:
+```
+
+Each filled line should usually become one atomic `muninn_remember` or `muninn_decide` call. Omit empty lines. If all lines are empty, say no Muninn write was needed.
+
+Do not store:
+
+- transcript summaries
+- noisy logs
+- proposal summaries already present in committed docs
+- routine "completed task X" entries unless the outcome changes future behavior
 
 ## Retrieval and Projection
 

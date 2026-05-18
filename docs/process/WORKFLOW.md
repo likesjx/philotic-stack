@@ -20,6 +20,8 @@ The first three are the standing loop. Retrospective is not mandatory for every 
 At session start or when resuming meaningful work:
 
 - do Muninn bootstrap and orientation (`just session-start` — also runs harness drift check)
+- retrieve Muninn continuity with the self/user/topic triad before decisions, resumed work, or implementation
+- if Muninn cannot bootstrap, stop for explicit operator approval before continuing on observed repo/runtime truth only
 - when the graph server is reachable, `just session-start` also claims a visible graph session/workstream on the board using the `session-start-bootstrap-slice` seam
 - identify the current owner of truth
 - inspect the relevant code, tests, and nearby docs
@@ -52,7 +54,7 @@ At slice close or end of session:
 
 - capture durable decisions and outcomes
 - update docs/tasks if current truth or active seams changed
-- store durable memory to Muninn
+- store only the durable Muninn memory delta: decisions, reality gaps, validation outcomes, next seams, and operator preferences
 - state what is working, what is incomplete, and the next highest-value seam
 - close any open harness trial: `just harness-trial-close [status] [verified] [summary]`
 - close any active workstream with explicit verification on completed closes: `just close-workstream`
@@ -138,6 +140,17 @@ Examples in this repo:
 - slice close-out discipline
 - check-engine expectations
 - rollout/watch verification before claiming live green
+
+### Muninn Ownership
+
+Muninn is the continuity layer, not the source of truth, the task tracker, or a transcript archive.
+
+Use the right owner:
+
+- repo docs and code store implemented truth
+- Intel Graph stores structure, seams, work coordination, decisions, and verification evidence
+- `docs/task.md` stores active execution work
+- Muninn stores why something matters next time: compact decisions, learned preferences, reality gaps, validation outcomes, and continuity handles
 
 ## Runtime Truth Rule
 
@@ -226,10 +239,10 @@ Canonical profiles for this repo:
 | Profile | Role | Skills |
 |---|---|---|
 | `philotic-operator` | orchestrator | graph-intelligence, implementation, philotic-slice-closeout, verification-orchestrator, sver-harness, session-hygiene, muninn-memory-habit, check-engine |
-| `philotic-implementer` | implementer | graph-intelligence, implementation, runtime-debugger, runtime-materialization, runtime-rollout-watch, subagent-delegation |
-| `philotic-reviewer` | reviewer | graph-intelligence, review, verification-ladder, verification-orchestrator, architecture-docs-maintainer, proposal-maintainer |
+| `philotic-implementer` | implementer | graph-intelligence, implementation, runtime-debugger, runtime-materialization, runtime-rollout-watch, subagent-delegation, muninn-memory-habit |
+| `philotic-reviewer` | reviewer | graph-intelligence, review, verification-ladder, verification-orchestrator, architecture-docs-maintainer, proposal-maintainer, muninn-memory-habit |
 | `philotic-orchestrator` | orchestrator | graph-intelligence, planning, multi-agent-orchestration, subagent-delegation, session-hygiene, proposal-maintainer, muninn-memory-habit |
-| `philotic-verifier` | verifier | graph-intelligence, verification, verification-ladder, verification-orchestrator, runtime-rollout-watch, philotic-slice-closeout, check-engine |
+| `philotic-verifier` | verifier | graph-intelligence, verification, verification-ladder, verification-orchestrator, runtime-rollout-watch, philotic-slice-closeout, check-engine, muninn-memory-habit |
 
 Registered harnesses: `claude-local` (philotic-operator), `claude-native` (philotic-orchestrator), `windsurf-native` (orchestrator), plus codex harnesses.
 
