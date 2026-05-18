@@ -6699,7 +6699,9 @@ async fn main() -> Result<()> {
     }
 
     // Abstracted Universal Materializer with trait-object storage
-    let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new());
+    let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new(
+        db_path.to_string_lossy(),
+    ));
     let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(
         hotel_name.clone(),
         graph_domain_arc.clone(),

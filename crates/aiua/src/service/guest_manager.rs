@@ -14,12 +14,14 @@ use tracing::{error, info, warn};
 /// A Universal Materializer backed by the local OS Process space.
 pub struct LocalProcessMaterializer {
     children: HashMap<String, tokio::process::Child>,
+    db_path: String,
 }
 
 impl LocalProcessMaterializer {
-    pub fn new() -> Self {
+    pub fn new(db_path: impl Into<String>) -> Self {
         Self {
             children: HashMap::new(),
+            db_path: db_path.into(),
         }
     }
 
@@ -129,7 +131,7 @@ impl Materializer for LocalProcessMaterializer {
         // NOTE: In the trait-abstracted world, the GuestManager passes the PID
         // to reclaim_guest. For now, LocalProcessMaterializer opens a throwaway
         // connection for backwards compatibility until the caller is fully refactored.
-        if let Ok(local_graph) = crate::graph::ContextGraph::open("aiua_context.db") {
+        if let Ok(local_graph) = crate::graph::ContextGraph::open(&self.db_path) {
             let conn = local_graph.conn.lock().unwrap();
             let mut stmt =
                 conn.prepare("SELECT active_pid FROM materialized_guests WHERE guest_id = ?")?;
@@ -314,6 +316,10 @@ impl GuestManager {
                 }
             }
         };
+        // Acquire the spawn lock BEFORE reading active_pid so that concurrent callers
+        // see a fresh DB snapshot rather than racing on a stale active_pid=None
+        // (TOCTOU: multiple concurrent ensure_guest_active calls each saw None, each spawned).
+        let mut mat = self.materializer.lock().await;
         let Some(current_rec) =
             Self::refresh_guest_record(self.graph.as_ref(), &self.hotel_name, &effective_id)?
         else {
@@ -322,8 +328,6 @@ impl GuestManager {
         if !current_rec.is_active {
             return Ok(false);
         }
-
-        let mut mat = self.materializer.lock().await;
         if let Some(active_pid) = current_rec.active_pid.as_deref() {
             let is_live = mat.check_status(&current_rec.guest_id, active_pid).await?;
             if is_live {
@@ -683,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_process_materializer_tracks_spawned_child_status() {
-        let mut materializer = LocalProcessMaterializer::new();
+        let mut materializer = LocalProcessMaterializer::new("aiua_context.db");
         let guest_id = "sleepy-guest";
         let pid = materializer
             .spawn_guest(

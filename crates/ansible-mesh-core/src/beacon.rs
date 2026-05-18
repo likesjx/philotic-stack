@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// A lightweight beacon daemon that binds to a UDP port and listens
@@ -18,7 +18,9 @@ pub struct BeaconDaemon {
     registry: Arc<RwLock<NodeRegistry>>,
     local_capabilities: NodeCapabilities,
     inbox_tx: mpsc::Sender<BeaconMessage>,
-    nonce_db_path: String,
+    // Persistent nonce tracker — initialized once to avoid per-packet DB open overhead
+    // and WAL contention on the main context.db under concurrent UDP load.
+    nonce_tracker: Option<Mutex<NonceTracker>>,
     enable_rust_auth: bool,
 }
 
@@ -58,13 +60,31 @@ impl BeaconDaemon {
             .context(format!("Failed to bind UDP socket to {}", addr))?;
 
         info!("Beacon daemon listening on {}", socket.local_addr()?);
+        // Derive a sidecar nonces.db path alongside the main context DB.
+        // Using a dedicated file avoids WAL write contention with the hotel's main DB
+        // on every incoming beacon packet.
+        let nonce_tracker = if enable_rust_auth {
+            let nonce_path = std::path::Path::new(db_path)
+                .parent()
+                .map(|p| p.join("nonces.db").to_string_lossy().to_string())
+                .unwrap_or_else(|| "nonces.db".to_string());
+            match NonceTracker::open(&nonce_path) {
+                Ok(t) => Some(Mutex::new(t)),
+                Err(e) => {
+                    warn!("Failed to initialize beacon nonce tracker (replay protection disabled): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             socket: Arc::new(socket),
             graph,
             registry,
             local_capabilities,
             inbox_tx,
-            nonce_db_path: db_path.to_string(),
+            nonce_tracker,
             enable_rust_auth,
         })
     }
@@ -140,18 +160,17 @@ impl BeaconDaemon {
                         return;
                     }
 
-                    let nonce_tracker = match NonceTracker::open(&self.nonce_db_path) {
-                        Ok(tracker) => tracker,
-                        Err(e) => {
-                            warn!(
-                                "Packet dropped: failed to open nonce tracker for {}: {}",
-                                msg.msg_id, e
-                            );
+                    if let Some(ref tracker_mutex) = self.nonce_tracker {
+                        let tracker = tracker_mutex.lock().await;
+                        if let Err(e) = tracker.assert_and_record_nonce(&msg.msg_id) {
+                            warn!("Packet dropped: {}", e);
                             return;
                         }
-                    };
-                    if let Err(e) = nonce_tracker.assert_and_record_nonce(&msg.msg_id) {
-                        warn!("Packet dropped: {}", e);
+                    } else {
+                        warn!(
+                            "Packet dropped: nonce tracker unavailable for {}",
+                            msg.msg_id
+                        );
                         return;
                     }
                 } else {
