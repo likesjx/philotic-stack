@@ -11,7 +11,7 @@
 <circle cx="50" cy="44" r="20" fill="none" stroke="#00e5ff" stroke-width="2" opacity="0.9"/>
 <text x="50" y="49" text-anchor="middle" font-size="16" fill="#00e5ff">&#x2B21;</text>
 <text x="80" y="37" font-size="20" font-weight="700" fill="#e8eaf0" letter-spacing="0.5">The <tspan fill="#00e5ff">Philotic Stack</tspan></text>
-<text x="80" y="56" font-size="11" fill="#8892b0">Distributed AI Agent OS  ·  Rust  ·  Hotel / Guest Model  ·  Target Architecture</text>
+<text x="80" y="56" font-size="11" fill="#8892b0">Distributed AI Agent OS  ·  Rust  ·  Hotel / Guest Metaphor  ·  Target Architecture</text>
 <line x1="0" y1="76" x2="1400" y2="76" stroke="#1e2540" stroke-width="1"/>
 
 <!-- Crate count -->
@@ -129,7 +129,7 @@
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <rect x="562" y="160" width="806" height="534" rx="12" fill="#00e676" fill-opacity="0.04" stroke="#00e676" stroke-opacity="0.4" stroke-width="1.5"/>
 <circle cx="580" cy="179" r="4" fill="#00e676" opacity="0.9"/>
-<text x="592" y="184" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e676" style="text-transform:uppercase">GUEST PROCESSES (MATERIALIZED BY GUESTMANAGER)</text>
+<text x="592" y="184" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e676" style="text-transform:uppercase">GUEST PROCESSES (MATERIALIZED BY THE HOTEL)</text>
 
 <!-- Row 1: Philote, Membrane, Philote Worker -->
 <rect x="574" y="194" width="248" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
@@ -138,7 +138,7 @@
 <text x="584" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">philote crate</text>
 
 <rect x="832" y="194" width="248" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-<text x="842" y="213" font-size="11" font-weight="600" fill="#e8eaf0">Membranes</text>
+<text x="842" y="213" font-size="11" font-weight="600" fill="#e8eaf0">Membrane Guests</text>
 <text x="842" y="227" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Telegram, Discord, MCP gateways</text>
 <text x="842" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">membrane-* crates</text>
 
@@ -171,7 +171,7 @@
 
 <!-- Row 3: Runners + Sandbox -->
 <rect x="574" y="328" width="192" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-<text x="584" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Tool Runner</text>
+<text x="584" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Tool Runner Guest</text>
 <text x="584" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">sandboxed tool execution</text>
 
 <rect x="776" y="328" width="192" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>

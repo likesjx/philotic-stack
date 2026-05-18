@@ -9,7 +9,7 @@
   <circle cx="50" cy="44" r="20" fill="none" stroke="#00e5ff" stroke-width="2" opacity="0.9"/>
   <text x="50" y="49" text-anchor="middle" font-size="16" fill="#00e5ff">&#x2B21;</text>
   <text x="80" y="37" font-size="20" font-weight="700" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">The <tspan fill="#00e5ff">Philotic Stack</tspan></text>
-  <text x="80" y="56" font-size="11" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Distributed AI Agent OS  ·  Rust  ·  Hotel / Guest Model  ·  Implementation Status</text>
+  <text x="80" y="56" font-size="11" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Distributed AI Agent OS  ·  Rust  ·  Hotel / Guest Metaphor  ·  Implementation Status</text>
   <line x1="0" y1="76" x2="1400" y2="76" stroke="#1e2540" stroke-width="1"/>
 
   <!-- Legend -->
@@ -253,11 +253,11 @@
   <!-- Guest OS Processes -->
   <rect x="914" y="182" width="466" height="682" rx="12" fill="#00e676" fill-opacity="0.04" stroke="#00e676" stroke-opacity="0.4" stroke-width="1.5"/>
   <circle cx="932" cy="201" r="4" fill="#00e676" opacity="0.9"/>
-  <text x="944" y="206" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">GUEST OS PROCESSES</text>
+  <text x="944" y="206" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">GUEST PROCESSES (MATERIALIZED BY THE HOTEL)</text>
   <rect x="924" y="208" width="218" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
   <circle cx="1132" cy="220" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="1132" cy="220" r="3.5" fill="#00e676"/>
-  <text x="933" y="224" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Membrane (Telegram)</text>
+  <text x="933" y="224" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Membrane Guest</text>
   <rect x="933" y="229" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
   <text x="938" y="238" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
   <text x="933" y="249" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">membrane-telegram-01</text>
@@ -299,7 +299,7 @@
   <rect x="924" y="376" width="218" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
   <circle cx="1132" cy="388" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="1132" cy="388" r="3.5" fill="#00e676"/>
-  <text x="933" y="392" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Tool-Runner</text>
+  <text x="933" y="392" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Tool-Runner Guest</text>
   <rect x="933" y="397" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
   <text x="938" y="406" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
   <text x="933" y="417" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">sandboxed tool execution</text>

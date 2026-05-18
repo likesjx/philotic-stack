@@ -29,8 +29,7 @@ tracks_domains:
 > **Status:** Living Document | **Last Updated:** 2026-03-12
 
 This document describes the full runtime architecture of the Philotic Stack —
-a distributed AI agent operating system built in Rust. It covers the hotel
-model, all crates, all in-process components, the IPC and mesh transports,
+a distributed AI agent operating system built in Rust. It is built around a powerful and intuitive **Hotel & Guest** metaphor. It covers The Hotel daemon (the orchestrator), all crates, all materialized Guest processes (the agents and gateways), the IPC and mesh transports,
 storage abstractions, and state synchronization.
 
 This is a durable hierarchy reference, not the live work queue. The graph is

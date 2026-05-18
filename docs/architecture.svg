@@ -37,7 +37,7 @@
     <circle cx="15" cy="15.5" r="1.5" fill="#00e5ff"/>
   </g>
   <text x="550" y="42" text-anchor="middle" fill="#e8eaf0" font-size="20" font-weight="700" letter-spacing="0.5">Philotic Stack Architecture</text>
-  <text x="550" y="60" text-anchor="middle" fill="#8892b0" font-size="10" letter-spacing="0.3">Distributed AI Agent OS · Rust · Hotel / Guest Model · 29 Crates · ~100K LOC</text>
+  <text x="550" y="60" text-anchor="middle" fill="#8892b0" font-size="10" letter-spacing="0.3">Distributed AI Agent OS · Rust · Hotel / Guest Metaphor · 29 Crates</text>
 
   <!-- ═══════════════════════════════════════════ -->
   <!-- TOP: Mesh Network Zone                      -->
@@ -126,7 +126,7 @@
   <rect x="252" y="200" width="376" height="376" rx="7" fill="none" stroke="#00e5ff" stroke-width="0.3" opacity="0.3"/>
 
   <text x="440" y="220" text-anchor="middle" fill="#00e5ff" font-size="9" font-weight="700" letter-spacing="1.6">THE HOTEL</text>
-  <text x="440" y="233" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">aiua daemon · central switchboard</text>
+  <text x="440" y="233" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">The Hotel Daemon · Secure Switchboard</text>
 
   <!-- IPC Server -->
   <rect x="268" y="248" width="165" height="52" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
@@ -138,7 +138,7 @@
   <!-- Guest Manager -->
   <rect x="448" y="248" width="165" height="52" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
   <text x="530" y="266" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">Guest Manager</text>
-  <text x="530" y="280" text-anchor="middle" fill="#8892b0" font-size="8">Process materialization</text>
+  <text x="530" y="280" text-anchor="middle" fill="#8892b0" font-size="8">Guest Materialization</text>
   <text x="530" y="292" text-anchor="middle" fill="#8892b0" font-size="7.5">Spawn · supervise · reap</text>
   <circle cx="603" cy="260" r="3.5" fill="#00e676"/>
 
@@ -228,7 +228,7 @@
 
   <!-- Tool Runner -->
   <rect x="678" y="340" width="190" height="52" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
-  <text x="773" y="358" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Tool Runner</text>
+  <text x="773" y="358" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Tool Runner Guest</text>
   <text x="773" y="373" text-anchor="middle" fill="#8892b0" font-size="8">Sandboxed execution</text>
   <text x="773" y="385" text-anchor="middle" fill="#8892b0" font-size="7.5">Landlock + seccomp policies</text>
   <circle cx="858" cy="352" r="3" fill="#00e676"/>
@@ -247,7 +247,7 @@
 
   <!-- Membrane (guest) -->
   <rect x="878" y="422" width="190" height="42" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
-  <text x="973" y="440" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Membranes (Guests)</text>
+  <text x="973" y="440" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Membrane Guests (Gateways)</text>
   <text x="973" y="456" text-anchor="middle" fill="#8892b0" font-size="7.5">Telegram, Discord, MCP</text>
   <circle cx="1058" cy="434" r="3" fill="#00e676"/>
 

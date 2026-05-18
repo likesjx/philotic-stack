@@ -1,8 +1,10 @@
 # The Philotic Stack
 
-A distributed AI agent operating system built in Rust — modeled after the "Ansible" and "Philotic Web" metaphors from _Speaker for the Dead_.
+A distributed AI agent operating system built in Rust — designed around a clear, intuitive **Hotel & Guest** metaphor.
 
-Each hotel is an autonomous, Rust-powered node that materializes AI guest processes, persists state in a local Context Graph, and communicates with peer hotels over a durable UDP mesh.
+At the core of the stack is **The Hotel** (an autonomous, Rust-powered node). The Hotel acts as a secure supervisor and message switchboard. It brings **Guests** (specialized AI agent processes like your personal assistant or system architect) to life, manages their memory within a local **Context Graph**, and connects them to the outside world through secure **Membranes**. 
+
+Multiple Hotels can link together to form a resilient, cryptographically secure mesh network—the **Philotic Web**.
 
 [![Philotic Web Teaser](https://img.youtube.com/vi/SF2C9rbz330/maxresdefault.jpg)](https://youtu.be/SF2C9rbz330)
 
