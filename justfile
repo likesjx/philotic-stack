@@ -525,6 +525,63 @@ jane-start:
 jane-status:
     @ssh mbp-jane "ps aux | grep '[/]opt/homebrew/bin/aiua' || echo 'aiua is not running on mbp-jane'"
 
+# ── VPS deploy (vps-jane / Linux x86_64 via Ansible) ────────────────────────
+# Strategy: rsync source to VPS → build there (VPS has rustup) → ansible
+# deploys binaries from the VPS build output and restarts the systemd service.
+# Prerequisites: SSH key at ~/.ssh/vps_deploy_key, vault pass at ~/.philotic-vault-pass
+
+# Full deploy to vps-jane: sync source, build on VPS, ansible config + service.
+vps-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT_DIR="{{justfile_directory()}}"
+    VPS="deploy@jane-vps"
+    VPS_CODE="/home/deploy/code/philotic-stack"
+    VPS_BUILD="${VPS_CODE}/target/release"
+
+    echo "▶ Syncing source to ${VPS}:${VPS_CODE}..."
+    rsync -az --delete \
+      --exclude='.git' \
+      --exclude='target/' \
+      --exclude='dist/' \
+      --exclude='*.db' \
+      --exclude='.claude/' \
+      "${ROOT_DIR}/" "${VPS}:${VPS_CODE}/"
+
+    echo "▶ Building release on ${VPS} (this may take a few minutes)..."
+    ssh -n "${VPS}" "cd '${VPS_CODE}' && \$HOME/.cargo/bin/cargo build --release --bins \
+      -p aiua \
+      -p philote \
+      -p membrane \
+      -p membrane-telegram \
+      -p membrane-mcp \
+      -p model-router \
+      -p tool-runner \
+      -p graph-runner \
+      -p graph-datasource \
+      -p graph-intelligence \
+      -p table-datasource \
+      -p router-listener \
+      -p agent-graph-runner"
+
+    echo "▶ Deploying via ansible (binaries from VPS build at ${VPS_BUILD})..."
+    cd "${ROOT_DIR}/ansible" && ansible-playbook \
+      -i inventory/hosts.ini \
+      deploy_hotel.yml \
+      --limit jane-vps \
+      --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${VPS_BUILD}"
+
+# Config-only push to vps-jane: re-render mesh-config + secrets, restart service.
+# Does NOT rebuild or copy binaries — uses whatever is already in /opt/philotic/bin.
+vps-config:
+    cd ansible && ansible-playbook -i inventory/hosts.ini deploy_hotel.yml --limit jane-vps --skip-tags binary
+
+# Deploy to all hotel nodes: local (bjork) + mbp-jane + vps-jane.
+push-all:
+    just local-push
+    just jane-push
+    just vps-push
+
 # Show configured Ansible inventory for deployment targets
 ansible-inventory:
     cd ansible && ansible-inventory --list

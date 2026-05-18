@@ -1299,6 +1299,11 @@ pub enum IpcRequest {
     GetHotelLogs {
         lines: u32,
     },
+    /// Query aggregated routing performance stats from the router trace store.
+    /// `window_secs`: if Some, only include traces from the last N seconds; None = all time.
+    GetRouterStats {
+        window_secs: Option<u64>,
+    },
 }
 
 /// Payload for [`IpcResponse::UserProfileData`].
@@ -1388,7 +1393,10 @@ pub enum IpcResponse {
         retry_after_ms: Option<u64>,
     },
     HandoffBackAck {
-        handoff_guest_id: String,
+        // Named differently from HandoffAck.handoff_guest_id so the untagged serde
+        // repr can distinguish the two variants (serde tries variants in order; a
+        // missing required field causes the attempt to fail and the next is tried).
+        return_guest_id: String,
         became_active: bool,
     },
     DelegationAck {
@@ -1591,6 +1599,11 @@ pub enum IpcResponse {
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
     /// Placing it last ensures it only wins when no other variant can match.
+    RouterStats {
+        stats: Vec<ansible_mesh_core::router_trace::ProviderStats>,
+        /// Unix epoch seconds of the query.
+        generated_at: u64,
+    },
     MemoryConfig {
         config_json: Option<String>,
     },

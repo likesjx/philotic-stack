@@ -16,7 +16,8 @@ use crate::session::{
 };
 use anyhow::Result;
 use memory_core::{
-    MemoryScope, MuninnConfig, MuninnRestEngine, RecallContext, RecallTrigger, VaultResolver,
+    Engram, MemoryScope, MuninnConfig, MuninnRestEngine, RecallContext, RecallTrigger,
+    VaultResolver,
 };
 use philotic_client::{
     Exosome, HandoffBundle, IpcRequest, IpcResponse, ParacrineRouting, PhiloticClient,
@@ -32,6 +33,96 @@ pub const DEFAULT_AGENT_ID: &str = "agent-bjork-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
+
+fn engram_metadata_string(metadata: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        metadata
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn engram_metadata_array(metadata: &Value, keys: &[&str]) -> Vec<Value> {
+    keys.iter()
+        .find_map(|key| metadata.get(*key).and_then(|value| value.as_array()))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn engram_annotations(metadata: &Value) -> Option<Value> {
+    metadata
+        .get("annotations")
+        .or_else(|| metadata.get("annotation"))
+        .cloned()
+        .filter(|value| !value.is_null())
+}
+
+fn recalled_memory_from_engram(
+    engram: Engram,
+    recall_reason: Option<&str>,
+) -> RecalledMemoryRecord {
+    let summary = engram_metadata_string(&engram.metadata, &["summary"]);
+    let memory_type = engram_metadata_string(&engram.metadata, &["memory_type", "type"]);
+    let trust = engram_metadata_string(&engram.metadata, &["trust", "trust_level"]);
+    let source = engram_metadata_string(&engram.metadata, &["source", "provenance_source"]);
+    let entities = engram_metadata_array(&engram.metadata, &["entities"]);
+    let relationships =
+        engram_metadata_array(&engram.metadata, &["relationships", "entity_relationships"]);
+    let annotations = engram_annotations(&engram.metadata);
+
+    RecalledMemoryRecord {
+        id: Some(engram.id),
+        vault_id: if engram.vault_id.is_empty() {
+            None
+        } else {
+            Some(engram.vault_id)
+        },
+        concept: engram.concept,
+        content: engram.content,
+        tags: engram.tags,
+        summary,
+        memory_type,
+        confidence: Some(engram.confidence),
+        trust,
+        source,
+        created_at: Some(engram.created_at),
+        updated_at: Some(engram.updated_at),
+        entities,
+        relationships,
+        annotations,
+        recall_reason: recall_reason.map(str::to_string),
+    }
+}
+
+fn turn_memory_user_id(state: &SessionState) -> String {
+    state
+        .active_turn
+        .as_ref()
+        .map(|turn| turn.chat_id.trim())
+        .filter(|chat_id| !chat_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| state.session_id.clone())
+}
+
+fn default_turn_recall_scope(session_id: &str) -> MemoryScope {
+    MemoryScope::CrossScope(vec![
+        MemoryScope::SelfOnly,
+        MemoryScope::SharedUser,
+        MemoryScope::Session(session_id.to_string()),
+    ])
+}
+
+fn memory_scope_from_tool_arg(scope: Option<&str>, session_id: &str) -> MemoryScope {
+    match scope.unwrap_or("self") {
+        "shared_user" | "user" => MemoryScope::SharedUser,
+        "session" | "working" => MemoryScope::Session(session_id.to_string()),
+        "cross" | "all" => default_turn_recall_scope(session_id),
+        _ => MemoryScope::SelfOnly,
+    }
+}
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
@@ -4909,7 +5000,7 @@ impl AgentRuntime {
 
         let recall_context = RecallContext {
             trigger: RecallTrigger::UserTurnStart,
-            scope: MemoryScope::SelfOnly,
+            scope: default_turn_recall_scope(session_id),
             recall_seed_text: active_turn.user_content.clone(),
             active_goal: active_turn
                 .active_plan
@@ -4940,7 +5031,8 @@ impl AgentRuntime {
             lens: None,
         };
 
-        let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) else {
+        let memory_user_id = turn_memory_user_id(state);
+        let Some(engine) = self.memory_engine_for(&self.agent_id, &memory_user_id) else {
             let decision = memory_core::evaluate_recall(&recall_context);
             info!(
                 session_id = %session_id,
@@ -5002,14 +5094,11 @@ impl AgentRuntime {
                 return Ok(());
             }
         };
+        let recall_reason = result.decision.reason.clone();
         let recalled_memories = result
             .engrams
             .into_iter()
-            .map(|engram| RecalledMemoryRecord {
-                concept: engram.concept,
-                content: engram.content,
-                tags: engram.tags,
-            })
+            .map(|engram| recalled_memory_from_engram(engram, Some(recall_reason.as_str())))
             .collect::<Vec<_>>();
         let recalled_count = recalled_memories.len();
         let concept_summary = recalled_memories
@@ -6830,7 +6919,7 @@ impl AgentRuntime {
                 became_active.then_some(handoff_guest_id),
             ),
             IpcResponse::HandoffBackAck {
-                handoff_guest_id,
+                return_guest_id,
                 became_active,
             } => (
                 format_role_command_reply(&command, became_active),
@@ -6844,10 +6933,10 @@ impl AgentRuntime {
                     "turn_id": command_turn_id,
                     "chat_id": command_chat_id,
                     "role_command": "handoff_back",
-                    "handoff_guest_id": handoff_guest_id,
+                    "return_guest_id": return_guest_id,
                     "became_active": became_active,
                 }),
-                became_active.then_some(handoff_guest_id),
+                became_active.then_some(return_guest_id),
             ),
             IpcResponse::Standard { ok: true, data, .. }
                 if matches!(command, SlashCommand::Roles) =>
@@ -8006,6 +8095,59 @@ impl AgentRuntime {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
                             format!("hotel.logs: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "router.stats" => {
+                let window_secs = payload
+                    .arguments
+                    .get("window_hours")
+                    .and_then(|v| v.as_f64())
+                    .map(|h| (h * 3600.0) as u64);
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetRouterStats { window_secs })
+                    .await
+                {
+                    Ok(IpcResponse::RouterStats { stats, generated_at }) => {
+                        let text = serde_json::to_string_pretty(&serde_json::json!({
+                            "generated_at": generated_at,
+                            "stats": stats
+                        }))
+                        .unwrap_or_else(|_| "Router stats unavailable.".into());
+                        (text, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("Router stats unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("router.stats: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }
@@ -10298,10 +10440,10 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::HandoffBackAck {
-                        handoff_guest_id, ..
+                        return_guest_id, ..
                     }) => (
                         format!(
-                            "Returned control (from guest {handoff_guest_id}). Summary: {summary}"
+                            "Returned control (to guest {return_guest_id}). Summary: {summary}"
                         ),
                         None,
                     ),
@@ -10734,12 +10876,19 @@ impl AgentRuntime {
                     .unwrap_or(5);
                 let limit = explicit_limit.unwrap_or(recall_limit).clamp(1, 20);
 
-                let content = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
+                let memory_user_id = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .map(turn_memory_user_id)
+                    .unwrap_or_else(|| self.agent_id.clone());
+                let scope = memory_scope_from_tool_arg(
+                    payload.arguments.get("scope").and_then(|v| v.as_str()),
+                    &payload.session_id,
+                );
+
+                let content = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
                     None => "Memory unavailable: MuninnDB not configured.".to_string(),
-                    Some(engine) => match engine
-                        .activate(&query, MemoryScope::SelfOnly, Some(limit))
-                        .await
-                    {
+                    Some(engine) => match engine.activate(&query, scope, Some(limit)).await {
                         Err(e) => format!("memory.recall error: {e}"),
                         Ok(result) if result.engrams.is_empty() => {
                             "No relevant memories found.".to_string()
@@ -10748,11 +10897,16 @@ impl AgentRuntime {
                             let mut out = format!("{} engram(s) recalled:\n", result.engrams.len());
                             for (i, eng) in result.engrams.iter().enumerate() {
                                 out.push_str(&format!(
-                                    "{}. [{}] {} — {}\n",
+                                    "{}. [{}] {} — {}{}\n",
                                     i + 1,
                                     eng.concept,
                                     eng.content,
-                                    eng.tags.join(", ")
+                                    eng.tags.join(", "),
+                                    if eng.vault_id.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" (vault: {})", eng.vault_id)
+                                    }
                                 ));
                             }
                             out
@@ -10814,15 +10968,25 @@ impl AgentRuntime {
                             .collect()
                     })
                     .unwrap_or_default();
+                let scope = memory_scope_from_tool_arg(
+                    payload.arguments.get("scope").and_then(|v| v.as_str()),
+                    &payload.session_id,
+                );
 
-                let result_text = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
+                let memory_user_id = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .map(turn_memory_user_id)
+                    .unwrap_or_else(|| self.agent_id.clone());
+                let result_text = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
                     None => "Memory unavailable: MuninnDB not configured.".to_string(),
-                    Some(engine) => match engine
-                        .remember(MemoryScope::SelfOnly, &concept, &content_str, tags)
-                        .await
-                    {
+                    Some(engine) => match engine.remember(scope, &concept, &content_str, tags).await {
                         Ok(engram_ref) => {
-                            format!("Stored memory '{}' (id: {}).", concept, engram_ref.id)
+                            let _ = engine.retry_enrich(&engram_ref.id).await;
+                            format!(
+                                "Stored memory '{}' (id: {}, vault: {}).",
+                                concept, engram_ref.id, engram_ref.vault_id
+                            )
                         }
                         Err(e) => format!("memory.remember error: {e}"),
                     },

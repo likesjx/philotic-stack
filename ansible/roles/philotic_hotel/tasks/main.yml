@@ -64,15 +64,17 @@
     group: "{{ philotic_group }}"
     mode: "0755"
   loop: "{{ philotic_binaries }}"
-  when: not philotic_artifacts_remote
+  when: not (philotic_artifacts_remote | bool)
   notify: Restart philotic-hotel
+  tags: [binary]
 
 - name: Check which remote Philotic binaries are available on host
   stat:
     path: "{{ philotic_artifacts_dir }}/{{ item }}"
   loop: "{{ philotic_binaries }}"
   register: philotic_remote_artifact_stats
-  when: philotic_artifacts_remote
+  when: philotic_artifacts_remote | bool
+  tags: [binary]
 
 - name: Warn about missing remote Philotic binaries
   debug:
@@ -81,8 +83,9 @@
       is not present on the target host.
   loop: "{{ philotic_remote_artifact_stats.results }}"
   when:
-    - philotic_artifacts_remote
+    - philotic_artifacts_remote | bool
     - not item.stat.exists
+  tags: [binary]
 
 - name: Install Philotic binaries (already built on host)
   copy:
@@ -99,8 +102,9 @@
       | map(attribute='item')
       | list
     }}
-  when: philotic_artifacts_remote
+  when: philotic_artifacts_remote | bool
   notify: Restart philotic-hotel
+  tags: [binary]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
