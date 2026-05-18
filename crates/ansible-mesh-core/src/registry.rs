@@ -197,6 +197,7 @@ impl NodeRegistry {
             && h.load_avg_1m.map_or(true, |v| v < 16.0)
     }
 
+
     fn prune_pending_syncs(&mut self) {
         self.pending_capability_syncs
             .retain(|_, pending| pending.started_at.elapsed() <= PENDING_SYNC_TTL);

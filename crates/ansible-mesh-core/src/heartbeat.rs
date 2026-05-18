@@ -65,7 +65,6 @@ pub async fn emit_capability_sync(
     advertisements: &[CapabilityAdvertisement],
     execution_reachability: Option<ExecutionReachability>,
     auth_key: &str,
-    node_health: Option<NodeHealthSnapshot>,
 ) -> Result<()> {
     let sync_id = Uuid::new_v4();
     let chunks =

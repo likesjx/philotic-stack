@@ -2,24 +2,6 @@ use crate::event::NodeId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Point-in-time environment snapshot self-reported by a hotel in each heartbeat.
-/// All fields are optional so older nodes remain wire-compatible.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct NodeHealthSnapshot {
-    /// Active guest process count on this hotel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guest_count: Option<u32>,
-    /// Percentage of disk space still free on the primary volume (0.0–100.0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disk_free_pct: Option<f32>,
-    /// Percentage of system memory still free (0.0–100.0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mem_free_pct: Option<f32>,
-    /// 1-minute load average (Unix `uptime` style).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub load_avg_1m: Option<f32>,
-}
-
 /// The core envelope for UDP mesh communication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeaconMessage {
