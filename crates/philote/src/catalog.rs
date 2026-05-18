@@ -52,6 +52,13 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "routing.pipeline.remove",
             "routing.pipeline.get",
         ],
+        "graph.knowledge" => &[
+            "graph.create",
+            "graph.query",
+            "graph.list",
+            "graph.drop",
+            "graph.grant_access",
+        ],
         _ => &[],
     }
 }
@@ -127,6 +134,30 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "lines": {
                         "type": "integer",
                         "description": "Number of log lines to return (default 50, max 500)."
+                    }
+                }
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
+        "router.stats".into(),
+        ToolDefinition {
+            tool_name: "router.stats".into(),
+            description: "Returns aggregated routing performance statistics from the model-router \
+                          trace store: per-provider success rate, average latency, p90 latency, \
+                          and failure counts broken down by task_kind. Use this to inspect which \
+                          providers are performing well or poorly, diagnose routing failures, or \
+                          reason about model selection. Pass `window_hours` to limit to recent \
+                          history (e.g. 24 for last day); omit for all-time stats."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "window_hours": {
+                        "type": "number",
+                        "description": "If set, only include traces from the last N hours. Omit for all-time stats."
                     }
                 }
             }),
@@ -240,9 +271,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                           Use this to read or write structured knowledge — entities, relationships, \
                           and typed records — in the agent graph store. \
                           Omit graph_id to query your own partition. \
-                          Supported patterns: MATCH (n:Label) RETURN n, \
-                          CREATE (n:Label {id:'...', ...}), \
-                          CREATE (a:L {id:'A'})-[:REL]->(b:L {id:'B'})."
+                          Supported patterns: \
+                          MATCH (n) RETURN n [all nodes], \
+                          MATCH (n:Label) RETURN n [by label], \
+                          MATCH (n:Label {id:'X'}) RETURN n [by label+id], \
+                          CREATE (n:Label {id:'...', ...}) [create node], \
+                          CREATE (a:L {id:'A'})-[:REL]->(b:L {id:'B'}) [create edge], \
+                          MATCH (n {id:'X'}) DELETE n [delete node], \
+                          MATCH (n:Label {id:'X'}) DETACH DELETE n [delete node with label], \
+                          MATCH ()-[r {id:'X'}]-() DELETE r [delete edge]."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1494,6 +1531,12 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum number of engrams to return. Defaults to the \
                                         session recall_limit setting (default 5). Range 1–20."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["self", "shared_user", "session", "cross"],
+                        "description": "Optional memory scope. 'cross' searches agent self, \
+                                        shared user, and active session memories."
                     }
                 },
                 "required": ["query"]
@@ -1528,6 +1571,13 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional tags for recall filtering (e.g. ['preference', 'user', 'decision'])."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["self", "shared_user", "session"],
+                        "description": "Optional write scope. Use 'shared_user' for operator \
+                                        preferences, 'session' for active workstream context, \
+                                        and 'self' for the agent's own habits or observations."
                     }
                 },
                 "required": ["concept", "content"]

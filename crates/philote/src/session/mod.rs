@@ -1336,7 +1336,7 @@ impl SessionState {
     ) -> Option<(String, Value, Value, Vec<ToolDefinition>)> {
         let turn = self.active_turn.as_ref()?;
         let user_content = turn.user_content.clone();
-        let tools = self.tool_assembly.tools_for_model.clone();
+        let tools = self.project_tools_for_turn(&user_content);
         let (prompt, context, context_projection) =
             self.model_request_payloads(&user_content, &tools);
         Some((prompt, context, context_projection, tools))
@@ -1580,6 +1580,10 @@ impl SessionState {
 
         if looks_like_conversational_goal(&normalized) {
             return Vec::new();
+        }
+
+        if !looks_like_memory_write_goal(&normalized) {
+            all_tools.retain(|tool| tool.tool_name != "memory.remember");
         }
 
         if !looks_like_execution_goal(&normalized) {
@@ -2268,14 +2272,46 @@ impl SessionState {
              (date and time).\n",
         );
         for (i, memory) in turn.recalled_memories.iter().enumerate() {
+            let mut provenance = Vec::new();
+            if let Some(id) = memory.id.as_deref() {
+                provenance.push(format!("id={id}"));
+            }
+            if let Some(vault) = memory.vault_id.as_deref() {
+                provenance.push(format!("vault={vault}"));
+            }
+            if let Some(confidence) = memory.confidence {
+                provenance.push(format!("confidence={confidence:.2}"));
+            }
+            if let Some(trust) = memory.trust.as_deref() {
+                provenance.push(format!("trust={trust}"));
+            }
+            if let Some(reason) = memory.recall_reason.as_deref() {
+                provenance.push(format!("reason={reason}"));
+            }
+
             out.push_str(&format!(
                 "{}. [{}] {}",
                 i + 1,
                 memory.concept,
                 memory.content
             ));
+            if !provenance.is_empty() {
+                out.push_str(&format!(" {{{}}}", provenance.join("; ")));
+            }
             if !memory.tags.is_empty() {
                 out.push_str(&format!(" ({})", memory.tags.join(", ")));
+            }
+            if let Some(summary) = memory.summary.as_deref().filter(|text| !text.is_empty()) {
+                out.push_str(&format!("\n   summary: {summary}"));
+            }
+            if !memory.entities.is_empty() {
+                out.push_str(&format!("\n   entities: {}", memory.entities.len()));
+            }
+            if !memory.relationships.is_empty() {
+                out.push_str(&format!("\n   relationships: {}", memory.relationships.len()));
+            }
+            if let Some(annotations) = memory.annotations.as_ref().filter(|v| !v.is_null()) {
+                out.push_str(&format!("\n   annotations: {annotations}"));
             }
             out.push('\n');
         }
@@ -3155,6 +3191,24 @@ fn looks_like_execution_goal(normalized: &str) -> bool {
     .any(|keyword| normalized.contains(keyword))
 }
 
+fn looks_like_memory_write_goal(normalized: &str) -> bool {
+    [
+        "remember",
+        "write this down",
+        "store memory",
+        "save memory",
+        "note this",
+        "memory delta",
+        "decision:",
+        "operator preference",
+        "reality gap",
+        "next seam",
+        "closeout",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
 fn normalized_turn_text(user_content: &str) -> String {
     user_content
         .trim()
@@ -3400,6 +3454,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "delegate.whisper"
             | "approval.request_standing"
             | "table.add_listener"
+            | "router.stats"
     )
 }
 
@@ -5517,6 +5572,61 @@ mod tests {
     }
 
     #[test]
+    fn memory_write_tool_is_hidden_without_write_intent() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("memory.recall");
+        state.add_tool_binding("memory.remember");
+        state.add_tool_binding("workspace.read");
+
+        let projected = state.project_tools_for_turn("Help me plan the next memory slice");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(projected_names.contains(&"memory.recall"));
+        assert!(projected_names.contains(&"workspace.read"));
+        assert!(!projected_names.contains(&"memory.remember"));
+    }
+
+    #[test]
+    fn memory_write_intent_can_project_remember_tool() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("memory.recall");
+        state.add_tool_binding("memory.remember");
+
+        let projected =
+            state.project_tools_for_turn("remember operator preference for short closeouts");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(projected_names.contains(&"memory.remember"));
+    }
+
+    #[test]
+    fn reentry_context_uses_projected_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        let mut turn = test_working_turn(None);
+        turn.user_content = "What do you think about this architecture?".into();
+        state.start_turn(turn);
+
+        let (_, _, _, tools) = state
+            .build_reentry_context_envelope()
+            .expect("active turn should produce reentry envelope");
+
+        assert!(tools.is_empty());
+    }
+
+    #[test]
     fn execution_intent_keeps_shell_tools_visible() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -6044,10 +6154,17 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: vec![RecalledMemoryRecord {
+                id: Some("01MEMORY".into()),
+                vault_id: Some("user_chat-memory".into()),
                 concept: "memory-architecture".into(),
                 content: "User prefers deterministic bounded recall over broad automatic dumps."
                     .into(),
                 tags: vec!["memory".into(), "preference".into()],
+                confidence: Some(0.91),
+                trust: Some("verified".into()),
+                entities: vec![serde_json::json!({"name": "Muninn", "type": "memory_system"})],
+                recall_reason: Some("meaningful_user_turn".into()),
+                ..Default::default()
             }],
             active_plan: None,
             consecutive_step_failures: 0,
@@ -6080,6 +6197,11 @@ mod tests {
             .expect("recalled memory entry should render text");
         assert!(text.contains("[Recalled memory]"));
         assert!(text.contains("memory-architecture"));
+        assert!(text.contains("id=01MEMORY"));
+        assert!(text.contains("vault=user_chat-memory"));
+        assert!(text.contains("confidence=0.91"));
+        assert!(text.contains("trust=verified"));
+        assert!(text.contains("entities: 1"));
     }
 
     #[test]

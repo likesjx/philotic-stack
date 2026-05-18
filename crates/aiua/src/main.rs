@@ -3736,6 +3736,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.enable".into(),
                 "cron.disable".into(),
                 "cron.remove".into(),
+                "router.stats".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "memory".into(), "graph".into(), "agent_graph".into(), "table".into(), "cron".into(), "mcp".into(), "desktop".into()],
             allowed_skills: vec![
@@ -3873,6 +3874,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.enable".into(),
                 "cron.disable".into(),
                 "cron.remove".into(),
+                "router.stats".into(),
             ],
             allowed_classes: vec![
                 "session".into(),

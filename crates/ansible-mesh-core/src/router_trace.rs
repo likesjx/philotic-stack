@@ -55,6 +55,24 @@ pub struct RouterTrainingRecord {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Aggregates
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Per-provider routing performance summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderStats {
+    pub provider_id: String,
+    pub task_kind: String,
+    pub total_calls: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    /// 0.0–1.0 success fraction.
+    pub success_rate: f64,
+    pub avg_latency_ms: Option<f64>,
+    pub p90_latency_ms: Option<u64>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Trait
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -79,6 +97,10 @@ pub trait RouterTraceStorage: Send + Sync {
         provider_id: &str,
         limit: usize,
     ) -> Result<Vec<RouterTrainingRecord>>;
+
+    /// Aggregate per-(provider, task_kind) stats over the last `window_secs` seconds.
+    /// Pass `None` to aggregate all time.
+    fn provider_stats(&self, window_secs: Option<u64>) -> Result<Vec<ProviderStats>>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -210,6 +232,102 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         )?;
         collect_records(&mut stmt, params![provider_id, limit as i64])
     }
+
+    fn provider_stats(&self, window_secs: Option<u64>) -> Result<Vec<ProviderStats>> {
+        let conn = self.conn.lock().unwrap();
+        let since_ts: i64 = if let Some(secs) = window_secs {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (now.saturating_sub(secs)) as i64
+        } else {
+            0
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT provider_id, task_kind, outcome, latency_ms
+             FROM router_traces
+             WHERE timestamp >= ?1
+             ORDER BY provider_id, task_kind",
+        )?;
+
+        #[derive(Debug)]
+        struct Row {
+            provider_id: String,
+            task_kind: String,
+            outcome: String,
+            latency_ms: Option<i64>,
+        }
+
+        let rows: Vec<Row> = stmt
+            .query_map(params![since_ts], |r| {
+                Ok(Row {
+                    provider_id: r.get(0)?,
+                    task_kind: r.get(1)?,
+                    outcome: r.get(2)?,
+                    latency_ms: r.get(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Group by (provider_id, task_kind)
+        use std::collections::HashMap;
+        let mut buckets: HashMap<(String, String), (u64, u64, Vec<u64>)> = HashMap::new();
+        for row in &rows {
+            let key = (row.provider_id.clone(), row.task_kind.clone());
+            let entry = buckets.entry(key).or_default();
+            entry.0 += 1;
+            if row.outcome == "success" || row.outcome == "tool_call" {
+                entry.1 += 1;
+            }
+            if let Some(ms) = row.latency_ms {
+                entry.2.push(ms as u64);
+            }
+        }
+
+        let mut stats: Vec<ProviderStats> = buckets
+            .into_iter()
+            .map(|((provider_id, task_kind), (total, successes, mut latencies))| {
+                let failures = total - successes;
+                let success_rate = if total == 0 {
+                    0.0
+                } else {
+                    successes as f64 / total as f64
+                };
+                let avg_latency_ms = if latencies.is_empty() {
+                    None
+                } else {
+                    Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
+                };
+                let p90_latency_ms = if latencies.is_empty() {
+                    None
+                } else {
+                    latencies.sort_unstable();
+                    let idx = (latencies.len() as f64 * 0.90) as usize;
+                    Some(latencies[idx.min(latencies.len() - 1)])
+                };
+                ProviderStats {
+                    provider_id,
+                    task_kind,
+                    total_calls: total,
+                    success_count: successes,
+                    failure_count: failures,
+                    success_rate,
+                    avg_latency_ms,
+                    p90_latency_ms,
+                }
+            })
+            .collect();
+
+        stats.sort_by(|a, b| {
+            a.provider_id
+                .cmp(&b.provider_id)
+                .then(a.task_kind.cmp(&b.task_kind))
+        });
+        Ok(stats)
+    }
 }
 
 fn collect_records(
@@ -334,6 +452,75 @@ mod tests {
             traces[0].failure_code.as_deref(),
             Some("MODEL_INVALID_TOOL_CALL")
         );
+    }
+
+    #[test]
+    fn provider_stats_aggregates_success_and_failure() {
+        let (s, _f) = open_tmp();
+        // 3 gemini successes + 1 failure for text.generate
+        s.record_trace(&make_record(1, "gemini", "aria", "success")).unwrap();
+        s.record_trace(&make_record(2, "gemini", "aria", "success")).unwrap();
+        s.record_trace(&make_record(3, "gemini", "aria", "success")).unwrap();
+        s.record_trace(&make_record(4, "gemini", "aria", "failure")).unwrap();
+        // 1 elevenlabs success for text.generate
+        s.record_trace(&make_record(5, "elevenlabs", "aria", "success")).unwrap();
+
+        let stats = s.provider_stats(None).unwrap();
+        let gemini = stats
+            .iter()
+            .find(|r| r.provider_id == "gemini")
+            .expect("gemini stats missing");
+        assert_eq!(gemini.total_calls, 4);
+        assert_eq!(gemini.success_count, 3);
+        assert_eq!(gemini.failure_count, 1);
+        assert!((gemini.success_rate - 0.75).abs() < 1e-9);
+
+        let eleven = stats
+            .iter()
+            .find(|r| r.provider_id == "elevenlabs")
+            .expect("elevenlabs stats missing");
+        assert_eq!(eleven.total_calls, 1);
+        assert!((eleven.success_rate - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn provider_stats_window_filters_old_records() {
+        let (s, _f) = open_tmp();
+        // Insert one record with a very old timestamp manually.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO router_traces
+                 (trace_id, agent_id, session_id, turn_id, provider_id, model_id,
+                  task_kind, outcome, latency_ms, timestamp)
+                 VALUES ('old-trace','aria','s0','t0','gemini',NULL,'text.generate','success',100,1)",
+                [],
+            )
+            .unwrap();
+        }
+        // One recent record via make_record (timestamp = 1_000_000 + n, which is in the past but
+        // effectively "all-time"; window test needs a relative future record so we insert one now).
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO router_traces
+                 (trace_id, agent_id, session_id, turn_id, provider_id, model_id,
+                  task_kind, outcome, latency_ms, timestamp)
+                 VALUES ('new-trace','aria','s1','t1','gemini',NULL,'text.generate','failure',200,?1)",
+                rusqlite::params![now_ts],
+            )
+            .unwrap();
+        }
+
+        // Window of 3600s should exclude the epoch-1 record and include the now record.
+        let stats = s.provider_stats(Some(3600)).unwrap();
+        let gemini = stats.iter().find(|r| r.provider_id == "gemini").unwrap();
+        assert_eq!(gemini.total_calls, 1);
+        assert_eq!(gemini.success_count, 0);
     }
 
     #[test]
