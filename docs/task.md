@@ -1202,7 +1202,8 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
     - [x] wire desktop `User Settings` onto the canonical hotel-owned auth-user surface so `System Settings > Aiua Membrane` can actually author local-first user graph fields and linked identities instead of only hosting the auth bootstrap
   - [~] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
     - [x] land first graph-backed `ProjectedUserIdentityRecord` seam with stable provider-backed `principal_id` and hotel-auth-store sync
-    - [ ] propagate projected user identity across hotels through an explicit mesh sync path instead of assuming full graph replication already exists
+    - [x] propagate projected user identity across hotels through explicit durable `ProjectedUserIdentitySync` mesh events instead of assuming full graph replication already exists
+    - [ ] use that propagated projected identity during remote user resolution/onboarding instead of treating every hotel as socially amnesiac until login
   - [ ] philote-visible bounded user context projection instead of raw root-user secret access
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
   - [ ] passkey-backed local-first operator login after OIDC and membrane step-up are landed

@@ -53,8 +53,11 @@
 //!              auth via same-origin cookie
 
 use ansible_mesh_core::domain::GraphDomain;
-use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
-use ansible_mesh_core::storage::{ProjectedExternalIdentityRecord, ProjectedUserIdentityRecord};
+use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+use ansible_mesh_core::sqlite_storage::{SqliteEventStorage, SqliteGraphStorage};
+use ansible_mesh_core::storage::{
+    EventStorage, ProjectedExternalIdentityRecord, ProjectedUserIdentityRecord,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{
@@ -5605,6 +5608,40 @@ fn projected_external_identity(
     }
 }
 
+fn emit_projected_user_identity_sync_event(
+    db_path: &PathBuf,
+    hotel: &str,
+    graph: &GraphDomain,
+    identity: &ProjectedUserIdentityRecord,
+) -> Result<()> {
+    let local_node_id = graph
+        .get_hotel(hotel)?
+        .map(|record| record.capabilities.node_id)
+        .unwrap_or_else(|| default_operator_node_id(hotel));
+    let payload = serde_json::to_string(identity)
+        .context("emit_projected_user_identity_sync_event: serialize identity")?;
+    let mut env = EventEnvelope {
+        event_id: uuid::Uuid::new_v4(),
+        seq: 0,
+        source_node_id: local_node_id,
+        target_node_id: None,
+        source_agent_id: operator_surface_agent_id(hotel),
+        target_agent_id: None,
+        kind: EventKind::ProjectedUserIdentitySync,
+        corr_id: format!("projected-user-sync:{}", identity.principal_id),
+        attempt: 0,
+        created_at: now_epoch_secs().max(0) as u64,
+        expires_at: None,
+        payload: EventPayload::Inline { data: payload },
+        trace: vec![format!(
+            "operator-auth:projected-user-sync:{}",
+            identity.principal_id
+        )],
+    };
+    SqliteEventStorage::open(db_path)?.append_event(&mut env)?;
+    Ok(())
+}
+
 fn load_projected_user_identity_for_user(
     db_path: &PathBuf,
     hotel: &str,
@@ -5635,7 +5672,8 @@ fn sync_projected_user_identity(db_path: &PathBuf, hotel: &str, user_id: &str) -
     };
     let storage = SqliteGraphStorage::open(db_path)?;
     let graph = GraphDomain::new(Arc::new(storage.adapter()));
-    graph.upsert_projected_user_identity(&projected)
+    graph.upsert_projected_user_identity(&projected)?;
+    emit_projected_user_identity_sync_event(db_path, hotel, &graph, &projected)
 }
 
 #[allow(dead_code)]
@@ -5773,8 +5811,26 @@ fn default_operator_user_id(hotel: &str) -> String {
     format!("root-user:{hotel}")
 }
 
+fn sanitize_hotel_name(hotel_name: &str) -> String {
+    hotel_name
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
 fn default_operator_principal_id(hotel: &str) -> String {
     format!("local-user:{hotel}")
+}
+
+fn default_operator_node_id(hotel: &str) -> String {
+    format!("{}-aiua-01", sanitize_hotel_name(hotel))
+}
+
+fn operator_surface_agent_id(hotel: &str) -> String {
+    format!("desktop:{hotel}:operator-surface")
 }
 
 fn projected_principal_id_for_identity(identity: &OidcIdentity) -> String {
@@ -6353,6 +6409,7 @@ fn oidc_callback_error_response(status: StatusCode, message: String) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ansible_mesh_core::storage::EventStorage;
     use std::fs;
 
     fn temp_db_path(name: &str) -> PathBuf {
@@ -6549,6 +6606,44 @@ mod tests {
         assert_eq!(projected.home_hotel, "mac-jane");
         assert_eq!(projected.linked_identities.len(), 1);
         assert_eq!(projected.linked_identities[0].provider, "google");
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn projected_user_identity_sync_appends_broadcast_mesh_event() {
+        let context_path = temp_db_path("projected-user-sync");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+
+        let _link = upsert_operator_external_identity_link(
+            &context_path,
+            "mac-jane",
+            &OidcIdentity {
+                provider: "google".into(),
+                provider_subject: "google-subject-123".into(),
+                display_name: "Jared Likes".into(),
+                email: Some("jared@example.com".into()),
+                login: None,
+            },
+        )
+        .unwrap();
+
+        let ledger = SqliteEventStorage::open(&context_path).unwrap();
+        let events = ledger
+            .query_unacked_events("remote-aiua-01", 0, 20)
+            .unwrap();
+        let sync_event = events
+            .iter()
+            .find(|event| event.kind == EventKind::ProjectedUserIdentitySync)
+            .expect("projected identity sync event should be present");
+        assert!(sync_event.target_node_id.is_none());
+        let EventPayload::Inline { data } = &sync_event.payload else {
+            panic!("expected inline payload");
+        };
+        let payload: ProjectedUserIdentityRecord = serde_json::from_str(data).unwrap();
+        assert_eq!(payload.principal_id, "user:google:google-subject-123");
+        assert_eq!(payload.home_hotel, "mac-jane");
+        assert_eq!(payload.linked_identities.len(), 1);
 
         let _ = fs::remove_file(&context_path);
     }

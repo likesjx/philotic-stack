@@ -53,6 +53,7 @@ What OIDC contributes:
 - provider subject / stable external ID
 - supporting aliases such as email or login
 - a stable projected mesh principal like `user:google:<subject>` once the first provider link is attached
+- a durable `ProjectedUserIdentitySync` ghost-mirror event so peer hotels can learn that non-secret projected identity without inheriting local sessions or vault bindings
 
 What it does **not** do yet:
 

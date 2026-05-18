@@ -749,6 +749,33 @@ fn handle_cron_job_sync(graph: &GraphDomain, payload_json: &str) {
     }
 }
 
+/// Handle an inbound `ProjectedUserIdentitySync` broadcast from a peer hotel.
+///
+/// Replicates only the non-secret user ghost mirror so remote hotels can
+/// recognize the same human without inheriting local sessions or credentials.
+fn handle_projected_user_identity_sync(graph: &GraphDomain, payload_json: &str) {
+    let identity: ansible_mesh_core::storage::ProjectedUserIdentityRecord =
+        match serde_json::from_str(payload_json) {
+            Ok(identity) => identity,
+            Err(e) => {
+                warn!("handle_projected_user_identity_sync: invalid payload: {e}");
+                return;
+            }
+        };
+
+    if let Err(e) = graph.upsert_projected_user_identity(&identity) {
+        warn!(
+            "handle_projected_user_identity_sync: upsert failed for {}: {e}",
+            identity.principal_id
+        );
+    } else {
+        info!(
+            "ProjectedUserIdentitySync: replicated principal {} from {}",
+            identity.principal_id, identity.home_hotel
+        );
+    }
+}
+
 fn mesh_target_addr_for_node(graph: &GraphDomain, target_node_id: &str) -> Result<Option<String>> {
     Ok(graph
         .list_hotels()?
@@ -1443,6 +1470,17 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                             } = &event.payload
                                             {
                                                 handle_cron_job_sync(
+                                                    inbound_graph.as_ref(),
+                                                    data,
+                                                );
+                                            }
+                                        }
+                                        ansible_mesh_core::event::EventKind::ProjectedUserIdentitySync => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                handle_projected_user_identity_sync(
                                                     inbound_graph.as_ref(),
                                                     data,
                                                 );
