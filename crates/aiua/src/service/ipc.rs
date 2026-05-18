@@ -875,6 +875,8 @@ struct PendingPipeline {
     completed_stages: Vec<serde_json::Value>,
     /// Zero-based index of the stage currently in flight.
     stage_index: usize,
+    /// Role of the capability currently in flight (for provenance records).
+    current_stage_capability: String,
     /// Unix timestamp (seconds) when the current stage was dispatched (for elapsed_ms).
     stage_dispatched_at: u64,
     /// Unix timestamp (seconds) when this entry was inserted; used by the TTL watchdog.
@@ -3163,6 +3165,16 @@ impl IpcServer {
 
             {
                 let mut guard = pending_pipelines.lock().await;
+                // Collision guard: if a pipeline is already in-flight for this turn,
+                // refuse the second intercept and fall through to normal delivery.
+                if guard.contains_key(&corr_key) {
+                    warn!(
+                        "Golgi: corr_key '{}' already in-flight — refusing duplicate intercept, \
+                         delivering task normally",
+                        corr_key
+                    );
+                    return None;
+                }
                 let now = unix_ts();
                 guard.insert(
                     corr_key,
@@ -3176,6 +3188,7 @@ impl IpcServer {
                         remaining_stages: remaining,
                         completed_stages: Vec::new(),
                         stage_index: 0,
+                        current_stage_capability: first_capability.to_string(),
                         stage_dispatched_at: now,
                         created_at: now,
                     },
@@ -3235,7 +3248,7 @@ impl IpcServer {
 
         // Build provenance record for this stage (enriches golgi_stages array).
         let stage_record = serde_json::json!({
-            "capability": "",          // filled below after name is known
+            "capability": pending.current_stage_capability,
             "stage": pending.stage_index,
             "ok": stage_ok,
             "elapsed_ms": elapsed_ms,
@@ -3283,6 +3296,7 @@ impl IpcServer {
                 pending.rule_id, pending.stage_index, next_capability,
             );
             pending.stage_index += 1;
+            pending.current_stage_capability = next_capability.clone();
             pending.stage_dispatched_at = unix_ts();
 
             // Rewrite reply_role/reply_to so the next capability also replies to hotel:golgi.
@@ -24874,6 +24888,7 @@ mod tests {
                     remaining_stages: std::collections::VecDeque::new(),
                     completed_stages: Vec::new(),
                     stage_index: 0,
+                    current_stage_capability: "voice.transcribe".into(),
                     stage_dispatched_at: 0,
                     created_at: 0, // epoch — guaranteed expired
                 },
@@ -25406,6 +25421,174 @@ mod tests {
             payload.get("golgi_stages").is_none(),
             "on_failure delivery must not include golgi_stages"
         );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Verify the collision guard: if a second EmitTask arrives with the same
+    /// session_id:turn_id while a pipeline is already in-flight, the second task
+    /// is delivered normally to the agent (no intercept) and the first pipeline
+    /// entry remains intact.
+    ///
+    /// Test plan:
+    /// 1. Configure a pipeline rule for audio_input.
+    /// 2. Subscribe agent + capability.
+    /// 3. Emit first task → intercepted (capability receives it, agent does not).
+    /// 4. Emit second task with the SAME session_id:turn_id → NOT intercepted (agent receives it).
+    /// 5. Assert pending_pipelines still has the first entry (not evicted by collision).
+    #[tokio::test]
+    async fn golgi_pipeline_collision_guard_passes_duplicate_corr_key_through() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-golgi-slice6-coll";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = make_hotel_graph(&socket_path, agent_id);
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let pending_pipelines = server.pending_pipelines();
+        let server_task =
+            tokio::spawn(async move { server.run().await.expect("ipc server should run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut admin_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "admin-coll-test".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("admin connect");
+
+        admin_client
+            .send_request(IpcRequest::UpsertRoutingPipelineRule {
+                agent_id: agent_id.into(),
+                rule_id: "coll-test-rule".into(),
+                rule_json: serde_json::json!({
+                    "match": { "action": "audio_input" },
+                    "stages": [{ "capability": "voice.transcribe" }],
+                }),
+            })
+            .await
+            .expect("upsert rule");
+
+        let agent_guest_id = "coll-agent-guest-01";
+        let mut agent_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: agent_guest_id.into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let mut cap_client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "coll-cap-voice-01".into(),
+            role: "voice.transcribe".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("cap connect");
+
+        let task_json = serde_json::json!({
+            "action": "audio_input",
+            "session_id": "sess-coll-01",
+            "turn_id": "turn-coll-01",
+            "agent_id": agent_id,
+        })
+        .to_string();
+
+        // ── First emit — intercepted ──────────────────────────────────────────
+        admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some(agent_guest_id.into()),
+                task_json: task_json.clone(),
+            })
+            .await
+            .expect("first emit");
+
+        // Capability must receive the first task.
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            cap_client.recv_task(),
+        )
+        .await
+        .expect("cap must receive first task")
+        .expect("cap recv error");
+
+        // Agent must NOT receive anything yet.
+        let agent_check = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            agent_client.recv_task(),
+        )
+        .await;
+        assert!(agent_check.is_err(), "agent must not receive first task (intercepted)");
+
+        // ── Second emit — same corr_key, collision guard fires ────────────────
+        admin_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some(agent_guest_id.into()),
+                task_json: task_json.clone(),
+            })
+            .await
+            .expect("second emit");
+
+        // Agent MUST receive the second task (passed through normally).
+        let recv = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            agent_client.recv_task(),
+        )
+        .await
+        .expect("agent must receive second task within 2s (collision passthrough)")
+        .expect("agent recv error");
+
+        let philotic_client::IpcResponse::InboundTask { task_json: recv_json, .. } = recv else {
+            panic!("expected InboundTask, got {:?}", recv);
+        };
+        let recv_payload: serde_json::Value =
+            serde_json::from_str(&recv_json).unwrap_or_default();
+        assert_eq!(
+            recv_payload.get("action").and_then(serde_json::Value::as_str),
+            Some("audio_input"),
+        );
+        // No on_failure marker — this is a normal passthrough, not a failure.
+        assert!(
+            recv_payload.get("golgi_on_failure").is_none(),
+            "collision passthrough must not carry golgi_on_failure"
+        );
+
+        // ── First pipeline entry must still be in-flight ──────────────────────
+        {
+            let guard = pending_pipelines.lock().await;
+            assert_eq!(
+                guard.len(),
+                1,
+                "pending_pipelines must still hold the first in-flight entry; got: {:?}",
+                guard.keys().collect::<Vec<_>>()
+            );
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
