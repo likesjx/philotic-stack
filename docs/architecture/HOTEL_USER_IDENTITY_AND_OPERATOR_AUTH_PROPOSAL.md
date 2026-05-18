@@ -257,6 +257,7 @@ This is intentionally a first slice, not a final auth model:
 - `GET /api/auth/status` now exposes that non-secret external identity linkage so the future `User Settings` surface has a real hotel-owned user graph seam to build on
 - `philotic-web` now exposes a first bounded `GET/PATCH /api/auth/user` surface that reads and updates the canonical hotel-local operator user record, bridges timezone/display-name through the existing hotel profile seam, and now returns the projected identity record so local-first onboarding can see the mesh-facing principal it is authoring
 - the embedded desktop `Aiua Membrane` settings panel is now wired onto that canonical auth-user surface, so `User Settings` can actually curate display name, preferred name, primary email, onboarding state, timezone, and linked provider identities instead of leaving hotel-local user graph authorship stranded in backend purity
+- `GetUserProfile` now returns a bounded projected user context package for philotes — timezone plus stable principal, preferred/display identity summary, home hotel, and linked provider labels — so cognition can inherit operator continuity without touching sessions, challenges, or vault-backed secret state directly
 - the concrete first-admin and new-operator setup flow now lives in [docs/process/OPERATOR_AUTH_ONBOARDING.md](/Users/jaredlikes/code/philotic-stack/docs/process/OPERATOR_AUTH_ONBOARDING.md), so the auth stack has a human procedure instead of a collection of correct but socially unhelpful boundaries
 
 ## Desktop Auth Recommendation

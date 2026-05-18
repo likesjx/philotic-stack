@@ -328,6 +328,8 @@ pub struct WorkingTurn {
     pub task_id: Uuid,
     pub turn_id: String,
     pub chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_user_id: Option<String>,
     pub user_content: String,
     pub final_reply_to: String,
     pub final_reply_role: String,
@@ -823,6 +825,19 @@ pub struct AgentProfile {
     /// time references correctly. Optional; UTC is assumed when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_timezone: Option<String>,
+    /// Stable mesh-facing principal for the operator when the hotel has linked
+    /// the human to a projected user identity. Bounded projection only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_principal_id: Option<String>,
+    /// Human-friendly preferred name for the operator when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_preferred_name: Option<String>,
+    /// Non-secret primary email alias for the operator when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_primary_email: Option<String>,
+    /// Linked provider labels (e.g. `google`, `github`) projected by the hotel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_linked_providers: Vec<String>,
     /// Authoritative list of role names registered for this agent, fetched from
     /// the hotel graph at startup. Injected into the system prompt so the model
     /// always uses exact, DB-sourced names in delegate.whisper / handoff.to_role.

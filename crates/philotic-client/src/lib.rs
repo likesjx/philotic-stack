@@ -1366,6 +1366,16 @@ pub enum IpcRequest {
 pub struct UserProfileDataPayload {
     pub timezone: Option<String>,
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_hotel: Option<String>,
+    #[serde(default)]
+    pub linked_providers: Vec<String>,
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.

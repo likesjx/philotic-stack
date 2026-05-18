@@ -21,7 +21,7 @@ use memory_core::{
 };
 use philotic_client::{
     Exosome, HandoffBundle, IpcRequest, IpcResponse, ParacrineRouting, PhiloticClient,
-    TaskErrorPayload, is_ipc_disconnect,
+    TaskErrorPayload, UserProfileDataPayload, is_ipc_disconnect,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashMap};
@@ -101,10 +101,28 @@ fn turn_memory_user_id(state: &SessionState) -> String {
     state
         .active_turn
         .as_ref()
-        .map(|turn| turn.chat_id.trim())
-        .filter(|chat_id| !chat_id.is_empty())
+        .and_then(|turn| turn.primary_user_id.as_deref())
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
         .map(str::to_string)
+        .or_else(|| {
+            state
+                .active_turn
+                .as_ref()
+                .map(|turn| turn.chat_id.trim())
+                .filter(|chat_id| !chat_id.is_empty())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| state.session_id.clone())
+}
+
+fn inbound_primary_user_id(task: &InboundTaskPayload) -> Option<String> {
+    task.sender_id
+        .as_deref()
+        .or(task.sender_username.as_deref())
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
+        .map(str::to_string)
 }
 
 fn default_turn_recall_scope(session_id: &str) -> MemoryScope {
@@ -123,7 +141,6 @@ fn memory_scope_from_tool_arg(scope: Option<&str>, session_id: &str) -> MemorySc
         _ => MemoryScope::SelfOnly,
     }
 }
-
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
@@ -993,9 +1010,28 @@ impl AgentRuntime {
             {
                 Ok(IpcResponse::UserProfileData(p)) => {
                     if self.default_agent_profile.user_timezone.is_none() {
-                        if let Some(tz) = p.timezone {
+                        if let Some(tz) = p.timezone.clone() {
                             info!(hotel = %hotel_name, tz = %tz, "Injecting user timezone from hotel user profile.");
                             self.default_agent_profile.user_timezone = Some(tz);
+                        }
+                    }
+                    if self.default_agent_profile.user_principal_id.is_none() {
+                        self.default_agent_profile.user_principal_id = p.principal_id.clone();
+                    }
+                    if self.default_agent_profile.user_preferred_name.is_none() {
+                        self.default_agent_profile.user_preferred_name = p.preferred_name.clone();
+                    }
+                    if self.default_agent_profile.user_primary_email.is_none() {
+                        self.default_agent_profile.user_primary_email = p.primary_email.clone();
+                    }
+                    if self.default_agent_profile.user_linked_providers.is_empty() {
+                        self.default_agent_profile.user_linked_providers =
+                            p.linked_providers.clone();
+                    }
+                    if self.default_agent_profile.user_context_text.is_none() {
+                        if let Some(context) = projected_user_context_from_profile(&p) {
+                            info!(hotel = %hotel_name, "Injecting bounded projected user context from hotel identity.");
+                            self.default_agent_profile.user_context_text = Some(context);
                         }
                     }
                 }
@@ -2542,6 +2578,7 @@ impl AgentRuntime {
                 task_id,
                 turn_id: turn_id.clone(),
                 chat_id: chat_id.clone(),
+                primary_user_id: inbound_primary_user_id(&task),
                 user_content: content.clone(),
                 final_reply_to: final_reply_to.clone(),
                 final_reply_role: final_reply_role.clone(),
@@ -3398,7 +3435,10 @@ impl AgentRuntime {
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     state.active_user_task_id = Some(user_task_id.clone());
                 }
-                info!(user_task_id, "UserTask created and steps set for plan proposal");
+                info!(
+                    user_task_id,
+                    "UserTask created and steps set for plan proposal"
+                );
             }
             Ok(other) => {
                 warn!(?other, "CreateUserTask returned unexpected response");
@@ -8205,7 +8245,10 @@ impl AgentRuntime {
                     .send_request(IpcRequest::GetRouterStats { window_secs })
                     .await
                 {
-                    Ok(IpcResponse::RouterStats { stats, generated_at }) => {
+                    Ok(IpcResponse::RouterStats {
+                        stats,
+                        generated_at,
+                    }) => {
                         let text = serde_json::to_string_pretty(&serde_json::json!({
                             "generated_at": generated_at,
                             "stats": stats
@@ -11059,16 +11102,18 @@ impl AgentRuntime {
                     .unwrap_or_else(|| self.agent_id.clone());
                 let result_text = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
                     None => "Memory unavailable: MuninnDB not configured.".to_string(),
-                    Some(engine) => match engine.remember(scope, &concept, &content_str, tags).await {
-                        Ok(engram_ref) => {
-                            let _ = engine.retry_enrich(&engram_ref.id).await;
-                            format!(
-                                "Stored memory '{}' (id: {}, vault: {}).",
-                                concept, engram_ref.id, engram_ref.vault_id
-                            )
+                    Some(engine) => {
+                        match engine.remember(scope, &concept, &content_str, tags).await {
+                            Ok(engram_ref) => {
+                                let _ = engine.retry_enrich(&engram_ref.id).await;
+                                format!(
+                                    "Stored memory '{}' (id: {}, vault: {}).",
+                                    concept, engram_ref.id, engram_ref.vault_id
+                                )
+                            }
+                            Err(e) => format!("memory.remember error: {e}"),
                         }
-                        Err(e) => format!("memory.remember error: {e}"),
-                    },
+                    }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
@@ -12791,6 +12836,55 @@ fn local_hotel_name() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+fn projected_user_context_from_profile(profile: &UserProfileDataPayload) -> Option<String> {
+    let display_name = profile
+        .preferred_name
+        .as_deref()
+        .or(profile.display_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let principal_id = profile
+        .principal_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let home_hotel = profile
+        .home_hotel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider_summary = if profile.linked_providers.is_empty() {
+        None
+    } else {
+        Some(profile.linked_providers.join(", "))
+    };
+
+    if display_name.is_none()
+        && principal_id.is_none()
+        && home_hotel.is_none()
+        && provider_summary.is_none()
+    {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if let Some(name) = display_name {
+        lines.push(format!("Current operator: {name}."));
+    }
+    if let Some(principal_id) = principal_id {
+        lines.push(format!("Stable operator principal: {principal_id}."));
+    }
+    if let Some(home_hotel) = home_hotel {
+        lines.push(format!("Operator identity home hotel: {home_hotel}."));
+    }
+    if let Some(provider_summary) = provider_summary {
+        lines.push(format!(
+            "Recognized login providers for this operator: {provider_summary}."
+        ));
+    }
+    Some(lines.join(" "))
+}
+
 /// Executes a shell command via `sh -c`, capturing stdout/stderr and enforcing a timeout.
 ///
 /// Returns a JSON object with `stdout`, `stderr`, `exit_code`, and `success` fields.
@@ -12852,7 +12946,7 @@ mod tests {
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
         ResponseRouteMode, SessionState, WorkingTurn,
     };
-    use philotic_client::TaskErrorPayload;
+    use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
     #[test]
     fn model_request_targets_agent_for_reply() {
@@ -13197,6 +13291,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "say hello".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -13692,6 +13787,27 @@ mod tests {
         assert!(!super::command_bypasses_turn_start(
             &SlashCommand::Approve { note: None }
         ));
+    }
+
+    #[test]
+    fn projected_user_context_from_profile_formats_bounded_identity_summary() {
+        let profile = UserProfileDataPayload {
+            timezone: Some("America/New_York".into()),
+            display_name: Some("Jared Likes".into()),
+            principal_id: Some("user:google:subject-123".into()),
+            preferred_name: Some("Jared".into()),
+            primary_email: Some("jared@example.com".into()),
+            home_hotel: Some("vps-jane".into()),
+            linked_providers: vec!["google".into(), "github".into()],
+        };
+
+        let summary = super::projected_user_context_from_profile(&profile)
+            .expect("bounded user context should be present");
+        assert!(summary.contains("Current operator: Jared."));
+        assert!(summary.contains("Stable operator principal: user:google:subject-123."));
+        assert!(summary.contains("Operator identity home hotel: vps-jane."));
+        assert!(summary.contains("Recognized login providers for this operator: google, github."));
+        assert!(!summary.contains("jared@example.com"));
     }
 
     // ── bash.exec tests ──────────────────────────────────────────────────────

@@ -1204,7 +1204,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
     - [x] land first graph-backed `ProjectedUserIdentityRecord` seam with stable provider-backed `principal_id` and hotel-auth-store sync
     - [x] propagate projected user identity across hotels through explicit durable `ProjectedUserIdentitySync` mesh events instead of assuming full graph replication already exists
     - [x] use that propagated projected identity during remote user resolution/onboarding by exact provider subject or unique verified email alias instead of treating every hotel as socially amnesiac until login
-  - [ ] philote-visible bounded user context projection instead of raw root-user secret access
+  - [x] philote-visible bounded user context projection instead of raw root-user secret access
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
   - [ ] passkey-backed local-first operator login after OIDC and membrane step-up are landed
 - [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.

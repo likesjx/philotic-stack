@@ -987,6 +987,23 @@ impl GraphDomain {
             .collect()
     }
 
+    pub fn find_projected_user_identity_for_local_user(
+        &self,
+        local_user_id: &str,
+    ) -> Result<Option<ProjectedUserIdentityRecord>> {
+        let mut matches = self
+            .list_projected_user_identities()?
+            .into_iter()
+            .filter(|identity| identity.local_user_id == local_user_id);
+        let Some(first) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        Ok(Some(first))
+    }
+
     // ── Node capabilities ─────────────────────────────────────────────────────
 
     const NODE_CAPABILITIES_KEY: &'static str = "node_capabilities:local";
@@ -1950,6 +1967,27 @@ mod tests {
     }
 
     #[test]
+    fn find_projected_user_identity_for_local_user_returns_unique_match() {
+        let d = make_domain();
+        let identity = ProjectedUserIdentityRecord {
+            principal_id: "user:google:subject-123".into(),
+            local_user_id: "root-user:mac-jane".into(),
+            home_hotel: "mac-jane".into(),
+            display_name: "Jared Likes".into(),
+            preferred_name: Some("Jared".into()),
+            primary_email: Some("jared@example.com".into()),
+            linked_identities: Vec::new(),
+            updated_at: 789,
+        };
+        d.upsert_projected_user_identity(&identity).unwrap();
+        let loaded = d
+            .find_projected_user_identity_for_local_user("root-user:mac-jane")
+            .unwrap()
+            .expect("stored projected user identity");
+        assert_eq!(loaded.principal_id, "user:google:subject-123");
+    }
+
+    #[test]
     fn user_task_round_trip_create_and_get() {
         let d = make_domain();
         let task_id = "task-001";
@@ -2031,9 +2069,12 @@ mod tests {
                 "approval_note": null,
             })
         };
-        d.upsert_user_task(make_task("t1", "session-A"), "t1").unwrap();
-        d.upsert_user_task(make_task("t2", "session-B"), "t2").unwrap();
-        d.upsert_user_task(make_task("t3", "session-A"), "t3").unwrap();
+        d.upsert_user_task(make_task("t1", "session-A"), "t1")
+            .unwrap();
+        d.upsert_user_task(make_task("t2", "session-B"), "t2")
+            .unwrap();
+        d.upsert_user_task(make_task("t3", "session-A"), "t3")
+            .unwrap();
 
         let all = d.list_user_tasks(None, None).unwrap();
         assert_eq!(all.len(), 3);

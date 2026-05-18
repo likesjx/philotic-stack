@@ -3240,7 +3240,10 @@ impl IpcServer {
         };
 
         // Detect capability error reply — abort the pipeline and deliver original task.
-        let stage_ok = payload.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(true)
+        let stage_ok = payload
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
             && payload.get("error").is_none();
         let elapsed_ms = unix_ts()
             .saturating_sub(pending.stage_dispatched_at)
@@ -5678,9 +5681,7 @@ impl IpcServer {
                 } else if let Some(guest_id) = resolved_target_guest_id.as_deref() {
                     // Inject delivery_target_guest_id so the remote hotel's
                     // deliver_event_envelope can filter to this specific guest.
-                    if let Ok(mut payload) =
-                        serde_json::from_str::<serde_json::Value>(&task_json)
-                    {
+                    if let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&task_json) {
                         if let Some(obj) = payload.as_object_mut() {
                             obj.entry("delivery_target_guest_id")
                                 .or_insert_with(|| serde_json::json!(guest_id));
@@ -6902,17 +6903,66 @@ impl IpcServer {
                 }
             }
             IpcRequest::GetUserProfile { hotel_name } => {
+                let local_user_id = format!("root-user:{hotel_name}");
+                let projected_identity = graph
+                    .find_projected_user_identity_for_local_user(&local_user_id)
+                    .ok()
+                    .flatten();
                 match graph.get_user_profile(&hotel_name) {
                     Ok(Some(p)) => {
                         IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
                             timezone: p.timezone,
                             display_name: p.display_name,
+                            principal_id: projected_identity
+                                .as_ref()
+                                .map(|identity| identity.principal_id.clone()),
+                            preferred_name: projected_identity
+                                .as_ref()
+                                .and_then(|identity| identity.preferred_name.clone()),
+                            primary_email: projected_identity
+                                .as_ref()
+                                .and_then(|identity| identity.primary_email.clone()),
+                            home_hotel: projected_identity
+                                .as_ref()
+                                .map(|identity| identity.home_hotel.clone()),
+                            linked_providers: projected_identity
+                                .as_ref()
+                                .map(|identity| {
+                                    identity
+                                        .linked_identities
+                                        .iter()
+                                        .map(|link| link.provider.clone())
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         })
                     }
                     Ok(None) => {
                         IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
                             timezone: None,
                             display_name: None,
+                            principal_id: projected_identity
+                                .as_ref()
+                                .map(|identity| identity.principal_id.clone()),
+                            preferred_name: projected_identity
+                                .as_ref()
+                                .and_then(|identity| identity.preferred_name.clone()),
+                            primary_email: projected_identity
+                                .as_ref()
+                                .and_then(|identity| identity.primary_email.clone()),
+                            home_hotel: projected_identity
+                                .as_ref()
+                                .map(|identity| identity.home_hotel.clone()),
+                            linked_providers: projected_identity
+                                .as_ref()
+                                .map(|identity| {
+                                    identity
+                                        .linked_identities
+                                        .iter()
+                                        .map(|link| link.provider.clone())
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         })
                     }
                     Err(e) => IpcResponse::error(
@@ -6943,9 +6993,36 @@ impl IpcServer {
                 };
                 match graph.upsert_user_profile(&hotel_name, &updated) {
                     Ok(()) => {
+                        let local_user_id = format!("root-user:{hotel_name}");
+                        let projected_identity = graph
+                            .find_projected_user_identity_for_local_user(&local_user_id)
+                            .ok()
+                            .flatten();
                         IpcResponse::UserProfileData(philotic_client::UserProfileDataPayload {
                             timezone: updated.timezone,
                             display_name: updated.display_name,
+                            principal_id: projected_identity
+                                .as_ref()
+                                .map(|identity| identity.principal_id.clone()),
+                            preferred_name: projected_identity
+                                .as_ref()
+                                .and_then(|identity| identity.preferred_name.clone()),
+                            primary_email: projected_identity
+                                .as_ref()
+                                .and_then(|identity| identity.primary_email.clone()),
+                            home_hotel: projected_identity
+                                .as_ref()
+                                .map(|identity| identity.home_hotel.clone()),
+                            linked_providers: projected_identity
+                                .as_ref()
+                                .map(|identity| {
+                                    identity
+                                        .linked_identities
+                                        .iter()
+                                        .map(|link| link.provider.clone())
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         })
                     }
                     Err(e) => IpcResponse::error(
@@ -8359,7 +8436,10 @@ impl IpcServer {
 
                 match SqliteRouterTraceStorage::open(&trace_db_path) {
                     Ok(store) => match store.provider_stats(window_secs) {
-                        Ok(stats) => IpcResponse::RouterStats { stats, generated_at },
+                        Ok(stats) => IpcResponse::RouterStats {
+                            stats,
+                            generated_at,
+                        },
                         Err(e) => IpcResponse::error(
                             "router_stats",
                             "STATS_QUERY_FAILED",
@@ -8691,7 +8771,6 @@ impl IpcServer {
             }
 
             // ── User Task Engine ──────────────────────────────────────────────
-
             IpcRequest::CreateUserTask {
                 task_id,
                 session_id,
@@ -8721,8 +8800,12 @@ impl IpcServer {
                     "approval_note": null,
                 });
                 match graph.upsert_user_task(task_data, &task_id) {
-                    Ok(_) => IpcResponse::UserTaskCreated { user_task_id: task_id },
-                    Err(e) => IpcResponse::error("create_user_task", "STORAGE_ERROR", format!("{e}")),
+                    Ok(_) => IpcResponse::UserTaskCreated {
+                        user_task_id: task_id,
+                    },
+                    Err(e) => {
+                        IpcResponse::error("create_user_task", "STORAGE_ERROR", format!("{e}"))
+                    }
                 }
             }
 
@@ -8751,7 +8834,9 @@ impl IpcServer {
                             user_task_id: task_id,
                             user_task_updated: true,
                         },
-                        Err(e) => IpcResponse::error("update_user_task", "STORAGE_ERROR", format!("{e}")),
+                        Err(e) => {
+                            IpcResponse::error("update_user_task", "STORAGE_ERROR", format!("{e}"))
+                        }
                     }
                 }
                 Ok(None) => IpcResponse::error(
@@ -8787,7 +8872,11 @@ impl IpcServer {
                             user_task_id: task_id,
                             user_task_updated: true,
                         },
-                        Err(e) => IpcResponse::error("update_user_task_step", "STORAGE_ERROR", format!("{e}")),
+                        Err(e) => IpcResponse::error(
+                            "update_user_task_step",
+                            "STORAGE_ERROR",
+                            format!("{e}"),
+                        ),
                     }
                 }
                 Ok(None) => IpcResponse::error(
@@ -8795,7 +8884,9 @@ impl IpcServer {
                     "NOT_FOUND",
                     format!("user task {task_id} not found"),
                 ),
-                Err(e) => IpcResponse::error("update_user_task_step", "STORAGE_ERROR", format!("{e}")),
+                Err(e) => {
+                    IpcResponse::error("update_user_task_step", "STORAGE_ERROR", format!("{e}"))
+                }
             },
 
             IpcRequest::GetUserTask { task_id } => match graph.get_user_task(&task_id) {
@@ -25065,7 +25156,9 @@ mod tests {
             Some("sess-watchdog-01"),
         );
         assert_eq!(
-            payload.get("golgi_on_failure").and_then(serde_json::Value::as_bool),
+            payload
+                .get("golgi_on_failure")
+                .and_then(serde_json::Value::as_bool),
             Some(true),
             "watchdog passthrough must carry golgi_on_failure: true"
         );
@@ -25480,13 +25573,10 @@ mod tests {
             .expect("emit task");
 
         // Capability receives the task.
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            cap_client.recv_task(),
-        )
-        .await
-        .expect("cap must receive task within 2s")
-        .expect("cap recv_task error");
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), cap_client.recv_task())
+            .await
+            .expect("cap must receive task within 2s")
+            .expect("cap recv_task error");
 
         // ── Capability replies with error ─────────────────────────────────────
         admin_client
@@ -25531,7 +25621,9 @@ mod tests {
             "on_failure must preserve original blob_id"
         );
         assert_eq!(
-            payload.get("golgi_on_failure").and_then(serde_json::Value::as_bool),
+            payload
+                .get("golgi_on_failure")
+                .and_then(serde_json::Value::as_bool),
             Some(true),
             "on_failure delivery must carry golgi_on_failure: true"
         );
@@ -25656,13 +25748,10 @@ mod tests {
             .expect("first emit");
 
         // Capability must receive the first task.
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            cap_client.recv_task(),
-        )
-        .await
-        .expect("cap must receive first task")
-        .expect("cap recv error");
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), cap_client.recv_task())
+            .await
+            .expect("cap must receive first task")
+            .expect("cap recv error");
 
         // Agent must NOT receive anything yet.
         let agent_check = tokio::time::timeout(
@@ -25670,7 +25759,10 @@ mod tests {
             agent_client.recv_task(),
         )
         .await;
-        assert!(agent_check.is_err(), "agent must not receive first task (intercepted)");
+        assert!(
+            agent_check.is_err(),
+            "agent must not receive first task (intercepted)"
+        );
 
         // ── Second emit — same corr_key, collision guard fires ────────────────
         admin_client
@@ -25692,13 +25784,18 @@ mod tests {
         .expect("agent must receive second task within 2s (collision passthrough)")
         .expect("agent recv error");
 
-        let philotic_client::IpcResponse::InboundTask { task_json: recv_json, .. } = recv else {
+        let philotic_client::IpcResponse::InboundTask {
+            task_json: recv_json,
+            ..
+        } = recv
+        else {
             panic!("expected InboundTask, got {:?}", recv);
         };
-        let recv_payload: serde_json::Value =
-            serde_json::from_str(&recv_json).unwrap_or_default();
+        let recv_payload: serde_json::Value = serde_json::from_str(&recv_json).unwrap_or_default();
         assert_eq!(
-            recv_payload.get("action").and_then(serde_json::Value::as_str),
+            recv_payload
+                .get("action")
+                .and_then(serde_json::Value::as_str),
             Some("audio_input"),
         );
         // No on_failure marker — this is a normal passthrough, not a failure.
