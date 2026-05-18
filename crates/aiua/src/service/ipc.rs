@@ -4146,11 +4146,18 @@ impl IpcServer {
                 Some(target_role),
                 EventPayload::Inline { data },
             ) => {
+                let target_guest_id = serde_json::from_str::<serde_json::Value>(data)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("delivery_target_guest_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    });
                 Self::deliver_inbound_task(
                     inboxes,
                     &event.source_node_id,
                     target_role,
-                    None,
+                    target_guest_id.as_deref(),
                     event.event_id,
                     data.clone(),
                 )
@@ -5589,6 +5596,20 @@ impl IpcServer {
                         resolved_target_guest_id.as_deref(),
                         &task_json,
                     )
+                } else if let Some(guest_id) = resolved_target_guest_id.as_deref() {
+                    // Inject delivery_target_guest_id so the remote hotel's
+                    // deliver_event_envelope can filter to this specific guest.
+                    if let Ok(mut payload) =
+                        serde_json::from_str::<serde_json::Value>(&task_json)
+                    {
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.entry("delivery_target_guest_id")
+                                .or_insert_with(|| serde_json::json!(guest_id));
+                        }
+                        serde_json::to_string(&payload).unwrap_or(task_json)
+                    } else {
+                        task_json
+                    }
                 } else {
                     task_json
                 };
@@ -6062,7 +6083,7 @@ impl IpcServer {
                 .await
                 {
                     Ok(active) => IpcResponse::HandoffBackAck {
-                        handoff_guest_id: target_guest_id,
+                        return_guest_id: target_guest_id,
                         became_active: active,
                     },
                     Err(err) => IpcResponse::error(
@@ -8231,6 +8252,45 @@ impl IpcServer {
                         "hotel_logs",
                         "LOG_NOT_FOUND",
                         "Hotel log file not found — check ~/.philotic/aiua.log",
+                    ),
+                }
+            }
+
+            IpcRequest::GetRouterStats { window_secs } => {
+                use ansible_mesh_core::router_trace::{
+                    RouterTraceStorage, SqliteRouterTraceStorage,
+                };
+                use std::time::{SystemTime, UNIX_EPOCH};
+
+                let trace_db_path = {
+                    let profile = std::env::var("PHILOTIC_PROFILE")
+                        .ok()
+                        .filter(|s| !s.is_empty());
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                    match profile {
+                        Some(p) => format!("{home}/.philotic/{p}/router_traces.db"),
+                        None => format!("{home}/.philotic/router_traces.db"),
+                    }
+                };
+
+                let generated_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                match SqliteRouterTraceStorage::open(&trace_db_path) {
+                    Ok(store) => match store.provider_stats(window_secs) {
+                        Ok(stats) => IpcResponse::RouterStats { stats, generated_at },
+                        Err(e) => IpcResponse::error(
+                            "router_stats",
+                            "STATS_QUERY_FAILED",
+                            &format!("failed to compute router stats: {e}"),
+                        ),
+                    },
+                    Err(e) => IpcResponse::error(
+                        "router_stats",
+                        "TRACE_DB_UNAVAILABLE",
+                        &format!("router trace DB not available at {trace_db_path}: {e}"),
                     ),
                 }
             }
@@ -23460,6 +23520,817 @@ mod tests {
             bindings2.len(),
             1,
             "idempotent re-acquire must not duplicate discord binding (got: {bindings2:?})"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn assign_skill_adds_skill_to_toolset_profile() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_abstract_skill(&AbstractSkillRecord {
+                skill_name: "research".into(),
+                description: "Research skill for testing.".into(),
+                ..Default::default()
+            })
+            .expect("seed abstract skill");
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "orchestrator".into(),
+                allowed_tools: vec!["session.status".into()],
+                allowed_classes: vec![],
+                allowed_skills: vec![],
+                description: None,
+            })
+            .expect("seed toolset profile");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let response = orchestrator
+            .send_request(IpcRequest::AssignSkill {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                skill_name: "research".into(),
+            })
+            .await
+            .expect("assign skill request");
+
+        match response {
+            IpcResponse::SkillAssigned {
+                role_name,
+                skill_name,
+                operation,
+            } => {
+                assert_eq!(role_name, "orchestrator");
+                assert_eq!(skill_name, "research");
+                assert_eq!(operation, "assigned");
+            }
+            other => panic!("unexpected assign skill response: {other:?}"),
+        }
+
+        let profile = graph
+            .get_toolset_profile("orchestrator")
+            .expect("profile lookup")
+            .expect("profile exists");
+        assert!(
+            profile.allowed_skills.contains(&"research".to_string()),
+            "skill should be in allowed_skills after assignment"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_skill_removes_skill_from_toolset_profile() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "orchestrator".into(),
+                allowed_tools: vec![],
+                allowed_classes: vec![],
+                allowed_skills: vec!["research".into(), "handoff.back".into()],
+                description: None,
+            })
+            .expect("seed toolset profile with skills");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let response = orchestrator
+            .send_request(IpcRequest::RevokeSkill {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                skill_name: "research".into(),
+            })
+            .await
+            .expect("revoke skill request");
+
+        match response {
+            IpcResponse::SkillAssigned {
+                role_name,
+                skill_name,
+                operation,
+            } => {
+                assert_eq!(role_name, "orchestrator");
+                assert_eq!(skill_name, "research");
+                assert_eq!(operation, "revoked");
+            }
+            other => panic!("unexpected revoke skill response: {other:?}"),
+        }
+
+        let profile = graph
+            .get_toolset_profile("orchestrator")
+            .expect("profile lookup")
+            .expect("profile exists");
+        assert!(
+            !profile.allowed_skills.contains(&"research".to_string()),
+            "revoked skill must not remain in allowed_skills"
+        );
+        assert!(
+            profile.allowed_skills.contains(&"handoff.back".to_string()),
+            "unrevoked skill must remain in allowed_skills"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_skill_is_idempotent_when_skill_not_present() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "orchestrator".into(),
+                allowed_tools: vec![],
+                allowed_classes: vec![],
+                allowed_skills: vec![],
+                description: None,
+            })
+            .expect("seed empty toolset profile");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+
+        // Revoking a skill that isn't present must succeed idempotently.
+        let response = orchestrator
+            .send_request(IpcRequest::RevokeSkill {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                skill_name: "nonexistent-skill".into(),
+            })
+            .await
+            .expect("idempotent revoke request");
+
+        assert!(
+            matches!(response, IpcResponse::SkillAssigned { ref operation, .. } if operation == "revoked"),
+            "idempotent revoke must still return SkillAssigned{{operation: revoked}}, got: {response:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn assign_skill_is_idempotent_when_skill_already_present() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_abstract_skill(&AbstractSkillRecord {
+                skill_name: "research".into(),
+                description: "Research skill.".into(),
+                ..Default::default()
+            })
+            .expect("seed abstract skill");
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "orchestrator".into(),
+                allowed_tools: vec![],
+                allowed_classes: vec![],
+                allowed_skills: vec!["research".into()],
+                description: None,
+            })
+            .expect("seed profile with research already present");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+
+        // Assigning an already-present skill must succeed idempotently (no duplicates).
+        let response = orchestrator
+            .send_request(IpcRequest::AssignSkill {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                skill_name: "research".into(),
+            })
+            .await
+            .expect("idempotent assign request");
+
+        assert!(
+            matches!(response, IpcResponse::SkillAssigned { ref operation, .. } if operation == "assigned"),
+            "idempotent assign must still return SkillAssigned{{operation: assigned}}, got: {response:?}"
+        );
+
+        let profile = graph
+            .get_toolset_profile("orchestrator")
+            .expect("profile lookup")
+            .expect("profile exists");
+        let count = profile
+            .allowed_skills
+            .iter()
+            .filter(|s| *s == "research")
+            .count();
+        assert_eq!(
+            count, 1,
+            "idempotent assign must not duplicate: {profile:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn assign_skill_forbidden_for_non_orchestrator_guest() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_abstract_skill(&AbstractSkillRecord {
+                skill_name: "research".into(),
+                description: "Research skill.".into(),
+                ..Default::default()
+            })
+            .expect("seed abstract skill");
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "developer".into(),
+                allowed_tools: vec![],
+                allowed_classes: vec![],
+                allowed_skills: vec![],
+                description: None,
+            })
+            .expect("seed toolset profile");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-beacon-01:developer".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        // Connect as a developer role — not orchestrator, not management.
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:developer".into(),
+            role: "developer".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+
+        let response = developer
+            .send_request(IpcRequest::AssignSkill {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "developer".into(),
+                skill_name: "research".into(),
+            })
+            .await
+            .expect("assign skill request from developer");
+
+        match response {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => {
+                assert_eq!(code, "ASSIGN_FORBIDDEN");
+            }
+            other => panic!("expected ASSIGN_FORBIDDEN error, got: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn assign_skill_fails_for_unknown_skill_name() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "orchestrator".into(),
+                allowed_tools: vec![],
+                allowed_classes: vec![],
+                allowed_skills: vec![],
+                description: None,
+            })
+            .expect("seed toolset profile");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let response = orchestrator
+            .send_request(IpcRequest::AssignSkill {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                skill_name: "skill-that-does-not-exist".into(),
+            })
+            .await
+            .expect("assign unknown skill request");
+
+        match response {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => {
+                assert_eq!(code, "SKILL_NOT_FOUND");
+            }
+            other => panic!("expected SKILL_NOT_FOUND error, got: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_back_delivers_return_task_to_orchestrator_inbox() {
+        // Full round-trip: developer sends HandoffBack → aiua resolves the orchestrator
+        // role from the session's primary_agent_id, delivers "handoff_return" to its
+        // inbox, returns HandoffBackAck.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-handoff-back".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon-01".into()),
+                active_incarnation_id: Some("agent-beacon-01:developer".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("999".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        // Orchestrator role record — this is what resolve_role_incarnation looks up.
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("orchestrator role should seed");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        // Orchestrator subscribes to its inbox before the handoff-back is sent.
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        orchestrator
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "role:agent-beacon-01:orchestrator".into(),
+            })
+            .await
+            .expect("orchestrator role inbox subscribe");
+
+        // Developer role sends HandoffBack — triggers return to orchestrator.
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+
+        let response = developer
+            .send_request(IpcRequest::HandoffBack {
+                session_id: "sess-handoff-back".into(),
+                summary: "task complete, returning to orchestrator".into(),
+                return_to: Some("orchestrator".into()),
+            })
+            .await
+            .expect("handoff back request");
+
+        match response {
+            IpcResponse::HandoffBackAck {
+                return_guest_id,
+                became_active,
+            } => {
+                assert_eq!(return_guest_id, "agent-beacon-01:orchestrator");
+                assert!(
+                    became_active,
+                    "orchestrator is live so became_active should be true"
+                );
+            }
+            other => panic!("unexpected handoff back response: {other:?}"),
+        }
+
+        // Orchestrator inbox must receive the "handoff_return" task.
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            orchestrator.recv_task(),
+        )
+        .await
+        .expect("orchestrator should receive handoff_return within 1s")
+        .expect("orchestrator recv should succeed");
+
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("handoff_return payload should decode");
+                assert_eq!(payload["action"], "handoff_return");
+                assert_eq!(payload["session_id"], "sess-handoff-back");
+                assert_eq!(
+                    payload["summary"],
+                    "task complete, returning to orchestrator"
+                );
+                assert_eq!(payload["from_incarnation_id"], "agent-beacon-01:developer");
+            }
+            other => panic!("unexpected orchestrator inbound task: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_back_defaults_return_to_orchestrator_when_return_to_is_none() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-handoff-back-default".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon-01".into()),
+                active_incarnation_id: Some("agent-beacon-01:developer".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("888".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("orchestrator role should seed");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        orchestrator
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "role:agent-beacon-01:orchestrator".into(),
+            })
+            .await
+            .expect("subscribe");
+
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+
+        // No explicit return_to — handler defaults to "orchestrator".
+        let response = developer
+            .send_request(IpcRequest::HandoffBack {
+                session_id: "sess-handoff-back-default".into(),
+                summary: "done".into(),
+                return_to: None,
+            })
+            .await
+            .expect("handoff back with default return_to");
+
+        assert!(
+            matches!(response, IpcResponse::HandoffBackAck { ref return_guest_id, .. } if return_guest_id == "agent-beacon-01:orchestrator"),
+            "default return_to must route to orchestrator, got: {response:?}"
+        );
+
+        // Orchestrator should still receive the task.
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            orchestrator.recv_task(),
+        )
+        .await
+        .expect("orchestrator should receive handoff_return within 1s")
+        .expect("recv ok");
+        assert!(
+            matches!(delivered, IpcResponse::InboundTask { ref task_json, .. } if task_json.contains("handoff_return")),
+            "delivered task must contain handoff_return action"
         );
 
         unsafe {

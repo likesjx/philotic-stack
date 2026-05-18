@@ -381,13 +381,13 @@ impl AnsibleCutoverFlags {
         Self {
             enable_rust_auth: std::env::var("PHILOTIC_ENABLE_RUST_AUTH")
                 .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+                .unwrap_or(true),
             enable_rust_dispatcher: std::env::var("PHILOTIC_ENABLE_RUST_DISPATCHER")
                 .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+                .unwrap_or(true),
             enable_rust_task_lifecycle: std::env::var("PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE")
                 .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+                .unwrap_or(true),
         }
     }
 }
@@ -2222,6 +2222,18 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
     let socket_path = hotel.ipc_socket_path;
     let blob_base_url = format!("http://127.0.0.1:{}", hotel.blob_port);
     let node_id = hotel.capabilities.node_id;
+    let training_base = profile_dir().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        std::path::PathBuf::from(home).join(".philotic")
+    });
+    let whisper_db = training_base
+        .join("whisper_training.db")
+        .to_string_lossy()
+        .to_string();
+    let training_audio_dir = training_base
+        .join("training_audio")
+        .to_string_lossy()
+        .to_string();
 
     // Build the agent roster JSON for the single membrane
     let roster: Vec<serde_json::Value> = profiles
@@ -2264,7 +2276,8 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
-                    "PHILOTIC_NODE_ID": node_id.clone()
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_ROUTER_CAPTURE_ENABLED": "true"
                 }
             })
             .to_string(),
@@ -2389,7 +2402,10 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
-                    "PHILOTIC_NODE_ID": node_id.clone()
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_TRAINING_DB": whisper_db,
+                    "PHILOTIC_TRAINING_AUDIO_DIR": training_audio_dir,
+                    "PHILOTIC_TRAINING_AUTO_ELIGIBLE": "false"
                 }
             })
             .to_string(),
@@ -3624,6 +3640,46 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             }),
             ..Default::default()
         },
+        AbstractSkillRecord {
+            skill_name: "graph.knowledge".into(),
+            description: "Create and manage a personal knowledge graph in the agent graph store. \
+                          Use graph.create to provision a named partition (or your default one keyed \
+                          to your agent_id), graph.query to build and traverse a typed node/edge schema, \
+                          graph.list to audit partitions, graph.drop to remove one, and graph.grant_access \
+                          to share a partition with a peer. Treat your graph as a persistent structured \
+                          memory: store entities, decisions, tasks, relationships, and any recurring \
+                          domain knowledge that would otherwise be lost across sessions."
+                .into(),
+            implied_tools: vec![
+                "graph.create".into(),
+                "graph.query".into(),
+                "graph.list".into(),
+                "graph.drop".into(),
+                "graph.grant_access".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "workflow": "graph.list → graph.create (if needed) → graph.query CREATE nodes → graph.query MATCH to verify → maintain",
+                "cypher_patterns": {
+                    "create_partition": "graph.create { graph_id: 'my-workspace' }",
+                    "create_node": "CREATE (n:Task {id: 'task-1', name: 'Do the thing', status: 'open'})",
+                    "create_edge": "CREATE (a:Task {id: 'task-1'})-[:BLOCKS]->(b:Task {id: 'task-2'})",
+                    "read_all": "MATCH (n) RETURN n",
+                    "read_by_label": "MATCH (n:Task) RETURN n",
+                    "read_by_id": "MATCH (n:Task {id: 'task-1'}) RETURN n",
+                    "delete_node": "MATCH (n {id: 'task-1'}) DELETE n",
+                    "delete_node_with_label": "MATCH (n:Task {id: 'task-1'}) DETACH DELETE n",
+                    "delete_edge": "MATCH ()-[r {id: 'edge-id'}]-() DELETE r"
+                },
+                "conventions": {
+                    "id_field": "Always set an explicit 'id' property on nodes and edges — it is the primary key.",
+                    "partition_default": "Omit graph_id to use your own partition (keyed to your agent_id).",
+                    "labels": "Use PascalCase labels (Task, Decision, Person, Concept).",
+                    "edge_labels": "Use SCREAMING_SNAKE_CASE edge labels (BLOCKS, DEPENDS_ON, AUTHORED_BY)."
+                }
+            }),
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -3697,6 +3753,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.manage".into(),
                 "context.synthesize".into(),
                 "profile.manage".into(),
+                "graph.knowledge".into(),
             ],
             description: Some("Default orchestrator role profile.".into()),
         },
@@ -3719,6 +3776,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "capability.request".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
+                "graph.knowledge".into(),
             ],
             description: Some("Codex specialist role profile — workspace read access.".into()),
         },
@@ -3739,6 +3797,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "capability.request".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
+                "graph.knowledge".into(),
             ],
             description: Some("Research specialist role profile — minimal tool surface.".into()),
         },
