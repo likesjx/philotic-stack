@@ -901,6 +901,18 @@ pub enum IpcRequest {
         target_guest_id: Option<String>,
         task_json: String,
     },
+    /// Ask the hotel to initiate a WebRTC session offer toward a remote node.
+    StartWebRtcSession {
+        target_node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_guest_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    /// Ask the hotel for the current status of a locally-tracked WebRTC session.
+    GetWebRtcSessionStatus {
+        session_id: String,
+    },
     /// Optimistically push a RAM-based memory apartment update to the Hotel's SQLite Graph
     SyncApartment {
         agent_id: String,
