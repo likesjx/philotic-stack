@@ -5388,6 +5388,12 @@ fn patch_operator_user_record(
         rusqlite::params![user_id, &normalized_display_name],
     )?;
 
+    if existing.mesh_principal_id.starts_with("local-user:") {
+        if let Some(email) = normalized_primary_email.as_deref() {
+            let _ = maybe_adopt_projected_identity_from_email(db_path, hotel, user_id, email)?;
+        }
+    }
+
     let updated = resolve_operator_user(db_path, hotel, user_id)?
         .context("operator user record disappeared")?;
     sync_projected_user_identity(db_path, hotel, user_id)?;
@@ -5521,16 +5527,36 @@ fn upsert_operator_external_identity_link(
     let current_principal = resolve_operator_user(db_path, hotel, &user_id)?
         .map(|user| user.mesh_principal_id)
         .unwrap_or_else(|| default_operator_principal_id(hotel));
+    let exact_projected_principal = projected_principal_id_for_identity(identity);
     let next_principal = if current_principal.starts_with("local-user:") {
-        projected_principal_id_for_identity(identity)
+        if let Some(projected) =
+            find_projected_user_identity_by_principal(db_path, &exact_projected_principal)?
+        {
+            projected.principal_id
+        } else if let Some(email) = identity.email.as_deref() {
+            if let Some(projected) = find_unique_projected_user_identity_by_email(db_path, email)? {
+                projected.principal_id
+            } else {
+                exact_projected_principal
+            }
+        } else {
+            exact_projected_principal
+        }
     } else {
         current_principal
     };
     conn.execute(
         "UPDATE operator_users
-         SET mesh_principal_id = ?2, updated_at = ?3
+         SET mesh_principal_id = ?2,
+             primary_email = COALESCE(primary_email, ?3),
+             updated_at = ?4
          WHERE user_id = ?1",
-        rusqlite::params![&user_id, &next_principal, now],
+        rusqlite::params![
+            &user_id,
+            &next_principal,
+            normalize_optional_text(identity.email.clone()),
+            now
+        ],
     )?;
     conn.execute(
         "INSERT INTO external_identity_links
@@ -5608,6 +5634,119 @@ fn projected_external_identity(
     }
 }
 
+fn normalize_email_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_ascii_lowercase())
+}
+
+fn find_projected_user_identity_by_principal(
+    db_path: &PathBuf,
+    principal_id: &str,
+) -> Result<Option<ProjectedUserIdentityRecord>> {
+    let storage = SqliteGraphStorage::open(db_path)?;
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    graph.get_projected_user_identity(principal_id)
+}
+
+fn find_unique_projected_user_identity_by_email(
+    db_path: &PathBuf,
+    email: &str,
+) -> Result<Option<ProjectedUserIdentityRecord>> {
+    let Some(target_email) = normalize_email_key(email) else {
+        return Ok(None);
+    };
+    let storage = SqliteGraphStorage::open(db_path)?;
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    let mut matches = graph
+        .list_projected_user_identities()?
+        .into_iter()
+        .filter(|identity| {
+            identity
+                .primary_email
+                .as_deref()
+                .and_then(normalize_email_key)
+                .as_deref()
+                == Some(target_email.as_str())
+                || identity.linked_identities.iter().any(|link| {
+                    link.email
+                        .as_deref()
+                        .and_then(normalize_email_key)
+                        .as_deref()
+                        == Some(target_email.as_str())
+                })
+        });
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Ok(None);
+    }
+    Ok(first)
+}
+
+fn merge_projected_external_identities(
+    existing: &[ProjectedExternalIdentityRecord],
+    local: &[ProjectedExternalIdentityRecord],
+) -> Vec<ProjectedExternalIdentityRecord> {
+    let mut merged: HashMap<(String, String), ProjectedExternalIdentityRecord> = HashMap::new();
+    for identity in existing {
+        merged.insert(
+            (identity.provider.clone(), identity.provider_subject.clone()),
+            identity.clone(),
+        );
+    }
+    for identity in local {
+        merged
+            .entry((identity.provider.clone(), identity.provider_subject.clone()))
+            .and_modify(|current| {
+                if identity.last_seen_at >= current.last_seen_at {
+                    *current = identity.clone();
+                }
+            })
+            .or_insert_with(|| identity.clone());
+    }
+    let mut values: Vec<_> = merged.into_values().collect();
+    values.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.provider_subject.cmp(&right.provider_subject))
+    });
+    values
+}
+
+fn maybe_adopt_projected_identity_from_email(
+    db_path: &PathBuf,
+    _hotel: &str,
+    user_id: &str,
+    email: &str,
+) -> Result<Option<ProjectedUserIdentityRecord>> {
+    let Some(projected) = find_unique_projected_user_identity_by_email(db_path, email)? else {
+        return Ok(None);
+    };
+    let conn = Connection::open(db_path)?;
+    let now = now_epoch_secs();
+    conn.execute(
+        "UPDATE operator_users
+         SET mesh_principal_id = ?2,
+             display_name = CASE
+                 WHEN trim(display_name) = '' OR display_name = ?3 THEN ?4
+                 ELSE display_name
+             END,
+             preferred_name = COALESCE(preferred_name, ?5),
+             primary_email = COALESCE(primary_email, ?6),
+             updated_at = ?7
+         WHERE user_id = ?1",
+        rusqlite::params![
+            user_id,
+            &projected.principal_id,
+            default_operator_display_name(),
+            &projected.display_name,
+            &projected.preferred_name,
+            &projected.primary_email,
+            now,
+        ],
+    )?;
+    Ok(Some(projected))
+}
+
 fn emit_projected_user_identity_sync_event(
     db_path: &PathBuf,
     hotel: &str,
@@ -5660,14 +5799,28 @@ fn sync_projected_user_identity(db_path: &PathBuf, hotel: &str, user_id: &str) -
         return Ok(());
     };
     let links = list_external_identity_link_records_for_user(db_path, user_id)?;
+    let local_links: Vec<_> = links.iter().map(projected_external_identity).collect();
+    let existing = find_projected_user_identity_by_principal(db_path, &user.mesh_principal_id)?
+        .unwrap_or_default();
     let projected = ProjectedUserIdentityRecord {
         principal_id: user.mesh_principal_id.clone(),
         local_user_id: user.user_id.clone(),
-        home_hotel: user.home_hotel.clone(),
-        display_name: user.display_name.clone(),
-        preferred_name: user.preferred_name.clone(),
-        primary_email: user.primary_email.clone(),
-        linked_identities: links.iter().map(projected_external_identity).collect(),
+        home_hotel: if existing.principal_id.is_empty() {
+            user.home_hotel.clone()
+        } else {
+            existing.home_hotel
+        },
+        display_name: if user.display_name.trim().is_empty() {
+            existing.display_name
+        } else {
+            user.display_name.clone()
+        },
+        preferred_name: user.preferred_name.clone().or(existing.preferred_name),
+        primary_email: user.primary_email.clone().or(existing.primary_email),
+        linked_identities: merge_projected_external_identities(
+            &existing.linked_identities,
+            &local_links,
+        ),
         updated_at: now_epoch_secs().max(0) as u64,
     };
     let storage = SqliteGraphStorage::open(db_path)?;
@@ -6416,6 +6569,12 @@ mod tests {
         std::env::temp_dir().join(format!("philotic-web-{name}-{}.db", uuid::Uuid::new_v4()))
     }
 
+    fn seed_projected_identity(context_path: &PathBuf, identity: &ProjectedUserIdentityRecord) {
+        let storage = SqliteGraphStorage::open(context_path).unwrap();
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        graph.upsert_projected_user_identity(identity).unwrap();
+    }
+
     #[test]
     fn summarize_router_event_includes_failure_code() {
         assert_eq!(
@@ -6644,6 +6803,117 @@ mod tests {
         assert_eq!(payload.principal_id, "user:google:google-subject-123");
         assert_eq!(payload.home_hotel, "mac-jane");
         assert_eq!(payload.linked_identities.len(), 1);
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn upsert_operator_external_identity_link_adopts_existing_projected_identity_by_email() {
+        let context_path = temp_db_path("external-identity-project-adopt");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        seed_projected_identity(
+            &context_path,
+            &ProjectedUserIdentityRecord {
+                principal_id: "user:google:google-subject-123".into(),
+                local_user_id: "root-user:vps-jane".into(),
+                home_hotel: "vps-jane".into(),
+                display_name: "Jared Likes".into(),
+                preferred_name: Some("Jared".into()),
+                primary_email: Some("jared@example.com".into()),
+                linked_identities: vec![ProjectedExternalIdentityRecord {
+                    provider: "google".into(),
+                    provider_subject: "google-subject-123".into(),
+                    email: Some("jared@example.com".into()),
+                    login: None,
+                    display_name: Some("Jared Likes".into()),
+                    verified_at: 100,
+                    last_seen_at: 100,
+                }],
+                updated_at: 100,
+            },
+        );
+
+        let _link = upsert_operator_external_identity_link(
+            &context_path,
+            "mac-jane",
+            &OidcIdentity {
+                provider: "github".into(),
+                provider_subject: "github-user-456".into(),
+                display_name: "Jared Likes".into(),
+                email: Some("jared@example.com".into()),
+                login: Some("likesjx".into()),
+            },
+        )
+        .unwrap();
+
+        let user = resolve_operator_user(&context_path, "mac-jane", "root-user:mac-jane")
+            .unwrap()
+            .expect("operator user should exist");
+        assert_eq!(user.mesh_principal_id, "user:google:google-subject-123");
+
+        let projected =
+            load_projected_user_identity_for_user(&context_path, "mac-jane", "root-user:mac-jane")
+                .unwrap()
+                .expect("projected identity should exist");
+        assert_eq!(projected.principal_id, "user:google:google-subject-123");
+        assert_eq!(projected.home_hotel, "vps-jane");
+        assert_eq!(projected.linked_identities.len(), 2);
+        assert!(projected
+            .linked_identities
+            .iter()
+            .any(|link| link.provider == "google"));
+        assert!(projected
+            .linked_identities
+            .iter()
+            .any(|link| link.provider == "github"));
+
+        let _ = fs::remove_file(&context_path);
+    }
+
+    #[test]
+    fn patch_operator_user_record_adopts_existing_projected_identity_by_email() {
+        let context_path = temp_db_path("operator-user-patch-project-adopt");
+        ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
+        seed_projected_identity(
+            &context_path,
+            &ProjectedUserIdentityRecord {
+                principal_id: "user:google:google-subject-123".into(),
+                local_user_id: "root-user:vps-jane".into(),
+                home_hotel: "vps-jane".into(),
+                display_name: "Jared Likes".into(),
+                preferred_name: Some("Jared".into()),
+                primary_email: Some("jared@example.com".into()),
+                linked_identities: vec![ProjectedExternalIdentityRecord {
+                    provider: "google".into(),
+                    provider_subject: "google-subject-123".into(),
+                    email: Some("jared@example.com".into()),
+                    login: None,
+                    display_name: Some("Jared Likes".into()),
+                    verified_at: 100,
+                    last_seen_at: 100,
+                }],
+                updated_at: 100,
+            },
+        );
+
+        let updated = patch_operator_user_record(
+            &context_path,
+            "mac-jane",
+            "root-user:mac-jane",
+            Some("Jared Likes".into()),
+            Some("Jared".into()),
+            Some("jared@example.com".into()),
+            Some("enriched".into()),
+        )
+        .unwrap();
+
+        assert_eq!(updated.mesh_principal_id, "user:google:google-subject-123");
+        let projected =
+            load_projected_user_identity_for_user(&context_path, "mac-jane", "root-user:mac-jane")
+                .unwrap()
+                .expect("projected identity should exist");
+        assert_eq!(projected.principal_id, "user:google:google-subject-123");
+        assert_eq!(projected.home_hotel, "vps-jane");
 
         let _ = fs::remove_file(&context_path);
     }
