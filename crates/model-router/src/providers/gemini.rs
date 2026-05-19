@@ -1599,11 +1599,14 @@ impl ModelProvider for GeminiProvider {
         // Close the channel — token consumer will see this as end of stream.
         drop(token_tx);
 
+        // If a function call arrived alongside streamed text, prefer the function call.
+        // The text was already forwarded to the user as partial_reply tokens; returning
+        // ToolCall here ensures the tool actually executes instead of being silently dropped.
+        if let Some(fc) = pending_function_call {
+            return Ok(fc);
+        }
+
         if full_text.trim().is_empty() {
-            // Gemini delivered a function call via SSE without any text — return it directly.
-            if let Some(fc) = pending_function_call {
-                return Ok(fc);
-            }
             // Stream completed without delivering text content (safety block, quota, etc.).
             // Do NOT fall back to batch — that path has no timeout and caused a 27-minute hang.
             // Return a streaming_timeout error so philote escalates to the next fallback tier.

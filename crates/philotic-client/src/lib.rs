@@ -2160,7 +2160,16 @@ impl PhiloticClient {
     fn is_ignorable_push(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::UserProfileData(_) | IpcResponse::NetworkState { .. }
+            IpcResponse::UserProfileData(_)
+                | IpcResponse::NetworkState { .. }
+                // Lease notifications may be broadcast or arrive out-of-band on any connection.
+                // They are never the expected response to an unrelated request, so skip them.
+                | IpcResponse::McpMembraneLease { .. }
+                | IpcResponse::DesktopMembraneLease { .. }
+                | IpcResponse::TelegramPollLeaseStatus { .. }
+                | IpcResponse::DesktopMembraneLeaseStatus { .. }
+                | IpcResponse::DiscordGatewayLease { .. }
+                | IpcResponse::DiscordGatewayLeaseStatus { .. }
         )
     }
 
