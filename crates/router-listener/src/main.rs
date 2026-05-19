@@ -3,7 +3,6 @@ use ansible_mesh_core::whisper_training::{
 };
 use anyhow::{Context, Result};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
-use philotic_client::{GuestIdentity, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -171,7 +170,6 @@ async fn run_connect_and_listen() -> Result<()> {
             }
         };
 
-        let kind = envelope.get("kind").and_then(Value::as_str).unwrap_or("");
         let kind = envelope.get("kind").and_then(|v| v.as_str()).unwrap_or("");
 
         // Config-driven path.
@@ -195,14 +193,6 @@ async fn run_connect_and_listen() -> Result<()> {
                         warn!("router-listener: malformed transcription_capture");
                     }
                 }
-                let capture: TranscriptionCapture = match serde_json::from_value(envelope.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("router-listener: malformed transcription_capture: {e}");
-                        continue;
-                    }
-                };
-                handle_capture(store, http, audio_dir, capture).await;
             }
             "transcription_correction" => {
                 if let Some(ref store) = whisper_store {
@@ -398,21 +388,11 @@ async fn handle_whisper_capture(
                         Some(dest.to_string_lossy().to_string())
                     }
                     Err(e) => {
-                        warn!("failed to write audio file: {e}");
-                        info!(
-                            turn_id = %capture.turn_id,
-                            path = %dest.display(),
-                            "router-listener: audio saved"
-                        );
-                        Some(dest.to_string_lossy().to_string())
-                    }
-                    Err(e) => {
                         warn!("router-listener: failed to write audio file: {e}");
                         None
                     }
                 },
                 Err(e) => {
-                    warn!("failed to read audio response body: {e}");
                     warn!("router-listener: failed to read audio response body: {e}");
                     None
                 }
