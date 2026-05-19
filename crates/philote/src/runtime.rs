@@ -2505,6 +2505,7 @@ impl AgentRuntime {
                                 exosome,
                                 reply_to_node: local_node_id(),
                                 reply_to_role: "orchestrator".into(),
+                                reply_to_guest_id: None,
                                 timeout_secs: None,
                             })
                             .await;
@@ -11406,11 +11407,14 @@ impl AgentRuntime {
 
                 // Log the outbound exosome ID on the active turn so the routing
                 // reflex can correlate the response when it arrives.
-                // Also capture the current session_id and chat_id so the specialist's
-                // response can be routed back to the originating conversation channel.
-                let (source_session_id, source_chat_id) = {
+                // Also capture the current session_id, chat_id, and final_reply_guest_id so
+                // the specialist's response is routed back to the exact membrane seat that
+                // owns this conversation — without this, the reply fans out to all membrane
+                // subscribers.
+                let (source_session_id, source_chat_id, source_reply_guest_id) = {
                     let mut sess_id = None;
                     let mut chat_id = None;
+                    let mut reply_guest_id = None;
                     if let Some(state) = self.sessions.get_mut(&payload.session_id) {
                         if let Some(turn) = state.active_turn.as_mut() {
                             turn.associated_paracrine_ids.push(paracrine_id.clone());
@@ -11418,9 +11422,10 @@ impl AgentRuntime {
                             if !turn.chat_id.is_empty() {
                                 chat_id = Some(turn.chat_id.clone());
                             }
+                            reply_guest_id = turn.final_reply_guest_id.clone();
                         }
                     }
-                    (sess_id, chat_id)
+                    (sess_id, chat_id, reply_guest_id)
                 };
 
                 let exosome = Exosome {
@@ -11439,6 +11444,7 @@ impl AgentRuntime {
                         exosome,
                         reply_to_node,
                         reply_to_role,
+                        reply_to_guest_id: source_reply_guest_id,
                         timeout_secs: None,
                     })
                     .await

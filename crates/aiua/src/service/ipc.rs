@@ -10082,6 +10082,7 @@ impl IpcServer {
                 exosome,
                 reply_to_node,
                 reply_to_role,
+                reply_to_guest_id,
                 ..
             } => {
                 // Session key: paracrine:{chat_id}:{role}
@@ -10115,6 +10116,7 @@ impl IpcServer {
                     "transport": specialist_transport,
                     "final_reply_to": reply_to_node,
                     "final_reply_role": reply_to_role,
+                    "final_reply_guest_id": reply_to_guest_id,
                 });
                 let task_json = paracrine_task.to_string();
                 let task_id = Uuid::new_v4();

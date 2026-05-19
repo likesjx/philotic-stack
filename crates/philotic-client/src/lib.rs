@@ -1518,6 +1518,11 @@ pub enum IpcRequest {
         reply_to_node: String,
         /// Role at that node ("membrane", "agent", etc.).
         reply_to_role: String,
+        /// Specific guest_id to target for the reply (e.g. "default:membrane-gateway-astrid").
+        /// When set, the specialist's final send_reply/partial_reply is routed to this exact
+        /// guest rather than fanning out to all subscribers of reply_to_role.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_guest_id: Option<String>,
         /// Materialisation timeout for the target role. `None` uses the hotel default.
         #[serde(default)]
         timeout_secs: Option<u64>,
