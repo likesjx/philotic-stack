@@ -8234,6 +8234,113 @@ impl AgentRuntime {
                 })
                 .await
             }
+            "hotel.best_place_to_run" => {
+                let args = &payload.arguments;
+                let agent_id = args.get("agent_id").and_then(|v| v.as_str()).map(str::to_string);
+                let role_name = args.get("role_name").and_then(|v| v.as_str()).map(str::to_string);
+                let tool_name = args.get("tool_name").and_then(|v| v.as_str()).map(str::to_string);
+                let required_markers = args
+                    .get("required_markers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let prefer_locality = args
+                    .get("prefer_locality")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::BestPlaceToRun {
+                        agent_id,
+                        role_name,
+                        tool_name,
+                        required_markers,
+                        prefer_locality,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let hotel = data
+                            .get("recommended_hotel")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let node = data
+                            .get("recommended_node_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let reason = data
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("no reason recorded");
+                        let candidate_lines = data
+                            .get("candidates")
+                            .and_then(|v| v.as_array())
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .take(5)
+                                    .map(|c| {
+                                        let h = c.get("hotel_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                        let n = c.get("node_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                        let s = c.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
+                                        format!("- {} ({}) score={}", h, n, s)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        let msg = if candidate_lines.is_empty() {
+                            format!("Best placement: {} ({}).\nReason: {}", hotel, node, reason)
+                        } else {
+                            format!(
+                                "Best placement: {} ({}).\nReason: {}\nCandidates:\n{}",
+                                hotel, node, reason, candidate_lines
+                            )
+                        };
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("Placement recommendation unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.best_place_to_run: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
             "router.stats" => {
                 let window_secs = payload
                     .arguments
