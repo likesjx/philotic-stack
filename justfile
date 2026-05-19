@@ -137,7 +137,7 @@ clear-aiua:
     @pkill -KILL -f "model-router" 2>/dev/null || true
     @pkill -KILL -f "tool-runner" 2>/dev/null || true
     @pkill -KILL -f "graph-runner" 2>/dev/null || true
-    @pkill -KILL -f "agent-graph-runner" 2>/dev/null || true
+    @pkill -KILL -f "agent-datasource" 2>/dev/null || true
     @sleep 0.5
     @rm -f /tmp/philotic-*.sock
     @find "${HOME}/.philotic" -name "*.sock" -delete 2>/dev/null || true
@@ -374,9 +374,9 @@ smoke-gemini-live:
 smoke-mlx:
     bash scripts/smoke-mlx-controller.sh
 
-# Run the agent-graph-runner cargo integration tests (tool dispatch without live hotel, Seams 3 & 4)
+# Run the agent-datasource cargo integration tests (tool dispatch without live hotel, Seams 3 & 4)
 test-agent-graph:
-    cargo test -p agent-graph-runner --test smoke -- --nocapture
+    cargo test -p agent-datasource --test smoke -- --nocapture
 
 # Run the router trace cargo tests (RouterTraceStorage unit coverage, Seam 5)
 test-router-trace:
@@ -389,7 +389,7 @@ test-suite:
     cargo test -p philotic-client -- --nocapture
     cargo test -p philote -- --nocapture
     cargo test -p aiua -- --nocapture
-    cargo test -p agent-graph-runner --test smoke -- --nocapture
+    cargo test -p agent-datasource --test smoke -- --nocapture
     cargo test -p ansible-mesh-core -- router_trace --nocapture
 
 # Full binary smoke suite (no external credentials or large model downloads)
@@ -454,9 +454,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet philote-worker tool-runner graph-runner graph-datasource graph-intelligence table-datasource router-listener agent-graph-runner"
+    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet philote-worker tool-runner graph-runner graph-datasource graph-intelligence table-datasource router-listener agent-datasource"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p graph-intelligence -p philotic-web -p table-datasource -p router-listener -p agent-graph-runner
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p graph-intelligence -p philotic-web -p table-datasource -p router-listener -p agent-datasource
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -562,7 +562,7 @@ vps-push:
       -p graph-intelligence \
       -p table-datasource \
       -p router-listener \
-      -p agent-graph-runner"
+      -p agent-datasource"
 
     echo "▶ Deploying via ansible (binaries from VPS build at ${VPS_BUILD})..."
     cd "${ROOT_DIR}/ansible" && ansible-playbook \
