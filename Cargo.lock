@@ -44,12 +44,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-graph-runner"
+name = "agent-datasource"
 version = "0.1.0"
 dependencies = [
  "ansible-mesh-core",
  "anyhow",
+ "async-trait",
  "clap",
+ "datasource",
  "philotic-client",
  "serde",
  "serde_json",
