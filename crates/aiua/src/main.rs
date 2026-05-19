@@ -7069,7 +7069,7 @@ mod tests {
             .expect("resolve target")
             .expect("remote target should exist");
 
-        assert_eq!(target, "100.79.239.64:13104");
+        assert_eq!(target, "100.79.239.64:13106"); // execution_port = base+2
     }
 
     #[test]
