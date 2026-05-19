@@ -35,6 +35,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
         "handoff.back" => &["session.status", "handoff.back"],
         "role.governance" => &[
             "session.status",
+            "hotel.best_place_to_run",
             "agent.configure",
             "role.create_or_update",
             "role.set_home",

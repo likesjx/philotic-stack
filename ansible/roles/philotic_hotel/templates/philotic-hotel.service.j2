@@ -36,9 +36,8 @@ TimeoutStopSec=30
 
 # Hardening (progressive — tighten as hotel VPN and vault mature)
 NoNewPrivileges=yes
-PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths={{ philotic_data_dir }} {{ philotic_blob_dir }} /run/philotic
+ReadWritePaths={{ philotic_data_dir }} {{ philotic_blob_dir }} {{ philotic_runtime_dir }}
 {% set read_only_paths = [] %}
 {% for item in philotic_agents.values() %}
 {% if item.import_workspace is defined %}

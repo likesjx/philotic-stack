@@ -24,6 +24,21 @@
 //!   GET  /api/mesh/targets/:target_node_id/status
 //!   GET  /api/mesh/targets/:target_node_id/guests
 //!   GET  /api/mesh/targets/:target_node_id/agents
+//!   GET  /api/mesh/targets/:target_node_id/components
+//!   GET  /api/mesh/targets/:target_node_id/components/:guest_id
+//!   POST /api/mesh/targets/:target_node_id/components
+//!   PATCH /api/mesh/targets/:target_node_id/components/:guest_id
+//!   DELETE /api/mesh/targets/:target_node_id/components/:guest_id
+//!   POST /api/mesh/targets/:target_node_id/components/:guest_id/enable
+//!   POST /api/mesh/targets/:target_node_id/components/:guest_id/disable
+//!   POST /api/mesh/targets/:target_node_id/components/:guest_id/restart
+//!   GET  /api/mesh/targets/:target_node_id/config
+//!   PUT  /api/mesh/targets/:target_node_id/config/:key
+//!   GET  /api/mesh/targets/:target_node_id/secrets
+//!   POST /api/mesh/targets/:target_node_id/secrets/rotate
+//!   POST /api/mesh/targets/:target_node_id/vault
+//!   GET  /api/mesh/targets/:target_node_id/best-place-to-run
+//!   PUT  /api/mesh/targets/:target_node_id/agents/:agent_id/roles/:role_name/home
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
 //!   GET  /api/event-log
 //!   GET  /api/config
@@ -82,10 +97,15 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use philotic_client::{
-    ComponentManifest, CronJob, CronJobSource, DesktopMembraneAgentView, DesktopMembraneGuestView,
-    DesktopMembraneStatusView, GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
-    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView, OperatorTargetStatusView,
-    OperatorTargetView, PhiloticClient, ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE,
+    ComponentInventoryEntryView, ComponentManifest, CronJob, CronJobSource,
+    DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView, GuestIdentity,
+    IpcRequest, IpcResponse, LeaseEnvelope, OperatorTargetAgentInventoryView,
+    OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
+    OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
+    OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
+    OperatorTargetSecretInventoryView, OperatorTargetSecretMutationAckView,
+    OperatorTargetStatusView, OperatorTargetView, PhiloticClient, ResponseRoutePolicyView,
+    OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -144,29 +164,6 @@ struct SetRoutingPolicyDispositionBody {
     state: String,
     reason: String,
 }
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct ComponentInventoryEntry {
-    guest_id: String,
-    role: String,
-    hotel: String,
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
-    component_type: String,
-    is_active: bool,
-    auto_start: bool,
-    #[serde(default)]
-    active_pid: Option<String>,
-    #[serde(default)]
-    last_active_at: Option<u64>,
-    #[serde(default)]
-    component_config: Value,
-    #[serde(default)]
-    capabilities: Vec<String>,
-}
-
 #[derive(Clone, Debug, serde::Serialize)]
 struct ComponentTemplateFieldView {
     key: String,
@@ -503,6 +500,39 @@ struct ExternalIdentityLinkStatusView {
     last_seen_at: i64,
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ConfirmGuestActionBody {
+    confirm_guest_id: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ConfirmSecretRefBody {
+    secret_ref: String,
+    plaintext: String,
+    confirm_secret_ref: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ConfirmVaultEntryBody {
+    vault_name: String,
+    plaintext: String,
+    #[serde(default)]
+    allowed_roles: Vec<String>,
+    confirm_vault_name: String,
+}
+
+fn require_exact_confirmation(provided: &str, expected: &str, label: &str) -> Result<(), Response> {
+    if provided == expected {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("confirmation text must exactly match {}", label)})),
+        )
+            .into_response())
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -635,6 +665,7 @@ pub async fn run(
             "/api/agents/:agent_id/roles/:role_name/skills/:skill_name",
             delete(handle_revoke_skill),
         )
+        .route("/api/mesh/invite", post(handle_mesh_invite_create))
         .route("/api/mesh/targets", get(handle_mesh_targets))
         .route(
             "/api/mesh/targets/:target_node_id/status",
@@ -647,6 +678,63 @@ pub async fn run(
         .route(
             "/api/mesh/targets/:target_node_id/agents",
             get(handle_mesh_target_agents),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components",
+            get(handle_mesh_target_components),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id",
+            get(handle_mesh_target_component_detail),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components",
+            post(handle_mesh_target_component_create),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id",
+            axum::routing::patch(handle_mesh_target_component_patch)
+                .delete(handle_mesh_target_component_delete),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id/enable",
+            post(handle_mesh_target_component_enable),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id/disable",
+            post(handle_mesh_target_component_disable),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/components/:guest_id/restart",
+            post(handle_mesh_target_component_restart),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/config",
+            get(handle_mesh_target_config),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/config/:key",
+            put(handle_mesh_target_config_put),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/secrets",
+            get(handle_mesh_target_secrets),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/secrets/rotate",
+            post(handle_mesh_target_secret_rotate),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/vault",
+            post(handle_mesh_target_vault_add),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/best-place-to-run",
+            get(handle_mesh_target_best_place_to_run),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/agents/:agent_id/roles/:role_name/home",
+            put(handle_mesh_target_role_home_put),
         )
         .route(
             "/api/mesh/targets/:target_node_id/agents/:agent_id/chat",
@@ -1923,6 +2011,532 @@ async fn handle_mesh_target_agents(
     }
 }
 
+async fn handle_mesh_target_components(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    match ipc_desktop_membrane_target_components(&state.socket, &target_node_id).await {
+        Ok(components) => Json(components).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_component_detail(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    match ipc_desktop_membrane_target_component(&state.socket, &target_node_id, &guest_id).await {
+        Ok(component) => Json(component).into_response(),
+        Err(err) if err.to_string().contains("component not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "component not found"})),
+        )
+            .into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_component_create(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+    Json(manifest): Json<ComponentManifest>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_register_target_component(&state.socket, &target_node_id, manifest).await {
+        Ok(component) => {
+            let event = json!({
+                "type": "component:created",
+                "payload": { "guest_id": component.guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            (StatusCode::CREATED, Json(component)).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+    Json(body): Json<PatchComponentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_desktop_membrane_target_component(&state.socket, &target_node_id, &guest_id).await {
+        Ok(current) => {
+            let manifest = ComponentManifest {
+                guest_id: guest_id.clone(),
+                role: body.role.unwrap_or(current.role),
+                hotel: body.hotel.unwrap_or(current.hotel),
+                command: body.command.unwrap_or(current.command),
+                args: body.args.unwrap_or(current.args),
+                env: body.env.unwrap_or(current.env),
+                component_config: body.component_config.unwrap_or(current.component_config),
+                auto_start: body.auto_start.unwrap_or(current.auto_start),
+            };
+            match ipc_register_target_component(&state.socket, &target_node_id, manifest).await {
+                Ok(component) => {
+                    let event = json!({
+                        "type": "component:updated",
+                        "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+                    });
+                    let _ = state.tx.send(event.to_string());
+                    Json(component).into_response()
+                }
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        Err(err) if err.to_string().contains("component not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "component not found"})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_delete(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+    Json(body): Json<DeleteComponentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if let Err(response) = require_exact_confirmation(&body.confirm_guest_id, &guest_id, "guest_id")
+    {
+        return response;
+    }
+    match ipc_remove_target_component(&state.socket, &target_node_id, &guest_id).await {
+        Ok(_) => {
+            let event = json!({
+                "type": "component:deleted",
+                "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "target_node_id": target_node_id}))
+                .into_response()
+        }
+        Err(err)
+            if err.to_string().contains("GUEST_NOT_FOUND")
+                || err.to_string().contains("component not found") =>
+        {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "component not found"})),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_enable(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_set_target_component_active(&state.socket, &target_node_id, &guest_id, true).await {
+        Ok(_) => {
+            let event = json!({
+                "type": "component:enabled",
+                "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "active": true, "target_node_id": target_node_id})).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_disable(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_set_target_component_active(&state.socket, &target_node_id, &guest_id, false).await {
+        Ok(_) => {
+            let event = json!({
+                "type": "component:disabled",
+                "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "active": false, "target_node_id": target_node_id})).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_component_restart(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, guest_id)): Path<(String, String)>,
+    Json(body): Json<ConfirmGuestActionBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if let Err(response) = require_exact_confirmation(&body.confirm_guest_id, &guest_id, "guest_id")
+    {
+        return response;
+    }
+    match ipc_restart_target_component(&state.socket, &target_node_id, &guest_id).await {
+        Ok(_) => {
+            let event = json!({
+                "type": "component:restarted",
+                "payload": { "guest_id": guest_id, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "target_node_id": target_node_id}))
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_mesh_target_config(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    match ipc_desktop_membrane_target_config(&state.socket, &target_node_id).await {
+        Ok(config) => Json(config).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_config_put(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, key)): Path<(String, String)>,
+    Json(body): Json<SetConfigBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if !OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS.contains(&key.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("config key '{}' is not operator-mutable on remote targets", key)})),
+        )
+            .into_response();
+    }
+    let value_json = match serde_json::to_string(&body.value) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid value: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    match ipc_set_target_config(&state.socket, &target_node_id, &key, &value_json).await {
+        Ok(ack) => {
+            let event = json!({
+                "type": "config:updated",
+                "payload": { "key": key, "target_node_id": target_node_id }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(ack).into_response()
+        }
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else if err.to_string().contains("not operator-mutable") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_secrets(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_desktop_membrane_target_secrets(&state.socket, &target_node_id).await {
+        Ok(secrets) => Json(secrets).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_secret_rotate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+    Json(body): Json<ConfirmSecretRefBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if let Err(response) =
+        require_exact_confirmation(&body.confirm_secret_ref, &body.secret_ref, "secret_ref")
+    {
+        return response;
+    }
+    match ipc_rotate_target_secret(
+        &state.socket,
+        &target_node_id,
+        &body.secret_ref,
+        &body.plaintext,
+    )
+    .await
+    {
+        Ok(ack) => {
+            let event = json!({
+                "type": "secret:rotated",
+                "payload": { "target_node_id": target_node_id, "secret_ref": body.secret_ref }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(ack).into_response()
+        }
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_vault_add(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+    Json(body): Json<ConfirmVaultEntryBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if let Err(response) =
+        require_exact_confirmation(&body.confirm_vault_name, &body.vault_name, "vault_name")
+    {
+        return response;
+    }
+    match ipc_add_target_vault_entry(
+        &state.socket,
+        &target_node_id,
+        &body.vault_name,
+        &body.plaintext,
+        body.allowed_roles,
+    )
+    .await
+    {
+        Ok(ack) => {
+            let event = json!({
+                "type": "vault:entry-added",
+                "payload": { "target_node_id": target_node_id, "vault_name": body.vault_name, "secret_ref": ack.secret_ref }
+            });
+            let _ = state.tx.send(event.to_string());
+            (StatusCode::CREATED, Json(ack)).into_response()
+        }
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_best_place_to_run(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+    Query(query): Query<PlacementQuery>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_desktop_membrane_target_placement(
+        &state.socket,
+        &target_node_id,
+        query.agent_id,
+        query.role_name,
+        query.tool_name,
+        query.required_markers,
+        query.prefer_locality,
+    )
+    .await
+    {
+        Ok(view) => Json(view).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_role_home_put(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, agent_id, role_name)): Path<(String, String, String)>,
+    Json(body): Json<SetRoleHomeBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let confirmation_target = format!("{}:{}", agent_id, role_name);
+    if let Err(response) = require_exact_confirmation(
+        &body.confirm_role_binding,
+        &confirmation_target,
+        "agent_id:role_name",
+    ) {
+        return response;
+    }
+    match ipc_set_target_role_home(
+        &state.socket,
+        &target_node_id,
+        &agent_id,
+        &role_name,
+        "orchestrator",
+        body.target_hotel,
+    )
+    .await
+    {
+        Ok(ack) => {
+            let event = json!({
+                "type": "role:home-updated",
+                "payload": { "target_node_id": target_node_id, "agent_id": agent_id, "role_name": role_name, "home_node": ack.home_node, "reason": body.reason }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(ack).into_response()
+        }
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
 async fn handle_mesh_target_agent_chat(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -2782,9 +3396,8 @@ async fn handle_config(headers: HeaderMap, State(state): State<AppState>) -> Res
     }
     // Read well-known operator-facing config keys. Values are returned as-is
     // (already JSON-encoded strings in the context graph).
-    let keys = &["execution_host", "vault_registry", "tool_runner_registry"];
     let mut out = serde_json::Map::new();
-    for key in keys {
+    for key in OPERATOR_REMOTE_CONFIG_KEYS {
         match ipc_get_config(&state.socket, key).await {
             Ok(Some(val)) => {
                 out.insert(key.to_string(), val);
@@ -3085,6 +3698,45 @@ struct SetConfigBody {
     value: Value,
 }
 
+#[derive(serde::Deserialize)]
+struct CreateMeshInviteBody {
+    mesh_host: String,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+async fn handle_mesh_invite_create(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<CreateMeshInviteBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if body.mesh_host.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "mesh_host must not be empty"})),
+        )
+            .into_response();
+    }
+    match ipc_create_mesh_invite(&state.socket, state.hotel.as_str(), body.mesh_host.trim(), body.ttl_secs).await {
+        Ok(data) => Json(json!({
+            "ok": true,
+            "hotel_name": state.hotel.as_str(),
+            "file_name": format!("{}-mesh-invite.json", state.hotel.as_str()),
+            "mesh_host": body.mesh_host.trim(),
+            "invite": data,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn handle_config_put(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -3127,19 +3779,18 @@ async fn handle_config_put(
 
 // ── POST /api/secrets/rotate ──────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
-struct RotateSecretBody {
-    secret_ref: String,
-    plaintext: String,
-}
-
 async fn handle_secret_rotate(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(body): Json<RotateSecretBody>,
+    Json(body): Json<ConfirmSecretRefBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) =
+        require_exact_confirmation(&body.confirm_secret_ref, &body.secret_ref, "secret_ref")
+    {
+        return response;
     }
     match ipc_rotate_secret(&state.socket, &body.secret_ref, &body.plaintext).await {
         Ok(()) => Json(json!({"ok": true})).into_response(),
@@ -3153,21 +3804,40 @@ async fn handle_secret_rotate(
 
 // ── POST /api/vault ───────────────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
-struct AddVaultEntryBody {
-    vault_name: String,
-    plaintext: String,
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PlacementQuery {
     #[serde(default)]
-    allowed_roles: Vec<String>,
+    agent_id: Option<String>,
+    #[serde(default)]
+    role_name: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    required_markers: Vec<String>,
+    #[serde(default)]
+    prefer_locality: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct SetRoleHomeBody {
+    #[serde(default)]
+    target_hotel: Option<String>,
+    reason: String,
+    confirm_role_binding: String,
 }
 
 async fn handle_vault_add(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(body): Json<AddVaultEntryBody>,
+    Json(body): Json<ConfirmVaultEntryBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) =
+        require_exact_confirmation(&body.confirm_vault_name, &body.vault_name, "vault_name")
+    {
+        return response;
     }
     match ipc_add_vault_entry(
         &state.socket,
@@ -3803,12 +4473,9 @@ async fn handle_component_delete(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    if body.confirm_guest_id != guest_id {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "confirmation text must exactly match guest_id"})),
-        )
-            .into_response();
+    if let Err(response) = require_exact_confirmation(&body.confirm_guest_id, &guest_id, "guest_id")
+    {
+        return response;
     }
     match ipc_remove_component(&state.socket, &guest_id).await {
         Ok(_) => {
@@ -3889,9 +4556,14 @@ async fn handle_component_restart(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(guest_id): Path<String>,
+    Json(body): Json<ConfirmGuestActionBody>,
 ) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
+    }
+    if let Err(response) = require_exact_confirmation(&body.confirm_guest_id, &guest_id, "guest_id")
+    {
+        return response;
     }
     match ipc_restart_component(&state.socket, &guest_id).await {
         Ok(_) => {
@@ -4043,6 +4715,333 @@ async fn ipc_desktop_membrane_target_agents(
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!(
             "unexpected desktop membrane target agents response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_components(
+    socket: &str,
+    target_node_id: &str,
+) -> Result<OperatorTargetComponentInventoryView> {
+    let mut client =
+        connect_management_client(socket, "philotic-web-mesh-target-components").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetComponents {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetComponentsView {
+            operator_target_components,
+        } => Ok(operator_target_components),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target components response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_config(
+    socket: &str,
+    target_node_id: &str,
+) -> Result<OperatorTargetConfigView> {
+    let mut client = connect_management_client(socket, "philotic-web-mesh-target-config").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetConfig {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetConfigView {
+            operator_target_config,
+        } => Ok(operator_target_config),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target config response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_secrets(
+    socket: &str,
+    target_node_id: &str,
+) -> Result<OperatorTargetSecretInventoryView> {
+    let mut client = connect_management_client(socket, "philotic-web-mesh-target-secrets").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetSecrets {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetSecretsView {
+            operator_target_secrets,
+        } => Ok(operator_target_secrets),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target secrets response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_placement(
+    socket: &str,
+    target_node_id: &str,
+    agent_id: Option<String>,
+    role_name: Option<String>,
+    tool_name: Option<String>,
+    required_markers: Vec<String>,
+    prefer_locality: bool,
+) -> Result<OperatorTargetPlacementView> {
+    let mut client =
+        connect_management_client(socket, "philotic-web-mesh-target-placement").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetPlacement {
+            target_node_id: target_node_id.to_string(),
+            agent_id,
+            role_name,
+            tool_name,
+            required_markers,
+            prefer_locality,
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetPlacementView {
+            operator_target_placement,
+        } => Ok(operator_target_placement),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target placement response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_component(
+    socket: &str,
+    target_node_id: &str,
+    guest_id: &str,
+) -> Result<ComponentInventoryEntryView> {
+    let components = ipc_desktop_membrane_target_components(socket, target_node_id).await?;
+    components
+        .components
+        .into_iter()
+        .find(|component| component.guest_id == guest_id)
+        .ok_or_else(|| anyhow!("component not found"))
+}
+
+async fn ipc_set_target_config(
+    socket: &str,
+    target_node_id: &str,
+    key: &str,
+    value_json: &str,
+) -> Result<OperatorTargetConfigMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-config").await?;
+    match client
+        .send_request(IpcRequest::SetOperatorTargetConfig {
+            target_node_id: target_node_id.to_string(),
+            key: key.to_string(),
+            value_json: value_json.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetConfigMutationAckView {
+            operator_target_config_mutation,
+        } => Ok(operator_target_config_mutation),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected target config mutation response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_rotate_target_secret(
+    socket: &str,
+    target_node_id: &str,
+    secret_ref: &str,
+    plaintext: &str,
+) -> Result<OperatorTargetSecretMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-secrets").await?;
+    match client
+        .send_request(IpcRequest::RotateOperatorTargetSecret {
+            target_node_id: target_node_id.to_string(),
+            secret_ref: secret_ref.to_string(),
+            plaintext: plaintext.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetSecretMutationAckView {
+            operator_target_secret_mutation,
+        } => Ok(operator_target_secret_mutation),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected target secret rotation response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_add_target_vault_entry(
+    socket: &str,
+    target_node_id: &str,
+    vault_name: &str,
+    plaintext: &str,
+    allowed_roles: Vec<String>,
+) -> Result<OperatorTargetSecretMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-secrets").await?;
+    match client
+        .send_request(IpcRequest::AddOperatorTargetVaultEntry {
+            target_node_id: target_node_id.to_string(),
+            vault_name: vault_name.to_string(),
+            plaintext: plaintext.to_string(),
+            allowed_roles,
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetSecretMutationAckView {
+            operator_target_secret_mutation,
+        } => Ok(operator_target_secret_mutation),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected target vault entry response: {other:?}")),
+    }
+}
+
+async fn ipc_set_target_role_home(
+    socket: &str,
+    target_node_id: &str,
+    agent_id: &str,
+    role_name: &str,
+    calling_role: &str,
+    target_hotel: Option<String>,
+) -> Result<OperatorTargetRoleHomeAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-role-home").await?;
+    match client
+        .send_request(IpcRequest::SetOperatorTargetRoleHome {
+            target_node_id: target_node_id.to_string(),
+            agent_id: agent_id.to_string(),
+            role_name: role_name.to_string(),
+            calling_role: calling_role.to_string(),
+            target_hotel,
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetRoleHomeAckView {
+            operator_target_role_home,
+        } => Ok(operator_target_role_home),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected target role home response: {other:?}")),
+    }
+}
+
+async fn ipc_register_target_component(
+    socket: &str,
+    target_node_id: &str,
+    manifest: ComponentManifest,
+) -> Result<ComponentInventoryEntryView> {
+    let guest_id = manifest.guest_id.clone();
+    let mut client = connect_management_client(socket, "philotic-web-target-components").await?;
+    match client
+        .send_request(IpcRequest::RegisterOperatorTargetComponent {
+            target_node_id: target_node_id.to_string(),
+            manifest,
+        })
+        .await?
+    {
+        IpcResponse::ComponentInventory { components } => components
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("component mutation reply missing refreshed component"))
+            .and_then(|value| serde_json::from_value(value).map_err(Into::into)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected register_target_component response: {other:?}"
+        )),
+    }
+    .and_then(|component: ComponentInventoryEntryView| {
+        if component.guest_id == guest_id {
+            Ok(component)
+        } else {
+            Err(anyhow!("refreshed component reply guest mismatch"))
+        }
+    })
+}
+
+async fn ipc_set_target_component_active(
+    socket: &str,
+    target_node_id: &str,
+    guest_id: &str,
+    active: bool,
+) -> Result<OperatorTargetComponentMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-components").await?;
+    match client
+        .send_request(IpcRequest::SetOperatorTargetComponentActive {
+            target_node_id: target_node_id.to_string(),
+            guest_id: guest_id.to_string(),
+            active,
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetComponentMutationAckView {
+            operator_target_component_mutation,
+        } => Ok(operator_target_component_mutation),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected set_target_component_active response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_restart_target_component(
+    socket: &str,
+    target_node_id: &str,
+    guest_id: &str,
+) -> Result<OperatorTargetComponentMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-components").await?;
+    match client
+        .send_request(IpcRequest::RestartOperatorTargetComponent {
+            target_node_id: target_node_id.to_string(),
+            guest_id: guest_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetComponentMutationAckView {
+            operator_target_component_mutation,
+        } => Ok(operator_target_component_mutation),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected restart_target_component response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_remove_target_component(
+    socket: &str,
+    target_node_id: &str,
+    guest_id: &str,
+) -> Result<OperatorTargetComponentMutationAckView> {
+    let mut client = connect_management_client(socket, "philotic-web-target-components").await?;
+    match client
+        .send_request(IpcRequest::RemoveOperatorTargetComponent {
+            target_node_id: target_node_id.to_string(),
+            guest_id: guest_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetComponentMutationAckView {
+            operator_target_component_mutation,
+        } => Ok(operator_target_component_mutation),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected remove_target_component response: {other:?}"
         )),
     }
 }
@@ -4247,6 +5246,33 @@ async fn ipc_get_config(socket: &str, key: &str) -> Result<Option<Value>> {
     }
 }
 
+async fn ipc_create_mesh_invite(
+    socket: &str,
+    hotel_name: &str,
+    mesh_host: &str,
+    ttl_secs: Option<u64>,
+) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-mesh-invite").await?;
+    match client
+        .send_request(IpcRequest::CreateMeshInvite {
+            hotel_name: hotel_name.to_string(),
+            mesh_host: mesh_host.to_string(),
+            ttl_secs,
+        })
+        .await?
+    {
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        } => Ok(data),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected mesh invite response: {other:?}"
+        )),
+    }
+}
+
 async fn ipc_set_config(socket: &str, key: &str, value_json: &str) -> Result<()> {
     let mut client = connect_management_client(socket, "philotic-web-config-write").await?;
     match client
@@ -4412,13 +5438,13 @@ async fn ipc_revoke_skill(
     }
 }
 
-async fn ipc_list_components(socket: &str) -> Result<Vec<ComponentInventoryEntry>> {
+async fn ipc_list_components(socket: &str) -> Result<Vec<ComponentInventoryEntryView>> {
     let mut client = connect_management_client(socket, "philotic-web-components").await?;
     match client.send_request(IpcRequest::ListComponents {}).await? {
         IpcResponse::ComponentInventory { components } => components
             .into_iter()
             .map(serde_json::from_value)
-            .collect::<Result<Vec<ComponentInventoryEntry>, _>>()
+            .collect::<Result<Vec<ComponentInventoryEntryView>, _>>()
             .map_err(Into::into),
         IpcResponse::Standard {
             ok: false, message, ..
@@ -4427,7 +5453,7 @@ async fn ipc_list_components(socket: &str) -> Result<Vec<ComponentInventoryEntry
     }
 }
 
-async fn ipc_get_component(socket: &str, guest_id: &str) -> Result<ComponentInventoryEntry> {
+async fn ipc_get_component(socket: &str, guest_id: &str) -> Result<ComponentInventoryEntryView> {
     let components = ipc_list_components(socket).await?;
     components
         .into_iter()
@@ -4438,7 +5464,7 @@ async fn ipc_get_component(socket: &str, guest_id: &str) -> Result<ComponentInve
 async fn ipc_register_component(
     socket: &str,
     manifest: ComponentManifest,
-) -> Result<ComponentInventoryEntry> {
+) -> Result<ComponentInventoryEntryView> {
     let guest_id = manifest.guest_id.clone();
     let mut client = connect_management_client(socket, "philotic-web-components").await?;
     match client

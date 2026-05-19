@@ -675,12 +675,30 @@ Seam IDs: `multi-hotel-route-consistency`, `cross-host-distributed-validation`, 
 - [ ] Review [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md).
 - [ ] Extend remote-capable route metadata consistently across remaining routed component classes beyond the first tool/model paths.
 - [ ] Preserve session-owned membrane reply routing while proving broader distributed component placement.
+- [ ] Concentrate Telegram-facing membranes on `jane-vps` as an explicit placement policy instead of an ad hoc deployment habit:
+  - define “membrane home hotel” posture and failover expectations
+  - keep laptop hotels mesh-visible and reachable without making them poller perimeters by default
+  - prove reply/approval routing when ingress lives on `jane-vps` and cognition lives elsewhere
 - [ ] Define the first remote materialization ceremony:
   - mesh-visible intent
   - deterministic winning target selection
   - targeted materialization request to the winner
   - readiness publication before parked work is released
   - explicit distinction between routeable-ready and lease-authorized when the component family is singleton-scoped
+- [ ] Land the next singular-mesh membership slice:
+  - propagate revocation mesh-wide instead of pairwise folklore
+  - move member-record sync from “first converged path” to audited canonical mesh authority
+  - make cross-hotel philote / role transport consume the converged membership view directly
+  - close the retroactive convergence gap so already-paired hotels learn the full current circle without requiring a fresh admission ceremony
+- [x] Sync the canonical mesh catalog across hotels instead of seeding hotel-local tool/skill/profile folklore:
+  - replicate `abstract_tool`, `abstract_skill`, and `toolset_profile` records on change and periodic full sync
+  - use the built-in `admin` profile as the first proving profile
+  - let newly admitted hotels receive the current canonical catalog as part of the singular-mesh convergence path
+- [ ] Decide whether ad hoc `skill.register` writes are canonical mesh-catalog truth or hotel-local overlays, then implement that authority boundary instead of leaving dynamic skill propagation to vibes.
+- [x] Expose the first hotel-owned placement judgment API:
+  - add `hotel.best_place_to_run`
+  - respect explicit role home pins first
+  - fall back to ghost-mirror health, reachability, tool affinity, and locality ranking
 - [ ] Define the first capacity-relief placement flow:
   - stressed hotel help signal
   - candidate offers
@@ -1208,6 +1226,27 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
   - [ ] passkey-backed local-first operator login after OIDC and membrane step-up are landed
 - [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.
+- [ ] Launch the operator identity and dangerous-action ceremonies effort:
+  - [x] write [OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md)
+  - [ ] define the first desktop operator identity/session model
+  - [ ] define posture transitions and expiry for `normal` and `admin_elevated`
+  - [ ] classify current dangerous actions by ceremony tier
+  - [ ] define the first target-scoped grant record and lifecycle
+  - [ ] prove one end-to-end grant-backed remote admin action
+- [x] Define the first remote dangerous-action confirmation policy:
+  - reads and bounded non-secret config remain admin-posture only
+  - remote component restart/delete require typed `guest_id` confirmation
+  - remote secret rotation requires typed `secret_ref` confirmation
+  - remote vault entry creation requires typed `vault_name` confirmation
+  - remote role-home moves require typed `{agent_id}:{role_name}` confirmation
+- [ ] First-class remote hotel admin parity so the Philote desktop can manage a remote `aiua` through the same hotel-mediated control plane:
+  - [x] write [REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md)
+  - [x] add remote parity for component inventory/detail
+  - [x] add remote parity for component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`)
+  - [x] add bounded remote config read/mutate parity for operator-approved keys
+  - [x] add remote secret/vault-ref inventory and rotation workflows without normalizing plaintext fetches
+  - [x] add remote placement and role/philote transport actions through the same operator control plane
+  - [x] define the first confirmation boundary for dangerous remote actions
 - [ ] Define the first high-trust remote action ceremonies for:
   - secret rotation
   - node shutdown/restart

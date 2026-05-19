@@ -6,7 +6,7 @@ pub use ansible_mesh_core::resources::{
 pub use ansible_mesh_core::storage::ComponentManifest;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::ErrorKind;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -147,15 +147,166 @@ pub struct OperatorTargetAgentInventoryView {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentInventoryEntryView {
+    pub guest_id: String,
+    pub role: String,
+    pub hotel: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub component_type: String,
+    pub is_active: bool,
+    pub auto_start: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_pid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<u64>,
+    #[serde(default)]
+    pub component_config: serde_json::Value,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetComponentInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub components: Vec<ComponentInventoryEntryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetComponentMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub guest_id: String,
+    pub operation: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetConfigView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub config: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetConfigMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub key: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretEntryView {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub vault_entries: Vec<OperatorTargetSecretEntryView>,
+    #[serde(default)]
+    pub config_refs: Vec<OperatorTargetSecretEntryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_name: Option<String>,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorTargetPlacementView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    pub placement: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetRoleHomeAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub agent_id: String,
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_node: Option<String>,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
 pub type DesktopMembraneTargetView = OperatorTargetView;
 pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
 pub type DesktopMembraneTargetGuestInventoryView = OperatorTargetGuestInventoryView;
 pub type DesktopMembraneTargetAgentInventoryView = OperatorTargetAgentInventoryView;
+pub type DesktopMembraneTargetComponentInventoryView = OperatorTargetComponentInventoryView;
 
 pub const OPERATOR_SURFACE_QUERY_ROLE: &str = "management.operator_surface_query";
 pub const OPERATOR_SURFACE_QUERY_REPLY_ROLE: &str = "management.operator_surface_query.reply";
 pub const OPERATOR_SURFACE_QUERY_HANDOFF_KIND: &str = "operator_surface_query";
+pub const OPERATOR_REMOTE_CONFIG_KEYS: &[&str] =
+    &["execution_host", "vault_registry", "tool_runner_registry"];
+pub const OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS: &[&str] =
+    &["execution_host", "tool_runner_registry"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperatorSurfaceQueryHandoff {
@@ -688,6 +839,70 @@ pub enum IpcRequest {
     QueryOperatorTargetAgents {
         target_node_id: String,
     },
+    QueryOperatorTargetComponents {
+        target_node_id: String,
+    },
+    QueryOperatorTargetConfig {
+        target_node_id: String,
+    },
+    QueryOperatorTargetSecrets {
+        target_node_id: String,
+    },
+    QueryOperatorTargetPlacement {
+        target_node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default)]
+        required_markers: Vec<String>,
+        #[serde(default)]
+        prefer_locality: bool,
+    },
+    RegisterOperatorTargetComponent {
+        target_node_id: String,
+        manifest: ComponentManifest,
+    },
+    SetOperatorTargetConfig {
+        target_node_id: String,
+        key: String,
+        value_json: String,
+    },
+    RotateOperatorTargetSecret {
+        target_node_id: String,
+        secret_ref: String,
+        plaintext: String,
+    },
+    AddOperatorTargetVaultEntry {
+        target_node_id: String,
+        vault_name: String,
+        plaintext: String,
+        #[serde(default)]
+        allowed_roles: Vec<String>,
+    },
+    SetOperatorTargetRoleHome {
+        target_node_id: String,
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_hotel: Option<String>,
+    },
+    SetOperatorTargetComponentActive {
+        target_node_id: String,
+        guest_id: String,
+        active: bool,
+    },
+    RestartOperatorTargetComponent {
+        target_node_id: String,
+        guest_id: String,
+    },
+    RemoveOperatorTargetComponent {
+        target_node_id: String,
+        guest_id: String,
+    },
     SendOperatorChatTurn {
         target_node_id: String,
         target_agent_id: String,
@@ -701,6 +916,9 @@ pub enum IpcRequest {
         target_node_id: String,
     },
     ListDesktopMembraneAgents,
+    ListDesktopMembraneTargetComponents {
+        target_node_id: String,
+    },
     ListDesktopMembraneTargets,
     RenewTelegramPollLease {
         lease_key: String,
@@ -1307,6 +1525,19 @@ pub enum IpcRequest {
     /// Return a safe view of hotel state: hotel name, active guests, agent identities.
     /// No secret or credential values are included.
     GetHotelStatus,
+    /// Ask the hotel to recommend the best execution placement for a role or tool need.
+    BestPlaceToRun {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default)]
+        required_markers: Vec<String>,
+        #[serde(default)]
+        prefer_locality: bool,
+    },
     /// Return the last `lines` lines from the hotel's log file.
     GetHotelLogs {
         lines: u32,
@@ -1439,6 +1670,30 @@ pub enum IpcResponse {
     OperatorTargetAgentsView {
         operator_target_agents: OperatorTargetAgentInventoryView,
     },
+    OperatorTargetComponentsView {
+        operator_target_components: OperatorTargetComponentInventoryView,
+    },
+    OperatorTargetConfigView {
+        operator_target_config: OperatorTargetConfigView,
+    },
+    OperatorTargetSecretsView {
+        operator_target_secrets: OperatorTargetSecretInventoryView,
+    },
+    OperatorTargetPlacementView {
+        operator_target_placement: OperatorTargetPlacementView,
+    },
+    OperatorTargetComponentMutationAckView {
+        operator_target_component_mutation: OperatorTargetComponentMutationAckView,
+    },
+    OperatorTargetConfigMutationAckView {
+        operator_target_config_mutation: OperatorTargetConfigMutationAckView,
+    },
+    OperatorTargetSecretMutationAckView {
+        operator_target_secret_mutation: OperatorTargetSecretMutationAckView,
+    },
+    OperatorTargetRoleHomeAckView {
+        operator_target_role_home: OperatorTargetRoleHomeAckView,
+    },
     OperatorChatTurnReply {
         operator_chat_reply: OperatorChatTurnReply,
     },
@@ -1447,6 +1702,9 @@ pub enum IpcResponse {
     },
     DesktopMembraneTargetGuestsView {
         membrane_target_guests: DesktopMembraneTargetGuestInventoryView,
+    },
+    DesktopMembraneTargetComponentsView {
+        membrane_target_components: DesktopMembraneTargetComponentInventoryView,
     },
     DesktopMembraneAgentsView {
         membrane_agents: Vec<DesktopMembraneAgentView>,

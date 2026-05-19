@@ -97,6 +97,9 @@ Today, Philotic has proven:
 - remote model routing for `text.generate` and `media.analyze`
 - first remote tool fallback placement
 - TCP execution plane for routed inter-hotel task traffic
+- cross-machine WebRTC offer/answer plus data-channel `ping`/`pong` over mesh-backed signaling
+- cross-host mesh payload plus WebRTC smoke between `bjork/local-telegram` and `jane-vps/beacon-test-hotel`
+- cross-host mesh payload plus WebRTC smoke between `mbp-jane` and `jane-vps/beacon-test-hotel`
 
 But a broader multi-hotel vertical slice is still open because:
 
@@ -104,6 +107,28 @@ But a broader multi-hotel vertical slice is still open because:
 - broader routed component classes are not all using the same remote-capable path yet
 - inter-hotel ACK truth is still transitional
 - trust/perimeter policy is not closed enough for a serious cross-host split
+
+That means the next placement seam is operational rather than mystical: making it routine to place agents on any hotel, hand work off across hotels, and deliberately concentrate membranes on a VPS boundary without pretending membrane ownership has already been generalized.
+
+### Membranes On `jane-vps`
+
+The strongest immediate placement posture is:
+
+- keep Telegram-facing membranes concentrated on `jane-vps`
+- let laptops (`mac-jane`, `mbp-jane`) remain cognition / operator / local-tool hotels
+- route work, role handoff, and remote materialization across that shared mesh instead of duplicating every membrane on every laptop
+
+Why this is attractive:
+
+- one VPS boundary is easier to supervise than a swarm of roaming pollers
+- Telegram credentials and edge trust posture become more boring, which is a compliment
+- laptops may sleep, roam, or change networks without also becoming the membrane perimeter
+
+What remains open:
+
+- a formal “membrane home hotel” placement policy
+- remote materialization for philotes and role incarnations behind a VPS-owned membrane
+- durable approval / reply routing proof when ingress is VPS-local and cognition lands elsewhere
 
 ## Remote Materialization Ceremony
 

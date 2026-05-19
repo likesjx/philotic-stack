@@ -10,6 +10,7 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::mesh::mesh_auth_key_for_node;
 use crate::service::execution_transport::send_execution_message;
 
 /// Continuously polls the EventStorage and CursorStorage to dispatch durable
@@ -110,11 +111,7 @@ async fn dispatch_for_target(
     // 3. Prepare the BeaconMessage batch (for now sending one event in the batch)
     for event in unacked_events {
         let payload = serde_json::to_vec(&vec![&event])?;
-        let auth_key = graph
-            .get_config_value(&format!("mesh_auth_key:{target_node_id}"))?
-            .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        let auth_key = mesh_auth_key_for_node(graph, local_node_id, target_node_id)?
             .ok_or_else(|| anyhow::anyhow!("no mesh auth key for node {target_node_id}"))?;
 
         // Wrap in BeaconMessage

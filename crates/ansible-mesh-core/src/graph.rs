@@ -117,6 +117,7 @@ pub enum SkillValidationState {
     Draft,
     Validated,
     Registered,
+    Active,
     Suspended { reason: String },
     Invalid { errors: Vec<String> },
     Deprecated,

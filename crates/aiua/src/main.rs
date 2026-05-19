@@ -38,6 +38,7 @@ mod auth;
 mod dream;
 mod graph;
 mod memory;
+mod mesh;
 mod muninn_provision;
 mod vault;
 
@@ -575,6 +576,13 @@ fn resolve_runtime_ports(hotel: &HotelRecord, mesh_enabled: bool) -> Result<(u16
 }
 
 fn hotel_ipc_socket_path(hotel_name: &str) -> String {
+    if let Ok(explicit) = std::env::var("PHILOTIC_HOTEL_SOCKET") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
     let safe_name = sanitize_hotel_name(hotel_name);
     profile_dir()
         .map(|d| {
@@ -2757,9 +2765,17 @@ fn reconcile_hotel_record(graph: &GraphDomain, hotel_name: &str) -> Result<Hotel
         hotel.execution_port = desired.execution_port;
         changed = true;
     }
-    // When a profile is active, always use the profile-derived socket path.
-    // The stored path may be from a non-profile run and must not win.
-    if hotel.ipc_socket_path.trim().is_empty() || profile_dir().is_some() {
+    let explicit_socket = std::env::var("PHILOTIC_HOTEL_SOCKET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    // When a profile is active or the operator explicitly configured a socket
+    // path, the derived/default value must override stale graph state.
+    if hotel.ipc_socket_path.trim().is_empty()
+        || profile_dir().is_some()
+        || explicit_socket.as_deref() == Some(desired.ipc_socket_path.as_str())
+    {
         hotel.ipc_socket_path = desired.ipc_socket_path;
         changed = true;
     }
@@ -7075,6 +7091,20 @@ mod tests {
         unsafe {
             std::env::remove_var("PHILOTIC_PROFILE");
             std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn explicit_socket_env_overrides_default_derivation() {
+        unsafe {
+            std::env::remove_var("PHILOTIC_PROFILE");
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", "/run/philotic/test.sock");
+        }
+
+        assert_eq!(hotel_ipc_socket_path("beacon-test-hotel"), "/run/philotic/test.sock");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
         }
     }
 
