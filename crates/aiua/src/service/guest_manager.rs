@@ -98,6 +98,13 @@ impl Materializer for LocalProcessMaterializer {
                     }
                 }
             }
+            // Always override with hotel's current socket path so stale DB values
+            // don't cause guests to connect to the wrong socket.
+            if let Ok(socket) = std::env::var("PHILOTIC_HOTEL_SOCKET") {
+                if !socket.trim().is_empty() {
+                    command.env("PHILOTIC_HOTEL_SOCKET", socket.trim());
+                }
+            }
 
             let child = command
                 .spawn()
