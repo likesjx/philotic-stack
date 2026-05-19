@@ -90,5 +90,3 @@ pub struct NodeHealthSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_avg_1m: Option<f32>,
 }
-
-pub use philotic_primitives_mesh::beacon::*;
