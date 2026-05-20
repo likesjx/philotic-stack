@@ -1424,6 +1424,7 @@ impl AgentRuntime {
     /// user a brief notice so they know the session is unblocked.
     async fn evict_timed_out_turns(&mut self) {
         const WAITING_MODEL_SECS: u64 = 120;
+        const THINKING_SECS: u64 = 90; // post-model, dispatching actions or building reply
         const WAITING_TOOL_SECS: u64 = 90;
         const WAITING_VOICE_SECS: u64 = 60;
         const WAITING_APPROVAL_SECS: u64 = 300; // 5 min — operator may be slow
@@ -1467,6 +1468,7 @@ impl AgentRuntime {
                             matches!(
                                 t.phase,
                                 TurnPhase::WaitingModel
+                                    | TurnPhase::Thinking
                                     | TurnPhase::WaitingTool
                                     | TurnPhase::WaitingVoice
                             )
@@ -1529,6 +1531,7 @@ impl AgentRuntime {
                 let turn = state.active_turn.as_ref()?;
                 let limit = match turn.phase {
                     TurnPhase::WaitingModel => WAITING_MODEL_SECS,
+                    TurnPhase::Thinking => THINKING_SECS,
                     TurnPhase::WaitingTool => WAITING_TOOL_SECS,
                     TurnPhase::WaitingVoice => WAITING_VOICE_SECS,
                     _ => return None,
@@ -1582,10 +1585,17 @@ impl AgentRuntime {
         for (session_id, reply_to, reply_role, reply_guest_id, chat_id, phase, elapsed_secs) in
             timed_out
         {
+            let has_pending_tool = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .map(|t| t.pending_tool_call.is_some())
+                .unwrap_or(false);
             warn!(
                 session_id = %session_id,
                 phase = %phase,
                 elapsed_secs = %elapsed_secs,
+                has_pending_tool = %has_pending_tool,
                 "Turn watchdog: evicting stuck turn"
             );
 
