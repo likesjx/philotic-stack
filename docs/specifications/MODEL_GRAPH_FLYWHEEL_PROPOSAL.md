@@ -2,8 +2,8 @@
 title: Model Graph, Routing Oracle, and Flywheel
 doc_type: proposal
 domain: tooling-execution
-status: proposed
-last_updated: 2026-05-06
+status: in-progress
+last_updated: 2026-05-20
 tags:
 - models
 - routing
@@ -525,6 +525,28 @@ Cognitive envelope injection: at session load, for each registered `table_config
 - Threshold-based degradation detection in hotel daemon
 - Admin notification on degradation events
 - Auto-retry loop for subprocess model guests
+
+### Slice 9 — Oracle Integration into Cascade Failover
+
+**Status**: not started  
+**Seam**: `model-cascade-failover`  
+**Dependencies**: `model-graph-decision-layer`, `model-oracle-routing`
+
+Currently `advance_turn_to_next_fallback_tier` in `philote/src/runtime.rs` uses a static ordered `fallback_tiers` config list. When `streaming_timeout` fires: 1 same-tier retry → next index in list. No health awareness, no task-type awareness, no cross-hotel awareness.
+
+This slice replaces the static index with an oracle query:
+
+1. On timeout, call oracle with `{ task_kind, requesting_node_id, failed_model_ref, trust_floor }`
+2. Oracle returns `{ selected_model, fallback_chain, reasons }` using live `model_operational_signal` data, excluding degraded models
+3. Philote routes to oracle-selected tier; logs the oracle decision as a training signal for the flywheel
+4. If oracle unavailable, fall back to static `fallback_tiers` list (backward compat preserved)
+
+**Constraint**: oracle query must be <50ms local — the `WaitingModel` phase timeout is 120s and the `streaming_timeout` fires at 8s idle, so failover latency budget is tight.
+
+**Related reliability work shipped (2026-05-20)**:
+- `TurnPhase::Thinking` added to per-phase watchdog (was falling to 600s catch-all)
+- `send_request` lease hang fixed in `philotic-client`
+- `turn_status` streaming: ephemeral status messages shown during tool calls (membrane-telegram)
 
 ---
 
