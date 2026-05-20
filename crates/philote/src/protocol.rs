@@ -212,6 +212,16 @@ pub struct TurnEventPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TurnStatusPayload {
+    pub action: &'static str,
+    pub session_id: String,
+    pub turn_id: String,
+    pub chat_id: String,
+    /// Human-readable status, e.g. "Searching the web..."
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TaskRunnerOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_ref: Option<String>,

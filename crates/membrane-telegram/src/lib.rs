@@ -662,6 +662,9 @@ struct ActiveTurn {
     cancel_typing: oneshot::Sender<()>,
     /// `message_id` of the first message sent for this turn, used for edit-based streaming.
     draft_message_id: Option<i64>,
+    /// Ephemeral status message (e.g. "Running command...") shown during tool calls.
+    /// Deleted when the final reply is delivered.
+    status_message_id: Option<i64>,
     /// Telegram thread the turn belongs to, if any.
     thread_id: Option<String>,
 }
@@ -792,6 +795,19 @@ async fn edit_telegram_text(
             error!("editMessageText failed: {}", e);
             false
         }
+    }
+}
+
+async fn delete_telegram_message(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    message_id: i64,
+) {
+    let url = format!("{tg_base}deleteMessage");
+    let payload = json!({ "chat_id": chat_id, "message_id": message_id });
+    if let Err(e) = http_client.post(&url).json(&payload).send().await {
+        warn!("deleteMessage failed: {}", e);
     }
 }
 
@@ -1908,6 +1924,7 @@ async fn run_seat_impl(
                                                         ActiveTurn {
                                                             cancel_typing: cancel_tx,
                                                             draft_message_id: None,
+                                                            status_message_id: None,
                                                             thread_id: envelope.thread_id.clone(),
                                                         },
                                                     );
@@ -1987,6 +2004,14 @@ async fn run_seat_impl(
                                 // a separate send_reply which will also cancel the turn entry.
                                 if event == "waiting_approval" {
                                     if let Some(active) = active_turns.remove(&session_id) {
+                                        if let Some(sid) = active.status_message_id {
+                                            let c = http_client.clone();
+                                            let b = tg_base.clone();
+                                            let cid = chat_id.clone();
+                                            tokio::spawn(async move {
+                                                delete_telegram_message(&c, &b, &cid, sid).await;
+                                            });
+                                        }
                                         active.cancel();
                                     }
                                 }
@@ -2017,16 +2042,42 @@ async fn run_seat_impl(
                                         }
                                     }
                                 }
+                            } else if action == "turn_status" {
+                                // Ephemeral status message: shows what the agent is doing right
+                                // now (e.g. "Searching the web..."). Created on first call,
+                                // edited on subsequent calls, deleted on final reply.
+                                let status = task.get("status").and_then(Value::as_str).unwrap_or_default().to_string();
+                                if !chat_id.is_empty() && !status.is_empty() {
+                                    let (existing_id, thread_id) = active_turns
+                                        .get(&session_id)
+                                        .map(|a| (a.status_message_id, a.thread_id.clone()))
+                                        .unwrap_or((None, None));
+                                    let formatted = format!("_{}_", status);
+                                    if let Some(new_id) = upsert_formatted_text(
+                                        &http_client,
+                                        &tg_base,
+                                        &chat_id,
+                                        thread_id.as_deref(),
+                                        existing_id,
+                                        &formatted,
+                                        None,
+                                    ).await {
+                                        if let Some(active) = active_turns.get_mut(&session_id) {
+                                            active.status_message_id = Some(new_id);
+                                        }
+                                    }
+                                }
                             } else {
                                 // send_reply (or any unrecognised action): deliver to Telegram and
                                 // cancel the typing heartbeat for this session.
-                                let (draft_message_id, active_thread_id) = if let Some(active) = active_turns.remove(&session_id) {
+                                let (draft_message_id, status_message_id, active_thread_id) = if let Some(active) = active_turns.remove(&session_id) {
                                     let draft_message_id = active.draft_message_id;
+                                    let status_message_id = active.status_message_id;
                                     let active_thread_id = active.thread_id.clone();
                                     active.cancel();
-                                    (draft_message_id, active_thread_id)
+                                    (draft_message_id, status_message_id, active_thread_id)
                                 } else {
-                                    (None, None)
+                                    (None, None, None)
                                 };
 
                                 let raw_content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
@@ -2050,8 +2101,14 @@ async fn run_seat_impl(
                                     let tg_base_clone = tg_base.clone();
                                     let thread_id_clone = thread_id.clone();
                                     let draft_message_id = draft_message_id;
+                                    let status_message_id = status_message_id;
 
                                     tokio::spawn(async move {
+                                        // Delete ephemeral status message (e.g. "Searching...") before reply.
+                                        if let Some(sid) = status_message_id {
+                                            delete_telegram_message(&http_client_clone, &tg_base_clone, &chat_id, sid).await;
+                                        }
+
                                         // Voice path: send audio first, then optional text caption.
                                         if let Some(artifact_json) = audio_artifact_json {
                                             if let Ok(artifact) = serde_json::from_str::<Value>(&artifact_json) {

@@ -6,7 +6,7 @@ use crate::r#loop::{
 use crate::protocol::{
     FinalReplyPayload, InboundTaskPayload, LigandEnvelope, ModelRequestPayload,
     PartialReplyPayload, TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment,
-    TurnEventPayload,
+    TurnEventPayload, TurnStatusPayload,
 };
 use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
@@ -868,6 +868,23 @@ fn format_role_command_reply(command: &SlashCommand, became_active: bool) -> Str
         }
         _ => "Role command completed.".into(),
     }
+}
+
+fn tool_status_label(tool_name: &str) -> String {
+    let label = if tool_name.contains("search") || tool_name.contains("web") {
+        "Searching the web..."
+    } else if tool_name.starts_with("memory.") || tool_name.contains("recall") {
+        "Recalling memory..."
+    } else if tool_name == "bash.exec" || tool_name == "bash" {
+        "Running command..."
+    } else if tool_name.starts_with("file") || tool_name.contains("read") {
+        "Reading files..."
+    } else if tool_name.starts_with("graph") {
+        "Checking context..."
+    } else {
+        return format!("Running {}...", tool_name);
+    };
+    label.to_string()
 }
 
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
@@ -3791,6 +3808,43 @@ impl AgentRuntime {
         Ok(())
     }
 
+    async fn emit_turn_status(&mut self, session_id: &str, status: String) -> Result<()> {
+        let (turn_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
+            let Some(state) = self.sessions.get(session_id) else {
+                return Ok(());
+            };
+            let Some(active_turn) = state.active_turn.as_ref() else {
+                return Ok(());
+            };
+            (
+                active_turn.turn_id.clone(),
+                active_turn.chat_id.clone(),
+                active_turn.final_reply_to.clone(),
+                active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
+            )
+        };
+
+        let payload = TurnStatusPayload {
+            action: "turn_status",
+            session_id: session_id.to_string(),
+            turn_id,
+            chat_id,
+            status,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: final_reply_to,
+                target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
+                task_json: serde_json::to_string(&payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
     fn route_tool_call_execution(
         &mut self,
         session_id: String,
@@ -4057,6 +4111,10 @@ impl AgentRuntime {
             if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.set_pending_tool_call(tool_call.clone());
             }
+
+            // Emit a status message to membrane so the user sees what's happening.
+            let status_label = tool_status_label(&tool_call.tool_name);
+            let _ = self.emit_turn_status(&session_id, status_label).await;
 
             let tool_req = ToolExecutionPayload {
                 action: "execute_tool",
