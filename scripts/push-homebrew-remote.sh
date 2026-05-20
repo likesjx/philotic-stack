@@ -33,7 +33,6 @@ cargo build --release --bins \
   -p tool-runner \
   -p graph-runner \
   -p graph-datasource \
-  -p graph-intelligence \
   -p table-datasource \
   -p router-listener \
   -p philotic-web
@@ -56,7 +55,7 @@ echo "▶ Signing and verifying local binaries before push..."
 UNSIGNED=()
 while IFS= read -r bin_path; do
   bin="$(basename "${bin_path}")"
-  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" ]]; then
+  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" || "${bin}" == "graph-intelligence" ]]; then
     continue
   fi
   codesign -s - --force "${bin_path}" 2>/dev/null || true
@@ -81,7 +80,7 @@ while IFS= read -r _bp; do BIN_PATHS+=("${_bp}"); done \
   < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
 for bin_path in "${BIN_PATHS[@]}"; do
   bin="$(basename "${bin_path}")"
-  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" ]]; then
+  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" || "${bin}" == "graph-intelligence" ]]; then
     continue
   fi
 
