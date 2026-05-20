@@ -1161,18 +1161,22 @@ impl GeminiProvider {
             return None;
         }
         let chunk: Value = serde_json::from_str(json_str).ok()?;
-        chunk
+        let parts = chunk
             .get("candidates")
             .and_then(Value::as_array)
             .and_then(|c| c.first())
             .and_then(|c| c.get("content"))
             .and_then(|c| c.get("parts"))
-            .and_then(Value::as_array)
-            .and_then(|p| p.first())
-            .and_then(|p| p.get("text"))
-            .and_then(Value::as_str)
+            .and_then(Value::as_array)?;
+        // Collect text from all parts — Gemini can send [{functionCall:...}, {text:...}]
+        // in a single chunk, so scanning only the first part misses text after a tool call.
+        let combined: String = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
             .filter(|t| !t.is_empty())
-            .map(str::to_string)
+            .collect::<Vec<_>>()
+            .join("");
+        if combined.is_empty() { None } else { Some(combined) }
     }
 
     /// Parse one SSE line and return the full chunk Value if it contains a `functionCall`
@@ -1548,7 +1552,12 @@ impl ModelProvider for GeminiProvider {
                                 } else {
                                     let _ = token_tx.send(text_chunk).await;
                                 }
-                            } else if pending_function_call.is_none() {
+                            }
+                            // Check for a function call independently — a single SSE chunk can
+                            // carry both a text part and a functionCall part simultaneously.
+                            // Using a separate `if` (not `else if`) ensures the function call
+                            // is captured even when text was also present in the same chunk.
+                            if pending_function_call.is_none() {
                                 if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
                                     match Self::parse_native_function_call(task, &fc_chunk) {
                                         Ok(Some(tc)) => pending_function_call = Some(tc),
@@ -1583,7 +1592,8 @@ impl ModelProvider for GeminiProvider {
             if !line.is_empty() {
                 if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                     full_text.push_str(&text_chunk);
-                } else if pending_function_call.is_none() {
+                }
+                if pending_function_call.is_none() {
                     if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
                         match Self::parse_native_function_call(task, &fc_chunk) {
                             Ok(Some(tc)) => pending_function_call = Some(tc),
