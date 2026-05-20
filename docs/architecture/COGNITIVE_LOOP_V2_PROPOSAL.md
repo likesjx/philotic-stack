@@ -2,8 +2,8 @@
 title: Cognitive Loop v2 — Plan Gate, Anti-Loop, and Earned Permissions
 doc_type: proposal
 domain: runtime-sessions
-status: in-progress
-last_updated: 2026-04-27
+status: implemented
+last_updated: 2026-05-20
 tags:
 - agent-loop
 - plan-gate
