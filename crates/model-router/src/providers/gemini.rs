@@ -24,6 +24,9 @@ use tracing::{info, warn};
 
 /// Seconds without a byte chunk from the SSE stream before we abort and escalate.
 const STREAMING_IDLE_SECS: u64 = 8;
+/// Seconds to wait for the initial HTTP response headers from Gemini before aborting.
+/// Large contexts (100KB+) can take 20–30s before the first SSE byte arrives.
+const STREAMING_CONNECT_SECS: u64 = 30;
 
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
@@ -1492,7 +1495,19 @@ impl ModelProvider for GeminiProvider {
 
         let url = self.streaming_endpoint_url(Some(self.request_model(task)))?;
         let req = self.http_client.post(url).json(&payload);
-        let response = self.apply_auth_headers(req)?.send().await?;
+        // Wrap send() in a timeout — for large contexts Gemini can take 20–30s
+        // before returning the first response byte, leaving send().await hung forever.
+        let response = timeout(
+            Duration::from_secs(STREAMING_CONNECT_SECS),
+            self.apply_auth_headers(req)?.send(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "streaming_timeout: Gemini did not respond within {}s (large context?)",
+                STREAMING_CONNECT_SECS
+            )
+        })??;
         let status = response.status();
 
         if !status.is_success() {
