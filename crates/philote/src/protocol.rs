@@ -147,6 +147,8 @@ pub struct ModelRequestPayload {
     pub context: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_projection: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affordances: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<TransportAttachment>,
     pub tools_for_model: Vec<ToolDefinition>,

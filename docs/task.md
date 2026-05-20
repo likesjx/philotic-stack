@@ -1360,7 +1360,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - `project_agent_self`
   - `project_user`
   - `project_knowledge`
-- [ ] Make skill and tool exposure goal-scoped turn projections instead of full inventory dumps when the goal is clear.
+- [x] Make skill and tool exposure goal-scoped turn projections instead of full inventory dumps when the goal is clear.
 - [ ] Compose those projections with explicit context layers:
   - soul
   - identity

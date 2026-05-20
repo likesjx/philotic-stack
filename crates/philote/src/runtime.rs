@@ -865,6 +865,41 @@ fn planning_ligand(
     })
 }
 
+fn model_affordances(
+    state: Option<&SessionState>,
+    user_content: &str,
+    tools_for_model: &[ToolDefinition],
+) -> Option<Value> {
+    let value = state
+        .map(|state| state.model_affordances_for_turn(user_content, tools_for_model))
+        .unwrap_or_else(|| {
+            let tools = tools_for_model
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "name": tool.tool_name,
+                        "class": tool.class,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "skills": [],
+                "tools": tools,
+            })
+        });
+    let is_empty = value
+        .get("skills")
+        .and_then(Value::as_array)
+        .map(Vec::is_empty)
+        .unwrap_or(true)
+        && value
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(Vec::is_empty)
+            .unwrap_or(true);
+    if is_empty { None } else { Some(value) }
+}
+
 fn looks_like_planning_turn(user_content: &str) -> bool {
     let normalized = user_content.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -2816,6 +2851,11 @@ impl AgentRuntime {
                     &Vec::new(),
                 ));
                 let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools);
+                let affordances = model_affordances(
+                    self.sessions.get(&session_id),
+                    &restored_user_content,
+                    &tools,
+                );
                 let model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
                     request_class: Some("cognitive".to_string()),
@@ -2825,6 +2865,7 @@ impl AgentRuntime {
                     user_content: restored_user_content,
                     context: Some(context),
                     context_projection: Some(context_projection),
+                    affordances,
                     attachments: Vec::new(),
                     tools_for_model: tools,
                     response_contract,
@@ -3380,6 +3421,8 @@ impl AgentRuntime {
             &attachments,
         ));
         let ligand = planning_ligand(self.sessions.get(&session_id), &content, &tools_for_model);
+        let affordances =
+            model_affordances(self.sessions.get(&session_id), &content, &tools_for_model);
         let model_req = ModelRequestPayload {
             action,
             request_class: Some(
@@ -3396,6 +3439,7 @@ impl AgentRuntime {
             user_content: content,
             context: Some(model_context),
             context_projection: Some(context_projection),
+            affordances,
             attachments,
             tools_for_model,
             response_contract,
@@ -4884,6 +4928,11 @@ impl AgentRuntime {
                 ));
                 let ligand =
                     planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
+                let affordances = model_affordances(
+                    self.sessions.get(&session_id),
+                    &user_content,
+                    &tools_for_model,
+                );
                 let model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
                     request_class: Some("cognitive".to_string()),
@@ -4893,6 +4942,7 @@ impl AgentRuntime {
                     user_content,
                     context: Some(context),
                     context_projection: Some(context_projection),
+                    affordances,
                     attachments: Vec::new(),
                     tools_for_model,
                     response_contract,
@@ -5014,6 +5064,11 @@ impl AgentRuntime {
             &Vec::new(),
         ));
         let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
+        let affordances = model_affordances(
+            self.sessions.get(&session_id),
+            &user_content,
+            &tools_for_model,
+        );
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -5023,6 +5078,7 @@ impl AgentRuntime {
             user_content,
             context: Some(context),
             context_projection: Some(context_projection),
+            affordances,
             attachments: Vec::new(),
             tools_for_model,
             response_contract,
@@ -5194,6 +5250,11 @@ impl AgentRuntime {
             &Vec::new(),
         ));
         let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
+        let affordances = model_affordances(
+            self.sessions.get(&session_id),
+            &user_content,
+            &tools_for_model,
+        );
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -5203,6 +5264,7 @@ impl AgentRuntime {
             user_content,
             context: Some(context),
             context_projection: Some(context_projection),
+            affordances,
             attachments: Vec::new(),
             tools_for_model,
             response_contract,
@@ -5329,6 +5391,11 @@ impl AgentRuntime {
             &reentry.user_content,
             &reentry.tools_for_model,
         );
+        let affordances = model_affordances(
+            self.sessions.get(&session_id),
+            &reentry.user_content,
+            &reentry.tools_for_model,
+        );
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -5338,6 +5405,7 @@ impl AgentRuntime {
             user_content: reentry.user_content.clone(),
             context,
             context_projection,
+            affordances,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
             response_contract,
@@ -6595,6 +6663,7 @@ impl AgentRuntime {
             &Vec::new(),
         ));
         let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools);
+        let affordances = model_affordances(self.sessions.get(&session_id), &user_content, &tools);
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -6604,6 +6673,7 @@ impl AgentRuntime {
             user_content,
             context: Some(context),
             context_projection: Some(context_projection),
+            affordances,
             attachments: Vec::new(),
             tools_for_model: tools,
             response_contract,
@@ -7768,6 +7838,11 @@ impl AgentRuntime {
 
         let response_route = Some(model_response_route(None, None, &Map::new(), &Vec::new()));
         let ligand = None;
+        let affordances = model_affordances(
+            self.sessions.get(&session_id),
+            &user_content,
+            &tools_for_model,
+        );
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -7777,6 +7852,7 @@ impl AgentRuntime {
             user_content,
             context,
             context_projection,
+            affordances,
             attachments: Vec::new(),
             tools_for_model,
             response_contract: None,
@@ -13740,6 +13816,7 @@ mod tests {
             context_projection: Some(serde_json::json!({
                 "conversation_turn": {"conversation_turn_id": "turn-1"}
             })),
+            affordances: None,
             attachments: Vec::new(),
             tools_for_model: Vec::new(),
             response_contract: None,

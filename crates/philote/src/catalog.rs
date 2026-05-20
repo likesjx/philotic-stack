@@ -135,61 +135,113 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
     let t = turn_text;
     match skill_name {
         "cron.manage" => {
-            t.contains("cron") || t.contains("schedule") || t.contains("recurring")
-                || t.contains("daily") || t.contains("weekly") || t.contains("hourly")
-                || t.contains("every day") || t.contains("every hour") || t.contains("every week")
-                || t.contains("remind me") || t.contains("run at ") || t.contains("timer")
-                || t.contains("scheduled") || t.contains("at midnight") || t.contains("at noon")
+            t.contains("cron")
+                || t.contains("schedule")
+                || t.contains("recurring")
+                || t.contains("daily")
+                || t.contains("weekly")
+                || t.contains("hourly")
+                || t.contains("every day")
+                || t.contains("every hour")
+                || t.contains("every week")
+                || t.contains("remind me")
+                || t.contains("run at ")
+                || t.contains("timer")
+                || t.contains("scheduled")
+                || t.contains("at midnight")
+                || t.contains("at noon")
         }
         "observability.pipeline" => {
-            t.contains("table") || t.contains("pipeline") || t.contains("rolloff")
-                || t.contains("datasource") || t.contains("table.") || t.contains("stream")
-                || t.contains("insert row") || t.contains("table schema") || t.contains("listener")
+            t.contains("table")
+                || t.contains("pipeline")
+                || t.contains("rolloff")
+                || t.contains("datasource")
+                || t.contains("table.")
+                || t.contains("stream")
+                || t.contains("insert row")
+                || t.contains("table schema")
+                || t.contains("listener")
         }
         "graph.knowledge" => {
-            t.contains("graph.") || t.contains("knowledge graph") || t.contains("create graph")
-                || t.contains("graph node") || t.contains("graph query") || t.contains("graph edge")
-                || t.contains("grant_access") || t.contains("drop graph")
+            t.contains("graph.")
+                || t.contains("knowledge graph")
+                || t.contains("create graph")
+                || t.contains("graph node")
+                || t.contains("graph query")
+                || t.contains("graph edge")
+                || t.contains("grant_access")
+                || t.contains("drop graph")
         }
         "routing.refinement" => {
-            t.contains("routing") || t.contains("reflex") || t.contains("pipeline route")
-                || t.contains("routing policy") || t.contains("router.stats")
-                || t.contains("routing.") || t.contains("dispatch policy")
+            t.contains("routing")
+                || t.contains("reflex")
+                || t.contains("pipeline route")
+                || t.contains("routing policy")
+                || t.contains("router.stats")
+                || t.contains("routing.")
+                || t.contains("dispatch policy")
         }
         "role.governance" => {
-            t.contains("create role") || t.contains("update role") || t.contains("configure agent")
-                || t.contains("best place to run") || t.contains("place role")
-                || t.contains("home node") || t.contains("role.create") || t.contains("agent.configure")
+            t.contains("create role")
+                || t.contains("update role")
+                || t.contains("configure agent")
+                || t.contains("best place to run")
+                || t.contains("place role")
+                || t.contains("home node")
+                || t.contains("role.create")
+                || t.contains("agent.configure")
                 || t.contains("set_home")
         }
         "role.authoring" => {
-            t.contains("create role") || t.contains("update role") || t.contains("author role")
-                || t.contains("role.create") || t.contains("role manifest") || t.contains("new role")
+            t.contains("create role")
+                || t.contains("update role")
+                || t.contains("author role")
+                || t.contains("role.create")
+                || t.contains("role manifest")
+                || t.contains("new role")
                 || t.contains("write role")
         }
         "skill.authoring" => {
-            t.contains("register skill") || t.contains("skill.register") || t.contains("skill.assign")
-                || t.contains("create skill") || t.contains("add skill") || t.contains("assign skill")
+            t.contains("register skill")
+                || t.contains("skill.register")
+                || t.contains("skill.assign")
+                || t.contains("create skill")
+                || t.contains("add skill")
+                || t.contains("assign skill")
                 || t.contains("revoke skill")
         }
         "context.synthesize" => {
-            t.contains("workspace") || t.contains("list files") || t.contains("read file")
-                || t.contains("code file") || t.contains("synthesize context")
-                || t.contains("workspace.") || t.contains("file list")
+            t.contains("workspace")
+                || t.contains("list files")
+                || t.contains("read file")
+                || t.contains("code file")
+                || t.contains("synthesize context")
+                || t.contains("workspace.")
+                || t.contains("file list")
         }
         "agent.initiate" => {
-            t.contains("agent.graph") || t.contains("write agent") || t.contains("initiate agent")
-                || t.contains("agent graph write") || t.contains("recall agent")
+            t.contains("agent.graph")
+                || t.contains("write agent")
+                || t.contains("initiate agent")
+                || t.contains("agent graph write")
+                || t.contains("recall agent")
         }
         "profile.manage" => {
-            t.contains("role.configure") || t.contains("configure role") || t.contains("profile.manage")
-                || t.contains("manage profile") || t.contains("role config")
+            t.contains("role.configure")
+                || t.contains("configure role")
+                || t.contains("profile.manage")
+                || t.contains("manage profile")
+                || t.contains("role config")
         }
         "mcp.manage" => {
-            t.contains("mcp") || t.contains("provision") || t.contains("revoke mcp")
-                || t.contains("mcp.provision") || t.contains("mcp server") || t.contains("mcp route")
+            t.contains("mcp")
+                || t.contains("provision")
+                || t.contains("revoke mcp")
+                || t.contains("mcp.provision")
+                || t.contains("mcp server")
+                || t.contains("mcp route")
         }
-        _ => true, // Unknown skill — don't suppress
+        _ => false,
     }
 }
 

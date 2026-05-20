@@ -1629,12 +1629,14 @@ impl SessionState {
             };
 
             if !on_demand_ownership.is_empty() {
-                all_tools.retain(|tool| match on_demand_ownership.get(tool.tool_name.as_str()) {
-                    None => true,
-                    Some(owners) => owners
-                        .iter()
-                        .any(|s| crate::catalog::skill_is_relevant_for_turn(s, &normalized)),
-                });
+                all_tools.retain(
+                    |tool| match on_demand_ownership.get(tool.tool_name.as_str()) {
+                        None => true,
+                        Some(owners) => owners
+                            .iter()
+                            .any(|s| crate::catalog::skill_is_relevant_for_turn(s, &normalized)),
+                    },
+                );
             }
         }
 
@@ -1817,7 +1819,7 @@ impl SessionState {
                 started_at: None,
             },
             active_step,
-            role_activation: self.role_activation.clone(),
+            role_activation: self.projected_role_activation_for_turn(user_content, projected_tools),
             current_user_message: user_content.to_string(),
             budget: ContextBudget {
                 included_sections: layers.len(),
@@ -2043,6 +2045,87 @@ impl SessionState {
         })
     }
 
+    pub fn model_affordances_for_turn(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> Value {
+        let skills = self
+            .projected_skill_names_for_turn(user_content, projected_tools)
+            .into_iter()
+            .map(|skill| {
+                json!({
+                    "id": skill,
+                    "source": "session_projection",
+                })
+            })
+            .collect::<Vec<_>>();
+        let tools = projected_tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.tool_name,
+                    "class": tool.class,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "skills": skills,
+            "tools": tools,
+        })
+    }
+
+    fn projected_skill_names_for_turn(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> Vec<String> {
+        if self.bindings.effective_skillset.is_empty() {
+            return Vec::new();
+        }
+
+        let normalized = normalized_turn_text(user_content);
+        let projected_tool_names = projected_tools
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        self.bindings
+            .effective_skillset
+            .iter()
+            .filter(|skill| {
+                if self
+                    .bindings
+                    .on_demand_skills
+                    .iter()
+                    .any(|on_demand| on_demand == *skill)
+                {
+                    return crate::catalog::skill_is_relevant_for_turn(skill, &normalized);
+                }
+
+                let implied_tools = crate::catalog::skill_implied_tools(skill);
+                let owned_tools = crate::catalog::tools_for_skill(skill);
+                implied_tools
+                    .iter()
+                    .chain(owned_tools.iter())
+                    .any(|tool| projected_tool_names.contains(tool))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn projected_role_activation_for_turn(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> Option<RoleActivation> {
+        let mut activation = self.role_activation.clone()?;
+        activation.effective_skillset =
+            self.projected_skill_names_for_turn(user_content, projected_tools);
+        activation.effective_skill_guidance.clear();
+        Some(activation)
+    }
+
     fn push_layer(
         &self,
         layers: &mut Vec<LayerPayload>,
@@ -2102,19 +2185,6 @@ impl SessionState {
             .filter(|text| !text.is_empty())
         {
             lines.push(soul.to_string());
-        }
-
-        if !self.bindings.effective_skillset.is_empty() {
-            lines.push(format!(
-                "Current skill posture: {}.",
-                self.bindings.effective_skillset.join(", ")
-            ));
-        }
-        if !self.bindings.effective_skill_guidance.is_empty() {
-            lines.push(format!(
-                "\n[Skill guidance]\n{}",
-                self.bindings.effective_skill_guidance.join("\n\n")
-            ));
         }
 
         if let Some(role_activation) = self.role_activation.as_ref() {
@@ -2547,12 +2617,6 @@ impl SessionState {
             if let Some(toolset_profile_ref) = role_activation.toolset_profile_ref.as_deref() {
                 envelope.push_str(&format!("Role toolset profile: {}.\n", toolset_profile_ref));
             }
-            if !role_activation.effective_skillset.is_empty() {
-                envelope.push_str(&format!(
-                    "Role skillset posture: {}.\n",
-                    role_activation.effective_skillset.join(", ")
-                ));
-            }
             if let Some(working_memory_policy) = role_activation.working_memory_policy.as_deref() {
                 envelope.push_str(&format!(
                     "Role working-memory policy: {}.\n",
@@ -2577,12 +2641,6 @@ impl SessionState {
             .and_then(|turn| turn.provider_repair_note.as_deref())
         {
             envelope.push_str(&format!("Provider correction: {}.\n", note));
-        }
-        if !self.bindings.effective_toolset.is_empty() {
-            envelope.push_str(&format!(
-                "Effective tools: {}.\n",
-                self.bindings.effective_toolset.join(", ")
-            ));
         }
         if !projected_tools.is_empty() {
             envelope.push_str("Tools available:\n");
@@ -5154,7 +5212,9 @@ mod tests {
 
         let prompt = state.build_prompt("status");
         assert!(prompt.contains("Session status: paused."));
-        assert!(prompt.contains("Effective tools: echo."));
+        assert!(!prompt.contains("Effective tools: echo."));
+        assert!(prompt.contains("Tools available:"));
+        assert!(prompt.contains("echo"));
         assert!(prompt.contains("Workspace: workspace://main."));
         assert!(
             prompt
@@ -5364,8 +5424,52 @@ mod tests {
         assert!(prompt.contains("Active role posture: developer."));
         assert!(prompt.contains("Role addendum: Focus on implementation and code changes."));
         assert!(prompt.contains("Role toolset profile: codex."));
-        assert!(prompt.contains("Role skillset posture: planning, implementation."));
+        assert!(!prompt.contains("Role skillset posture: planning, implementation."));
         assert!(prompt.contains("Role working-memory policy: role_local."));
+    }
+
+    #[test]
+    fn model_affordances_project_visible_tools_without_raw_inventory_prompt_dump() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("workspace.read");
+        state.add_tool_binding("memory.recall");
+        state.add_tool_binding("memory.remember");
+        state.bindings.effective_skillset = vec!["context.synthesize".into(), "memory".into()];
+        state.bindings.on_demand_skills = vec!["context.synthesize".into()];
+
+        let projected = state.project_tools_for_turn("Help me plan the next memory slice");
+        let prompt =
+            state.build_prompt_with_tools("Help me plan the next memory slice", &projected);
+        let affordances =
+            state.model_affordances_for_turn("Help me plan the next memory slice", &projected);
+
+        assert!(!prompt.contains("Effective tools:"));
+        assert!(!prompt.contains("Current skill posture:"));
+        assert!(!prompt.contains("context.synthesize, memory"));
+        assert!(
+            affordances["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "echo")
+        );
+        assert!(
+            affordances["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["id"] == "memory")
+        );
+        assert!(
+            !affordances["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["id"] == "context.synthesize")
+        );
     }
 
     #[test]
