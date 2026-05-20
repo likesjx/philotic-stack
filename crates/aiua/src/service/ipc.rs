@@ -15102,6 +15102,7 @@ mod tests {
                 allowed_tools: vec!["session.status".into(), "workspace.read".into()],
                 allowed_classes: vec!["session".into(), "workspace".into()],
                 allowed_skills: vec!["handoff.back".into()],
+                on_demand_skills: vec![],
                 description: Some("Codex specialist role profile — workspace read access.".into()),
             })
             .expect("seed toolset profile");
@@ -18726,6 +18727,7 @@ mod tests {
                 allowed_tools: vec!["session.status".into(), "workspace.read".into()],
                 allowed_classes: vec!["session".into()],
                 allowed_skills: vec!["handoff.back".into()],
+                on_demand_skills: vec![],
                 description: None,
             })
             .expect("toolset profile should seed");
@@ -21747,6 +21749,7 @@ mod tests {
                 allowed_tools: vec!["workspace.read".into()],
                 allowed_classes: vec!["workflow".into()],
                 allowed_skills: vec!["handoff.back".into()],
+                on_demand_skills: vec![],
                 description: Some("Implementation-focused role lens.".into()),
             })
             .expect("toolset profile should seed");
@@ -25915,6 +25918,7 @@ mod tests {
                 allowed_tools: vec!["session.status".into()],
                 allowed_classes: vec![],
                 allowed_skills: vec![],
+                on_demand_skills: vec![],
                 description: None,
             })
             .expect("seed toolset profile");
@@ -26011,6 +26015,7 @@ mod tests {
                 allowed_tools: vec![],
                 allowed_classes: vec![],
                 allowed_skills: vec!["research".into(), "handoff.back".into()],
+                on_demand_skills: vec![],
                 description: None,
             })
             .expect("seed toolset profile with skills");
@@ -26111,6 +26116,7 @@ mod tests {
                 allowed_tools: vec![],
                 allowed_classes: vec![],
                 allowed_skills: vec![],
+                on_demand_skills: vec![],
                 description: None,
             })
             .expect("seed empty toolset profile");
@@ -26198,6 +26204,7 @@ mod tests {
                 allowed_tools: vec![],
                 allowed_classes: vec![],
                 allowed_skills: vec!["research".into()],
+                on_demand_skills: vec![],
                 description: None,
             })
             .expect("seed profile with research already present");
@@ -26299,6 +26306,7 @@ mod tests {
                 allowed_tools: vec![],
                 allowed_classes: vec![],
                 allowed_skills: vec![],
+                on_demand_skills: vec![],
                 description: None,
             })
             .expect("seed toolset profile");
@@ -26383,6 +26391,7 @@ mod tests {
                 allowed_tools: vec![],
                 allowed_classes: vec![],
                 allowed_skills: vec![],
+                on_demand_skills: vec![],
                 description: None,
             })
             .expect("seed toolset profile");

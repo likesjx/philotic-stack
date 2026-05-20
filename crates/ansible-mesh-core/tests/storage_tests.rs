@@ -920,6 +920,7 @@ fn graph_storage_toolset_profile_round_trip() {
         allowed_tools: vec!["session.status".into(), "echo".into()],
         allowed_classes: vec!["session".into()],
         allowed_skills: vec!["handoff.to_role".into()],
+        on_demand_skills: vec![],
         description: Some("Core orchestrator profile.".into()),
     };
 

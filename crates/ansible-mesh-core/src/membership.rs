@@ -466,6 +466,7 @@ mod tests {
                 allowed_tools: vec!["hotel.best_place_to_run".into()],
                 allowed_classes: vec!["config".into()],
                 allowed_skills: vec!["role.governance".into()],
+                on_demand_skills: vec![],
                 description: Some("admin defaults".into()),
             }],
         };
