@@ -29,6 +29,20 @@ pub trait MemoryEngine: Send + Sync {
         tags: Vec<String>,
     ) -> anyhow::Result<EngramRef>;
 
+    /// Store an engram with caller-supplied metadata. Implementations that do
+    /// not support metadata may fall back to `remember`; callers should treat
+    /// metadata persistence as best-effort unless the backend advertises it.
+    async fn remember_with_metadata(
+        &self,
+        scope: MemoryScope,
+        concept: &str,
+        content: &str,
+        tags: Vec<String>,
+        _metadata: serde_json::Value,
+    ) -> anyhow::Result<EngramRef> {
+        self.remember(scope, concept, content, tags).await
+    }
+
     /// Store multiple engrams in a single round-trip.
     async fn remember_batch(
         &self,

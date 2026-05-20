@@ -46,6 +46,20 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 - [ ] Prove roaming peer auto-reconnect live by validating observed-endpoint reconciliation against stale peer graph records.
 - [ ] Feed hotel-owned router traces and mesh events into the desktop event log through `philotic-web` so mesh/routing failures are visible without live journal spelunking.
 
+## New Project: Memory Cultivation and True-Up
+
+Proposal: [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)
+
+Seam IDs: `memory-spacetime-frame`, `memory-shaping-context`, `memory-cultivation-loop`, `graph-muninn-true-up`, `memory-promotion-gates`
+
+- [x] Implement `MemorySpacetimeFrame` and `MemoryShapingContext` for Philote memory recall shaping.
+- [x] Project temporal scope, spatial scope, authority, validation level, and space anchors into recalled memory sections.
+- [x] Attach graph-derived anchors as Muninn entities/relationships during `memory.remember`.
+- [x] Add the first low-risk `memory.cultivate` path for closeout and staleness review.
+- [x] Add graph-intelligence true-up finding records using existing node/mutation primitives before introducing new node kinds.
+- [x] Gate promotion from Muninn into AgentGraph/docs/code behind validation evidence or explicit operator approval.
+- [x] Deploy and watched-live verify on `mbp-jane` and `vps-jane` before claiming runtime truth.
+
 ### WI 1: Session Management
 
 Seam IDs: `session-leases`

@@ -96,6 +96,8 @@ struct WriteRequest {
     tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
     /// Caller-provided idempotency key. MuninnDB returns the existing engram
     /// if a live engram with this key already exists in the vault, rather than
     /// creating a duplicate. Use for identity/system writes that should
@@ -395,8 +397,24 @@ impl MemoryEngine for MuninnRestEngine {
         content: &str,
         tags: Vec<String>,
     ) -> anyhow::Result<EngramRef> {
+        self.remember_with_metadata(scope, concept, content, tags, serde_json::Value::Null)
+            .await
+    }
+
+    async fn remember_with_metadata(
+        &self,
+        scope: MemoryScope,
+        concept: &str,
+        content: &str,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> anyhow::Result<EngramRef> {
         let vault = self.resolver.resolve_primary(&scope);
         let tags = self.apply_lens_tags(tags).await;
+        let metadata = match metadata {
+            serde_json::Value::Null => None,
+            other => Some(other),
+        };
 
         let body = WriteRequest {
             vault: vault.clone(),
@@ -404,6 +422,7 @@ impl MemoryEngine for MuninnRestEngine {
             content: content.to_string(),
             tags,
             confidence: None,
+            metadata,
             idempotent_id: Some(format!("{}:{}", vault, concept)),
         };
 

@@ -10,9 +10,10 @@ use crate::protocol::{
 };
 use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
-    ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, RecalledMemoryRecord,
-    SessionState, ToolDefinition, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index,
+    ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors, MediaRoutingPolicy,
+    MemoryAuthority, MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope,
+    MemoryTemporalKind, MemoryValidationLevel, RecalledMemoryRecord, SessionState, ToolDefinition,
+    ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -60,6 +61,14 @@ fn engram_annotations(metadata: &Value) -> Option<Value> {
         .filter(|value| !value.is_null())
 }
 
+fn engram_spacetime_frame(metadata: &Value) -> Option<MemorySpacetimeFrame> {
+    metadata
+        .get("spacetime_frame")
+        .or_else(|| metadata.get("memory_spacetime_frame"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 fn recalled_memory_from_engram(
     engram: Engram,
     recall_reason: Option<&str>,
@@ -72,6 +81,7 @@ fn recalled_memory_from_engram(
     let relationships =
         engram_metadata_array(&engram.metadata, &["relationships", "entity_relationships"]);
     let annotations = engram_annotations(&engram.metadata);
+    let spacetime_frame = engram_spacetime_frame(&engram.metadata);
 
     RecalledMemoryRecord {
         id: Some(engram.id),
@@ -94,6 +104,7 @@ fn recalled_memory_from_engram(
         relationships,
         annotations,
         recall_reason: recall_reason.map(str::to_string),
+        spacetime_frame,
     }
 }
 
@@ -114,6 +125,395 @@ fn turn_memory_user_id(state: &SessionState) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| state.session_id.clone())
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn memory_enum_arg(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn memory_temporal_kind_from_arg(value: Option<&Value>) -> Option<MemoryTemporalKind> {
+    match memory_enum_arg(value)?.as_str() {
+        "event" => Some(MemoryTemporalKind::Event),
+        "state" => Some(MemoryTemporalKind::State),
+        "preference" => Some(MemoryTemporalKind::Preference),
+        "rule" => Some(MemoryTemporalKind::Rule),
+        "decision" => Some(MemoryTemporalKind::Decision),
+        "hypothesis" => Some(MemoryTemporalKind::Hypothesis),
+        "gap" => Some(MemoryTemporalKind::Gap),
+        "checkpoint" => Some(MemoryTemporalKind::Checkpoint),
+        _ => None,
+    }
+}
+
+fn memory_spatial_scope_from_arg(value: Option<&Value>, scope: &MemoryScope) -> MemorySpatialScope {
+    match memory_enum_arg(value).as_deref() {
+        Some("self") => MemorySpatialScope::SelfScope,
+        Some("agent") => MemorySpatialScope::Agent,
+        Some("user") => MemorySpatialScope::User,
+        Some("session") => MemorySpatialScope::Session,
+        Some("workspace") => MemorySpatialScope::Workspace,
+        Some("hotel") => MemorySpatialScope::Hotel,
+        Some("mesh") => MemorySpatialScope::Mesh,
+        Some("global") => MemorySpatialScope::Global,
+        _ => match scope {
+            MemoryScope::SharedUser => MemorySpatialScope::User,
+            MemoryScope::Session(_) => MemorySpatialScope::Session,
+            MemoryScope::CrossScope(_) => MemorySpatialScope::Mesh,
+            MemoryScope::SelfOnly => MemorySpatialScope::SelfScope,
+        },
+    }
+}
+
+fn memory_authority_from_arg(value: Option<&Value>) -> Option<MemoryAuthority> {
+    match memory_enum_arg(value)?.as_str() {
+        "observed_runtime" => Some(MemoryAuthority::ObservedRuntime),
+        "observed_repo" => Some(MemoryAuthority::ObservedRepo),
+        "graph_structured" => Some(MemoryAuthority::GraphStructured),
+        "user_stated" => Some(MemoryAuthority::UserStated),
+        "verified_memory" => Some(MemoryAuthority::VerifiedMemory),
+        "inferred_memory" => Some(MemoryAuthority::InferredMemory),
+        "external" => Some(MemoryAuthority::External),
+        "untrusted" => Some(MemoryAuthority::Untrusted),
+        _ => None,
+    }
+}
+
+fn memory_validation_level_from_arg(value: Option<&Value>) -> Option<MemoryValidationLevel> {
+    match memory_enum_arg(value)?.as_str() {
+        "unverified" => Some(MemoryValidationLevel::Unverified),
+        "check-green" | "check_green" => Some(MemoryValidationLevel::CheckGreen),
+        "test-green" | "test_green" => Some(MemoryValidationLevel::TestGreen),
+        "smoke-green" | "smoke_green" => Some(MemoryValidationLevel::SmokeGreen),
+        "watched-live-green" | "watched_live_green" => {
+            Some(MemoryValidationLevel::WatchedLiveGreen)
+        }
+        _ => None,
+    }
+}
+
+fn string_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn string_array_arg(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn graph_anchors_from_args(args: &Value) -> GraphAnchors {
+    let graph_anchors_arg = args.get("graph_anchors").filter(|v| v.is_object());
+    let value_for = |key: &str| -> Option<String> {
+        string_arg(args, key).or_else(|| graph_anchors_arg.and_then(|v| string_arg(v, key)))
+    };
+    let affected_nodes = {
+        let mut nodes = string_array_arg(args, "affected_nodes");
+        if nodes.is_empty() {
+            if let Some(v) = graph_anchors_arg {
+                nodes = string_array_arg(v, "affected_nodes");
+            }
+        }
+        nodes
+    };
+
+    GraphAnchors {
+        proposal_id: value_for("proposal_id"),
+        seam_id: value_for("seam_id"),
+        task_id: value_for("task_id"),
+        decision_id: value_for("decision_id"),
+        test_run_id: value_for("test_run_id"),
+        source_doc: value_for("source_doc"),
+        source_file: value_for("source_file"),
+        affected_nodes,
+    }
+}
+
+fn memory_shaping_context_for_write(
+    state: Option<&SessionState>,
+    args: &Value,
+    scope: &MemoryScope,
+) -> MemoryShapingContext {
+    let frame_arg = args.get("spacetime_frame").filter(|v| v.is_object());
+    let value_for = |key: &str| -> Option<String> {
+        string_arg(args, key).or_else(|| frame_arg.and_then(|v| string_arg(v, key)))
+    };
+    let number_for = |key: &str| -> Option<u64> {
+        args.get(key)
+            .and_then(Value::as_u64)
+            .or_else(|| frame_arg.and_then(|v| v.get(key)).and_then(Value::as_u64))
+    };
+    let primary_user_id = state
+        .and_then(|s| s.active_turn.as_ref())
+        .and_then(|turn| turn.primary_user_id.clone())
+        .or_else(|| value_for("primary_user_id"));
+
+    let frame = MemorySpacetimeFrame {
+        observed_at: number_for("observed_at").or_else(|| Some(now_unix_ms())),
+        valid_from: number_for("valid_from"),
+        valid_until: number_for("valid_until"),
+        last_verified_at: number_for("last_verified_at"),
+        temporal_kind: memory_temporal_kind_from_arg(
+            args.get("temporal_kind")
+                .or_else(|| frame_arg.and_then(|v| v.get("temporal_kind"))),
+        )
+        .or(Some(MemoryTemporalKind::State)),
+        spatial_scope: Some(memory_spatial_scope_from_arg(
+            args.get("spatial_scope")
+                .or_else(|| frame_arg.and_then(|v| v.get("spatial_scope"))),
+            scope,
+        )),
+        hotel_id: value_for("hotel_id")
+            .or_else(|| std::env::var("PHILOTIC_HOTEL_NAME").ok())
+            .or_else(|| std::env::var("PHILOTIC_HOTEL_ID").ok()),
+        node_id: value_for("node_id").or_else(|| std::env::var("PHILOTIC_NODE_ID").ok()),
+        workspace_path: value_for("workspace_path")
+            .or_else(|| std::env::var("PHILOTIC_WORKSPACE").ok()),
+        repo_id: value_for("repo_id"),
+        branch: value_for("branch"),
+        worktree_id: value_for("worktree_id"),
+        session_id: state.map(|s| s.session_id.clone()),
+        agent_id: state.map(|s| s.agent_id.clone()),
+        primary_user_id,
+        authority: memory_authority_from_arg(
+            args.get("authority")
+                .or_else(|| frame_arg.and_then(|v| v.get("authority"))),
+        )
+        .or(Some(MemoryAuthority::InferredMemory)),
+        validation_level: memory_validation_level_from_arg(
+            args.get("validation_level")
+                .or_else(|| args.get("validation"))
+                .or_else(|| frame_arg.and_then(|v| v.get("validation_level")))
+                .or_else(|| frame_arg.and_then(|v| v.get("validation"))),
+        ),
+    };
+
+    MemoryShapingContext {
+        frame,
+        graph_anchors: graph_anchors_from_args(args),
+        recall_policy: string_arg(args, "recall_policy"),
+        write_policy: string_arg(args, "write_policy"),
+        promotion_policy: string_arg(args, "promotion_policy"),
+    }
+}
+
+fn shaped_memory_tags(mut tags: Vec<String>, shaping: &MemoryShapingContext) -> Vec<String> {
+    if let Some(kind) = shaping.frame.temporal_kind {
+        tags.push(format!("temporal:{}", kind.as_str()));
+    }
+    if let Some(scope) = shaping.frame.spatial_scope {
+        tags.push(format!("scope:{}", scope.as_str()));
+    }
+    if let Some(authority) = shaping.frame.authority {
+        tags.push(format!("authority:{}", authority.as_str()));
+    }
+    if let Some(seam_id) = shaping.graph_anchors.seam_id.as_deref() {
+        tags.push(format!("seam:{seam_id}"));
+    }
+    if let Some(proposal_id) = shaping.graph_anchors.proposal_id.as_deref() {
+        tags.push(format!("proposal:{proposal_id}"));
+    }
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn shaped_memory_metadata(shaping: &MemoryShapingContext) -> Value {
+    let entities = shaped_memory_entities(shaping);
+    let relationships = shaped_memory_relationships(shaping, &entities);
+    serde_json::json!({
+        "spacetime_frame": shaping.frame,
+        "graph_anchors": shaping.graph_anchors,
+        "entities": entities,
+        "relationships": relationships,
+        "recall_policy": shaping.recall_policy,
+        "write_policy": shaping.write_policy,
+        "promotion_policy": shaping.promotion_policy,
+        "source": "philote.memory.remember",
+    })
+}
+
+fn shaped_memory_entities(shaping: &MemoryShapingContext) -> Vec<Value> {
+    let mut entities = Vec::new();
+    let mut push = |name: Option<&str>, entity_type: &str| {
+        if let Some(name) = name.map(str::trim).filter(|value| !value.is_empty()) {
+            entities.push(serde_json::json!({
+                "name": name,
+                "type": entity_type,
+            }));
+        }
+    };
+
+    push(shaping.graph_anchors.proposal_id.as_deref(), "proposal");
+    push(shaping.graph_anchors.seam_id.as_deref(), "seam");
+    push(shaping.graph_anchors.task_id.as_deref(), "task");
+    push(shaping.frame.session_id.as_deref(), "session");
+    push(shaping.frame.agent_id.as_deref(), "agent");
+    push(shaping.frame.primary_user_id.as_deref(), "user");
+    push(shaping.frame.hotel_id.as_deref(), "hotel");
+    push(shaping.frame.node_id.as_deref(), "node");
+
+    for affected in &shaping.graph_anchors.affected_nodes {
+        push(Some(affected), "graph_node");
+    }
+
+    entities
+}
+
+fn shaped_memory_relationships(shaping: &MemoryShapingContext, entities: &[Value]) -> Vec<Value> {
+    let mut relationships = Vec::new();
+    let has_entity = |name: &str| {
+        entities
+            .iter()
+            .any(|entity| entity.get("name").and_then(Value::as_str) == Some(name))
+    };
+    let mut push = |from: Option<&str>, rel_type: &str, to: Option<&str>| {
+        let Some(from) = from.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let Some(to) = to.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if has_entity(from) && has_entity(to) {
+            relationships.push(serde_json::json!({
+                "from_entity": from,
+                "rel_type": rel_type,
+                "to_entity": to,
+                "weight": 0.9,
+            }));
+        }
+    };
+
+    push(
+        shaping.graph_anchors.seam_id.as_deref(),
+        "belongs_to",
+        shaping.graph_anchors.proposal_id.as_deref(),
+    );
+    push(
+        shaping.graph_anchors.task_id.as_deref(),
+        "belongs_to",
+        shaping.graph_anchors.seam_id.as_deref(),
+    );
+    push(
+        shaping.frame.session_id.as_deref(),
+        "worked_by",
+        shaping.frame.agent_id.as_deref(),
+    );
+    push(
+        shaping.frame.session_id.as_deref(),
+        "serves_user",
+        shaping.frame.primary_user_id.as_deref(),
+    );
+    push(
+        shaping.frame.node_id.as_deref(),
+        "runs_in",
+        shaping.frame.hotel_id.as_deref(),
+    );
+
+    relationships
+}
+
+fn memory_text_arg(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| string_arg(args, key))
+}
+
+fn classify_memory_true_up(args: &Value) -> Value {
+    let memory_claim = memory_text_arg(args, &["memory_claim", "claim"]);
+    let observed_truth = memory_text_arg(args, &["observed_truth", "observed"]);
+    let graph_truth = memory_text_arg(args, &["graph_truth", "graph"]);
+    let resolution = memory_text_arg(args, &["resolution"]);
+
+    let normalize = |value: &str| value.trim().to_ascii_lowercase();
+    let finding_type = match (&memory_claim, &observed_truth, &graph_truth) {
+        (Some(memory), Some(observed), _) if normalize(memory) == normalize(observed) => {
+            "confirmed"
+        }
+        (Some(memory), Some(observed), _) if normalize(memory) != normalize(observed) => {
+            "contradicted"
+        }
+        (Some(memory), None, Some(graph)) if normalize(memory) == normalize(graph) => "confirmed",
+        (Some(memory), None, Some(graph)) if normalize(memory) != normalize(graph) => {
+            "contradicted"
+        }
+        (Some(_), None, None) => "underspecified",
+        (None, Some(_), Some(_)) => "missing_memory",
+        _ => "needs_operator",
+    };
+
+    serde_json::json!({
+        "finding_type": finding_type,
+        "memory_claim": memory_claim,
+        "observed_truth": observed_truth,
+        "graph_truth": graph_truth,
+        "resolution": resolution,
+        "recommended_action": match finding_type {
+            "confirmed" => "keep",
+            "contradicted" => "true_up_required",
+            "missing_memory" => "consider_remember",
+            "underspecified" => "gather_evidence",
+            _ => "operator_review",
+        },
+        "requires_operator": matches!(finding_type, "contradicted" | "needs_operator"),
+    })
+}
+
+fn promotion_gate_report(args: &Value) -> Value {
+    let authority =
+        memory_authority_from_arg(args.get("authority")).unwrap_or(MemoryAuthority::InferredMemory);
+    let validation_level = memory_validation_level_from_arg(
+        args.get("validation_level")
+            .or_else(|| args.get("validation")),
+    )
+    .unwrap_or(MemoryValidationLevel::Unverified);
+    let evidence_refs = string_array_arg(args, "evidence_refs");
+    let operator_approved = args
+        .get("operator_approved")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let authority_ok = !matches!(
+        authority,
+        MemoryAuthority::InferredMemory | MemoryAuthority::Untrusted
+    ) || operator_approved;
+    let validation_ok =
+        !matches!(validation_level, MemoryValidationLevel::Unverified) || operator_approved;
+    let evidence_ok = !evidence_refs.is_empty() || operator_approved;
+    let allowed = authority_ok && validation_ok && evidence_ok;
+
+    serde_json::json!({
+        "allowed": allowed,
+        "authority": authority.as_str(),
+        "validation_level": validation_level.as_str(),
+        "evidence_refs": evidence_refs,
+        "operator_approved": operator_approved,
+        "required_before_promotion": {
+            "authority": if authority_ok { Value::Null } else { Value::String("observed_runtime, observed_repo, graph_structured, user_stated, verified_memory, or operator approval".into()) },
+            "validation": if validation_ok { Value::Null } else { Value::String("check-green or stronger, or operator approval".into()) },
+            "evidence": if evidence_ok { Value::Null } else { Value::String("at least one evidence_ref, or operator approval".into()) },
+        }
+    })
 }
 
 fn inbound_primary_user_id(task: &InboundTaskPayload) -> Option<String> {
@@ -8305,9 +8705,18 @@ impl AgentRuntime {
             }
             "hotel.best_place_to_run" => {
                 let args = &payload.arguments;
-                let agent_id = args.get("agent_id").and_then(|v| v.as_str()).map(str::to_string);
-                let role_name = args.get("role_name").and_then(|v| v.as_str()).map(str::to_string);
-                let tool_name = args.get("tool_name").and_then(|v| v.as_str()).map(str::to_string);
+                let agent_id = args
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let role_name = args
+                    .get("role_name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let tool_name = args
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 let required_markers = args
                     .get("required_markers")
                     .and_then(|v| v.as_array())
@@ -8357,9 +8766,16 @@ impl AgentRuntime {
                                     .iter()
                                     .take(5)
                                     .map(|c| {
-                                        let h = c.get("hotel_name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                        let n = c.get("node_id").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                        let s = c.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
+                                        let h = c
+                                            .get("hotel_name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown");
+                                        let n = c
+                                            .get("node_id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown");
+                                        let s =
+                                            c.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
                                         format!("- {} ({}) score={}", h, n, s)
                                     })
                                     .collect::<Vec<_>>()
@@ -11276,10 +11692,20 @@ impl AgentRuntime {
                     .get(&payload.session_id)
                     .map(turn_memory_user_id)
                     .unwrap_or_else(|| self.agent_id.clone());
+                let shaping = memory_shaping_context_for_write(
+                    self.sessions.get(&payload.session_id),
+                    &payload.arguments,
+                    &scope,
+                );
+                let tags = shaped_memory_tags(tags, &shaping);
+                let metadata = shaped_memory_metadata(&shaping);
                 let result_text = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
                     None => "Memory unavailable: MuninnDB not configured.".to_string(),
                     Some(engine) => {
-                        match engine.remember(scope, &concept, &content_str, tags).await {
+                        match engine
+                            .remember_with_metadata(scope, &concept, &content_str, tags, metadata)
+                            .await
+                        {
                             Ok(engram_ref) => {
                                 let _ = engine.retry_enrich(&engram_ref.id).await;
                                 format!(
@@ -11306,6 +11732,175 @@ impl AgentRuntime {
                     sender_username: None,
                     message_kind: None,
                     content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "memory.cultivate" => {
+                use memory_core::MemoryEngine as _;
+
+                let query = payload
+                    .arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("memory cultivation candidates")
+                    .to_string();
+                let limit = payload
+                    .arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(8)
+                    .clamp(1, 20);
+                let mode = payload
+                    .arguments
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("report");
+                let scope = memory_scope_from_tool_arg(
+                    payload.arguments.get("scope").and_then(|v| v.as_str()),
+                    &payload.session_id,
+                );
+                let memory_user_id = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .map(turn_memory_user_id)
+                    .unwrap_or_else(|| self.agent_id.clone());
+
+                let report = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
+                    None => serde_json::json!({
+                        "ok": false,
+                        "error": "MuninnDB not configured",
+                    }),
+                    Some(engine) => match engine.activate(&query, scope, Some(limit)).await {
+                        Err(e) => serde_json::json!({
+                            "ok": false,
+                            "error": e.to_string(),
+                        }),
+                        Ok(result) => {
+                            let candidates = result
+                                .engrams
+                                .iter()
+                                .map(|engram| {
+                                    let has_frame =
+                                        engram_spacetime_frame(&engram.metadata).is_some();
+                                    let has_entities =
+                                        !engram_metadata_array(&engram.metadata, &["entities"])
+                                            .is_empty();
+                                    serde_json::json!({
+                                        "id": engram.id,
+                                        "concept": engram.concept,
+                                        "vault_id": engram.vault_id,
+                                        "needs_spacetime_frame": !has_frame,
+                                        "needs_entity_overlay": !has_entities,
+                                        "recommended_action": if !has_frame || !has_entities {
+                                            "enrich_metadata"
+                                        } else {
+                                            "keep"
+                                        },
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            serde_json::json!({
+                                "ok": true,
+                                "mode": mode,
+                                "query": query,
+                                "mutation_performed": false,
+                                "candidates": candidates,
+                            })
+                        }
+                    },
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(report.to_string()),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "memory.true_up" => {
+                let report = classify_memory_true_up(&payload.arguments);
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(report.to_string()),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "memory.promote_candidate" => {
+                let report = promotion_gate_report(&payload.arguments);
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(report.to_string()),
                     attachments: Vec::new(),
                     command: None,
                     callback_data: None,
