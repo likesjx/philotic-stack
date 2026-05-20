@@ -3786,19 +3786,27 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             allowed_skills: vec![
                 "handoff.to_role".into(),
                 "handoff.back".into(),
-                "role.governance".into(),
-                "role.authoring".into(),
-                "skill.authoring".into(),
                 "memory.fix".into(),
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
-                "observability.pipeline".into(),
                 "session.recover".into(),
-                "agent.initiate".into(),
+            ],
+            // Domain-specific skill groups: injected per-turn only when the
+            // turn content signals the skill's domain (cron scheduling, table
+            // pipelines, graph operations, etc.). Reduces Gemini context from
+            // ~47 tool schemas to ~10-15 for typical orchestrator turns.
+            on_demand_skills: vec![
                 "cron.manage".into(),
-                "context.synthesize".into(),
-                "profile.manage".into(),
+                "observability.pipeline".into(),
                 "graph.knowledge".into(),
+                "routing.refinement".into(),
+                "role.governance".into(),
+                "role.authoring".into(),
+                "skill.authoring".into(),
+                "context.synthesize".into(),
+                "agent.initiate".into(),
+                "profile.manage".into(),
+                "mcp.manage".into(),
             ],
             description: Some("Default orchestrator role profile.".into()),
         },
@@ -3823,6 +3831,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
                 "graph.knowledge".into(),
             ],
+            on_demand_skills: vec![],
             description: Some("Codex specialist role profile — workspace read access.".into()),
         },
         ToolsetProfileRecord {
@@ -3844,6 +3853,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
                 "graph.knowledge".into(),
             ],
+            on_demand_skills: vec![],
             description: Some("Research specialist role profile — minimal tool surface.".into()),
         },
         ToolsetProfileRecord {
@@ -3863,6 +3873,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "session.recover".into(),
             ],
+            on_demand_skills: vec![],
             description: Some("Bare utility profile — session and echo only.".into()),
         },
         ToolsetProfileRecord {
@@ -3953,6 +3964,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "profile.manage".into(),
             ],
+            on_demand_skills: vec![],
             description: Some(
                 "Admin role profile — full skill crafting, role governance, training data authority, ASR provisioning, vision model provisioning, and cron scheduling.".into(),
             ),
@@ -3984,6 +3996,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "session.recover".into(),
             ],
+            on_demand_skills: vec![],
             description: Some(
                 "Architect specialist role profile — systems, infrastructure, debugging. \
                  bash.exec requires operator approval."
@@ -4007,6 +4020,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "session.recover".into(),
             ],
+            on_demand_skills: vec![],
             description: Some(
                 "Virtuoso specialist role profile — creative and expressive. \
                  Minimal tools, focused on reflection and lyrical output."

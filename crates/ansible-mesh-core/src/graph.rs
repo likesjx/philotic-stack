@@ -198,6 +198,12 @@ pub struct ToolsetProfileRecord {
     /// Skill names whose `implied_tools` are transitively granted.
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+    /// Skills whose tools are included in the ToolAssembly but suppressed from
+    /// the model's visible list unless the current turn's content activates
+    /// the skill. Use for domain-specific tool groups (cron, table, graph, etc.)
+    /// that should not appear in every orchestrator turn.
+    #[serde(default)]
+    pub on_demand_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }

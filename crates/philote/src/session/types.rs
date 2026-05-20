@@ -290,6 +290,184 @@ pub struct Context1Advisory {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemorySpacetimeFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_kind: Option<MemoryTemporalKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial_scope: Option<MemorySpatialScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<MemoryAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_level: Option<MemoryValidationLevel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryTemporalKind {
+    Event,
+    State,
+    Preference,
+    Rule,
+    Decision,
+    Hypothesis,
+    Gap,
+    Checkpoint,
+}
+
+impl MemoryTemporalKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::State => "state",
+            Self::Preference => "preference",
+            Self::Rule => "rule",
+            Self::Decision => "decision",
+            Self::Hypothesis => "hypothesis",
+            Self::Gap => "gap",
+            Self::Checkpoint => "checkpoint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySpatialScope {
+    #[serde(rename = "self")]
+    SelfScope,
+    Agent,
+    User,
+    Session,
+    Workspace,
+    Hotel,
+    Mesh,
+    Global,
+}
+
+impl MemorySpatialScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SelfScope => "self",
+            Self::Agent => "agent",
+            Self::User => "user",
+            Self::Session => "session",
+            Self::Workspace => "workspace",
+            Self::Hotel => "hotel",
+            Self::Mesh => "mesh",
+            Self::Global => "global",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAuthority {
+    ObservedRuntime,
+    ObservedRepo,
+    GraphStructured,
+    UserStated,
+    VerifiedMemory,
+    InferredMemory,
+    External,
+    Untrusted,
+}
+
+impl MemoryAuthority {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ObservedRuntime => "observed_runtime",
+            Self::ObservedRepo => "observed_repo",
+            Self::GraphStructured => "graph_structured",
+            Self::UserStated => "user_stated",
+            Self::VerifiedMemory => "verified_memory",
+            Self::InferredMemory => "inferred_memory",
+            Self::External => "external",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryValidationLevel {
+    Unverified,
+    CheckGreen,
+    TestGreen,
+    SmokeGreen,
+    WatchedLiveGreen,
+}
+
+impl MemoryValidationLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::CheckGreen => "check-green",
+            Self::TestGreen => "test-green",
+            Self::SmokeGreen => "smoke-green",
+            Self::WatchedLiveGreen => "watched-live-green",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct GraphAnchors {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seam_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_nodes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryShapingContext {
+    pub frame: MemorySpacetimeFrame,
+    #[serde(default)]
+    pub graph_anchors: GraphAnchors,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RecalledMemoryRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -321,6 +499,8 @@ pub struct RecalledMemoryRecord {
     pub annotations: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacetime_frame: Option<MemorySpacetimeFrame>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -854,6 +1034,11 @@ pub struct SessionBindings {
     pub effective_skillset: Vec<String>,
     #[serde(default)]
     pub effective_skill_guidance: Vec<String>,
+    /// Skills whose tools are in the ToolAssembly but suppressed per-turn unless
+    /// the turn content signals the skill is needed. Populated from the role's
+    /// toolset profile `on_demand_skills` list at session snapshot time.
+    #[serde(default)]
+    pub on_demand_skills: Vec<String>,
     #[serde(default)]
     pub effective_workspace_ref: Option<String>,
     #[serde(default)]
@@ -1123,4 +1308,3 @@ pub struct UserTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_note: Option<String>,
 }
-

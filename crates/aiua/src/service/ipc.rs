@@ -12441,16 +12441,35 @@ impl IpcServer {
                         skillset.push(skill.clone());
                     }
                 }
+                // Merge on_demand_skills from profile (without expanding their tools).
+                // These skills gate which tool schemas are visible per-turn in philote.
+                let mut on_demand: Vec<String> = bindings
+                    .get("on_demand_skills")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                    .unwrap_or_default();
+                for skill in &profile.on_demand_skills {
+                    if !on_demand.contains(skill) {
+                        on_demand.push(skill.clone());
+                    }
+                }
+
                 if let Some(obj) = bindings.as_object_mut() {
                     obj.insert("effective_toolset".to_string(), serde_json::json!(toolset));
                     obj.insert(
                         "effective_skillset".to_string(),
                         serde_json::json!(skillset),
                     );
+                    if !on_demand.is_empty() {
+                        obj.insert(
+                            "on_demand_skills".to_string(),
+                            serde_json::json!(on_demand),
+                        );
+                    }
                 } else {
                     bindings = serde_json::json!({
                         "effective_toolset": toolset,
                         "effective_skillset": skillset,
+                        "on_demand_skills": on_demand,
                     });
                 }
             }

@@ -60,6 +60,13 @@ fn first_line_summary(text: &str) -> String {
         .unwrap_or_else(|| "empty".into())
 }
 
+fn json_escape_for_projection(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .trim_matches('"')
+        .to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
@@ -1590,9 +1597,45 @@ impl SessionState {
         if !looks_like_memory_write_goal(&normalized) {
             all_tools.retain(|tool| tool.tool_name != "memory.remember");
         }
+        if !looks_like_memory_cultivation_goal(&normalized) {
+            all_tools.retain(|tool| tool.tool_name != "memory.cultivate");
+        }
+        if !looks_like_memory_true_up_goal(&normalized) {
+            all_tools.retain(|tool| tool.tool_name != "memory.true_up");
+        }
+        if !looks_like_memory_promotion_goal(&normalized) {
+            all_tools.retain(|tool| tool.tool_name != "memory.promote_candidate");
+        }
 
         if !looks_like_execution_goal(&normalized) {
             all_tools.retain(|tool| tool.class.as_deref() != Some("shell"));
+        }
+
+        // Strip on-demand skill tools whose domain is not signaled by this turn.
+        // Build a reverse map of tool_name → owning on-demand skills once, then
+        // filter: keep a tool only if it has no on-demand owner OR at least one
+        // of its owning skills is relevant for this turn.
+        if !self.bindings.on_demand_skills.is_empty() {
+            // Collect (tool_name, owning_skills) for all on-demand-gated tools.
+            let on_demand_ownership: std::collections::HashMap<&str, Vec<&str>> = {
+                let mut map: std::collections::HashMap<&str, Vec<&str>> =
+                    std::collections::HashMap::new();
+                for skill in &self.bindings.on_demand_skills {
+                    for &tool in crate::catalog::tools_for_skill(skill.as_str()) {
+                        map.entry(tool).or_default().push(skill.as_str());
+                    }
+                }
+                map
+            };
+
+            if !on_demand_ownership.is_empty() {
+                all_tools.retain(|tool| match on_demand_ownership.get(tool.tool_name.as_str()) {
+                    None => true,
+                    Some(owners) => owners
+                        .iter()
+                        .any(|s| crate::catalog::skill_is_relevant_for_turn(s, &normalized)),
+                });
+            }
         }
 
         all_tools
@@ -1735,20 +1778,26 @@ impl SessionState {
             );
         }
 
-        if let Some(graph_content) = self
-            .agent_graph_snapshot
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
+        let agent_graph_content = self.project_agent_graph_with_memory_overlay();
+        if !agent_graph_content.is_empty() {
+            let mut source_refs = vec!["agent_graph_snapshot".into()];
+            if self
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| !turn.recalled_memories.is_empty())
+            {
+                source_refs.push("active_turn.recalled_memories.entities".into());
+                source_refs.push("active_turn.recalled_memories.relationships".into());
+            }
             self.push_layer(
                 &mut layers,
                 &mut contributions,
                 ContextLayerId::AgentGraph,
-                "graph_datasource:agent_partition",
+                "graph_datasource:agent_partition+memory_core:entity_overlay",
                 ContextAuthority::Advisory,
                 ContextMutability::Refreshable,
-                graph_content.to_string(),
-                vec!["agent_graph_snapshot".into()],
+                agent_graph_content,
+                source_refs,
                 "graph_candidate",
             );
         }
@@ -1760,7 +1809,10 @@ impl SessionState {
                 agent_id: self.agent_id.clone(),
                 source: self.source.clone(),
                 active_incarnation_id: self.active_incarnation_id.clone(),
-                primary_user_id: None,
+                primary_user_id: self
+                    .active_turn
+                    .as_ref()
+                    .and_then(|turn| turn.primary_user_id.clone()),
                 trigger_kind: "user_message".into(),
                 started_at: None,
             },
@@ -2309,11 +2361,54 @@ impl SessionState {
             if let Some(summary) = memory.summary.as_deref().filter(|text| !text.is_empty()) {
                 out.push_str(&format!("\n   summary: {summary}"));
             }
+            let frame = self.memory_spacetime_frame_for(memory);
+            if let Some(temporal_kind) = frame.temporal_kind {
+                out.push_str(&format!("\n   temporal_kind: {}", temporal_kind.as_str()));
+            }
+            if let Some(observed_at) = frame.observed_at {
+                out.push_str(&format!(
+                    "\n   observed_at: {}",
+                    format_memory_timestamp(observed_at)
+                ));
+            }
+            if let Some(last_verified_at) = frame.last_verified_at {
+                out.push_str(&format!(
+                    "\n   last_verified_at: {}",
+                    format_memory_timestamp(last_verified_at)
+                ));
+            }
+            if let Some(valid_from) = frame.valid_from {
+                out.push_str(&format!(
+                    "\n   valid_from: {}",
+                    format_memory_timestamp(valid_from)
+                ));
+            }
+            if let Some(valid_until) = frame.valid_until {
+                out.push_str(&format!(
+                    "\n   valid_until: {}",
+                    format_memory_timestamp(valid_until)
+                ));
+            }
+            if let Some(spatial_scope) = frame.spatial_scope {
+                out.push_str(&format!("\n   spatial_scope: {}", spatial_scope.as_str()));
+            }
+            if let Some(space) = memory_space_summary(&frame) {
+                out.push_str(&format!("\n   space: {space}"));
+            }
+            if let Some(authority) = frame.authority {
+                out.push_str(&format!("\n   authority: {}", authority.as_str()));
+            }
+            if let Some(validation_level) = frame.validation_level {
+                out.push_str(&format!("\n   validation: {}", validation_level.as_str()));
+            }
             if !memory.entities.is_empty() {
                 out.push_str(&format!("\n   entities: {}", memory.entities.len()));
             }
             if !memory.relationships.is_empty() {
-                out.push_str(&format!("\n   relationships: {}", memory.relationships.len()));
+                out.push_str(&format!(
+                    "\n   relationships: {}",
+                    memory.relationships.len()
+                ));
             }
             if let Some(annotations) = memory.annotations.as_ref().filter(|v| !v.is_null()) {
                 out.push_str(&format!("\n   annotations: {annotations}"));
@@ -2321,6 +2416,120 @@ impl SessionState {
             out.push('\n');
         }
         out.trim_end().to_string()
+    }
+
+    fn memory_spacetime_frame_for(&self, memory: &RecalledMemoryRecord) -> MemorySpacetimeFrame {
+        let mut frame = memory.spacetime_frame.clone().unwrap_or_default();
+        if frame.observed_at.is_none() {
+            frame.observed_at = memory.created_at;
+        }
+        if frame.last_verified_at.is_none() {
+            frame.last_verified_at = memory.updated_at;
+        }
+        if frame.temporal_kind.is_none() {
+            frame.temporal_kind = Some(infer_memory_temporal_kind(memory));
+        }
+        if frame.spatial_scope.is_none() {
+            frame.spatial_scope = Some(infer_memory_spatial_scope(memory));
+        }
+        if frame.session_id.is_none() {
+            frame.session_id = Some(self.session_id.clone());
+        }
+        if frame.agent_id.is_none() {
+            frame.agent_id = Some(self.agent_id.clone());
+        }
+        if frame.primary_user_id.is_none() {
+            frame.primary_user_id = self
+                .active_turn
+                .as_ref()
+                .and_then(|turn| turn.primary_user_id.clone());
+        }
+        if frame.authority.is_none() {
+            frame.authority = Some(infer_memory_authority(memory));
+        }
+        frame
+    }
+
+    fn project_agent_graph_with_memory_overlay(&self) -> String {
+        let graph_content = self
+            .agent_graph_snapshot
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let Some(turn) = self.active_turn.as_ref() else {
+            return graph_content
+                .map(|content| format!("[Agent graph]\n{content}"))
+                .unwrap_or_default();
+        };
+
+        let mut entity_lines = Vec::new();
+        let mut relation_lines = Vec::new();
+        for memory in &turn.recalled_memories {
+            let memory_id = memory.id.as_deref().unwrap_or("unknown");
+            let concept = memory.concept.as_str();
+            for entity in &memory.entities {
+                let Some(name) = entity.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let entity_type = entity
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("entity");
+                entity_lines.push(format!(
+                    "MuninnEntity: {{\"name\":\"{}\",\"type\":\"{}\",\"memory_id\":\"{}\",\"concept\":\"{}\"}}",
+                    json_escape_for_projection(name),
+                    json_escape_for_projection(entity_type),
+                    json_escape_for_projection(memory_id),
+                    json_escape_for_projection(concept),
+                ));
+            }
+            for relationship in &memory.relationships {
+                let Some(from) = relationship
+                    .get("from_entity")
+                    .or_else(|| relationship.get("from"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(to) = relationship
+                    .get("to_entity")
+                    .or_else(|| relationship.get("to"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let rel_type = relationship
+                    .get("rel_type")
+                    .or_else(|| relationship.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("relates_to");
+                relation_lines.push(format!(
+                    "MuninnRelation: {{\"from\":\"{}\",\"rel_type\":\"{}\",\"to\":\"{}\",\"memory_id\":\"{}\"}}",
+                    json_escape_for_projection(from),
+                    json_escape_for_projection(rel_type),
+                    json_escape_for_projection(to),
+                    json_escape_for_projection(memory_id),
+                ));
+            }
+        }
+
+        let mut sections = Vec::new();
+        if let Some(content) = graph_content {
+            sections.push(format!("[Agent graph]\n{content}"));
+        }
+        if !entity_lines.is_empty() || !relation_lines.is_empty() {
+            let mut overlay = String::from("[Muninn entity overlay]\n");
+            overlay.push_str(
+                "Advisory continuity hints from recalled memories. Current graph/code truth wins on conflict.\n",
+            );
+            overlay.push_str(&entity_lines.join("\n"));
+            if !entity_lines.is_empty() && !relation_lines.is_empty() {
+                overlay.push('\n');
+            }
+            overlay.push_str(&relation_lines.join("\n"));
+            sections.push(overlay.trim_end().to_string());
+        }
+        sections.join("\n\n")
     }
 
     fn project_session_context(&self, projected_tools: &[ToolDefinition]) -> String {
@@ -3223,6 +3432,51 @@ fn looks_like_memory_write_goal(normalized: &str) -> bool {
     .any(|phrase| normalized.contains(phrase))
 }
 
+fn looks_like_memory_cultivation_goal(normalized: &str) -> bool {
+    [
+        "cultivate memory",
+        "memory cultivate",
+        "memory cultivation",
+        "memory maintenance",
+        "memory sweep",
+        "closeout",
+        "memory delta",
+        "true-up",
+        "true up",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_memory_true_up_goal(normalized: &str) -> bool {
+    [
+        "true-up",
+        "true up",
+        "recalibration",
+        "contradiction",
+        "contradictions",
+        "reality gap",
+        "memory gap",
+        "stale memory",
+        "graph mismatch",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_memory_promotion_goal(normalized: &str) -> bool {
+    [
+        "promote memory",
+        "promote candidate",
+        "memory promotion",
+        "make durable",
+        "operator approved",
+        "verified memory",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
 fn normalized_turn_text(user_content: &str) -> String {
     user_content
         .trim()
@@ -3444,6 +3698,9 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "agent.configure"
             | "memory.recall"
             | "memory.remember"
+            | "memory.cultivate"
+            | "memory.true_up"
+            | "memory.promote_candidate"
             | "rule.propose"
             | "routing.policy.propose"
             | "routing.reflex.set"
@@ -3748,6 +4005,133 @@ fn projection_item(text: &str, source_ref: &str, projection_kind: &str) -> Value
     })
 }
 
+fn format_memory_timestamp(value: u64) -> String {
+    if value >= 1_000_000_000_000 {
+        format!("unix_ms={value}")
+    } else {
+        format!("unix_s={value}")
+    }
+}
+
+fn infer_memory_temporal_kind(memory: &RecalledMemoryRecord) -> MemoryTemporalKind {
+    let haystack = format!(
+        "{} {} {}",
+        memory.memory_type.as_deref().unwrap_or_default(),
+        memory.concept,
+        memory.tags.join(" ")
+    )
+    .to_ascii_lowercase();
+
+    if haystack.contains("decision") {
+        MemoryTemporalKind::Decision
+    } else if haystack.contains("preference") || haystack.contains("operator-preference") {
+        MemoryTemporalKind::Preference
+    } else if haystack.contains("rule") || haystack.contains("protocol") {
+        MemoryTemporalKind::Rule
+    } else if haystack.contains("hypothesis") || haystack.contains("inferred") {
+        MemoryTemporalKind::Hypothesis
+    } else if haystack.contains("gap") || haystack.contains("reality-gap") {
+        MemoryTemporalKind::Gap
+    } else if haystack.contains("checkpoint") || haystack.contains("where-left-off") {
+        MemoryTemporalKind::Checkpoint
+    } else if haystack.contains("event") {
+        MemoryTemporalKind::Event
+    } else {
+        MemoryTemporalKind::State
+    }
+}
+
+fn infer_memory_spatial_scope(memory: &RecalledMemoryRecord) -> MemorySpatialScope {
+    if let Some(vault) = memory.vault_id.as_deref() {
+        if vault.starts_with("user_") {
+            return MemorySpatialScope::User;
+        }
+        if vault.starts_with("session_") {
+            return MemorySpatialScope::Session;
+        }
+        if vault.starts_with("agent_") {
+            return MemorySpatialScope::Agent;
+        }
+    }
+    if memory
+        .tags
+        .iter()
+        .any(|tag| tag == "mesh" || tag == "multi-hotel")
+    {
+        MemorySpatialScope::Mesh
+    } else if memory
+        .tags
+        .iter()
+        .any(|tag| tag == "workspace" || tag == "repo")
+    {
+        MemorySpatialScope::Workspace
+    } else {
+        MemorySpatialScope::Session
+    }
+}
+
+fn infer_memory_authority(memory: &RecalledMemoryRecord) -> MemoryAuthority {
+    match memory.trust.as_deref() {
+        Some("verified") => return MemoryAuthority::VerifiedMemory,
+        Some("external") => return MemoryAuthority::External,
+        Some("untrusted") => return MemoryAuthority::Untrusted,
+        _ => {}
+    }
+
+    let source = memory
+        .source
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if source.contains("runtime") || source.contains("watched") {
+        MemoryAuthority::ObservedRuntime
+    } else if source.contains("repo") || source.contains("code") {
+        MemoryAuthority::ObservedRepo
+    } else if source.contains("graph") {
+        MemoryAuthority::GraphStructured
+    } else if source.contains("user") || source.contains("operator") {
+        MemoryAuthority::UserStated
+    } else {
+        MemoryAuthority::InferredMemory
+    }
+}
+
+fn memory_space_summary(frame: &MemorySpacetimeFrame) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(workspace_path) = frame.workspace_path.as_deref() {
+        parts.push(format!("workspace={workspace_path}"));
+    }
+    if let Some(repo_id) = frame.repo_id.as_deref() {
+        parts.push(format!("repo={repo_id}"));
+    }
+    if let Some(branch) = frame.branch.as_deref() {
+        parts.push(format!("branch={branch}"));
+    }
+    if let Some(worktree_id) = frame.worktree_id.as_deref() {
+        parts.push(format!("worktree={worktree_id}"));
+    }
+    if let Some(hotel_id) = frame.hotel_id.as_deref() {
+        parts.push(format!("hotel={hotel_id}"));
+    }
+    if let Some(node_id) = frame.node_id.as_deref() {
+        parts.push(format!("node={node_id}"));
+    }
+    if let Some(session_id) = frame.session_id.as_deref() {
+        parts.push(format!("session={session_id}"));
+    }
+    if let Some(agent_id) = frame.agent_id.as_deref() {
+        parts.push(format!("agent={agent_id}"));
+    }
+    if let Some(primary_user_id) = frame.primary_user_id.as_deref() {
+        parts.push(format!("user={primary_user_id}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
 fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3811,11 +4195,13 @@ mod tests {
     use super::{
         ActivePlan, ApprovalPolicy, ApprovalRiskHint, ComponentExecutionRoute,
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
-        ContextLayerId, ContextMutability, HookRequest, HookResult, PlanStep, PromotionAction,
-        RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation, SessionBindings,
-        SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn,
-        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
+        ContextLayerId, ContextMutability, HookRequest, HookResult, MemoryAuthority,
+        MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel,
+        PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode,
+        RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, VoiceDeliveryMode,
+        VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
+        session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
@@ -4248,6 +4634,7 @@ mod tests {
                 preferred_hotel_id: None,
                 preferred_environment_id: None,
                 allowed_tool_runner_incarnations: Vec::new(),
+                on_demand_skills: Vec::new(),
             }
         );
         assert_eq!(state.recent_turns.len(), 1);
@@ -4762,6 +5149,7 @@ mod tests {
             preferred_hotel_id: None,
             preferred_environment_id: None,
             allowed_tool_runner_incarnations: Vec::new(),
+            on_demand_skills: Vec::new(),
         };
 
         let prompt = state.build_prompt("status");
@@ -5632,6 +6020,38 @@ mod tests {
     }
 
     #[test]
+    fn advanced_memory_tools_require_matching_intent() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("memory.recall");
+        state.add_tool_binding("memory.cultivate");
+        state.add_tool_binding("memory.true_up");
+        state.add_tool_binding("memory.promote_candidate");
+
+        let projected = state.project_tools_for_turn("Help me think through the memory design");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(projected_names.contains(&"memory.recall"));
+        assert!(!projected_names.contains(&"memory.cultivate"));
+        assert!(!projected_names.contains(&"memory.true_up"));
+        assert!(!projected_names.contains(&"memory.promote_candidate"));
+
+        let projected = state.project_tools_for_turn(
+            "Run a memory true-up and cultivate memory gaps before closeout",
+        );
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(projected_names.contains(&"memory.cultivate"));
+        assert!(projected_names.contains(&"memory.true_up"));
+        assert!(!projected_names.contains(&"memory.promote_candidate"));
+    }
+
+    #[test]
     fn reentry_context_uses_projected_tools() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -6229,6 +6649,116 @@ mod tests {
         assert!(text.contains("confidence=0.91"));
         assert!(text.contains("trust=verified"));
         assert!(text.contains("entities: 1"));
+    }
+
+    #[test]
+    fn recalled_memory_projects_spacetime_frame() {
+        let mut state = SessionState::new(
+            "sess-frame".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = test_working_turn(None);
+        turn.primary_user_id = Some("jared".into());
+        turn.recalled_memories = vec![RecalledMemoryRecord {
+            id: Some("01FRAME".into()),
+            concept: "deployed-runtime-truth-gap".into(),
+            content: "vps-jane needed a runtime true-up after source changed.".into(),
+            spacetime_frame: Some(MemorySpacetimeFrame {
+                observed_at: Some(1_768_922_400_000),
+                last_verified_at: Some(1_768_922_430_000),
+                temporal_kind: Some(MemoryTemporalKind::Gap),
+                spatial_scope: Some(MemorySpatialScope::Hotel),
+                hotel_id: Some("vps-jane".into()),
+                branch: Some("develop".into()),
+                authority: Some(MemoryAuthority::ObservedRuntime),
+                validation_level: Some(MemoryValidationLevel::WatchedLiveGreen),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        state.start_turn(turn);
+
+        let projection = state.build_context_projection("continue memory work");
+        let context = state.model_context_from_projection(&projection);
+        let recalled_text = context["recalled_memory"]
+            .as_array()
+            .expect("recalled_memory must be an array")[0]["text"]
+            .as_str()
+            .expect("recalled memory should render text");
+
+        assert!(recalled_text.contains("temporal_kind: gap"));
+        assert!(recalled_text.contains("observed_at: unix_ms=1768922400000"));
+        assert!(recalled_text.contains("last_verified_at: unix_ms=1768922430000"));
+        assert!(recalled_text.contains("spatial_scope: hotel"));
+        assert!(recalled_text.contains("space: branch=develop; hotel=vps-jane; session=sess-frame; agent=agent-jane-01; user=jared"));
+        assert!(recalled_text.contains("authority: observed_runtime"));
+        assert!(recalled_text.contains("validation: watched-live-green"));
+    }
+
+    #[test]
+    fn context_projection_carries_primary_user_id() {
+        let mut state = SessionState::new(
+            "sess-user".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = test_working_turn(None);
+        turn.primary_user_id = Some("jared".into());
+        state.start_turn(turn);
+
+        let projection = state.build_context_projection("continue memory work");
+
+        assert_eq!(
+            projection.conversation_turn.primary_user_id.as_deref(),
+            Some("jared")
+        );
+    }
+
+    #[test]
+    fn agent_graph_layer_includes_muninn_entity_overlay() {
+        let mut state = SessionState::new(
+            "sess-overlay".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.agent_graph_snapshot = Some("Task: {\"id\":\"memory-tightening\"}".into());
+        let mut turn = test_working_turn(None);
+        turn.turn_id = "turn-overlay".into();
+        turn.recalled_memories = vec![RecalledMemoryRecord {
+            id: Some("01MEMORY".into()),
+            concept: "memory-architecture".into(),
+            content: "Muninn entity relationships should advise the graph projection.".into(),
+            entities: vec![serde_json::json!({
+                "name": "Muninn",
+                "type": "memory_system"
+            })],
+            relationships: vec![serde_json::json!({
+                "from_entity": "Muninn",
+                "rel_type": "dovetails_with",
+                "to_entity": "Agent Graph"
+            })],
+            ..Default::default()
+        }];
+        state.start_turn(turn);
+
+        let projection = state.build_context_projection("continue memory work");
+        let context = state.model_context_from_projection(&projection);
+        let agent_graph_text = context["memory"]
+            .as_array()
+            .expect("memory channel should exist")
+            .iter()
+            .filter(|item| item["projection_kind"] == "agent_graph")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(agent_graph_text.contains("[Agent graph]"));
+        assert!(agent_graph_text.contains("memory-tightening"));
+        assert!(agent_graph_text.contains("[Muninn entity overlay]"));
+        assert!(agent_graph_text.contains("MuninnEntity"));
+        assert!(agent_graph_text.contains("MuninnRelation"));
+        assert!(agent_graph_text.contains("dovetails_with"));
     }
 
     #[test]

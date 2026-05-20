@@ -41,7 +41,13 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "role.set_home",
         ],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
-        "memory" => &["memory.recall", "memory.remember"],
+        "memory" => &[
+            "memory.recall",
+            "memory.remember",
+            "memory.cultivate",
+            "memory.true_up",
+            "memory.promote_candidate",
+        ],
         "routing.refinement" => &[
             "session.status",
             "agent.graph.read",
@@ -61,6 +67,129 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "graph.grant_access",
         ],
         _ => &[],
+    }
+}
+
+/// Returns the tools that are exclusively granted by a given on-demand skill.
+///
+/// Used by `project_tools_for_turn` to know which tool schemas to suppress when
+/// the skill is not relevant to the current turn. Tools that appear in multiple
+/// skill grants are included in each grant — the caller should include the tool
+/// if ANY of its owning skills is active.
+pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
+    match skill_name {
+        "cron.manage" => &[
+            "cron.register",
+            "cron.list",
+            "cron.enable",
+            "cron.disable",
+            "cron.remove",
+        ],
+        "observability.pipeline" => &[
+            "table.configure",
+            "table.query",
+            "table.insert",
+            "table.rolloff",
+            "table.stats",
+            "table.schema",
+            "table.add_listener",
+        ],
+        "graph.knowledge" => &[
+            "graph.create",
+            "graph.query",
+            "graph.list",
+            "graph.drop",
+            "graph.grant_access",
+        ],
+        "routing.refinement" => &[
+            "routing.policy.propose",
+            "routing.reflex.set",
+            "routing.reflex.get",
+            "routing.pipeline.set",
+            "routing.pipeline.remove",
+            "routing.pipeline.get",
+            "router.stats",
+        ],
+        "role.governance" => &[
+            "agent.configure",
+            "role.create_or_update",
+            "role.set_home",
+            "hotel.best_place_to_run",
+        ],
+        "role.authoring" => &["role.create_or_update"],
+        "skill.authoring" => &["skill.register", "skill.assign", "skill.revoke"],
+        "context.synthesize" => &["workspace.list", "workspace.read"],
+        "agent.initiate" => &["agent.graph.write", "agent.graph.recall"],
+        "profile.manage" => &["role.configure"],
+        "mcp.manage" => &["mcp.provision", "mcp.revoke"],
+        _ => &[],
+    }
+}
+
+/// Returns `true` if the given on-demand skill is relevant for the current turn's content.
+///
+/// Used by `project_tools_for_turn` to decide whether to suppress a skill's tools.
+/// Errs on the side of inclusion — only suppresses when the turn clearly has no
+/// bearing on the skill's domain.
+pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
+    let t = turn_text;
+    match skill_name {
+        "cron.manage" => {
+            t.contains("cron") || t.contains("schedule") || t.contains("recurring")
+                || t.contains("daily") || t.contains("weekly") || t.contains("hourly")
+                || t.contains("every day") || t.contains("every hour") || t.contains("every week")
+                || t.contains("remind me") || t.contains("run at ") || t.contains("timer")
+                || t.contains("scheduled") || t.contains("at midnight") || t.contains("at noon")
+        }
+        "observability.pipeline" => {
+            t.contains("table") || t.contains("pipeline") || t.contains("rolloff")
+                || t.contains("datasource") || t.contains("table.") || t.contains("stream")
+                || t.contains("insert row") || t.contains("table schema") || t.contains("listener")
+        }
+        "graph.knowledge" => {
+            t.contains("graph.") || t.contains("knowledge graph") || t.contains("create graph")
+                || t.contains("graph node") || t.contains("graph query") || t.contains("graph edge")
+                || t.contains("grant_access") || t.contains("drop graph")
+        }
+        "routing.refinement" => {
+            t.contains("routing") || t.contains("reflex") || t.contains("pipeline route")
+                || t.contains("routing policy") || t.contains("router.stats")
+                || t.contains("routing.") || t.contains("dispatch policy")
+        }
+        "role.governance" => {
+            t.contains("create role") || t.contains("update role") || t.contains("configure agent")
+                || t.contains("best place to run") || t.contains("place role")
+                || t.contains("home node") || t.contains("role.create") || t.contains("agent.configure")
+                || t.contains("set_home")
+        }
+        "role.authoring" => {
+            t.contains("create role") || t.contains("update role") || t.contains("author role")
+                || t.contains("role.create") || t.contains("role manifest") || t.contains("new role")
+                || t.contains("write role")
+        }
+        "skill.authoring" => {
+            t.contains("register skill") || t.contains("skill.register") || t.contains("skill.assign")
+                || t.contains("create skill") || t.contains("add skill") || t.contains("assign skill")
+                || t.contains("revoke skill")
+        }
+        "context.synthesize" => {
+            t.contains("workspace") || t.contains("list files") || t.contains("read file")
+                || t.contains("code file") || t.contains("synthesize context")
+                || t.contains("workspace.") || t.contains("file list")
+        }
+        "agent.initiate" => {
+            t.contains("agent.graph") || t.contains("write agent") || t.contains("initiate agent")
+                || t.contains("agent graph write") || t.contains("recall agent")
+        }
+        "profile.manage" => {
+            t.contains("role.configure") || t.contains("configure role") || t.contains("profile.manage")
+                || t.contains("manage profile") || t.contains("role config")
+        }
+        "mcp.manage" => {
+            t.contains("mcp") || t.contains("provision") || t.contains("revoke mcp")
+                || t.contains("mcp.provision") || t.contains("mcp server") || t.contains("mcp route")
+        }
+        _ => true, // Unknown skill — don't suppress
     }
 }
 
@@ -1579,9 +1708,204 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "description": "Optional write scope. Use 'shared_user' for operator \
                                         preferences, 'session' for active workstream context, \
                                         and 'self' for the agent's own habits or observations."
+                    },
+                    "temporal_kind": {
+                        "type": "string",
+                        "enum": ["event", "state", "preference", "rule", "decision", "hypothesis", "gap", "checkpoint"],
+                        "description": "Optional temporal behavior for the memory."
+                    },
+                    "spatial_scope": {
+                        "type": "string",
+                        "enum": ["self", "agent", "user", "session", "workspace", "hotel", "mesh", "global"],
+                        "description": "Optional spatial scope for where this memory applies."
+                    },
+                    "authority": {
+                        "type": "string",
+                        "enum": ["observed_runtime", "observed_repo", "graph_structured", "user_stated", "verified_memory", "inferred_memory", "external", "untrusted"],
+                        "description": "Optional evidence authority. Runtime/repo observations should be used only when actually observed."
+                    },
+                    "validation_level": {
+                        "type": "string",
+                        "enum": ["unverified", "check-green", "test-green", "smoke-green", "watched-live-green"],
+                        "description": "Optional validation level backing the memory."
+                    },
+                    "observed_at": {
+                        "type": "integer",
+                        "description": "Optional Unix timestamp in milliseconds for when this was observed. Defaults to write time."
+                    },
+                    "valid_from": {
+                        "type": "integer",
+                        "description": "Optional Unix timestamp in milliseconds when this memory starts being valid."
+                    },
+                    "valid_until": {
+                        "type": "integer",
+                        "description": "Optional Unix timestamp in milliseconds when this memory stops being valid."
+                    },
+                    "last_verified_at": {
+                        "type": "integer",
+                        "description": "Optional Unix timestamp in milliseconds when this memory was last verified."
+                    },
+                    "hotel_id": {
+                        "type": "string",
+                        "description": "Optional hotel this memory applies to."
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Optional node this memory applies to."
+                    },
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Optional workspace path this memory applies to."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional git branch this memory applies to."
+                    },
+                    "proposal_id": {
+                        "type": "string",
+                        "description": "Optional AgentGraph proposal anchor."
+                    },
+                    "seam_id": {
+                        "type": "string",
+                        "description": "Optional AgentGraph seam anchor."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional AgentGraph task anchor."
+                    },
+                    "affected_nodes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional graph/code node ids this memory affects."
                     }
                 },
                 "required": ["concept", "content"]
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.cultivate".into(),
+        ToolDefinition {
+            tool_name: "memory.cultivate".into(),
+            description: "Inspect recalled memories for cultivation needs without mutating memory. \
+                          Use during closeout, reflection, or explicit memory-maintenance turns to \
+                          find missing spacetime frames, entity overlays, or stale candidates."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language scope for candidate memories to inspect."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum candidate count. Defaults to 8. Range 1-20."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["self", "shared_user", "session", "cross"],
+                        "description": "Optional memory scope to inspect."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["report", "closeout", "true_up"],
+                        "description": "Cultivation intent. Current implementation reports candidates and performs no mutation."
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.true_up".into(),
+        ToolDefinition {
+            tool_name: "memory.true_up".into(),
+            description: "Compare a memory claim with observed repo/runtime truth or AgentGraph truth \
+                          and return a structured true-up finding. Use when memory and graph may have \
+                          holes, contradictions, or stale assumptions."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "memory_claim": {
+                        "type": "string",
+                        "description": "Claim currently held in memory."
+                    },
+                    "observed_truth": {
+                        "type": "string",
+                        "description": "Observed repo/runtime truth, if directly checked."
+                    },
+                    "graph_truth": {
+                        "type": "string",
+                        "description": "AgentGraph structured truth, if available."
+                    },
+                    "resolution": {
+                        "type": "string",
+                        "description": "Optional proposed resolution or operator note."
+                    },
+                    "muninn_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Muninn engram ids involved in this finding."
+                    },
+                    "graph_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "AgentGraph node ids involved in this finding."
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Evidence references such as file paths, test names, or smoke runs."
+                    }
+                },
+                "required": []
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.promote_candidate".into(),
+        ToolDefinition {
+            tool_name: "memory.promote_candidate".into(),
+            description: "Evaluate whether a memory candidate is allowed to become durable shared \
+                          memory. This is a gate: it reports missing authority, validation, or evidence \
+                          and does not promote unverified inferred claims."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "candidate": {
+                        "type": "string",
+                        "description": "Candidate memory or claim being considered for promotion."
+                    },
+                    "authority": {
+                        "type": "string",
+                        "enum": ["observed_runtime", "observed_repo", "graph_structured", "user_stated", "verified_memory", "inferred_memory", "external", "untrusted"],
+                        "description": "Evidence authority behind the candidate."
+                    },
+                    "validation_level": {
+                        "type": "string",
+                        "enum": ["unverified", "check-green", "test-green", "smoke-green", "watched-live-green"],
+                        "description": "Validation level backing the candidate."
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Evidence references such as files, test runs, graph ids, or Muninn ids."
+                    },
+                    "operator_approved": {
+                        "type": "boolean",
+                        "description": "Set only when the operator explicitly approves promotion despite missing gates."
+                    }
+                },
+                "required": ["candidate"]
             }),
             class: Some("memory".into()),
         },
