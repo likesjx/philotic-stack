@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -27,6 +27,10 @@ const STREAMING_IDLE_SECS: u64 = 8;
 /// Seconds to wait for the initial HTTP response headers from Gemini before aborting.
 /// Large contexts (100KB+) can take 20–30s before the first SSE byte arrives.
 const STREAMING_CONNECT_SECS: u64 = 30;
+/// Hard wall-clock cap on the entire SSE session (post-connect). Gemini can drip
+/// keep-alive SSE bytes every <8s indefinitely, which prevents STREAMING_IDLE_SECS
+/// from firing. This ensures the stream always terminates within a reasonable bound.
+const STREAMING_TOTAL_SECS: u64 = 120;
 
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
@@ -1538,11 +1542,22 @@ impl ModelProvider for GeminiProvider {
         let mut _display_text_out = String::new();
 
         let idle_dur = Duration::from_secs(STREAMING_IDLE_SECS);
+        let sse_start = Instant::now();
         // Stash a function-call response found in SSE chunks. Gemini delivers tool
         // calls via streaming without any text content; we capture them here so the
         // empty-full_text check below can return them instead of bailing.
         let mut pending_function_call: Option<ProviderOutput> = None;
         loop {
+            // Hard wall-clock cap: Gemini can drip keep-alive SSE bytes every ~7s,
+            // resetting the idle timer without making progress. Bail if the whole
+            // SSE session has run too long regardless of individual byte activity.
+            if sse_start.elapsed() > Duration::from_secs(STREAMING_TOTAL_SECS) {
+                drop(token_tx);
+                bail!(
+                    "streaming_timeout: Gemini SSE session exceeded {}s total (keep-alive drip?)",
+                    STREAMING_TOTAL_SECS
+                );
+            }
             match timeout(idle_dur, byte_stream.next()).await {
                 Ok(Some(chunk_result)) => {
                     let bytes = chunk_result.context("Gemini SSE stream read error")?;
