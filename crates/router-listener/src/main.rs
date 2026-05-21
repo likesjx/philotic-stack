@@ -95,23 +95,6 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     info!("router-listener starting");
 
-    let db_path =
-        std::env::var("PHILOTIC_TRAINING_DB").unwrap_or_else(|_| "whisper_training.db".to_string());
-    let audio_dir = PathBuf::from(
-        std::env::var("PHILOTIC_TRAINING_AUDIO_DIR")
-            .unwrap_or_else(|_| "training_audio".to_string()),
-    );
-    tokio::fs::create_dir_all(&audio_dir)
-        .await
-        .context("failed to create PHILOTIC_TRAINING_AUDIO_DIR")?;
-
-    let store: Arc<dyn WhisperTrainingStorage> =
-        Arc::new(SqliteWhisperTrainingStorage::open(&db_path)?);
-
-    let http = reqwest::Client::new();
-
-    info!("router-listener starting, db={db_path}");
-
     loop {
         match run_connect_and_listen().await {
             Ok(()) => {

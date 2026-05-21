@@ -28,6 +28,8 @@ impl TaskKind {
 pub struct DatasourceTask {
     pub kind: TaskKind,
     pub provider: Option<String>,
+    /// Named database to target. None means "default". Used by table-datasource for multi-DB routing.
+    pub db: Option<String>,
     pub graph_id: Option<String>,
     pub query: Option<String>,
     pub parameters: Value,
@@ -56,6 +58,10 @@ impl DatasourceTask {
             kind,
             provider: task
                 .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            db: task
+                .get("db")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             graph_id: task

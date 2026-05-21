@@ -10,16 +10,19 @@ fn guest_id() -> String {
         .unwrap_or_else(|_| "table-datasource-01".to_string())
 }
 
-fn db_path() -> PathBuf {
+fn base_dir() -> PathBuf {
+    // PHILOTIC_TABLE_DB: if it ends in .db treat it as a single-file legacy path;
+    // otherwise treat it as the base directory directly.
     if let Ok(p) = std::env::var("PHILOTIC_TABLE_DB") {
-        return PathBuf::from(p);
+        let path = PathBuf::from(&p);
+        if p.ends_with(".db") {
+            return path.parent().unwrap_or(&path).to_path_buf();
+        }
+        return path;
     }
     let profile = std::env::var("PHILOTIC_PROFILE").unwrap_or_else(|_| "default".to_string());
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".philotic")
-        .join(profile)
-        .join("tables.db")
+    PathBuf::from(home).join(".philotic").join(profile)
 }
 
 #[tokio::main]
@@ -27,13 +30,13 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let id: &'static str = Box::leak(guest_id().into_boxed_str());
-    let path = db_path();
+    let dir = base_dir();
 
-    info!(guest_id = id, db = %path.display(), "table-datasource starting");
+    info!(guest_id = id, base_dir = %dir.display(), "table-datasource starting");
 
     let provider = Arc::new(
-        SqliteTableProvider::open(&path)
-            .with_context(|| format!("failed to open table DB at {}", path.display()))?,
+        SqliteTableProvider::new(&dir)
+            .with_context(|| format!("failed to init table DB at {}", dir.display()))?,
     );
 
     run_datasource_controller(DatasourceGuestConfig {
