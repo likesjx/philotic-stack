@@ -192,8 +192,10 @@ fn load_keychain_root_key() -> Result<Option<Vec<u8>>> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("could not be found")
+    if output.status.code() == Some(36)
+        || stderr.contains("could not be found")
         || stderr.contains("The specified item could not be found")
+        || stderr.contains("User interaction is not allowed")
     {
         return Ok(None);
     }

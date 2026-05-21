@@ -106,9 +106,12 @@ impl Materializer for LocalProcessMaterializer {
                 }
             }
 
-            let child = command
-                .spawn()
-                .context("Failed to spawn OS child process")?;
+            let child = command.spawn().with_context(|| {
+                format!(
+                    "Failed to spawn OS child process for guest '{}' using command '{}'",
+                    guest_id, resolved_cmd
+                )
+            })?;
             let child_pid = child.id().unwrap_or(0);
             self.children.insert(guest_id.to_string(), child);
 
