@@ -1211,6 +1211,7 @@ fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapsh
         disk_free_pct,
         mem_free_pct,
         load_avg_1m,
+        perimeter: None,
     }
 }
 
