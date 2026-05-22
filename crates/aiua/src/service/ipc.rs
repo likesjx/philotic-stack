@@ -14045,6 +14045,14 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "cron.enable"
             | "cron.disable"
             | "cron.remove"
+            | "delegate.to_peer"
+            | "delegate.to_external_cognitive_peer"
+            | "delegate.merge"
+            | "delegate.whisper"
+            | "handoff.to_role"
+            | "handoff.back"
+            | "rule.propose"
+            | "routing.policy.propose"
     )
 }
 
