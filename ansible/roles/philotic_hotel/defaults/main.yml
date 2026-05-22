@@ -33,7 +33,6 @@ philotic_binaries:
   - table-datasource
   - router-listener
   - agent-datasource
-  - agent-graph-runner
   - tool-runner
   - agent-core
   - hegemon

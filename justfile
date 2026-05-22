@@ -454,9 +454,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource agent-graph-runner"
+    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p agent-graph-runner
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -561,8 +561,7 @@ vps-push:
       -p graph-datasource \
       -p table-datasource \
       -p router-listener \
-      -p agent-datasource \
-      -p agent-graph-runner"
+      -p agent-datasource"
 
     echo "▶ Deploying via ansible (binaries from VPS build at ${VPS_BUILD})..."
     cd "${ROOT_DIR}/ansible" && ansible-playbook \
