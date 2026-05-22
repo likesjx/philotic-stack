@@ -10,6 +10,7 @@ use ansible_mesh_core::storage::{
     AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeHealthSnapshot, NodeRole};
+use perimeter_core::service::PerimeterService as _;
 use anyhow::{Context, Result};
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path as AxumPath, Query, Request, State};
@@ -111,6 +112,7 @@ struct MeshRuntimeContext {
     inbox_rx: BeaconInboxReceiver,
     webrtc_signal_tx: mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>,
     webrtc_signal_rx: WebRtcSignalReceiver,
+    perimeter_svc: Arc<crate::service::perimeter::HotelPerimeterService>,
 }
 
 /// Operator surface query worker — receives tasks via in-process channel (no UDS
@@ -1118,7 +1120,11 @@ fn execution_reachability_for_hotel(
 /// Samples local environment vitals for inclusion in the outbound heartbeat.
 /// All fields are best-effort; failures are silently swallowed so a bad sysfs
 /// read never blocks the heartbeat loop.
-fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapshot {
+fn sample_node_health(
+    graph: &GraphDomain,
+    hotel_name: &str,
+    perimeter_svc: &crate::service::perimeter::HotelPerimeterService,
+) -> NodeHealthSnapshot {
     let guest_count = graph
         .list_guests(hotel_name, false)
         .ok()
@@ -1211,7 +1217,7 @@ fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapsh
         disk_free_pct,
         mem_free_pct,
         load_avg_1m,
-        perimeter: None,
+        perimeter: Some(perimeter_svc.snapshot()),
     }
 }
 
@@ -1286,6 +1292,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
         let heartbeat_graph = ctx.graph_domain.clone();
         let heartbeat_hotel = ctx.hotel.clone();
         let heartbeat_caps = ctx.caps.clone();
+        let heartbeat_perimeter = ctx.perimeter_svc.clone();
         let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
@@ -1305,7 +1312,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         let execution_reachability =
                             execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
                         let node_health =
-                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name);
+                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name, &heartbeat_perimeter);
                         for (_target_node_id, target_addr) in targets {
                             let Ok(target) = target_addr.parse::<SocketAddr>() else {
                                 warn!("Skipping invalid heartbeat target address {}", target_addr);
@@ -6661,6 +6668,49 @@ async fn main() -> Result<()> {
     let execution_addr = format!("0.0.0.0:{}", hotel.execution_port);
     let execution_enable_rust_auth = flags.enable_rust_auth;
 
+    // Build and persist the PerimeterService from the hotel's actual listener bindings.
+    // Blob binds to 127.0.0.1 (Local); mesh + execution bind to 0.0.0.0 (tier depends on
+    // whether a public IP is detected). IPC is always Local (added by HotelPerimeterService).
+    let perimeter_svc = {
+        use std::net::{IpAddr, Ipv4Addr};
+        use crate::service::perimeter::{HotelPerimeterService, ListenerDecl};
+        let listeners = vec![
+            ListenerDecl {
+                purpose: "beacon",
+                bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: hotel.mesh_port,
+                iface: None,
+            },
+            ListenerDecl {
+                purpose: "execution",
+                bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: hotel.execution_port,
+                iface: None,
+            },
+            ListenerDecl {
+                purpose: "blob",
+                bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: hotel.blob_port,
+                iface: None,
+            },
+        ];
+        let svc = HotelPerimeterService::new(listeners);
+        // Persist snapshot to node_config so restart hydration has a last-known baseline
+        let snapshot_json = serde_json::to_string(&svc.snapshot()).unwrap_or_default();
+        if let Err(e) = graph_domain_arc.set_config_value("__hotel_perimeter__", &snapshot_json) {
+            warn!("Failed to persist hotel perimeter snapshot: {e}");
+        } else {
+            info!(ceiling = ?svc.ceiling(), "Hotel perimeter derived and persisted");
+        }
+        // Spawn periodic refresh (every 5 minutes)
+        crate::service::perimeter::spawn_refresh_loop(
+            svc.clone(),
+            std::time::Duration::from_secs(300),
+            shutdown_rx.resubscribe(),
+        );
+        svc
+    };
+
     // Create the memory channel dispatcher for PORT-BP-003 to pick up
     // In PORT-BP-003, this receiver will hand off to the persistent mesh_events ledger
     let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel::<LedgerCommand>(1024);
@@ -6876,6 +6926,7 @@ async fn main() -> Result<()> {
         inbox_rx: inbox_rx.clone(),
         webrtc_signal_tx: webrtc_signal_tx.clone(),
         webrtc_signal_rx: webrtc_signal_rx.clone(),
+        perimeter_svc: perimeter_svc.clone(),
     };
 
     if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {
