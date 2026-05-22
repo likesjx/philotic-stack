@@ -26,7 +26,7 @@ use tracing::{info, warn};
 const STREAMING_IDLE_SECS: u64 = 8;
 /// Seconds to wait for the initial HTTP response headers from Gemini before aborting.
 /// Large contexts (100KB+) can take 20–30s before the first SSE byte arrives.
-const STREAMING_CONNECT_SECS: u64 = 30;
+const STREAMING_CONNECT_SECS: u64 = 60;
 /// Hard wall-clock cap on the entire SSE session (post-connect). Gemini can drip
 /// keep-alive SSE bytes every <8s indefinitely, which prevents STREAMING_IDLE_SECS
 /// from firing. This ensures the stream always terminates within a reasonable bound.

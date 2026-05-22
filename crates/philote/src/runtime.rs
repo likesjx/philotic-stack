@@ -7182,10 +7182,44 @@ impl AgentRuntime {
             _ => return Ok(()),
         };
 
-        // Only handle graph.query preload responses; other datasource responses may arrive
-        // for user-initiated tool calls which have their own result path.
-        if task.capability.as_deref() != Some("graph.query") {
-            return Ok(());
+        // graph.query with no pending tool call = background preload; update the snapshot.
+        // All other datasource responses (user-initiated tool calls) must be routed back to
+        // the model as tool results so the turn doesn't hang waiting for a reply that never
+        // comes. Previously these were silently dropped, causing the watchdog to fire.
+        let is_preload = task.capability.as_deref() == Some("graph.query")
+            && self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .map(|t| t.pending_tool_call.is_none())
+                .unwrap_or(true);
+
+        if !is_preload {
+            // Convert datasource success/failure into a tool_result the model can read.
+            let content = if let Some(ref err) = task.error {
+                format!(
+                    "Tool call failed: {} (provider: {}, capability: {})",
+                    err.message,
+                    err.provider.as_deref().unwrap_or("unknown"),
+                    task.capability.as_deref().unwrap_or("unknown"),
+                )
+            } else {
+                task.result
+                    .as_ref()
+                    .map(|r| serde_json::to_string_pretty(r).unwrap_or_else(|_| r.to_string()))
+                    .unwrap_or_else(|| "(empty result)".into())
+            };
+            return self
+                .handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    content: Some(content),
+                    session_id: task.session_id.clone(),
+                    turn_id: task.turn_id.clone(),
+                    chat_id: task.chat_id.clone(),
+                    tool_name: task.tool_name.clone(),
+                    ..Default::default()
+                })
+                .await;
         }
 
         let data = task
