@@ -6934,6 +6934,61 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
+    // Spawn task: fan perimeter tier to mcp-membrane guests on every Shift event,
+    // and send the initial tier right away so membrane-mcp starts with the correct gate.
+    {
+        use perimeter_core::service::{PerimeterEvent, PerimeterService as _};
+        let fanout_inboxes = ipc_inboxes.clone();
+        let fanout_node_id = caps.node_id.clone();
+        let fanout_perimeter = perimeter_svc.clone();
+        let mut fanout_rx = fanout_perimeter.subscribe();
+        let initial_tier = fanout_perimeter.ceiling();
+
+        // Push current tier immediately so membrane-mcp doesn't wait for the first shift.
+        let initial_task = serde_json::json!({
+            "action": "update_perimeter",
+            "tier": initial_tier,
+        }).to_string();
+        let fanout_inboxes_init = fanout_inboxes.clone();
+        let fanout_node_id_init = fanout_node_id.clone();
+        tokio::spawn(async move {
+            let guard = fanout_inboxes_init.lock().await;
+            if let Some(subs) = guard.get("mcp-membrane") {
+                let msg = philotic_client::IpcResponse::InboundTask {
+                    source_node: fanout_node_id_init.clone(),
+                    task_id: uuid::Uuid::new_v4(),
+                    task_json: initial_task,
+                };
+                for sub in subs {
+                    let _ = sub.tx.send(msg.clone());
+                }
+            }
+        });
+
+        // Fan on every subsequent Shift.
+        tokio::spawn(async move {
+            while let Ok(event) = fanout_rx.recv().await {
+                if let PerimeterEvent::Shift { current, .. } = event {
+                    let task_json = serde_json::json!({
+                        "action": "update_perimeter",
+                        "tier": current,
+                    }).to_string();
+                    let guard = fanout_inboxes.lock().await;
+                    if let Some(subs) = guard.get("mcp-membrane") {
+                        let msg = philotic_client::IpcResponse::InboundTask {
+                            source_node: fanout_node_id.clone(),
+                            task_id: uuid::Uuid::new_v4(),
+                            task_json,
+                        };
+                        for sub in subs {
+                            let _ = sub.tx.send(msg.clone());
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // RESOURCE BROKER BOOT RECONCILIATION (transitional — Seam 2 / demand-derived-materialization)
     // Reads agents from the context graph, replays their static_resource_declarations through the
     // resource registry, and logs the demand-derived guest set. Does not yet replace the
