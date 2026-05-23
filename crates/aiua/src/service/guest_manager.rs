@@ -6,6 +6,7 @@ use rusqlite::types::ValueRef;
 use std::collections::HashMap;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
@@ -106,13 +107,27 @@ impl Materializer for LocalProcessMaterializer {
                 }
             }
 
-            let child = command.spawn().with_context(|| {
+            command.stderr(std::process::Stdio::piped());
+
+            let mut child = command.spawn().with_context(|| {
                 format!(
                     "Failed to spawn OS child process for guest '{}' using command '{}'",
                     guest_id, resolved_cmd
                 )
             })?;
             let child_pid = child.id().unwrap_or(0);
+
+            // Take stderr BEFORE moving child into the map.
+            if let Some(stderr) = child.stderr.take() {
+                let gid = guest_id.to_string();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        warn!(guest_id = %gid, "stderr: {}", line);
+                    }
+                });
+            }
+
             self.children.insert(guest_id.to_string(), child);
 
             Ok(child_pid.to_string())
