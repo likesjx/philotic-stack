@@ -217,6 +217,7 @@ mod tests {
                 disk_free_pct: Some(72.5),
                 mem_free_pct: Some(61.0),
                 load_avg_1m: Some(0.42),
+                perimeter: None,
             }),
         };
 

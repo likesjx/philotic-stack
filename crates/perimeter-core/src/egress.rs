@@ -79,3 +79,146 @@ pub trait EgressGateway: Send + Sync {
     /// exists for the target host. Mutates `request.headers` in place.
     async fn inject_credentials(&self, request: &mut EgressRequest) -> anyhow::Result<()>;
 }
+
+/// Pure policy evaluation — no I/O. Used by `HotelEgressGateway::check()` and unit tests.
+pub fn evaluate_egress_policy(
+    policies: &HashMap<ExposureTier, EgressPolicy>,
+    request: &EgressRequest,
+) -> EgressDecision {
+    let policy = match policies.get(&request.tier) {
+        Some(p) => p,
+        None => return EgressDecision::Allow,
+    };
+
+    let host = host_from_url(&request.target_url).unwrap_or("");
+
+    if policy.denied_hosts.iter().any(|h| h == host || h == "*") {
+        return EgressDecision::Deny {
+            reason: format!(
+                "host '{}' is in the denied list for tier {:?}",
+                host, request.tier
+            ),
+        };
+    }
+
+    if !policy.allowed_hosts.is_empty()
+        && !policy.allowed_hosts.iter().any(|h| h == host || h == "*")
+    {
+        return EgressDecision::Deny {
+            reason: format!(
+                "host '{}' is not in the allowed list for tier {:?}",
+                host, request.tier
+            ),
+        };
+    }
+
+    match &policy.default_action {
+        EgressDefaultAction::Allow => EgressDecision::Allow,
+        EgressDefaultAction::AllowWithAudit => EgressDecision::AllowWithAudit,
+        EgressDefaultAction::Deny => EgressDecision::Deny {
+            reason: format!("tier {:?} default action is deny", request.tier),
+        },
+    }
+}
+
+pub fn host_from_url(url: &str) -> Option<&str> {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    Some(host_port.split(':').next().unwrap_or(host_port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn internet_policy(default_action: EgressDefaultAction) -> EgressPolicy {
+        EgressPolicy {
+            tier: ExposureTier::Internet,
+            default_action,
+            require_tls: true,
+            allowed_hosts: vec![],
+            denied_hosts: vec![],
+            credentials: HashMap::new(),
+        }
+    }
+
+    fn req(url: &str) -> EgressRequest {
+        EgressRequest {
+            agent_id: "agent-test".into(),
+            target_url: url.into(),
+            method: "POST".into(),
+            headers: HashMap::new(),
+            tier: ExposureTier::Internet,
+        }
+    }
+
+    #[test]
+    fn no_policy_allows() {
+        let policies: HashMap<ExposureTier, EgressPolicy> = HashMap::new();
+        assert!(evaluate_egress_policy(&policies, &req("https://api.example.com/v1")).is_allowed());
+    }
+
+    #[test]
+    fn default_allow_permits() {
+        let policies = [(ExposureTier::Internet, internet_policy(EgressDefaultAction::Allow))]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            evaluate_egress_policy(&policies, &req("https://api.example.com/v1")),
+            EgressDecision::Allow
+        );
+    }
+
+    #[test]
+    fn default_deny_blocks() {
+        let policies = [(ExposureTier::Internet, internet_policy(EgressDefaultAction::Deny))]
+            .into_iter()
+            .collect();
+        assert!(!evaluate_egress_policy(&policies, &req("https://api.example.com/v1")).is_allowed());
+    }
+
+    #[test]
+    fn denied_host_blocks() {
+        let mut policy = internet_policy(EgressDefaultAction::Allow);
+        policy.denied_hosts = vec!["api.example.com".into()];
+        let policies = [(ExposureTier::Internet, policy)].into_iter().collect();
+        assert!(!evaluate_egress_policy(&policies, &req("https://api.example.com/v1")).is_allowed());
+    }
+
+    #[test]
+    fn allow_list_permits_listed_host() {
+        let mut policy = internet_policy(EgressDefaultAction::Allow);
+        policy.allowed_hosts = vec!["api.example.com".into()];
+        let policies = [(ExposureTier::Internet, policy)].into_iter().collect();
+        assert!(evaluate_egress_policy(&policies, &req("https://api.example.com/v1")).is_allowed());
+    }
+
+    #[test]
+    fn allow_list_blocks_unlisted_host() {
+        let mut policy = internet_policy(EgressDefaultAction::Allow);
+        policy.allowed_hosts = vec!["api.example.com".into()];
+        let policies = [(ExposureTier::Internet, policy)].into_iter().collect();
+        assert!(!evaluate_egress_policy(&policies, &req("https://other.example.com/v1")).is_allowed());
+    }
+
+    #[test]
+    fn audit_variant_is_allowed() {
+        let policies =
+            [(ExposureTier::Internet, internet_policy(EgressDefaultAction::AllowWithAudit))]
+                .into_iter()
+                .collect();
+        let decision = evaluate_egress_policy(&policies, &req("https://api.example.com/v1"));
+        assert!(decision.is_allowed());
+        assert_eq!(decision, EgressDecision::AllowWithAudit);
+    }
+
+    #[test]
+    fn host_parsing() {
+        assert_eq!(host_from_url("https://api.perplexity.ai/chat"), Some("api.perplexity.ai"));
+        assert_eq!(host_from_url("http://localhost:8080/v1"), Some("localhost"));
+        assert_eq!(host_from_url("https://example.com"), Some("example.com"));
+    }
+}

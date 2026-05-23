@@ -7,7 +7,7 @@ pub use ansible_mesh_core::{ExposureTier, ListenerProfile, PerimeterSnapshot};
 pub use classifier::{ClassifyResult, classify_bind_addr};
 pub use egress::{
     EgressCredential, EgressDecision, EgressDefaultAction, EgressGateway, EgressPolicy,
-    EgressRequest,
+    EgressRequest, evaluate_egress_policy, host_from_url,
 };
 pub use fence::{IngressDecision, check_ingress};
 pub use service::{PerimeterEvent, PerimeterService};

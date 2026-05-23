@@ -235,6 +235,16 @@ impl MembraneGuest for McpMembrane {
     }
 
     async fn handle_push(&mut self, msg: &IpcResponse) -> Result<bool> {
+        // Handle direct broadcast variants before the InboundTask path.
+        if let IpcResponse::PerimeterShift { previous, current } = msg {
+            // The update_perimeter inbox push is the primary path; this broadcast
+            // provides a secondary update in case the inbox push races or is missed.
+            let current = *current;
+            *self.state.ingress_tier.write().unwrap() = current;
+            info!(?previous, ?current, "Ingress fence tier updated from PerimeterShift broadcast");
+            return Ok(true);
+        }
+
         let task_json = match msg {
             IpcResponse::InboundTask { task_json, .. } => task_json,
             _ => return Ok(false),

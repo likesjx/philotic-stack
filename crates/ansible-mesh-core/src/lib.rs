@@ -85,7 +85,7 @@ pub struct NodeConstraints {
 
 /// Ordered trust levels for network exposure. Higher = more exposed = more enforcement.
 /// Used as a ceiling on hotel listeners and as a required field on MCP endpoint configs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExposureTier {
     /// Loopback/UDS only. IPC-equivalent trust. No auth ever required.

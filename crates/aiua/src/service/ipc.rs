@@ -928,6 +928,10 @@ pub struct IpcServer {
     /// When set, tasks addressed to `OPERATOR_SURFACE_QUERY_ROLE` are sent here
     /// instead of through the UDS inbox registry, eliminating the self-connection.
     operator_surface_tx: Option<mpsc::Sender<String>>,
+    /// Hotel network security perimeter service — wired in via `with_perimeter()`.
+    perimeter_svc: Option<Arc<crate::service::perimeter::HotelPerimeterService>>,
+    /// Hotel egress gateway — wired in via `with_egress()`.
+    egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
 }
 
 struct LoggingLeaseObserver;
@@ -3827,6 +3831,8 @@ impl IpcServer {
             webrtc_signal_tx: None,
             network_broadcast,
             operator_surface_tx: None,
+            perimeter_svc: None,
+            egress_gw: None,
         }
     }
 
@@ -3872,6 +3878,22 @@ impl IpcServer {
 
     pub fn with_registry(mut self, registry: Arc<RwLock<NodeRegistry>>) -> Self {
         self.registry = registry;
+        self
+    }
+
+    pub fn with_perimeter(
+        mut self,
+        svc: Arc<crate::service::perimeter::HotelPerimeterService>,
+    ) -> Self {
+        self.perimeter_svc = Some(svc);
+        self
+    }
+
+    pub fn with_egress(
+        mut self,
+        gw: Arc<crate::service::egress::HotelEgressGateway>,
+    ) -> Self {
+        self.egress_gw = Some(gw);
         self
     }
 
@@ -3943,6 +3965,8 @@ impl IpcServer {
                     let network_broadcast_rx = self.network_broadcast.subscribe();
                     let operator_surface_tx = self.operator_surface_tx.clone();
                     let socket_path = self.socket_path.clone();
+                    let perimeter_svc = self.perimeter_svc.clone();
+                    let egress_gw = self.egress_gw.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -3967,6 +3991,8 @@ impl IpcServer {
                             network_broadcast_rx,
                             operator_surface_tx,
                             socket_path,
+                            perimeter_svc,
+                            egress_gw,
                         )
                         .await
                         {
@@ -4011,6 +4037,8 @@ impl IpcServer {
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
         socket_path: String,
+        perimeter_svc: Option<Arc<crate::service::perimeter::HotelPerimeterService>>,
+        egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -4075,6 +4103,85 @@ impl IpcServer {
                             "FetchMemoryConfig handled"
                         );
                         let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
+                    }
+                    Ok(IpcRequest::GetPerimeterStatus) => {
+                        use perimeter_core::service::PerimeterService as _;
+                        let snapshot = perimeter_svc
+                            .as_deref()
+                            .map(|s| s.snapshot())
+                            .unwrap_or_default();
+                        let snapshot_json =
+                            serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
+                        let _ = outbound_tx
+                            .send(IpcResponse::PerimeterStatus { snapshot_json });
+                    }
+                    Ok(IpcRequest::RefreshPerimeter) => {
+                        use perimeter_core::service::PerimeterService as _;
+                        if let Some(svc) = perimeter_svc.as_deref() {
+                            svc.refresh();
+                        }
+                        let snapshot = perimeter_svc
+                            .as_deref()
+                            .map(|s| s.snapshot())
+                            .unwrap_or_default();
+                        let snapshot_json =
+                            serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
+                        let _ = outbound_tx
+                            .send(IpcResponse::PerimeterStatus { snapshot_json });
+                    }
+                    Ok(IpcRequest::CheckEgress {
+                        agent_id,
+                        target_url,
+                        method,
+                    }) => {
+                        use perimeter_core::egress::{EgressDecision, EgressGateway as _, EgressRequest};
+                        use perimeter_core::service::PerimeterService as _;
+                        let tier = perimeter_svc
+                            .as_deref()
+                            .map(|s| s.ceiling())
+                            .unwrap_or_default();
+                        let mut req = EgressRequest {
+                            agent_id: agent_id.clone(),
+                            target_url: target_url.clone(),
+                            method: method.clone(),
+                            headers: std::collections::HashMap::new(),
+                            tier,
+                        };
+                        let resp = match egress_gw.as_deref() {
+                            Some(gw) => {
+                                let decision = gw.check(&req);
+                                if decision.is_allowed() {
+                                    let _ = gw.inject_credentials(&mut req).await;
+                                }
+                                match decision {
+                                    EgressDecision::Allow => IpcResponse::EgressGrant {
+                                        allowed: true,
+                                        audit: false,
+                                        deny_reason: None,
+                                        inject_headers: req.headers,
+                                    },
+                                    EgressDecision::AllowWithAudit => IpcResponse::EgressGrant {
+                                        allowed: true,
+                                        audit: true,
+                                        deny_reason: None,
+                                        inject_headers: req.headers,
+                                    },
+                                    EgressDecision::Deny { reason } => IpcResponse::EgressGrant {
+                                        allowed: false,
+                                        audit: false,
+                                        deny_reason: Some(reason),
+                                        inject_headers: std::collections::HashMap::new(),
+                                    },
+                                }
+                            }
+                            None => IpcResponse::EgressGrant {
+                                allowed: true,
+                                audit: false,
+                                deny_reason: None,
+                                inject_headers: std::collections::HashMap::new(),
+                            },
+                        };
+                        let _ = outbound_tx.send(resp);
                     }
                     Ok(IpcRequest::ListTrainingSamples {
                         agent_id,
@@ -9279,6 +9386,16 @@ impl IpcServer {
                 "UNREACHABLE",
                 "ASR request intercepted before process_request",
             ),
+            IpcRequest::GetPerimeterStatus | IpcRequest::RefreshPerimeter => IpcResponse::error(
+                "perimeter",
+                "UNREACHABLE",
+                "Perimeter request intercepted before process_request",
+            ),
+            IpcRequest::CheckEgress { .. } => IpcResponse::error(
+                "egress",
+                "UNREACHABLE",
+                "Egress check intercepted before process_request",
+            ),
             IpcRequest::RegisterGraphInstance {
                 graph_id,
                 instance_id,
@@ -10647,6 +10764,32 @@ impl IpcServer {
                 let endpoint_id = config.endpoint_id.clone();
                 let port = config.port;
 
+                // Fence: reject provision if the declared exposure exceeds the hotel's
+                // current perimeter ceiling. An agent must not open a higher-tier
+                // endpoint than the hotel is currently able to defend.
+                {
+                    use ansible_mesh_core::PerimeterSnapshot;
+                    let ceiling = graph
+                        .get_config_value("__hotel_perimeter__")
+                        .ok()
+                        .flatten()
+                        .and_then(|j| serde_json::from_str::<PerimeterSnapshot>(&j).ok())
+                        .map(|s| s.ceiling)
+                        .unwrap_or(ansible_mesh_core::ExposureTier::Internet); // safe default: allow if unknown
+
+                    if config.exposure > ceiling {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "EXPOSURE_EXCEEDS_PERIMETER",
+                            format!(
+                                "endpoint '{}' declares exposure {:?} but hotel ceiling is {:?}; \
+                                 lower the exposure tier or wait for the perimeter to expand",
+                                endpoint_id, config.exposure, ceiling
+                            ),
+                        );
+                    }
+                }
+
                 // Persist the endpoint config in the context graph.
                 let config_key = format!("__mcp_endpoint__:{endpoint_id}");
                 let preapproval_key = format!("__mcp_preapproval__:{endpoint_id}");
@@ -10664,6 +10807,30 @@ impl IpcServer {
 
                 if let Err(e) = graph.set_config_value(&config_key, &config_json) {
                     return IpcResponse::error("mcp_endpoint", "CONFIG_STORE_ERROR", e.to_string());
+                }
+
+                // Write a durable intent node capturing who provisioned this endpoint, why,
+                // and at what exposure tier. Queryable later via agent graph reads without
+                // needing to decode the full endpoint config.
+                {
+                    let tool_names: Vec<&str> =
+                        config.tools.iter().map(|t| t.name.as_str()).collect();
+                    let provisioned_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let intent = serde_json::json!({
+                        "endpoint_id": endpoint_id,
+                        "owner_agent_id": config.owner_agent_id,
+                        "exposure": config.exposure,
+                        "port": port,
+                        "tool_names": tool_names,
+                        "provisioned_at": provisioned_at,
+                    });
+                    let intent_key = format!("__mcp_endpoint_intent__:{endpoint_id}");
+                    if let Ok(intent_json) = serde_json::to_string(&intent) {
+                        let _ = graph.set_config_value(&intent_key, &intent_json);
+                    }
                 }
 
                 // Persist pre-approval rules separately for fast lookup.
@@ -10703,6 +10870,34 @@ impl IpcServer {
                     task_json,
                 )
                 .await;
+
+                // Also re-push the current perimeter tier so that a membrane-mcp guest
+                // that reconnected after a hotel restart has the correct fence tier even
+                // if it missed the initial startup push.
+                {
+                    use ansible_mesh_core::PerimeterSnapshot;
+                    let ceiling = graph
+                        .get_config_value("__hotel_perimeter__")
+                        .ok()
+                        .flatten()
+                        .and_then(|j| serde_json::from_str::<PerimeterSnapshot>(&j).ok())
+                        .map(|s| s.ceiling)
+                        .unwrap_or_default();
+                    let perimeter_task = serde_json::json!({
+                        "action": "update_perimeter",
+                        "tier": ceiling,
+                    })
+                    .to_string();
+                    Self::deliver_inbound_task(
+                        inboxes,
+                        local_node_id,
+                        &guest_id,
+                        None,
+                        Uuid::new_v4(),
+                        perimeter_task,
+                    )
+                    .await;
+                }
 
                 info!(
                     endpoint_id,
@@ -10752,6 +10947,8 @@ impl IpcServer {
                 let _ = graph.set_config_value(&config_key, "null");
                 let _ =
                     graph.set_config_value(&format!("__mcp_preapproval__:{endpoint_id}"), "null");
+                let _ = graph
+                    .set_config_value(&format!("__mcp_endpoint_intent__:{endpoint_id}"), "null");
 
                 // Signal the membrane-mcp guest to shut down.
                 let guest_id = format!("mcp-membrane-{endpoint_id}");
@@ -10777,6 +10974,32 @@ impl IpcServer {
                     port,
                     materialized: false,
                 }
+            }
+
+            IpcRequest::GetMcpEndpointStatus { endpoint_id } => {
+                use ansible_mesh_core::{ExposureTier, PerimeterSnapshot};
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let config: Option<serde_json::Value> = graph
+                    .get_config_value(&config_key)
+                    .ok()
+                    .flatten()
+                    .and_then(|j| serde_json::from_str(&j).ok());
+                let ceiling = graph
+                    .get_config_value("__hotel_perimeter__")
+                    .ok()
+                    .flatten()
+                    .and_then(|j| serde_json::from_str::<PerimeterSnapshot>(&j).ok())
+                    .map(|s| s.ceiling)
+                    .unwrap_or(ExposureTier::Local);
+                IpcResponse::success(
+                    "mcp_status",
+                    Some(serde_json::json!({
+                        "endpoint_id": endpoint_id,
+                        "config": config,
+                        "hotel_ceiling": ceiling,
+                        "active": config.is_some(),
+                    })),
+                )
             }
 
             // ── User Task Engine ──────────────────────────────────────────────
@@ -14027,6 +14250,9 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
         "session.status"
             | "hotel.status"
             | "hotel.logs"
+            | "hotel.perimeter.status"
+            | "hotel.perimeter.refresh"
+            | "hotel.egress.check"
             | "agent.configure"
             | "skill.register"
             | "subagent.spawn"

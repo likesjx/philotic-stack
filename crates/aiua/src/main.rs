@@ -2986,6 +2986,58 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "hotel.perimeter.status".into(),
+            description: "Returns the hotel's current network security perimeter snapshot: \
+                          exposure ceiling tier (Local/Lan/Mesh/Internet), per-listener profiles, \
+                          Tailscale presence, and detected public/private IP addresses. \
+                          Use this to understand what auth is required on ingress and what \
+                          egress policies apply."
+                .into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "hotel.perimeter.refresh".into(),
+            description: "Forces the hotel to re-derive its network security perimeter from live \
+                          OS interfaces and returns the updated snapshot. Use this after a network \
+                          change (e.g. joining a VPN, gaining a public IP) to ensure the fence \
+                          tiers reflect current topology."
+                .into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "hotel.egress.check".into(),
+            description: "Check whether an outbound HTTP request is permitted by the hotel's \
+                          egress policy and retrieve any vault-backed credentials to inject. \
+                          Returns `allowed`, `inject_headers` (e.g. Authorization), and \
+                          `deny_reason` if blocked. Call this before making privileged outbound \
+                          requests when operating at Mesh or Internet exposure tier."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["target_url"],
+                "properties": {
+                    "target_url": {
+                        "type": "string",
+                        "description": "Full URL of the outbound request (e.g. https://api.perplexity.ai/chat/completions)."
+                    },
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (default: GET)."
+                    },
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Calling agent's ID for vault access decisions."
+                    }
+                }
+            }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
             tool_name: "role.list".into(),
             description: "Lists all role incarnations configured for this agent, with their \
                           toolset profile, readiness state, and home hotel. Call this before \
@@ -6711,6 +6763,13 @@ async fn main() -> Result<()> {
         svc
     };
 
+    // Construct the egress gateway (empty policies = allow-all by default).
+    // Policies can be loaded from mesh-config.json in a future slice.
+    let egress_gw = Arc::new(crate::service::egress::HotelEgressGateway::new(
+        vec![],
+        graph_domain_arc.clone(),
+    ));
+
     // Create the memory channel dispatcher for PORT-BP-003 to pick up
     // In PORT-BP-003, this receiver will hand off to the persistent mesh_events ledger
     let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel::<LedgerCommand>(1024);
@@ -6834,11 +6893,14 @@ async fn main() -> Result<()> {
     .with_materialization_requester(guest_manager.clone())
     .with_webrtc_signal_tx(webrtc_signal_tx.clone())
     .with_registry(registry.clone())
-    .with_operator_surface_channel(operator_surface_tx);
+    .with_operator_surface_channel(operator_surface_tx)
+    .with_perimeter(perimeter_svc.clone())
+    .with_egress(egress_gw.clone());
     let ipc_inboxes = ipc_server.inboxes();
     let ipc_parked_inbound = ipc_server.parked_inbound();
     let ipc_materialization_requester = ipc_server.materialization_requester_arc();
     let network_broadcast_tx = ipc_server.network_broadcast_tx();
+    let perimeter_broadcast_tx = network_broadcast_tx.clone();
 
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
@@ -6936,6 +6998,7 @@ async fn main() -> Result<()> {
 
     // Spawn task: fan perimeter tier to mcp-membrane guests on every Shift event,
     // and send the initial tier right away so membrane-mcp starts with the correct gate.
+    // Also broadcast PerimeterShift to ALL connected guests so they can react.
     {
         use perimeter_core::service::{PerimeterEvent, PerimeterService as _};
         let fanout_inboxes = ipc_inboxes.clone();
@@ -6965,25 +7028,39 @@ async fn main() -> Result<()> {
             }
         });
 
-        // Fan on every subsequent Shift.
+        // Fan on every subsequent Shift: push to mcp-membrane inbox AND broadcast to all guests.
+        let fanout_broadcast_tx = perimeter_broadcast_tx;
         tokio::spawn(async move {
             while let Ok(event) = fanout_rx.recv().await {
-                if let PerimeterEvent::Shift { current, .. } = event {
+                if let PerimeterEvent::Shift { previous, current } = event {
+                    // 1. Update the membrane-mcp fence tier via inbox push.
                     let task_json = serde_json::json!({
                         "action": "update_perimeter",
                         "tier": current,
                     }).to_string();
-                    let guard = fanout_inboxes.lock().await;
-                    if let Some(subs) = guard.get("mcp-membrane") {
-                        let msg = philotic_client::IpcResponse::InboundTask {
-                            source_node: fanout_node_id.clone(),
-                            task_id: uuid::Uuid::new_v4(),
-                            task_json,
-                        };
-                        for sub in subs {
-                            let _ = sub.tx.send(msg.clone());
+                    {
+                        let guard = fanout_inboxes.lock().await;
+                        if let Some(subs) = guard.get("mcp-membrane") {
+                            let msg = philotic_client::IpcResponse::InboundTask {
+                                source_node: fanout_node_id.clone(),
+                                task_id: uuid::Uuid::new_v4(),
+                                task_json,
+                            };
+                            for sub in subs {
+                                let _ = sub.tx.send(msg.clone());
+                            }
                         }
                     }
+
+                    // 2. Broadcast PerimeterShift to all connected guests so they can
+                    //    react: re-evaluate in-flight work, update routing, etc.
+                    info!(
+                        ?previous, ?current,
+                        "Perimeter ceiling shifted — broadcasting PerimeterShift to all guests"
+                    );
+                    let _ = fanout_broadcast_tx.send(
+                        philotic_client::IpcResponse::PerimeterShift { previous, current },
+                    );
                 }
             }
         });
