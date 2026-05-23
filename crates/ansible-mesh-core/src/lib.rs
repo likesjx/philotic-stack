@@ -14,6 +14,7 @@ pub mod domain;
 pub mod event;
 pub mod graph;
 pub mod graph_tools;
+pub mod heal_queue;
 pub mod heartbeat;
 pub mod ledger;
 pub mod materializer;

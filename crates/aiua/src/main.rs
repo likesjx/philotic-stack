@@ -6866,10 +6866,51 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Heal queue: guest stderr lines flow into heal_queue in the hotel DB.
+    let (stderr_tx, mut stderr_rx) =
+        tokio::sync::mpsc::channel::<crate::service::guest_manager::GuestStderrLine>(1024);
+    {
+        use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
+        use std::sync::Arc;
+        match SqliteHealQueueStorage::open(db_path) {
+            Ok(hq) => {
+                let hq: Arc<dyn HealQueueStorage> = Arc::new(hq);
+                let hq_vacuum = hq.clone();
+                // Consumer: persist each stderr line to heal_queue.
+                tokio::spawn(async move {
+                    while let Some(entry) = stderr_rx.recv().await {
+                        if let Err(e) = hq.push_error(&entry.guest_id, &entry.line) {
+                            warn!("heal_queue push_error failed: {e}");
+                        }
+                    }
+                });
+                // Vacuum resolved rows older than 7 days once per hour.
+                tokio::spawn(async move {
+                    const SEVEN_DAYS: u64 = 7 * 24 * 3600;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        match hq_vacuum.vacuum_old(SEVEN_DAYS) {
+                            Ok(n) if n > 0 => info!(deleted = n, "heal_queue vacuum complete"),
+                            Ok(_) => {}
+                            Err(e) => warn!("heal_queue vacuum failed: {e}"),
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("heal_queue: failed to open storage ({e:#}); stderr will log only");
+                tokio::spawn(async move {
+                    while let Some(_) = stderr_rx.recv().await {}
+                });
+            }
+        }
+    }
+
     // Abstracted Universal Materializer with trait-object storage
-    let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new(
-        db_path.to_string_lossy(),
-    ));
+    let materializer = Box::new(
+        crate::service::guest_manager::LocalProcessMaterializer::new(db_path.to_string_lossy())
+            .with_stderr_sink(stderr_tx),
+    );
     let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(
         hotel_name.clone(),
         graph_domain_arc.clone(),

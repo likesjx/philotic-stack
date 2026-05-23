@@ -10,12 +10,20 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+/// A single stderr line emitted by a guest process.
+pub struct GuestStderrLine {
+    pub guest_id: String,
+    pub line: String,
+}
 
 /// A Universal Materializer backed by the local OS Process space.
 pub struct LocalProcessMaterializer {
     children: HashMap<String, tokio::process::Child>,
     db_path: String,
+    stderr_tx: Option<mpsc::Sender<GuestStderrLine>>,
 }
 
 impl LocalProcessMaterializer {
@@ -23,7 +31,15 @@ impl LocalProcessMaterializer {
         Self {
             children: HashMap::new(),
             db_path: db_path.into(),
+            stderr_tx: None,
         }
+    }
+
+    /// Attach a channel through which guest stderr lines are forwarded for
+    /// storage in the heal_queue table. Must be called before guests spawn.
+    pub fn with_stderr_sink(mut self, tx: mpsc::Sender<GuestStderrLine>) -> Self {
+        self.stderr_tx = Some(tx);
+        self
     }
 
     fn pid_exists(pid: u32) -> bool {
@@ -120,10 +136,17 @@ impl Materializer for LocalProcessMaterializer {
             // Take stderr BEFORE moving child into the map.
             if let Some(stderr) = child.stderr.take() {
                 let gid = guest_id.to_string();
+                let tx = self.stderr_tx.clone();
                 tokio::spawn(async move {
                     let mut lines = BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         warn!(guest_id = %gid, "stderr: {}", line);
+                        if let Some(ref tx) = tx {
+                            let _ = tx.try_send(GuestStderrLine {
+                                guest_id: gid.clone(),
+                                line,
+                            });
+                        }
                     }
                 });
             }
