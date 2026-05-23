@@ -26,5 +26,6 @@ members = [
     "crates/parakeet-runner",
     "crates/table-datasource",
     "crates/media-codec",
+    "crates/perimeter-core",
 ]
 resolver = "2"

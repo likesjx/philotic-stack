@@ -10,6 +10,7 @@ use ansible_mesh_core::storage::{
     AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeHealthSnapshot, NodeRole};
+use perimeter_core::service::PerimeterService as _;
 use anyhow::{Context, Result};
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path as AxumPath, Query, Request, State};
@@ -111,6 +112,7 @@ struct MeshRuntimeContext {
     inbox_rx: BeaconInboxReceiver,
     webrtc_signal_tx: mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>,
     webrtc_signal_rx: WebRtcSignalReceiver,
+    perimeter_svc: Arc<crate::service::perimeter::HotelPerimeterService>,
 }
 
 /// Operator surface query worker — receives tasks via in-process channel (no UDS
@@ -1118,7 +1120,11 @@ fn execution_reachability_for_hotel(
 /// Samples local environment vitals for inclusion in the outbound heartbeat.
 /// All fields are best-effort; failures are silently swallowed so a bad sysfs
 /// read never blocks the heartbeat loop.
-fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapshot {
+fn sample_node_health(
+    graph: &GraphDomain,
+    hotel_name: &str,
+    perimeter_svc: &crate::service::perimeter::HotelPerimeterService,
+) -> NodeHealthSnapshot {
     let guest_count = graph
         .list_guests(hotel_name, false)
         .ok()
@@ -1211,6 +1217,7 @@ fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapsh
         disk_free_pct,
         mem_free_pct,
         load_avg_1m,
+        perimeter: Some(perimeter_svc.snapshot()),
     }
 }
 
@@ -1285,6 +1292,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
         let heartbeat_graph = ctx.graph_domain.clone();
         let heartbeat_hotel = ctx.hotel.clone();
         let heartbeat_caps = ctx.caps.clone();
+        let heartbeat_perimeter = ctx.perimeter_svc.clone();
         let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
@@ -1304,7 +1312,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         let execution_reachability =
                             execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
                         let node_health =
-                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name);
+                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name, &heartbeat_perimeter);
                         for (_target_node_id, target_addr) in targets {
                             let Ok(target) = target_addr.parse::<SocketAddr>() else {
                                 warn!("Skipping invalid heartbeat target address {}", target_addr);
@@ -2971,6 +2979,58 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                     "lines": {
                         "type": "integer",
                         "description": "Number of recent log lines to return (max 500, default 50)."
+                    }
+                }
+            }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "hotel.perimeter.status".into(),
+            description: "Returns the hotel's current network security perimeter snapshot: \
+                          exposure ceiling tier (Local/Lan/Mesh/Internet), per-listener profiles, \
+                          Tailscale presence, and detected public/private IP addresses. \
+                          Use this to understand what auth is required on ingress and what \
+                          egress policies apply."
+                .into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "hotel.perimeter.refresh".into(),
+            description: "Forces the hotel to re-derive its network security perimeter from live \
+                          OS interfaces and returns the updated snapshot. Use this after a network \
+                          change (e.g. joining a VPN, gaining a public IP) to ensure the fence \
+                          tiers reflect current topology."
+                .into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            class: "session".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "hotel.egress.check".into(),
+            description: "Check whether an outbound HTTP request is permitted by the hotel's \
+                          egress policy and retrieve any vault-backed credentials to inject. \
+                          Returns `allowed`, `inject_headers` (e.g. Authorization), and \
+                          `deny_reason` if blocked. Call this before making privileged outbound \
+                          requests when operating at Mesh or Internet exposure tier."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["target_url"],
+                "properties": {
+                    "target_url": {
+                        "type": "string",
+                        "description": "Full URL of the outbound request (e.g. https://api.perplexity.ai/chat/completions)."
+                    },
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (default: GET)."
+                    },
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Calling agent's ID for vault access decisions."
                     }
                 }
             }),
@@ -6660,6 +6720,56 @@ async fn main() -> Result<()> {
     let execution_addr = format!("0.0.0.0:{}", hotel.execution_port);
     let execution_enable_rust_auth = flags.enable_rust_auth;
 
+    // Build and persist the PerimeterService from the hotel's actual listener bindings.
+    // Blob binds to 127.0.0.1 (Local); mesh + execution bind to 0.0.0.0 (tier depends on
+    // whether a public IP is detected). IPC is always Local (added by HotelPerimeterService).
+    let perimeter_svc = {
+        use std::net::{IpAddr, Ipv4Addr};
+        use crate::service::perimeter::{HotelPerimeterService, ListenerDecl};
+        let listeners = vec![
+            ListenerDecl {
+                purpose: "beacon",
+                bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: hotel.mesh_port,
+                iface: None,
+            },
+            ListenerDecl {
+                purpose: "execution",
+                bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: hotel.execution_port,
+                iface: None,
+            },
+            ListenerDecl {
+                purpose: "blob",
+                bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: hotel.blob_port,
+                iface: None,
+            },
+        ];
+        let svc = HotelPerimeterService::new(listeners);
+        // Persist snapshot to node_config so restart hydration has a last-known baseline
+        let snapshot_json = serde_json::to_string(&svc.snapshot()).unwrap_or_default();
+        if let Err(e) = graph_domain_arc.set_config_value("__hotel_perimeter__", &snapshot_json) {
+            warn!("Failed to persist hotel perimeter snapshot: {e}");
+        } else {
+            info!(ceiling = ?svc.ceiling(), "Hotel perimeter derived and persisted");
+        }
+        // Spawn periodic refresh (every 5 minutes)
+        crate::service::perimeter::spawn_refresh_loop(
+            svc.clone(),
+            std::time::Duration::from_secs(300),
+            shutdown_rx.resubscribe(),
+        );
+        svc
+    };
+
+    // Construct the egress gateway (empty policies = allow-all by default).
+    // Policies can be loaded from mesh-config.json in a future slice.
+    let egress_gw = Arc::new(crate::service::egress::HotelEgressGateway::new(
+        vec![],
+        graph_domain_arc.clone(),
+    ));
+
     // Create the memory channel dispatcher for PORT-BP-003 to pick up
     // In PORT-BP-003, this receiver will hand off to the persistent mesh_events ledger
     let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel::<LedgerCommand>(1024);
@@ -6783,11 +6893,14 @@ async fn main() -> Result<()> {
     .with_materialization_requester(guest_manager.clone())
     .with_webrtc_signal_tx(webrtc_signal_tx.clone())
     .with_registry(registry.clone())
-    .with_operator_surface_channel(operator_surface_tx);
+    .with_operator_surface_channel(operator_surface_tx)
+    .with_perimeter(perimeter_svc.clone())
+    .with_egress(egress_gw.clone());
     let ipc_inboxes = ipc_server.inboxes();
     let ipc_parked_inbound = ipc_server.parked_inbound();
     let ipc_materialization_requester = ipc_server.materialization_requester_arc();
     let network_broadcast_tx = ipc_server.network_broadcast_tx();
+    let perimeter_broadcast_tx = network_broadcast_tx.clone();
 
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
@@ -6875,11 +6988,82 @@ async fn main() -> Result<()> {
         inbox_rx: inbox_rx.clone(),
         webrtc_signal_tx: webrtc_signal_tx.clone(),
         webrtc_signal_rx: webrtc_signal_rx.clone(),
+        perimeter_svc: perimeter_svc.clone(),
     };
 
     if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {
         let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
         return Err(e);
+    }
+
+    // Spawn task: fan perimeter tier to mcp-membrane guests on every Shift event,
+    // and send the initial tier right away so membrane-mcp starts with the correct gate.
+    // Also broadcast PerimeterShift to ALL connected guests so they can react.
+    {
+        use perimeter_core::service::{PerimeterEvent, PerimeterService as _};
+        let fanout_inboxes = ipc_inboxes.clone();
+        let fanout_node_id = caps.node_id.clone();
+        let fanout_perimeter = perimeter_svc.clone();
+        let mut fanout_rx = fanout_perimeter.subscribe();
+        let initial_tier = fanout_perimeter.ceiling();
+
+        // Push current tier immediately so membrane-mcp doesn't wait for the first shift.
+        let initial_task = serde_json::json!({
+            "action": "update_perimeter",
+            "tier": initial_tier,
+        }).to_string();
+        let fanout_inboxes_init = fanout_inboxes.clone();
+        let fanout_node_id_init = fanout_node_id.clone();
+        tokio::spawn(async move {
+            let guard = fanout_inboxes_init.lock().await;
+            if let Some(subs) = guard.get("mcp-membrane") {
+                let msg = philotic_client::IpcResponse::InboundTask {
+                    source_node: fanout_node_id_init.clone(),
+                    task_id: uuid::Uuid::new_v4(),
+                    task_json: initial_task,
+                };
+                for sub in subs {
+                    let _ = sub.tx.send(msg.clone());
+                }
+            }
+        });
+
+        // Fan on every subsequent Shift: push to mcp-membrane inbox AND broadcast to all guests.
+        let fanout_broadcast_tx = perimeter_broadcast_tx;
+        tokio::spawn(async move {
+            while let Ok(event) = fanout_rx.recv().await {
+                if let PerimeterEvent::Shift { previous, current } = event {
+                    // 1. Update the membrane-mcp fence tier via inbox push.
+                    let task_json = serde_json::json!({
+                        "action": "update_perimeter",
+                        "tier": current,
+                    }).to_string();
+                    {
+                        let guard = fanout_inboxes.lock().await;
+                        if let Some(subs) = guard.get("mcp-membrane") {
+                            let msg = philotic_client::IpcResponse::InboundTask {
+                                source_node: fanout_node_id.clone(),
+                                task_id: uuid::Uuid::new_v4(),
+                                task_json,
+                            };
+                            for sub in subs {
+                                let _ = sub.tx.send(msg.clone());
+                            }
+                        }
+                    }
+
+                    // 2. Broadcast PerimeterShift to all connected guests so they can
+                    //    react: re-evaluate in-flight work, update routing, etc.
+                    info!(
+                        ?previous, ?current,
+                        "Perimeter ceiling shifted — broadcasting PerimeterShift to all guests"
+                    );
+                    let _ = fanout_broadcast_tx.send(
+                        philotic_client::IpcResponse::PerimeterShift { previous, current },
+                    );
+                }
+            }
+        });
     }
 
     // RESOURCE BROKER BOOT RECONCILIATION (transitional — Seam 2 / demand-derived-materialization)

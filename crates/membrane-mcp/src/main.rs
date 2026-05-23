@@ -235,6 +235,16 @@ impl MembraneGuest for McpMembrane {
     }
 
     async fn handle_push(&mut self, msg: &IpcResponse) -> Result<bool> {
+        // Handle direct broadcast variants before the InboundTask path.
+        if let IpcResponse::PerimeterShift { previous, current } = msg {
+            // The update_perimeter inbox push is the primary path; this broadcast
+            // provides a secondary update in case the inbox push races or is missed.
+            let current = *current;
+            *self.state.ingress_tier.write().unwrap() = current;
+            info!(?previous, ?current, "Ingress fence tier updated from PerimeterShift broadcast");
+            return Ok(true);
+        }
+
         let task_json = match msg {
             IpcResponse::InboundTask { task_json, .. } => task_json,
             _ => return Ok(false),
@@ -296,6 +306,21 @@ impl MembraneGuest for McpMembrane {
             "revoke_mcp_config" => {
                 let mut table = self.state.endpoint_table.write().await;
                 table.revoke();
+                Ok(true)
+            }
+            "update_perimeter" => {
+                let tier: ansible_mesh_core::ExposureTier = match payload
+                    .get("tier")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                {
+                    Some(t) => t,
+                    None => {
+                        warn!("update_perimeter push missing or invalid 'tier' field");
+                        return Ok(false);
+                    }
+                };
+                *self.state.ingress_tier.write().unwrap() = tier;
+                info!(?tier, "Ingress fence tier updated from hotel push");
                 Ok(true)
             }
             _ => Ok(false),
@@ -370,6 +395,9 @@ async fn main() -> Result<()> {
 
     let endpoint_table = new_shared_endpoint_table();
 
+    // Default to Local (safest). Updated via update_perimeter push once the hotel connects.
+    let ingress_tier = Arc::new(std::sync::RwLock::new(ansible_mesh_core::ExposureTier::Local));
+
     let state = Arc::new(MembraneState {
         routing_table: table,
         endpoint_table,
@@ -384,6 +412,7 @@ async fn main() -> Result<()> {
         node_id: args.node_id.clone(),
         inbound_tx,
         pending_responses,
+        ingress_tier,
     });
 
     let guest = McpMembrane::new(args.port, &args.node_id, state);

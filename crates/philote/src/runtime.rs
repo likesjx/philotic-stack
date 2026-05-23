@@ -2291,6 +2291,29 @@ impl AgentRuntime {
                         info!("Network restored — cloud model tiers re-enabled");
                     }
                 }
+                Ok(Ok(IpcResponse::PerimeterShift { previous, current })) => {
+                    use ansible_mesh_core::ExposureTier;
+                    if current > previous {
+                        // Ceiling rose: enforcement tightened (e.g. Lan → Internet).
+                        // In-flight turns that assumed lower-trust access may now require
+                        // re-authentication. Log and let the turn complete — the fence on
+                        // the listener side will enforce on the next inbound request.
+                        warn!(
+                            ?previous, ?current,
+                            "Security perimeter ceiling raised — stricter enforcement now active"
+                        );
+                    } else {
+                        // Ceiling dropped: less exposed (e.g. Internet → Lan). Relax.
+                        info!(?previous, ?current, "Security perimeter ceiling lowered");
+                    }
+                    // Fail any in-flight turns that were operating at a tier above the
+                    // new ceiling. This is conservative but prevents stale-auth continuations.
+                    if current < ExposureTier::Mesh {
+                        // Below Mesh means no external callers — but if we had in-flight
+                        // mesh-origin turns, they should be re-evaluated. For now, log only.
+                        // Active turn interruption (if needed) would go here.
+                    }
+                }
                 Ok(Ok(IpcResponse::GracefulShutdown { drain_timeout_secs })) => {
                     info!(
                         "Hotel requested graceful shutdown (drain window: {}s). \
@@ -8755,6 +8778,150 @@ impl AgentRuntime {
                 })
                 .await
             }
+            "hotel.perimeter.status" => {
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetPerimeterStatus)
+                    .await
+                {
+                    Ok(IpcResponse::PerimeterStatus { snapshot_json }) => {
+                        let text = serde_json::from_str::<serde_json::Value>(&snapshot_json)
+                            .ok()
+                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                            .unwrap_or(snapshot_json);
+                        (text, None)
+                    }
+                    Ok(_) => ("Perimeter status unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.perimeter.status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "hotel.perimeter.refresh" => {
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RefreshPerimeter)
+                    .await
+                {
+                    Ok(IpcResponse::PerimeterStatus { snapshot_json }) => {
+                        let text = serde_json::from_str::<serde_json::Value>(&snapshot_json)
+                            .ok()
+                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                            .unwrap_or(snapshot_json);
+                        (format!("Perimeter refreshed.\n{text}"), None)
+                    }
+                    Ok(_) => ("Perimeter refresh unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.perimeter.refresh: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "hotel.egress.check" => {
+                let target_url = payload
+                    .arguments
+                    .get("target_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let method = payload
+                    .arguments
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("GET")
+                    .to_string();
+                let agent_id = payload
+                    .arguments
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::CheckEgress {
+                        agent_id,
+                        target_url,
+                        method,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::EgressGrant {
+                        allowed,
+                        audit,
+                        deny_reason,
+                        inject_headers,
+                    }) => {
+                        let text = serde_json::to_string_pretty(&serde_json::json!({
+                            "allowed": allowed,
+                            "audit": audit,
+                            "deny_reason": deny_reason,
+                            "inject_headers": inject_headers,
+                        }))
+                        .unwrap_or_else(|_| format!("allowed={allowed}"));
+                        (text, None)
+                    }
+                    Ok(_) => ("Egress check unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.egress.check: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
             "hotel.logs" => {
                 let lines = payload
                     .arguments
@@ -12549,11 +12716,19 @@ impl AgentRuntime {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
+                let exposure = args
+                    .get("exposure")
+                    .and_then(|v| {
+                        serde_json::from_value::<ansible_mesh_core::ExposureTier>(v.clone()).ok()
+                    })
+                    .unwrap_or(ansible_mesh_core::ExposureTier::Local);
+
                 let config = ansible_mesh_core::mcp_endpoint::McpEndpointConfig {
                     endpoint_id: endpoint_id.clone(),
                     owner_agent_id: self.agent_id.clone(),
                     port,
                     path: None,
+                    exposure,
                     tools,
                     preapproval_rules,
                     updated_at,
@@ -12746,6 +12921,71 @@ impl AgentRuntime {
                     error: tool_err,
                     tool_name: Some("mcp.revoke".into()),
                     arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── mcp.status ───────────────────────────────────────────────────
+            "mcp.status" => {
+                let endpoint_id = match payload.arguments.get("endpoint_id").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "mcp.status: missing required argument 'endpoint_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetMcpEndpointStatus {
+                        endpoint_id: endpoint_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let text = serde_json::to_string_pretty(&data)
+                            .unwrap_or_else(|_| data.to_string());
+                        (text, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("MCP endpoint status unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("mcp.status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
