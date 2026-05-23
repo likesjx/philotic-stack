@@ -6867,19 +6867,20 @@ async fn main() -> Result<()> {
     }
 
     // Heal queue: guest stderr lines flow into heal_queue in the hotel DB.
+    // The Arc is also wired into IpcServer so guests can push entries via IPC.
     let (stderr_tx, mut stderr_rx) =
         tokio::sync::mpsc::channel::<crate::service::guest_manager::GuestStderrLine>(1024);
-    {
+    let heal_queue_arc: Option<std::sync::Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>> = {
         use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
-        use std::sync::Arc;
         match SqliteHealQueueStorage::open(db_path) {
             Ok(hq) => {
-                let hq: Arc<dyn HealQueueStorage> = Arc::new(hq);
+                let hq: std::sync::Arc<dyn HealQueueStorage> = std::sync::Arc::new(hq);
+                let hq_consumer = hq.clone();
                 let hq_vacuum = hq.clone();
                 // Consumer: persist each stderr line to heal_queue.
                 tokio::spawn(async move {
                     while let Some(entry) = stderr_rx.recv().await {
-                        if let Err(e) = hq.push_error(&entry.guest_id, &entry.line) {
+                        if let Err(e) = hq_consumer.push_error(&entry.guest_id, &entry.line) {
                             warn!("heal_queue push_error failed: {e}");
                         }
                     }
@@ -6896,15 +6897,17 @@ async fn main() -> Result<()> {
                         }
                     }
                 });
+                Some(hq)
             }
             Err(e) => {
                 warn!("heal_queue: failed to open storage ({e:#}); stderr will log only");
                 tokio::spawn(async move {
                     while let Some(_) = stderr_rx.recv().await {}
                 });
+                None
             }
         }
-    }
+    };
 
     // Abstracted Universal Materializer with trait-object storage
     let materializer = Box::new(
@@ -6937,6 +6940,11 @@ async fn main() -> Result<()> {
     .with_operator_surface_channel(operator_surface_tx)
     .with_perimeter(perimeter_svc.clone())
     .with_egress(egress_gw.clone());
+    let ipc_server = if let Some(hq) = heal_queue_arc {
+        ipc_server.with_heal_queue(hq)
+    } else {
+        ipc_server
+    };
     let ipc_inboxes = ipc_server.inboxes();
     let ipc_parked_inbound = ipc_server.parked_inbound();
     let ipc_materialization_requester = ipc_server.materialization_requester_arc();

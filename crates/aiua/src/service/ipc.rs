@@ -920,6 +920,7 @@ pub struct IpcServer {
     peer_sockets: Arc<RwLock<HashMap<String, String>>>,
     muninn_config: Option<Arc<memory_core::MuninnConfig>>,
     training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
+    heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
     webrtc_signal_tx: Option<mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
     /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
     /// The sender is cloned into each `handle_client` task for forwarding.
@@ -3828,6 +3829,7 @@ impl IpcServer {
             peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
             training_storage: None,
+            heal_queue: None,
             webrtc_signal_tx: None,
             network_broadcast,
             operator_surface_tx: None,
@@ -3846,6 +3848,14 @@ impl IpcServer {
         storage: Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
     ) -> Self {
         self.training_storage = Some(storage);
+        self
+    }
+
+    pub fn with_heal_queue(
+        mut self,
+        hq: Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+    ) -> Self {
+        self.heal_queue = Some(hq);
         self
     }
 
@@ -3961,6 +3971,7 @@ impl IpcServer {
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     let training_storage = self.training_storage.clone();
+                    let heal_queue = self.heal_queue.clone();
                     let webrtc_signal_tx = self.webrtc_signal_tx.clone();
                     let network_broadcast_rx = self.network_broadcast.subscribe();
                     let operator_surface_tx = self.operator_surface_tx.clone();
@@ -3987,6 +3998,7 @@ impl IpcServer {
                             peer_sockets,
                             muninn_config,
                             training_storage,
+                            heal_queue,
                             webrtc_signal_tx,
                             network_broadcast_rx,
                             operator_surface_tx,
@@ -4033,6 +4045,7 @@ impl IpcServer {
         training_storage: Option<
             Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
         >,
+        heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
         webrtc_signal_tx: Option<mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
@@ -4283,6 +4296,7 @@ impl IpcServer {
                             &registry,
                             &peer_sockets,
                             webrtc_signal_tx.as_ref(),
+                            heal_queue.as_deref(),
                             conn_id,
                             &outbound_tx,
                             &mut subscribed_roles,
@@ -6041,6 +6055,7 @@ impl IpcServer {
         registry: &Arc<RwLock<NodeRegistry>>,
         peer_sockets: &Arc<RwLock<HashMap<String, String>>>,
         webrtc_signal_tx: Option<&mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
         conn_id: Uuid,
         outbound_tx: &mpsc::UnboundedSender<IpcResponse>,
         subscribed_roles: &mut Vec<String>,
@@ -11140,6 +11155,46 @@ impl IpcServer {
                 Ok(tasks) => IpcResponse::UserTaskList { user_tasks: tasks },
                 Err(e) => IpcResponse::error("list_user_tasks", "STORAGE_ERROR", format!("{e}")),
             },
+
+            IpcRequest::PushHealEntry { guest_id, raw_text } => {
+                match heal_queue.as_deref() {
+                    Some(hq) => match hq.push_error(&guest_id, &raw_text) {
+                        Ok(id) => IpcResponse::HealEntryPushed { id },
+                        Err(e) => IpcResponse::error("push_heal_entry", "STORAGE_ERROR", format!("{e}")),
+                    },
+                    None => IpcResponse::error("push_heal_entry", "UNAVAILABLE", "heal_queue not configured".to_string()),
+                }
+            }
+
+            IpcRequest::GetHealQueuePending { limit } => {
+                match heal_queue.as_deref() {
+                    Some(hq) => match hq.pending_errors(limit) {
+                        Ok(rows) => IpcResponse::HealQueuePending { rows },
+                        Err(e) => IpcResponse::error("get_heal_queue_pending", "STORAGE_ERROR", format!("{e}")),
+                    },
+                    None => IpcResponse::HealQueuePending { rows: vec![] },
+                }
+            }
+
+            IpcRequest::TriageHealEntry { id, severity, pattern_tag, heal_action } => {
+                match heal_queue.as_deref() {
+                    Some(hq) => match hq.update_triage(&id, &severity, &pattern_tag, &heal_action) {
+                        Ok(()) => IpcResponse::success("triage_heal_entry", None),
+                        Err(e) => IpcResponse::error("triage_heal_entry", "STORAGE_ERROR", format!("{e}")),
+                    },
+                    None => IpcResponse::error("triage_heal_entry", "UNAVAILABLE", "heal_queue not configured".to_string()),
+                }
+            }
+
+            IpcRequest::ResolveHealEntry { id, outcome } => {
+                match heal_queue.as_deref() {
+                    Some(hq) => match hq.resolve(&id, &outcome) {
+                        Ok(()) => IpcResponse::success("resolve_heal_entry", None),
+                        Err(e) => IpcResponse::error("resolve_heal_entry", "STORAGE_ERROR", format!("{e}")),
+                    },
+                    None => IpcResponse::error("resolve_heal_entry", "UNAVAILABLE", "heal_queue not configured".to_string()),
+                }
+            }
         }
     }
 

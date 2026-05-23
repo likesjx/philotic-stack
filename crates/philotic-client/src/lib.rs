@@ -1622,6 +1622,36 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
     },
+    /// Push a heal_queue entry from any guest (e.g. model-router on call failure).
+    /// Responds with [`IpcResponse::HealEntryPushed`].
+    PushHealEntry {
+        guest_id: String,
+        raw_text: String,
+    },
+    /// Retrieve pending (unresolved) heal_queue rows for the dispatcher.
+    /// Responds with [`IpcResponse::HealQueuePending`].
+    GetHealQueuePending {
+        #[serde(default = "default_heal_queue_limit")]
+        limit: usize,
+    },
+    /// Write triage decision back onto a heal_queue row.
+    /// Responds with [`IpcResponse::Standard`] (ok=true).
+    TriageHealEntry {
+        id: String,
+        severity: String,
+        pattern_tag: String,
+        heal_action: String,
+    },
+    /// Mark a heal_queue row resolved with the observed outcome.
+    /// Responds with [`IpcResponse::Standard`] (ok=true).
+    ResolveHealEntry {
+        id: String,
+        outcome: String,
+    },
+}
+
+fn default_heal_queue_limit() -> usize {
+    50
 }
 
 /// Payload for [`IpcResponse::UserProfileData`].
@@ -1989,6 +2019,14 @@ pub enum IpcResponse {
         /// Only populated when `allowed` is true and a vault credential was resolved.
         #[serde(default)]
         inject_headers: std::collections::HashMap<String, String>,
+    },
+    /// Response to [`IpcRequest::PushHealEntry`].
+    HealEntryPushed {
+        id: String,
+    },
+    /// Response to [`IpcRequest::GetHealQueuePending`].
+    HealQueuePending {
+        rows: Vec<ansible_mesh_core::heal_queue::HealQueueRow>,
     },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
