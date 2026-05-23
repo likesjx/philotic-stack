@@ -2398,6 +2398,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-codec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "media-prep",
+ "rusqlite",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "media-prep"
 version = "0.1.0"
 dependencies = [
@@ -2600,6 +2613,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "media-codec",
  "media-prep",
  "mlx-runner",
  "onnx-runner",

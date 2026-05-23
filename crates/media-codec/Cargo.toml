@@ -1,0 +1,17 @@
+[package]
+name = "media-codec"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "media_codec"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+hex = "0.4"
+media-prep = { path = "../media-prep" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"

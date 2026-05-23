@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::{SinkExt, StreamExt};
-use media_prep::{PcmPrepPolicy, prepare_audio_ligand_for_pcm, transcode_to_wav_16k};
+use media_codec::{AudioProvider as CodecProvider, normalize_audio};
+use media_prep::{PcmPrepPolicy, prepare_audio_ligand_for_pcm};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -658,22 +659,16 @@ impl GeminiProvider {
                 );
             }
             let bytes = response.bytes().await?.to_vec();
-            // Gemini inline_data does not support audio/ogg; transcode to WAV.
-            let (final_bytes, final_mime) =
-                if mime_type.starts_with("audio/ogg") || mime_type.starts_with("audio/x-ogg") {
-                    match transcode_to_wav_16k(bytes, &mime_type, "ffmpeg").await {
-                        Ok(wav) => (wav, Cow::Borrowed("audio/wav")),
-                        Err(e) => {
-                            bail!("failed to transcode OGG→WAV for Gemini: {e:#}");
-                        }
-                    }
-                } else {
-                    (bytes, mime_type)
-                };
+            let normalized =
+                normalize_audio(bytes, &mime_type, CodecProvider::Gemini, None, "ffmpeg")
+                    .await
+                    .with_context(|| {
+                        format!("media-codec: failed to normalize audio [{mime_type}] for Gemini")
+                    })?;
             parts.push(json!({
                 "inline_data": {
-                    "mime_type": final_mime,
-                    "data": BASE64_STANDARD.encode(final_bytes)
+                    "mime_type": normalized.mime_type,
+                    "data": BASE64_STANDARD.encode(normalized.bytes)
                 }
             }));
         }
