@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use ansible_mesh_core::ExposureTier;
 use crate::auth::{AllotmentTracker, VaultHashCache, VaultResolver, authorize_call};
 use crate::protocol::{
     InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse, McpToolDescriptor,
@@ -48,6 +49,9 @@ pub struct MembraneState {
     pub inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// Pending tool-call responses keyed by turn_id.
     pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    /// Current exposure tier for this listener — drives the ingress fence gate.
+    /// Updated via `update_perimeter` push from the hotel when the perimeter shifts.
+    pub ingress_tier: Arc<std::sync::RwLock<ExposureTier>>,
 }
 
 impl std::fmt::Debug for MembraneState {
@@ -103,6 +107,26 @@ async fn handle_mcp(
     let id = req.id.clone().unwrap_or(Value::Null);
     let is_loopback = addr.ip().is_loopback();
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+
+    // Ingress fence: listener-level check before any per-route auth.
+    {
+        let tier = *state.ingress_tier.read().unwrap();
+        let decision = perimeter_core::fence::check_ingress(tier, auth_header, is_loopback);
+        if !decision.is_allowed() {
+            let perimeter_core::IngressDecision::Deny { status, message } = decision else {
+                unreachable!()
+            };
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req.id,
+                "error": { "code": -32001, "message": message }
+            });
+            return (
+                axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
+                axum::Json(body),
+            ).into_response();
+        }
+    }
 
     match req.method.as_str() {
         // Notifications — JSON-RPC spec: MUST NOT send a response.

@@ -1458,6 +1458,11 @@ pub enum IpcRequest {
         endpoint_id: String,
         owner_agent_id: String,
     },
+    /// Return the stored `McpEndpointConfig` for the given endpoint, plus the
+    /// hotel's current perimeter ceiling. Responds with [`IpcResponse::Standard`].
+    GetMcpEndpointStatus {
+        endpoint_id: String,
+    },
     // ── Training data admin IPC ───────────────────────────────────────────────
     /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
     ListTrainingSamples {
@@ -1530,6 +1535,21 @@ pub enum IpcRequest {
     /// Return a safe view of hotel state: hotel name, active guests, agent identities.
     /// No secret or credential values are included.
     GetHotelStatus,
+    /// Return the hotel's current network security perimeter snapshot.
+    GetPerimeterStatus,
+    /// Force the hotel's PerimeterService to re-derive the snapshot from live interfaces.
+    RefreshPerimeter,
+    /// Ask the hotel's EgressGateway whether an outbound request is permitted and
+    /// inject vault-backed credentials for the target host if applicable.
+    /// Responds with [`IpcResponse::EgressGrant`].
+    CheckEgress {
+        /// Calling agent's ID (used for vault access decisions).
+        agent_id: String,
+        /// Full target URL (e.g. "https://api.perplexity.ai/chat/completions").
+        target_url: String,
+        /// HTTP method (e.g. "POST").
+        method: String,
+    },
     /// Ask the hotel to recommend the best execution placement for a role or tool need.
     BestPlaceToRun {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1942,6 +1962,33 @@ pub enum IpcResponse {
     },
     UserTaskList {
         user_tasks: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::GetPerimeterStatus`] and [`IpcRequest::RefreshPerimeter`].
+    /// `snapshot_json` is the serialized [`ansible_mesh_core::PerimeterSnapshot`].
+    PerimeterStatus {
+        snapshot_json: String,
+    },
+    /// Hotel → guest broadcast: the hotel's network security perimeter ceiling changed.
+    /// Sent to ALL connected guests via the broadcast channel when the perimeter shifts.
+    /// Guests should react by re-evaluating in-flight work, adjusting routing assumptions,
+    /// or propagating the shift to their own listeners.
+    PerimeterShift {
+        previous: ansible_mesh_core::ExposureTier,
+        current: ansible_mesh_core::ExposureTier,
+    },
+    /// Response to [`IpcRequest::CheckEgress`].
+    EgressGrant {
+        /// Whether the request is permitted.
+        allowed: bool,
+        /// Set to `true` when the policy matched `AllowWithAudit`.
+        audit: bool,
+        /// If `allowed` is false, the reason for denial.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deny_reason: Option<String>,
+        /// Headers to inject into the outbound request (e.g. `Authorization: Bearer <token>`).
+        /// Only populated when `allowed` is true and a vault credential was resolved.
+        #[serde(default)]
+        inject_headers: std::collections::HashMap<String, String>,
     },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it

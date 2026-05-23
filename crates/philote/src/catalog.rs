@@ -2045,6 +2045,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                          "inbound_transform", "outbound_transform"]
                         }
                     },
+                    "exposure": {
+                        "type": "string",
+                        "enum": ["local", "lan", "mesh", "internet"],
+                        "description": "Minimum tier at which this endpoint is intentionally \
+                                        served. The hotel validates that exposure <= its current \
+                                        perimeter ceiling and rejects the provision if it does not. \
+                                        Defaults to 'local'. Set to 'mesh' for Tailscale-reachable \
+                                        endpoints or 'internet' for public endpoints."
+                    },
                     "preapproval_rules": {
                         "type": "array",
                         "description": "Envelope actions pre-approved by this provisioning turn.",
@@ -2089,6 +2098,31 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["endpoint_id"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.status".into(),
+        ToolDefinition {
+            tool_name: "mcp.status".into(),
+            description: "Return the current configuration and exposure status of an MCP \
+                          endpoint. Shows the stored McpEndpointConfig (tools, preapproval rules, \
+                          port), the hotel's current perimeter ceiling, and whether the endpoint \
+                          is active. Use this to verify a provision succeeded, check whether an \
+                          endpoint's exposure tier is within the hotel's perimeter ceiling, or \
+                          inspect the live configuration."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The endpoint ID to inspect."
+                    }
+                },
+                "required": ["endpoint_id"]
+            }),
+            class: Some("session".into()),
         },
     );
 

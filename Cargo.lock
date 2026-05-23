@@ -100,6 +100,7 @@ dependencies = [
  "hex",
  "memory-core",
  "parakeet-runner",
+ "perimeter-core",
  "philotic-client",
  "rand 0.8.5",
  "reqwest",
@@ -2464,6 +2465,7 @@ dependencies = [
  "clap",
  "hex",
  "membrane",
+ "perimeter-core",
  "philotic-client",
  "serde",
  "serde_json",
@@ -3023,6 +3025,19 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "perimeter-core"
+version = "0.1.0"
+dependencies = [
+ "ansible-mesh-core",
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "philote"
