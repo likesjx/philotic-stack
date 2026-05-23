@@ -2027,6 +2027,10 @@ pub fn is_ipc_disconnect(err: &anyhow::Error) -> bool {
     })
 }
 
+pub fn is_graceful_shutdown(resp: &IpcResponse) -> bool {
+    matches!(resp, IpcResponse::GracefulShutdown { .. })
+}
+
 impl PhiloticClient {
     async fn write_frame(&mut self, payload: &[u8]) -> Result<()> {
         let len = u32::try_from(payload.len()).context("IPC payload too large")?;
@@ -2153,7 +2157,9 @@ impl PhiloticClient {
     fn is_push_message(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::InboundTask { .. } | IpcResponse::ApartmentUpdate { .. }
+            IpcResponse::InboundTask { .. }
+                | IpcResponse::ApartmentUpdate { .. }
+                | IpcResponse::GracefulShutdown { .. }
         )
     }
 

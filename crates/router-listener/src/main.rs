@@ -2,7 +2,9 @@ use ansible_mesh_core::whisper_training::{
     SqliteWhisperTrainingStorage, WhisperTrainingSample, WhisperTrainingStorage,
 };
 use anyhow::{Context, Result};
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_graceful_shutdown, is_ipc_disconnect,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -141,6 +143,10 @@ async fn run_connect_and_listen() -> Result<()> {
 
     loop {
         let msg = ipc.recv_task().await?;
+        if is_graceful_shutdown(&msg) {
+            info!("router-listener: received graceful shutdown from hotel");
+            return Ok(());
+        }
         let IpcResponse::InboundTask { task_json, .. } = msg else {
             continue;
         };

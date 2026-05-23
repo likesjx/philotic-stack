@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::{SinkExt, StreamExt};
-use media_codec::{AudioProvider as CodecProvider, normalize_audio};
+use media_codec::{AudioProvider as CodecProvider, CodecCache, normalize_audio};
 use media_prep::{PcmPrepPolicy, prepare_audio_ligand_for_pcm};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -56,6 +56,7 @@ pub struct GeminiProvider {
     auth: Option<GeminiAuth>,
     default_model: String,
     base_url: String,
+    codec_cache: Option<CodecCache>,
 }
 
 #[derive(Debug, Default)]
@@ -91,6 +92,15 @@ impl GeminiProvider {
         auth: Option<GeminiAuth>,
         base_url: Option<String>,
     ) -> Self {
+        let codec_cache = std::env::var("PHILOTIC_CODEC_CACHE_DB")
+            .ok()
+            .and_then(|path| match CodecCache::open(&path) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!("GeminiProvider: failed to open codec cache at {path}: {e:#}");
+                    None
+                }
+            });
         Self {
             http_client,
             auth,
@@ -99,6 +109,7 @@ impl GeminiProvider {
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into())
                 .trim_end_matches('/')
                 .to_string(),
+            codec_cache,
         }
     }
 
@@ -660,7 +671,7 @@ impl GeminiProvider {
             }
             let bytes = response.bytes().await?.to_vec();
             let normalized =
-                normalize_audio(bytes, &mime_type, CodecProvider::Gemini, None, "ffmpeg")
+                normalize_audio(bytes, &mime_type, CodecProvider::Gemini, self.codec_cache.as_ref(), "ffmpeg")
                     .await
                     .with_context(|| {
                         format!("media-codec: failed to normalize audio [{mime_type}] for Gemini")
