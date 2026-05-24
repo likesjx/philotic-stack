@@ -4906,6 +4906,32 @@ mod tests {
     }
 
     #[test]
+    fn delegate_whisper_catalog_exposes_blocking_paracrine_mode() {
+        use crate::catalog::tool_catalog;
+        let catalog = tool_catalog();
+        let entry = catalog
+            .get("delegate.whisper")
+            .expect("delegate.whisper in catalog");
+        let props = entry
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties object");
+        assert!(props.contains_key("wait_for_response"));
+        let routing_enum = props
+            .get("routing")
+            .and_then(|v| v.get("enum"))
+            .and_then(|v| v.as_array())
+            .expect("routing enum");
+        assert!(
+            routing_enum
+                .iter()
+                .any(|value| value.as_str() == Some("enriched_tool_result")),
+            "routing enum must expose enriched_tool_result"
+        );
+    }
+
+    #[test]
     fn desktop_observe_is_desktop_class_and_low_agency() {
         use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
         let catalog = tool_catalog();

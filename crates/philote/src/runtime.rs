@@ -1984,6 +1984,15 @@ impl AgentRuntime {
                 let limit = match turn.phase {
                     TurnPhase::WaitingModel => WAITING_MODEL_SECS,
                     TurnPhase::Thinking => THINKING_SECS,
+                    TurnPhase::WaitingTool
+                        if turn
+                            .pending_tool_call
+                            .as_ref()
+                            .map(|tool| tool.tool_name == "delegate.whisper")
+                            .unwrap_or(false) =>
+                    {
+                        WAITING_APPROVAL_SECS
+                    }
                     TurnPhase::WaitingTool => WAITING_TOOL_SECS,
                     TurnPhase::WaitingVoice => WAITING_VOICE_SECS,
                     _ => return None,
@@ -2354,26 +2363,23 @@ impl AgentRuntime {
             .and_then(|e| e.response_routing.clone())
             .unwrap_or(ParacrineRouting::CognitiveReEntry);
 
-        // Locate the owning session by matching paracrine_id against turn logs,
+        // Locate the owning turn by matching paracrine_id against active turns,
         // falling back to the task's session_id field.
+        let owner_turn = paracrine_id.as_ref().and_then(|pid| {
+            self.sessions.iter().find_map(|(sid, state)| {
+                state.active_turn.as_ref().and_then(|turn| {
+                    turn.associated_paracrine_ids
+                        .contains(pid)
+                        .then(|| (sid.clone(), turn.turn_id.clone(), turn.chat_id.clone()))
+                })
+            })
+        });
         let session_id = task
             .session_id
             .as_deref()
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                if let Some(pid) = &paracrine_id {
-                    self.sessions.iter().find_map(|(sid, state)| {
-                        state
-                            .active_turn
-                            .as_ref()
-                            .filter(|t| t.associated_paracrine_ids.contains(pid))
-                            .map(|_| sid.as_str())
-                    })
-                } else {
-                    None
-                }
-            })
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| owner_turn.as_ref().map(|(sid, _, _)| sid.clone()));
 
         match routing {
             ParacrineRouting::RawForward => {
@@ -2444,13 +2450,15 @@ impl AgentRuntime {
                 // Replace the "paracrine dispatched" placeholder with the real
                 // specialist response and re-enter the model as if the tool call
                 // completed normally.
+                let owner_turn_id = owner_turn.as_ref().map(|(_, tid, _)| tid.clone());
+                let owner_chat_id = owner_turn.as_ref().map(|(_, _, cid)| cid.clone());
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     tool_name: Some("delegate.whisper".into()),
                     content: task.content.clone(),
                     session_id: session_id.clone().or(task.session_id.clone()),
-                    turn_id: task.turn_id.clone(),
-                    chat_id: task.chat_id.clone(),
+                    turn_id: owner_turn_id.or(task.turn_id.clone()),
+                    chat_id: owner_chat_id.or(task.chat_id.clone()),
                     source: Some("paracrine".into()),
                     final_reply_to: task.final_reply_to.clone(),
                     final_reply_role: task.final_reply_role.clone(),
@@ -12186,12 +12194,25 @@ impl AgentRuntime {
 
                 // Parse optional response_routing hint from arguments.
                 // Defaults to CognitiveReEntry if absent or unrecognised.
-                let response_routing = args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
-                    serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
-                        s.to_string(),
-                    ))
-                    .ok()
-                });
+                let explicit_response_routing =
+                    args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
+                        serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
+                            s.to_string(),
+                        ))
+                        .ok()
+                    });
+                let wait_requested = args
+                    .get("wait_for_response")
+                    .or_else(|| args.get("blocking"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let response_routing = if wait_requested && explicit_response_routing.is_none() {
+                    Some(ParacrineRouting::EnrichedToolResult)
+                } else {
+                    explicit_response_routing
+                };
+                let wait_for_response = wait_requested
+                    || matches!(response_routing, Some(ParacrineRouting::EnrichedToolResult));
 
                 // Always generate a paracrine_id — it threads through the full
                 // thought graph and ties the response back to this turn.
@@ -12241,6 +12262,29 @@ impl AgentRuntime {
                     })
                     .await
                 {
+                    Ok(_) if wait_for_response => {
+                        if let Some(state) = self.sessions.get(&payload.session_id) {
+                            let checkpoint_memory_type = state.checkpoint_memory_type();
+                            let checkpoint_json = state.checkpoint_json();
+                            let index_state = state.clone();
+                            self.ipc_client
+                                .sync_apartment(
+                                    &self.agent_id,
+                                    &checkpoint_memory_type,
+                                    checkpoint_json,
+                                )
+                                .await?;
+                            self.sync_session_index(&index_state).await?;
+                        }
+                        let _ = self
+                            .emit_turn_event(
+                                &payload.session_id,
+                                "waiting_paracrine",
+                                Some(paracrine_id.clone()),
+                            )
+                            .await;
+                        return Ok(());
+                    }
                     Ok(_) => (
                         format!(
                             "Whisper sent to specialist (paracrine_id: {paracrine_id}). \
@@ -12319,6 +12363,7 @@ impl AgentRuntime {
                     paracrine_id,
                     reply_session_id,
                     reply_chat_id,
+                    response_routing,
                     final_reply_to,
                     final_reply_role,
                     final_reply_guest_id,
@@ -12349,12 +12394,13 @@ impl AgentRuntime {
                         .paracrine_reply_chat_id
                         .clone()
                         .unwrap_or_else(|| turn.chat_id.clone());
+                    let rr = turn.paracrine_response_routing.clone();
                     let frt = turn.final_reply_to.clone();
                     let frr = turn.final_reply_role.clone();
                     let frg = turn.final_reply_guest_id.clone();
                     // Mark merge as done so deliver_text_reply suppresses the auto-emit.
                     turn.paracrine_merge_completed = true;
-                    (pid, rs, rc, frt, frr, frg)
+                    (pid, rs, rc, rr, frt, frr, frg)
                 };
 
                 // Append role attribution tag (same as deliver_text_reply does).
@@ -12379,6 +12425,7 @@ impl AgentRuntime {
                     "exosome": {
                         "prompt": "",
                         "paracrine_id": paracrine_id,
+                        "response_routing": response_routing,
                         "source_session_id": reply_session_id,
                         "source_chat_id": reply_chat_id,
                     },
