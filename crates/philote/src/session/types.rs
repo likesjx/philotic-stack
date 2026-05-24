@@ -563,6 +563,10 @@ pub struct WorkingTurn {
     /// The chat_id (Telegram / membrane channel) of the originating conversation.
     /// Included in the `paracrine_response` so the routing reflex knows where to deliver.
     pub paracrine_reply_chat_id: Option<String>,
+    /// How the originating philote should handle the specialist's response.
+    /// Captured from the inbound exosome and echoed back on `paracrine_response`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_response_routing: Option<philotic_client::ParacrineRouting>,
     /// Set to true when the specialist explicitly calls `delegate.merge` during a turn.
     /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
     /// is no duplicate delivery after the explicit merge already fired.

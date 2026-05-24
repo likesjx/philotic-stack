@@ -3007,6 +3007,7 @@ impl SessionState {
                 "paracrine_origin": turn.paracrine_origin,
                 "paracrine_reply_session_id": turn.paracrine_reply_session_id,
                 "paracrine_reply_chat_id": turn.paracrine_reply_chat_id,
+                "paracrine_response_routing": turn.paracrine_response_routing,
                 "paracrine_merge_completed": turn.paracrine_merge_completed,
             })
         });
@@ -3317,6 +3318,10 @@ impl SessionState {
                     .get("paracrine_reply_chat_id")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                paracrine_response_routing: turn
+                    .get("paracrine_response_routing")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok()),
                 paracrine_merge_completed: turn
                     .get("paracrine_merge_completed")
                     .and_then(serde_json::Value::as_bool)
@@ -4295,6 +4300,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -4334,6 +4340,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -4364,6 +4371,33 @@ mod tests {
         // by compose_session_snapshot on every turn.
         assert!(checkpoint.get("component_route_assembly").is_none());
         assert!(checkpoint.get("tool_assembly").is_none());
+    }
+
+    #[test]
+    fn checkpoint_round_trip_preserves_paracrine_response_routing() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut turn = test_working_turn(None);
+        turn.paracrine_origin = Some("paracrine-1".into());
+        turn.paracrine_reply_session_id = Some("source-session".into());
+        turn.paracrine_reply_chat_id = Some("source-chat".into());
+        turn.paracrine_response_routing =
+            Some(philotic_client::ParacrineRouting::EnrichedToolResult);
+        turn.phase = TurnPhase::WaitingTool;
+        state.start_turn(turn);
+
+        let checkpoint = state.checkpoint_json();
+        assert_eq!(
+            checkpoint["active_turn"]["paracrine_response_routing"],
+            "enriched_tool_result"
+        );
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        let restored_turn = restored.active_turn.expect("active turn restored");
+        assert_eq!(
+            restored_turn.paracrine_response_routing,
+            Some(philotic_client::ParacrineRouting::EnrichedToolResult)
+        );
     }
 
     #[test]
@@ -4493,6 +4527,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -4541,6 +4576,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -5301,6 +5337,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -5392,6 +5429,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -5521,6 +5559,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -5603,6 +5642,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -6250,6 +6290,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -6305,6 +6346,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -6375,6 +6417,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -6446,6 +6489,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -6732,6 +6776,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -7003,6 +7048,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -7126,6 +7172,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,

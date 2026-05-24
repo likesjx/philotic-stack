@@ -3031,7 +3031,12 @@ impl AgentRuntime {
             // Also capture source_session_id / source_chat_id from the exosome so the
             // response is routed back to the originating conversation channel, not the
             // specialist's own ephemeral session.
-            let (paracrine_origin, paracrine_reply_session_id, paracrine_reply_chat_id) = {
+            let (
+                paracrine_origin,
+                paracrine_reply_session_id,
+                paracrine_reply_chat_id,
+                paracrine_response_routing,
+            ) = {
                 let exosome = task
                     .exosome
                     .as_ref()
@@ -3040,6 +3045,7 @@ impl AgentRuntime {
                     exosome.as_ref().and_then(|e| e.paracrine_id.clone()),
                     exosome.as_ref().and_then(|e| e.source_session_id.clone()),
                     exosome.as_ref().and_then(|e| e.source_chat_id.clone()),
+                    exosome.as_ref().and_then(|e| e.response_routing.clone()),
                 )
             };
 
@@ -3070,6 +3076,7 @@ impl AgentRuntime {
                 paracrine_origin,
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
+                paracrine_response_routing,
                 paracrine_merge_completed: false,
                 plan_confirmed: false,
                 plan_confirm_note: None,
@@ -6219,6 +6226,7 @@ impl AgentRuntime {
                 "exosome": {
                     "prompt": "",
                     "paracrine_id": pid,
+                    "response_routing": completed_turn.paracrine_response_routing,
                     "source_session_id": reply_session_id,
                     "source_chat_id": reply_chat_id,
                 },
@@ -7146,13 +7154,24 @@ impl AgentRuntime {
                     t.final_reply_guest_id.clone(),
                     t.turn_id.clone(),
                     t.chat_id.clone(),
+                    t.paracrine_origin.is_some(),
                 )
             });
 
-        let Some((reply_to, reply_role, reply_guest_id, turn_id, chat_id)) = routing else {
+        let Some((reply_to, reply_role, reply_guest_id, turn_id, chat_id, is_paracrine_turn)) =
+            routing
+        else {
             // No active turn — token arrived after turn completed; drop silently.
             return Ok(());
         };
+
+        if is_paracrine_turn {
+            // Paracrine specialist output is private until it is wrapped as a
+            // paracrine_response at final completion. Streaming it through the
+            // ordinary reply route leaks aside tokens and can target a role with
+            // no subscriber, leaving the response ledger-only.
+            return Ok(());
+        }
 
         let task_json = serde_json::to_string(&serde_json::json!({
             "action": "partial_reply",
@@ -14201,6 +14220,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
