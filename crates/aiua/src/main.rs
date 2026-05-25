@@ -6913,6 +6913,7 @@ async fn main() -> Result<()> {
     // Abstracted Universal Materializer with trait-object storage
     let materializer = Box::new(
         crate::service::guest_manager::LocalProcessMaterializer::new(db_path.to_string_lossy())
+            .with_hotel_socket(&hotel.ipc_socket_path)
             .with_stderr_sink(stderr_tx),
     );
     let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(

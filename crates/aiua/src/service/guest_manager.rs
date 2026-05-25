@@ -23,6 +23,7 @@ pub struct GuestStderrLine {
 pub struct LocalProcessMaterializer {
     children: HashMap<String, tokio::process::Child>,
     db_path: String,
+    hotel_socket: Option<String>,
     stderr_tx: Option<mpsc::Sender<GuestStderrLine>>,
 }
 
@@ -31,8 +32,17 @@ impl LocalProcessMaterializer {
         Self {
             children: HashMap::new(),
             db_path: db_path.into(),
+            hotel_socket: None,
             stderr_tx: None,
         }
+    }
+
+    /// Supply the hotel's IPC socket path so all spawned guests receive
+    /// PHILOTIC_HOTEL_SOCKET even when the hotel process itself wasn't started
+    /// with that env var set.
+    pub fn with_hotel_socket(mut self, socket: impl Into<String>) -> Self {
+        self.hotel_socket = Some(socket.into());
+        self
     }
 
     /// Attach a channel through which guest stderr lines are forwarded for
@@ -115,12 +125,13 @@ impl Materializer for LocalProcessMaterializer {
                     }
                 }
             }
-            // Always override with hotel's current socket path so stale DB values
-            // don't cause guests to connect to the wrong socket.
-            if let Ok(socket) = std::env::var("PHILOTIC_HOTEL_SOCKET") {
-                if !socket.trim().is_empty() {
-                    command.env("PHILOTIC_HOTEL_SOCKET", socket.trim());
-                }
+            // Always override with hotel's own socket path.  Prefer the value
+            // supplied at construction time; fall back to the process env (for
+            // cases where the hotel was started with the var already set).
+            let socket_override = self.hotel_socket.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string())
+                .or_else(|| std::env::var("PHILOTIC_HOTEL_SOCKET").ok().filter(|s| !s.trim().is_empty()));
+            if let Some(socket) = socket_override {
+                command.env("PHILOTIC_HOTEL_SOCKET", socket.trim());
             }
 
             command.stderr(std::process::Stdio::piped());
