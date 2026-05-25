@@ -30,3 +30,6 @@ pub const NODE_KIND_CRON_JOB: &str = "cron_job";
 pub const NODE_KIND_USER_PROFILE: &str = "user_profile";
 pub const NODE_KIND_PROJECTED_USER_IDENTITY: &str = "projected_user_identity";
 pub const NODE_KIND_USER_TASK: &str = "user_task";
+
+// Model graph (doc:model-graph-flywheel / doc:hardened-model-dispatch)
+pub const NODE_KIND_MODEL_PROFILE: &str = "model_profile";

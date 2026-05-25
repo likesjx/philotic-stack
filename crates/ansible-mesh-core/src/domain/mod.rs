@@ -16,8 +16,8 @@
 use crate::cron::CronJob;
 use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
-    RoleIncarnationRecord, RoleReadinessState, RoutingPolicyEvaluationRecord, RoutingPolicyRecord,
-    RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
+    ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState, RoutingPolicyEvaluationRecord,
+    RoutingPolicyRecord, RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
@@ -1301,6 +1301,128 @@ impl GraphDomain {
             out.push(node.data);
         }
         Ok(out)
+    }
+}
+
+// ── Model profile ─────────────────────────────────────────────────────────────
+
+impl GraphDomain {
+    fn model_profile_key(model_ref: &str, node_id: &str) -> String {
+        format!("{}:{}:{}", NODE_KIND_MODEL_PROFILE, model_ref, node_id)
+    }
+
+    /// Upsert a model provider's operational profile.
+    pub fn upsert_model_profile(&self, profile: &ModelProfileRecord) -> Result<()> {
+        let data = serde_json::to_value(profile)
+            .context("GraphDomain::upsert_model_profile: serialize")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::model_profile_key(&profile.model_ref, &profile.node_id),
+            kind: NODE_KIND_MODEL_PROFILE.to_string(),
+            label: Some(format!("{}@{}", profile.model_ref, profile.node_id)),
+            data,
+        })
+    }
+
+    pub fn get_model_profile(
+        &self,
+        model_ref: &str,
+        node_id: &str,
+    ) -> Result<Option<ModelProfileRecord>> {
+        let key = Self::model_profile_key(model_ref, node_id);
+        match self.adapter.get_node(&key)? {
+            Some(node) => Ok(Some(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::get_model_profile: deserialize")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_model_profiles(&self) -> Result<Vec<ModelProfileRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_MODEL_PROFILE)? {
+            out.push(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::list_model_profiles: deserialize")?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Record the outcome of a single dispatch attempt, updating the profile's
+    /// latency_p50_ms (EMA α=0.25) and error_rate (EMA α=0.1).
+    pub fn observe_model_outcome(
+        &self,
+        model_ref: &str,
+        node_id: &str,
+        latency_ms: u64,
+        success: bool,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut profile = self
+            .get_model_profile(model_ref, node_id)?
+            .unwrap_or_else(|| ModelProfileRecord {
+                model_ref: model_ref.to_string(),
+                node_id: node_id.to_string(),
+                provider: model_ref.to_string(),
+                task_kinds: Vec::new(),
+                trust_tier: String::new(),
+                max_context_tokens: 0,
+                latency_p50_ms: latency_ms,
+                error_rate: 0.0,
+                status: "healthy".to_string(),
+                last_healthy_secs: 0,
+                updated_secs: now,
+            });
+
+        // Exponential moving averages
+        const LATENCY_ALPHA: f64 = 0.25;
+        const ERROR_ALPHA: f32 = 0.1;
+        profile.latency_p50_ms = ((1.0 - LATENCY_ALPHA) * profile.latency_p50_ms as f64
+            + LATENCY_ALPHA * latency_ms as f64) as u64;
+        let outcome = if success { 0.0f32 } else { 1.0f32 };
+        profile.error_rate = (1.0 - ERROR_ALPHA) * profile.error_rate + ERROR_ALPHA * outcome;
+
+        if success {
+            profile.last_healthy_secs = now;
+        }
+        profile.status = if profile.error_rate > 0.5 {
+            "degraded".to_string()
+        } else {
+            "healthy".to_string()
+        };
+        profile.updated_secs = now;
+
+        self.upsert_model_profile(&profile)
+    }
+
+    /// Return model profiles for `task_kind` on `node_id`, sorted by health then latency.
+    /// Degraded or unavailable models are included but sorted last.
+    pub fn best_model_for(&self, task_kind: &str, node_id: &str) -> Result<Vec<ModelProfileRecord>> {
+        let mut profiles: Vec<ModelProfileRecord> = self
+            .list_model_profiles()?
+            .into_iter()
+            .filter(|p| p.node_id == node_id)
+            .filter(|p| {
+                p.task_kinds.is_empty() || p.task_kinds.iter().any(|t| t == task_kind)
+            })
+            .collect();
+
+        profiles.sort_by(|a, b| {
+            let a_degraded = a.status != "healthy";
+            let b_degraded = b.status != "healthy";
+            match (a_degraded, b_degraded) {
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => a.latency_p50_ms.cmp(&b.latency_p50_ms),
+            }
+        });
+
+        Ok(profiles)
     }
 }
 

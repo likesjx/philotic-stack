@@ -2,9 +2,11 @@ use crate::controller::{
     BackoffStrategy, ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
     NativeLiveRegistry, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
 };
+use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::router_trace::{
     RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
 };
+use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
 use anyhow::Result;
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
@@ -97,6 +99,22 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 None
             }
         }
+    };
+
+    // Open a read-write handle to the context graph for model profile observability.
+    // This is the same DB the hotel daemon owns; model-router opens a sidecar connection
+    // (SQLite WAL allows concurrent writers) to persist latency/error signals.
+    let graph_domain: Option<GraphDomain> = {
+        let path = std::env::var("PHILOTIC_GRAPH_DB_PATH").ok();
+        path.and_then(|p| {
+            SqliteGraphStorage::open(&p)
+                .map(|s| GraphDomain::new(Arc::new(s.adapter())))
+                .map_err(|e| {
+                    warn!("model-router: failed to open graph domain for model profiles: {e}");
+                    e
+                })
+                .ok()
+        })
     };
 
     info!(
@@ -494,6 +512,11 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 model_id,
                                 None,
                             );
+                            if let Some(ref gd) = graph_domain {
+                                if let Err(e) = gd.observe_model_outcome(&provider_id, &local_node_id(), latency_ms, true) {
+                                    warn!("observe_model_outcome (success): {e}");
+                                }
+                            }
 
                             // ── Transcription flywheel fan-out ────────────────
                             // After a successful AudioTranscribe, fire a capture
@@ -577,6 +600,11 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 None,
                                 None,
                             );
+                            if let Some(ref gd) = graph_domain {
+                                if let Err(e) = gd.observe_model_outcome(&provider_id, &local_node_id(), latency_ms, false) {
+                                    warn!("observe_model_outcome (failure): {e}");
+                                }
+                            }
                             error!("Provider invocation failed: {}", err);
                             emit_failure(
                                 &mut ipc_client,

@@ -35,6 +35,7 @@ cargo build --release --bins \
   -p graph-datasource \
   -p table-datasource \
   -p router-listener \
+  -p heal-dispatcher \
   -p philotic-web
 
 echo "▶ Preparing remote staging directory on ${REMOTE}..."

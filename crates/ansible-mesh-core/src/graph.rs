@@ -469,3 +469,46 @@ pub struct CompactSessionEnvelope {
     // ── Checkpoint metadata ───────────────────────────────────────────────
     pub checkpoint_metadata: CompactCheckpointMeta,
 }
+
+/// Operational profile for a model provider, keyed per (model_ref, node_id).
+///
+/// Node kind: `model_profile`. Node key: `model_profile:{model_ref}:{node_id}`.
+/// Updated after every dispatch via `observe_model_outcome`. Used by
+/// `GraphDomain::best_model_for` to select the healthiest available provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfileRecord {
+    /// Canonical model identifier, e.g. "gemini", "gemini-2.5-flash", "parakeet".
+    pub model_ref: String,
+    /// Node (hotel) this record belongs to, e.g. "mac-jane-aiua-01".
+    pub node_id: String,
+    /// Provider kind: "gemini", "ollama", "mlx", "elevenlabs", etc.
+    pub provider: String,
+    /// Task kinds this provider handles, e.g. ["text.generate", "media.analyze"].
+    #[serde(default)]
+    pub task_kinds: Vec<String>,
+    /// Trust tier: "remote_cloud", "local_trusted", "local_experimental".
+    #[serde(default)]
+    pub trust_tier: String,
+    /// Maximum context tokens this provider accepts (0 = unknown).
+    #[serde(default)]
+    pub max_context_tokens: u32,
+    /// Observed p50 latency in milliseconds over a rolling window.
+    #[serde(default)]
+    pub latency_p50_ms: u64,
+    /// Rolling error rate 0.0–1.0 (exponential moving average, α=0.1).
+    #[serde(default)]
+    pub error_rate: f32,
+    /// Operational status: "healthy", "degraded", "unavailable".
+    #[serde(default = "default_model_status")]
+    pub status: String,
+    /// Unix timestamp of last successful dispatch.
+    #[serde(default)]
+    pub last_healthy_secs: u64,
+    /// Unix timestamp of when this record was last updated.
+    #[serde(default)]
+    pub updated_secs: u64,
+}
+
+fn default_model_status() -> String {
+    "healthy".to_string()
+}
