@@ -12,8 +12,9 @@ use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors, MediaRoutingPolicy,
     MemoryAuthority, MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope,
-    MemoryTemporalKind, MemoryValidationLevel, RecalledMemoryRecord, SessionState, ToolDefinition,
-    ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn, merge_session_index,
+    MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, RecalledMemoryRecord,
+    SessionState, ToolDefinition, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
+    merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -2344,6 +2345,19 @@ impl AgentRuntime {
     /// This is a separate path from [`handle_user_message`]: the main cognitive
     /// loop is not re-entered unless the routing explicitly calls for it. The
     /// `paracrine_id` threads through every branch for cross-mesh provenance.
+    async fn persist_session_checkpoint(&mut self, session_id: &str) -> Result<()> {
+        let Some(state) = self.sessions.get(session_id) else {
+            return Ok(());
+        };
+        let checkpoint_memory_type = state.checkpoint_memory_type();
+        let checkpoint_json = state.checkpoint_json();
+        let index_state = state.clone();
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await
+    }
+
     async fn handle_paracrine_response(
         &mut self,
         task: InboundTaskPayload,
@@ -2374,17 +2388,38 @@ impl AgentRuntime {
                 })
             })
         });
+        let owner_thread = paracrine_id.as_ref().and_then(|pid| {
+            self.sessions.iter().find_map(|(sid, state)| {
+                state
+                    .paracrine_threads
+                    .iter()
+                    .find(|thread| thread.id == pid.as_str())
+                    .map(|thread| (sid.clone(), thread.origin_turn_id.clone()))
+            })
+        });
         let session_id = task
             .session_id
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| owner_turn.as_ref().map(|(sid, _, _)| sid.clone()));
+            .or_else(|| owner_turn.as_ref().map(|(sid, _, _)| sid.clone()))
+            .or_else(|| owner_thread.as_ref().map(|(sid, _)| sid.clone()));
 
         match routing {
             ParacrineRouting::RawForward => {
                 // Emit content directly to membrane — no model loop.
                 let content = task.content.clone().unwrap_or_default();
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            Some(content.clone()),
+                            Some("raw_forward".into()),
+                        );
+                    }
+                    self.persist_session_checkpoint(sid).await?;
+                }
                 let node_id = local_node_id();
                 let _ = self
                     .ipc_client
@@ -2407,6 +2442,12 @@ impl AgentRuntime {
                 // or interrupting the active turn.
                 let content = task.content.clone().unwrap_or_default();
                 if let Some(sid) = &session_id {
+                    if let Some(pid) = &paracrine_id {
+                        if let Some(state) = self.sessions.get_mut(sid) {
+                            state.signal_paracrine_thread(pid, content.clone());
+                        }
+                        self.persist_session_checkpoint(sid).await?;
+                    }
                     let _ = self.emit_partial_reply(sid, content).await;
                 }
             }
@@ -2417,6 +2458,12 @@ impl AgentRuntime {
                     paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
                     "paracrine heartbeat received"
                 );
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.signal_paracrine_thread(pid, "heartbeat".into());
+                    }
+                    self.persist_session_checkpoint(sid).await?;
+                }
             }
 
             ParacrineRouting::MemoryEnrichment => {
@@ -2430,6 +2477,16 @@ impl AgentRuntime {
                     return Ok(());
                 }
                 // Memory injection handled by model re-entry with enriched context.
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("memory_enrichment".into()),
+                        );
+                    }
+                }
                 self.handle_user_message(task, task_id).await?;
             }
 
@@ -2443,6 +2500,16 @@ impl AgentRuntime {
                     );
                     return Ok(());
                 }
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("datasource_injection".into()),
+                        );
+                    }
+                }
                 self.handle_user_message(task, task_id).await?;
             }
 
@@ -2452,6 +2519,16 @@ impl AgentRuntime {
                 // completed normally.
                 let owner_turn_id = owner_turn.as_ref().map(|(_, tid, _)| tid.clone());
                 let owner_chat_id = owner_turn.as_ref().map(|(_, _, cid)| cid.clone());
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("enriched_tool_result".into()),
+                        );
+                    }
+                }
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     tool_name: Some("delegate.whisper".into()),
@@ -2471,6 +2548,16 @@ impl AgentRuntime {
                 // Standard path: feed into cognitive re-entry.
                 // If there is an active turn, the re-entry will merge this
                 // response into its context. If not, a new synthesis turn begins.
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("cognitive_re_entry".into()),
+                        );
+                    }
+                }
                 self.handle_user_message(task, task_id).await?;
             }
 
@@ -2478,6 +2565,16 @@ impl AgentRuntime {
                 // Arbiter-promoted: prepend to the session queue so this task is
                 // processed NEXT, ahead of any already-waiting messages.
                 let session_id = task.session_id_or_default(&self.agent_id);
+                if let Some(pid) = &paracrine_id {
+                    if let Some(state) = self.sessions.get_mut(&session_id) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("priority_re_entry".into()),
+                        );
+                    }
+                }
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     if state.is_turn_active() {
                         info!(
@@ -2499,6 +2596,16 @@ impl AgentRuntime {
                 // approval resolution path.
                 let session_id =
                     session_id.unwrap_or_else(|| task.session_id_or_default(&self.agent_id));
+                if let Some(pid) = &paracrine_id {
+                    if let Some(state) = self.sessions.get_mut(&session_id) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("approval_resolution".into()),
+                        );
+                    }
+                }
                 // The sender encodes the decision as JSON in `content`, e.g.:
                 //   {"decision": "approved", "note": "looks good"}
                 let parsed_content = task
@@ -12213,6 +12320,21 @@ impl AgentRuntime {
                 };
                 let wait_for_response = wait_requested
                     || matches!(response_routing, Some(ParacrineRouting::EnrichedToolResult));
+                let authority = args
+                    .get("authority")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("advice_only")
+                    .to_string();
+                let tool_policy = args
+                    .get("tool_policy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("role_default")
+                    .to_string();
+                let approval_scope = args
+                    .get("approval_scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("originating_session")
+                    .to_string();
 
                 // Always generate a paracrine_id — it threads through the full
                 // thought graph and ties the response back to this turn.
@@ -12242,26 +12364,43 @@ impl AgentRuntime {
                 };
 
                 let exosome = Exosome {
-                    prompt,
+                    prompt: prompt.clone(),
                     context: None,
                     paracrine_id: Some(paracrine_id.clone()),
-                    response_routing,
+                    response_routing: response_routing.clone(),
                     source_session_id,
                     source_chat_id,
                 };
 
-                let (content, tool_err) = match self
+                let emit_result = self
                     .ipc_client
                     .send_request(IpcRequest::ParacrineEmit {
-                        role,
+                        role: role.clone(),
                         exosome,
                         reply_to_node,
                         reply_to_role,
                         reply_to_guest_id: source_reply_guest_id,
                         timeout_secs: None,
                     })
-                    .await
-                {
+                    .await;
+
+                if emit_result.is_ok() {
+                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                        state.open_paracrine_thread(
+                            paracrine_id.clone(),
+                            role.clone(),
+                            prompt.clone(),
+                            response_routing
+                                .clone()
+                                .unwrap_or(ParacrineRouting::CognitiveReEntry),
+                            authority,
+                            tool_policy,
+                            approval_scope,
+                        );
+                    }
+                }
+
+                let (content, tool_err) = match emit_result {
                     Ok(_) if wait_for_response => {
                         if let Some(state) = self.sessions.get(&payload.session_id) {
                             let checkpoint_memory_type = state.checkpoint_memory_type();

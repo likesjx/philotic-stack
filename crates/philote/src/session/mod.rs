@@ -83,6 +83,9 @@ pub struct SessionState {
     pub tool_assembly: ToolAssembly,
     pub recent_turns: Vec<TurnRecord>,
     pub active_turn: Option<WorkingTurn>,
+    /// Durable side-loop records for paracrine conversations opened in this session.
+    /// Nonblocking paracrine remains visible until it closes with a final disposition.
+    pub paracrine_threads: Vec<ParacrineThread>,
     /// Subagents spawned during this session that have not yet been released or aborted.
     pub active_subagents: Vec<SpawnedSubagentRef>,
     /// Working summary carried in from the most recent inbound handoff bundle.
@@ -167,6 +170,7 @@ impl SessionState {
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
+            paracrine_threads: Vec::new(),
             last_handoff_summary: None,
             active_subagents: Vec::new(),
             rules: Vec::new(),
@@ -257,6 +261,69 @@ impl SessionState {
     pub fn clear_pending_tool_call(&mut self) {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.pending_tool_call = None;
+        }
+    }
+
+    pub fn open_paracrine_thread(
+        &mut self,
+        id: String,
+        role: String,
+        goal: String,
+        routing: philotic_client::ParacrineRouting,
+        authority: String,
+        tool_policy: String,
+        approval_scope: String,
+    ) {
+        let origin_turn_id = self
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.clone())
+            .unwrap_or_default();
+        self.paracrine_threads.push(ParacrineThread {
+            id,
+            origin_turn_id,
+            role,
+            goal,
+            status: ParacrineThreadStatus::Open,
+            routing,
+            authority,
+            tool_policy,
+            approval_scope,
+            opened_at: current_unix_ts(),
+            closed_at: None,
+            last_signal: None,
+            final_result: None,
+            close_reason: None,
+        });
+    }
+
+    pub fn close_paracrine_thread(
+        &mut self,
+        id: &str,
+        status: ParacrineThreadStatus,
+        final_result: Option<String>,
+        close_reason: Option<String>,
+    ) {
+        if let Some(thread) = self
+            .paracrine_threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+        {
+            thread.status = status;
+            thread.closed_at = Some(current_unix_ts());
+            thread.last_signal = close_reason.clone();
+            thread.final_result = final_result;
+            thread.close_reason = close_reason;
+        }
+    }
+
+    pub fn signal_paracrine_thread(&mut self, id: &str, signal: String) {
+        if let Some(thread) = self
+            .paracrine_threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+        {
+            thread.last_signal = Some(signal);
         }
     }
 
@@ -2813,6 +2880,33 @@ impl SessionState {
             };
             lines.push(reentry_hint);
         }
+        if !self.paracrine_threads.is_empty() {
+            lines.push("\n[Paracrine side loops]".into());
+            for thread in &self.paracrine_threads {
+                lines.push(format!(
+                    "Paracrine thread {id}: role='{role}', status='{status}', routing='{routing:?}', authority='{authority}', tool_policy='{tool_policy}', approval_scope='{approval_scope}', goal='{goal}'.",
+                    id = thread.id,
+                    role = thread.role,
+                    status = thread.status.as_str(),
+                    routing = thread.routing,
+                    authority = thread.authority,
+                    tool_policy = thread.tool_policy,
+                    approval_scope = thread.approval_scope,
+                    goal = thread.goal,
+                ));
+                if let Some(result) = thread.final_result.as_deref() {
+                    lines.push(format!(
+                        "Final paracrine result for {}: {}",
+                        thread.id, result
+                    ));
+                } else if let Some(signal) = thread.last_signal.as_deref() {
+                    lines.push(format!(
+                        "Latest paracrine signal for {}: {}",
+                        thread.id, signal
+                    ));
+                }
+            }
+        }
         if turn.pending_tool_call.is_some() {
             lines.push("A tool call is pending.".into());
         }
@@ -3038,6 +3132,7 @@ impl SessionState {
             "bindings": self.bindings,
             "tool_success_streak": self.tool_success_streak,
             "pending_preapproval_thresholds": self.pending_preapproval_thresholds,
+            "paracrine_threads": self.paracrine_threads,
             "active_turn": active_turn,
             "parked_approval_turn": parked_approval_turn,
             "parked_plan_turn": parked_plan_turn,
@@ -3131,6 +3226,11 @@ impl SessionState {
             .get("pending_preapproval_thresholds")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let paracrine_threads = checkpoint
+            .get("paracrine_threads")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<ParacrineThread>>(value).ok())
             .unwrap_or_default();
         let bindings = checkpoint
             .get("bindings")
@@ -3381,6 +3481,7 @@ impl SessionState {
             tool_assembly,
             recent_turns,
             active_turn,
+            paracrine_threads,
             active_subagents: Vec::new(),
             last_handoff_summary: None,
             rules: checkpoint
@@ -4263,8 +4364,8 @@ mod tests {
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
         ContextLayerId, ContextMutability, HookRequest, HookResult, MemoryAuthority,
         MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel,
-        PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode,
-        RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ParacrineThreadStatus, PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest,
+        ResponseRouteMode, RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
         ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, VoiceDeliveryMode,
         VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
         session_checkpoint_memory_type,
@@ -4397,6 +4498,44 @@ mod tests {
         assert_eq!(
             restored_turn.paracrine_response_routing,
             Some(philotic_client::ParacrineRouting::EnrichedToolResult)
+        );
+    }
+
+    #[test]
+    fn paracrine_threads_survive_turn_completion_and_checkpoint_closeout() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(test_working_turn(None));
+        state.open_paracrine_thread(
+            "paracrine-1".into(),
+            "critic".into(),
+            "review the decision".into(),
+            philotic_client::ParacrineRouting::CognitiveReEntry,
+            "advice_only".into(),
+            "read_only".into(),
+            "originating_session".into(),
+        );
+        state.complete_active_turn("main turn finished".into());
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert_eq!(restored.paracrine_threads.len(), 1);
+        assert_eq!(restored.paracrine_threads[0].status.as_str(), "open");
+
+        let mut restored = restored;
+        restored.close_paracrine_thread(
+            "paracrine-1",
+            ParacrineThreadStatus::Completed,
+            Some("use this".into()),
+            Some("cognitive_re_entry".into()),
+        );
+
+        let closed_checkpoint = restored.checkpoint_json();
+        let closed = SessionState::from_checkpoint(&closed_checkpoint).expect("rehydrate state");
+        assert_eq!(closed.paracrine_threads[0].status.as_str(), "completed");
+        assert_eq!(
+            closed.paracrine_threads[0].final_result.as_deref(),
+            Some("use this")
         );
     }
 
@@ -4918,6 +5057,9 @@ mod tests {
             .and_then(|v| v.as_object())
             .expect("properties object");
         assert!(props.contains_key("wait_for_response"));
+        assert!(props.contains_key("authority"));
+        assert!(props.contains_key("tool_policy"));
+        assert!(props.contains_key("approval_scope"));
         let routing_enum = props
             .get("routing")
             .and_then(|v| v.get("enum"))

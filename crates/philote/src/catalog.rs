@@ -1375,6 +1375,21 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "wait_for_response": {
                         "type": "boolean",
                         "description": "When true, keep the current turn in waiting_tool until the specialist completes. If routing is omitted, this implies routing='enriched_tool_result'."
+                    },
+                    "authority": {
+                        "type": "string",
+                        "enum": ["advice_only", "context_patch", "execute_with_approval"],
+                        "description": "Authority granted to the paracrine side loop. Defaults to advice_only."
+                    },
+                    "tool_policy": {
+                        "type": "string",
+                        "enum": ["role_default", "read_only", "no_tools"],
+                        "description": "Tool policy for the specialist side loop. Defaults to role_default."
+                    },
+                    "approval_scope": {
+                        "type": "string",
+                        "enum": ["originating_session", "specialist_session"],
+                        "description": "Where approval requests from the side loop should resolve. Defaults to originating_session."
                     }
                 },
                 "required": ["role", "prompt"]
