@@ -3743,6 +3743,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "agent.configure".into(),
                 "role.configure".into(),
+                "role.create_or_update".into(),
                 "role.list".into(),
                 "role.set_home".into(),
                 "rule.propose".into(),

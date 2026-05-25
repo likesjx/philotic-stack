@@ -2792,6 +2792,22 @@ impl AgentRuntime {
                 | SlashCommand::WorkspaceSet { .. }
                 | SlashCommand::WorkspaceClear => {}
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => {
+                    if self
+                        .sessions
+                        .get(&session_id)
+                        .map(Self::should_defer_parked_approval_command)
+                        .unwrap_or(false)
+                    {
+                        if let Some(state) = self.sessions.get_mut(&session_id) {
+                            state.prepend_user_task(task_id, task);
+                        }
+                        info!(
+                            session_id = %session_id,
+                            "Approval command arrived while another turn is active; deferring until the parked approval turn can resume"
+                        );
+                        return Ok(());
+                    }
+
                     // "Trust for session" button sends callback_data="trust" which membrane
                     // translates to /approve + preserves the original callback_data.
                     // Pre-approve the session before resolving the parked turn, and
@@ -7238,6 +7254,15 @@ impl AgentRuntime {
         }
 
         Ok(())
+    }
+
+    fn should_defer_parked_approval_command(state: &SessionState) -> bool {
+        state.has_parked_approval_turn()
+            && state
+                .active_turn
+                .as_ref()
+                .map(|turn| turn.phase != TurnPhase::WaitingApproval)
+                .unwrap_or(false)
     }
 
     /// Forward a streaming LLM token fragment to membrane for progressive display.
@@ -14039,6 +14064,44 @@ mod tests {
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
+
+    fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            primary_user_id: None,
+            user_content: "test".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            streaming_retry_attempts: 0,
+        }
+    }
+
     #[test]
     fn model_request_targets_agent_for_reply() {
         let request = ModelRequestPayload {
@@ -14460,6 +14523,29 @@ mod tests {
             approved_response: "Approved: deploy the thing".into(),
         });
         assert!(approval.approval_id.is_some());
+    }
+
+    #[test]
+    fn parked_approval_command_defers_behind_active_turn() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.parked_approval_turn = Some(test_working_turn(TurnPhase::WaitingApproval));
+        state.start_turn(test_working_turn(TurnPhase::WaitingModel));
+
+        assert!(super::AgentRuntime::should_defer_parked_approval_command(
+            &state
+        ));
+    }
+
+    #[test]
+    fn parked_approval_command_does_not_defer_when_session_is_free() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.parked_approval_turn = Some(test_working_turn(TurnPhase::WaitingApproval));
+
+        assert!(!super::AgentRuntime::should_defer_parked_approval_command(
+            &state
+        ));
     }
 
     #[test]
