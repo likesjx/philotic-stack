@@ -2052,15 +2052,55 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                 "description": { "type": "string" },
                                 "input_schema": { "type": "object" },
                                 "inbound_transform": {
-                                    "type": "object",
-                                    "description": "FieldMap: { kind: 'field_map', action, target, mappings }. \
-                                                    Target: { kind: 'datasource'|'philote'|'tool', datasource_id|agent_id|tool_ref }. \
-                                                    Mappings: [{ from: 'arg.key', to: 'payload.key' }]."
+                                    "description": "How to map MCP tool call args into a router envelope. Use field_map for all normal cases.",
+                                    "oneOf": [
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "kind": { "type": "string", "enum": ["field_map"] },
+                                                "action": { "type": "string", "description": "Envelope action, e.g. 'datasource.query' or 'echo'." },
+                                                "target": {
+                                                    "type": "object",
+                                                    "description": "Dispatch target.",
+                                                    "oneOf": [
+                                                        { "properties": { "kind": { "enum": ["philote"] }, "agent_id": { "type": "string" } }, "required": ["kind", "agent_id"] },
+                                                        { "properties": { "kind": { "enum": ["datasource"] }, "datasource_id": { "type": "string" } }, "required": ["kind", "datasource_id"] },
+                                                        { "properties": { "kind": { "enum": ["tool"] }, "tool_ref": { "type": "string" } }, "required": ["kind", "tool_ref"] }
+                                                    ]
+                                                },
+                                                "mappings": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "from": { "type": "string", "description": "Dot-path in MCP args, e.g. 'query'." },
+                                                            "to": { "type": "string", "description": "Dot-path in envelope payload, e.g. 'payload.query'." }
+                                                        },
+                                                        "required": ["from", "to"]
+                                                    }
+                                                }
+                                            },
+                                            "required": ["kind", "action", "target"]
+                                        }
+                                    ]
                                 },
                                 "outbound_transform": {
-                                    "type": "object",
-                                    "description": "PassThrough: { kind: 'pass_through' }. \
-                                                    Extract: { kind: 'extract', path: 'dot.path' }."
+                                    "description": "How to map the router response back to an MCP result.",
+                                    "oneOf": [
+                                        {
+                                            "type": "object",
+                                            "properties": { "kind": { "type": "string", "enum": ["pass_through"] } },
+                                            "required": ["kind"]
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "kind": { "type": "string", "enum": ["extract"] },
+                                                "path": { "type": "string", "description": "Dot-path into response JSON, e.g. 'content'." }
+                                            },
+                                            "required": ["kind", "path"]
+                                        }
+                                    ]
                                 }
                             },
                             "required": ["name", "description", "input_schema",
