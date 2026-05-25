@@ -41,6 +41,7 @@ philotic_binaries:
   - model-controller-elevenlabs
   - model-controller-openai
   - model-controller-mlx
+  - heal-dispatcher
   - model-controller-onnx
   - philotic-web
 
