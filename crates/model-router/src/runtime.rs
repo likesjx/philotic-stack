@@ -175,6 +175,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             &reply,
                             Some(controller_task.kind.as_str()),
                             None,
+                            config.guest_id,
                             format!(
                                 "Model controller failed to refresh provider config: {}",
                                 err
@@ -204,6 +205,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 &reply,
                                 Some(controller_task.kind.as_str()),
                                 None,
+                                config.guest_id,
                                 format!("No native-live provider available for task: {}", err),
                             )
                             .await?;
@@ -297,6 +299,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 &reply,
                                 Some(controller_task.kind.as_str()),
                                 Some(provider.id()),
+                                config.guest_id,
                                 format!("Native-live provider invocation failed: {}", err),
                             )
                             .await?;
@@ -321,6 +324,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 &reply,
                                 Some(controller_task.kind.as_str()),
                                 None,
+                                config.guest_id,
                                 format!("no_provider: {}", err),
                             )
                             .await?;
@@ -672,6 +676,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 &reply,
                                 Some(controller_task.kind.as_str()),
                                 Some(provider.id()),
+                                config.guest_id,
                                 format!("Provider invocation failed: {}", err),
                             )
                             .await?;
