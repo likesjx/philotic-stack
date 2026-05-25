@@ -1,6 +1,6 @@
 use crate::controller::{
-    AttachmentInput, ControllerTask, ModelProvider, NativeLiveProvider, NativeLiveTurnOutput,
-    ProviderOutput, TaskKind,
+    AttemptPolicy, AttachmentInput, ControllerTask, ModelProvider, NativeLiveProvider,
+    NativeLiveTurnOutput, ProviderOutput, RetryPolicy, TaskKind,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -27,11 +27,15 @@ use tracing::{info, warn};
 const STREAMING_IDLE_SECS: u64 = 8;
 /// Seconds to wait for the initial HTTP response headers from Gemini before aborting.
 /// Large contexts (100KB+) can take 20–30s before the first SSE byte arrives.
-const STREAMING_CONNECT_SECS: u64 = 60;
+/// Reduced from 60s: the runtime now enforces an outer total_secs timeout per attempt
+/// so the internal connect timeout only needs to cover legitimate network latency.
+const STREAMING_CONNECT_SECS: u64 = 25;
 /// Hard wall-clock cap on the entire SSE session (post-connect). Gemini can drip
 /// keep-alive SSE bytes every <8s indefinitely, which prevents STREAMING_IDLE_SECS
-/// from firing. This ensures the stream always terminates within a reasonable bound.
-const STREAMING_TOTAL_SECS: u64 = 120;
+/// from firing. Must be <= AttemptPolicy::total_secs to ensure the provider returns
+/// before the runtime outer timeout fires. Reduced from 120s to eliminate the race
+/// with the philote WaitingModel watchdog (also 120s).
+const STREAMING_TOTAL_SECS: u64 = 32;
 
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
@@ -1347,6 +1351,22 @@ impl ModelProvider for GeminiProvider {
             task.kind,
             TaskKind::TextGenerate | TaskKind::MediaAnalyze | TaskKind::AudioTranscribe
         )
+    }
+
+    fn attempt_policy(&self) -> AttemptPolicy {
+        // total_secs must be >= STREAMING_TOTAL_SECS (provider's internal cap).
+        // Invariant: total_secs × retry_policy.max_attempts < philote watchdog (120s).
+        // 35 × 2 = 70s < 120s ✓
+        AttemptPolicy { connect_secs: STREAMING_CONNECT_SECS, idle_secs: STREAMING_IDLE_SECS, total_secs: 35 }
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        use crate::controller::{BackoffStrategy, RetryableErrorClass};
+        RetryPolicy {
+            max_attempts: 2,
+            backoff: BackoffStrategy::Linear { step_ms: 800 },
+            retryable: RetryableErrorClass { network_reset: true, streaming_timeout: true, provider_5xx: true, rate_limit: false },
+        }
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {

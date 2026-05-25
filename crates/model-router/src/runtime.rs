@@ -1,5 +1,5 @@
 use crate::controller::{
-    ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
+    BackoffStrategy, ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
     NativeLiveRegistry, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
 };
 use ansible_mesh_core::router_trace::{
@@ -318,55 +318,139 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                     let provider_id = provider.id().to_string();
 
-                    // ── Streaming dispatch ────────────────────────────────────
-                    // When the provider supports streaming for this task, spawn a
-                    // background task that forwards tokens to philote via EmitTask.
-                    // The main await still receives the final ProviderOutput.
-                    let provider_result = if provider.supports_streaming(&controller_task) {
-                        let (token_tx, mut token_rx) = tokio::sync::mpsc::channel::<String>(128);
+                    // ── Dispatch with policy-driven retry ────────────────────
+                    // Each provider declares AttemptPolicy (per-attempt wall-clock cap)
+                    // and RetryPolicy (max attempts + backoff).  The runtime enforces the
+                    // outer timeout and drives the retry loop so providers don't need to
+                    // implement this themselves.
+                    //
+                    // Invariant: attempt_policy.total_secs × retry_policy.max_attempts < 120s
+                    // (philote WaitingModel watchdog), ensuring the controller always
+                    // resolves before the watchdog evicts the turn.
+                    let provider_result = {
+                        let retry = provider.retry_policy();
+                        let attempt_secs = provider.attempt_policy().total_secs;
+                        let mut last_err = anyhow::anyhow!("dispatch: no attempts completed");
+                        let mut result: Option<Result<ProviderOutput>> = None;
 
-                        // Connect the stream IPC client BEFORE starting the SSE fetch so
-                        // the forwarding task is ready to drain tokens the moment they
-                        // arrive.  If we connected lazily (inside the spawned task) there
-                        // is a race where invoke_streaming completes and drops token_tx
-                        // before the task finishes connecting — the channel closes and no
-                        // tokens are ever forwarded.
-                        let stream_identity = GuestIdentity {
-                            guest_id: format!("model-stream-{}", Ulid::new()),
-                            role: config.guest_id.to_string(),
-                            supported_tools: Vec::new(),
-                        };
-                        let stream_ipc_opt = PhiloticClient::connect(stream_identity).await.ok();
-                        let reply_clone = reply.clone();
-                        tokio::spawn(async move {
-                            let Some(mut stream_ipc) = stream_ipc_opt else {
-                                return;
-                            };
-                            while let Some(token) = token_rx.recv().await {
-                                if token.is_empty() {
-                                    continue;
-                                }
-                                let task_json = serde_json::to_string(&json!({
-                                    "action": "streaming_token",
-                                    "session_id": reply_clone.session_id,
-                                    "turn_id": reply_clone.turn_id,
-                                    "chat_id": reply_clone.chat_id,
-                                    "content": token,
-                                }))
-                                .unwrap_or_default();
-                                let _ = stream_ipc
-                                    .send_request(IpcRequest::EmitTask {
-                                        target_node: reply_clone.reply_to.clone(),
-                                        target_role: reply_clone.reply_role.clone(),
-                                        target_guest_id: None,
-                                        task_json,
-                                    })
+                        for attempt in 0u8..retry.max_attempts {
+                            if attempt > 0 {
+                                warn!(
+                                    "Provider [{}] retrying (attempt {}/{})",
+                                    provider.id(),
+                                    attempt + 1,
+                                    retry.max_attempts
+                                );
+                                emit_dispatch_status(
+                                    &mut ipc_client,
+                                    &reply,
+                                    attempt,
+                                    "retrying",
+                                )
+                                .await;
+                                if let BackoffStrategy::Linear { step_ms } = retry.backoff {
+                                    tokio::time::sleep(Duration::from_millis(
+                                        step_ms * u64::from(attempt),
+                                    ))
                                     .await;
+                                }
                             }
-                        });
-                        provider.invoke_streaming(&controller_task, token_tx).await
-                    } else {
-                        provider.invoke(&controller_task).await
+
+                            // Streaming path: spawn a forwarder task for this attempt.
+                            // Connect the stream IPC BEFORE starting the SSE fetch so the
+                            // forwarder is ready to drain tokens immediately on arrival.
+                            let attempt_result = if provider.supports_streaming(&controller_task) {
+                                let (token_tx, mut token_rx) =
+                                    tokio::sync::mpsc::channel::<String>(128);
+                                let stream_identity = GuestIdentity {
+                                    guest_id: format!("model-stream-{}", Ulid::new()),
+                                    role: config.guest_id.to_string(),
+                                    supported_tools: Vec::new(),
+                                };
+                                let stream_ipc_opt =
+                                    PhiloticClient::connect(stream_identity).await.ok();
+                                let reply_clone = reply.clone();
+                                tokio::spawn(async move {
+                                    let Some(mut stream_ipc) = stream_ipc_opt else {
+                                        return;
+                                    };
+                                    while let Some(token) = token_rx.recv().await {
+                                        if token.is_empty() {
+                                            continue;
+                                        }
+                                        let task_json = serde_json::to_string(&json!({
+                                            "action": "streaming_token",
+                                            "session_id": reply_clone.session_id,
+                                            "turn_id": reply_clone.turn_id,
+                                            "chat_id": reply_clone.chat_id,
+                                            "content": token,
+                                        }))
+                                        .unwrap_or_default();
+                                        let _ = stream_ipc
+                                            .send_request(IpcRequest::EmitTask {
+                                                target_node: reply_clone.reply_to.clone(),
+                                                target_role: reply_clone.reply_role.clone(),
+                                                target_guest_id: None,
+                                                task_json,
+                                            })
+                                            .await;
+                                    }
+                                });
+                                tokio::time::timeout(
+                                    Duration::from_secs(attempt_secs),
+                                    provider.invoke_streaming(&controller_task, token_tx),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!(
+                                        "streaming_timeout: attempt exceeded {}s budget",
+                                        attempt_secs
+                                    ))
+                                })
+                            } else {
+                                tokio::time::timeout(
+                                    Duration::from_secs(attempt_secs),
+                                    provider.invoke(&controller_task),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!(
+                                        "streaming_timeout: attempt exceeded {}s budget",
+                                        attempt_secs
+                                    ))
+                                })
+                            };
+
+                            match attempt_result {
+                                Ok(output) => {
+                                    result = Some(Ok(output));
+                                    break;
+                                }
+                                Err(e) => {
+                                    let classified = classify_provider_failure(
+                                        Some(task_kind.as_str()),
+                                        Some(provider.id()),
+                                        &e.to_string(),
+                                    );
+                                    let retryable = classified.retryable.unwrap_or(false);
+                                    let has_more = attempt + 1 < retry.max_attempts;
+                                    if retryable && has_more {
+                                        warn!(
+                                            "Provider [{}] attempt {} failed (retryable, will retry): {}",
+                                            provider.id(),
+                                            attempt + 1,
+                                            e
+                                        );
+                                        last_err = e;
+                                    } else {
+                                        result = Some(Err(e));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        result.unwrap_or(Err(last_err))
                     };
 
                     match provider_result {
@@ -846,6 +930,33 @@ async fn emit_failure(
 
     ipc_client.send_request(reply_req).await?;
     Ok(())
+}
+
+/// Emit a dispatch status event to philote so it can surface transient state
+/// (e.g. "(retrying...)" in the Telegram draft) without a full model_response.
+async fn emit_dispatch_status(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    attempt: u8,
+    kind: &str,
+) {
+    let task_json = json!({
+        "action": "model_dispatch_status",
+        "kind": kind,
+        "attempt": attempt + 1,
+        "session_id": reply.session_id,
+        "turn_id": reply.turn_id,
+        "chat_id": reply.chat_id,
+    })
+    .to_string();
+    let _ = ipc_client
+        .send_request(IpcRequest::EmitTask {
+            target_node: reply.reply_to.clone(),
+            target_role: reply.reply_role.clone(),
+            target_guest_id: None,
+            task_json,
+        })
+        .await;
 }
 
 fn classify_provider_failure(

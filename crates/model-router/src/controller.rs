@@ -1481,11 +1481,73 @@ impl ProviderConfigs {
     }
 }
 
+/// Per-attempt timing budget declared by each provider.
+///
+/// The runtime enforces `total_secs` as an outer `tokio::time::timeout` around each
+/// invoke call.  Invariant: `total_secs × retry_policy.max_attempts < philote watchdog (120s)`.
+#[derive(Debug, Clone, Copy)]
+pub struct AttemptPolicy {
+    /// How long to wait for the first byte from the provider (connect phase).
+    pub connect_secs: u64,
+    /// Maximum silence gap during a streaming session before treating it as stalled.
+    pub idle_secs: u64,
+    /// Hard wall-clock cap for a single attempt.  The runtime cancels and retries if exceeded.
+    pub total_secs: u64,
+}
+
+impl Default for AttemptPolicy {
+    fn default() -> Self {
+        Self { connect_secs: 20, idle_secs: 10, total_secs: 35 }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BackoffStrategy {
+    None,
+    Linear { step_ms: u64 },
+}
+
+/// Which error classes the runtime should retry automatically.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryableErrorClass {
+    pub network_reset: bool,
+    pub streaming_timeout: bool,
+    pub provider_5xx: bool,
+    pub rate_limit: bool,
+}
+
+impl Default for RetryableErrorClass {
+    fn default() -> Self {
+        Self { network_reset: true, streaming_timeout: true, provider_5xx: true, rate_limit: false }
+    }
+}
+
+/// Retry budget declared by each provider.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Total number of attempts including the first.
+    pub max_attempts: u8,
+    pub backoff: BackoffStrategy,
+    pub retryable: RetryableErrorClass,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self { max_attempts: 2, backoff: BackoffStrategy::Linear { step_ms: 500 }, retryable: RetryableErrorClass::default() }
+    }
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn supports(&self, task: &ControllerTask) -> bool;
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput>;
+
+    /// Per-attempt timing budget.  The runtime enforces `total_secs` as an outer timeout.
+    fn attempt_policy(&self) -> AttemptPolicy { AttemptPolicy::default() }
+
+    /// Retry budget.  Invariant: `attempt_policy().total_secs × retry_policy().max_attempts < 120s`.
+    fn retry_policy(&self) -> RetryPolicy { RetryPolicy::default() }
 
     /// Whether this provider supports streaming token delivery for the given task.
     /// When true, the runtime may call `invoke_streaming` instead of `invoke`.
