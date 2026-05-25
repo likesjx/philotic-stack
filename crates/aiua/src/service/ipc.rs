@@ -10919,10 +10919,75 @@ impl IpcServer {
                     port, "MCP endpoint config stored and fanned out."
                 );
 
+                // Phase 3: materialize the membrane-mcp guest for this endpoint.
+                let materialized = if let Some(hotel_name) =
+                    Self::local_hotel_name(graph, local_node_id)
+                {
+                    let socket_path = graph
+                        .list_hotels()
+                        .ok()
+                        .and_then(|hs| {
+                            hs.into_iter()
+                                .find(|h| h.capabilities.node_id == local_node_id)
+                                .map(|h| h.ipc_socket_path)
+                        })
+                        .unwrap_or_default();
+
+                    let mcp_guest_id = format!("mcp-membrane-{endpoint_id}");
+                    let mcp_config = serde_json::json!({
+                        "command": "membrane-mcp",
+                        "args": [],
+                        "env": {
+                            "MCP_PORT": port,
+                            "PHILOTIC_HOTEL_SOCKET": socket_path,
+                            "PHILOTIC_GUEST_ID": mcp_guest_id,
+                            "PHILOTIC_NODE_ID": local_node_id,
+                        }
+                    });
+                    let mcp_record = ansible_mesh_core::storage::GuestRecord {
+                        hotel_name: hotel_name.clone(),
+                        guest_id: mcp_guest_id.clone(),
+                        role: "mcp-membrane".into(),
+                        config_json: mcp_config.to_string(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    };
+                    match graph.upsert_guest(&mcp_record) {
+                        Err(e) => {
+                            warn!("ProvisionMcpEndpoint: failed to upsert mcp-membrane guest [{}]: {e}", mcp_guest_id);
+                            false
+                        }
+                        Ok(()) => {
+                            if let Some(requester) = materialization_requester {
+                                match requester.ensure_guest_active(&mcp_guest_id).await {
+                                    Ok(true) => {
+                                        info!("mcp-membrane guest [{}] materialization triggered.", mcp_guest_id);
+                                        true
+                                    }
+                                    Ok(false) => {
+                                        warn!("mcp-membrane guest [{}] could not be materialized.", mcp_guest_id);
+                                        false
+                                    }
+                                    Err(e) => {
+                                        warn!("mcp-membrane guest [{}] materialization error: {e}", mcp_guest_id);
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                } else {
+                    warn!("ProvisionMcpEndpoint: hotel name not found for node [{}]; skipping guest spawn.", local_node_id);
+                    false
+                };
+
                 IpcResponse::McpEndpointProvisioned {
                     endpoint_id,
                     port,
-                    materialized: false, // guest spawn deferred to Phase 3
+                    materialized,
                 }
             }
 
@@ -10981,6 +11046,11 @@ impl IpcServer {
                     task_json,
                 )
                 .await;
+
+                // Mark guest inactive so hotel doesn't respawn after revoke.
+                if let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) {
+                    let _ = graph.set_guest_active(&hotel_name, &guest_id, false);
+                }
 
                 info!(endpoint_id, "MCP endpoint revoked.");
 
