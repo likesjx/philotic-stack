@@ -81,6 +81,11 @@ pub async fn run(hotel: String, detach: bool) -> Result<()> {
     if let Some(ref p) = active_profile() {
         cmd.env("PHILOTIC_PROFILE", p);
     }
+    if std::env::var_os("PHILOTIC_VAULT_MASTER_KEY").is_none() {
+        if let Some(root_key) = load_vault_master_key_env_file()? {
+            cmd.env("PHILOTIC_VAULT_MASTER_KEY", root_key);
+        }
+    }
 
     let child = cmd
         .spawn()
@@ -164,6 +169,32 @@ fn which_bin(name: &str) -> Result<PathBuf> {
     } else {
         bail!("{name} not on PATH")
     }
+}
+
+fn load_vault_master_key_env_file() -> Result<Option<String>> {
+    let path = philotic_dir().join("vault-master-key.env");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim() == "PHILOTIC_VAULT_MASTER_KEY" {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Ok(Some(value.to_string()));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 pub fn read_pid() -> Option<u32> {

@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -242,13 +243,64 @@ def resolve_local_server_dir() -> Optional[pathlib.Path]:
     return None
 
 
+def resolve_muninn_cli() -> Optional[pathlib.Path]:
+    env_cli = os.environ.get("MUNINN_CLI")
+    if env_cli:
+        candidate = pathlib.Path(env_cli).expanduser()
+        if candidate.exists():
+            return candidate
+
+    found = shutil.which("muninn")
+    if found:
+        return pathlib.Path(found)
+    return None
+
+
 def try_start_local_server() -> dict:
+    cli = resolve_muninn_cli()
+    if cli is not None:
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [str(cli), "start"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - bootstrap should report the real failure plainly
+            return {
+                "started": False,
+                "start_attempted": True,
+                "start_method": "muninn start",
+                "start_reason": f"failed to start local muninn CLI: {exc}",
+                "server_binary": str(cli),
+            }
+
+        if proc.returncode != 0:
+            return {
+                "started": False,
+                "start_attempted": True,
+                "start_method": "muninn start",
+                "start_reason": proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}",
+                "server_binary": str(cli),
+            }
+
+        time.sleep(1.0)
+        return {
+            "started": True,
+            "start_attempted": True,
+            "start_method": "muninn start",
+            "server_binary": str(cli),
+            "start_output": proc.stdout.strip(),
+        }
+
     server_dir = resolve_local_server_dir()
     if server_dir is None:
         return {
             "started": False,
             "start_attempted": False,
-            "start_reason": "local muninndb-server binary not found",
+            "start_reason": "local muninn CLI or muninndb-server binary not found",
         }
 
     binary = server_dir / "muninndb-server"

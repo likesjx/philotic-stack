@@ -1341,11 +1341,14 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "delegate.whisper".into(),
         ToolDefinition {
             tool_name: "delegate.whisper".into(),
-            description: "Fire-and-forget paracrine dispatch — silently consults a specialist \
-                          role without interrupting the current turn. The specialist's response \
-                          arrives back asynchronously as a paracrine_response. Use for quiet \
-                          delegation, mid-turn enrichment, or specialist consultation where the \
-                          user does not need to see the handoff. \
+            description: "Paracrine dispatch — silently consults a specialist role. By default \
+                          the specialist's response arrives back asynchronously as a \
+                          paracrine_response. Use routing='enriched_tool_result' or \
+                          wait_for_response=true when the main loop should pause until the \
+                          aside completes and then continue with the specialist result as this \
+                          tool's result. Use other routing modes for quiet delegation, mid-turn \
+                          enrichment, or specialist consultation where the user does not need to \
+                          see the handoff. \
                           Set reply_to='membrane' to route the specialist's response directly \
                           to the user with an inline role-switch button."
                 .into(),
@@ -1366,8 +1369,27 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "routing": {
                         "type": "string",
-                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward"],
+                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward", "priority_re_entry", "approval_resolution"],
                         "description": "How to handle the specialist's response when it arrives. Defaults to cognitive_re_entry."
+                    },
+                    "wait_for_response": {
+                        "type": "boolean",
+                        "description": "When true, keep the current turn in waiting_tool until the specialist completes. If routing is omitted, this implies routing='enriched_tool_result'."
+                    },
+                    "authority": {
+                        "type": "string",
+                        "enum": ["advice_only", "context_patch", "execute_with_approval"],
+                        "description": "Authority granted to the paracrine side loop. Defaults to advice_only."
+                    },
+                    "tool_policy": {
+                        "type": "string",
+                        "enum": ["role_default", "read_only", "no_tools"],
+                        "description": "Tool policy for the specialist side loop. Defaults to role_default."
+                    },
+                    "approval_scope": {
+                        "type": "string",
+                        "enum": ["originating_session", "specialist_session"],
+                        "description": "Where approval requests from the side loop should resolve. Defaults to originating_session."
                     }
                 },
                 "required": ["role", "prompt"]

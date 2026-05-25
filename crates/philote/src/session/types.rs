@@ -504,6 +504,52 @@ pub struct RecalledMemoryRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParacrineThreadStatus {
+    Open,
+    Completed,
+    Superseded,
+    Cancelled,
+    Expired,
+    Escalated,
+}
+
+impl ParacrineThreadStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Completed => "completed",
+            Self::Superseded => "superseded",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Escalated => "escalated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParacrineThread {
+    pub id: String,
+    pub origin_turn_id: String,
+    pub role: String,
+    pub goal: String,
+    pub status: ParacrineThreadStatus,
+    pub routing: philotic_client::ParacrineRouting,
+    pub authority: String,
+    pub tool_policy: String,
+    pub approval_scope: String,
+    pub opened_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
     pub turn_id: String,
@@ -563,6 +609,10 @@ pub struct WorkingTurn {
     /// The chat_id (Telegram / membrane channel) of the originating conversation.
     /// Included in the `paracrine_response` so the routing reflex knows where to deliver.
     pub paracrine_reply_chat_id: Option<String>,
+    /// How the originating philote should handle the specialist's response.
+    /// Captured from the inbound exosome and echoed back on `paracrine_response`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_response_routing: Option<philotic_client::ParacrineRouting>,
     /// Set to true when the specialist explicitly calls `delegate.merge` during a turn.
     /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
     /// is no duplicate delivery after the explicit merge already fired.

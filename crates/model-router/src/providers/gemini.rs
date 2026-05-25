@@ -104,7 +104,7 @@ impl GeminiProvider {
         Self {
             http_client,
             auth,
-            default_model: "gemini-flash-latest".into(),
+            default_model: "gemini-3.5-flash".into(),
             base_url: base_url
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into())
                 .trim_end_matches('/')

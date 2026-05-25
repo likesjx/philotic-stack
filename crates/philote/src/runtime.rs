@@ -12,8 +12,9 @@ use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors, MediaRoutingPolicy,
     MemoryAuthority, MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope,
-    MemoryTemporalKind, MemoryValidationLevel, RecalledMemoryRecord, SessionState, ToolDefinition,
-    ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn, merge_session_index,
+    MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, RecalledMemoryRecord,
+    SessionState, ToolDefinition, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
+    merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -1984,6 +1985,15 @@ impl AgentRuntime {
                 let limit = match turn.phase {
                     TurnPhase::WaitingModel => WAITING_MODEL_SECS,
                     TurnPhase::Thinking => THINKING_SECS,
+                    TurnPhase::WaitingTool
+                        if turn
+                            .pending_tool_call
+                            .as_ref()
+                            .map(|tool| tool.tool_name == "delegate.whisper")
+                            .unwrap_or(false) =>
+                    {
+                        WAITING_APPROVAL_SECS
+                    }
                     TurnPhase::WaitingTool => WAITING_TOOL_SECS,
                     TurnPhase::WaitingVoice => WAITING_VOICE_SECS,
                     _ => return None,
@@ -2358,6 +2368,19 @@ impl AgentRuntime {
     /// This is a separate path from [`handle_user_message`]: the main cognitive
     /// loop is not re-entered unless the routing explicitly calls for it. The
     /// `paracrine_id` threads through every branch for cross-mesh provenance.
+    async fn persist_session_checkpoint(&mut self, session_id: &str) -> Result<()> {
+        let Some(state) = self.sessions.get(session_id) else {
+            return Ok(());
+        };
+        let checkpoint_memory_type = state.checkpoint_memory_type();
+        let checkpoint_json = state.checkpoint_json();
+        let index_state = state.clone();
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await
+    }
+
     async fn handle_paracrine_response(
         &mut self,
         task: InboundTaskPayload,
@@ -2377,31 +2400,49 @@ impl AgentRuntime {
             .and_then(|e| e.response_routing.clone())
             .unwrap_or(ParacrineRouting::CognitiveReEntry);
 
-        // Locate the owning session by matching paracrine_id against turn logs,
+        // Locate the owning turn by matching paracrine_id against active turns,
         // falling back to the task's session_id field.
+        let owner_turn = paracrine_id.as_ref().and_then(|pid| {
+            self.sessions.iter().find_map(|(sid, state)| {
+                state.active_turn.as_ref().and_then(|turn| {
+                    turn.associated_paracrine_ids
+                        .contains(pid)
+                        .then(|| (sid.clone(), turn.turn_id.clone(), turn.chat_id.clone()))
+                })
+            })
+        });
+        let owner_thread = paracrine_id.as_ref().and_then(|pid| {
+            self.sessions.iter().find_map(|(sid, state)| {
+                state
+                    .paracrine_threads
+                    .iter()
+                    .find(|thread| thread.id == pid.as_str())
+                    .map(|thread| (sid.clone(), thread.origin_turn_id.clone()))
+            })
+        });
         let session_id = task
             .session_id
             .as_deref()
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                if let Some(pid) = &paracrine_id {
-                    self.sessions.iter().find_map(|(sid, state)| {
-                        state
-                            .active_turn
-                            .as_ref()
-                            .filter(|t| t.associated_paracrine_ids.contains(pid))
-                            .map(|_| sid.as_str())
-                    })
-                } else {
-                    None
-                }
-            })
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| owner_turn.as_ref().map(|(sid, _, _)| sid.clone()))
+            .or_else(|| owner_thread.as_ref().map(|(sid, _)| sid.clone()));
 
         match routing {
             ParacrineRouting::RawForward => {
                 // Emit content directly to membrane — no model loop.
                 let content = task.content.clone().unwrap_or_default();
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            Some(content.clone()),
+                            Some("raw_forward".into()),
+                        );
+                    }
+                    self.persist_session_checkpoint(sid).await?;
+                }
                 let node_id = local_node_id();
                 let _ = self
                     .ipc_client
@@ -2424,6 +2465,12 @@ impl AgentRuntime {
                 // or interrupting the active turn.
                 let content = task.content.clone().unwrap_or_default();
                 if let Some(sid) = &session_id {
+                    if let Some(pid) = &paracrine_id {
+                        if let Some(state) = self.sessions.get_mut(sid) {
+                            state.signal_paracrine_thread(pid, content.clone());
+                        }
+                        self.persist_session_checkpoint(sid).await?;
+                    }
                     let _ = self.emit_partial_reply(sid, content).await;
                 }
             }
@@ -2434,6 +2481,12 @@ impl AgentRuntime {
                     paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
                     "paracrine heartbeat received"
                 );
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.signal_paracrine_thread(pid, "heartbeat".into());
+                    }
+                    self.persist_session_checkpoint(sid).await?;
+                }
             }
 
             ParacrineRouting::MemoryEnrichment => {
@@ -2447,6 +2500,16 @@ impl AgentRuntime {
                     return Ok(());
                 }
                 // Memory injection handled by model re-entry with enriched context.
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("memory_enrichment".into()),
+                        );
+                    }
+                }
                 self.handle_user_message(task, task_id).await?;
             }
 
@@ -2460,6 +2523,16 @@ impl AgentRuntime {
                     );
                     return Ok(());
                 }
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("datasource_injection".into()),
+                        );
+                    }
+                }
                 self.handle_user_message(task, task_id).await?;
             }
 
@@ -2467,13 +2540,25 @@ impl AgentRuntime {
                 // Replace the "paracrine dispatched" placeholder with the real
                 // specialist response and re-enter the model as if the tool call
                 // completed normally.
+                let owner_turn_id = owner_turn.as_ref().map(|(_, tid, _)| tid.clone());
+                let owner_chat_id = owner_turn.as_ref().map(|(_, _, cid)| cid.clone());
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("enriched_tool_result".into()),
+                        );
+                    }
+                }
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     tool_name: Some("delegate.whisper".into()),
                     content: task.content.clone(),
                     session_id: session_id.clone().or(task.session_id.clone()),
-                    turn_id: task.turn_id.clone(),
-                    chat_id: task.chat_id.clone(),
+                    turn_id: owner_turn_id.or(task.turn_id.clone()),
+                    chat_id: owner_chat_id.or(task.chat_id.clone()),
                     source: Some("paracrine".into()),
                     final_reply_to: task.final_reply_to.clone(),
                     final_reply_role: task.final_reply_role.clone(),
@@ -2486,6 +2571,16 @@ impl AgentRuntime {
                 // Standard path: feed into cognitive re-entry.
                 // If there is an active turn, the re-entry will merge this
                 // response into its context. If not, a new synthesis turn begins.
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("cognitive_re_entry".into()),
+                        );
+                    }
+                }
                 self.handle_user_message(task, task_id).await?;
             }
 
@@ -2493,6 +2588,16 @@ impl AgentRuntime {
                 // Arbiter-promoted: prepend to the session queue so this task is
                 // processed NEXT, ahead of any already-waiting messages.
                 let session_id = task.session_id_or_default(&self.agent_id);
+                if let Some(pid) = &paracrine_id {
+                    if let Some(state) = self.sessions.get_mut(&session_id) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("priority_re_entry".into()),
+                        );
+                    }
+                }
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     if state.is_turn_active() {
                         info!(
@@ -2514,6 +2619,16 @@ impl AgentRuntime {
                 // approval resolution path.
                 let session_id =
                     session_id.unwrap_or_else(|| task.session_id_or_default(&self.agent_id));
+                if let Some(pid) = &paracrine_id {
+                    if let Some(state) = self.sessions.get_mut(&session_id) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("approval_resolution".into()),
+                        );
+                    }
+                }
                 // The sender encodes the decision as JSON in `content`, e.g.:
                 //   {"decision": "approved", "note": "looks good"}
                 let parsed_content = task
@@ -2700,6 +2815,22 @@ impl AgentRuntime {
                 | SlashCommand::WorkspaceSet { .. }
                 | SlashCommand::WorkspaceClear => {}
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => {
+                    if self
+                        .sessions
+                        .get(&session_id)
+                        .map(Self::should_defer_parked_approval_command)
+                        .unwrap_or(false)
+                    {
+                        if let Some(state) = self.sessions.get_mut(&session_id) {
+                            state.prepend_user_task(task_id, task);
+                        }
+                        info!(
+                            session_id = %session_id,
+                            "Approval command arrived while another turn is active; deferring until the parked approval turn can resume"
+                        );
+                        return Ok(());
+                    }
+
                     // "Trust for session" button sends callback_data="trust" which membrane
                     // translates to /approve + preserves the original callback_data.
                     // Pre-approve the session before resolving the parked turn, and
@@ -3054,7 +3185,12 @@ impl AgentRuntime {
             // Also capture source_session_id / source_chat_id from the exosome so the
             // response is routed back to the originating conversation channel, not the
             // specialist's own ephemeral session.
-            let (paracrine_origin, paracrine_reply_session_id, paracrine_reply_chat_id) = {
+            let (
+                paracrine_origin,
+                paracrine_reply_session_id,
+                paracrine_reply_chat_id,
+                paracrine_response_routing,
+            ) = {
                 let exosome = task
                     .exosome
                     .as_ref()
@@ -3063,6 +3199,7 @@ impl AgentRuntime {
                     exosome.as_ref().and_then(|e| e.paracrine_id.clone()),
                     exosome.as_ref().and_then(|e| e.source_session_id.clone()),
                     exosome.as_ref().and_then(|e| e.source_chat_id.clone()),
+                    exosome.as_ref().and_then(|e| e.response_routing.clone()),
                 )
             };
 
@@ -3093,6 +3230,7 @@ impl AgentRuntime {
                 paracrine_origin,
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
+                paracrine_response_routing,
                 paracrine_merge_completed: false,
                 plan_confirmed: false,
                 plan_confirm_note: None,
@@ -6242,6 +6380,7 @@ impl AgentRuntime {
                 "exosome": {
                     "prompt": "",
                     "paracrine_id": pid,
+                    "response_routing": completed_turn.paracrine_response_routing,
                     "source_session_id": reply_session_id,
                     "source_chat_id": reply_chat_id,
                 },
@@ -7140,6 +7279,15 @@ impl AgentRuntime {
         Ok(())
     }
 
+    fn should_defer_parked_approval_command(state: &SessionState) -> bool {
+        state.has_parked_approval_turn()
+            && state
+                .active_turn
+                .as_ref()
+                .map(|turn| turn.phase != TurnPhase::WaitingApproval)
+                .unwrap_or(false)
+    }
+
     /// Forward a streaming LLM token fragment to membrane for progressive display.
     ///
     /// model-router emits `action = "streaming_token"` tasks as the Gemini SSE stream
@@ -7169,13 +7317,24 @@ impl AgentRuntime {
                     t.final_reply_guest_id.clone(),
                     t.turn_id.clone(),
                     t.chat_id.clone(),
+                    t.paracrine_origin.is_some(),
                 )
             });
 
-        let Some((reply_to, reply_role, reply_guest_id, turn_id, chat_id)) = routing else {
+        let Some((reply_to, reply_role, reply_guest_id, turn_id, chat_id, is_paracrine_turn)) =
+            routing
+        else {
             // No active turn — token arrived after turn completed; drop silently.
             return Ok(());
         };
+
+        if is_paracrine_turn {
+            // Paracrine specialist output is private until it is wrapped as a
+            // paracrine_response at final completion. Streaming it through the
+            // ordinary reply route leaks aside tokens and can target a role with
+            // no subscriber, leaving the response ledger-only.
+            return Ok(());
+        }
 
         let task_json = serde_json::to_string(&serde_json::json!({
             "action": "partial_reply",
@@ -12334,12 +12493,40 @@ impl AgentRuntime {
 
                 // Parse optional response_routing hint from arguments.
                 // Defaults to CognitiveReEntry if absent or unrecognised.
-                let response_routing = args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
-                    serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
-                        s.to_string(),
-                    ))
-                    .ok()
-                });
+                let explicit_response_routing =
+                    args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
+                        serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
+                            s.to_string(),
+                        ))
+                        .ok()
+                    });
+                let wait_requested = args
+                    .get("wait_for_response")
+                    .or_else(|| args.get("blocking"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let response_routing = if wait_requested && explicit_response_routing.is_none() {
+                    Some(ParacrineRouting::EnrichedToolResult)
+                } else {
+                    explicit_response_routing
+                };
+                let wait_for_response = wait_requested
+                    || matches!(response_routing, Some(ParacrineRouting::EnrichedToolResult));
+                let authority = args
+                    .get("authority")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("advice_only")
+                    .to_string();
+                let tool_policy = args
+                    .get("tool_policy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("role_default")
+                    .to_string();
+                let approval_scope = args
+                    .get("approval_scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("originating_session")
+                    .to_string();
 
                 // Always generate a paracrine_id — it threads through the full
                 // thought graph and ties the response back to this turn.
@@ -12369,26 +12556,66 @@ impl AgentRuntime {
                 };
 
                 let exosome = Exosome {
-                    prompt,
+                    prompt: prompt.clone(),
                     context: None,
                     paracrine_id: Some(paracrine_id.clone()),
-                    response_routing,
+                    response_routing: response_routing.clone(),
                     source_session_id,
                     source_chat_id,
                 };
 
-                let (content, tool_err) = match self
+                let emit_result = self
                     .ipc_client
                     .send_request(IpcRequest::ParacrineEmit {
-                        role,
+                        role: role.clone(),
                         exosome,
                         reply_to_node,
                         reply_to_role,
                         reply_to_guest_id: source_reply_guest_id,
                         timeout_secs: None,
                     })
-                    .await
-                {
+                    .await;
+
+                if emit_result.is_ok() {
+                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                        state.open_paracrine_thread(
+                            paracrine_id.clone(),
+                            role.clone(),
+                            prompt.clone(),
+                            response_routing
+                                .clone()
+                                .unwrap_or(ParacrineRouting::CognitiveReEntry),
+                            authority,
+                            tool_policy,
+                            approval_scope,
+                        );
+                    }
+                }
+
+                let (content, tool_err) = match emit_result {
+                    Ok(_) if wait_for_response => {
+                        if let Some(state) = self.sessions.get(&payload.session_id) {
+                            let checkpoint_memory_type = state.checkpoint_memory_type();
+                            let checkpoint_json = state.checkpoint_json();
+                            let index_state = state.clone();
+                            self.ipc_client
+                                .sync_apartment(
+                                    &self.agent_id,
+                                    &checkpoint_memory_type,
+                                    checkpoint_json,
+                                )
+                                .await?;
+                            self.sync_session_index(&index_state).await?;
+                        }
+                        let _ = self
+                            .emit_turn_event(
+                                &payload.session_id,
+                                "waiting_paracrine",
+                                Some(paracrine_id.clone()),
+                            )
+                            .await;
+                        return Ok(());
+                    }
                     Ok(_) => (
                         format!(
                             "Whisper sent to specialist (paracrine_id: {paracrine_id}). \
@@ -12467,6 +12694,7 @@ impl AgentRuntime {
                     paracrine_id,
                     reply_session_id,
                     reply_chat_id,
+                    response_routing,
                     final_reply_to,
                     final_reply_role,
                     final_reply_guest_id,
@@ -12497,12 +12725,13 @@ impl AgentRuntime {
                         .paracrine_reply_chat_id
                         .clone()
                         .unwrap_or_else(|| turn.chat_id.clone());
+                    let rr = turn.paracrine_response_routing.clone();
                     let frt = turn.final_reply_to.clone();
                     let frr = turn.final_reply_role.clone();
                     let frg = turn.final_reply_guest_id.clone();
                     // Mark merge as done so deliver_text_reply suppresses the auto-emit.
                     turn.paracrine_merge_completed = true;
-                    (pid, rs, rc, frt, frr, frg)
+                    (pid, rs, rc, rr, frt, frr, frg)
                 };
 
                 // Append role attribution tag (same as deliver_text_reply does).
@@ -12527,6 +12756,7 @@ impl AgentRuntime {
                     "exosome": {
                         "prompt": "",
                         "paracrine_id": paracrine_id,
+                        "response_routing": response_routing,
                         "source_session_id": reply_session_id,
                         "source_chat_id": reply_chat_id,
                     },
@@ -14074,6 +14304,44 @@ mod tests {
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
+
+    fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            primary_user_id: None,
+            user_content: "test".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            streaming_retry_attempts: 0,
+        }
+    }
+
     #[test]
     fn model_request_targets_agent_for_reply() {
         let request = ModelRequestPayload {
@@ -14441,6 +14709,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
@@ -14494,6 +14763,29 @@ mod tests {
             approved_response: "Approved: deploy the thing".into(),
         });
         assert!(approval.approval_id.is_some());
+    }
+
+    #[test]
+    fn parked_approval_command_defers_behind_active_turn() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.parked_approval_turn = Some(test_working_turn(TurnPhase::WaitingApproval));
+        state.start_turn(test_working_turn(TurnPhase::WaitingModel));
+
+        assert!(super::AgentRuntime::should_defer_parked_approval_command(
+            &state
+        ));
+    }
+
+    #[test]
+    fn parked_approval_command_does_not_defer_when_session_is_free() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.parked_approval_turn = Some(test_working_turn(TurnPhase::WaitingApproval));
+
+        assert!(!super::AgentRuntime::should_defer_parked_approval_command(
+            &state
+        ));
     }
 
     #[test]
