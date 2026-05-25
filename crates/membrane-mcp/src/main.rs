@@ -113,10 +113,10 @@ struct McpMembrane {
 }
 
 impl McpMembrane {
-    fn new(port: u16, node_id: &str, state: Arc<MembraneState>) -> Self {
+    fn new(port: u16, guest_id: &str, state: Arc<MembraneState>) -> Self {
         Self {
             port,
-            lease_key_value: format!("mcp-membrane:{}", node_id),
+            lease_key_value: guest_id.to_string(),
             state,
         }
     }
@@ -415,7 +415,7 @@ async fn main() -> Result<()> {
         ingress_tier,
     });
 
-    let guest = McpMembrane::new(args.port, &args.node_id, state);
+    let guest = McpMembrane::new(args.port, &args.guest_id, state);
 
     if let Some(socket) = &args.ipc_socket {
         membrane::MembraneRuntime::new(socket, &args.guest_id, &args.node_id)

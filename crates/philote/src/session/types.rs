@@ -923,10 +923,20 @@ pub struct ContextWindowPolicy {
     /// Default: 32_768, min: 1_000, max: 500_000.
     #[serde(default = "default_max_tool_result_chars")]
     pub max_tool_result_chars: usize,
+    /// Maximum number of tool call entries included in the history for a single
+    /// turn. Oldest entries are dropped first; a compact note is prepended when
+    /// any are dropped. Prevents unbounded context growth on long agentic turns.
+    /// Default: 15, min: 3, max: 100.
+    #[serde(default = "default_max_tool_history_entries")]
+    pub max_tool_history_entries: usize,
 }
 
 fn default_max_tool_result_chars() -> usize {
     32_768
+}
+
+fn default_max_tool_history_entries() -> usize {
+    15
 }
 
 impl Default for ContextWindowPolicy {
@@ -936,6 +946,7 @@ impl Default for ContextWindowPolicy {
             dialogue_window_chars: 10_000,
             include_tool_calls: true,
             max_tool_result_chars: 32_768,
+            max_tool_history_entries: 15,
         }
     }
 }
