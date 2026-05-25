@@ -934,16 +934,21 @@ async fn emit_failure(
 
 /// Emit a dispatch status event to philote so it can surface transient state
 /// (e.g. "(retrying...)" in the Telegram draft) without a full model_response.
+/// The human-readable label is formatted here and carried in `content` so philote
+/// can forward it without parsing additional fields.
 async fn emit_dispatch_status(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
     attempt: u8,
     kind: &str,
 ) {
+    let label = match kind {
+        "retrying" => format!("_(retrying\u{2026} attempt {})_", attempt + 1),
+        other => format!("_({other})_"),
+    };
     let task_json = json!({
         "action": "model_dispatch_status",
-        "kind": kind,
-        "attempt": attempt + 1,
+        "content": label,
         "session_id": reply.session_id,
         "turn_id": reply.turn_id,
         "chat_id": reply.chat_id,

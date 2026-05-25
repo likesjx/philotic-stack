@@ -2271,6 +2271,13 @@ impl AgentRuntime {
                                 warn!("Failed to forward streaming_token: {}", err);
                             }
                         }
+                        Ok(task) if task.action.as_deref() == Some("model_dispatch_status") => {
+                            // Transient dispatch state from the model controller retry loop.
+                            // Forward to membrane so the user sees "(retrying...)" etc.
+                            if let Err(err) = self.handle_model_dispatch_status(task).await {
+                                warn!("Failed to forward model_dispatch_status: {}", err);
+                            }
+                        }
                         Ok(task) if task.action.as_deref() == Some("datasource_response") => {
                             if let Err(err) = self.handle_datasource_response(task).await {
                                 warn!("Failed to handle datasource_response: {}", err);
@@ -7342,6 +7349,60 @@ impl AgentRuntime {
             "turn_id": turn_id,
             "chat_id": chat_id,
             "content": token,
+        }))?;
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: reply_to,
+                target_role: reply_role,
+                target_guest_id: reply_guest_id,
+                task_json,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// model-router emits `action = "model_dispatch_status"` during its retry loop so users
+    /// see transient state ("retrying...", "switching model...") rather than silence.
+    /// The label is pre-formatted by the controller into `content`; philote forwards it
+    /// as a partial_reply to membrane. Dropped silently if no active turn.
+    async fn handle_model_dispatch_status(&mut self, task: InboundTaskPayload) -> Result<()> {
+        let session_id = match &task.session_id {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+
+        let label = match &task.content {
+            Some(c) if !c.is_empty() => c.clone(),
+            _ => return Ok(()),
+        };
+
+        let routing = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .filter(|t| t.paracrine_origin.is_none())
+            .map(|t| {
+                (
+                    t.final_reply_to.clone(),
+                    t.final_reply_role.clone(),
+                    t.final_reply_guest_id.clone(),
+                    t.turn_id.clone(),
+                    t.chat_id.clone(),
+                )
+            });
+
+        let Some((reply_to, reply_role, reply_guest_id, turn_id, chat_id)) = routing else {
+            return Ok(());
+        };
+
+        let task_json = serde_json::to_string(&serde_json::json!({
+            "action": "partial_reply",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "chat_id": chat_id,
+            "content": label,
         }))?;
 
         self.ipc_client
