@@ -302,7 +302,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         }
                     }
                 } else {
-                    let provider = match providers.resolve(&controller_task) {
+                    let primary_provider = match providers.resolve(&controller_task) {
                         Ok(provider) => provider,
                         Err(err) => {
                             // No provider for this task kind. Emit an immediate failure so the
@@ -325,6 +325,66 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             .await?;
                             continue;
                         }
+                    };
+
+                    // ── Model routing reflex ──────────────────────────────────
+                    // If the resolved provider's operational profile shows degraded
+                    // health, walk the full supporting-provider list and substitute
+                    // the first healthy alternative. Only applies when there is no
+                    // explicit provider_hint — hints are honoured unconditionally.
+                    let provider = if controller_task.provider_hint().is_none() {
+                        let primary_degraded = graph_domain
+                            .as_ref()
+                            .and_then(|gd| {
+                                gd.get_model_profile(primary_provider.id(), &local_node_id())
+                                    .ok()
+                                    .flatten()
+                            })
+                            .map(|p| p.status == "degraded")
+                            .unwrap_or(false);
+
+                        if primary_degraded {
+                            let candidates = providers.all_supporting(&controller_task);
+                            let healthy = candidates.into_iter().find(|p| {
+                                graph_domain
+                                    .as_ref()
+                                    .and_then(|gd| {
+                                        gd.get_model_profile(p.id(), &local_node_id())
+                                            .ok()
+                                            .flatten()
+                                    })
+                                    .map(|prof| prof.status != "degraded")
+                                    .unwrap_or(true) // unknown profile = assume healthy
+                            });
+
+                            if let Some(alt) = healthy {
+                                info!(
+                                    "Routing reflex: [{}] degraded, substituting [{}]",
+                                    primary_provider.id(),
+                                    alt.id()
+                                );
+                                emit_falling_back(
+                                    &mut ipc_client,
+                                    &reply,
+                                    primary_provider.id(),
+                                    alt.id(),
+                                )
+                                .await;
+                                alt
+                            } else {
+                                // All providers degraded — use primary, it may recover.
+                                warn!(
+                                    "Routing reflex: all providers degraded for {}; using primary [{}]",
+                                    controller_task.kind.as_str(),
+                                    primary_provider.id()
+                                );
+                                primary_provider
+                            }
+                        } else {
+                            primary_provider
+                        }
+                    } else {
+                        primary_provider
                     };
 
                     info!(
@@ -958,6 +1018,33 @@ async fn emit_failure(
 
     ipc_client.send_request(reply_req).await?;
     Ok(())
+}
+
+/// Emit a model_dispatch_status event to philote when the routing reflex
+/// substitutes a degraded provider with a healthy fallback.
+async fn emit_falling_back(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    from: &str,
+    to: &str,
+) {
+    let label = format!("_(switching model: {from} \u{2192} {to})_");
+    let task_json = json!({
+        "action": "model_dispatch_status",
+        "content": label,
+        "session_id": reply.session_id,
+        "turn_id": reply.turn_id,
+        "chat_id": reply.chat_id,
+    })
+    .to_string();
+    let _ = ipc_client
+        .send_request(IpcRequest::EmitTask {
+            target_node: reply.reply_to.clone(),
+            target_role: reply.reply_role.clone(),
+            target_guest_id: None,
+            task_json,
+        })
+        .await;
 }
 
 /// Emit a dispatch status event to philote so it can surface transient state

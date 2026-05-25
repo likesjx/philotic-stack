@@ -1625,6 +1625,15 @@ impl ProviderRegistry {
             .cloned()
             .with_context(|| format!("no provider registered for {}", task.kind.as_str()))
     }
+
+    /// All providers that support `task`, in priority order.
+    pub fn all_supporting(&self, task: &ControllerTask) -> Vec<Arc<dyn ModelProvider>> {
+        self.providers
+            .iter()
+            .filter(|p| p.supports(task))
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone)]
