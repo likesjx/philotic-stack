@@ -2058,36 +2058,56 @@ impl SessionState {
         // tool_history: accumulated (call, result) pairs from the active turn.
         // Always present in the envelope — empty on initial turn, populated on re-entry.
         // Results are truncated to max_tool_result_chars to prevent context overflow.
+        // Oldest entries are dropped first when working_tool_history exceeds max_tool_history_entries.
         let max_result_chars = self
             .settings
             .context_window
             .max_tool_result_chars
             .max(1_000);
+        let max_history_entries = self
+            .settings
+            .context_window
+            .max_tool_history_entries
+            .max(3);
         let tool_history: Vec<Value> = self
             .active_turn
             .as_ref()
             .map(|turn| {
-                turn.working_tool_history
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (call, result))| {
-                        let result_text = if result.content.len() > max_result_chars {
-                            format!(
-                                "{}… [truncated: {} chars total]",
-                                &result.content[..max_result_chars],
-                                result.content.len()
-                            )
-                        } else {
-                            result.content.clone()
-                        };
-                        json!({
-                            "index": i + 1,
-                            "tool_name": call.tool_name,
-                            "arguments": call.arguments,
-                            "result": result_text,
-                        })
-                    })
-                    .collect()
+                let all = &turn.working_tool_history;
+                let total = all.len();
+                let dropped = total.saturating_sub(max_history_entries);
+                let windowed = &all[dropped..];
+
+                let mut entries: Vec<Value> = Vec::with_capacity(windowed.len() + 1);
+                if dropped > 0 {
+                    entries.push(json!({
+                        "index": 0,
+                        "tool_name": "__context_compacted__",
+                        "arguments": {},
+                        "result": format!(
+                            "[Context compacted: {} older tool result(s) omitted to stay within context limits]",
+                            dropped
+                        ),
+                    }));
+                }
+                for (i, (call, result)) in windowed.iter().enumerate() {
+                    let result_text = if result.content.len() > max_result_chars {
+                        format!(
+                            "{}… [truncated: {} chars total]",
+                            &result.content[..max_result_chars],
+                            result.content.len()
+                        )
+                    } else {
+                        result.content.clone()
+                    };
+                    entries.push(json!({
+                        "index": dropped + i + 1,
+                        "tool_name": call.tool_name,
+                        "arguments": call.arguments,
+                        "result": result_text,
+                    }));
+                }
+                entries
             })
             .unwrap_or_default();
 

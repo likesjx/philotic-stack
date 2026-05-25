@@ -159,6 +159,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             &reply,
                             None,
                             None,
+                            config.guest_id,
                             format!("Model controller could not interpret task: {}", err),
                         )
                         .await?;
@@ -983,6 +984,7 @@ async fn emit_failure(
     reply: &ReplyRoute,
     capability: Option<&str>,
     provider: Option<&str>,
+    guest_id: &str,
     message: String,
 ) -> Result<()> {
     let error_payload = classify_provider_failure(capability, provider, &message);
@@ -990,6 +992,19 @@ async fn emit_failure(
         "Emitting model failure capability={:?} provider={:?}: {}",
         capability, provider, message
     );
+    let raw_text = format!(
+        "[{}][{}] {}: {}",
+        guest_id,
+        capability.unwrap_or("unknown"),
+        provider.unwrap_or("unknown"),
+        message
+    );
+    let _ = ipc_client
+        .send_request(IpcRequest::PushHealEntry {
+            guest_id: guest_id.to_string(),
+            raw_text,
+        })
+        .await;
     let reply_req = IpcRequest::EmitTask {
         target_node: reply.reply_to.clone(),
         target_role: reply.reply_role.clone(),

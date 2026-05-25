@@ -10938,7 +10938,7 @@ impl IpcServer {
                         "command": "membrane-mcp",
                         "args": [],
                         "env": {
-                            "MCP_PORT": port,
+                            "MCP_PORT": port.to_string(),
                             "PHILOTIC_HOTEL_SOCKET": socket_path,
                             "PHILOTIC_GUEST_ID": mcp_guest_id,
                             "PHILOTIC_NODE_ID": local_node_id,
