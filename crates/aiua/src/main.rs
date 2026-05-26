@@ -2234,7 +2234,7 @@ fn agent_guests_for_profile(hotel_name: &str, profile: &AgentProfile) -> GuestRe
     }
 }
 
-/// Companion agent-graph-runner guest for a philote agent.
+/// Companion agent-datasource guest for a philote agent.
 /// One per agent; stores per-agent cognitive graph at ~/.philotic/agent-graph-{id}.db.
 fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRecord {
     let hotel = default_hotel_record(hotel_name);
@@ -2245,11 +2245,12 @@ fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRe
         guest_id: guest_id.clone(),
         role: "agent-graph".into(),
         config_json: serde_json::json!({
-            "command": "agent-graph-runner",
+            "command": "agent-datasource",
             "args": [],
             "env": {
                 "PHILOTIC_AGENT_ID": profile.agent_id,
                 "PHILOTIC_GRAPH_RUNNER_ID": guest_id,
+                "PHILOTIC_HOTEL_SOCKET": socket_path,
                 "PHILOTIC_IPC_SOCKET": socket_path
             }
         })
@@ -7380,7 +7381,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 12); // shared: membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, graph-datasource, table-datasource, router-listener, mcp-membrane; profile: agent, agent-graph-runner
+        assert_eq!(guests.len(), 12); // shared: membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, graph-datasource, table-datasource, router-listener, mcp-membrane; profile: agent, agent-datasource
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
