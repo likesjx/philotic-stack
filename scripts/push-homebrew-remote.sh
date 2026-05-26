@@ -26,7 +26,7 @@ REMOTE_GRAPH_DIR="${REMOTE_HOME}/.philotic/${REMOTE_PROFILE}/graphs"
 cd "${ROOT_DIR}"
 
 if [[ -n "${EXPECTED_HOSTNAME}" ]]; then
-  ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
+  ACTUAL_HOST="$(ssh "${REMOTE}" "scutil --get LocalHostName 2>/dev/null || hostname -s" 2>/dev/null)"
   if [[ "${ACTUAL_HOST}" != "${EXPECTED_HOSTNAME}" ]]; then
     echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected '${EXPECTED_HOSTNAME}'."
     exit 1
