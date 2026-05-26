@@ -2279,6 +2279,34 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
         .join("training_audio")
         .to_string_lossy()
         .to_string();
+    let mut graph_datasource_env = serde_json::json!({
+        "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+        "PHILOTIC_NODE_ID": node_id.clone(),
+        "PHILOTIC_GRAPH_DATASOURCE_ID": format!("{hotel_name}:graph-datasource")
+    });
+    if let Some(env) = graph_datasource_env.as_object_mut() {
+        if let Ok(profile) = std::env::var("PHILOTIC_PROFILE") {
+            if !profile.trim().is_empty() {
+                env.insert(
+                    "PHILOTIC_PROFILE".into(),
+                    serde_json::Value::String(profile),
+                );
+            }
+        }
+        if let Ok(dir) = std::env::var("PHILOTIC_GRAPH_DATABASE_DIR") {
+            if !dir.trim().is_empty() {
+                env.insert(
+                    "PHILOTIC_GRAPH_DATABASE_DIR".into(),
+                    serde_json::Value::String(dir),
+                );
+            }
+        } else if let Some(pdir) = profile_dir() {
+            env.insert(
+                "PHILOTIC_GRAPH_DATABASE_DIR".into(),
+                serde_json::Value::String(pdir.join("graphs").to_string_lossy().into_owned()),
+            );
+        }
+    }
 
     // Build the agent roster JSON for the single membrane
     let roster: Vec<serde_json::Value> = profiles
@@ -2409,11 +2437,7 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
             config_json: serde_json::json!({
                 "command": "graph-datasource",
                 "args": [],
-                "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
-                    "PHILOTIC_NODE_ID": node_id.clone(),
-                    "PHILOTIC_GRAPH_DATASOURCE_ID": format!("{hotel_name}:graph-datasource")
-                }
+                "env": graph_datasource_env
             })
             .to_string(),
             is_active: true,
@@ -7405,6 +7429,39 @@ mod tests {
         assert!(!roster.is_empty());
         assert_eq!(roster[0]["agent_key"].as_str(), Some("beta"));
         assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-beta-01"));
+    }
+
+    #[test]
+    fn graph_datasource_guest_env_is_profile_scoped() {
+        unsafe {
+            std::env::set_var("HOME", "/tmp/codex-home");
+            std::env::set_var("PHILOTIC_PROFILE", "jane");
+            std::env::remove_var("PHILOTIC_GRAPH_DATABASE_DIR");
+        }
+
+        let guests = default_guest_seed("mbp-jane");
+        let graph_datasource = guests
+            .iter()
+            .find(|guest| guest.role == "graph-datasource")
+            .expect("graph datasource guest");
+        let config: serde_json::Value =
+            serde_json::from_str(&graph_datasource.config_json).unwrap();
+
+        assert_eq!(
+            config["env"]["PHILOTIC_GRAPH_DATASOURCE_ID"].as_str(),
+            Some("mbp-jane:graph-datasource")
+        );
+        assert_eq!(config["env"]["PHILOTIC_PROFILE"].as_str(), Some("jane"));
+        assert_eq!(
+            config["env"]["PHILOTIC_GRAPH_DATABASE_DIR"].as_str(),
+            Some("/tmp/codex-home/.philotic/jane/graphs")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_PROFILE");
+            std::env::remove_var("PHILOTIC_GRAPH_DATABASE_DIR");
+            std::env::remove_var("HOME");
+        }
     }
 
     #[test]

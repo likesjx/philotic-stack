@@ -189,6 +189,8 @@
   environment:
     PHILOTIC_BIN_DIR: "{{ philotic_bin_dir }}"
     PHILOTIC_HOTEL_SOCKET: "{{ philotic_hotel_socket }}"
+    PHILOTIC_GRAPH_DATABASE_DIR: "{{ philotic_data_dir }}/graphs"
+    PHILOTIC_TABLE_DB: "{{ philotic_data_dir }}/tables"
     PHILOTIC_ENABLE_RUST_AUTH: "{{ philotic_enable_rust_auth }}"
     PHILOTIC_ENABLE_RUST_DISPATCHER: "{{ philotic_enable_rust_dispatcher }}"
     PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE: "{{ philotic_enable_rust_task_lifecycle }}"

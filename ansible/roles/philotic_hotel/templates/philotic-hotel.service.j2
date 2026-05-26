@@ -25,6 +25,8 @@ Environment="PHILOTIC_ENABLE_RUST_AUTH={{ philotic_enable_rust_auth }}"
 Environment="PHILOTIC_ENABLE_RUST_DISPATCHER={{ philotic_enable_rust_dispatcher }}"
 Environment="PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE={{ philotic_enable_rust_task_lifecycle }}"
 Environment="PHILOTIC_GRAPH_DB_PATH={{ philotic_data_dir }}/graph-runner.db"
+Environment="PHILOTIC_GRAPH_DATABASE_DIR={{ philotic_data_dir }}/graphs"
+Environment="PHILOTIC_TABLE_DB={{ philotic_data_dir }}/tables"
 
 # Mesh PSK — injected from Ansible vault; never stored in plaintext on disk
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env
