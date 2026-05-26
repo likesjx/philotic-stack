@@ -674,18 +674,28 @@ impl GeminiProvider {
                 );
             }
             let bytes = response.bytes().await?.to_vec();
-            let normalized =
-                normalize_audio(bytes, &mime_type, CodecProvider::Gemini, self.codec_cache.as_ref(), "ffmpeg")
-                    .await
-                    .with_context(|| {
-                        format!("media-codec: failed to normalize audio [{mime_type}] for Gemini")
-                    })?;
-            parts.push(json!({
-                "inline_data": {
-                    "mime_type": normalized.mime_type,
-                    "data": BASE64_STANDARD.encode(normalized.bytes)
-                }
-            }));
+            if mime_type.starts_with("audio/") {
+                let normalized =
+                    normalize_audio(bytes, &mime_type, CodecProvider::Gemini, self.codec_cache.as_ref(), "ffmpeg")
+                        .await
+                        .with_context(|| {
+                            format!("media-codec: failed to normalize audio [{mime_type}] for Gemini")
+                        })?;
+                parts.push(json!({
+                    "inline_data": {
+                        "mime_type": normalized.mime_type,
+                        "data": BASE64_STANDARD.encode(normalized.bytes)
+                    }
+                }));
+            } else {
+                // Images and other non-audio media — pass through directly.
+                parts.push(json!({
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": BASE64_STANDARD.encode(&bytes)
+                    }
+                }));
+            }
         }
 
         Ok(json!({
