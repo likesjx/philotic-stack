@@ -5592,6 +5592,19 @@ impl IpcServer {
             return Ok(readiness);
         }
 
+        // If a role worker process is already running (but not yet registered to its inbox),
+        // skip re-registering. handle_register_component resets active_pid=None in its upsert,
+        // which causes ensure_guest_active to re-spawn unconditionally — creating a spawn storm
+        // on each 250ms HandoffPending retry.
+        if Self::role_guest_process_is_live(graph, local_node_id, &role_record.guest_id)? {
+            graph.set_role_incarnation_readiness(
+                agent_id,
+                role_name,
+                RoleReadinessState::Materializing,
+            )?;
+            return Ok(RoleReadinessState::Materializing);
+        }
+
         let manifest = Self::role_worker_manifest(graph, local_node_id, &role_record)?;
         match Self::handle_register_component(graph, materialization_requester, manifest).await {
             IpcResponse::ComponentRegistered { .. } => {}
