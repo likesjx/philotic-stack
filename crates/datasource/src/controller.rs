@@ -38,9 +38,15 @@ pub struct DatasourceTask {
 
 impl DatasourceTask {
     pub fn from_value(task: &Value) -> Result<Self> {
+        // When dispatched via ToolExecutionPayload (philote → EmitTask), tool arguments
+        // are nested under "arguments". Fall through to that sub-object when top-level
+        // lookups miss, so both direct and ToolExecutionPayload-shaped tasks work.
+        let args = task.get("arguments");
+
+        let get = |key: &str| task.get(key).or_else(|| args.and_then(|a| a.get(key)));
+
         let kind_str = task
             .get("kind")
-            .or_else(|| task.get("action"))
             .or_else(|| task.get("tool_name"))
             .or_else(|| task.get("tool"))
             .and_then(Value::as_str);
@@ -56,28 +62,22 @@ impl DatasourceTask {
 
         Ok(Self {
             kind,
-            provider: task
-                .get("provider")
+            provider: get("provider")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            db: task
-                .get("db")
+            db: get("db").and_then(Value::as_str).map(str::to_string),
+            graph_id: get("graph_id")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            graph_id: task
-                .get("graph_id")
+            query: get("query")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            query: task
-                .get("query")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            parameters: task
-                .get("parameters")
+            // For ToolExecutionPayload dispatch, the entire arguments object serves as
+            // parameters when no explicit "parameters" key is present.
+            parameters: get("parameters")
                 .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-            identity: task
-                .get("identity")
+                .unwrap_or_else(|| args.cloned().unwrap_or_else(|| serde_json::json!({}))),
+            identity: get("identity")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
         })
@@ -155,6 +155,20 @@ mod tests {
 
         assert_eq!(task.kind, TaskKind::Query);
         assert_eq!(task.provider_hint(), Some("graph"));
+        assert_eq!(task.graph_id.as_deref(), Some("workspace"));
+    }
+
+    #[test]
+    fn datasource_task_prefers_tool_name_over_execute_action() {
+        let payload = serde_json::json!({
+            "action": "execute_tool",
+            "tool_name": "graph.create",
+            "graph_id": "workspace",
+        });
+
+        let task = DatasourceTask::from_value(&payload).expect("task parsed");
+
+        assert_eq!(task.kind, TaskKind::CreatePartition);
         assert_eq!(task.graph_id.as_deref(), Some("workspace"));
     }
 

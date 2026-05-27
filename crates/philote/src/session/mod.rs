@@ -3762,6 +3762,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                 "datasource"
             } else if is_table_datasource_tool(tool_name) {
                 "table_datasource"
+            } else if is_vision_datasource_tool(tool_name) {
+                "vision_datasource"
             } else if is_pinned_tool(tool_name) {
                 "pinned"
             } else {
@@ -3779,6 +3781,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         "graph-datasource".into()
                     } else if execution_mode == "table_datasource" {
                         "table-datasource".into()
+                    } else if execution_mode == "vision_datasource" {
+                        "model-controller-vision".into()
                     } else {
                         format!("tool.{tool_name}")
                     },
@@ -3808,6 +3812,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         "graph_datasource_route".into()
                     } else if execution_mode == "table_datasource" {
                         "table_datasource_route".into()
+                    } else if execution_mode == "vision_datasource" {
+                        "vision_datasource_route".into()
                     } else if execution_mode == "pinned" {
                         "default_pinned_route".into()
                     } else {
@@ -3917,6 +3923,8 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "approval.request_standing"
             | "table.add_listener"
             | "router.stats"
+            | "vision.setup"
+            | "vision.status"
     )
 }
 
@@ -3948,6 +3956,10 @@ fn is_table_datasource_tool(tool_name: &str) -> bool {
             | "table.stats"
             | "table.schema"
     )
+}
+
+fn is_vision_datasource_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "image.ocr" | "image.ground")
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {

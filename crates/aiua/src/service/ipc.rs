@@ -14,7 +14,8 @@ use ansible_mesh_core::catalog_rights::{
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{
-    AbstractSkillRecord, RoleIncarnationRecord, RoleReadinessState, SkillValidationState,
+    AbstractSkillRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
+    SkillValidationState,
 };
 use ansible_mesh_core::membership::{
     DEFAULT_INVITE_TTL_SECS, MeshInvite, MeshInvitePayload, MeshJoinRequestPayload,
@@ -4273,6 +4274,42 @@ impl IpcServer {
                         .await
                         .unwrap_or_else(|e| {
                             IpcResponse::error("asr_status", "INTERNAL_ERROR", &e.to_string())
+                        });
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::VisionSetup {
+                        python_path,
+                        script_path,
+                        auto_install,
+                    }) => {
+                        let graph_clone = Arc::clone(&graph);
+                        let local_node_id_clone = local_node_id.clone();
+                        let socket_path_clone = socket_path.clone();
+                        let resp = tokio::task::spawn_blocking(move || {
+                            Self::handle_vision_setup(
+                                &graph_clone,
+                                &local_node_id_clone,
+                                &socket_path_clone,
+                                python_path.as_deref().unwrap_or("python3"),
+                                script_path.as_deref(),
+                                auto_install,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            IpcResponse::error("vision_setup", "INTERNAL_ERROR", &e.to_string())
+                        });
+                        let _ = outbound_tx.send(resp);
+                    }
+                    Ok(IpcRequest::VisionStatus {}) => {
+                        let graph_clone = Arc::clone(&graph);
+                        let local_node_id_clone = local_node_id.clone();
+                        let resp = tokio::task::spawn_blocking(move || {
+                            Self::handle_vision_status(&graph_clone, &local_node_id_clone)
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            IpcResponse::error("vision_status", "INTERNAL_ERROR", &e.to_string())
                         });
                         let _ = outbound_tx.send(resp);
                     }
@@ -9414,6 +9451,11 @@ impl IpcServer {
                 "UNREACHABLE",
                 "ASR request intercepted before process_request",
             ),
+            IpcRequest::VisionSetup { .. } | IpcRequest::VisionStatus {} => IpcResponse::error(
+                "vision",
+                "UNREACHABLE",
+                "Vision request intercepted before process_request",
+            ),
             IpcRequest::GetPerimeterStatus | IpcRequest::RefreshPerimeter => IpcResponse::error(
                 "perimeter",
                 "UNREACHABLE",
@@ -13678,6 +13720,199 @@ impl IpcServer {
             })),
         )
     }
+
+    // ── Vision provider lifecycle handlers ────────────────────────────────────
+
+    const VISION_GUEST_ID_SUFFIX: &'static str = "model-controller-vision-01";
+
+    fn handle_vision_setup(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        socket_path: &str,
+        python_path: &str,
+        script_path: Option<&str>,
+        auto_install: bool,
+    ) -> IpcResponse {
+        use std::process::Command;
+
+        // Step 1: check transformers + PIL import.
+        let check_ok = Command::new(python_path)
+            .args(["-c", "import transformers; from PIL import Image"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let libs_available = if !check_ok && auto_install {
+            info!("vision.setup: import check failed; attempting pip install transformers Pillow");
+            let install = Command::new(python_path)
+                .args(["-m", "pip", "install", "transformers", "Pillow"])
+                .output();
+            match install {
+                Ok(o) if o.status.success() => Command::new(python_path)
+                    .args(["-c", "import transformers; from PIL import Image"])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false),
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                    warn!("vision.setup: pip install failed: {stderr}");
+                    false
+                }
+                Err(e) => {
+                    warn!("vision.setup: pip install error: {e}");
+                    false
+                }
+            }
+        } else {
+            check_ok
+        };
+
+        if !libs_available {
+            let hint = format!(
+                "transformers/PIL import failed. Install manually: `{python_path} -m pip install transformers Pillow`"
+            );
+            return IpcResponse::error("vision_setup", "LIBS_UNAVAILABLE", &hint);
+        }
+
+        // Step 2: resolve hotel name.
+        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error(
+                "vision_setup",
+                "HOTEL_NOT_FOUND",
+                "could not resolve hotel name",
+            );
+        };
+        let guest_id = format!("{hotel_name}:{}", Self::VISION_GUEST_ID_SUFFIX);
+
+        // Step 3: write component config.
+        let config = serde_json::json!({
+            "python_path": python_path,
+            "script_path": script_path,
+        });
+        let config_json = match serde_json::to_string(&config) {
+            Ok(j) => j,
+            Err(e) => {
+                return IpcResponse::error("vision_setup", "SERIALIZE_ERROR", &e.to_string())
+            }
+        };
+        let key = format!("component:{guest_id}");
+        if let Err(e) = graph.set_config_value(&key, &config_json) {
+            return IpcResponse::error("vision_setup", "CONFIG_WRITE_ERROR", &e.to_string());
+        }
+
+        // Step 4: upsert ModelProfileRecord so health-aware routing picks this provider up.
+        let profile = ModelProfileRecord {
+            model_ref: "vision".to_string(),
+            node_id: local_node_id.to_string(),
+            provider: "script".to_string(),
+            task_kinds: vec!["image.ocr".to_string(), "image.ground".to_string()],
+            trust_tier: "local_experimental".to_string(),
+            max_context_tokens: 0,
+            latency_p50_ms: 0,
+            error_rate: 0.0,
+            status: "healthy".to_string(),
+            last_healthy_secs: 0,
+            updated_secs: 0,
+        };
+        if let Err(e) = graph.upsert_model_profile(&profile) {
+            return IpcResponse::error(
+                "vision_setup",
+                "PROFILE_REGISTER_ERROR",
+                &e.to_string(),
+            );
+        }
+
+        // Step 5: upsert guest record so the reconcile loop spawns model-controller-vision.
+        let guest_record = GuestRecord {
+            hotel_name: hotel_name.clone(),
+            guest_id: guest_id.clone(),
+            role: "model-controller-vision".to_string(),
+            config_json: serde_json::json!({
+                "command": "model-controller-vision",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path,
+                    "PHILOTIC_VISION_GUEST_ID": guest_id,
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        };
+        if let Err(e) = graph.upsert_guest(&guest_record) {
+            return IpcResponse::error("vision_setup", "GUEST_REGISTER_ERROR", &e.to_string());
+        }
+
+        info!(
+            hotel = %hotel_name,
+            guest_id = %guest_id,
+            "vision.setup: guest registered; will be spawned within 5s"
+        );
+
+        IpcResponse::success(
+            "vision_setup",
+            Some(serde_json::json!({
+                "message": format!(
+                    "Vision provider configured. Guest '{guest_id}' registered — will start within 5 seconds."
+                ),
+                "guest_id": guest_id,
+                "python_path": python_path,
+                "libs_available": true,
+            })),
+        )
+    }
+
+    fn handle_vision_status(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
+        use std::process::Command;
+
+        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error(
+                "vision_status",
+                "HOTEL_NOT_FOUND",
+                "could not resolve hotel name",
+            );
+        };
+        let guest_id = format!("{hotel_name}:{}", Self::VISION_GUEST_ID_SUFFIX);
+
+        let component_key = format!("component:{guest_id}");
+        let python_path = graph
+            .get_config_value(&component_key)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .and_then(|v| v.get("python_path").and_then(|p| p.as_str()).map(String::from))
+            .unwrap_or_else(|| "python3".to_string());
+
+        let guest = graph.get_guest(&hotel_name, &guest_id).ok().flatten();
+        let guest_registered = guest.is_some();
+        let guest_active = guest.as_ref().map(|g| g.is_active).unwrap_or(false);
+        let guest_pid = guest.as_ref().and_then(|g| g.active_pid.clone());
+
+        let libs_available = Command::new(&python_path)
+            .args(["-c", "import transformers; from PIL import Image"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let model_profile = graph
+            .get_model_profile("vision", local_node_id)
+            .ok()
+            .flatten();
+
+        IpcResponse::success(
+            "vision_status",
+            Some(serde_json::json!({
+                "guest_id": guest_id,
+                "registered": guest_registered,
+                "active": guest_active,
+                "pid": guest_pid,
+                "libs_available": libs_available,
+                "python_path": python_path,
+                "model_profile_status": model_profile.as_ref().map(|p| &p.status),
+            })),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -14404,6 +14639,8 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "training.status"
             | "asr.setup"
             | "asr.status"
+            | "vision.setup"
+            | "vision.status"
             | "cron.register"
             | "cron.list"
             | "cron.enable"

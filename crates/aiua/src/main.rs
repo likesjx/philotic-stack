@@ -3281,6 +3281,101 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             class: "asr".into(),
             tool_markers: Vec::new(),
         },
+        // ── Vision provider tools ─────────────────────────────────────────────
+        AbstractToolRecord {
+            tool_name: "vision.setup".into(),
+            description: "Set up the vision inference provider on this node: verifies Python + \
+                          transformers/PIL, optionally installs them via pip, writes the component \
+                          config, upserts a ModelProfileRecord so health-aware routing picks it up, \
+                          and registers the model-controller-vision guest for automatic materialization. \
+                          python_path defaults to 'python3'; auto_install defaults to true."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "python_path": {
+                        "type": "string",
+                        "description": "Python interpreter path (must have or will get transformers + Pillow)."
+                    },
+                    "script_path": {
+                        "type": "string",
+                        "description": "Path to a custom inference script (optional; uses built-in stub if omitted)."
+                    },
+                    "auto_install": {
+                        "type": "boolean",
+                        "description": "Attempt pip install if imports fail (default: true)."
+                    }
+                }
+            }),
+            class: "vision".into(),
+            tool_markers: vec!["high_agency".into()],
+        },
+        AbstractToolRecord {
+            tool_name: "vision.status".into(),
+            description: "Return the current status of the vision provider: whether the guest is \
+                          registered and active, its PID if running, whether transformers/PIL are \
+                          importable, and the ModelProfileRecord health status."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: "vision".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "image.ocr".into(),
+            description: "Extract text from an image using the local vision provider. \
+                          Provide image_url (HTTP/file URL) or image_base64 (base64-encoded PNG/JPEG). \
+                          Returns the extracted text."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_url": {
+                        "type": "string",
+                        "description": "HTTP or file URL of the image to process."
+                    },
+                    "image_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded PNG or JPEG image data."
+                    },
+                    "hint": {
+                        "type": "string",
+                        "description": "Optional text prompt to guide OCR (e.g. 'extract only the table')."
+                    }
+                }
+            }),
+            class: "vision".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "image.ground".into(),
+            description: "Locate objects or regions in an image (visual grounding). \
+                          Provide image_url or image_base64 and a query describing what to find. \
+                          Returns bounding boxes and labels."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_url": {
+                        "type": "string",
+                        "description": "HTTP or file URL of the image to process."
+                    },
+                    "image_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded PNG or JPEG image data."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language description of what to locate in the image."
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: "vision".into(),
+            tool_markers: Vec::new(),
+        },
         // ── Cron scheduler tools ──────────────────────────────────────────────
         AbstractToolRecord {
             tool_name: "cron.register".into(),

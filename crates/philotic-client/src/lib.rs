@@ -1508,6 +1508,25 @@ pub enum IpcRequest {
     /// Return the current status of the Parakeet ASR provider (guest active, nemo available).
     /// Responds with [`IpcResponse::Standard`] (data.status).
     AsrStatus {},
+    // ── Vision provider lifecycle ─────────────────────────────────────────────
+    /// Set up the vision inference provider: verify/install transformers+PIL, write
+    /// component config, register the model-controller-vision guest, and upsert a
+    /// ModelProfileRecord so health-aware routing picks it up.
+    /// Responds with [`IpcResponse::Standard`] (data.message).
+    VisionSetup {
+        /// Python interpreter path (default: "python3").
+        #[serde(default)]
+        python_path: Option<String>,
+        /// Path to a custom inference script (default: built-in stub).
+        #[serde(default)]
+        script_path: Option<String>,
+        /// If true, attempt `pip install transformers Pillow` when the import check fails.
+        #[serde(default = "default_true")]
+        auto_install: bool,
+    },
+    /// Return the current status of the vision provider (guest active, libs available).
+    /// Responds with [`IpcResponse::Standard`] (data.status).
+    VisionStatus {},
     /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
     /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
     GracefulShutdown {

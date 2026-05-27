@@ -16,6 +16,7 @@ media-prep = { path = "../media-prep" }
 mlx-runner = { path = "../mlx-runner" }
 parakeet-runner = { path = "../parakeet-runner" }
 onnx-runner = { path = "../onnx-runner" }
+datasource = { path = "../datasource" }
 philotic-client = { path = "../philotic-client" }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }

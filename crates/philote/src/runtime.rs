@@ -11069,6 +11069,150 @@ impl AgentRuntime {
                 .await
             }
 
+            "vision.setup" => {
+                use philotic_client::IpcRequest;
+                let python_path = payload
+                    .arguments
+                    .get("python_path")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let script_path = payload
+                    .arguments
+                    .get("script_path")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let auto_install = payload
+                    .arguments
+                    .get("auto_install")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::VisionSetup {
+                        python_path,
+                        script_path,
+                        auto_install,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let msg = data
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Vision provider configured.")
+                            .to_string();
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("vision.setup: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("vision.setup: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "vision.status" => {
+                use philotic_client::IpcRequest;
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::VisionStatus {})
+                    .await
+                {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let registered = data
+                            .get("registered")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let active = data
+                            .get("active")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let pid = data.get("pid").and_then(|v| v.as_str()).unwrap_or("none");
+                        let libs = data
+                            .get("libs_available")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let guest_id =
+                            data.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?");
+                        let profile_status = data
+                            .get("model_profile_status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("not registered");
+                        let content = format!(
+                            "Vision provider status:\n  guest: {guest_id}\n  registered: {registered}\n  active: {active}\n  pid: {pid}\n  libs_available: {libs}\n  model_profile: {profile_status}"
+                        );
+                        (content, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("vision.status: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("vision.status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             "cron.list" => {
                 use philotic_client::IpcRequest;
                 let (content, tool_err) = match self

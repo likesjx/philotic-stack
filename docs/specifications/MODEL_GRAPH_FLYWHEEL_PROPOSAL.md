@@ -3,7 +3,7 @@ title: Model Graph, Routing Oracle, and Flywheel
 doc_type: proposal
 domain: tooling-execution
 status: in-progress
-last_updated: 2026-05-20
+last_updated: 2026-05-26
 tags:
 - models
 - routing
@@ -487,21 +487,30 @@ Config nodes scoped per agent:
 
 Cognitive envelope injection: at session load, for each registered `table_config` node with a `context_query` property, execute that query against the table-datasource and inject result as `[Table: {name}]` section in the context envelope. Default `context_query` for `router_signals`: `SELECT provider_id, model_id, outcome, latency_ms, ts FROM router_signals ORDER BY ts DESC LIMIT 20`.
 
-### Slice 2 — ElevenLabs STT
-- Extend `ElevenLabsProvider` to support `TaskKind::AudioTranscribe`
-- Add to fallback chain for `audio.transcribe`
-- Wire into `model_profile` catalog seed
+### Slice 2 — ElevenLabs STT ✅ COMPLETE
+- `ElevenLabsProvider` extended to support `TaskKind::AudioTranscribe`
+- POST audio to `https://api.elevenlabs.io/v1/speech-to-text`, returns transcript
+- Added to `audio.transcribe` fallback chain as position 2 (after Parakeet, before Gemini)
+- Same `model-controller-elevenlabs` binary — no new binary needed
 
-### Slice 3 — Model Graph Seed
-- Define `model_profile` + `model_capability_score` storage in ansible-mesh-core
-- Seed all currently wired models with initial scores and trust tiers
-- Expose via read-only `model.list` admin tool
+### Slice 3 — Model Profile Storage + Health-Aware Routing Reflex ✅ COMPLETE
+- `ModelProfileRecord` defined in `ansible-mesh-core::graph` (model_ref, provider, task_kinds, status, latency_p50_ms, error_rate_1h, trust_tier)
+- `GraphDomain::upsert_model_profile`, `get_model_profile`, `list_model_profiles`, `observe_model_outcome` (EMA α=0.25 latency, α=0.1 error_rate)
+- `GraphDomain::best_model_for(task_kind, node_id)` — returns healthy profiles ranked by latency
+- Health-aware routing reflex in `model-router/src/controller.rs`: checks primary provider's `ModelProfileRecord.status`; if `degraded`, walks `all_supporting()` to find healthy alternative
+- **What was NOT shipped**: full capability score dimensions, `model.list` admin tool, initial catalog seed — these remain deferred
+- Seam: `model-graph-decision-layer`
 
-### Slice 4 — Vision Pipeline Foundation
-- Add `TaskKind::ImageGround` + `TaskKind::ImageOcr` to controller
-- `vision.setup` / `vision.status` IPC handlers in aiua
-- Florence-2 inference script (default embedded, agent-overridable)
-- `image.ocr` + `image.ground` tools wired in philote + admin catalog
+### Slice 4 — Vision Pipeline Foundation ✅ COMPLETE
+- `model-controller-vision` binary: `ScriptProvider` implementing `DatasourceProvider` (not `ModelProvider`), spawns Python subprocess for `image.ocr` / `image.ground`, built-in transformers/PIL stub with pytesseract fallback
+- Uses `run_datasource_controller` — replies via `datasource_response` action, picked up by philote `handle_datasource_response` → `handle_tool_result` (no parallel mechanism)
+- `vision.setup` upserts `ModelProfileRecord` (model_ref="vision", provider="script", task_kinds=["image.ocr","image.ground"], trust_tier="local_experimental") so health-aware routing reflex from Slice 3 applies
+- `vision.setup` / `vision.status` IPC handlers in aiua; dispatch arms in IPC loop; `IpcRequest::VisionSetup` + `VisionStatus` in philotic-client
+- `vision.setup` / `vision.status` added to BOTH `is_local_agent_tool` functions (ipc.rs + session/mod.rs)
+- `is_vision_datasource_tool` + `vision_datasource` execution mode → target_role `model-controller-vision` in session/mod.rs
+- `execute_local_agent_tool` handlers for vision.setup / vision.status in philote/runtime.rs
+- `vision.setup`, `vision.status`, `image.ocr`, `image.ground` AbstractToolRecord definitions in aiua/main.rs
+- Bug fix: `DatasourceTask::from_value` now falls back to `arguments` sub-object for `query`/`db`/`graph_id`/`parameters` — fixes table.query, table.insert, and all datasource tool dispatch from ToolExecutionPayload
 - Seam: `vision-model-provisioning`
 
 ### Slice 5 — Image Pipeline (Telegram)
