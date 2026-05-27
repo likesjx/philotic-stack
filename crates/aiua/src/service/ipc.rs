@@ -4295,6 +4295,18 @@ impl IpcServer {
                         });
                         let _ = outbound_tx.send(resp);
                     }
+                    Ok(IpcRequest::CapabilityInvoke { request }) => {
+                        // Slice 7: hotel streaming router not yet implemented.
+                        // Returns NOT_IMPLEMENTED so callers can fall back to legacy paths.
+                        let _ = outbound_tx.send(IpcResponse::error(
+                            "capability_invoke",
+                            "NOT_IMPLEMENTED",
+                            &format!(
+                                "capability routing for '{}' not yet implemented (Slice 7)",
+                                request.task
+                            ),
+                        ));
+                    }
                     Ok(IpcRequest::VisionStatus {}) => {
                         let graph_clone = Arc::clone(&graph);
                         let local_node_id_clone = local_node_id.clone();
@@ -9449,6 +9461,11 @@ impl IpcServer {
                 "vision",
                 "UNREACHABLE",
                 "Vision request intercepted before process_request",
+            ),
+            IpcRequest::CapabilityInvoke { .. } => IpcResponse::error(
+                "capability_invoke",
+                "UNREACHABLE",
+                "CapabilityInvoke intercepted before process_request",
             ),
             IpcRequest::GetPerimeterStatus | IpcRequest::RefreshPerimeter => IpcResponse::error(
                 "perimeter",

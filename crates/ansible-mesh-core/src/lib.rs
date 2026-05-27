@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
 pub mod adapter;
+pub mod capability;
 pub mod agent;
 pub mod agent_graph_storage;
 pub mod authz;

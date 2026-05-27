@@ -1521,6 +1521,13 @@ pub enum IpcRequest {
     /// Return the current status of the vision provider (guest active, backend type).
     /// Responds with [`IpcResponse::Standard`] (data.status).
     VisionStatus {},
+    /// Invoke a capability using the normalized input envelope.
+    /// Routes to the healthiest model-controller that declares the task_kind.
+    /// Responds with a stream of [`CapabilityEvent`] frames terminated by Done or Error.
+    /// (Slice 7: hotel streaming router — currently returns NOT_IMPLEMENTED)
+    CapabilityInvoke {
+        request: ansible_mesh_core::capability::CapabilityRequest,
+    },
     /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
     /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
     GracefulShutdown {
