@@ -11071,28 +11071,14 @@ impl AgentRuntime {
 
             "vision.setup" => {
                 use philotic_client::IpcRequest;
-                let python_path = payload
+                let repo_id = payload
                     .arguments
-                    .get("python_path")
+                    .get("repo_id")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let script_path = payload
-                    .arguments
-                    .get("script_path")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let auto_install = payload
-                    .arguments
-                    .get("auto_install")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
                 let (content, tool_err) = match self
                     .ipc_client
-                    .send_request(IpcRequest::VisionSetup {
-                        python_path,
-                        script_path,
-                        auto_install,
-                    })
+                    .send_request(IpcRequest::VisionSetup { repo_id })
                     .await
                 {
                     Ok(IpcResponse::Standard {

@@ -1514,17 +1514,11 @@ pub enum IpcRequest {
     /// ModelProfileRecord so health-aware routing picks it up.
     /// Responds with [`IpcResponse::Standard`] (data.message).
     VisionSetup {
-        /// Python interpreter path (default: "python3").
+        /// Florence-2 ONNX repo ID (default: "onnx-community/Florence-2-base-ft").
         #[serde(default)]
-        python_path: Option<String>,
-        /// Path to a custom inference script (default: built-in stub).
-        #[serde(default)]
-        script_path: Option<String>,
-        /// If true, attempt `pip install transformers Pillow` when the import check fails.
-        #[serde(default = "default_true")]
-        auto_install: bool,
+        repo_id: Option<String>,
     },
-    /// Return the current status of the vision provider (guest active, libs available).
+    /// Return the current status of the vision provider (guest active, backend type).
     /// Responds with [`IpcResponse::Standard`] (data.status).
     VisionStatus {},
     /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;

@@ -196,6 +196,69 @@ impl Default for ModelCache {
     }
 }
 
+// ── Vision (Florence-2) ───────────────────────────────────────────────────────
+
+/// Resolved local paths for a Florence-2 ONNX vision model downloaded from HF Hub.
+#[derive(Debug, Clone)]
+pub struct VisionHandle {
+    /// Local path to the merged encoder ONNX file (vision + text encoder).
+    pub encoder_path: PathBuf,
+    /// Local path to the decoder ONNX file (no past KV cache).
+    pub decoder_path: PathBuf,
+    /// Local path to `tokenizer.json`.
+    pub tokenizer_path: PathBuf,
+    /// Provenance token: `"{repo}@{sha8}"`.
+    pub model_gen: String,
+}
+
+impl ModelCache {
+    /// Download (or serve from cache) the Florence-2 encoder + decoder for `repo_id`.
+    ///
+    /// Expects the repo to follow the `onnx-community/Florence-2-*` layout:
+    /// - `onnx/encoder_model.onnx` (or `_fp16`)
+    /// - `onnx/decoder_model.onnx`
+    /// - `tokenizer.json`
+    pub fn pull_vision(&self, repo_id: &str) -> Result<VisionHandle> {
+        let repo = self.api.model(repo_id.to_string());
+
+        let encoder_path = repo
+            .get("onnx/encoder_model.onnx")
+            .with_context(|| format!("could not download Florence-2 encoder from {}", repo_id))?;
+
+        let decoder_path = repo
+            .get("onnx/decoder_model.onnx")
+            .with_context(|| format!("could not download Florence-2 decoder from {}", repo_id))?;
+
+        let tokenizer_path = repo
+            .get("tokenizer.json")
+            .with_context(|| format!("could not download tokenizer.json from {}", repo_id))?;
+
+        let sha8 = encoder_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "unknown".into());
+
+        let model_gen = format!("{}@{}", repo_id, sha8);
+
+        tracing::info!(
+            repo_id,
+            model_gen,
+            ?encoder_path,
+            ?decoder_path,
+            "Florence-2 model resolved from hub cache"
+        );
+
+        Ok(VisionHandle {
+            encoder_path,
+            decoder_path,
+            tokenizer_path,
+            model_gen,
+        })
+    }
+}
+
 // ── Kokoro ────────────────────────────────────────────────────────────────────
 
 /// Resolved local paths for a Kokoro ONNX TTS model downloaded from HF Hub.

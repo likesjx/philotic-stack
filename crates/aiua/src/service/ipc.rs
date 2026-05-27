@@ -4277,11 +4277,7 @@ impl IpcServer {
                         });
                         let _ = outbound_tx.send(resp);
                     }
-                    Ok(IpcRequest::VisionSetup {
-                        python_path,
-                        script_path,
-                        auto_install,
-                    }) => {
+                    Ok(IpcRequest::VisionSetup { repo_id }) => {
                         let graph_clone = Arc::clone(&graph);
                         let local_node_id_clone = local_node_id.clone();
                         let socket_path_clone = socket_path.clone();
@@ -4290,9 +4286,7 @@ impl IpcServer {
                                 &graph_clone,
                                 &local_node_id_clone,
                                 &socket_path_clone,
-                                python_path.as_deref().unwrap_or("python3"),
-                                script_path.as_deref(),
-                                auto_install,
+                                repo_id.as_deref(),
                             )
                         })
                         .await
@@ -13729,52 +13723,12 @@ impl IpcServer {
         graph: &GraphDomain,
         local_node_id: &str,
         socket_path: &str,
-        python_path: &str,
-        script_path: Option<&str>,
-        auto_install: bool,
+        repo_id: Option<&str>,
     ) -> IpcResponse {
-        use std::process::Command;
+        let repo_id =
+            repo_id.unwrap_or("onnx-community/Florence-2-base-ft");
 
-        // Step 1: check transformers + PIL import.
-        let check_ok = Command::new(python_path)
-            .args(["-c", "import transformers; from PIL import Image"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        let libs_available = if !check_ok && auto_install {
-            info!("vision.setup: import check failed; attempting pip install transformers Pillow");
-            let install = Command::new(python_path)
-                .args(["-m", "pip", "install", "transformers", "Pillow"])
-                .output();
-            match install {
-                Ok(o) if o.status.success() => Command::new(python_path)
-                    .args(["-c", "import transformers; from PIL import Image"])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false),
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                    warn!("vision.setup: pip install failed: {stderr}");
-                    false
-                }
-                Err(e) => {
-                    warn!("vision.setup: pip install error: {e}");
-                    false
-                }
-            }
-        } else {
-            check_ok
-        };
-
-        if !libs_available {
-            let hint = format!(
-                "transformers/PIL import failed. Install manually: `{python_path} -m pip install transformers Pillow`"
-            );
-            return IpcResponse::error("vision_setup", "LIBS_UNAVAILABLE", &hint);
-        }
-
-        // Step 2: resolve hotel name.
+        // Step 1: resolve hotel name.
         let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
             return IpcResponse::error(
                 "vision_setup",
@@ -13784,11 +13738,8 @@ impl IpcServer {
         };
         let guest_id = format!("{hotel_name}:{}", Self::VISION_GUEST_ID_SUFFIX);
 
-        // Step 3: write component config.
-        let config = serde_json::json!({
-            "python_path": python_path,
-            "script_path": script_path,
-        });
+        // Step 2: write component config (repo_id for the ONNX backend).
+        let config = serde_json::json!({ "repo_id": repo_id });
         let config_json = match serde_json::to_string(&config) {
             Ok(j) => j,
             Err(e) => {
@@ -13800,11 +13751,11 @@ impl IpcServer {
             return IpcResponse::error("vision_setup", "CONFIG_WRITE_ERROR", &e.to_string());
         }
 
-        // Step 4: upsert ModelProfileRecord so health-aware routing picks this provider up.
+        // Step 3: upsert ModelProfileRecord so health-aware routing picks this provider up.
         let profile = ModelProfileRecord {
             model_ref: "vision".to_string(),
             node_id: local_node_id.to_string(),
-            provider: "script".to_string(),
+            provider: "onnx".to_string(),
             task_kinds: vec!["image.ocr".to_string(), "image.ground".to_string()],
             trust_tier: "local_experimental".to_string(),
             max_context_tokens: 0,
@@ -13822,7 +13773,7 @@ impl IpcServer {
             );
         }
 
-        // Step 5: upsert guest record so the reconcile loop spawns model-controller-vision.
+        // Step 4: upsert guest record so the reconcile loop spawns model-controller-vision.
         let guest_record = GuestRecord {
             hotel_name: hotel_name.clone(),
             guest_id: guest_id.clone(),
@@ -13833,6 +13784,7 @@ impl IpcServer {
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path,
                     "PHILOTIC_VISION_GUEST_ID": guest_id,
+                    "PHILOTIC_VISION_REPO_ID": repo_id,
                 }
             })
             .to_string(),
@@ -13847,25 +13799,24 @@ impl IpcServer {
         info!(
             hotel = %hotel_name,
             guest_id = %guest_id,
-            "vision.setup: guest registered; will be spawned within 5s"
+            repo_id,
+            "vision.setup: ONNX guest registered; will be spawned within 5s"
         );
 
         IpcResponse::success(
             "vision_setup",
             Some(serde_json::json!({
                 "message": format!(
-                    "Vision provider configured. Guest '{guest_id}' registered — will start within 5 seconds."
+                    "Vision provider configured (ONNX/Florence-2). Guest '{guest_id}' registered — will start within 5 seconds."
                 ),
                 "guest_id": guest_id,
-                "python_path": python_path,
-                "libs_available": true,
+                "repo_id": repo_id,
+                "backend": "onnx",
             })),
         )
     }
 
     fn handle_vision_status(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
-        use std::process::Command;
-
         let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
             return IpcResponse::error(
                 "vision_status",
@@ -13876,24 +13827,18 @@ impl IpcServer {
         let guest_id = format!("{hotel_name}:{}", Self::VISION_GUEST_ID_SUFFIX);
 
         let component_key = format!("component:{guest_id}");
-        let python_path = graph
+        let repo_id = graph
             .get_config_value(&component_key)
             .ok()
             .flatten()
             .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .and_then(|v| v.get("python_path").and_then(|p| p.as_str()).map(String::from))
-            .unwrap_or_else(|| "python3".to_string());
+            .and_then(|v| v.get("repo_id").and_then(|r| r.as_str()).map(String::from))
+            .unwrap_or_else(|| "onnx-community/Florence-2-base-ft".to_string());
 
         let guest = graph.get_guest(&hotel_name, &guest_id).ok().flatten();
         let guest_registered = guest.is_some();
         let guest_active = guest.as_ref().map(|g| g.is_active).unwrap_or(false);
         let guest_pid = guest.as_ref().and_then(|g| g.active_pid.clone());
-
-        let libs_available = Command::new(&python_path)
-            .args(["-c", "import transformers; from PIL import Image"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
 
         let model_profile = graph
             .get_model_profile("vision", local_node_id)
@@ -13907,8 +13852,8 @@ impl IpcServer {
                 "registered": guest_registered,
                 "active": guest_active,
                 "pid": guest_pid,
-                "libs_available": libs_available,
-                "python_path": python_path,
+                "backend": "onnx",
+                "repo_id": repo_id,
                 "model_profile_status": model_profile.as_ref().map(|p| &p.status),
             })),
         )

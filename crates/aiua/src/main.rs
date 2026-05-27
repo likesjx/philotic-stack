@@ -3284,26 +3284,18 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         // ── Vision provider tools ─────────────────────────────────────────────
         AbstractToolRecord {
             tool_name: "vision.setup".into(),
-            description: "Set up the vision inference provider on this node: verifies Python + \
-                          transformers/PIL, optionally installs them via pip, writes the component \
+            description: "Set up the local ONNX vision provider (Florence-2): writes the component \
                           config, upserts a ModelProfileRecord so health-aware routing picks it up, \
                           and registers the model-controller-vision guest for automatic materialization. \
-                          python_path defaults to 'python3'; auto_install defaults to true."
+                          The model is downloaded from HuggingFace Hub on first start. \
+                          repo_id defaults to 'onnx-community/Florence-2-base-ft'."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "python_path": {
+                    "repo_id": {
                         "type": "string",
-                        "description": "Python interpreter path (must have or will get transformers + Pillow)."
-                    },
-                    "script_path": {
-                        "type": "string",
-                        "description": "Path to a custom inference script (optional; uses built-in stub if omitted)."
-                    },
-                    "auto_install": {
-                        "type": "boolean",
-                        "description": "Attempt pip install if imports fail (default: true)."
+                        "description": "HuggingFace repo ID for the Florence-2 ONNX model (optional)."
                     }
                 }
             }),
@@ -3312,9 +3304,9 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         },
         AbstractToolRecord {
             tool_name: "vision.status".into(),
-            description: "Return the current status of the vision provider: whether the guest is \
-                          registered and active, its PID if running, whether transformers/PIL are \
-                          importable, and the ModelProfileRecord health status."
+            description: "Return the current status of the ONNX vision provider: whether the guest is \
+                          registered and active, its PID if running, the configured model repo, \
+                          and the ModelProfileRecord health status."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
