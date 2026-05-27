@@ -866,6 +866,12 @@ pub(crate) type ParkedInboundRegistry = Arc<Mutex<HashMap<String, Vec<ParkedInbo
 /// Special sink role: capabilities reply here when dispatched by the Golgi pipeline.
 const GOLGI_SINK_ROLE: &str = "hotel:golgi";
 
+/// Special sink role: CapabilityInvoke responses route here for synchronous round-trip.
+const CAPABILITY_ROUTER_ROLE: &str = "hotel:capability-router";
+
+/// Pending synchronous capability calls keyed by turn_id (== dispatch task_id).
+pub(crate) type PendingCapabilityRegistry = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>>;
+
 /// A task intercepted by the Golgi routing pipeline, awaiting capability-stage completion.
 /// Keyed by `"session_id:turn_id"` in [`PendingPipelineRegistry`].
 struct PendingPipeline {
@@ -908,6 +914,7 @@ pub struct IpcServer {
     inboxes: InboxRegistry,
     parked_inbound: ParkedInboundRegistry,
     pending_pipelines: PendingPipelineRegistry,
+    pending_capability_calls: PendingCapabilityRegistry,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -3819,6 +3826,7 @@ impl IpcServer {
             inboxes: Arc::new(Mutex::new(HashMap::new())),
             parked_inbound: Arc::new(Mutex::new(HashMap::new())),
             pending_pipelines: Arc::new(Mutex::new(HashMap::new())),
+            pending_capability_calls: Arc::new(Mutex::new(HashMap::new())),
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             desktop_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
@@ -3961,6 +3969,7 @@ impl IpcServer {
                     let inboxes = self.inboxes.clone();
                     let parked_inbound = self.parked_inbound.clone();
                     let pending_pipelines = self.pending_pipelines.clone();
+                    let pending_capability_calls = self.pending_capability_calls.clone();
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
                     let desktop_membrane_leases = self.desktop_membrane_leases.clone();
@@ -3988,6 +3997,7 @@ impl IpcServer {
                             inboxes,
                             parked_inbound,
                             pending_pipelines,
+                            pending_capability_calls,
                             materialization_requester,
                             telegram_poll_leases,
                             desktop_membrane_leases,
@@ -4033,6 +4043,7 @@ impl IpcServer {
         inboxes: InboxRegistry,
         parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         pending_pipelines: PendingPipelineRegistry,
+        pending_capability_calls: PendingCapabilityRegistry,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -4296,16 +4307,15 @@ impl IpcServer {
                         let _ = outbound_tx.send(resp);
                     }
                     Ok(IpcRequest::CapabilityInvoke { request }) => {
-                        // Slice 7: hotel streaming router not yet implemented.
-                        // Returns NOT_IMPLEMENTED so callers can fall back to legacy paths.
-                        let _ = outbound_tx.send(IpcResponse::error(
-                            "capability_invoke",
-                            "NOT_IMPLEMENTED",
-                            &format!(
-                                "capability routing for '{}' not yet implemented (Slice 7)",
-                                request.task
-                            ),
-                        ));
+                        let resp = Self::dispatch_capability_invoke(
+                            graph.as_ref(),
+                            &inboxes,
+                            &pending_capability_calls,
+                            &local_node_id,
+                            request,
+                        )
+                        .await;
+                        let _ = outbound_tx.send(resp);
                     }
                     Ok(IpcRequest::VisionStatus {}) => {
                         let graph_clone = Arc::clone(&graph);
@@ -4329,6 +4339,7 @@ impl IpcServer {
                             &inboxes,
                             &parked_inbound,
                             &pending_pipelines,
+                            &pending_capability_calls,
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
                             &desktop_membrane_leases,
@@ -4931,6 +4942,161 @@ impl IpcServer {
         }
 
         None
+    }
+
+    /// Routes a `CapabilityInvoke` request to the appropriate model-controller guest.
+    ///
+    /// Finds the best local provider for the task kind, dispatches the request as a
+    /// datasource `InboundTask`, awaits the synchronous reply via `pending_capability_calls`,
+    /// and returns the result as an `IpcResponse`.
+    async fn dispatch_capability_invoke(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        pending_capability_calls: &PendingCapabilityRegistry,
+        local_node_id: &str,
+        request: ansible_mesh_core::capability::CapabilityRequest,
+    ) -> IpcResponse {
+        use ansible_mesh_core::capability::CapabilityInput;
+
+        // Find a healthy local provider for this task kind.
+        let profiles = match graph.best_model_for(&request.task, local_node_id) {
+            Ok(p) => p,
+            Err(e) => {
+                return IpcResponse::error(
+                    "capability_invoke",
+                    "INTERNAL_ERROR",
+                    &format!("model profile lookup failed: {e}"),
+                );
+            }
+        };
+
+        let profile = match profiles.into_iter().find(|p| p.status == "healthy") {
+            Some(p) => p,
+            None => {
+                return IpcResponse::error(
+                    "capability_invoke",
+                    "NO_PROVIDER",
+                    &format!("no healthy local provider for task '{}'", request.task),
+                );
+            }
+        };
+
+        let target_role = format!("model-controller-{}", profile.model_ref);
+
+        // Build datasource-compatible parameters from CapabilityInputs.
+        let mut params = serde_json::Map::new();
+        for input in &request.inputs {
+            match input {
+                CapabilityInput::Image { url, base64, mime_type } => {
+                    if let Some(u) = url {
+                        params.insert("image_url".into(), serde_json::Value::String(u.clone()));
+                    }
+                    if let Some(b) = base64 {
+                        params.insert("image_base64".into(), serde_json::Value::String(b.clone()));
+                    }
+                    if let Some(m) = mime_type {
+                        params.insert("mime_type".into(), serde_json::Value::String(m.clone()));
+                    }
+                }
+                CapabilityInput::Text { content } => {
+                    params.insert("query".into(), serde_json::Value::String(content.clone()));
+                }
+                CapabilityInput::Audio { url, base64, mime_type } => {
+                    if let Some(u) = url {
+                        params.insert("audio_url".into(), serde_json::Value::String(u.clone()));
+                    }
+                    if let Some(b) = base64 {
+                        params.insert("audio_base64".into(), serde_json::Value::String(b.clone()));
+                    }
+                    if let Some(m) = mime_type {
+                        params.insert("audio_mime_type".into(), serde_json::Value::String(m.clone()));
+                    }
+                }
+                CapabilityInput::Document { url, content, mime_type } => {
+                    if let Some(u) = url {
+                        params.insert("document_url".into(), serde_json::Value::String(u.clone()));
+                    }
+                    if let Some(c) = content {
+                        params.insert("document_content".into(), serde_json::Value::String(c.clone()));
+                    }
+                    if let Some(m) = mime_type {
+                        params.insert("document_mime_type".into(), serde_json::Value::String(m.clone()));
+                    }
+                }
+            }
+        }
+
+        let task_id = Uuid::new_v4();
+        let session_id = request
+            .context
+            .conversation_id
+            .clone()
+            .unwrap_or_else(|| task_id.to_string());
+
+        let task_json = serde_json::json!({
+            "kind": request.task,
+            "parameters": serde_json::Value::Object(params),
+            "reply_to": local_node_id,
+            "reply_role": CAPABILITY_ROUTER_ROLE,
+            "session_id": session_id,
+            "turn_id": task_id.to_string(),
+            "chat_id": "",
+        })
+        .to_string();
+
+        // Register oneshot channel before dispatching so there's no race.
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
+        {
+            let mut guard = pending_capability_calls.lock().await;
+            guard.insert(task_id.to_string(), tx);
+        }
+
+        // Deliver InboundTask to the model-controller's inbox subscriber.
+        Self::deliver_inbound_task(
+            inboxes,
+            local_node_id,
+            &target_role,
+            None,
+            task_id,
+            task_json,
+        )
+        .await;
+
+        // Await the synchronous reply (60s timeout — covers ONNX inference).
+        match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+            Ok(Ok(Ok(result))) => IpcResponse::Standard {
+                ok: true,
+                code: "OK".into(),
+                message: format!("capability '{}' completed", request.task),
+                corr_id: task_id.to_string(),
+                data: Some(result),
+            },
+            Ok(Ok(Err(err))) => IpcResponse::error(
+                "capability_invoke",
+                "PROVIDER_ERROR",
+                &format!("capability '{}' failed: {}", request.task, err),
+            ),
+            Ok(Err(_)) => {
+                // Sender dropped without sending — model-controller disconnected.
+                let mut guard = pending_capability_calls.lock().await;
+                guard.remove(&task_id.to_string());
+                IpcResponse::error(
+                    "capability_invoke",
+                    "PROVIDER_DISCONNECTED",
+                    &format!("model-controller for '{}' disconnected mid-flight", request.task),
+                )
+            }
+            Err(_) => {
+                // Timeout: clean up the pending entry.
+                let mut guard = pending_capability_calls.lock().await;
+                guard.remove(&task_id.to_string());
+                IpcResponse::error(
+                    "capability_invoke",
+                    "TIMEOUT",
+                    &format!("capability '{}' timed out after 60s", request.task),
+                )
+            }
+        }
     }
 
     /// Handles a capability result arriving at `GOLGI_SINK_ROLE`.
@@ -6101,6 +6267,7 @@ impl IpcServer {
         inboxes: &InboxRegistry,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         pending_pipelines: &PendingPipelineRegistry,
+        pending_capability_calls: &PendingCapabilityRegistry,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -7761,6 +7928,36 @@ impl IpcServer {
                             data: None,
                         };
                     }
+                }
+                // Short-circuit synchronous CapabilityInvoke responses.
+                if target_role == CAPABILITY_ROUTER_ROLE {
+                    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) {
+                        let turn_id = payload
+                            .get("turn_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let sender = {
+                            let mut guard = pending_capability_calls.lock().await;
+                            guard.remove(&turn_id)
+                        };
+                        if let Some(tx) = sender {
+                            let result = if let Some(err) = payload.get("error") {
+                                Err(err
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("capability failed")
+                                    .to_string())
+                            } else {
+                                Ok(payload
+                                    .get("result")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null))
+                            };
+                            let _ = tx.send(result);
+                        }
+                    }
+                    return IpcResponse::success("capability_router", None);
                 }
                 // Short-circuit Golgi capability responses — skip agent-context enrichment.
                 if target_role == GOLGI_SINK_ROLE {
