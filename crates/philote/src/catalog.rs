@@ -66,6 +66,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "graph.drop",
             "graph.grant_access",
         ],
+        "imessage-monitor" => &["bash.exec"],
         _ => &[],
     }
 }
