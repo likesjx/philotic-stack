@@ -2177,5 +2177,28 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         },
     );
 
+    m.insert(
+        "agent.migrate_to".into(),
+        ToolDefinition {
+            tool_name: "agent.migrate_to".into(),
+            description: "Migrate this agent to a different hotel. All context, memory, \
+                          role incarnations, vault secrets (Telegram tokens, etc.), and \
+                          guest processes travel to the destination. The source hotel \
+                          remains active as a fallback. Requires operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "dest_hotel": {
+                        "type": "string",
+                        "description": "Name of the destination hotel (e.g. 'vps-jane')."
+                    }
+                },
+                "required": ["dest_hotel"]
+            }),
+            class: Some("admin".into()),
+        },
+    );
+
     m
 }

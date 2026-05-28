@@ -3762,8 +3762,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                 "datasource"
             } else if is_table_datasource_tool(tool_name) {
                 "table_datasource"
-            } else if is_vision_datasource_tool(tool_name) {
-                "vision_datasource"
+            } else if is_capability_primitive(tool_name) {
+                "capability_invoke"
             } else if is_pinned_tool(tool_name) {
                 "pinned"
             } else {
@@ -3781,8 +3781,9 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         "graph-datasource".into()
                     } else if execution_mode == "table_datasource" {
                         "table-datasource".into()
-                    } else if execution_mode == "vision_datasource" {
-                        "model-controller-vision".into()
+                    } else if execution_mode == "capability_invoke" {
+                        // Hotel routes CapabilityInvoke to the best provider — target_role is unused.
+                        String::new()
                     } else {
                         format!("tool.{tool_name}")
                     },
@@ -3812,8 +3813,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         "graph_datasource_route".into()
                     } else if execution_mode == "table_datasource" {
                         "table_datasource_route".into()
-                    } else if execution_mode == "vision_datasource" {
-                        "vision_datasource_route".into()
+                    } else if execution_mode == "capability_invoke" {
+                        "capability_invoke_route".into()
                     } else if execution_mode == "pinned" {
                         "default_pinned_route".into()
                     } else {
@@ -3958,8 +3959,14 @@ fn is_table_datasource_tool(tool_name: &str) -> bool {
     )
 }
 
-fn is_vision_datasource_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "image.ocr" | "image.ground")
+/// Returns true for any tool name that maps to a normalized capability primitive
+/// (`{modality}.{operation}`). These are dispatched via `IpcRequest::CapabilityInvoke`
+/// so the hotel can route to the best available model-controller.
+fn is_capability_primitive(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "image.ocr" | "image.ground" | "image.describe" | "audio.transcribe"
+    )
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {

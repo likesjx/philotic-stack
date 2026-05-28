@@ -4,7 +4,7 @@ use crate::service::lease::{
     LeaseAcquireOutcome, LeaseObserver, LeaseObserverEvent, LeaseObserverEventKind, LeaseProvider,
     LeaseRenewOutcome, RuntimeLeaseRegistry,
 };
-use crate::vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
+use crate::vault::{SecretAccess, SecretInput, export_secret_plaintext, resolve_secret, store_secret};
 use ansible_mesh_core::agent_graph_storage::{
     AgentGraphSnapshot, AgentGraphStorage, SqliteAgentGraphStorage,
 };
@@ -37,20 +37,21 @@ use ansible_mesh_core::{NodeCapabilities, NodeConstraints};
 use anyhow::{Context, bail};
 use ed25519_dalek::SigningKey;
 use philotic_client::{
-    ComponentInventoryEntryView, DesktopMembraneAgentView, DesktopMembraneGuestView,
-    DesktopMembraneStatusView, DesktopMembraneTargetGuestInventoryView,
+    AgentMigrationBundle, ComponentInventoryEntryView, ConfigEntryExport, DesktopMembraneAgentView,
+    DesktopMembraneGuestView, DesktopMembraneStatusView, DesktopMembraneTargetGuestInventoryView,
     DesktopMembraneTargetReachabilityView, DesktopMembraneTargetStatusView,
-    DesktopMembraneTargetView, GuestIdentity, HookRoute, HookSubscription, IpcRequest, IpcResponse,
-    LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
-    OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
-    OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
-    OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
+    DesktopMembraneTargetView, GuestExport, GuestIdentity, HookRoute, HookSubscription,
+    IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE,
+    OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
+    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
+    OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView, OperatorChatTurnReply,
+    OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
     OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
     OperatorTargetSecretEntryView, OperatorTargetSecretInventoryView,
     OperatorTargetSecretMutationAckView, OperatorTargetStatusView, PhiloticClient,
-    ResponseRoutePolicyView, SubagentDelegation,
+    ResponseRoutePolicyView, SubagentDelegation, VaultEntryExport,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -4334,6 +4335,7 @@ impl IpcServer {
                         let response = Self::process_request(
                             req,
                             &local_node_id,
+                            &socket_path,
                             &dispatcher_tx,
                             graph.as_ref(),
                             &inboxes,
@@ -6262,6 +6264,7 @@ impl IpcServer {
     async fn process_request(
         req: IpcRequest,
         local_node_id: &str,
+        socket_path: &str,
         dispatcher_tx: &mpsc::Sender<LedgerCommand>,
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
@@ -11528,6 +11531,44 @@ impl IpcServer {
                     None => IpcResponse::error("resolve_heal_entry", "UNAVAILABLE", "heal_queue not configured".to_string()),
                 }
             }
+
+            IpcRequest::AgentMigrateToHotel { agent_id, dest_hotel } => {
+                match Self::handle_agent_migrate_to_hotel(
+                    &registry,
+                    graph,
+                    local_node_id,
+                    socket_path,
+                    &agent_id,
+                    &dest_hotel,
+                )
+                .await
+                {
+                    Ok(()) => IpcResponse::success("agent_migrate_to_hotel", None),
+                    Err(e) => IpcResponse::error(
+                        "agent_migrate_to_hotel",
+                        "MIGRATION_ERROR",
+                        format!("{e:#}"),
+                    ),
+                }
+            }
+
+            IpcRequest::ApplyAgentBundle { bundle_json } => {
+                match Self::handle_apply_agent_bundle(
+                    graph,
+                    &local_node_id,
+                    materialization_requester.as_deref(),
+                    &bundle_json,
+                )
+                .await
+                {
+                    Ok(_agent_id) => IpcResponse::success("apply_agent_bundle", None),
+                    Err(e) => IpcResponse::error(
+                        "apply_agent_bundle",
+                        "APPLY_ERROR",
+                        format!("{e:#}"),
+                    ),
+                }
+            }
         }
     }
 
@@ -11589,6 +11630,445 @@ impl IpcServer {
             trace: vec!["ipc:cron-sync-remove".into()],
         };
         let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
+    }
+
+    // ── Agent migration ───────────────────────────────────────────────────────
+
+    /// Build an `AgentMigrationBundle`, upload it to the local blob store, then
+    /// dispatch it to `dest_hotel` via the OperatorSurface cross-hotel relay.
+    async fn handle_agent_migrate_to_hotel(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        socket_path: &str,
+        agent_id: &str,
+        dest_hotel: &str,
+    ) -> anyhow::Result<()> {
+        let hotel_name = Self::local_hotel_name(graph, local_node_id)
+            .ok_or_else(|| anyhow::anyhow!("local hotel record missing"))?;
+
+        // ── 1. Agent identity ────────────────────────────────────────────────
+        let identity = graph
+            .get_agent_identity(agent_id)?
+            .ok_or_else(|| anyhow::anyhow!("agent_identity for '{}' not found", agent_id))?;
+
+        // ── 2. Derive agent_key from role incarnation guest_id pattern ───────
+        // Guest IDs follow: `{hotel_name}:philote-{agent_key}`
+        let philote_prefix = format!("{hotel_name}:philote-");
+        let agent_key = graph
+            .list_role_incarnations(agent_id)?
+            .iter()
+            .find_map(|r| r.guest_id.strip_prefix(&philote_prefix).map(str::to_string))
+            .or_else(|| {
+                // Fallback: search all guests
+                graph
+                    .list_guests(&hotel_name, false)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find_map(|g| g.guest_id.strip_prefix(&philote_prefix).map(str::to_string))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot derive agent_key for '{}': no philote guest found on hotel '{}'",
+                    agent_id, hotel_name
+                )
+            })?;
+
+        // ── 3. Apartments ────────────────────────────────────────────────────
+        let apartments: Vec<(String, serde_json::Value)> = graph
+            .list_apartments(agent_id)?
+            .into_iter()
+            .filter_map(|memory_type| {
+                graph
+                    .get_apartment(agent_id, &memory_type)
+                    .ok()
+                    .flatten()
+                    .map(|content| (memory_type, content))
+            })
+            .collect();
+
+        // ── 4. Role incarnations ─────────────────────────────────────────────
+        let role_incarnations = graph.list_role_incarnations(agent_id)?;
+
+        // ── 5. Agent-specific guests ─────────────────────────────────────────
+        let philote_guest_id = format!("{hotel_name}:philote-{agent_key}");
+        let datasource_guest_id = format!("{hotel_name}:agent-graph-{agent_id}");
+        let guests: Vec<GuestExport> = graph
+            .list_guests(&hotel_name, false)?
+            .into_iter()
+            .filter(|g| g.guest_id == philote_guest_id || g.guest_id == datasource_guest_id)
+            .map(|g| {
+                let suffix = g
+                    .guest_id
+                    .strip_prefix(&format!("{hotel_name}:"))
+                    .unwrap_or(&g.guest_id)
+                    .to_string();
+                GuestExport {
+                    guest_id_suffix: suffix,
+                    role: g.role,
+                    config_json: g.config_json,
+                    is_active: g.is_active,
+                }
+            })
+            .collect();
+
+        // ── 6. Vault entries (agent-specific telegram token) ─────────────────
+        let vault_registry: Vec<serde_json::Value> = graph
+            .get_config_value("vault_registry")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let token_config_key = format!("telegram_bot_token_{agent_key}");
+        let mut vault_entries: Vec<VaultEntryExport> = Vec::new();
+        if let Ok(Some(secret_ref_raw)) = graph.get_config_value(&token_config_key) {
+            // Config value may be a quoted JSON string or a bare string
+            let secret_ref = serde_json::from_str::<String>(&secret_ref_raw)
+                .unwrap_or(secret_ref_raw.clone());
+            if let Ok(Some(plaintext)) = export_secret_plaintext(graph, &secret_ref) {
+                let vault_name = vault_registry
+                    .iter()
+                    .find_map(|e| {
+                        if e.get("secret_ref").and_then(|v| v.as_str()) == Some(&secret_ref) {
+                            e.get("vault_name").and_then(|v| v.as_str()).map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "default".to_string());
+                vault_entries.push(VaultEntryExport {
+                    config_key: token_config_key,
+                    vault_name,
+                    plaintext,
+                    allowed_roles: Vec::new(),
+                });
+            }
+        }
+
+        // ── 7. Non-vault agent config entries ────────────────────────────────
+        let allowed_users_key = format!("telegram_allowed_users_{agent_key}");
+        let mut config_entries: Vec<ConfigEntryExport> = Vec::new();
+        if let Ok(Some(value_json)) = graph.get_config_value(&allowed_users_key) {
+            config_entries.push(ConfigEntryExport {
+                key: allowed_users_key,
+                value_json,
+            });
+        }
+
+        // ── 8. Build bundle ──────────────────────────────────────────────────
+        let migration_id = Uuid::new_v4().to_string();
+        let bundle = AgentMigrationBundle {
+            migration_id: migration_id.clone(),
+            source_hotel: hotel_name.clone(),
+            agent_id: agent_id.to_string(),
+            agent_key: agent_key.clone(),
+            agent_identity: identity,
+            apartments,
+            role_incarnations,
+            vault_entries,
+            config_entries,
+            guests,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+
+        // ── 9. Upload bundle to local blob store ─────────────────────────────
+        let hotel_record = graph
+            .get_hotel(&hotel_name)?
+            .ok_or_else(|| anyhow::anyhow!("hotel record for '{}' missing", hotel_name))?;
+        let blob_port = hotel_record.blob_port;
+        let blob_base = format!("http://127.0.0.1:{blob_port}");
+
+        let bundle_bytes = serde_json::to_vec(&bundle)?;
+        let part = reqwest::multipart::Part::bytes(bundle_bytes)
+            .file_name("migration_bundle.json")
+            .mime_str("application/json")?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let upload_resp = reqwest::Client::new()
+            .post(format!("{blob_base}/upload"))
+            .multipart(form)
+            .send()
+            .await
+            .context("blob store upload failed")?;
+        if !upload_resp.status().is_success() {
+            anyhow::bail!("blob store upload returned {}", upload_resp.status());
+        }
+        let upload_json: serde_json::Value = upload_resp.json().await?;
+        let blob_id = upload_json["blob_ids"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("blob upload response missing blob_id"))?
+            .to_string();
+
+        // Use the hotel's mesh_host for the externally-reachable URL
+        let source_mesh_host = hotel_record
+            .mesh_host
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .unwrap_or("127.0.0.1");
+        let blob_url = format!("http://{source_mesh_host}:{blob_port}/download/{blob_id}");
+
+        // ── 10. Get dest hotel node_id ───────────────────────────────────────
+        let dest_record = graph
+            .get_hotel(dest_hotel)?
+            .ok_or_else(|| anyhow::anyhow!("dest hotel '{}' not found in local graph", dest_hotel))?;
+        let dest_node_id = dest_record.capabilities.node_id;
+
+        // Verify the dest node is reachable in the registry
+        {
+            let guard = registry.read().await;
+            if guard.get_node(&dest_node_id).is_none() {
+                anyhow::bail!(
+                    "dest hotel '{}' (node {}) is not active in the mesh registry",
+                    dest_hotel, dest_node_id
+                );
+            }
+        }
+
+        // ── 11. Cross-hotel dispatch via OperatorSurfaceQueryHandoff ─────────
+        let reply_guest_id = format!("agent-migration-reply-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox { role: reply_role.into() })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("subscribe inbox failed: {other:?}"),
+        }
+
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "agent.deploy_bundle".into(),
+            request_id: migration_id.clone(),
+            source_hotel: hotel_name.clone(),
+            target_hotel: dest_hotel.to_string(),
+            target_node_id: dest_node_id.clone(),
+            caller_kind: "agent_migration".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: format!("migrate agent '{}' from '{}' to '{}'", agent_id, hotel_name, dest_hotel),
+            payload: serde_json::json!({ "blob_url": blob_url }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: dest_node_id,
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("EmitTask for deploy_bundle failed: {other:?}"),
+        }
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for deploy_bundle reply from '{}'", dest_hotel))??;
+
+        let IpcResponse::InboundTask { task_json: reply_json, .. } = reply else {
+            anyhow::bail!("unexpected deploy_bundle reply: {reply:?}");
+        };
+        let result: serde_json::Value = serde_json::from_str(&reply_json)?;
+        if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let msg = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("deploy_bundle on '{}' failed: {}", dest_hotel, msg);
+        }
+
+        info!(
+            migration_id = %migration_id,
+            agent_id = %agent_id,
+            dest_hotel = %dest_hotel,
+            "Agent migration dispatched successfully"
+        );
+        Ok(())
+    }
+
+    /// Apply a serialised `AgentMigrationBundle` to the local hotel.
+    ///
+    /// Writes all agent state (identity, apartments, role incarnations, vault
+    /// entries, config, guests) and materialises active guests.
+    async fn handle_apply_agent_bundle(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        bundle_json: &str,
+    ) -> anyhow::Result<String> {
+        let bundle: AgentMigrationBundle = serde_json::from_str(bundle_json)
+            .context("failed to deserialise AgentMigrationBundle")?;
+        let dest_hotel = Self::local_hotel_name(graph, local_node_id)
+            .ok_or_else(|| anyhow::anyhow!("local hotel record missing"))?;
+        let source_hotel = &bundle.source_hotel;
+
+        info!(
+            migration_id = %bundle.migration_id,
+            agent_id = %bundle.agent_id,
+            source_hotel = %source_hotel,
+            dest_hotel = %dest_hotel,
+            "Applying agent migration bundle"
+        );
+
+        // ── 1. Agent identity ────────────────────────────────────────────────
+        let mut identity = bundle.agent_identity.clone();
+        identity.authority_hotel = dest_hotel.clone();
+        graph
+            .upsert_agent_identity(&identity)
+            .context("upsert_agent_identity failed")?;
+
+        // ── 2. Apartments ────────────────────────────────────────────────────
+        for (memory_type, content) in &bundle.apartments {
+            graph
+                .sync_apartment(&bundle.agent_id, memory_type, content)
+                .with_context(|| format!("sync_apartment '{}' failed", memory_type))?;
+        }
+
+        // ── 3. Role incarnations (rewrite guest_id hotel prefix) ─────────────
+        let src_philote_prefix = format!("{source_hotel}:philote-");
+        let dst_philote_prefix = format!("{dest_hotel}:philote-");
+        for mut ri in bundle.role_incarnations.clone() {
+            // Rewrite the home guest_id to point at dest hotel
+            if ri.guest_id.starts_with(&src_philote_prefix) {
+                ri.guest_id = ri.guest_id.replacen(source_hotel, &dest_hotel, 1);
+            }
+            // Clear home_node if it was pinned to the source hotel
+            if ri.home_node.as_deref() == Some(source_hotel)
+                || ri.home_node.as_deref().map_or(false, |n| n.contains(source_hotel))
+            {
+                ri.home_node = None;
+            }
+            graph
+                .upsert_role_incarnation(&ri)
+                .context("upsert_role_incarnation failed")?;
+        }
+        drop(src_philote_prefix);
+        drop(dst_philote_prefix);
+
+        // ── 4. Vault entries (re-encrypt with local vault key) ───────────────
+        for ve in &bundle.vault_entries {
+            let new_secret_ref = store_secret(
+                graph,
+                SecretInput {
+                    secret_kind: "vault-token".to_string(),
+                    scope: "hotel".to_string(),
+                    allowed_roles: ve.allowed_roles.clone(),
+                    allowed_guests: Vec::new(),
+                    plaintext: ve.plaintext.clone(),
+                },
+            )
+            .context("store_secret for vault entry failed")?;
+
+            // Append to vault_registry
+            let mut registry: Vec<serde_json::Value> = graph
+                .get_config_value("vault_registry")?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            registry.push(serde_json::json!({
+                "vault_name": ve.vault_name,
+                "secret_ref": new_secret_ref,
+            }));
+            graph.set_config_value("vault_registry", &serde_json::to_string(&registry)?)?;
+
+            // Set config key to the new secret_ref (as a JSON string)
+            graph.set_config_value(
+                &ve.config_key,
+                &serde_json::to_string(&new_secret_ref)?,
+            )?;
+        }
+
+        // ── 5. Non-vault config entries ──────────────────────────────────────
+        for ce in &bundle.config_entries {
+            graph
+                .set_config_value(&ce.key, &ce.value_json)
+                .with_context(|| format!("set_config_value '{}' failed", ce.key))?;
+        }
+
+        // ── 6. Guests (rewrite hotel prefix, materialize active ones) ────────
+        for ge in &bundle.guests {
+            let new_guest_id = format!("{dest_hotel}:{}", ge.guest_id_suffix);
+            // Replace all occurrences of source hotel name in config_json env vars
+            let new_config_json = ge.config_json.replace(source_hotel.as_str(), dest_hotel.as_str());
+            let rec = GuestRecord {
+                hotel_name: dest_hotel.clone(),
+                guest_id: new_guest_id.clone(),
+                role: ge.role.clone(),
+                config_json: new_config_json,
+                is_active: ge.is_active,
+                active_pid: None,
+                last_active_at: None,
+            };
+            graph.upsert_guest(&rec).context("upsert_guest failed")?;
+            if ge.is_active {
+                if let Some(mat_req) = materialization_requester {
+                    let _ = mat_req.ensure_guest_active(&new_guest_id).await;
+                }
+            }
+        }
+
+        // ── 7. Update membrane-gateway AGENT_ROSTER if agent has telegram ────
+        if !bundle.vault_entries.is_empty() {
+            let membrane_guest_id = format!("{dest_hotel}:membrane-gateway");
+            if let Ok(Some(mut gw)) = graph.get_guest(&dest_hotel, &membrane_guest_id) {
+                if let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&gw.config_json) {
+                    let roster_key = "PHILOTIC_AGENT_ROSTER";
+                    let mut roster: Vec<serde_json::Value> = cfg
+                        .get("env")
+                        .and_then(|e| e.get(roster_key))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default();
+                    let already_present = roster.iter().any(|e| {
+                        e.get("agent_id").and_then(|v| v.as_str()) == Some(&bundle.agent_id)
+                    });
+                    if !already_present {
+                        roster.push(serde_json::json!({
+                            "agent_id": bundle.agent_id,
+                            "agent_key": bundle.agent_key,
+                        }));
+                        let new_roster_json = serde_json::to_string(&roster)?;
+                        if let Some(env) = cfg.get_mut("env").and_then(|e| e.as_object_mut()) {
+                            env.insert(roster_key.to_string(), serde_json::Value::String(new_roster_json));
+                        }
+                        gw.config_json = serde_json::to_string(&cfg)?;
+                        graph.upsert_guest(&gw)?;
+                        // Restart membrane-gateway so it picks up the new roster
+                        if let Some(mat_req) = materialization_requester {
+                            let _ = mat_req.ensure_guest_active(&membrane_guest_id).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            migration_id = %bundle.migration_id,
+            agent_id = %bundle.agent_id,
+            "Agent migration bundle applied on '{}'", dest_hotel
+        );
+        Ok(bundle.agent_id)
     }
 
     async fn handle_register_component(

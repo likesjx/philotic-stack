@@ -1323,6 +1323,65 @@ fn tool_status_label(tool_name: &str) -> String {
     label.to_string()
 }
 
+/// Stage 2 (prepare_inputs) + Stage 3 (merge_context) for the philote capability pipeline.
+///
+/// Converts a tool call's flat argument map into a normalized `CapabilityRequest`,
+/// extracting image/text inputs and injecting conversation + agent identity.
+fn build_capability_request(
+    tool_name: &str,
+    arguments: &Value,
+    session_id: &str,
+    agent_id: &str,
+) -> ansible_mesh_core::capability::CapabilityRequest {
+    use ansible_mesh_core::capability::{CapabilityContext, CapabilityInput, CapabilityRequest};
+
+    let mut req = CapabilityRequest::new(tool_name);
+
+    // Inject image input from image_url or image_base64.
+    if let Some(url) = arguments.get("image_url").and_then(Value::as_str) {
+        req = req.with_image_url(url);
+    } else if let Some(b64) = arguments.get("image_base64").and_then(Value::as_str) {
+        let mime = arguments
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        req = req.with_image_base64(b64, mime);
+    }
+
+    // For audio primitives: inject audio input.
+    if tool_name.starts_with("audio.") {
+        if let Some(url) = arguments.get("audio_url").and_then(Value::as_str) {
+            req.inputs.push(CapabilityInput::Audio {
+                url: Some(url.to_string()),
+                base64: None,
+                mime_type: arguments
+                    .get("audio_mime_type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+    }
+
+    // Inject text prompt (query / hint).
+    let text_prompt = arguments
+        .get("query")
+        .or_else(|| arguments.get("hint"))
+        .or_else(|| arguments.get("prompt"))
+        .and_then(Value::as_str);
+    if let Some(text) = text_prompt {
+        req = req.with_text(text);
+    }
+
+    // Stage 3 — merge context.
+    req.context = CapabilityContext {
+        conversation_id: Some(session_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        identity: Value::Null,
+    };
+
+    req
+}
+
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
     matches!(
         command,
@@ -4767,6 +4826,50 @@ impl AgentRuntime {
 
             if route.execution_mode == "local_agent" {
                 return self.execute_local_agent_tool(tool_req).await;
+            }
+
+            // Capability primitives (image.*, audio.*, etc.) use the synchronous hotel router.
+            if route.execution_mode == "capability_invoke" {
+                let capability_req = build_capability_request(
+                    &tool_req.tool_name,
+                    &tool_req.arguments,
+                    &tool_req.session_id,
+                    &tool_req.agent_id,
+                );
+                let ipc_resp = self
+                    .ipc_client
+                    .send_request(IpcRequest::CapabilityInvoke {
+                        request: capability_req,
+                    })
+                    .await?;
+                let content = match ipc_resp {
+                    IpcResponse::Standard {
+                        ok: true,
+                        data: Some(result),
+                        ..
+                    } => serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| result.to_string()),
+                    IpcResponse::Standard {
+                        ok: false,
+                        message,
+                        ..
+                    } => format!("Capability call failed: {message}"),
+                    other => format!(
+                        "Unexpected hotel response for capability '{}': {other:?}",
+                        tool_req.tool_name
+                    ),
+                };
+                return self
+                    .handle_tool_result(crate::protocol::InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        session_id: Some(tool_req.session_id),
+                        turn_id: Some(tool_req.turn_id),
+                        chat_id: Some(tool_req.chat_id),
+                        tool_name: Some(tool_req.tool_name),
+                        content: Some(content),
+                        ..Default::default()
+                    })
+                    .await;
             }
 
             self.ipc_client
@@ -9447,6 +9550,96 @@ impl AgentRuntime {
                     }
                 }
 
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "agent.migrate_to" => {
+                let dest_hotel = match payload
+                    .arguments
+                    .get("dest_hotel")
+                    .and_then(|v| v.as_str())
+                {
+                    Some(h) => h.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "agent.migrate_to: missing required argument 'dest_hotel'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let result = self
+                    .ipc_client
+                    .send_request(IpcRequest::AgentMigrateToHotel {
+                        agent_id: self.agent_id.clone(),
+                        dest_hotel: dest_hotel.clone(),
+                    })
+                    .await;
+                let content = match result {
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => if message.is_empty() {
+                        format!("Migration to '{}' dispatched.", dest_hotel)
+                    } else {
+                        message
+                    },
+                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                if message.is_empty() {
+                                    format!("agent.migrate_to: migration to '{}' failed", dest_hotel)
+                                } else {
+                                    message
+                                },
+                            )
+                            .await;
+                    }
+                    Ok(other) => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                format!("agent.migrate_to: unexpected response: {other:?}"),
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                format!("agent.migrate_to: IPC error — {e}"),
+                            )
+                            .await;
+                    }
+                };
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,

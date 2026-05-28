@@ -245,6 +245,40 @@ async fn handle_operator_surface_query_task(
             } => operator_target_agents,
             other => anyhow::bail!("unexpected operator target agents response: {other:?}"),
         })?,
+        "agent.deploy_bundle" => {
+            let blob_url = payload
+                .payload
+                .get("blob_url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("agent.deploy_bundle: missing blob_url in payload"))?;
+            // Fetch the bundle from the source hotel's blob store
+            let bundle_bytes = reqwest::get(blob_url)
+                .await
+                .with_context(|| format!("failed to fetch migration bundle from {blob_url}"))?
+                .bytes()
+                .await
+                .context("failed to read migration bundle response body")?;
+            let bundle_json = String::from_utf8(bundle_bytes.to_vec())
+                .context("migration bundle is not valid UTF-8")?;
+            match client
+                .send_request(IpcRequest::ApplyAgentBundle { bundle_json })
+                .await?
+            {
+                IpcResponse::Standard { ok: true, message, .. } => {
+                    serde_json::to_string(&serde_json::json!({
+                        "ok": true,
+                        "message": message,
+                    }))?
+                }
+                IpcResponse::Standard { ok: false, message, .. } => {
+                    serde_json::to_string(&serde_json::json!({
+                        "ok": false,
+                        "error": if message.is_empty() { "apply_agent_bundle failed".to_string() } else { message },
+                    }))?
+                }
+                other => anyhow::bail!("unexpected ApplyAgentBundle response: {other:?}"),
+            }
+        }
         _ => return Ok(()),
     };
 

@@ -104,6 +104,18 @@ pub fn resolve_secret(
     Ok(Some(decrypt(&secret)?))
 }
 
+/// Read and decrypt a vault secret without ACL checks.
+/// Only for hotel-internal operations (e.g. migration bundle building).
+pub(crate) fn export_secret_plaintext(
+    graph: &GraphDomain,
+    secret_ref: &str,
+) -> Result<Option<String>> {
+    let Some(secret) = graph.get_secret(secret_ref)? else {
+        return Ok(None);
+    };
+    Ok(Some(decrypt(&secret)?))
+}
+
 fn encrypt(plaintext: &str) -> Result<(String, String)> {
     let cipher = cipher()?;
     let nonce_bytes = random_nonce();

@@ -4,6 +4,8 @@ pub use ansible_mesh_core::resources::{
     ResourceRevoked, ResourceType,
 };
 pub use ansible_mesh_core::storage::ComponentManifest;
+pub use ansible_mesh_core::storage::AgentIdentityRecord;
+pub use ansible_mesh_core::graph::RoleIncarnationRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -1668,10 +1670,93 @@ pub enum IpcRequest {
         id: String,
         outcome: String,
     },
+    // ── Agent migration IPC ───────────────────────────────────────────────────
+    /// Initiate a full agent migration to a remote hotel.
+    ///
+    /// The source hotel bundles the agent's identity, apartments, role incarnations,
+    /// vault entries (decrypted), guests, and agent-specific config, uploads the bundle
+    /// to its blob store, then dispatches it to the destination hotel via the
+    /// OperatorSurface cross-hotel relay.  The source stays active throughout.
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    AgentMigrateToHotel {
+        /// The agent making the request.
+        agent_id: String,
+        /// The hotel the agent wants to move to (e.g. "vps-jane").
+        dest_hotel: String,
+    },
+    /// Apply a serialized [`AgentMigrationBundle`] to the local hotel.
+    ///
+    /// Writes agent identity, apartments, role incarnations, vault entries, guests,
+    /// and config to the local context graph, then materializes the new guests.
+    ///
+    /// Called internally by the `"agent.deploy_bundle"` operator surface handler.
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    ApplyAgentBundle {
+        bundle_json: String,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
     50
+}
+
+// ── Agent migration bundle types ─────────────────────────────────────────────
+
+/// A vault secret that travels with an agent during migration.
+/// The plaintext is included so the destination hotel can re-encrypt with its
+/// own vault key.  Only transmit over a trusted network (e.g. Tailscale VPN).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultEntryExport {
+    /// Config key that points at this secret (e.g. `"telegram_bot_token_beacon"`).
+    pub config_key: String,
+    /// Vault name (e.g. `"bjork"`), used to place the entry in the dest vault_registry.
+    pub vault_name: String,
+    /// Decrypted plaintext value.
+    pub plaintext: String,
+    /// Role ACL preserved from the source secret record.
+    #[serde(default)]
+    pub allowed_roles: Vec<String>,
+}
+
+/// A non-vault config entry to replicate verbatim on the destination hotel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigEntryExport {
+    /// Config key without the `"config:"` prefix.
+    pub key: String,
+    /// Raw JSON value string as stored in the context graph.
+    pub value_json: String,
+}
+
+/// A guest record stripped of its hotel prefix, ready to be re-homed on dest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestExport {
+    /// The suffix of the guest_id after the hotel prefix (e.g. `"philote-beacon"`).
+    pub guest_id_suffix: String,
+    pub role: String,
+    /// Raw config_json string from the source GuestRecord.
+    /// The `ApplyAgentBundle` handler replaces occurrences of the source hotel name.
+    pub config_json: String,
+    pub is_active: bool,
+}
+
+/// Full snapshot of an agent suitable for cross-hotel migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMigrationBundle {
+    pub migration_id: String,
+    pub source_hotel: String,
+    /// Stable agent identifier (e.g. `"agent-beacon-01"`).
+    pub agent_id: String,
+    /// Short agent key used in guest ID patterns (e.g. `"beacon"`).
+    pub agent_key: String,
+    pub agent_identity: AgentIdentityRecord,
+    pub apartments: Vec<(String, serde_json::Value)>,
+    pub role_incarnations: Vec<RoleIncarnationRecord>,
+    pub vault_entries: Vec<VaultEntryExport>,
+    pub config_entries: Vec<ConfigEntryExport>,
+    pub guests: Vec<GuestExport>,
+    pub timestamp: u64,
 }
 
 /// Payload for [`IpcResponse::UserProfileData`].
