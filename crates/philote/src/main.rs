@@ -61,7 +61,19 @@ async fn main() -> Result<()> {
         );
     }
 
-    let ipc_client = philotic_client::PhiloticClient::connect(identity).await?;
+    let mut ipc_client = philotic_client::PhiloticClient::connect(identity).await?;
+
+    // Role incarnation philotes subscribe to "role:{agent}:{role_name}" for handoff delivery,
+    // but also need to be in the "agent" subscribers so aiua's is_registered check (which
+    // reads inboxes["agent"]) can find them for subsequent turn routing after a handoff.
+    if role_name.is_some() {
+        ipc_client
+            .send_request(philotic_client::IpcRequest::SubscribeInbox {
+                role: "agent".to_string(),
+            })
+            .await?;
+    }
+
     let mut runtime = AgentRuntime::new(ipc_client, agent_id);
     runtime.run().await
 }
