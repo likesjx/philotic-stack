@@ -509,7 +509,7 @@ remote-homebrew-start remote hotel:
     if [[ "{{hotel}}" == "mbp-jane" || "{{hotel}}" == "mac-jane" ]]; then profile="jane"; fi
     if [[ "{{hotel}}" == "local-telegram" || "{{hotel}}" == "bjork" ]]; then profile="bjork"; fi
     ssh "{{remote}}" "uid=\$(id -u); launchctl bootout gui/\${uid}/com.philotic.aiua.{{hotel}} 2>/dev/null || true; pkill -f '[a]iua --hotel {{hotel}}' 2>/dev/null || true"
-    ssh "{{remote}}" "mkdir -p ~/.philotic/${profile}/graphs && nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid)"
+    ssh "{{remote}}" "mkdir -p ~/.philotic/${profile}/graphs && ulimit -n 65536; nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid)"
 
 remote-homebrew-status remote hotel:
     @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
