@@ -7876,6 +7876,9 @@ impl AgentRuntime {
         // Set by the Roles arm of the match below to carry the inline keyboard to the reply.
         let mut roles_keyboard_holder: Option<serde_json::Value> = None;
 
+        const HANDOFF_MAX_RETRIES: u32 = 12;
+        const HANDOFF_DEFAULT_WAIT_MS: u64 = 250;
+
         let response = match &command {
             SlashCommand::Role { role_name } => {
                 let handoff_bundle = self
@@ -7907,23 +7910,49 @@ impl AgentRuntime {
                         expected_return_mode: Some("required".into()),
                         cleanup_actions: vec!["switch_active_role".into()],
                     });
-                self.ipc_client
-                    .send_request(IpcRequest::HandoffToRole {
-                        session_id: session_id.clone(),
-                        role_name: role_name.clone(),
-                        handoff_bundle,
-                    })
-                    .await?
+                let req = IpcRequest::HandoffToRole {
+                    session_id: session_id.clone(),
+                    role_name: role_name.clone(),
+                    handoff_bundle,
+                };
+                let mut attempt = 0u32;
+                loop {
+                    let resp = self.ipc_client.send_request(req.clone()).await?;
+                    match resp {
+                        IpcResponse::HandoffPending { retry_after_ms, .. } => {
+                            attempt += 1;
+                            if attempt >= HANDOFF_MAX_RETRIES {
+                                break resp;
+                            }
+                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
+                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        }
+                        other => break other,
+                    }
+                }
             }
             SlashCommand::Back => {
-                self.ipc_client
-                    .send_request(IpcRequest::HandoffBack {
-                        session_id: session_id.clone(),
-                        summary: "Manual return to orchestrator requested by user slash command."
-                            .into(),
-                        return_to: None,
-                    })
-                    .await?
+                let req = IpcRequest::HandoffBack {
+                    session_id: session_id.clone(),
+                    summary: "Manual return to orchestrator requested by user slash command."
+                        .into(),
+                    return_to: None,
+                };
+                let mut attempt = 0u32;
+                loop {
+                    let resp = self.ipc_client.send_request(req.clone()).await?;
+                    match resp {
+                        IpcResponse::HandoffPending { retry_after_ms, .. } => {
+                            attempt += 1;
+                            if attempt >= HANDOFF_MAX_RETRIES {
+                                break resp;
+                            }
+                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
+                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        }
+                        other => break other,
+                    }
+                }
             }
             SlashCommand::Roles => {
                 self.ipc_client
@@ -8030,6 +8059,19 @@ impl AgentRuntime {
                     None,
                 )
             }
+            IpcResponse::HandoffPending { role_name, .. } => (
+                format!(
+                    "Role '{role_name}' is still materializing — please try again in a moment."
+                ),
+                "role_handoff_failed",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "error": "handoff_pending_timeout",
+                }),
+                None,
+            ),
             IpcResponse::Error(message) => (
                 format!("Couldn't switch roles: {message}"),
                 "role_handoff_failed",
