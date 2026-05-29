@@ -113,6 +113,7 @@ struct MeshRuntimeContext {
     webrtc_signal_tx: mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>,
     webrtc_signal_rx: WebRtcSignalReceiver,
     perimeter_svc: Arc<crate::service::perimeter::HotelPerimeterService>,
+    ipc_operator_surface_tx: Option<mpsc::Sender<String>>,
 }
 
 /// Operator surface query worker — receives tasks via in-process channel (no UDS
@@ -1459,6 +1460,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
         let inbound_local_node_id = ctx.caps.node_id.clone();
         let webrtc_signal_tx_inbound = ctx.webrtc_signal_tx.clone();
         let local_node_id_webrtc_inbound = ctx.caps.node_id.clone();
+        let inbound_operator_surface_tx = ctx.ipc_operator_surface_tx.clone();
         tokio::spawn(async move {
             while let Some(msg) = inbox_rx.recv().await {
                 match msg.msg_type {
@@ -1470,8 +1472,12 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                             if !events.is_empty() {
                                 let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
                                 for event in &events {
-                                    IpcServer::deliver_event_envelope(&inbound_inboxes, event)
-                                        .await;
+                                    IpcServer::deliver_event_envelope(
+                                        &inbound_inboxes,
+                                        event,
+                                        inbound_operator_surface_tx.as_ref(),
+                                    )
+                                    .await;
                                     // Cron control-plane broadcasts.
                                     match &event.kind {
                                         ansible_mesh_core::event::EventKind::CronFired => {
@@ -6754,36 +6760,46 @@ async fn main() -> Result<()> {
             hotel.blob_port = resolved_blob_port;
             hotel.execution_port = resolved_execution_port;
             graph_domain_arc.upsert_hotel(&hotel)?;
+        }
 
-            // Patch PHILOTIC_BLOB_BASE_URL in all membrane guest configs so they
-            // use the newly resolved blob port instead of the stale stored URL.
-            let new_blob_base_url = format!("http://127.0.0.1:{}", resolved_blob_port);
-            if let Ok(guests) = graph_domain_arc.list_guests(&hotel_name, false) {
-                for mut guest in guests {
-                    if guest.role != "membrane" {
+        // Always reconcile PHILOTIC_BLOB_BASE_URL in membrane guest configs against
+        // the hotel's live blob_port.  The port-change guard above only fires when
+        // ports shift, so without this outer pass the URL stays stale across restarts
+        // when the port happens to be unchanged.
+        let correct_blob_base_url = format!("http://127.0.0.1:{}", hotel.blob_port);
+        if let Ok(guests) = graph_domain_arc.list_guests(&hotel_name, false) {
+            for mut guest in guests {
+                if guest.role != "membrane" {
+                    continue;
+                }
+                if let Ok(mut cfg) =
+                    serde_json::from_str::<serde_json::Value>(&guest.config_json)
+                {
+                    let current_url = cfg
+                        .get("env")
+                        .and_then(|e| e.get("PHILOTIC_BLOB_BASE_URL"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if current_url == correct_blob_base_url {
                         continue;
                     }
-                    if let Ok(mut cfg) =
-                        serde_json::from_str::<serde_json::Value>(&guest.config_json)
+                    if let Some(env) = cfg
+                        .as_object_mut()
+                        .and_then(|o| o.get_mut("env"))
+                        .and_then(serde_json::Value::as_object_mut)
                     {
-                        if let Some(env) = cfg
-                            .as_object_mut()
-                            .and_then(|o| o.get_mut("env"))
-                            .and_then(serde_json::Value::as_object_mut)
-                        {
-                            env.insert(
-                                "PHILOTIC_BLOB_BASE_URL".into(),
-                                serde_json::Value::String(new_blob_base_url.clone()),
+                        env.insert(
+                            "PHILOTIC_BLOB_BASE_URL".into(),
+                            serde_json::Value::String(correct_blob_base_url.clone()),
+                        );
+                        guest.config_json = cfg.to_string();
+                        if let Err(e) = graph_domain_arc.seed_guests(&hotel_name, &[guest]) {
+                            warn!("Failed to reconcile membrane blob URL: {e}");
+                        } else {
+                            info!(
+                                blob_url = %correct_blob_base_url,
+                                "Reconciled membrane guest blob URL at startup."
                             );
-                            guest.config_json = cfg.to_string();
-                            if let Err(e) = graph_domain_arc.seed_guests(&hotel_name, &[guest]) {
-                                warn!("Failed to patch membrane blob URL: {e}");
-                            } else {
-                                info!(
-                                    blob_url = %new_blob_base_url,
-                                    "Patched membrane guest blob URL after port shift."
-                                );
-                            }
                         }
                     }
                 }
@@ -7073,6 +7089,8 @@ async fn main() -> Result<()> {
     // In-process channel: operator surface query tasks are delivered here
     // instead of through UDS self-connection, eliminating the socket leak.
     let (operator_surface_tx, operator_surface_rx) = tokio::sync::mpsc::channel::<String>(128);
+    // Clone before moving into IpcServer so mesh inbound worker can also route to it.
+    let inbound_operator_surface_tx = operator_surface_tx.clone();
 
     let ipc_server = IpcServer::new(
         socket_path.clone(),
@@ -7186,6 +7204,7 @@ async fn main() -> Result<()> {
         webrtc_signal_tx: webrtc_signal_tx.clone(),
         webrtc_signal_rx: webrtc_signal_rx.clone(),
         perimeter_svc: perimeter_svc.clone(),
+        ipc_operator_surface_tx: Some(inbound_operator_surface_tx),
     };
 
     if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {
