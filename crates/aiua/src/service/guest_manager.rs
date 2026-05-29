@@ -128,8 +128,16 @@ impl Materializer for LocalProcessMaterializer {
             // Always override with hotel's own socket path.  Prefer the value
             // supplied at construction time; fall back to the process env (for
             // cases where the hotel was started with the var already set).
-            let socket_override = self.hotel_socket.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string())
-                .or_else(|| std::env::var("PHILOTIC_HOTEL_SOCKET").ok().filter(|s| !s.trim().is_empty()));
+            let socket_override = self
+                .hotel_socket
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    std::env::var("PHILOTIC_HOTEL_SOCKET")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                });
             if let Some(socket) = socket_override {
                 command.env("PHILOTIC_HOTEL_SOCKET", socket.trim());
             }
@@ -299,14 +307,29 @@ impl GuestManager {
             );
 
             // --- GHOST RECLAMATION ---
-            if let Some(_pid) = &rec.active_pid {
+            if let Some(ref pid_str) = rec.active_pid {
                 info!(
                     "Context Graph shows Ghost PID {} for Guest [{}]. Reclaiming identity...",
-                    _pid, rec.guest_id
+                    pid_str, rec.guest_id
                 );
-                let mut mat = self.materializer.lock().await;
-                if let Err(e) = mat.reclaim_guest(&rec.guest_id).await {
-                    warn!("Reclamation error for {}: {}", rec.guest_id, e);
+                {
+                    let mut mat = self.materializer.lock().await;
+                    if let Err(e) = mat.reclaim_guest(&rec.guest_id).await {
+                        warn!("Reclamation error for {}: {}", rec.guest_id, e);
+                    }
+                }
+                // Belt-and-suspenders: after a restart the materializer's children map is
+                // empty and the legacy materialized_guests table is unused, so reclaim_guest
+                // may silently skip the kill. Finish the job with a direct signal if the
+                // process is still alive.
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if LocalProcessMaterializer::pid_exists(pid) {
+                        warn!(
+                            "Guest [{}] PID {} survived reclaim_guest; killing directly.",
+                            rec.guest_id, pid
+                        );
+                        LocalProcessMaterializer::terminate_pid(pid);
+                    }
                 }
                 Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
             }
