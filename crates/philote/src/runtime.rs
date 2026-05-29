@@ -12006,45 +12006,68 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
 
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::HandoffBack {
-                        session_id: payload.session_id.clone(),
-                        summary: summary.clone(),
-                        return_to,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::HandoffBackAck {
-                        return_guest_id, ..
-                    }) => (
-                        format!(
-                            "Returned control (to guest {return_guest_id}). Summary: {summary}"
-                        ),
-                        None,
-                    ),
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::tool_execution(
-                            "handoff.back",
-                            msg,
-                            Some("HANDOFF_BACK_REJECTED"),
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "handoff.back: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("handoff.back: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
+                const HANDOFF_BACK_MAX_RETRIES: u32 = 12;
+                const HANDOFF_BACK_DEFAULT_WAIT_MS: u64 = 250;
+                let handoff_back_req = IpcRequest::HandoffBack {
+                    session_id: payload.session_id.clone(),
+                    summary: summary.clone(),
+                    return_to,
+                };
+                let mut handoff_back_attempt = 0u32;
+                let (content, tool_err) = loop {
+                    match self
+                        .ipc_client
+                        .send_request(handoff_back_req.clone())
+                        .await
+                    {
+                        Ok(IpcResponse::HandoffBackAck {
+                            return_guest_id, ..
+                        }) => {
+                            break (
+                                format!(
+                                    "Returned control (to guest {return_guest_id}). Summary: {summary}"
+                                ),
+                                None,
+                            );
+                        }
+                        Ok(IpcResponse::HandoffPending { retry_after_ms, .. }) => {
+                            handoff_back_attempt += 1;
+                            if handoff_back_attempt >= HANDOFF_BACK_MAX_RETRIES {
+                                let e = TaskErrorPayload::tool_execution(
+                                    "handoff.back",
+                                    format!(
+                                        "Return role did not become live after {HANDOFF_BACK_MAX_RETRIES} retries"
+                                    ),
+                                    Some("HANDOFF_BACK_TIMEOUT"),
+                                );
+                                break (e.display_message(), Some(e));
+                            }
+                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_BACK_DEFAULT_WAIT_MS);
+                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        }
+                        Ok(IpcResponse::Error(msg)) => {
+                            let e = TaskErrorPayload::tool_execution(
+                                "handoff.back",
+                                msg,
+                                Some("HANDOFF_BACK_REJECTED"),
+                            );
+                            break (e.display_message(), Some(e));
+                        }
+                        Ok(_) => {
+                            let e = TaskErrorPayload::ipc_failure(
+                                "aiua",
+                                "UNEXPECTED_RESPONSE",
+                                "handoff.back: unexpected hotel response",
+                            );
+                            break (e.display_message(), Some(e));
+                        }
+                        Err(e) => {
+                            let err = TaskErrorPayload::transport_error(
+                                "philote",
+                                format!("handoff.back: IPC transport error — {e}"),
+                            );
+                            break (err.display_message(), Some(err));
+                        }
                     }
                 };
 
