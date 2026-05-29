@@ -10,7 +10,6 @@ use ansible_mesh_core::storage::{
     AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeHealthSnapshot, NodeRole};
-use perimeter_core::service::PerimeterService as _;
 use anyhow::{Context, Result};
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path as AxumPath, Query, Request, State};
@@ -21,6 +20,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, Subcommand, ValueEnum};
+use perimeter_core::service::PerimeterService as _;
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
     OPERATOR_SURFACE_QUERY_ROLE, OperatorSurfaceQueryHandoff, OperatorTargetGuestInventoryView,
@@ -251,7 +251,9 @@ async fn handle_operator_surface_query_task(
                 .payload
                 .get("blob_url")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("agent.deploy_bundle: missing blob_url in payload"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("agent.deploy_bundle: missing blob_url in payload")
+                })?;
             // Fetch the bundle from the source hotel's blob store
             let bundle_bytes = reqwest::get(blob_url)
                 .await
@@ -265,18 +267,18 @@ async fn handle_operator_surface_query_task(
                 .send_request(IpcRequest::ApplyAgentBundle { bundle_json })
                 .await?
             {
-                IpcResponse::Standard { ok: true, message, .. } => {
-                    serde_json::to_string(&serde_json::json!({
-                        "ok": true,
-                        "message": message,
-                    }))?
-                }
-                IpcResponse::Standard { ok: false, message, .. } => {
-                    serde_json::to_string(&serde_json::json!({
-                        "ok": false,
-                        "error": if message.is_empty() { "apply_agent_bundle failed".to_string() } else { message },
-                    }))?
-                }
+                IpcResponse::Standard {
+                    ok: true, message, ..
+                } => serde_json::to_string(&serde_json::json!({
+                    "ok": true,
+                    "message": message,
+                }))?,
+                IpcResponse::Standard {
+                    ok: false, message, ..
+                } => serde_json::to_string(&serde_json::json!({
+                    "ok": false,
+                    "error": if message.is_empty() { "apply_agent_bundle failed".to_string() } else { message },
+                }))?,
                 other => anyhow::bail!("unexpected ApplyAgentBundle response: {other:?}"),
             }
         }
@@ -2302,10 +2304,12 @@ fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRe
 }
 
 /// Hotel-level shared guests: one membrane for all agents, plus model controllers.
-fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<GuestRecord> {
+/// `blob_port` must come from the stored hotel record (via `reconcile_hotel_record`),
+/// not from `default_hotel_record`, to avoid writing a stale hash-derived URL.
+fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile], blob_port: u16) -> Vec<GuestRecord> {
     let hotel = default_hotel_record(hotel_name);
     let socket_path = hotel.ipc_socket_path;
-    let blob_base_url = format!("http://127.0.0.1:{}", hotel.blob_port);
+    let blob_base_url = format!("http://127.0.0.1:{}", blob_port);
     let node_id = hotel.capabilities.node_id;
     let training_base = profile_dir().unwrap_or_else(|| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -2547,7 +2551,7 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
 /// Legacy single-profile seed — used in tests that expect the old per-profile layout.
 #[cfg(test)]
 fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<GuestRecord> {
-    let mut guests = hotel_shared_guests(hotel_name, std::slice::from_ref(profile));
+    let mut guests = hotel_shared_guests(hotel_name, std::slice::from_ref(profile), default_hotel_record(hotel_name).blob_port);
     guests.push(agent_guests_for_profile(hotel_name, profile));
     guests.push(agent_graph_runner_guest(hotel_name, profile));
     guests
@@ -6498,7 +6502,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         all_desired_guests.push(agent_guests_for_profile(hotel_name, profile));
         all_desired_guests.push(agent_graph_runner_guest(hotel_name, profile));
     }
-    all_desired_guests.extend(hotel_shared_guests(hotel_name, &all_profiles));
+    all_desired_guests.extend(hotel_shared_guests(hotel_name, &all_profiles, hotel.blob_port));
 
     deactivate_legacy_managed_guests(
         &graph_domain,
@@ -6772,9 +6776,7 @@ async fn main() -> Result<()> {
                 if guest.role != "membrane" {
                     continue;
                 }
-                if let Ok(mut cfg) =
-                    serde_json::from_str::<serde_json::Value>(&guest.config_json)
-                {
+                if let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&guest.config_json) {
                     let current_url = cfg
                         .get("env")
                         .and_then(|e| e.get("PHILOTIC_BLOB_BASE_URL"))
@@ -6887,8 +6889,8 @@ async fn main() -> Result<()> {
     // Blob binds to 127.0.0.1 (Local); mesh + execution bind to 0.0.0.0 (tier depends on
     // whether a public IP is detected). IPC is always Local (added by HotelPerimeterService).
     let perimeter_svc = {
-        use std::net::{IpAddr, Ipv4Addr};
         use crate::service::perimeter::{HotelPerimeterService, ListenerDecl};
+        use std::net::{IpAddr, Ipv4Addr};
         let listeners = vec![
             ListenerDecl {
                 purpose: "beacon",
@@ -7033,7 +7035,9 @@ async fn main() -> Result<()> {
     // The Arc is also wired into IpcServer so guests can push entries via IPC.
     let (stderr_tx, mut stderr_rx) =
         tokio::sync::mpsc::channel::<crate::service::guest_manager::GuestStderrLine>(1024);
-    let heal_queue_arc: Option<std::sync::Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>> = {
+    let heal_queue_arc: Option<
+        std::sync::Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+    > = {
         use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
         match SqliteHealQueueStorage::open(db_path) {
             Ok(hq) => {
@@ -7064,9 +7068,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 warn!("heal_queue: failed to open storage ({e:#}); stderr will log only");
-                tokio::spawn(async move {
-                    while let Some(_) = stderr_rx.recv().await {}
-                });
+                tokio::spawn(async move { while let Some(_) = stderr_rx.recv().await {} });
                 None
             }
         }
@@ -7227,7 +7229,8 @@ async fn main() -> Result<()> {
         let initial_task = serde_json::json!({
             "action": "update_perimeter",
             "tier": initial_tier,
-        }).to_string();
+        })
+        .to_string();
         let fanout_inboxes_init = fanout_inboxes.clone();
         let fanout_node_id_init = fanout_node_id.clone();
         tokio::spawn(async move {
@@ -7253,7 +7256,8 @@ async fn main() -> Result<()> {
                     let task_json = serde_json::json!({
                         "action": "update_perimeter",
                         "tier": current,
-                    }).to_string();
+                    })
+                    .to_string();
                     {
                         let guard = fanout_inboxes.lock().await;
                         if let Some(subs) = guard.get("mcp-membrane") {
@@ -7271,12 +7275,12 @@ async fn main() -> Result<()> {
                     // 2. Broadcast PerimeterShift to all connected guests so they can
                     //    react: re-evaluate in-flight work, update routing, etc.
                     info!(
-                        ?previous, ?current,
+                        ?previous,
+                        ?current,
                         "Perimeter ceiling shifted — broadcasting PerimeterShift to all guests"
                     );
-                    let _ = fanout_broadcast_tx.send(
-                        philotic_client::IpcResponse::PerimeterShift { previous, current },
-                    );
+                    let _ = fanout_broadcast_tx
+                        .send(philotic_client::IpcResponse::PerimeterShift { previous, current });
                 }
             }
         });
@@ -7440,8 +7444,8 @@ mod tests {
         enable_guest_test_overrides, execution_reachability_for_hotel,
         extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
         hotel_base_port, hotel_ipc_socket_path, local_capability_advertisements,
-        mesh_target_addr_for_node,
-        nearest_available_base_port, resolve_runtime_ports, startup_test_gemini_base_url,
+        mesh_target_addr_for_node, nearest_available_base_port, resolve_runtime_ports,
+        startup_test_gemini_base_url,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -7515,7 +7519,10 @@ mod tests {
             std::env::set_var("PHILOTIC_HOTEL_SOCKET", "/run/philotic/test.sock");
         }
 
-        assert_eq!(hotel_ipc_socket_path("beacon-test-hotel"), "/run/philotic/test.sock");
+        assert_eq!(
+            hotel_ipc_socket_path("beacon-test-hotel"),
+            "/run/philotic/test.sock"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
