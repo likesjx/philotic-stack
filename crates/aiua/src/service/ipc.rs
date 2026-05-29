@@ -6232,6 +6232,7 @@ impl IpcServer {
     pub(crate) async fn deliver_event_envelope(
         inboxes: &InboxRegistry,
         event: &EventEnvelope,
+        operator_surface_tx: Option<&mpsc::Sender<String>>,
     ) -> bool {
         match (&event.kind, &event.target_agent_id, &event.payload) {
             (
@@ -6239,6 +6240,13 @@ impl IpcServer {
                 Some(target_role),
                 EventPayload::Inline { data },
             ) => {
+                // Route cross-hotel operator surface queries to the in-process worker.
+                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                    if let Some(tx) = operator_surface_tx {
+                        let _ = tx.try_send(data.clone()).ok();
+                        return true;
+                    }
+                }
                 let target_guest_id = serde_json::from_str::<serde_json::Value>(data)
                     .ok()
                     .and_then(|v| {
@@ -7920,7 +7928,11 @@ impl IpcServer {
             } => {
                 // Short-circuit operator surface queries to the in-process channel,
                 // eliminating the UDS self-connection and its socket leak.
-                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                // Only short-circuit for local-node targets; cross-hotel queries must
+                // fall through to the normal mesh dispatch path.
+                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE
+                    && target_node == local_node_id
+                {
                     if let Some(tx) = operator_surface_tx {
                         let _ = tx.try_send(task_json).ok();
                         return IpcResponse::Standard {
