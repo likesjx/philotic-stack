@@ -4,7 +4,9 @@ use crate::service::lease::{
     LeaseAcquireOutcome, LeaseObserver, LeaseObserverEvent, LeaseObserverEventKind, LeaseProvider,
     LeaseRenewOutcome, RuntimeLeaseRegistry,
 };
-use crate::vault::{SecretAccess, SecretInput, export_secret_plaintext, resolve_secret, store_secret};
+use crate::vault::{
+    SecretAccess, SecretInput, export_secret_plaintext, resolve_secret, store_secret,
+};
 use ansible_mesh_core::agent_graph_storage::{
     AgentGraphSnapshot, AgentGraphStorage, SqliteAgentGraphStorage,
 };
@@ -14,8 +16,8 @@ use ansible_mesh_core::catalog_rights::{
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{
-    AbstractSkillRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
-    SkillValidationState,
+    AbstractSkillRecord, MembraneTransportHomeRecord, MembraneTransportHomeStatus,
+    ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState, SkillValidationState,
 };
 use ansible_mesh_core::membership::{
     DEFAULT_INVITE_TTL_SECS, MeshInvite, MeshInvitePayload, MeshJoinRequestPayload,
@@ -40,12 +42,11 @@ use philotic_client::{
     AgentMigrationBundle, ComponentInventoryEntryView, ConfigEntryExport, DesktopMembraneAgentView,
     DesktopMembraneGuestView, DesktopMembraneStatusView, DesktopMembraneTargetGuestInventoryView,
     DesktopMembraneTargetReachabilityView, DesktopMembraneTargetStatusView,
-    DesktopMembraneTargetView, GuestExport, GuestIdentity, HookRoute, HookSubscription,
-    IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE,
-    OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
-    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
-    OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView, OperatorChatTurnReply,
-    OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
+    DesktopMembraneTargetView, GuestExport, GuestIdentity, HookRoute, HookSubscription, IpcRequest,
+    IpcResponse, LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
+    OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
+    OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
+    OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
     OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
@@ -871,7 +872,8 @@ const GOLGI_SINK_ROLE: &str = "hotel:golgi";
 const CAPABILITY_ROUTER_ROLE: &str = "hotel:capability-router";
 
 /// Pending synchronous capability calls keyed by turn_id (== dispatch task_id).
-pub(crate) type PendingCapabilityRegistry = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>>;
+pub(crate) type PendingCapabilityRegistry =
+    Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>>;
 
 /// A task intercepted by the Golgi routing pipeline, awaiting capability-stage completion.
 /// Keyed by `"session_id:turn_id"` in [`PendingPipelineRegistry`].
@@ -899,7 +901,6 @@ struct PendingPipeline {
 }
 
 pub(crate) type PendingPipelineRegistry = Arc<Mutex<HashMap<String, PendingPipeline>>>;
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRouteResolution {
@@ -1812,9 +1813,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote guest query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for remote guest inventory reply"))??;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote guest inventory reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
             anyhow::bail!("unexpected remote guest inventory reply envelope: {reply:?}");
         };
@@ -1902,9 +1906,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote status query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for remote target status reply"))??;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target status reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
             anyhow::bail!("unexpected remote target status reply envelope: {reply:?}");
         };
@@ -1992,9 +1999,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote agent query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for remote target agent reply"))??;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target agent reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
             anyhow::bail!("unexpected remote target agent reply envelope: {reply:?}");
         };
@@ -2082,9 +2092,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote config query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for remote target config reply"))??;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target config reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
             anyhow::bail!("unexpected remote target config reply envelope: {reply:?}");
         };
@@ -2172,9 +2185,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote secret query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for remote target secret reply"))??;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target secret reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
             anyhow::bail!("unexpected remote target secret reply envelope: {reply:?}");
         };
@@ -2272,11 +2288,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote placement query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("timed out waiting for remote target placement reply")
-            })??;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target placement reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
             anyhow::bail!("unexpected remote target placement reply envelope: {reply:?}");
         };
@@ -2364,11 +2381,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote component query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS), client.recv_task())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("timed out waiting for remote target component reply")
-            })??;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target component reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = reply else {
             anyhow::bail!("unexpected remote target component reply envelope: {reply:?}");
         };
@@ -3655,11 +3673,10 @@ impl IpcServer {
             .and_then(|rc| rc.get_mut("membrane_bindings"))
             .and_then(|b| b.as_array_mut());
         if let Some(arr) = bindings {
-            arr.retain(|b| {
-                !(b.get("kind").and_then(|k| k.as_str()) == Some(kind)
-                    && b.get("membrane_guest_id").and_then(|g| g.as_str())
-                        == Some(membrane_guest_id))
-            });
+            // Remove ALL entries for this kind — not just the exact-ID match — so
+            // stale bindings from a renamed or replaced membrane are evicted on
+            // every successful lease acquisition.
+            arr.retain(|b| b.get("kind").and_then(|k| k.as_str()) != Some(kind));
             arr.push(new_binding);
         } else {
             if let Some(obj) = identity.bundle_json.as_object_mut() {
@@ -3689,6 +3706,25 @@ impl IpcServer {
             || Self::delegated_poll_hotels(agent_identity)
                 .iter()
                 .any(|hotel| hotel == local_hotel_name)
+    }
+
+    fn hotel_may_poll_transport_home(
+        graph: &GraphDomain,
+        agent_identity: &ansible_mesh_core::storage::AgentIdentityRecord,
+        agent_id: &str,
+        transport: &str,
+        resource_ref: &str,
+        local_hotel_name: &str,
+    ) -> Result<bool, String> {
+        match graph.resolve_membrane_transport_home(agent_id, transport, resource_ref) {
+            Ok(Some(home)) => Ok(home.status == MembraneTransportHomeStatus::Active
+                && home.active_home_hotel == local_hotel_name),
+            Ok(None) => Ok(Self::hotel_may_poll_for_agent(
+                agent_identity,
+                local_hotel_name,
+            )),
+            Err(err) => Err(err.to_string()),
+        }
     }
 
     fn telegram_poll_lease_is_expired(lease: &LeaseEnvelope) -> bool {
@@ -3909,10 +3945,7 @@ impl IpcServer {
         self
     }
 
-    pub fn with_egress(
-        mut self,
-        gw: Arc<crate::service::egress::HotelEgressGateway>,
-    ) -> Self {
+    pub fn with_egress(mut self, gw: Arc<crate::service::egress::HotelEgressGateway>) -> Self {
         self.egress_gw = Some(gw);
         self
     }
@@ -3928,7 +3961,6 @@ impl IpcServer {
     pub(crate) fn pending_pipelines(&self) -> PendingPipelineRegistry {
         self.pending_pipelines.clone()
     }
-
 
     pub(crate) fn materialization_requester_arc(
         &self,
@@ -4138,8 +4170,7 @@ impl IpcServer {
                             .unwrap_or_default();
                         let snapshot_json =
                             serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
-                        let _ = outbound_tx
-                            .send(IpcResponse::PerimeterStatus { snapshot_json });
+                        let _ = outbound_tx.send(IpcResponse::PerimeterStatus { snapshot_json });
                     }
                     Ok(IpcRequest::RefreshPerimeter) => {
                         use perimeter_core::service::PerimeterService as _;
@@ -4152,15 +4183,16 @@ impl IpcServer {
                             .unwrap_or_default();
                         let snapshot_json =
                             serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
-                        let _ = outbound_tx
-                            .send(IpcResponse::PerimeterStatus { snapshot_json });
+                        let _ = outbound_tx.send(IpcResponse::PerimeterStatus { snapshot_json });
                     }
                     Ok(IpcRequest::CheckEgress {
                         agent_id,
                         target_url,
                         method,
                     }) => {
-                        use perimeter_core::egress::{EgressDecision, EgressGateway as _, EgressRequest};
+                        use perimeter_core::egress::{
+                            EgressDecision, EgressGateway as _, EgressRequest,
+                        };
                         use perimeter_core::service::PerimeterService as _;
                         let tier = perimeter_svc
                             .as_deref()
@@ -4989,7 +5021,11 @@ impl IpcServer {
         let mut params = serde_json::Map::new();
         for input in &request.inputs {
             match input {
-                CapabilityInput::Image { url, base64, mime_type } => {
+                CapabilityInput::Image {
+                    url,
+                    base64,
+                    mime_type,
+                } => {
                     if let Some(u) = url {
                         params.insert("image_url".into(), serde_json::Value::String(u.clone()));
                     }
@@ -5003,7 +5039,11 @@ impl IpcServer {
                 CapabilityInput::Text { content } => {
                     params.insert("query".into(), serde_json::Value::String(content.clone()));
                 }
-                CapabilityInput::Audio { url, base64, mime_type } => {
+                CapabilityInput::Audio {
+                    url,
+                    base64,
+                    mime_type,
+                } => {
                     if let Some(u) = url {
                         params.insert("audio_url".into(), serde_json::Value::String(u.clone()));
                     }
@@ -5011,18 +5051,31 @@ impl IpcServer {
                         params.insert("audio_base64".into(), serde_json::Value::String(b.clone()));
                     }
                     if let Some(m) = mime_type {
-                        params.insert("audio_mime_type".into(), serde_json::Value::String(m.clone()));
+                        params.insert(
+                            "audio_mime_type".into(),
+                            serde_json::Value::String(m.clone()),
+                        );
                     }
                 }
-                CapabilityInput::Document { url, content, mime_type } => {
+                CapabilityInput::Document {
+                    url,
+                    content,
+                    mime_type,
+                } => {
                     if let Some(u) = url {
                         params.insert("document_url".into(), serde_json::Value::String(u.clone()));
                     }
                     if let Some(c) = content {
-                        params.insert("document_content".into(), serde_json::Value::String(c.clone()));
+                        params.insert(
+                            "document_content".into(),
+                            serde_json::Value::String(c.clone()),
+                        );
                     }
                     if let Some(m) = mime_type {
-                        params.insert("document_mime_type".into(), serde_json::Value::String(m.clone()));
+                        params.insert(
+                            "document_mime_type".into(),
+                            serde_json::Value::String(m.clone()),
+                        );
                     }
                 }
             }
@@ -5085,7 +5138,10 @@ impl IpcServer {
                 IpcResponse::error(
                     "capability_invoke",
                     "PROVIDER_DISCONNECTED",
-                    &format!("model-controller for '{}' disconnected mid-flight", request.task),
+                    &format!(
+                        "model-controller for '{}' disconnected mid-flight",
+                        request.task
+                    ),
                 )
             }
             Err(_) => {
@@ -6837,6 +6893,7 @@ impl IpcServer {
             IpcRequest::AcquireTelegramPollLease {
                 lease_key,
                 agent_id,
+                resource_ref,
             } => {
                 let Some(identity) = current_identity.as_ref() else {
                     return IpcResponse::error(
@@ -6863,15 +6920,33 @@ impl IpcServer {
                         ),
                     );
                 };
-                if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
-                    return IpcResponse::error(
-                        "telegram_poll_lease",
-                        "LEASE_FOREIGN_AUTHORITY",
-                        format!(
-                            "agent [{}] is owned by hotel [{}], and hotel [{}] is not in its telegram_poll_delegate_hotels",
-                            agent_id, agent_identity.authority_hotel, local_hotel_name
-                        ),
-                    );
+                let transport_resource_ref = resource_ref.as_deref().unwrap_or(&lease_key);
+                match Self::hotel_may_poll_transport_home(
+                    graph,
+                    &agent_identity,
+                    &agent_id,
+                    "telegram",
+                    transport_resource_ref,
+                    &local_hotel_name,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return IpcResponse::error(
+                            "telegram_poll_lease",
+                            "LEASE_TRANSPORT_HOME_MISMATCH",
+                            format!(
+                                "hotel [{}] is not the active telegram transport home for agent [{}] resource [{}]",
+                                local_hotel_name, agent_id, transport_resource_ref
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "telegram_poll_lease",
+                            "LEASE_TRANSPORT_HOME_LOOKUP_FAILED",
+                            err,
+                        );
+                    }
                 }
 
                 let mut guard = telegram_poll_leases.lock().await;
@@ -6946,6 +7021,7 @@ impl IpcServer {
             IpcRequest::RenewTelegramPollLease {
                 lease_key,
                 agent_id,
+                resource_ref,
                 lease_epoch,
             } => {
                 let Some(identity) = current_identity.as_ref() else {
@@ -6973,15 +7049,33 @@ impl IpcServer {
                         ),
                     );
                 };
-                if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
-                    return IpcResponse::error(
-                        "telegram_poll_lease",
-                        "LEASE_FOREIGN_AUTHORITY",
-                        format!(
-                            "agent [{}] is owned by hotel [{}], and hotel [{}] is not in its telegram_poll_delegate_hotels",
-                            agent_id, agent_identity.authority_hotel, local_hotel_name
-                        ),
-                    );
+                let transport_resource_ref = resource_ref.as_deref().unwrap_or(&lease_key);
+                match Self::hotel_may_poll_transport_home(
+                    graph,
+                    &agent_identity,
+                    &agent_id,
+                    "telegram",
+                    transport_resource_ref,
+                    &local_hotel_name,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return IpcResponse::error(
+                            "telegram_poll_lease",
+                            "LEASE_TRANSPORT_HOME_MISMATCH",
+                            format!(
+                                "hotel [{}] is not the active telegram transport home for agent [{}] resource [{}]",
+                                local_hotel_name, agent_id, transport_resource_ref
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "telegram_poll_lease",
+                            "LEASE_TRANSPORT_HOME_LOOKUP_FAILED",
+                            err,
+                        );
+                    }
                 }
 
                 let mut guard = telegram_poll_leases.lock().await;
@@ -8617,6 +8711,90 @@ impl IpcServer {
                 IpcResponse::RoleHomeSet {
                     role_name,
                     home_node: target_hotel,
+                }
+            }
+            IpcRequest::SetTransportHome {
+                agent_id,
+                transport,
+                resource_ref,
+                calling_role,
+                target_hotel,
+                standby_hotels,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "set_transport_home",
+                        "SET_TRANSPORT_HOME_UNREGISTERED",
+                        "guest must register before calling set_transport_home",
+                    );
+                };
+                if identity.role != "agent" {
+                    return IpcResponse::error(
+                        "set_transport_home",
+                        "SET_TRANSPORT_HOME_FORBIDDEN",
+                        "only agent guests may call set_transport_home",
+                    );
+                }
+
+                let calling_role_record = graph.get_role_incarnation(&agent_id, &calling_role);
+                let is_admin = calling_role_record
+                    .ok()
+                    .flatten()
+                    .map(|r| r.is_admin || r.role_name == "orchestrator")
+                    .unwrap_or(false);
+                if !is_admin {
+                    return IpcResponse::error(
+                        "set_transport_home",
+                        "SET_TRANSPORT_HOME_FORBIDDEN",
+                        format!(
+                            "role '{}' does not have authority to set transport homes",
+                            calling_role
+                        ),
+                    );
+                }
+
+                if graph.get_agent_identity(&agent_id).ok().flatten().is_none() {
+                    return IpcResponse::error(
+                        "set_transport_home",
+                        "SET_TRANSPORT_HOME_AGENT_UNKNOWN",
+                        format!("agent '{}' not found", agent_id),
+                    );
+                }
+
+                let home = MembraneTransportHomeRecord {
+                    agent_id: agent_id.clone(),
+                    transport: transport.clone(),
+                    resource_ref: resource_ref.clone(),
+                    active_home_hotel: target_hotel.clone(),
+                    standby_hotels: standby_hotels.clone(),
+                    managed_by_role: calling_role.clone(),
+                    lease_type: match transport.as_str() {
+                        "telegram" => "telegram_poll".to_string(),
+                        "discord" => "discord_gateway".to_string(),
+                        other => format!("{other}_transport"),
+                    },
+                    failover_policy: "manual-or-explicit-delegation".to_string(),
+                    status: MembraneTransportHomeStatus::Active,
+                };
+
+                if let Err(err) = graph.upsert_membrane_transport_home(&home) {
+                    return IpcResponse::error(
+                        "set_transport_home",
+                        "SET_TRANSPORT_HOME_PERSIST_FAILED",
+                        err.to_string(),
+                    );
+                }
+
+                info!(
+                    "Transport home for agent '{}' transport '{}' resource '{}' set to '{}' by '{}'",
+                    agent_id, transport, resource_ref, target_hotel, calling_role
+                );
+                IpcResponse::TransportHomeSet {
+                    agent_id,
+                    transport,
+                    resource_ref,
+                    active_home_hotel: target_hotel,
+                    standby_hotels,
                 }
             }
             IpcRequest::DelegateToPeer {
@@ -11233,22 +11411,34 @@ impl IpcServer {
                     };
                     match graph.upsert_guest(&mcp_record) {
                         Err(e) => {
-                            warn!("ProvisionMcpEndpoint: failed to upsert mcp-membrane guest [{}]: {e}", mcp_guest_id);
+                            warn!(
+                                "ProvisionMcpEndpoint: failed to upsert mcp-membrane guest [{}]: {e}",
+                                mcp_guest_id
+                            );
                             false
                         }
                         Ok(()) => {
                             if let Some(requester) = materialization_requester {
                                 match requester.ensure_guest_active(&mcp_guest_id).await {
                                     Ok(true) => {
-                                        info!("mcp-membrane guest [{}] materialization triggered.", mcp_guest_id);
+                                        info!(
+                                            "mcp-membrane guest [{}] materialization triggered.",
+                                            mcp_guest_id
+                                        );
                                         true
                                     }
                                     Ok(false) => {
-                                        warn!("mcp-membrane guest [{}] could not be materialized.", mcp_guest_id);
+                                        warn!(
+                                            "mcp-membrane guest [{}] could not be materialized.",
+                                            mcp_guest_id
+                                        );
                                         false
                                     }
                                     Err(e) => {
-                                        warn!("mcp-membrane guest [{}] materialization error: {e}", mcp_guest_id);
+                                        warn!(
+                                            "mcp-membrane guest [{}] materialization error: {e}",
+                                            mcp_guest_id
+                                        );
                                         false
                                     }
                                 }
@@ -11258,7 +11448,10 @@ impl IpcServer {
                         }
                     }
                 } else {
-                    warn!("ProvisionMcpEndpoint: hotel name not found for node [{}]; skipping guest spawn.", local_node_id);
+                    warn!(
+                        "ProvisionMcpEndpoint: hotel name not found for node [{}]; skipping guest spawn.",
+                        local_node_id
+                    );
                     false
                 };
 
@@ -11504,47 +11697,69 @@ impl IpcServer {
                 Err(e) => IpcResponse::error("list_user_tasks", "STORAGE_ERROR", format!("{e}")),
             },
 
-            IpcRequest::PushHealEntry { guest_id, raw_text } => {
-                match heal_queue.as_deref() {
-                    Some(hq) => match hq.push_error(&guest_id, &raw_text) {
-                        Ok(id) => IpcResponse::HealEntryPushed { id },
-                        Err(e) => IpcResponse::error("push_heal_entry", "STORAGE_ERROR", format!("{e}")),
-                    },
-                    None => IpcResponse::error("push_heal_entry", "UNAVAILABLE", "heal_queue not configured".to_string()),
-                }
-            }
+            IpcRequest::PushHealEntry { guest_id, raw_text } => match heal_queue.as_deref() {
+                Some(hq) => match hq.push_error(&guest_id, &raw_text) {
+                    Ok(id) => IpcResponse::HealEntryPushed { id },
+                    Err(e) => {
+                        IpcResponse::error("push_heal_entry", "STORAGE_ERROR", format!("{e}"))
+                    }
+                },
+                None => IpcResponse::error(
+                    "push_heal_entry",
+                    "UNAVAILABLE",
+                    "heal_queue not configured".to_string(),
+                ),
+            },
 
-            IpcRequest::GetHealQueuePending { limit } => {
-                match heal_queue.as_deref() {
-                    Some(hq) => match hq.pending_errors(limit) {
-                        Ok(rows) => IpcResponse::HealQueuePending { rows },
-                        Err(e) => IpcResponse::error("get_heal_queue_pending", "STORAGE_ERROR", format!("{e}")),
-                    },
-                    None => IpcResponse::HealQueuePending { rows: vec![] },
-                }
-            }
+            IpcRequest::GetHealQueuePending { limit } => match heal_queue.as_deref() {
+                Some(hq) => match hq.pending_errors(limit) {
+                    Ok(rows) => IpcResponse::HealQueuePending { rows },
+                    Err(e) => IpcResponse::error(
+                        "get_heal_queue_pending",
+                        "STORAGE_ERROR",
+                        format!("{e}"),
+                    ),
+                },
+                None => IpcResponse::HealQueuePending { rows: vec![] },
+            },
 
-            IpcRequest::TriageHealEntry { id, severity, pattern_tag, heal_action } => {
-                match heal_queue.as_deref() {
-                    Some(hq) => match hq.update_triage(&id, &severity, &pattern_tag, &heal_action) {
-                        Ok(()) => IpcResponse::success("triage_heal_entry", None),
-                        Err(e) => IpcResponse::error("triage_heal_entry", "STORAGE_ERROR", format!("{e}")),
-                    },
-                    None => IpcResponse::error("triage_heal_entry", "UNAVAILABLE", "heal_queue not configured".to_string()),
-                }
-            }
+            IpcRequest::TriageHealEntry {
+                id,
+                severity,
+                pattern_tag,
+                heal_action,
+            } => match heal_queue.as_deref() {
+                Some(hq) => match hq.update_triage(&id, &severity, &pattern_tag, &heal_action) {
+                    Ok(()) => IpcResponse::success("triage_heal_entry", None),
+                    Err(e) => {
+                        IpcResponse::error("triage_heal_entry", "STORAGE_ERROR", format!("{e}"))
+                    }
+                },
+                None => IpcResponse::error(
+                    "triage_heal_entry",
+                    "UNAVAILABLE",
+                    "heal_queue not configured".to_string(),
+                ),
+            },
 
-            IpcRequest::ResolveHealEntry { id, outcome } => {
-                match heal_queue.as_deref() {
-                    Some(hq) => match hq.resolve(&id, &outcome) {
-                        Ok(()) => IpcResponse::success("resolve_heal_entry", None),
-                        Err(e) => IpcResponse::error("resolve_heal_entry", "STORAGE_ERROR", format!("{e}")),
-                    },
-                    None => IpcResponse::error("resolve_heal_entry", "UNAVAILABLE", "heal_queue not configured".to_string()),
-                }
-            }
+            IpcRequest::ResolveHealEntry { id, outcome } => match heal_queue.as_deref() {
+                Some(hq) => match hq.resolve(&id, &outcome) {
+                    Ok(()) => IpcResponse::success("resolve_heal_entry", None),
+                    Err(e) => {
+                        IpcResponse::error("resolve_heal_entry", "STORAGE_ERROR", format!("{e}"))
+                    }
+                },
+                None => IpcResponse::error(
+                    "resolve_heal_entry",
+                    "UNAVAILABLE",
+                    "heal_queue not configured".to_string(),
+                ),
+            },
 
-            IpcRequest::AgentMigrateToHotel { agent_id, dest_hotel } => {
+            IpcRequest::AgentMigrateToHotel {
+                agent_id,
+                dest_hotel,
+            } => {
                 match Self::handle_agent_migrate_to_hotel(
                     &registry,
                     graph,
@@ -11574,11 +11789,9 @@ impl IpcServer {
                 .await
                 {
                     Ok(_agent_id) => IpcResponse::success("apply_agent_bundle", None),
-                    Err(e) => IpcResponse::error(
-                        "apply_agent_bundle",
-                        "APPLY_ERROR",
-                        format!("{e:#}"),
-                    ),
+                    Err(e) => {
+                        IpcResponse::error("apply_agent_bundle", "APPLY_ERROR", format!("{e:#}"))
+                    }
                 }
             }
         }
@@ -11682,7 +11895,8 @@ impl IpcServer {
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "cannot derive agent_key for '{}': no philote guest found on hotel '{}'",
-                    agent_id, hotel_name
+                    agent_id,
+                    hotel_name
                 )
             })?;
 
@@ -11734,14 +11948,16 @@ impl IpcServer {
         let mut vault_entries: Vec<VaultEntryExport> = Vec::new();
         if let Ok(Some(secret_ref_raw)) = graph.get_config_value(&token_config_key) {
             // Config value may be a quoted JSON string or a bare string
-            let secret_ref = serde_json::from_str::<String>(&secret_ref_raw)
-                .unwrap_or(secret_ref_raw.clone());
+            let secret_ref =
+                serde_json::from_str::<String>(&secret_ref_raw).unwrap_or(secret_ref_raw.clone());
             if let Ok(Some(plaintext)) = export_secret_plaintext(graph, &secret_ref) {
                 let vault_name = vault_registry
                     .iter()
                     .find_map(|e| {
                         if e.get("secret_ref").and_then(|v| v.as_str()) == Some(&secret_ref) {
-                            e.get("vault_name").and_then(|v| v.as_str()).map(str::to_string)
+                            e.get("vault_name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
                         } else {
                             None
                         }
@@ -11823,9 +12039,9 @@ impl IpcServer {
         let blob_url = format!("http://{source_mesh_host}:{blob_port}/download/{blob_id}");
 
         // ── 10. Get dest hotel node_id ───────────────────────────────────────
-        let dest_record = graph
-            .get_hotel(dest_hotel)?
-            .ok_or_else(|| anyhow::anyhow!("dest hotel '{}' not found in local graph", dest_hotel))?;
+        let dest_record = graph.get_hotel(dest_hotel)?.ok_or_else(|| {
+            anyhow::anyhow!("dest hotel '{}' not found in local graph", dest_hotel)
+        })?;
         let dest_node_id = dest_record.capabilities.node_id;
 
         // Verify the dest node is reachable in the registry
@@ -11834,7 +12050,8 @@ impl IpcServer {
             if guard.get_node(&dest_node_id).is_none() {
                 anyhow::bail!(
                     "dest hotel '{}' (node {}) is not active in the mesh registry",
-                    dest_hotel, dest_node_id
+                    dest_hotel,
+                    dest_node_id
                 );
             }
         }
@@ -11852,7 +12069,9 @@ impl IpcServer {
         )
         .await?;
         match client
-            .send_request(IpcRequest::SubscribeInbox { role: reply_role.into() })
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
             .await?
         {
             IpcResponse::Standard { ok: true, .. } => {}
@@ -11870,7 +12089,10 @@ impl IpcServer {
             caller_id: local_node_id.to_string(),
             visibility_scope: "operator".into(),
             grant_scope: "default".into(),
-            intent: format!("migrate agent '{}' from '{}' to '{}'", agent_id, hotel_name, dest_hotel),
+            intent: format!(
+                "migrate agent '{}' from '{}' to '{}'",
+                agent_id, hotel_name, dest_hotel
+            ),
             payload: serde_json::json!({ "blob_url": blob_url }),
             reply_to_node: local_node_id.to_string(),
             reply_to_role: reply_role.into(),
@@ -11892,14 +12114,20 @@ impl IpcServer {
             other => anyhow::bail!("EmitTask for deploy_bundle failed: {other:?}"),
         }
 
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            client.recv_task(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for deploy_bundle reply from '{}'", dest_hotel))??;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out waiting for deploy_bundle reply from '{}'",
+                    dest_hotel
+                )
+            })??;
 
-        let IpcResponse::InboundTask { task_json: reply_json, .. } = reply else {
+        let IpcResponse::InboundTask {
+            task_json: reply_json,
+            ..
+        } = reply
+        else {
             anyhow::bail!("unexpected deploy_bundle reply: {reply:?}");
         };
         let result: serde_json::Value = serde_json::from_str(&reply_json)?;
@@ -11968,7 +12196,10 @@ impl IpcServer {
             }
             // Clear home_node if it was pinned to the source hotel
             if ri.home_node.as_deref() == Some(source_hotel)
-                || ri.home_node.as_deref().map_or(false, |n| n.contains(source_hotel))
+                || ri
+                    .home_node
+                    .as_deref()
+                    .map_or(false, |n| n.contains(source_hotel))
             {
                 ri.home_node = None;
             }
@@ -12005,10 +12236,7 @@ impl IpcServer {
             graph.set_config_value("vault_registry", &serde_json::to_string(&registry)?)?;
 
             // Set config key to the new secret_ref (as a JSON string)
-            graph.set_config_value(
-                &ve.config_key,
-                &serde_json::to_string(&new_secret_ref)?,
-            )?;
+            graph.set_config_value(&ve.config_key, &serde_json::to_string(&new_secret_ref)?)?;
         }
 
         // ── 5. Non-vault config entries ──────────────────────────────────────
@@ -12022,7 +12250,9 @@ impl IpcServer {
         for ge in &bundle.guests {
             let new_guest_id = format!("{dest_hotel}:{}", ge.guest_id_suffix);
             // Replace all occurrences of source hotel name in config_json env vars
-            let new_config_json = ge.config_json.replace(source_hotel.as_str(), dest_hotel.as_str());
+            let new_config_json = ge
+                .config_json
+                .replace(source_hotel.as_str(), dest_hotel.as_str());
             let rec = GuestRecord {
                 hotel_name: dest_hotel.clone(),
                 guest_id: new_guest_id.clone(),
@@ -12062,7 +12292,10 @@ impl IpcServer {
                         }));
                         let new_roster_json = serde_json::to_string(&roster)?;
                         if let Some(env) = cfg.get_mut("env").and_then(|e| e.as_object_mut()) {
-                            env.insert(roster_key.to_string(), serde_json::Value::String(new_roster_json));
+                            env.insert(
+                                roster_key.to_string(),
+                                serde_json::Value::String(new_roster_json),
+                            );
                         }
                         gw.config_json = serde_json::to_string(&cfg)?;
                         graph.upsert_guest(&gw)?;
@@ -13563,10 +13796,7 @@ impl IpcServer {
                         serde_json::json!(skillset),
                     );
                     if !on_demand.is_empty() {
-                        obj.insert(
-                            "on_demand_skills".to_string(),
-                            serde_json::json!(on_demand),
-                        );
+                        obj.insert("on_demand_skills".to_string(), serde_json::json!(on_demand));
                     }
                 } else {
                     bindings = serde_json::json!({
@@ -14431,8 +14661,7 @@ impl IpcServer {
         socket_path: &str,
         repo_id: Option<&str>,
     ) -> IpcResponse {
-        let repo_id =
-            repo_id.unwrap_or("onnx-community/Florence-2-base-ft");
+        let repo_id = repo_id.unwrap_or("onnx-community/Florence-2-base-ft");
 
         // Step 1: resolve hotel name.
         let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
@@ -14448,9 +14677,7 @@ impl IpcServer {
         let config = serde_json::json!({ "repo_id": repo_id });
         let config_json = match serde_json::to_string(&config) {
             Ok(j) => j,
-            Err(e) => {
-                return IpcResponse::error("vision_setup", "SERIALIZE_ERROR", &e.to_string())
-            }
+            Err(e) => return IpcResponse::error("vision_setup", "SERIALIZE_ERROR", &e.to_string()),
         };
         let key = format!("component:{guest_id}");
         if let Err(e) = graph.set_config_value(&key, &config_json) {
@@ -14472,11 +14699,7 @@ impl IpcServer {
             updated_secs: 0,
         };
         if let Err(e) = graph.upsert_model_profile(&profile) {
-            return IpcResponse::error(
-                "vision_setup",
-                "PROFILE_REGISTER_ERROR",
-                &e.to_string(),
-            );
+            return IpcResponse::error("vision_setup", "PROFILE_REGISTER_ERROR", &e.to_string());
         }
 
         // Step 4: upsert guest record so the reconcile loop spawns model-controller-vision.
@@ -15283,6 +15506,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "role.configure"
             | "role.list"
             | "role.set_home"
+            | "transport.set_home"
             | "bash.exec"
             | "training.list"
             | "training.correct"
@@ -15714,7 +15938,9 @@ mod tests {
     use ansible_mesh_core::agent_graph_storage::{
         AgentGraphStorage, AgentReflexPreference, AgentRoutingPreference, SqliteAgentGraphStorage,
     };
-    use ansible_mesh_core::graph::{RoleIncarnationRecord, TurnLoopConfig};
+    use ansible_mesh_core::graph::{
+        MembraneTransportHomeRecord, RoleIncarnationRecord, TurnLoopConfig,
+    };
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
@@ -24318,6 +24544,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: lease_key.into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("primary lease request");
@@ -24332,6 +24559,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: lease_key.into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("secondary lease request");
@@ -24349,6 +24577,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: lease_key.into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("secondary re-acquire after disconnect");
@@ -24425,6 +24654,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-aria-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("foreign authority request");
@@ -24509,6 +24739,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-aria-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("delegated foreign authority request");
@@ -24518,6 +24749,220 @@ mod tests {
         assert!(granted);
         assert_eq!(lease.lease_epoch, 1);
         assert_eq!(lease.owner_guest_id, "membrane-telegram-01");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_transport_home_persists_graph_record() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "vps-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "vps-jane".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+                authority_hotel: "vps-jane".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: true,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed orchestrator role");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "vps-jane",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let response = agent
+            .send_request(IpcRequest::SetTransportHome {
+                agent_id: "agent-beacon".into(),
+                transport: "telegram".into(),
+                resource_ref: "telegram_bot_token_beacon".into(),
+                calling_role: "orchestrator".into(),
+                target_hotel: "vps-jane".into(),
+                standby_hotels: vec!["mbp-jane".into(), "mac-jane".into()],
+            })
+            .await
+            .expect("set transport home");
+
+        match response {
+            IpcResponse::TransportHomeSet {
+                active_home_hotel,
+                standby_hotels,
+                ..
+            } => {
+                assert_eq!(active_home_hotel, "vps-jane");
+                assert_eq!(standby_hotels, vec!["mbp-jane", "mac-jane"]);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let home = graph
+            .resolve_membrane_transport_home(
+                "agent-beacon",
+                "telegram",
+                "telegram_bot_token_beacon",
+            )
+            .expect("resolve transport home")
+            .expect("transport home");
+        assert_eq!(home.active_home_hotel, "vps-jane");
+        assert_eq!(home.lease_type, "telegram_poll");
+        assert_eq!(home.managed_by_role, "orchestrator");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_poll_lease_denies_non_home_transport_hotel() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+            .upsert_membrane_transport_home(&MembraneTransportHomeRecord {
+                agent_id: "agent-beacon".into(),
+                transport: "telegram".into(),
+                resource_ref: "telegram_bot_token_beacon".into(),
+                active_home_hotel: "vps-jane".into(),
+                standby_hotels: vec!["local-hotel".into()],
+                managed_by_role: "orchestrator".into(),
+                lease_type: "telegram_poll".into(),
+                failover_policy: "manual-or-explicit-delegation".into(),
+                status: MembraneTransportHomeStatus::Active,
+            })
+            .expect("seed transport home");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut poller = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-telegram-01".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("poller connect");
+
+        let response = poller
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:telegram_bot_token_beacon:deadbeefcafebabe".into(),
+                agent_id: "agent-beacon".into(),
+                resource_ref: Some("telegram_bot_token_beacon".into()),
+            })
+            .await
+            .expect("transport home mismatch request");
+
+        match response {
+            IpcResponse::Standard {
+                ok, code, message, ..
+            } => {
+                assert!(!ok);
+                assert_eq!(code, "LEASE_TRANSPORT_HOME_MISMATCH");
+                assert!(message.contains("local-hotel"));
+                assert!(message.contains("telegram_bot_token_beacon"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -24585,6 +25030,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("acquire lease");
@@ -24597,6 +25043,7 @@ mod tests {
             .send_request(IpcRequest::RenewTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
                 lease_epoch: epoch,
             })
             .await
@@ -24680,6 +25127,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("acquire lease");
@@ -24693,6 +25141,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("takeover acquire");
@@ -24775,6 +25224,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("acquire lease");
@@ -24794,6 +25244,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("takeover acquire");
@@ -24888,6 +25339,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:telegram_bot_token:deadbeefcafebabe".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("acquire lease");
@@ -26984,6 +27436,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:bot_token:deadbeef".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("lease request");
@@ -27020,6 +27473,7 @@ mod tests {
             .send_request(IpcRequest::AcquireTelegramPollLease {
                 lease_key: "telegram:bot_token:deadbeef".into(),
                 agent_id: "agent-jane-01".into(),
+                resource_ref: None,
             })
             .await
             .expect("re-acquire lease");
