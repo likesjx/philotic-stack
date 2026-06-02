@@ -4162,6 +4162,16 @@ impl IpcServer {
             });
         }
 
+        // Push current MuninnDB state to the new guest so guests that connect while
+        // MuninnDB is down don't falsely assume available=true until the next probe flip.
+        if let Some(cfg) = muninn_config.as_deref() {
+            let available = muninn_reachable.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = outbound_tx.send(IpcResponse::MuninnStatus {
+                available,
+                endpoint: cfg.base_url.clone(),
+            });
+        }
+
         let mut subscribed_roles = Vec::new();
         let mut current_identity: Option<GuestIdentity> = None;
         loop {
