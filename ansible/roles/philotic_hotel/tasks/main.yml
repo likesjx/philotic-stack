@@ -10,6 +10,16 @@
     update_cache: yes
   when: ansible_facts["os_family"] == 'Debian'
 
+- name: Install Docker for Memgraph
+  apt:
+    name:
+      - docker.io
+    state: present
+    update_cache: yes
+  when:
+    - ansible_facts["os_family"] == 'Debian'
+    - philotic_memgraph_enabled | bool
+
 # ── Service user ───────────────────────────────────────────────────────────────
 
 - name: Create philotic group
@@ -49,6 +59,35 @@
     owner: "{{ philotic_user }}"
     group: "{{ philotic_group }}"
     mode: "0700"
+
+# ── Central graph database (optional Memgraph provider) ───────────────────────
+
+- name: Create Memgraph data directory
+  file:
+    path: "{{ philotic_memgraph_data_dir }}"
+    state: directory
+    owner: "root"
+    group: "root"
+    mode: "0755"
+  when: philotic_memgraph_enabled | bool
+
+- name: Deploy Memgraph systemd unit
+  template:
+    src: philotic-memgraph.service.j2
+    dest: /etc/systemd/system/philotic-memgraph.service
+    mode: "0644"
+  when: philotic_memgraph_enabled | bool
+  notify:
+    - Reload systemd
+    - Restart philotic-memgraph
+
+- name: Enable and start Memgraph
+  systemd:
+    name: philotic-memgraph
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: philotic_memgraph_enabled | bool
 
 # ── Binaries ───────────────────────────────────────────────────────────────────
 # Binaries are delivered externally (rsync, artifact fetch, or CI distribution).

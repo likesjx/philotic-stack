@@ -46,6 +46,22 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 - [ ] Prove roaming peer auto-reconnect live by validating observed-endpoint reconciliation against stale peer graph records.
 - [ ] Feed hotel-owned router traces and mesh events into the desktop event log through `philotic-web` so mesh/routing failures are visible without live journal spelunking.
 
+## New Project: Cypher-First Graph Datasource
+
+Proposal: [GRAPH_DATASOURCE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DATASOURCE_PROPOSAL.md)
+
+Seam IDs: `embedded-cypher-provider`, `central-graph-provider`, `graph-runner-migration`
+
+- [ ] Keep the current SQLite `graph.query` transpiler as an explicit compatibility bridge, not the target Cypher implementation.
+- [ ] Deploy Memgraph on `vps-jane` in Docker/Compose with persistent volume, backup procedure, and mesh-visible endpoint/config.
+- [ ] Add a Memgraph/Bolt-backed `graph-datasource` provider behind the provider boundary.
+- [ ] Prove Beacon-style graph writes against Memgraph: `MATCH`, `MERGE`, relationship creation from matched variables, and bounded `RETURN`.
+- [ ] Decide auth, network exposure, and whether the Memgraph MCP sidecar is useful for operator-facing tools.
+- [ ] Keep Kuzu as a deferred embedded-provider experiment for local hotel graphs.
+  - [ ] Resolve Kuzu Rust binding/linker issue on macOS Tahoe/Rust 1.94, or switch the spike to a maintained fork/alternate binding.
+- [ ] Define the `GraphStore`/provider contract around `query`, `schema`, `validate`, and graph-shaped results.
+- [ ] Decide whether centralized graph authority is Memgraph, Kuzu-per-hotel with mesh sync, or a tiered model with both.
+
 ## New Project: Memory Cultivation and True-Up
 
 Proposal: [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)

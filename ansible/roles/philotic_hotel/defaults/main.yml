@@ -69,6 +69,18 @@ philotic_agents: {}
 # Optional hotel-scoped auth/config overlays projected into mesh-config.json
 philotic_oidc_public_base_url: ""
 
+# Central Cypher graph provider. When enabled, graph-datasource can target a
+# local Memgraph Bolt endpoint while agents still see the same graph.query tool.
+philotic_memgraph_enabled: false
+philotic_memgraph_image: "memgraph/memgraph:latest"
+philotic_memgraph_container_name: "philotic-memgraph"
+philotic_memgraph_data_dir: "{{ philotic_data_dir }}/memgraph"
+philotic_memgraph_host: "127.0.0.1"
+philotic_memgraph_port: 7687
+philotic_graph_provider: "{{ 'memgraph' if philotic_memgraph_enabled else 'sqlite' }}"
+philotic_memgraph_user: ""
+philotic_memgraph_db: ""
+
 # Log level
 philotic_rust_log: "info"
 

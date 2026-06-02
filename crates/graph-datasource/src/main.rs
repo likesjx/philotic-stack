@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use datasource::runtime::{DatasourceGuestConfig, run_datasource_controller};
+use datasource::{
+    controller::DatasourceProvider,
+    runtime::{DatasourceGuestConfig, run_datasource_controller},
+};
 use graph_datasource::SqliteCypherProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,25 +27,53 @@ fn base_dir() -> PathBuf {
         .join("graphs")
 }
 
+fn provider_mode() -> String {
+    std::env::var("PHILOTIC_GRAPH_PROVIDER").unwrap_or_else(|_| "sqlite".to_string())
+}
+
+fn build_providers(mode: &str, db_base_path: PathBuf) -> Result<Vec<Arc<dyn DatasourceProvider>>> {
+    match mode {
+        "sqlite" | "sqlite-cypher" => Ok(vec![Arc::new(SqliteCypherProvider::new(db_base_path))]),
+        "memgraph" | "memgraph-cypher" => build_memgraph_provider(),
+        other => anyhow::bail!("unsupported PHILOTIC_GRAPH_PROVIDER mode: {other}"),
+    }
+}
+
+#[cfg(feature = "memgraph-provider")]
+fn build_memgraph_provider() -> Result<Vec<Arc<dyn DatasourceProvider>>> {
+    Ok(vec![Arc::new(
+        graph_datasource::MemgraphCypherProvider::from_env(),
+    )])
+}
+
+#[cfg(not(feature = "memgraph-provider"))]
+fn build_memgraph_provider() -> Result<Vec<Arc<dyn DatasourceProvider>>> {
+    anyhow::bail!(
+        "PHILOTIC_GRAPH_PROVIDER=memgraph requires graph-datasource built with feature `memgraph-provider`"
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let guest_id_static: &'static str = Box::leak(guest_id().into_boxed_str());
     let db_base_path = base_dir();
+    let graph_provider = provider_mode();
 
     info!(
         guest_id = guest_id_static,
         db_dir = ?db_base_path,
-        "graph-datasource starting with SqliteCypherProvider"
+        provider = graph_provider,
+        "graph-datasource starting"
     );
 
     run_datasource_controller(DatasourceGuestConfig {
         guest_id: guest_id_static,
         role: "graph-datasource",
         providers: Box::new(move || {
-            let provider = SqliteCypherProvider::new(db_base_path.clone());
-            vec![Arc::new(provider)]
+            build_providers(&graph_provider, db_base_path.clone())
+                .expect("failed to initialize graph datasource providers")
         }),
     })
     .await
@@ -51,7 +82,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::base_dir;
+    use super::{base_dir, build_providers, provider_mode};
     use std::path::PathBuf;
 
     #[test]
@@ -80,5 +111,22 @@ mod tests {
             std::env::remove_var("PHILOTIC_PROFILE");
             std::env::remove_var("HOME");
         }
+    }
+
+    #[test]
+    fn provider_mode_defaults_to_sqlite() {
+        unsafe {
+            std::env::remove_var("PHILOTIC_GRAPH_PROVIDER");
+        }
+
+        assert_eq!(provider_mode(), "sqlite");
+    }
+
+    #[test]
+    fn sqlite_provider_mode_builds_provider() {
+        let providers =
+            build_providers("sqlite", PathBuf::from("/tmp/philotic-graph-test")).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id(), "sqlite-cypher");
     }
 }

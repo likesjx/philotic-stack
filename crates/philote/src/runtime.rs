@@ -1453,6 +1453,10 @@ pub struct AgentRuntime {
     /// Reconciled on every watchdog tick — entries are added on first observation
     /// and removed when the session is no longer in a waiting phase.
     stuck_turn_first_seen: HashMap<String, std::time::Instant>,
+    /// Signature of the exact wait state currently being timed per session.
+    /// Includes turn id, phase, iteration, and pending tool name so productive
+    /// model/tool progress resets the watchdog timer.
+    stuck_turn_signature: HashMap<String, String>,
     /// Tracks when any active turn started, regardless of phase. Used as a
     /// catch-all eviction budget — a turn that stays active for too long in any
     /// phase (including InProgress) will be forcibly evicted. Separate from
@@ -1475,6 +1479,7 @@ impl AgentRuntime {
             default_agent_profile: AgentProfile::default(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
+            stuck_turn_signature: HashMap::new(),
             total_active_since: HashMap::new(),
             network_offline: false,
         }
@@ -1965,46 +1970,78 @@ impl AgentRuntime {
             .retain(|id, _| self.sessions.contains_key(id));
 
         // Step 1: reconcile stuck_turn_first_seen against current session state.
-        // Add sessions newly in a waiting phase; remove those that are no longer waiting.
+        // Add sessions newly in a waiting phase; reset when the exact wait signature changes.
         // Parked approval turns count as waiting (they live in parked_approval_turn, not active_turn).
         let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
         for session_id in &session_ids {
-            let is_waiting = self
-                .sessions
-                .get(session_id)
-                .map(|s| {
-                    let active_waiting = s
-                        .active_turn
-                        .as_ref()
-                        .map(|t| {
-                            matches!(
-                                t.phase,
-                                TurnPhase::WaitingModel
-                                    | TurnPhase::Thinking
-                                    | TurnPhase::WaitingTool
-                                    | TurnPhase::WaitingVoice
-                            )
-                        })
-                        .unwrap_or(false);
-                    active_waiting || s.has_parked_approval_turn()
-                })
-                .unwrap_or(false);
+            let wait_signature = self.sessions.get(session_id).and_then(|s| {
+                if let Some(turn) = s.active_turn.as_ref() {
+                    if matches!(
+                        turn.phase,
+                        TurnPhase::WaitingModel
+                            | TurnPhase::Thinking
+                            | TurnPhase::WaitingTool
+                            | TurnPhase::WaitingVoice
+                    ) {
+                        let pending_tool = turn
+                            .pending_tool_call
+                            .as_ref()
+                            .map(|tool| tool.tool_name.as_str())
+                            .unwrap_or("-");
+                        return Some(format!(
+                            "active:{}:{:?}:{}:{}",
+                            turn.turn_id, turn.phase, turn.iteration, pending_tool
+                        ));
+                    }
+                }
+                if let Some(turn) = s.parked_approval_turn.as_ref() {
+                    return Some(format!("parked_approval:{}", turn.turn_id));
+                }
+                if let Some(turn) = s.parked_plan_turn.as_ref() {
+                    return Some(format!("parked_plan:{}", turn.turn_id));
+                }
+                None
+            });
 
-            if is_waiting {
-                self.stuck_turn_first_seen
-                    .entry(session_id.clone())
-                    .or_insert(now);
+            if let Some(signature) = wait_signature {
+                let signature_changed = self
+                    .stuck_turn_signature
+                    .get(session_id)
+                    .map(|current| current != &signature)
+                    .unwrap_or(true);
+                if signature_changed {
+                    self.stuck_turn_first_seen.insert(session_id.clone(), now);
+                    self.stuck_turn_signature
+                        .insert(session_id.clone(), signature);
+                } else {
+                    self.stuck_turn_first_seen
+                        .entry(session_id.clone())
+                        .or_insert(now);
+                }
             } else {
                 self.stuck_turn_first_seen.remove(session_id);
+                self.stuck_turn_signature.remove(session_id);
             }
         }
         // Also remove entries for sessions that no longer exist.
         self.stuck_turn_first_seen
             .retain(|id, _| self.sessions.contains_key(id));
+        self.stuck_turn_signature
+            .retain(|id, _| self.sessions.contains_key(id));
 
         // Step 2: collect sessions whose waiting turn has exceeded the deadline.
         // Parked approval turns (in parked_approval_turn) use WAITING_APPROVAL_SECS.
-        let timed_out: Vec<(String, String, String, Option<String>, String, String, u64)> = self
+        let timed_out: Vec<(
+            String,
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            u64,
+        )> = self
             .sessions
             .iter()
             .filter_map(|(session_id, state)| {
@@ -2015,6 +2052,8 @@ impl AgentRuntime {
                     if elapsed >= WAITING_APPROVAL_SECS {
                         return Some((
                             session_id.clone(),
+                            turn.task_id,
+                            turn.turn_id.clone(),
                             turn.final_reply_to.clone(),
                             turn.final_reply_role.clone(),
                             turn.final_reply_guest_id.clone(),
@@ -2030,6 +2069,8 @@ impl AgentRuntime {
                     if elapsed >= WAITING_APPROVAL_SECS {
                         return Some((
                             session_id.clone(),
+                            turn.task_id,
+                            turn.turn_id.clone(),
                             turn.final_reply_to.clone(),
                             turn.final_reply_role.clone(),
                             turn.final_reply_guest_id.clone(),
@@ -2062,6 +2103,8 @@ impl AgentRuntime {
                 }
                 Some((
                     session_id.clone(),
+                    turn.task_id,
+                    turn.turn_id.clone(),
                     turn.final_reply_to.clone(),
                     turn.final_reply_role.clone(),
                     turn.final_reply_guest_id.clone(),
@@ -2076,7 +2119,17 @@ impl AgentRuntime {
         // in any phase (including InProgress) that wasn't already caught above.
         let already_caught: std::collections::HashSet<String> =
             timed_out.iter().map(|(id, ..)| id.clone()).collect();
-        let catch_all: Vec<(String, String, String, Option<String>, String, String, u64)> = self
+        let catch_all: Vec<(
+            String,
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            u64,
+        )> = self
             .total_active_since
             .iter()
             .filter_map(|(session_id, &started)| {
@@ -2091,6 +2144,8 @@ impl AgentRuntime {
                 let turn = state.active_turn.as_ref()?;
                 Some((
                     session_id.clone(),
+                    turn.task_id,
+                    turn.turn_id.clone(),
                     turn.final_reply_to.clone(),
                     turn.final_reply_role.clone(),
                     turn.final_reply_guest_id.clone(),
@@ -2103,8 +2158,17 @@ impl AgentRuntime {
         let timed_out: Vec<_> = timed_out.into_iter().chain(catch_all).collect();
 
         // Step 3: evict.
-        for (session_id, reply_to, reply_role, reply_guest_id, chat_id, phase, elapsed_secs) in
-            timed_out
+        for (
+            session_id,
+            task_id,
+            turn_id,
+            reply_to,
+            reply_role,
+            reply_guest_id,
+            chat_id,
+            phase,
+            elapsed_secs,
+        ) in timed_out
         {
             let has_pending_tool = self
                 .sessions
@@ -2121,6 +2185,7 @@ impl AgentRuntime {
             );
 
             self.stuck_turn_first_seen.remove(&session_id);
+            self.stuck_turn_signature.remove(&session_id);
             self.total_active_since.remove(&session_id);
 
             if let Some(state) = self.sessions.get_mut(&session_id) {
@@ -2141,6 +2206,21 @@ impl AgentRuntime {
                 }
             }
 
+            let reason = format!(
+                "Turn watchdog evicted stuck turn after {elapsed_secs}s in {phase}."
+            );
+            if let Err(e) = self
+                .ipc_client
+                .send_request(IpcRequest::FailTask {
+                    task_id,
+                    error_code: "TURN_WATCHDOG_TIMEOUT".into(),
+                    reason: reason.clone(),
+                })
+                .await
+            {
+                warn!("Turn watchdog: failed to mark task failed: {}", e);
+            }
+
             // Notify the user that the session is unblocked.
             let notify_req = IpcRequest::EmitTask {
                 target_node: reply_to,
@@ -2149,6 +2229,7 @@ impl AgentRuntime {
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,
+                    "turn_id": turn_id,
                     "chat_id": chat_id,
                     "content": "*(I seem to have gotten stuck waiting for a response. The session is unblocked — please try again.)*",
                     "final": true,

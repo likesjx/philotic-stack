@@ -8,6 +8,11 @@
     name: philotic-hotel
     state: restarted
 
+- name: Restart philotic-memgraph
+  systemd:
+    name: philotic-memgraph
+    state: restarted
+
 - name: Restart philotic-onnx-sidecar
   systemd:
     name: philotic-onnx-sidecar

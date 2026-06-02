@@ -996,7 +996,7 @@ pub struct ExecutionPolicy {
 impl Default for ExecutionPolicy {
     fn default() -> Self {
         Self {
-            iteration_cap: 20,
+            iteration_cap: 10,
             plan_required_on_skill: true,
             stream_tool_events: true,
             stall_detection_threshold: 3,
