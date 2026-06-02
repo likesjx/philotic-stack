@@ -203,15 +203,10 @@ async fn transcode_raw_to_wav_16k(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| {
-            format!(
-                "failed to spawn [{ffmpeg_bin}] for WAV transcode from [{source_mime_type}]"
-            )
+            format!("failed to spawn [{ffmpeg_bin}] for WAV transcode from [{source_mime_type}]")
         })?;
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("WAV transcoder missing stdin")?;
+    let mut stdin = child.stdin.take().context("WAV transcoder missing stdin")?;
     tokio::io::AsyncWriteExt::write_all(&mut stdin, &source_bytes)
         .await
         .context("failed to stream source audio into WAV transcoder")?;
@@ -229,9 +224,7 @@ async fn transcode_raw_to_wav_16k(
         );
     }
     if output.stdout.is_empty() {
-        bail!(
-            "WAV transcoder [{ffmpeg_bin}] returned empty output for [{source_mime_type}]"
-        );
+        bail!("WAV transcoder [{ffmpeg_bin}] returned empty output for [{source_mime_type}]");
     }
     // ffmpeg writes 0xffffffff for RIFF chunk size and data chunk size when the
     // output is a pipe (size unknown at write time). hound validates that the

@@ -33,16 +33,218 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
         "handoff.back" => &["session.status", "handoff.back"],
-        "role.governance" => &["session.status", "agent.configure", "role.create_or_update", "role.set_home"],
+        "role.governance" => &[
+            "session.status",
+            "hotel.best_place_to_run",
+            "agent.configure",
+            "role.create_or_update",
+            "role.set_home",
+            "transport.set_home",
+        ],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
-        "memory" => &["memory.recall", "memory.remember"],
+        "memory" => &[
+            "memory.recall",
+            "memory.remember",
+            "memory.cultivate",
+            "memory.true_up",
+            "memory.promote_candidate",
+        ],
         "routing.refinement" => &[
             "session.status",
             "agent.graph.read",
             "agent.graph.write",
             "routing.policy.propose",
+            "routing.reflex.set",
+            "routing.reflex.get",
+            "routing.pipeline.set",
+            "routing.pipeline.remove",
+            "routing.pipeline.get",
         ],
+        "graph.knowledge" => &[
+            "graph.create",
+            "graph.query",
+            "graph.list",
+            "graph.drop",
+            "graph.grant_access",
+        ],
+        "imessage-monitor" => &["bash.exec"],
         _ => &[],
+    }
+}
+
+/// Returns the tools that are exclusively granted by a given on-demand skill.
+///
+/// Used by `project_tools_for_turn` to know which tool schemas to suppress when
+/// the skill is not relevant to the current turn. Tools that appear in multiple
+/// skill grants are included in each grant — the caller should include the tool
+/// if ANY of its owning skills is active.
+pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
+    match skill_name {
+        "cron.manage" => &[
+            "cron.register",
+            "cron.list",
+            "cron.enable",
+            "cron.disable",
+            "cron.remove",
+        ],
+        "observability.pipeline" => &[
+            "table.configure",
+            "table.query",
+            "table.insert",
+            "table.rolloff",
+            "table.stats",
+            "table.schema",
+            "table.add_listener",
+        ],
+        "graph.knowledge" => &[
+            "graph.create",
+            "graph.query",
+            "graph.list",
+            "graph.drop",
+            "graph.grant_access",
+        ],
+        "routing.refinement" => &[
+            "routing.policy.propose",
+            "routing.reflex.set",
+            "routing.reflex.get",
+            "routing.pipeline.set",
+            "routing.pipeline.remove",
+            "routing.pipeline.get",
+            "router.stats",
+        ],
+        "role.governance" => &[
+            "agent.configure",
+            "role.create_or_update",
+            "role.set_home",
+            "transport.set_home",
+            "hotel.best_place_to_run",
+        ],
+        "role.authoring" => &["role.create_or_update"],
+        "skill.authoring" => &["skill.register", "skill.assign", "skill.revoke"],
+        "context.synthesize" => &["workspace.list", "workspace.read"],
+        "agent.initiate" => &["agent.graph.write", "agent.graph.recall"],
+        "profile.manage" => &["role.configure"],
+        "mcp.manage" => &["mcp.provision", "mcp.revoke"],
+        _ => &[],
+    }
+}
+
+/// Returns `true` if the given on-demand skill is relevant for the current turn's content.
+///
+/// Used by `project_tools_for_turn` to decide whether to suppress a skill's tools.
+/// Errs on the side of inclusion — only suppresses when the turn clearly has no
+/// bearing on the skill's domain.
+pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
+    let t = turn_text;
+    match skill_name {
+        "cron.manage" => {
+            t.contains("cron")
+                || t.contains("schedule")
+                || t.contains("recurring")
+                || t.contains("daily")
+                || t.contains("weekly")
+                || t.contains("hourly")
+                || t.contains("every day")
+                || t.contains("every hour")
+                || t.contains("every week")
+                || t.contains("remind me")
+                || t.contains("run at ")
+                || t.contains("timer")
+                || t.contains("scheduled")
+                || t.contains("at midnight")
+                || t.contains("at noon")
+        }
+        "observability.pipeline" => {
+            t.contains("table")
+                || t.contains("pipeline")
+                || t.contains("rolloff")
+                || t.contains("datasource")
+                || t.contains("table.")
+                || t.contains("stream")
+                || t.contains("insert row")
+                || t.contains("table schema")
+                || t.contains("listener")
+        }
+        "graph.knowledge" => {
+            t.contains("graph.")
+                || t.contains("knowledge graph")
+                || t.contains("create graph")
+                || t.contains("graph node")
+                || t.contains("graph query")
+                || t.contains("graph edge")
+                || t.contains("grant_access")
+                || t.contains("drop graph")
+        }
+        "routing.refinement" => {
+            t.contains("routing")
+                || t.contains("reflex")
+                || t.contains("pipeline route")
+                || t.contains("routing policy")
+                || t.contains("router.stats")
+                || t.contains("routing.")
+                || t.contains("dispatch policy")
+        }
+        "role.governance" => {
+            t.contains("create role")
+                || t.contains("update role")
+                || t.contains("configure agent")
+                || t.contains("best place to run")
+                || t.contains("place role")
+                || t.contains("home node")
+                || t.contains("role.create")
+                || t.contains("agent.configure")
+                || t.contains("set_home")
+        }
+        "role.authoring" => {
+            t.contains("create role")
+                || t.contains("update role")
+                || t.contains("author role")
+                || t.contains("role.create")
+                || t.contains("role manifest")
+                || t.contains("new role")
+                || t.contains("write role")
+        }
+        "skill.authoring" => {
+            t.contains("register skill")
+                || t.contains("skill.register")
+                || t.contains("skill.assign")
+                || t.contains("create skill")
+                || t.contains("add skill")
+                || t.contains("assign skill")
+                || t.contains("revoke skill")
+        }
+        "context.synthesize" => {
+            t.contains("workspace")
+                || t.contains("list files")
+                || t.contains("read file")
+                || t.contains("code file")
+                || t.contains("synthesize context")
+                || t.contains("workspace.")
+                || t.contains("file list")
+        }
+        "agent.initiate" => {
+            t.contains("agent.graph")
+                || t.contains("write agent")
+                || t.contains("initiate agent")
+                || t.contains("agent graph write")
+                || t.contains("recall agent")
+        }
+        "profile.manage" => {
+            t.contains("role.configure")
+                || t.contains("configure role")
+                || t.contains("profile.manage")
+                || t.contains("manage profile")
+                || t.contains("role config")
+        }
+        "mcp.manage" => {
+            t.contains("mcp")
+                || t.contains("provision")
+                || t.contains("revoke mcp")
+                || t.contains("mcp.provision")
+                || t.contains("mcp server")
+                || t.contains("mcp route")
+        }
+        _ => false,
     }
 }
 
@@ -117,6 +319,30 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "lines": {
                         "type": "integer",
                         "description": "Number of log lines to return (default 50, max 500)."
+                    }
+                }
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
+        "router.stats".into(),
+        ToolDefinition {
+            tool_name: "router.stats".into(),
+            description: "Returns aggregated routing performance statistics from the model-router \
+                          trace store: per-provider success rate, average latency, p90 latency, \
+                          and failure counts broken down by task_kind. Use this to inspect which \
+                          providers are performing well or poorly, diagnose routing failures, or \
+                          reason about model selection. Pass `window_hours` to limit to recent \
+                          history (e.g. 24 for last day); omit for all-time stats."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "window_hours": {
+                        "type": "number",
+                        "description": "If set, only include traces from the last N hours. Omit for all-time stats."
                     }
                 }
             }),
@@ -230,9 +456,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                           Use this to read or write structured knowledge — entities, relationships, \
                           and typed records — in the agent graph store. \
                           Omit graph_id to query your own partition. \
-                          Supported patterns: MATCH (n:Label) RETURN n, \
-                          CREATE (n:Label {id:'...', ...}), \
-                          CREATE (a:L {id:'A'})-[:REL]->(b:L {id:'B'})."
+                          Supported patterns: \
+                          MATCH (n) RETURN n [all nodes], \
+                          MATCH (n:Label) RETURN n [by label], \
+                          MATCH (n:Label {id:'X'}) RETURN n [by label+id], \
+                          CREATE (n:Label {id:'...', ...}) [create node], \
+                          CREATE (a:L {id:'A'})-[:REL]->(b:L {id:'B'}) [create edge], \
+                          MATCH (n {id:'X'}) DELETE n [delete node], \
+                          MATCH (n:Label {id:'X'}) DETACH DELETE n [delete node with label], \
+                          MATCH ()-[r {id:'X'}]-() DELETE r [delete edge]."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -296,8 +528,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "graph.grant_access".into(),
         ToolDefinition {
             tool_name: "graph.grant_access".into(),
-            description: "Grant another agent read or write access to one of your graph partitions."
-                .into(),
+            description:
+                "Grant another agent read or write access to one of your graph partitions.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -461,8 +693,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "table.schema".into(),
         ToolDefinition {
             tool_name: "table.schema".into(),
-            description: "Return the CREATE TABLE DDL for a table in the local table store."
-                .into(),
+            description: "Return the CREATE TABLE DDL for a table in the local table store.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -958,6 +1189,48 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "transport.set_home".into(),
+        ToolDefinition {
+            tool_name: "transport.set_home".into(),
+            description: "Pin an external membrane transport resource to the one hotel that may \
+                          own its inbound poller or gateway. Use this for scarce ingress like \
+                          Telegram long polling, Discord gateway sessions, or desktop chat \
+                          surfaces. This is separate from role.set_home: roles may run elsewhere \
+                          while a single stable hotel owns the transport. Requires operator \
+                          approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "transport": {
+                        "type": "string",
+                        "description": "Transport implementation name, e.g. 'telegram', 'discord', or 'desktop'."
+                    },
+                    "resource_ref": {
+                        "type": "string",
+                        "description": "Stable transport resource reference, such as a bot token key."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "Hotel node_id/name that should own the active poller or gateway."
+                    },
+                    "standby_hotels": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional standby hotels allowed for explicit future failover."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this transport belongs on this hotel. Required for operator visibility."
+                    }
+                },
+                "required": ["transport", "resource_ref", "target_hotel", "reason"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
         "delegate.to_peer".into(),
         ToolDefinition {
             tool_name: "delegate.to_peer".into(),
@@ -1113,11 +1386,14 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "delegate.whisper".into(),
         ToolDefinition {
             tool_name: "delegate.whisper".into(),
-            description: "Fire-and-forget paracrine dispatch — silently consults a specialist \
-                          role without interrupting the current turn. The specialist's response \
-                          arrives back asynchronously as a paracrine_response. Use for quiet \
-                          delegation, mid-turn enrichment, or specialist consultation where the \
-                          user does not need to see the handoff. \
+            description: "Paracrine dispatch — silently consults a specialist role. By default \
+                          the specialist's response arrives back asynchronously as a \
+                          paracrine_response. Use routing='enriched_tool_result' or \
+                          wait_for_response=true when the main loop should pause until the \
+                          aside completes and then continue with the specialist result as this \
+                          tool's result. Use other routing modes for quiet delegation, mid-turn \
+                          enrichment, or specialist consultation where the user does not need to \
+                          see the handoff. \
                           Set reply_to='membrane' to route the specialist's response directly \
                           to the user with an inline role-switch button."
                 .into(),
@@ -1138,8 +1414,27 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "routing": {
                         "type": "string",
-                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward"],
+                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward", "priority_re_entry", "approval_resolution"],
                         "description": "How to handle the specialist's response when it arrives. Defaults to cognitive_re_entry."
+                    },
+                    "wait_for_response": {
+                        "type": "boolean",
+                        "description": "When true, keep the current turn in waiting_tool until the specialist completes. If routing is omitted, this implies routing='enriched_tool_result'."
+                    },
+                    "authority": {
+                        "type": "string",
+                        "enum": ["advice_only", "context_patch", "execute_with_approval"],
+                        "description": "Authority granted to the paracrine side loop. Defaults to advice_only."
+                    },
+                    "tool_policy": {
+                        "type": "string",
+                        "enum": ["role_default", "read_only", "no_tools"],
+                        "description": "Tool policy for the specialist side loop. Defaults to role_default."
+                    },
+                    "approval_scope": {
+                        "type": "string",
+                        "enum": ["originating_session", "specialist_session"],
+                        "description": "Where approval requests from the side loop should resolve. Defaults to originating_session."
                     }
                 },
                 "required": ["role", "prompt"]
@@ -1312,6 +1607,158 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "routing.reflex.set".into(),
+        ToolDefinition {
+            tool_name: "routing.reflex.set".into(),
+            description: "Set a durable routing reflex that takes effect immediately on the \
+                          next turn. Use to self-administer low-level dispatch preferences \
+                          without operator approval. Currently supports \
+                          `preferred_generation_capability` (values: `text.generate` for \
+                          standard Gemini, `response.generate` for Gemini Live native audio). \
+                          Setting a reflex overrides any prior value for the same key."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "preference_key": {
+                        "type": "string",
+                        "description": "Stable identifier for this reflex, e.g. 'generation_capability_preference'. Used to update or clear the reflex later."
+                    },
+                    "reflexes": {
+                        "type": "object",
+                        "description": "Reflex fields to set. Supported keys: 'preferred_generation_capability' ('text.generate' or 'response.generate').",
+                        "properties": {
+                            "preferred_generation_capability": {
+                                "type": "string",
+                                "enum": ["text.generate", "response.generate"],
+                                "description": "Which generation capability to dispatch cognitive turns to."
+                            }
+                        }
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief reason for the change — stored in the config alongside the reflex for observability."
+                    }
+                },
+                "required": ["preference_key", "reflexes"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.reflex.get".into(),
+        ToolDefinition {
+            tool_name: "routing.reflex.get".into(),
+            description: "Read the agent's current routing reflexes from the agent graph. \
+                          Returns all stored reflex preference rows including their keys, \
+                          precedences, and current reflex values. Use to inspect what \
+                          generation capability or routing posture is active before deciding \
+                          whether to change it."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "preference_key": {
+                        "type": "string",
+                        "description": "Optional — if provided, returns only the row with this key. If omitted, returns all rows."
+                    }
+                },
+                "required": []
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.set".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.set".into(),
+            description: "Declare or replace a routing pipeline rule in the agent graph. \
+                          Pipeline rules define how the hotel pre-processes inbound envelopes \
+                          before delivering them to this agent — for example, transcribing \
+                          a voice memo before the agent sees it. Setting a rule with the same \
+                          rule_id replaces the previous definition. Takes effect on the next \
+                          inbound turn."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "Stable identifier for this rule (e.g. 'voice-transcribe'). \
+                                        Used as the primary key — re-set with the same rule_id to update."
+                    },
+                    "match": {
+                        "type": "object",
+                        "description": "Envelope match criteria. Supported fields: frame_kind (array of strings), \
+                                        channel_kind (array of strings), has_text (bool)."
+                    },
+                    "stages": {
+                        "type": "array",
+                        "description": "Ordered list of transform stages. Each stage has: capability (string), \
+                                        mode ('blob'|'stream'), collect ('full'|'incremental'), \
+                                        output_as ('replace_content'|'append_content'), \
+                                        on_failure ('passthrough'|'drop'|'error')."
+                    },
+                    "deliver_as": {
+                        "type": "string",
+                        "description": "How to deliver the transformed envelope to the agent. \
+                                        One of: 'user_message' (default), 'tool_result'."
+                    }
+                },
+                "required": ["rule_id", "match", "stages"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.remove".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.remove".into(),
+            description: "Remove a routing pipeline rule from the agent graph. \
+                          After removal, inbound envelopes that previously matched this rule \
+                          will be delivered to the agent without transformation."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "The rule_id of the rule to remove."
+                    }
+                },
+                "required": ["rule_id"]
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "routing.pipeline.get".into(),
+        ToolDefinition {
+            tool_name: "routing.pipeline.get".into(),
+            description: "Read the agent's declared routing pipeline rules from the agent graph. \
+                          Returns all stored rules or a specific rule by rule_id. \
+                          Use to inspect which pipeline transforms are currently active."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id": {
+                        "type": "string",
+                        "description": "Optional — if provided, returns only the rule with this id. \
+                                        If omitted, returns all rules."
+                    }
+                },
+                "required": []
+            }),
+            class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
         "memory.recall".into(),
         ToolDefinition {
             tool_name: "memory.recall".into(),
@@ -1333,6 +1780,12 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "integer",
                         "description": "Maximum number of engrams to return. Defaults to the \
                                         session recall_limit setting (default 5). Range 1–20."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["self", "shared_user", "session", "cross"],
+                        "description": "Optional memory scope. 'cross' searches agent self, \
+                                        shared user, and active session memories."
                     }
                 },
                 "required": ["query"]
@@ -1367,9 +1820,211 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional tags for recall filtering (e.g. ['preference', 'user', 'decision'])."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["self", "shared_user", "session"],
+                        "description": "Optional write scope. Use 'shared_user' for operator \
+                                        preferences, 'session' for active workstream context, \
+                                        and 'self' for the agent's own habits or observations."
+                    },
+                    "temporal_kind": {
+                        "type": "string",
+                        "enum": ["event", "state", "preference", "rule", "decision", "hypothesis", "gap", "checkpoint"],
+                        "description": "Optional temporal behavior for the memory."
+                    },
+                    "spatial_scope": {
+                        "type": "string",
+                        "enum": ["self", "agent", "user", "session", "workspace", "hotel", "mesh", "global"],
+                        "description": "Optional spatial scope for where this memory applies."
+                    },
+                    "authority": {
+                        "type": "string",
+                        "enum": ["observed_runtime", "observed_repo", "graph_structured", "user_stated", "verified_memory", "inferred_memory", "external", "untrusted"],
+                        "description": "Optional evidence authority. Runtime/repo observations should be used only when actually observed."
+                    },
+                    "validation_level": {
+                        "type": "string",
+                        "enum": ["unverified", "check-green", "test-green", "smoke-green", "watched-live-green"],
+                        "description": "Optional validation level backing the memory."
+                    },
+                    "observed_at": {
+                        "type": "integer",
+                        "description": "Optional Unix timestamp in milliseconds for when this was observed. Defaults to write time."
+                    },
+                    "valid_from": {
+                        "type": "integer",
+                        "description": "Optional Unix timestamp in milliseconds when this memory starts being valid."
+                    },
+                    "valid_until": {
+                        "type": "integer",
+                        "description": "Optional Unix timestamp in milliseconds when this memory stops being valid."
+                    },
+                    "last_verified_at": {
+                        "type": "integer",
+                        "description": "Optional Unix timestamp in milliseconds when this memory was last verified."
+                    },
+                    "hotel_id": {
+                        "type": "string",
+                        "description": "Optional hotel this memory applies to."
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Optional node this memory applies to."
+                    },
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Optional workspace path this memory applies to."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional git branch this memory applies to."
+                    },
+                    "proposal_id": {
+                        "type": "string",
+                        "description": "Optional AgentGraph proposal anchor."
+                    },
+                    "seam_id": {
+                        "type": "string",
+                        "description": "Optional AgentGraph seam anchor."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional AgentGraph task anchor."
+                    },
+                    "affected_nodes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional graph/code node ids this memory affects."
                     }
                 },
                 "required": ["concept", "content"]
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.cultivate".into(),
+        ToolDefinition {
+            tool_name: "memory.cultivate".into(),
+            description: "Inspect recalled memories for cultivation needs without mutating memory. \
+                          Use during closeout, reflection, or explicit memory-maintenance turns to \
+                          find missing spacetime frames, entity overlays, or stale candidates."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language scope for candidate memories to inspect."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum candidate count. Defaults to 8. Range 1-20."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["self", "shared_user", "session", "cross"],
+                        "description": "Optional memory scope to inspect."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["report", "closeout", "true_up"],
+                        "description": "Cultivation intent. Current implementation reports candidates and performs no mutation."
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.true_up".into(),
+        ToolDefinition {
+            tool_name: "memory.true_up".into(),
+            description: "Compare a memory claim with observed repo/runtime truth or AgentGraph truth \
+                          and return a structured true-up finding. Use when memory and graph may have \
+                          holes, contradictions, or stale assumptions."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "memory_claim": {
+                        "type": "string",
+                        "description": "Claim currently held in memory."
+                    },
+                    "observed_truth": {
+                        "type": "string",
+                        "description": "Observed repo/runtime truth, if directly checked."
+                    },
+                    "graph_truth": {
+                        "type": "string",
+                        "description": "AgentGraph structured truth, if available."
+                    },
+                    "resolution": {
+                        "type": "string",
+                        "description": "Optional proposed resolution or operator note."
+                    },
+                    "muninn_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Muninn engram ids involved in this finding."
+                    },
+                    "graph_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "AgentGraph node ids involved in this finding."
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Evidence references such as file paths, test names, or smoke runs."
+                    }
+                },
+                "required": []
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.promote_candidate".into(),
+        ToolDefinition {
+            tool_name: "memory.promote_candidate".into(),
+            description: "Evaluate whether a memory candidate is allowed to become durable shared \
+                          memory. This is a gate: it reports missing authority, validation, or evidence \
+                          and does not promote unverified inferred claims."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "candidate": {
+                        "type": "string",
+                        "description": "Candidate memory or claim being considered for promotion."
+                    },
+                    "authority": {
+                        "type": "string",
+                        "enum": ["observed_runtime", "observed_repo", "graph_structured", "user_stated", "verified_memory", "inferred_memory", "external", "untrusted"],
+                        "description": "Evidence authority behind the candidate."
+                    },
+                    "validation_level": {
+                        "type": "string",
+                        "enum": ["unverified", "check-green", "test-green", "smoke-green", "watched-live-green"],
+                        "description": "Validation level backing the candidate."
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Evidence references such as files, test runs, graph ids, or Muninn ids."
+                    },
+                    "operator_approved": {
+                        "type": "boolean",
+                        "description": "Set only when the operator explicitly approves promotion despite missing gates."
+                    }
+                },
+                "required": ["candidate"]
             }),
             class: Some("memory".into()),
         },
@@ -1443,19 +2098,57 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                 "input_schema": { "type": "object" },
                                 "inbound_transform": {
                                     "type": "object",
-                                    "description": "FieldMap: { kind: 'field_map', action, target, mappings }. \
-                                                    Target: { kind: 'datasource'|'philote'|'tool', datasource_id|agent_id|tool_ref }. \
-                                                    Mappings: [{ from: 'arg.key', to: 'payload.key' }]."
+                                    "description": "Always use kind='field_map'. Do NOT pass a string or template.",
+                                    "properties": {
+                                        "kind": { "type": "string", "enum": ["field_map"] },
+                                        "action": { "type": "string", "description": "Envelope action string, e.g. 'echo' or 'datasource.query'." },
+                                        "target": {
+                                            "type": "object",
+                                            "description": "philote: {kind:'philote',agent_id:'...'}  datasource: {kind:'datasource',datasource_id:'...'}  tool: {kind:'tool',tool_ref:'...'}",
+                                            "properties": {
+                                                "kind": { "type": "string", "enum": ["philote", "datasource", "tool"] },
+                                                "agent_id": { "type": "string" },
+                                                "datasource_id": { "type": "string" },
+                                                "tool_ref": { "type": "string" }
+                                            },
+                                            "required": ["kind"]
+                                        },
+                                        "mappings": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "from": { "type": "string", "description": "Arg key from MCP call, e.g. 'query'." },
+                                                    "to": { "type": "string", "description": "Destination key in envelope payload, e.g. 'query'." }
+                                                },
+                                                "required": ["from", "to"]
+                                            }
+                                        }
+                                    },
+                                    "required": ["kind", "action", "target"]
                                 },
                                 "outbound_transform": {
                                     "type": "object",
-                                    "description": "PassThrough: { kind: 'pass_through' }. \
-                                                    Extract: { kind: 'extract', path: 'dot.path' }."
+                                    "description": "pass_through: {kind:'pass_through'}  extract: {kind:'extract',path:'dot.path'}",
+                                    "properties": {
+                                        "kind": { "type": "string", "enum": ["pass_through", "extract"] },
+                                        "path": { "type": "string" }
+                                    },
+                                    "required": ["kind"]
                                 }
                             },
                             "required": ["name", "description", "input_schema",
                                          "inbound_transform", "outbound_transform"]
                         }
+                    },
+                    "exposure": {
+                        "type": "string",
+                        "enum": ["local", "lan", "mesh", "internet"],
+                        "description": "Minimum tier at which this endpoint is intentionally \
+                                        served. The hotel validates that exposure <= its current \
+                                        perimeter ceiling and rejects the provision if it does not. \
+                                        Defaults to 'local'. Set to 'mesh' for Tailscale-reachable \
+                                        endpoints or 'internet' for public endpoints."
                     },
                     "preapproval_rules": {
                         "type": "array",
@@ -1501,6 +2194,54 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["endpoint_id"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.status".into(),
+        ToolDefinition {
+            tool_name: "mcp.status".into(),
+            description: "Return the current configuration and exposure status of an MCP \
+                          endpoint. Shows the stored McpEndpointConfig (tools, preapproval rules, \
+                          port), the hotel's current perimeter ceiling, and whether the endpoint \
+                          is active. Use this to verify a provision succeeded, check whether an \
+                          endpoint's exposure tier is within the hotel's perimeter ceiling, or \
+                          inspect the live configuration."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The endpoint ID to inspect."
+                    }
+                },
+                "required": ["endpoint_id"]
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
+        "agent.migrate_to".into(),
+        ToolDefinition {
+            tool_name: "agent.migrate_to".into(),
+            description: "Migrate this agent to a different hotel. All context, memory, \
+                          role incarnations, vault secrets (Telegram tokens, etc.), and \
+                          guest processes travel to the destination. The source hotel \
+                          remains active as a fallback. Requires operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "dest_hotel": {
+                        "type": "string",
+                        "description": "Name of the destination hotel (e.g. 'vps-jane')."
+                    }
+                },
+                "required": ["dest_hotel"]
+            }),
+            class: Some("admin".into()),
         },
     );
 

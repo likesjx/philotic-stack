@@ -1,5 +1,5 @@
 [Unit]
-Description=Philotic Hotel Daemon — {{ philotic_hotel_name }}
+Description=Philotic Hotel Daemon — {{ philotic_hotel_runtime_name }}
 Documentation=https://github.com/your-org/philotic-stack
 After=network-online.target tailscaled.service
 Wants=network-online.target
@@ -12,6 +12,8 @@ User={{ philotic_user }}
 Group={{ philotic_group }}
 
 WorkingDirectory={{ philotic_data_dir }}
+RuntimeDirectory=philotic
+RuntimeDirectoryMode=0755
 
 # Runtime environment
 Environment="RUST_LOG={{ philotic_rust_log }}"
@@ -22,13 +24,14 @@ Environment="PHILOTIC_HOTEL_PORT={{ philotic_hotel_port }}"
 Environment="PHILOTIC_ENABLE_RUST_AUTH={{ philotic_enable_rust_auth }}"
 Environment="PHILOTIC_ENABLE_RUST_DISPATCHER={{ philotic_enable_rust_dispatcher }}"
 Environment="PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE={{ philotic_enable_rust_task_lifecycle }}"
+Environment="PHILOTIC_GRAPH_DB_PATH={{ philotic_data_dir }}/graph-runner.db"
+Environment="PHILOTIC_GRAPH_DATABASE_DIR={{ philotic_data_dir }}/graphs"
+Environment="PHILOTIC_TABLE_DB={{ philotic_data_dir }}/tables"
 
 # Mesh PSK — injected from Ansible vault; never stored in plaintext on disk
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env
 
-ExecStart={{ philotic_bin_dir }}/ansible \
-  --hotel {{ philotic_hotel_name }} \
-  --load-config {{ philotic_etc_dir }}/mesh-config.json
+ExecStart={{ philotic_bin_dir }}/aiua --hotel {{ philotic_hotel_runtime_name }}
 
 Restart=on-failure
 RestartSec=10
@@ -36,9 +39,8 @@ TimeoutStopSec=30
 
 # Hardening (progressive — tighten as hotel VPN and vault mature)
 NoNewPrivileges=yes
-PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths={{ philotic_data_dir }} {{ philotic_blob_dir }}
+ReadWritePaths={{ philotic_data_dir }} {{ philotic_blob_dir }} {{ philotic_runtime_dir }}
 {% set read_only_paths = [] %}
 {% for item in philotic_agents.values() %}
 {% if item.import_workspace is defined %}

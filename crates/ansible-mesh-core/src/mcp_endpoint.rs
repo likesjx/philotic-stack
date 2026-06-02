@@ -8,6 +8,7 @@
 //! These types are the shared contract between philote, hotel, and membrane-mcp.
 
 use crate::mcp_route::{McpAuthScheme, McpRouteTarget};
+use crate::ExposureTier;
 use serde::{Deserialize, Serialize};
 
 // ── Endpoint config ───────────────────────────────────────────────────────────
@@ -27,6 +28,12 @@ pub struct McpEndpointConfig {
     /// Path prefix. Defaults to `"/mcp"` if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Minimum exposure tier at which this endpoint is intentionally served.
+    /// The hotel validates that `exposure <= hotel_ceiling` at provision time.
+    /// Defaults to `Local` for backward compatibility; explicitly set to `Mesh`
+    /// or `Internet` for externally-reachable endpoints.
+    #[serde(default)]
+    pub exposure: ExposureTier,
     /// Tools advertised to MCP clients via `tools/list`.
     pub tools: Vec<McpToolSpec>,
     /// Pre-approval rules established by the philote's provisioning turn.
@@ -135,7 +142,9 @@ mod tests {
     use super::*;
     use crate::mcp_route::McpRouteTarget;
 
-    fn round_trip<T: serde::Serialize + for<'de> serde::Deserialize<'de> + std::fmt::Debug + PartialEq>(
+    fn round_trip<
+        T: serde::Serialize + for<'de> serde::Deserialize<'de> + std::fmt::Debug + PartialEq,
+    >(
         v: &T,
     ) {
         let json = serde_json::to_string(v).unwrap();
@@ -176,6 +185,7 @@ mod tests {
             owner_agent_id: "agent-bjork-01".into(),
             port: 8910,
             path: Some("/mcp".into()),
+            exposure: ExposureTier::Mesh,
             tools: vec![McpToolSpec {
                 name: "search_docs".into(),
                 description: "Search project documentation".into(),

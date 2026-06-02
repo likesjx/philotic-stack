@@ -117,6 +117,7 @@ pub enum SkillValidationState {
     Draft,
     Validated,
     Registered,
+    Active,
     Suspended { reason: String },
     Invalid { errors: Vec<String> },
     Deprecated,
@@ -197,6 +198,12 @@ pub struct ToolsetProfileRecord {
     /// Skill names whose `implied_tools` are transitively granted.
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+    /// Skills whose tools are included in the ToolAssembly but suppressed from
+    /// the model's visible list unless the current turn's content activates
+    /// the skill. Use for domain-specific tool groups (cron, table, graph, etc.)
+    /// that should not appear in every orchestrator turn.
+    #[serde(default)]
+    pub on_demand_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -302,6 +309,61 @@ pub struct RoleIncarnationRecord {
 impl RoleIncarnationRecord {
     pub fn routing_role(&self) -> String {
         format!("role:{}:{}", self.agent_id, self.role_name)
+    }
+}
+
+/// Lifecycle state for an externally polled membrane transport home.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MembraneTransportHomeStatus {
+    #[default]
+    Active,
+    Paused,
+    Retired,
+    Blocked,
+}
+
+impl MembraneTransportHomeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Retired => "retired",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// Declares the single active hotel that may poll an external membrane transport.
+///
+/// Node kind: `membrane_transport_home`.
+/// Node key: `membrane_transport_home:{agent_id}:{transport}:{resource_ref}`.
+///
+/// This is deliberately distinct from [`RoleIncarnationRecord::home_node`]:
+/// role homes place cognitive/runtime guests, while transport homes place
+/// scarce external ingress like Telegram long polling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MembraneTransportHomeRecord {
+    pub agent_id: String,
+    pub transport: String,
+    pub resource_ref: String,
+    pub active_home_hotel: String,
+    #[serde(default)]
+    pub standby_hotels: Vec<String>,
+    pub managed_by_role: String,
+    pub lease_type: String,
+    pub failover_policy: String,
+    #[serde(default)]
+    pub status: MembraneTransportHomeStatus,
+}
+
+impl MembraneTransportHomeRecord {
+    pub fn is_active_home(&self, hotel_name: &str) -> bool {
+        self.status == MembraneTransportHomeStatus::Active && self.active_home_hotel == hotel_name
+    }
+
+    pub fn is_standby_home(&self, hotel_name: &str) -> bool {
+        self.standby_hotels.iter().any(|hotel| hotel == hotel_name)
     }
 }
 
@@ -461,4 +523,47 @@ pub struct CompactSessionEnvelope {
 
     // ── Checkpoint metadata ───────────────────────────────────────────────
     pub checkpoint_metadata: CompactCheckpointMeta,
+}
+
+/// Operational profile for a model provider, keyed per (model_ref, node_id).
+///
+/// Node kind: `model_profile`. Node key: `model_profile:{model_ref}:{node_id}`.
+/// Updated after every dispatch via `observe_model_outcome`. Used by
+/// `GraphDomain::best_model_for` to select the healthiest available provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfileRecord {
+    /// Canonical model identifier, e.g. "gemini", "gemini-2.5-flash", "parakeet".
+    pub model_ref: String,
+    /// Node (hotel) this record belongs to, e.g. "mac-jane-aiua-01".
+    pub node_id: String,
+    /// Provider kind: "gemini", "ollama", "mlx", "elevenlabs", etc.
+    pub provider: String,
+    /// Task kinds this provider handles, e.g. ["text.generate", "media.analyze"].
+    #[serde(default)]
+    pub task_kinds: Vec<String>,
+    /// Trust tier: "remote_cloud", "local_trusted", "local_experimental".
+    #[serde(default)]
+    pub trust_tier: String,
+    /// Maximum context tokens this provider accepts (0 = unknown).
+    #[serde(default)]
+    pub max_context_tokens: u32,
+    /// Observed p50 latency in milliseconds over a rolling window.
+    #[serde(default)]
+    pub latency_p50_ms: u64,
+    /// Rolling error rate 0.0–1.0 (exponential moving average, α=0.1).
+    #[serde(default)]
+    pub error_rate: f32,
+    /// Operational status: "healthy", "degraded", "unavailable".
+    #[serde(default = "default_model_status")]
+    pub status: String,
+    /// Unix timestamp of last successful dispatch.
+    #[serde(default)]
+    pub last_healthy_secs: u64,
+    /// Unix timestamp of when this record was last updated.
+    #[serde(default)]
+    pub updated_secs: u64,
+}
+
+fn default_model_status() -> String {
+    "healthy".to_string()
 }

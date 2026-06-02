@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -23,13 +24,14 @@ DEFAULT_MUNINN_DIR = pathlib.Path.home() / "code" / "muninndb"
 
 
 class MuninnMcpClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, token: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
+        self.token = token
         self.message_url = None
         self._sse_response = None
 
     def connect(self) -> None:
-        req = urllib.request.Request(self.base_url, headers={"accept": "text/event-stream"})
+        req = urllib.request.Request(self.base_url, headers=self._headers({"accept": "text/event-stream"}))
         self._sse_response = urllib.request.urlopen(req, timeout=10)
         endpoint = None
         while True:
@@ -82,7 +84,7 @@ class MuninnMcpClient:
         req = urllib.request.Request(
             self.message_url,
             data=body,
-            headers={"content-type": "application/json"},
+            headers=self._headers({"content-type": "application/json"}),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=20) as response:
@@ -90,6 +92,12 @@ class MuninnMcpClient:
         if not raw.strip():
             return {}
         return json.loads(raw)
+
+    def _headers(self, headers: dict) -> dict:
+        if self.token:
+            headers = dict(headers)
+            headers["authorization"] = f"Bearer {self.token}"
+        return headers
 
     def tools_list(self) -> dict:
         return self._post({"jsonrpc": "2.0", "id": "tools-list", "method": "tools/list", "params": {}})
@@ -108,6 +116,12 @@ class MuninnMcpClient:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Muninn MCP helper")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Muninn MCP base URL")
+    parser.add_argument("--token", help="MCP bearer token; defaults to MUNINN_MCP_TOKEN or token file")
+    parser.add_argument(
+        "--token-file",
+        default=os.environ.get("MUNINN_MCP_TOKEN_FILE", str(pathlib.Path.home() / ".muninn" / "mcp.token")),
+        help="Path to MCP bearer token file when token auth is enabled",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("health", help="Check Muninn MCP connectivity and required tools")
@@ -149,6 +163,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_token(args: argparse.Namespace) -> Optional[str]:
+    token = args.token or os.environ.get("MUNINN_MCP_TOKEN")
+    if token:
+        return token.strip()
+    token_file = pathlib.Path(args.token_file).expanduser()
+    if token_file.exists():
+        value = token_file.read_text(encoding="utf-8").strip()
+        return value or None
+    return None
+
+
 def extract_tool_names(result: dict) -> List[str]:
     tools = (
         result.get("result", {})
@@ -162,7 +187,7 @@ def extract_tool_names(result: dict) -> List[str]:
     return names
 
 
-def health_payload(base_url: str) -> dict:
+def health_payload(base_url: str, token: Optional[str] = None) -> dict:
     payload = {
         "base_url": base_url,
         "reachable": False,
@@ -173,7 +198,7 @@ def health_payload(base_url: str) -> dict:
         "status": "unreachable",
     }
 
-    client = MuninnMcpClient(base_url)
+    client = MuninnMcpClient(base_url, token)
     try:
         client.connect()
         payload["reachable"] = True
@@ -218,13 +243,64 @@ def resolve_local_server_dir() -> Optional[pathlib.Path]:
     return None
 
 
+def resolve_muninn_cli() -> Optional[pathlib.Path]:
+    env_cli = os.environ.get("MUNINN_CLI")
+    if env_cli:
+        candidate = pathlib.Path(env_cli).expanduser()
+        if candidate.exists():
+            return candidate
+
+    found = shutil.which("muninn")
+    if found:
+        return pathlib.Path(found)
+    return None
+
+
 def try_start_local_server() -> dict:
+    cli = resolve_muninn_cli()
+    if cli is not None:
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [str(cli), "start"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - bootstrap should report the real failure plainly
+            return {
+                "started": False,
+                "start_attempted": True,
+                "start_method": "muninn start",
+                "start_reason": f"failed to start local muninn CLI: {exc}",
+                "server_binary": str(cli),
+            }
+
+        if proc.returncode != 0:
+            return {
+                "started": False,
+                "start_attempted": True,
+                "start_method": "muninn start",
+                "start_reason": proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}",
+                "server_binary": str(cli),
+            }
+
+        time.sleep(1.0)
+        return {
+            "started": True,
+            "start_attempted": True,
+            "start_method": "muninn start",
+            "server_binary": str(cli),
+            "start_output": proc.stdout.strip(),
+        }
+
     server_dir = resolve_local_server_dir()
     if server_dir is None:
         return {
             "started": False,
             "start_attempted": False,
-            "start_reason": "local muninndb-server binary not found",
+            "start_reason": "local muninn CLI or muninndb-server binary not found",
         }
 
     binary = server_dir / "muninndb-server"
@@ -257,15 +333,16 @@ def try_start_local_server() -> dict:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    token = resolve_token(args)
 
     if args.command == "health":
-        payload = health_payload(args.base_url)
+        payload = health_payload(args.base_url, token)
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0 if payload["status"] == "ready" else 1
 
     if args.command == "bootstrap":
-        payload = health_payload(args.base_url)
+        payload = health_payload(args.base_url, token)
         if payload["status"] == "ready":
             payload["start_attempted"] = False
             payload["started"] = False
@@ -278,7 +355,7 @@ def main() -> int:
             payload.update(start_info)
             payload["status_before_start"] = payload["status"]
 
-        retry_payload = health_payload(args.base_url)
+        retry_payload = health_payload(args.base_url, token)
         retry_payload.update(start_info)
         if start_info.get("start_attempted"):
             retry_payload["status_before_start"] = payload["status"]
@@ -289,14 +366,14 @@ def main() -> int:
         return 0
 
     if args.command == "require":
-        payload = health_payload(args.base_url)
+        payload = health_payload(args.base_url, token)
         if payload["status"] != "ready":
             return emit_approval_required(payload)
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0
 
-    client = MuninnMcpClient(args.base_url)
+    client = MuninnMcpClient(args.base_url, token)
     client.connect()
 
     if args.command == "tools":

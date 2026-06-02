@@ -28,6 +28,17 @@ impl MemoryEngine for NullMemoryEngine {
         anyhow::bail!("NullMemoryEngine: no memory backend configured")
     }
 
+    async fn remember_with_metadata(
+        &self,
+        _scope: MemoryScope,
+        _concept: &str,
+        _content: &str,
+        _tags: Vec<String>,
+        _metadata: serde_json::Value,
+    ) -> anyhow::Result<EngramRef> {
+        anyhow::bail!("NullMemoryEngine: no memory backend configured")
+    }
+
     async fn remember_batch(
         &self,
         _scope: MemoryScope,

@@ -30,6 +30,28 @@ pub struct ManageProposalResult {
     pub mutation: Mutation,
 }
 
+#[derive(Debug, Clone)]
+pub struct MemoryTrueUpFindingRequest {
+    pub finding_id: Option<String>,
+    pub finding_type: String,
+    pub scope: Option<String>,
+    pub summary: String,
+    pub muninn_ids: Vec<String>,
+    pub graph_ids: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub resolution: Option<String>,
+    pub recommended_action: Option<String>,
+    pub requires_operator: bool,
+    pub agent: Option<String>,
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryTrueUpFindingResult {
+    pub finding: Node,
+    pub mutation: Mutation,
+}
+
 impl GraphEngine {
     /// Open or create a SQLite database at the given path.
     /// Use ":memory:" for an in-memory database.
@@ -518,6 +540,93 @@ impl GraphEngine {
             mutations.push(row??);
         }
         Ok(mutations)
+    }
+
+    pub fn record_memory_true_up_finding(
+        &self,
+        request: MemoryTrueUpFindingRequest,
+    ) -> Result<MemoryTrueUpFindingResult> {
+        let finding_id = request
+            .finding_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let node_id = if finding_id.starts_with("memory_true_up:") {
+            finding_id
+        } else {
+            format!("memory_true_up:{finding_id}")
+        };
+        let now = chrono::Utc::now();
+        let finding = Node {
+            id: node_id.clone(),
+            kind: NodeKind::Task,
+            name: format!("Memory true-up: {}", request.finding_type),
+            properties: serde_json::json!({
+                "kind": "memory_true_up_finding",
+                "finding_type": request.finding_type,
+                "scope": request.scope,
+                "summary": request.summary,
+                "muninn_ids": request.muninn_ids,
+                "graph_ids": request.graph_ids,
+                "evidence_refs": request.evidence_refs,
+                "resolution": request.resolution,
+                "recommended_action": request.recommended_action,
+                "requires_operator": request.requires_operator,
+                "status": if request.requires_operator { "needs_operator" } else { "recorded" },
+            }),
+            file_path: None,
+            worktree: String::new(),
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
+        };
+        self.upsert_node(&finding)?;
+
+        for graph_id in finding
+            .properties
+            .get("graph_ids")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.upsert_edge(&Edge {
+                source_id: node_id.clone(),
+                target_id: graph_id.to_string(),
+                relation: EdgeRelation::References,
+                properties: serde_json::json!({
+                    "source": "memory_true_up",
+                }),
+                worktree: String::new(),
+            })?;
+        }
+
+        let mutation = Mutation {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now,
+            agent: request.agent,
+            session: request.session,
+            action: "memory_true_up".to_string(),
+            target_node: Some(node_id),
+            from_value: None,
+            to_value: Some(
+                finding
+                    .properties
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("recorded")
+                    .to_string(),
+            ),
+            reason: Some("Recorded memory/graph true-up finding".to_string()),
+            details: finding.properties.clone(),
+        };
+        self.record_mutation(&mutation)?;
+
+        Ok(MemoryTrueUpFindingResult { finding, mutation })
     }
 
     // ── Snapshots ──
@@ -1295,5 +1404,57 @@ mod tests {
         assert!(mutations
             .iter()
             .any(|mutation| mutation.action == "manage_proposal"));
+    }
+
+    #[test]
+    fn record_memory_true_up_finding_creates_audited_task() {
+        let engine = GraphEngine::open(":memory:").unwrap();
+        let now = chrono::Utc::now();
+        engine
+            .upsert_node(&Node {
+                id: "doc:memory-cultivation-true-up".into(),
+                kind: NodeKind::Proposal,
+                name: "Memory Cultivation True-Up".into(),
+                properties: serde_json::json!({}),
+                file_path: Some("docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md".into()),
+                worktree: String::new(),
+                created_at: now,
+                updated_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
+            })
+            .unwrap();
+
+        let result = engine
+            .record_memory_true_up_finding(MemoryTrueUpFindingRequest {
+                finding_id: Some("test-finding".into()),
+                finding_type: "contradicted".into(),
+                scope: Some("session".into()),
+                summary: "Memory says rollout is complete; observed runtime is still old.".into(),
+                muninn_ids: vec!["01TEST".into()],
+                graph_ids: vec!["doc:memory-cultivation-true-up".into()],
+                evidence_refs: vec!["cargo check -p philote".into()],
+                resolution: Some("deploy updated binaries before claiming live-green".into()),
+                recommended_action: Some("true_up_required".into()),
+                requires_operator: true,
+                agent: Some("codex".into()),
+                session: Some("session:test".into()),
+            })
+            .unwrap();
+
+        assert_eq!(result.finding.id, "memory_true_up:test-finding");
+        assert_eq!(result.finding.properties["kind"], "memory_true_up_finding");
+        assert_eq!(result.mutation.action, "memory_true_up");
+
+        let edges = engine
+            .get_edges_from("memory_true_up:test-finding")
+            .unwrap();
+        assert!(edges.iter().any(|edge| {
+            edge.relation == EdgeRelation::References
+                && edge.target_id == "doc:memory-cultivation-true-up"
+        }));
     }
 }

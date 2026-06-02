@@ -3,7 +3,7 @@ title: Control Plane Admin Surface Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: proposed
-last_updated: 2026-03-31
+last_updated: 2026-05-12
 tags:
 - admin
 - control-plane
@@ -13,6 +13,7 @@ tags:
 related_docs:
 - ARCHITECTURE_STATUS.md
 - ROLE_POSTURE_AND_ADMIN_PROPOSAL.md
+- HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md
 - LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md
 - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
 task_refs:
@@ -49,6 +50,10 @@ The first recommended shape is:
 1. CLI-backed control plane
 2. TUI as the first serious admin app
 3. web/app surfaces later if justified
+
+This admin surface should authenticate against hotel-owned operator identity rather than inventing its own principal truth; see [HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md).
+
+For desktop and always-on operator-server surfaces, that also means no meaningful admin view should render before hotel authentication succeeds.
 
 ## What This Surface Owns
 

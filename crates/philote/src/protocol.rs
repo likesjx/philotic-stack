@@ -147,6 +147,8 @@ pub struct ModelRequestPayload {
     pub context: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_projection: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affordances: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<TransportAttachment>,
     pub tools_for_model: Vec<ToolDefinition>,
@@ -209,6 +211,16 @@ pub struct TurnEventPayload {
     pub chat_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partial_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnStatusPayload {
+    pub action: &'static str,
+    pub session_id: String,
+    pub turn_id: String,
+    pub chat_id: String,
+    /// Human-readable status, e.g. "Searching the web..."
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,18 +1,19 @@
 use crate::controller::{
-    AttachmentInput, ControllerTask, ModelProvider, NativeLiveProvider, NativeLiveTurnOutput,
-    ProviderOutput, TaskKind,
+    AttachmentInput, AttemptPolicy, ControllerTask, ModelProvider, NativeLiveProvider,
+    NativeLiveTurnOutput, ProviderOutput, RetryPolicy, TaskKind,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::{SinkExt, StreamExt};
+use media_codec::{AudioProvider as CodecProvider, CodecCache, normalize_audio};
 use media_prep::{PcmPrepPolicy, prepare_audio_ligand_for_pcm};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -24,6 +25,17 @@ use tracing::{info, warn};
 
 /// Seconds without a byte chunk from the SSE stream before we abort and escalate.
 const STREAMING_IDLE_SECS: u64 = 8;
+/// Seconds to wait for the initial HTTP response headers from Gemini before aborting.
+/// Large contexts (100KB+) can take 20–30s before the first SSE byte arrives.
+/// Reduced from 60s: the runtime now enforces an outer total_secs timeout per attempt
+/// so the internal connect timeout only needs to cover legitimate network latency.
+const STREAMING_CONNECT_SECS: u64 = 25;
+/// Hard wall-clock cap on the entire SSE session (post-connect). Gemini can drip
+/// keep-alive SSE bytes every <8s indefinitely, which prevents STREAMING_IDLE_SECS
+/// from firing. Must be <= AttemptPolicy::total_secs to ensure the provider returns
+/// before the runtime outer timeout fires. Reduced from 120s to eliminate the race
+/// with the philote WaitingModel watchdog (also 120s).
+const STREAMING_TOTAL_SECS: u64 = 32;
 
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
@@ -48,6 +60,7 @@ pub struct GeminiProvider {
     auth: Option<GeminiAuth>,
     default_model: String,
     base_url: String,
+    codec_cache: Option<CodecCache>,
 }
 
 #[derive(Debug, Default)]
@@ -83,14 +96,24 @@ impl GeminiProvider {
         auth: Option<GeminiAuth>,
         base_url: Option<String>,
     ) -> Self {
+        let codec_cache = std::env::var("PHILOTIC_CODEC_CACHE_DB")
+            .ok()
+            .and_then(|path| match CodecCache::open(&path) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!("GeminiProvider: failed to open codec cache at {path}: {e:#}");
+                    None
+                }
+            });
         Self {
             http_client,
             auth,
-            default_model: "gemini-flash-latest".into(),
+            default_model: "gemini-3.5-flash".into(),
             base_url: base_url
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into())
                 .trim_end_matches('/')
                 .to_string(),
+            codec_cache,
         }
     }
 
@@ -502,7 +525,7 @@ impl GeminiProvider {
             "display_text": { "type": "STRING" },
             "spoken_text": { "type": "STRING" }
         });
-        let mut required = vec!["display_text", "spoken_text"];
+        let required = vec!["display_text", "spoken_text"];
 
         if wants_concept {
             properties["memory_candidate"] = json!({
@@ -650,13 +673,34 @@ impl GeminiProvider {
                     body
                 );
             }
-            let bytes = response.bytes().await?;
-            parts.push(json!({
-                "inline_data": {
-                    "mime_type": mime_type,
-                    "data": BASE64_STANDARD.encode(bytes)
-                }
-            }));
+            let bytes = response.bytes().await?.to_vec();
+            if mime_type.starts_with("audio/") {
+                let normalized = normalize_audio(
+                    bytes,
+                    &mime_type,
+                    CodecProvider::Gemini,
+                    self.codec_cache.as_ref(),
+                    "ffmpeg",
+                )
+                .await
+                .with_context(|| {
+                    format!("media-codec: failed to normalize audio [{mime_type}] for Gemini")
+                })?;
+                parts.push(json!({
+                    "inline_data": {
+                        "mime_type": normalized.mime_type,
+                        "data": BASE64_STANDARD.encode(normalized.bytes)
+                    }
+                }));
+            } else {
+                // Images and other non-audio media — pass through directly.
+                parts.push(json!({
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": BASE64_STANDARD.encode(&bytes)
+                    }
+                }));
+            }
         }
 
         Ok(json!({
@@ -1161,18 +1205,59 @@ impl GeminiProvider {
             return None;
         }
         let chunk: Value = serde_json::from_str(json_str).ok()?;
-        chunk
+        let parts = chunk
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)?;
+        // Collect text from all parts — Gemini can send [{functionCall:...}, {text:...}]
+        // in a single chunk, so scanning only the first part misses text after a tool call.
+        let combined: String = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("");
+        if combined.is_empty() {
+            None
+        } else {
+            Some(combined)
+        }
+    }
+
+    /// Parse one SSE line and return the full chunk Value if it contains a `functionCall`
+    /// part in `candidates[0].content.parts`. Gemini emits function calls via streaming
+    /// without any accompanying text, which causes `parse_sse_text_chunk` to return None
+    /// and `full_text` to stay empty. This helper detects those chunks so `invoke_streaming`
+    /// can return them correctly instead of bailing with a streaming_timeout error.
+    fn parse_sse_function_call_chunk(line: &str) -> Option<Value> {
+        let json_str = if let Some(rest) = line.strip_prefix("data: ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            rest
+        } else {
+            return None;
+        };
+        if json_str.trim() == "[DONE]" {
+            return None;
+        }
+        let chunk: Value = serde_json::from_str(json_str).ok()?;
+        let has_fc = chunk
             .get("candidates")
             .and_then(Value::as_array)
             .and_then(|c| c.first())
             .and_then(|c| c.get("content"))
             .and_then(|c| c.get("parts"))
             .and_then(Value::as_array)
-            .and_then(|p| p.first())
-            .and_then(|p| p.get("text"))
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .any(|p| p.get("functionCall").is_some() || p.get("function_call").is_some())
+            })
+            .unwrap_or(false);
+        if has_fc { Some(chunk) } else { None }
     }
 
     /// Scan `accumulated` for the display_text JSON string value, starting where we left off.
@@ -1287,6 +1372,31 @@ impl ModelProvider for GeminiProvider {
         )
     }
 
+    fn attempt_policy(&self) -> AttemptPolicy {
+        // total_secs must be >= STREAMING_TOTAL_SECS (provider's internal cap).
+        // Invariant: total_secs × retry_policy.max_attempts < philote watchdog (120s).
+        // 35 × 2 = 70s < 120s ✓
+        AttemptPolicy {
+            connect_secs: STREAMING_CONNECT_SECS,
+            idle_secs: STREAMING_IDLE_SECS,
+            total_secs: 35,
+        }
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        use crate::controller::{BackoffStrategy, RetryableErrorClass};
+        RetryPolicy {
+            max_attempts: 2,
+            backoff: BackoffStrategy::Linear { step_ms: 800 },
+            retryable: RetryableErrorClass {
+                network_reset: true,
+                streaming_timeout: true,
+                provider_5xx: true,
+                rate_limit: false,
+            },
+        }
+    }
+
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
         let has_tools = !task.tools.is_empty();
         let wants_concept = task.wants_channel("memory_concept");
@@ -1354,6 +1464,15 @@ impl ModelProvider for GeminiProvider {
         let response = self.apply_auth_headers(req)?.send().await?;
         let status = response.status();
         let body = response.json::<Value>().await?;
+
+        if !status.is_success() {
+            let message = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            bail!("Gemini API error ({}): {}", status.as_u16(), message);
+        }
 
         if use_structured {
             if has_tools {
@@ -1428,10 +1547,8 @@ impl ModelProvider for GeminiProvider {
         let has_tools = !task.tools.is_empty();
         let wants_concept = task.wants_channel("memory_concept");
         let wants_plan = task.wants_channel("active_plan");
-        let use_structured = has_tools
-            || task.wants_channel("spoken_text")
-            || wants_concept
-            || wants_plan;
+        let use_structured =
+            has_tools || task.wants_channel("spoken_text") || wants_concept || wants_plan;
 
         let payload = {
             let prompt = task
@@ -1448,26 +1565,31 @@ impl ModelProvider for GeminiProvider {
 
         let url = self.streaming_endpoint_url(Some(self.request_model(task)))?;
         let req = self.http_client.post(url).json(&payload);
-        let response = self.apply_auth_headers(req)?.send().await?;
+        // Wrap send() in a timeout — for large contexts Gemini can take 20–30s
+        // before returning the first response byte, leaving send().await hung forever.
+        let response = timeout(
+            Duration::from_secs(STREAMING_CONNECT_SECS),
+            self.apply_auth_headers(req)?.send(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "streaming_timeout: Gemini did not respond within {}s (large context?)",
+                STREAMING_CONNECT_SECS
+            )
+        })??;
         let status = response.status();
 
         if !status.is_success() {
-            // On HTTP error, read the full body and return an error response.
+            // On HTTP error, read the full body and propagate as a failure so
+            // the philote tier-escalation logic can route to a fallback provider.
             let body = response.json::<Value>().await.unwrap_or_default();
-            let content = Self::parse_response_text(status, body);
-            return Ok(ProviderOutput::Text {
-                display_text: Some(content.clone()),
-                content,
-                spoken_text: None,
-                partial_replies: Vec::new(),
-                working_memory_delta: None,
-                follow_up_questions: Vec::new(),
-                intent_summary: None,
-                memory_concept: None,
-                memory_candidate: None,
-                active_plan: None,
-                model_gen: None,
-            });
+            let message = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            bail!("Gemini API error ({}): {}", status.as_u16(), message);
         }
 
         // Read the SSE byte stream, splitting on newlines.
@@ -1486,7 +1608,22 @@ impl ModelProvider for GeminiProvider {
         let mut _display_text_out = String::new();
 
         let idle_dur = Duration::from_secs(STREAMING_IDLE_SECS);
+        let sse_start = Instant::now();
+        // Stash a function-call response found in SSE chunks. Gemini delivers tool
+        // calls via streaming without any text content; we capture them here so the
+        // empty-full_text check below can return them instead of bailing.
+        let mut pending_function_call: Option<ProviderOutput> = None;
         loop {
+            // Hard wall-clock cap: Gemini can drip keep-alive SSE bytes every ~7s,
+            // resetting the idle timer without making progress. Bail if the whole
+            // SSE session has run too long regardless of individual byte activity.
+            if sse_start.elapsed() > Duration::from_secs(STREAMING_TOTAL_SECS) {
+                drop(token_tx);
+                bail!(
+                    "streaming_timeout: Gemini SSE session exceeded {}s total (keep-alive drip?)",
+                    STREAMING_TOTAL_SECS
+                );
+            }
             match timeout(idle_dur, byte_stream.next()).await {
                 Ok(Some(chunk_result)) => {
                     let bytes = chunk_result.context("Gemini SSE stream read error")?;
@@ -1510,6 +1647,21 @@ impl ModelProvider for GeminiProvider {
                                     }
                                 } else {
                                     let _ = token_tx.send(text_chunk).await;
+                                }
+                            }
+                            // Check for a function call independently — a single SSE chunk can
+                            // carry both a text part and a functionCall part simultaneously.
+                            // Using a separate `if` (not `else if`) ensures the function call
+                            // is captured even when text was also present in the same chunk.
+                            if pending_function_call.is_none() {
+                                if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
+                                    match Self::parse_native_function_call(task, &fc_chunk) {
+                                        Ok(Some(tc)) => pending_function_call = Some(tc),
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            warn!("Failed to parse SSE function call chunk: {}", e)
+                                        }
+                                    }
                                 }
                             }
                         } else {
@@ -1537,10 +1689,28 @@ impl ModelProvider for GeminiProvider {
                 if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                     full_text.push_str(&text_chunk);
                 }
+                if pending_function_call.is_none() {
+                    if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
+                        match Self::parse_native_function_call(task, &fc_chunk) {
+                            Ok(Some(tc)) => pending_function_call = Some(tc),
+                            Ok(None) => {}
+                            Err(e) => {
+                                warn!("Failed to parse SSE function call chunk: {}", e)
+                            }
+                        }
+                    }
+                }
             }
         }
         // Close the channel — token consumer will see this as end of stream.
         drop(token_tx);
+
+        // If a function call arrived alongside streamed text, prefer the function call.
+        // The text was already forwarded to the user as partial_reply tokens; returning
+        // ToolCall here ensures the tool actually executes instead of being silently dropped.
+        if let Some(fc) = pending_function_call {
+            return Ok(fc);
+        }
 
         if full_text.trim().is_empty() {
             // Stream completed without delivering text content (safety block, quota, etc.).

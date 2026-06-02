@@ -289,12 +289,264 @@ pub struct Context1Advisory {
     pub rationale: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemorySpacetimeFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_kind: Option<MemoryTemporalKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial_scope: Option<MemorySpatialScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<MemoryAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_level: Option<MemoryValidationLevel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryTemporalKind {
+    Event,
+    State,
+    Preference,
+    Rule,
+    Decision,
+    Hypothesis,
+    Gap,
+    Checkpoint,
+}
+
+impl MemoryTemporalKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::State => "state",
+            Self::Preference => "preference",
+            Self::Rule => "rule",
+            Self::Decision => "decision",
+            Self::Hypothesis => "hypothesis",
+            Self::Gap => "gap",
+            Self::Checkpoint => "checkpoint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySpatialScope {
+    #[serde(rename = "self")]
+    SelfScope,
+    Agent,
+    User,
+    Session,
+    Workspace,
+    Hotel,
+    Mesh,
+    Global,
+}
+
+impl MemorySpatialScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SelfScope => "self",
+            Self::Agent => "agent",
+            Self::User => "user",
+            Self::Session => "session",
+            Self::Workspace => "workspace",
+            Self::Hotel => "hotel",
+            Self::Mesh => "mesh",
+            Self::Global => "global",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAuthority {
+    ObservedRuntime,
+    ObservedRepo,
+    GraphStructured,
+    UserStated,
+    VerifiedMemory,
+    InferredMemory,
+    External,
+    Untrusted,
+}
+
+impl MemoryAuthority {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ObservedRuntime => "observed_runtime",
+            Self::ObservedRepo => "observed_repo",
+            Self::GraphStructured => "graph_structured",
+            Self::UserStated => "user_stated",
+            Self::VerifiedMemory => "verified_memory",
+            Self::InferredMemory => "inferred_memory",
+            Self::External => "external",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryValidationLevel {
+    Unverified,
+    CheckGreen,
+    TestGreen,
+    SmokeGreen,
+    WatchedLiveGreen,
+}
+
+impl MemoryValidationLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::CheckGreen => "check-green",
+            Self::TestGreen => "test-green",
+            Self::SmokeGreen => "smoke-green",
+            Self::WatchedLiveGreen => "watched-live-green",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct GraphAnchors {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seam_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_nodes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryShapingContext {
+    pub frame: MemorySpacetimeFrame,
+    #[serde(default)]
+    pub graph_anchors: GraphAnchors,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RecalledMemoryRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_id: Option<String>,
     pub concept: String,
     pub content: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacetime_frame: Option<MemorySpacetimeFrame>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParacrineThreadStatus {
+    Open,
+    Completed,
+    Superseded,
+    Cancelled,
+    Expired,
+    Escalated,
+}
+
+impl ParacrineThreadStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Completed => "completed",
+            Self::Superseded => "superseded",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Escalated => "escalated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParacrineThread {
+    pub id: String,
+    pub origin_turn_id: String,
+    pub role: String,
+    pub goal: String,
+    pub status: ParacrineThreadStatus,
+    pub routing: philotic_client::ParacrineRouting,
+    pub authority: String,
+    pub tool_policy: String,
+    pub approval_scope: String,
+    pub opened_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +554,8 @@ pub struct WorkingTurn {
     pub task_id: Uuid,
     pub turn_id: String,
     pub chat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_user_id: Option<String>,
     pub user_content: String,
     pub final_reply_to: String,
     pub final_reply_role: String,
@@ -355,6 +609,10 @@ pub struct WorkingTurn {
     /// The chat_id (Telegram / membrane channel) of the originating conversation.
     /// Included in the `paracrine_response` so the routing reflex knows where to deliver.
     pub paracrine_reply_chat_id: Option<String>,
+    /// How the originating philote should handle the specialist's response.
+    /// Captured from the inbound exosome and echoed back on `paracrine_response`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_response_routing: Option<philotic_client::ParacrineRouting>,
     /// Set to true when the specialist explicitly calls `delegate.merge` during a turn.
     /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
     /// is no duplicate delivery after the explicit merge already fired.
@@ -372,6 +630,10 @@ pub struct WorkingTurn {
     /// Incremented each time the loop escalates to a lower-tier provider.
     #[serde(default)]
     pub fallback_tier: u8,
+    /// Number of same-tier retries attempted for streaming_timeout errors.
+    /// Allows one automatic retry before escalating to the next fallback tier.
+    #[serde(default)]
+    pub streaming_retry_attempts: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -570,10 +832,15 @@ impl VoiceResponsePolicy {
     /// Switches provider, updating `voice_ids` and returning the resolved voice ID.
     /// When `new_voice_id` is given it is persisted for this provider.
     /// When omitted the previously stored ID for the provider is used if available.
-    pub fn switch_provider(&mut self, new_provider: &str, new_voice_id: Option<&str>) -> Option<String> {
+    pub fn switch_provider(
+        &mut self,
+        new_provider: &str,
+        new_voice_id: Option<&str>,
+    ) -> Option<String> {
         self.provider = Some(new_provider.to_string());
         if let Some(vid) = new_voice_id {
-            self.voice_ids.insert(new_provider.to_string(), vid.to_string());
+            self.voice_ids
+                .insert(new_provider.to_string(), vid.to_string());
         }
         self.voice_ids.get(new_provider).cloned()
     }
@@ -656,10 +923,20 @@ pub struct ContextWindowPolicy {
     /// Default: 32_768, min: 1_000, max: 500_000.
     #[serde(default = "default_max_tool_result_chars")]
     pub max_tool_result_chars: usize,
+    /// Maximum number of tool call entries included in the history for a single
+    /// turn. Oldest entries are dropped first; a compact note is prepended when
+    /// any are dropped. Prevents unbounded context growth on long agentic turns.
+    /// Default: 15, min: 3, max: 100.
+    #[serde(default = "default_max_tool_history_entries")]
+    pub max_tool_history_entries: usize,
 }
 
 fn default_max_tool_result_chars() -> usize {
     32_768
+}
+
+fn default_max_tool_history_entries() -> usize {
+    15
 }
 
 impl Default for ContextWindowPolicy {
@@ -669,6 +946,7 @@ impl Default for ContextWindowPolicy {
             dialogue_window_chars: 10_000,
             include_tool_calls: true,
             max_tool_result_chars: 32_768,
+            max_tool_history_entries: 15,
         }
     }
 }
@@ -788,6 +1066,19 @@ pub struct AgentProfile {
     /// time references correctly. Optional; UTC is assumed when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_timezone: Option<String>,
+    /// Stable mesh-facing principal for the operator when the hotel has linked
+    /// the human to a projected user identity. Bounded projection only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_principal_id: Option<String>,
+    /// Human-friendly preferred name for the operator when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_preferred_name: Option<String>,
+    /// Non-secret primary email alias for the operator when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_primary_email: Option<String>,
+    /// Linked provider labels (e.g. `google`, `github`) projected by the hotel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_linked_providers: Vec<String>,
     /// Authoritative list of role names registered for this agent, fetched from
     /// the hotel graph at startup. Injected into the system prompt so the model
     /// always uses exact, DB-sourced names in delegate.whisper / handoff.to_role.
@@ -804,6 +1095,11 @@ pub struct SessionBindings {
     pub effective_skillset: Vec<String>,
     #[serde(default)]
     pub effective_skill_guidance: Vec<String>,
+    /// Skills whose tools are in the ToolAssembly but suppressed per-turn unless
+    /// the turn content signals the skill is needed. Populated from the role's
+    /// toolset profile `on_demand_skills` list at session snapshot time.
+    #[serde(default)]
+    pub on_demand_skills: Vec<String>,
     #[serde(default)]
     pub effective_workspace_ref: Option<String>,
     #[serde(default)]
@@ -950,6 +1246,8 @@ pub struct ComponentExecutionRoute {
     pub availability_state: String,
     #[serde(default)]
     pub selection_reason: Option<String>,
+    #[serde(default)]
+    pub target_capability: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1071,4 +1369,3 @@ pub struct UserTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_note: Option<String>,
 }
-

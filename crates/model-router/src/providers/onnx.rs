@@ -209,12 +209,9 @@ impl ModelProvider for OnnxProvider {
                 // Telegram voice memos arrive as OGG; transcode to 16 kHz mono
                 // WAV so WhisperBackend::decode_wav can parse them.
                 let mime = attachment.mime_type.as_deref().unwrap_or("audio/ogg");
-                let wav_bytes_owned =
-                    transcode_to_wav_16k(raw_bytes, mime, "ffmpeg")
-                        .await
-                        .with_context(|| {
-                            format!("transcode [{mime}] audio attachment for Whisper")
-                        })?;
+                let wav_bytes_owned = transcode_to_wav_16k(raw_bytes, mime, "ffmpeg")
+                    .await
+                    .with_context(|| format!("transcode [{mime}] audio attachment for Whisper"))?;
 
                 // Run Whisper in a blocking task to avoid blocking the async executor.
                 let guard = self.whisper.read().await;
@@ -266,9 +263,9 @@ impl ModelProvider for OnnxProvider {
                     .map(|s| s as f32);
 
                 let guard = self.kokoro.read().await;
-                let backend = guard
-                    .as_ref()
-                    .context("Kokoro backend not loaded — is espeak-ng installed and the model downloaded?")?;
+                let backend = guard.as_ref().context(
+                    "Kokoro backend not loaded — is espeak-ng installed and the model downloaded?",
+                )?;
 
                 // Run synthesis in a blocking thread (CPU-bound ONNX + subprocess).
                 let backend_ptr = backend as *const KokoroBackend as usize;

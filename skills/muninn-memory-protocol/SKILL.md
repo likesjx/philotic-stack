@@ -18,6 +18,17 @@ This skill standardizes how a client should:
 - keep memory atomic and fragmented into short, meaningful bursts
 - rely on the shared helper instead of hand-rolling MCP ceremony
 
+## Ownership Split
+
+Muninn is the continuity layer across clients. It is not the source of truth, the task tracker, or a transcript archive.
+
+Use the right owner:
+
+- repo docs and code store implemented truth
+- Intel Graph stores structure, seams, work coordination, decisions, and verification evidence
+- `docs/task.md` stores active execution work
+- Muninn stores why something matters next time: compact decisions, learned preferences, reality gaps, validation outcomes, and continuity handles
+
 ## Use The Shared Helper
 
 Preferred transport helper:
@@ -52,6 +63,19 @@ Use a small tag vocabulary only when it helps retrieval:
 - `validation`
 - `follow-up`
 - `operator-preference`
+
+At closeout, prefer a memory delta:
+
+```text
+Memory delta:
+- Decision:
+- Reality gap:
+- Validation:
+- Next seam:
+- Operator preference:
+```
+
+Each filled line should usually become one atomic write. Omit empty lines. Do not store transcripts, noisy logs, routine task churn, or summaries of docs already committed in the repo.
 
 ## Failure Rule
 

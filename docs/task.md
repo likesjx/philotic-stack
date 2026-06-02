@@ -34,6 +34,32 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 - [x] Extract the `ModelManagerInvoker` wiring out of `ansible-mesh-core`.
 - [ ] Migrate downstream crates off the remaining `ansible-mesh-core` compatibility imports where direct primitive crates are now clearer.
 
+## Current Mesh / Transport Pressure
+
+- [ ] Enforce the explicit mesh transport boundary from [MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md):
+  - [ ] keep UDP limited to compact state-sync/control traffic
+  - [ ] remove any remaining routed execution or payload traffic that still leans on the beacon family
+  - [ ] keep WebRTC as optional peer session transport after signaling, not the graph or membership sync plane
+  - [ ] classify the canonical mesh-shared graph projection in code instead of relying on operator intuition
+- [ ] Recover a single known-good live mesh runtime path across `bjork`, `mbp-jane`, and `jane-vps`.
+- [ ] Redeploy `jane-vps` through Ansible with a real Linux build and re-smoke mesh visibility from Bjork.
+- [ ] Prove roaming peer auto-reconnect live by validating observed-endpoint reconciliation against stale peer graph records.
+- [ ] Feed hotel-owned router traces and mesh events into the desktop event log through `philotic-web` so mesh/routing failures are visible without live journal spelunking.
+
+## New Project: Memory Cultivation and True-Up
+
+Proposal: [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)
+
+Seam IDs: `memory-spacetime-frame`, `memory-shaping-context`, `memory-cultivation-loop`, `graph-muninn-true-up`, `memory-promotion-gates`
+
+- [x] Implement `MemorySpacetimeFrame` and `MemoryShapingContext` for Philote memory recall shaping.
+- [x] Project temporal scope, spatial scope, authority, validation level, and space anchors into recalled memory sections.
+- [x] Attach graph-derived anchors as Muninn entities/relationships during `memory.remember`.
+- [x] Add the first low-risk `memory.cultivate` path for closeout and staleness review.
+- [x] Add graph-intelligence true-up finding records using existing node/mutation primitives before introducing new node kinds.
+- [x] Gate promotion from Muninn into AgentGraph/docs/code behind validation evidence or explicit operator approval.
+- [x] Deploy and watched-live verify on `mbp-jane` and `vps-jane` before claiming runtime truth.
+
 ### WI 1: Session Management
 
 Seam IDs: `session-leases`
@@ -594,7 +620,13 @@ Seam IDs: `secret-handling-hardening`, `watched-live-vps-smoke`, `artifact-distr
 - [x] Define the first peer inventory/rendering contract for deployed hotels so cross-host mesh no longer depends on loopback assumptions.
 - [ ] Prove a first VPS deployment smoke for one hotel.
 - [ ] Prove a first multi-host or local-to-VPS two-hotel roundtrip.
-- [ ] Render and deploy `beacon-test-hotel` on `vps-jane` with a Beacon agent profile, VPS-local `import_workspace`, and hotel-scoped Telegram credentials so Beacon can be UATed on the VPS test stack.
+- [ ] Render and deploy the canonical `vps-jane` hotel on `jane-vps` with a Beacon agent profile, VPS-local `import_workspace`, and hotel-scoped Telegram credentials so Beacon can be UATed on the VPS test stack.
+- [ ] Standardize canonical hotel naming across the active mesh:
+  - local desktop default hotel should migrate from legacy `default` to `mac-jane`
+  - MacBook Pro hotel remains `mbp-jane`
+  - VPS hotel should migrate from transitional `beacon-test-hotel` to `vps-jane`
+  - deploy paths should clean stale previous-name graph records so old identities do not persist as phantom peers after rename
+  - complete the live graph/profile/invite migration without losing existing trust edges or operator surfaces
 
 ## New Project: Native Overlay / VPN
 
@@ -657,12 +689,36 @@ Seam IDs: `multi-hotel-route-consistency`, `cross-host-distributed-validation`, 
 - [ ] Review [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md).
 - [ ] Extend remote-capable route metadata consistently across remaining routed component classes beyond the first tool/model paths.
 - [ ] Preserve session-owned membrane reply routing while proving broader distributed component placement.
+- [ ] Concentrate Telegram-facing membranes on `jane-vps` as an explicit placement policy instead of an ad hoc deployment habit:
+  - define “membrane home hotel” posture and failover expectations
+  - keep laptop hotels mesh-visible and reachable without making them poller perimeters by default
+  - prove reply/approval routing when ingress lives on `jane-vps` and cognition lives elsewhere
+- [ ] Implement [MEMBRANE_TRANSPORT_HOME_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_TRANSPORT_HOME_PROPOSAL.md) as the transport-agnostic version of that placement policy:
+  - [x] add graph-owned `membrane_transport_home` records for agent/transport/resource bindings
+  - [x] add governed `transport.set_home` control-plane mutation separate from `role.set_home`
+  - [x] make Telegram lease acquire/renew enforce active-home plus lease authority before acting
+  - [ ] make all membrane startup paths expose standby state before acting
+  - reconcile deployment/materialization from graph truth so YAML cannot resurrect old membrane homes
 - [ ] Define the first remote materialization ceremony:
   - mesh-visible intent
   - deterministic winning target selection
   - targeted materialization request to the winner
   - readiness publication before parked work is released
   - explicit distinction between routeable-ready and lease-authorized when the component family is singleton-scoped
+- [ ] Land the next singular-mesh membership slice:
+  - propagate revocation mesh-wide instead of pairwise folklore
+  - move member-record sync from “first converged path” to audited canonical mesh authority
+  - make cross-hotel philote / role transport consume the converged membership view directly
+  - close the retroactive convergence gap so already-paired hotels learn the full current circle without requiring a fresh admission ceremony
+- [x] Sync the canonical mesh catalog across hotels instead of seeding hotel-local tool/skill/profile folklore:
+  - replicate `abstract_tool`, `abstract_skill`, and `toolset_profile` records on change and periodic full sync
+  - use the built-in `admin` profile as the first proving profile
+  - let newly admitted hotels receive the current canonical catalog as part of the singular-mesh convergence path
+- [ ] Decide whether ad hoc `skill.register` writes are canonical mesh-catalog truth or hotel-local overlays, then implement that authority boundary instead of leaving dynamic skill propagation to vibes.
+- [x] Expose the first hotel-owned placement judgment API:
+  - add `hotel.best_place_to_run`
+  - respect explicit role home pins first
+  - fall back to ghost-mirror health, reachability, tool affinity, and locality ranking
 - [ ] Define the first capacity-relief placement flow:
   - stressed hotel help signal
   - candidate offers
@@ -1164,7 +1220,53 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - no browser-direct remote `aiua` protocol
   - no local mutation simulation standing in for target execution
 - [ ] Define the first desktop-aware operator session posture flow for mesh-wide admin work.
+- [~] Define the first hotel-owned user identity and operator auth slice.
+  - [x] canonical `UserRecord`, `RootUserKeyRefRecord`, and `OperatorSessionRecord` tables created in the hotel context DB
+  - [x] no-view-before-auth rule for the always-on desktop: keep operator work surfaces locked until a hotel-issued operator session exists
+  - [x] first login/bootstrap path: hotel-issued startup bootstrap token exchanged for a bounded operator session cookie
+  - [x] move the bootstrap UX into `System Settings > Aiua Membrane` while the embedded desktop shell stays live before auth
+  - [x] shell-level operator-session gate: before auth, non-settings workspace app launch/focus is blocked and redirected through the desktop event bus into `System Settings > Aiua Membrane`
+  - [x] seed and project hotel-local `root_user_key_refs` from the current vault key source (keychain/env) with non-secret fingerprint metadata
+  - [x] define canonical bootstrap direction: OIDC primary, membrane-assisted single-use challenge for step-up/recovery, passkeys later
+  - [x] persist hotel-local `operator_auth_challenges` and expose first challenge issuance endpoint for membrane/OIDC ceremony groundwork
+- [x] implement first OIDC start/callback flow for hotel-issued operator sessions, with hotel-config-backed public callback base URL / provider client IDs and vault-backed provider secret refs as the intended canonical configuration path (env fallback remains transitional); loopback/local membranes now intentionally prefer bootstrap/back-door auth unless a public OIDC base URL is explicitly configured, and `vps-jane` should standardize on `brain.jaredlikes.com` as its public operator ingress
+- [x] document the operator-auth onboarding flow for both first-admin bootstrap and fresh-operator OIDC setup in [docs/process/OPERATOR_AUTH_ONBOARDING.md](/Users/jaredlikes/code/philotic-stack/docs/process/OPERATOR_AUTH_ONBOARDING.md), so local bootstrap, provider config, and new-user enrichment stop depending on folklore
+- [ ] wire the desktop System Settings auth surface to read and mutate the bounded OIDC config surface (`/api/config/oidc`, `oidc_*` keys) instead of relying on env-era operator folklore
+  - [ ] move from current root-key source inspection to a richer hotel-local identity/step-up authority path with real vault-backed login ceremony
+  - [ ] implement membrane proof verification and single-use challenge redemption into operator sessions
+  - [x] persist the first normalized provider identity linkage on the hotel-local root user record using provider subject as the canonical link key and email/login as aliases
+  - [~] expand hotel-local user onboarding beyond the first root-user link so local-first `User Settings` can curate a richer canonical user graph
+    - [x] add a first bounded `GET/PATCH /api/auth/user` surface for canonical hotel-local operator user settings and onboarding state
+    - [x] wire desktop `User Settings` onto the canonical hotel-owned auth-user surface so `System Settings > Aiua Membrane` can actually author local-first user graph fields and linked identities instead of only hosting the auth bootstrap
+  - [~] mesh-visible ghost mirror projection for non-secret user identity and audit attribution
+    - [x] land first graph-backed `ProjectedUserIdentityRecord` seam with stable provider-backed `principal_id` and hotel-auth-store sync
+    - [x] propagate projected user identity across hotels through explicit durable `ProjectedUserIdentitySync` mesh events instead of assuming full graph replication already exists
+    - [x] use that propagated projected identity during remote user resolution/onboarding by exact provider subject or unique verified email alias instead of treating every hotel as socially amnesiac until login
+  - [x] philote-visible bounded user context projection instead of raw root-user secret access
+  - [ ] secure always-on desktop-server posture on `vps-jane` as a hotel-authenticated operator surface rather than a second ambient authority source
+  - [ ] passkey-backed local-first operator login after OIDC and membrane step-up are landed
 - [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.
+- [ ] Launch the operator identity and dangerous-action ceremonies effort:
+  - [x] write [OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md)
+  - [ ] define the first desktop operator identity/session model
+  - [ ] define posture transitions and expiry for `normal` and `admin_elevated`
+  - [ ] classify current dangerous actions by ceremony tier
+  - [ ] define the first target-scoped grant record and lifecycle
+  - [ ] prove one end-to-end grant-backed remote admin action
+- [x] Define the first remote dangerous-action confirmation policy:
+  - reads and bounded non-secret config remain admin-posture only
+  - remote component restart/delete require typed `guest_id` confirmation
+  - remote secret rotation requires typed `secret_ref` confirmation
+  - remote vault entry creation requires typed `vault_name` confirmation
+  - remote role-home moves require typed `{agent_id}:{role_name}` confirmation
+- [ ] First-class remote hotel admin parity so the Philote desktop can manage a remote `aiua` through the same hotel-mediated control plane:
+  - [x] write [REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REMOTE_HOTEL_ADMIN_PARITY_PROPOSAL.md)
+  - [x] add remote parity for component inventory/detail
+  - [x] add remote parity for component mutations (`create`, `update`, `delete`, `enable`, `disable`, `restart`)
+  - [x] add bounded remote config read/mutate parity for operator-approved keys
+  - [x] add remote secret/vault-ref inventory and rotation workflows without normalizing plaintext fetches
+  - [x] add remote placement and role/philote transport actions through the same operator control plane
+  - [x] define the first confirmation boundary for dangerous remote actions
 - [ ] Define the first high-trust remote action ceremonies for:
   - secret rotation
   - node shutdown/restart
@@ -1179,6 +1281,12 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - `jaredlikes-desktop` source ownership
   - `philotic-web` embedding/runtime ownership
   - release pipeline provenance ownership
+- [~] Define the desktop workspace component model.
+  - [x] document the current desktop substrate: application registry/manager, window manager, desktop manager, event bus, widget manager
+  - [x] document the system-settings vs workspace-app split
+  - [x] document the philote-published app/customization direction and artifact/catalog boundary
+  - [ ] formalize the first graph-canonical desktop app schema for philote-published apps
+  - [ ] define widget/app publication permissions and artifact verification rules
 - [ ] Define the frontend development workflow for:
   - frontend-first local iteration
   - integrated membrane development
@@ -1258,7 +1366,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - `project_agent_self`
   - `project_user`
   - `project_knowledge`
-- [ ] Make skill and tool exposure goal-scoped turn projections instead of full inventory dumps when the goal is clear.
+- [x] Make skill and tool exposure goal-scoped turn projections instead of full inventory dumps when the goal is clear.
 - [ ] Compose those projections with explicit context layers:
   - soul
   - identity

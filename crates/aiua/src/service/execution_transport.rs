@@ -8,6 +8,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
+use crate::mesh::mesh_auth_key_for_node;
+
 pub async fn serve_execution_plane(
     addr: &str,
     local_capabilities: NodeCapabilities,
@@ -46,7 +48,7 @@ pub async fn serve_execution_plane(
                     }
 
                     match msg.msg_type {
-                        MsgType::MeshEventBatch => {
+                        MsgType::ExecutionEventBatch | MsgType::ExecutionEventAck => {
                             if inbox_tx.send(msg).await.is_err() {
                                 warn!(
                                     "Execution transport could not forward message from {} because inbox receiver was closed",
@@ -104,11 +106,7 @@ fn validate_execution_message(
     }
 
     if enable_rust_auth {
-        let auth_key = graph
-            .get_config_value(&format!("mesh_auth_key:{}", msg.src_node))?
-            .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        let auth_key = mesh_auth_key_for_node(graph, local_node_id, &msg.src_node)?
             .ok_or_else(|| anyhow::anyhow!("no mesh auth key for node {}", msg.src_node))?;
         let auth = MeshAuth::new(auth_key);
         auth.validate(

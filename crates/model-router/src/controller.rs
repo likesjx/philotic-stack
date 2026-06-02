@@ -594,12 +594,14 @@ impl ControllerTask {
             return ResponseRouteBucket::RealtimeWebsocket;
         }
 
-        if matches!(self.provider_option_str("response_mode"), Some("native_audio"))
-            || self
-                .response_contract
-                .modalities
-                .iter()
-                .any(|modality| modality == "audio")
+        if matches!(
+            self.provider_option_str("response_mode"),
+            Some("native_audio")
+        ) || self
+            .response_contract
+            .modalities
+            .iter()
+            .any(|modality| modality == "audio")
         {
             return ResponseRouteBucket::AudioMultimodal;
         }
@@ -1437,10 +1439,16 @@ impl ProviderConfigs {
             .await?,
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
-            ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL")
-                .or(fetch_config_string(ipc_client, "ollama_base_url").await?),
-            ollama_model: env_override("PHILOTIC_OLLAMA_MODEL")
-                .or(fetch_config_string(ipc_client, "ollama_model").await?),
+            ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL").or(fetch_config_string(
+                ipc_client,
+                "ollama_base_url",
+            )
+            .await?),
+            ollama_model: env_override("PHILOTIC_OLLAMA_MODEL").or(fetch_config_string(
+                ipc_client,
+                "ollama_model",
+            )
+            .await?),
             openai_oauth_access_token: load_env_or_config_secret_string(
                 ipc_client,
                 "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
@@ -1455,10 +1463,16 @@ impl ProviderConfigs {
                 "openai_api_key_ref",
             )
             .await?,
-            openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL")
-                .or(fetch_config_string(ipc_client, "openai_base_url").await?),
-            openai_project_id: env_override("PHILOTIC_OPENAI_PROJECT_ID")
-                .or(fetch_config_string(ipc_client, "openai_project_id").await?),
+            openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL").or(fetch_config_string(
+                ipc_client,
+                "openai_base_url",
+            )
+            .await?),
+            openai_project_id: env_override("PHILOTIC_OPENAI_PROJECT_ID").or(fetch_config_string(
+                ipc_client,
+                "openai_project_id",
+            )
+            .await?),
             openai_default_model: env_override("PHILOTIC_OPENAI_DEFAULT_MODEL")
                 .or(fetch_config_string(ipc_client, "openai_default_model").await?),
             openai_default_embedding_model: env_override("PHILOTIC_OPENAI_DEFAULT_EMBEDDING_MODEL")
@@ -1467,11 +1481,90 @@ impl ProviderConfigs {
     }
 }
 
+/// Per-attempt timing budget declared by each provider.
+///
+/// The runtime enforces `total_secs` as an outer `tokio::time::timeout` around each
+/// invoke call.  Invariant: `total_secs × retry_policy.max_attempts < philote watchdog (120s)`.
+#[derive(Debug, Clone, Copy)]
+pub struct AttemptPolicy {
+    /// How long to wait for the first byte from the provider (connect phase).
+    pub connect_secs: u64,
+    /// Maximum silence gap during a streaming session before treating it as stalled.
+    pub idle_secs: u64,
+    /// Hard wall-clock cap for a single attempt.  The runtime cancels and retries if exceeded.
+    pub total_secs: u64,
+}
+
+impl Default for AttemptPolicy {
+    fn default() -> Self {
+        Self {
+            connect_secs: 20,
+            idle_secs: 10,
+            total_secs: 35,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BackoffStrategy {
+    None,
+    Linear { step_ms: u64 },
+}
+
+/// Which error classes the runtime should retry automatically.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryableErrorClass {
+    pub network_reset: bool,
+    pub streaming_timeout: bool,
+    pub provider_5xx: bool,
+    pub rate_limit: bool,
+}
+
+impl Default for RetryableErrorClass {
+    fn default() -> Self {
+        Self {
+            network_reset: true,
+            streaming_timeout: true,
+            provider_5xx: true,
+            rate_limit: false,
+        }
+    }
+}
+
+/// Retry budget declared by each provider.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Total number of attempts including the first.
+    pub max_attempts: u8,
+    pub backoff: BackoffStrategy,
+    pub retryable: RetryableErrorClass,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 2,
+            backoff: BackoffStrategy::Linear { step_ms: 500 },
+            retryable: RetryableErrorClass::default(),
+        }
+    }
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn supports(&self, task: &ControllerTask) -> bool;
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput>;
+
+    /// Per-attempt timing budget.  The runtime enforces `total_secs` as an outer timeout.
+    fn attempt_policy(&self) -> AttemptPolicy {
+        AttemptPolicy::default()
+    }
+
+    /// Retry budget.  Invariant: `attempt_policy().total_secs × retry_policy().max_attempts < 120s`.
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
 
     /// Whether this provider supports streaming token delivery for the given task.
     /// When true, the runtime may call `invoke_streaming` instead of `invoke`.
@@ -1548,6 +1641,15 @@ impl ProviderRegistry {
             .find(|provider| provider.supports(task))
             .cloned()
             .with_context(|| format!("no provider registered for {}", task.kind.as_str()))
+    }
+
+    /// All providers that support `task`, in priority order.
+    pub fn all_supporting(&self, task: &ControllerTask) -> Vec<Arc<dyn ModelProvider>> {
+        self.providers
+            .iter()
+            .filter(|p| p.supports(task))
+            .cloned()
+            .collect()
     }
 }
 

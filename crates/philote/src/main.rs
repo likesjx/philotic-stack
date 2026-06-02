@@ -33,8 +33,18 @@ async fn main() -> Result<()> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
+    // PHILOTIC_ROLE_INBOX is injected by aiua as "role:{agent_id}:{role_name}".
+    // Use it as the IPC subscription key so the hotel's role_route_is_live check matches.
+    let role_inbox = std::env::var("PHILOTIC_ROLE_INBOX")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
     let (role, guest_id) = match role_name {
-        Some(ref rn) => (rn.clone(), format!("{}:{}", agent_id, rn)),
+        Some(ref rn) => {
+            let role = role_inbox.unwrap_or_else(|| rn.clone());
+            (role, format!("{}:{}", agent_id, rn))
+        }
         None => ("agent".to_string(), agent_id.clone()),
     };
 
@@ -44,14 +54,26 @@ async fn main() -> Result<()> {
         supported_tools: Vec::new(),
     };
 
-    if let Some(ref rn) = role_name {
+    if role_name.is_some() {
         info!(
             "Starting as role-incarnation philote: agent={} role={} guest_id={}",
-            agent_id, rn, guest_id
+            agent_id, role, guest_id
         );
     }
 
-    let ipc_client = philotic_client::PhiloticClient::connect(identity).await?;
+    let mut ipc_client = philotic_client::PhiloticClient::connect(identity).await?;
+
+    // Role incarnation philotes subscribe to "role:{agent}:{role_name}" for handoff delivery,
+    // but also need to be in the "agent" subscribers so aiua's is_registered check (which
+    // reads inboxes["agent"]) can find them for subsequent turn routing after a handoff.
+    if role_name.is_some() {
+        ipc_client
+            .send_request(philotic_client::IpcRequest::SubscribeInbox {
+                role: "agent".to_string(),
+            })
+            .await?;
+    }
+
     let mut runtime = AgentRuntime::new(ipc_client, agent_id);
     runtime.run().await
 }

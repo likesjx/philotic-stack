@@ -137,7 +137,7 @@ clear-aiua:
     @pkill -KILL -f "model-router" 2>/dev/null || true
     @pkill -KILL -f "tool-runner" 2>/dev/null || true
     @pkill -KILL -f "graph-runner" 2>/dev/null || true
-    @pkill -KILL -f "agent-graph-runner" 2>/dev/null || true
+    @pkill -KILL -f "agent-datasource" 2>/dev/null || true
     @sleep 0.5
     @rm -f /tmp/philotic-*.sock
     @find "${HOME}/.philotic" -name "*.sock" -delete 2>/dev/null || true
@@ -374,9 +374,9 @@ smoke-gemini-live:
 smoke-mlx:
     bash scripts/smoke-mlx-controller.sh
 
-# Run the agent-graph-runner cargo integration tests (tool dispatch without live hotel, Seams 3 & 4)
+# Run the agent-datasource cargo integration tests (tool dispatch without live hotel, Seams 3 & 4)
 test-agent-graph:
-    cargo test -p agent-graph-runner --test smoke -- --nocapture
+    cargo test -p agent-datasource --test smoke -- --nocapture
 
 # Run the router trace cargo tests (RouterTraceStorage unit coverage, Seam 5)
 test-router-trace:
@@ -389,7 +389,7 @@ test-suite:
     cargo test -p philotic-client -- --nocapture
     cargo test -p philote -- --nocapture
     cargo test -p aiua -- --nocapture
-    cargo test -p agent-graph-runner --test smoke -- --nocapture
+    cargo test -p agent-datasource --test smoke -- --nocapture
     cargo test -p ansible-mesh-core -- router_trace --nocapture
 
 # Full binary smoke suite (no external credentials or large model downloads)
@@ -454,9 +454,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-onnx model-controller-parakeet philote-worker tool-runner graph-runner graph-datasource graph-intelligence table-datasource router-listener"
+    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p graph-datasource -p graph-intelligence -p philotic-web -p table-datasource -p router-listener
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -468,7 +468,13 @@ local-push:
         if [ ! -f "${AIUA_CELLAR}/$bin" ]; then
             cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
             chmod 555 "${AIUA_CELLAR}/$bin"
-            echo "  + $bin (new)"
+            # Create /opt/homebrew/bin symlink for new binaries
+            if [ ! -e "/opt/homebrew/bin/$bin" ]; then
+                ln -s "../Cellar/aiua/0.1.0-alpha/bin/$bin" "/opt/homebrew/bin/$bin"
+                echo "  + $bin (new + symlinked)"
+            else
+                echo "  + $bin (new)"
+            fi
             continue
         fi
         rm -f "${AIUA_CELLAR}/$bin"
@@ -485,8 +491,10 @@ local-push:
     echo "  ✓ phil"
     echo "✅ Local Homebrew install updated."
 
-# Push release binaries to any remote Homebrew host via SCP.
-remote-homebrew-push remote hotel expected_host:
+# Build release binaries locally (MacBook Air) and push them to mbp-jane via SCP.
+# mbp-jane is a separate machine — it has no repo, only runs Cellar-installed binaries.
+# Stops Jane on mbp-jane, installs, restarts.
+remote-homebrew-push remote hotel expected_host="":
     #!/usr/bin/env bash
     set -euo pipefail
     exec ./scripts/push-homebrew-remote.sh "{{remote}}" "{{hotel}}" "{{expected_host}}"
@@ -497,27 +505,89 @@ remote-homebrew-stop remote hotel:
 
 remote-homebrew-start remote hotel:
     #!/usr/bin/env bash
-    ssh "{{remote}}" "nohup env PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    profile="{{hotel}}"
+    if [[ "{{hotel}}" == "mbp-jane" || "{{hotel}}" == "mac-jane" ]]; then profile="jane"; fi
+    if [[ "{{hotel}}" == "local-telegram" || "{{hotel}}" == "bjork" ]]; then profile="bjork"; fi
+    ssh "{{remote}}" "uid=\$(id -u); launchctl bootout gui/\${uid}/com.philotic.aiua.{{hotel}} 2>/dev/null || true; pkill -f '[a]iua --hotel {{hotel}}' 2>/dev/null || true"
+    ssh "{{remote}}" "mkdir -p ~/.philotic/${profile}/graphs && ulimit -n 65536; nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid)"
 
 remote-homebrew-status remote hotel:
     @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
 
 jane-push:
-    just remote-homebrew-push mbp-jane mbp-jane MacBookPro
+    just remote-homebrew-push mbp-jane mbp-jane Jareds-MacBook-Pro
 
 # Stop Jane on mbp-jane without pushing new binaries.
 jane-stop:
-    #!/usr/bin/env bash
-    ssh mbp-jane "pkill -f '/opt/homebrew/bin/aiua' && echo '▶ aiua stopped' || echo '▶ aiua was not running'"
+    just remote-homebrew-stop mbp-jane mbp-jane
 
 # Start Jane on mbp-jane (without pushing — uses whatever binary is already installed).
 jane-start:
-    #!/usr/bin/env bash
-    ssh mbp-jane "nohup /opt/homebrew/bin/aiua --hotel mbp-jane >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    just remote-homebrew-start mbp-jane mbp-jane
 
 # Check whether Jane (aiua) is running on mbp-jane.
 jane-status:
-    @ssh mbp-jane "ps aux | grep '[/]opt/homebrew/bin/aiua' || echo 'aiua is not running on mbp-jane'"
+    @just remote-homebrew-status mbp-jane mbp-jane
+
+# ── VPS deploy (vps-jane / Linux x86_64 via Ansible) ────────────────────────
+# Strategy: rsync source to VPS → build there (VPS has rustup) → ansible
+# deploys binaries from the VPS build output and restarts the systemd service.
+# Prerequisites: SSH key at ~/.ssh/vps_deploy_key, vault pass at ~/.philotic-vault-pass
+
+# Full deploy to vps-jane: sync source, build on VPS, ansible config + service.
+vps-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT_DIR="{{justfile_directory()}}"
+    VPS="deploy@jane-vps"
+    VPS_CODE="/home/deploy/code/philotic-stack"
+    VPS_BUILD="${VPS_CODE}/target/release"
+
+    echo "▶ Syncing source to ${VPS}:${VPS_CODE}..."
+    rsync -az --delete \
+      --exclude='.git' \
+      --exclude='target/' \
+      --exclude='dist/' \
+      --exclude='*.db' \
+      --exclude='.claude/' \
+      "${ROOT_DIR}/" "${VPS}:${VPS_CODE}/"
+
+    echo "▶ Building release on ${VPS} (this may take a few minutes)..."
+    ssh -n "${VPS}" "cd '${VPS_CODE}' && \$HOME/.cargo/bin/cargo build --release --bins \
+      -p aiua \
+      -p philote \
+      -p membrane \
+      -p membrane-telegram \
+      -p membrane-mcp \
+      -p model-router \
+      -p tool-runner \
+      -p graph-runner \
+      -p graph-datasource \
+      -p table-datasource \
+      -p router-listener \
+      -p agent-datasource"
+
+    echo "▶ Deploying via ansible (binaries from VPS build at ${VPS_BUILD})..."
+    cd "${ROOT_DIR}/ansible" && ansible-playbook \
+      -i inventory/hosts.ini \
+      deploy_hotel.yml \
+      --limit jane-vps \
+      --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${VPS_BUILD}"
+
+# Config-only push to vps-jane: re-render mesh-config + secrets, restart service.
+# Does NOT rebuild or copy binaries — uses whatever is already in /opt/philotic/bin.
+vps-config:
+    cd ansible && ansible-playbook -i inventory/hosts.ini deploy_hotel.yml --limit jane-vps --skip-tags binary
+
+# Check that vps-jane host_vars peer ports match the live context graph.
+vps-port-drift-check:
+    ./scripts/check-hotel-port-drift.py --host-vars ansible/host_vars/jane-vps.yml --ssh-target vps-jane
+
+# Deploy to all hotel nodes: local (bjork) + mbp-jane + vps-jane.
+push-all:
+    just local-push
+    just jane-push
+    just vps-push
 
 # Show configured Ansible inventory for deployment targets
 ansible-inventory:

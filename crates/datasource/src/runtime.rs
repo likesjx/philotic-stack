@@ -212,6 +212,7 @@ async fn emit_success_response(
             task_json: json!({
                 "action": "datasource_response",
                 "capability": task.kind.as_str(),
+                "tool_name": task.kind.as_str(),
                 "provider": provider_id,
                 "session_id": reply.session_id,
                 "turn_id": reply.turn_id,
@@ -243,6 +244,7 @@ async fn emit_failure(
             task_json: json!({
                 "action": "datasource_response",
                 "capability": capability.unwrap_or("unknown"),
+                "tool_name": capability.unwrap_or("unknown"),
                 "provider": provider.unwrap_or("unknown"),
                 "session_id": reply.session_id,
                 "turn_id": reply.turn_id,

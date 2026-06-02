@@ -3,10 +3,11 @@
     "default_model": "{{ philotic_default_model | default('gemini-pro') }}"{% if vault_gemini_api_key is defined and vault_gemini_api_key %},
     "gemini_api_key": "{{ vault_gemini_api_key }}"{% endif %}{% if vault_elevenlabs_api_key is defined and vault_elevenlabs_api_key %},
     "elevenlabs_api_key": "{{ vault_elevenlabs_api_key }}"{% endif %}{% if vault_elevenlabs_voice_id is defined and vault_elevenlabs_voice_id %},
-    "elevenlabs_voice_id": "{{ vault_elevenlabs_voice_id }}"{% endif %}
+    "elevenlabs_voice_id": "{{ vault_elevenlabs_voice_id }}"{% endif %}{% if philotic_oidc_public_base_url is defined and philotic_oidc_public_base_url | trim %},
+    "oidc_public_base_url": "{{ philotic_oidc_public_base_url | trim }}"{% endif %}
   },
   "hotels": {
-    "{{ philotic_hotel_name }}": {
+    "{{ philotic_hotel_runtime_name }}": {
       "agents": {{ philotic_agents | to_nice_json }}{% if philotic_backbone_peers | length > 0 %},
       "backbone_peers": [
 {% for peer in philotic_backbone_peers %}

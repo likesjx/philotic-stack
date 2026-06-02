@@ -1,3 +1,2 @@
-pub mod event;
 pub mod beacon;
-
+pub mod event;

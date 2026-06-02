@@ -5,6 +5,8 @@ use ansible_mesh_core::storage::SecretRecord;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -102,6 +104,18 @@ pub fn resolve_secret(
     Ok(Some(decrypt(&secret)?))
 }
 
+/// Read and decrypt a vault secret without ACL checks.
+/// Only for hotel-internal operations (e.g. migration bundle building).
+pub(crate) fn export_secret_plaintext(
+    graph: &GraphDomain,
+    secret_ref: &str,
+) -> Result<Option<String>> {
+    let Some(secret) = graph.get_secret(secret_ref)? else {
+        return Ok(None);
+    };
+    Ok(Some(decrypt(&secret)?))
+}
+
 fn encrypt(plaintext: &str) -> Result<(String, String)> {
     let cipher = cipher()?;
     let nonce_bytes = random_nonce();
@@ -152,14 +166,24 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
             return Ok(from_env);
         }
 
+        if let Ok(from_file) = load_env_file_root_key() {
+            if let Err(err) = store_keychain_root_key(&from_file) {
+                warn!(
+                    error = %err,
+                    "Failed to seed the macOS Keychain with the Philotic vault root key file; continuing with the file-provided key for this process"
+                );
+            }
+            return Ok(from_file);
+        }
+
         let generated = random_root_key();
         store_keychain_root_key(&generated)?;
         return Ok(generated);
     }
 
-    load_env_root_key().with_context(|| {
+    load_env_root_key().or_else(|_| load_env_file_root_key()).with_context(|| {
         format!(
-            "{} must be set to a base64-encoded 32-byte key before using the hotel vault on this platform",
+            "{} must be set to a base64-encoded 32-byte key, or ~/.philotic/vault-master-key.env must exist, before using the hotel vault on this platform",
             VAULT_ENV_KEY
         )
     })
@@ -168,6 +192,31 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
 fn load_env_root_key() -> Result<Vec<u8>> {
     let raw = std::env::var(VAULT_ENV_KEY)?;
     decode_root_key(raw.trim(), VAULT_ENV_KEY)
+}
+
+fn load_env_file_root_key() -> Result<Vec<u8>> {
+    let path = vault_master_key_env_path()?;
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim() == VAULT_ENV_KEY {
+                return decode_root_key(value.trim(), &path.display().to_string());
+            }
+        }
+    }
+    bail!("{} did not contain {}", path.display(), VAULT_ENV_KEY)
+}
+
+fn vault_master_key_env_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join(".philotic")
+        .join("vault-master-key.env"))
 }
 
 fn load_keychain_root_key() -> Result<Option<Vec<u8>>> {
@@ -192,8 +241,10 @@ fn load_keychain_root_key() -> Result<Option<Vec<u8>>> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("could not be found")
+    if output.status.code() == Some(36)
+        || stderr.contains("could not be found")
         || stderr.contains("The specified item could not be found")
+        || stderr.contains("User interaction is not allowed")
     {
         return Ok(None);
     }

@@ -1,24 +1,6 @@
+use crate::event::NodeId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::event::NodeId;
-
-/// Point-in-time environment snapshot self-reported by a hotel in each heartbeat.
-/// All fields are optional so older nodes remain wire-compatible.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct NodeHealthSnapshot {
-    /// Active guest process count on this hotel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guest_count: Option<u32>,
-    /// Percentage of disk space still free on the primary volume (0.0–100.0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disk_free_pct: Option<f32>,
-    /// Percentage of system memory still free (0.0–100.0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mem_free_pct: Option<f32>,
-    /// 1-minute load average (Unix `uptime` style).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub load_avg_1m: Option<f32>,
-}
 
 /// The core envelope for UDP mesh communication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +41,8 @@ pub enum MsgType {
     SecretPull,
     /// Mesh presence and health update
     Heartbeat,
+    /// A chunk of capability advertisements and reachability metadata.
+    CapabilitySync,
     /// Asynchronous result delivery
     Result,
     /// Streaming execution logs
@@ -71,8 +55,38 @@ pub enum MsgType {
     MeshEventBatch,
     /// An acknowledgment of durably received mesh events
     MeshEventAck,
+    /// A batch of EventEnvelopes sent over the reliable execution plane
+    ExecutionEventBatch,
+    /// An acknowledgment of durably received execution-plane events
+    ExecutionEventAck,
     /// A membership acceptance packet emitted after an invite is accepted
     MeshMembershipAccept,
+    /// Propagated mesh membership records used to converge the shared trust view
+    MeshMembershipSync,
+    /// Propagated mesh-global tool, skill, and profile catalog records
+    MeshCatalogSync,
     /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
     WebRtcSignal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MsgType;
+
+    #[test]
+    fn execution_plane_msg_types_serialize_with_stable_names() {
+        let batch = serde_json::to_string(&MsgType::ExecutionEventBatch).expect("serialize batch");
+        let ack = serde_json::to_string(&MsgType::ExecutionEventAck).expect("serialize ack");
+
+        assert_eq!(batch, "\"EXECUTION_EVENT_BATCH\"");
+        assert_eq!(ack, "\"EXECUTION_EVENT_ACK\"");
+        assert_eq!(
+            serde_json::from_str::<MsgType>(&batch).expect("deserialize batch"),
+            MsgType::ExecutionEventBatch
+        );
+        assert_eq!(
+            serde_json::from_str::<MsgType>(&ack).expect("deserialize ack"),
+            MsgType::ExecutionEventAck
+        );
+    }
 }

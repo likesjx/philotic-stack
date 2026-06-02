@@ -16,8 +16,8 @@
 //! Every step is non-fatal: a failed vault is logged and skipped; a failed Ollama call
 //! drops consolidation for that cluster and falls back to evolve-only.
 
-use anyhow::Result;
 use ansible_mesh_core::domain::GraphDomain;
+use anyhow::Result;
 use memory_core::MuninnConfig;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -101,7 +101,16 @@ async fn sweep_vault(
         let ids: Vec<&str> = cluster.iter().map(|e| e.id.as_str()).collect();
         match ollama_merge(client, cluster).await {
             Ok(merged_content) => {
-                match consolidate(client, &config.base_url, token, vault_name, &ids, &merged_content).await {
+                match consolidate(
+                    client,
+                    &config.base_url,
+                    token,
+                    vault_name,
+                    &ids,
+                    &merged_content,
+                )
+                .await
+                {
                     Ok(_) => {
                         for e in cluster {
                             consolidated_ids.insert(e.id.clone());
@@ -130,7 +139,8 @@ async fn sweep_vault(
         .collect();
 
     for engram in &to_evolve {
-        if let Err(e) = evolve_engram(client, &config.base_url, token, vault_name, &engram.id).await {
+        if let Err(e) = evolve_engram(client, &config.base_url, token, vault_name, &engram.id).await
+        {
             debug!(vault = %vault_name, id = %engram.id, error = %e, "DreamsPhase: evolve failed (non-fatal)");
         }
     }
@@ -216,21 +226,21 @@ async fn embed_engrams(client: &reqwest::Client, engrams: &[EngramSummary]) -> V
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<EmbedResponse>().await {
-                    Ok(r) if !r.embedding.is_empty() => {
-                        out.push(EmbeddedEngram {
-                            id: engram.id.clone(),
-                            concept: engram.concept.clone(),
-                            content: engram.content.clone(),
-                            vector: r.embedding,
-                        });
-                    }
-                    Ok(_) => debug!(id = %engram.id, "DreamsPhase: empty embedding vector"),
-                    Err(e) => debug!(id = %engram.id, error = %e, "DreamsPhase: embed parse failed"),
+            Ok(resp) if resp.status().is_success() => match resp.json::<EmbedResponse>().await {
+                Ok(r) if !r.embedding.is_empty() => {
+                    out.push(EmbeddedEngram {
+                        id: engram.id.clone(),
+                        concept: engram.concept.clone(),
+                        content: engram.content.clone(),
+                        vector: r.embedding,
+                    });
                 }
+                Ok(_) => debug!(id = %engram.id, "DreamsPhase: empty embedding vector"),
+                Err(e) => debug!(id = %engram.id, error = %e, "DreamsPhase: embed parse failed"),
+            },
+            Ok(resp) => {
+                debug!(id = %engram.id, status = %resp.status(), "DreamsPhase: embed non-2xx")
             }
-            Ok(resp) => debug!(id = %engram.id, status = %resp.status(), "DreamsPhase: embed non-2xx"),
             Err(e) => debug!(id = %engram.id, error = %e, "DreamsPhase: embed request failed"),
         }
     }
@@ -308,11 +318,7 @@ async fn ollama_merge(client: &reqwest::Client, cluster: &[EmbeddedEngram]) -> R
         "stream": false,
     });
 
-    let resp = client
-        .post(OLLAMA_CHAT_URL)
-        .json(&body)
-        .send()
-        .await?;
+    let resp = client.post(OLLAMA_CHAT_URL).json(&body).send().await?;
 
     if !resp.status().is_success() {
         let status = resp.status();

@@ -6,21 +6,50 @@ use rusqlite::types::ValueRef;
 use std::collections::HashMap;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+/// A single stderr line emitted by a guest process.
+pub struct GuestStderrLine {
+    pub guest_id: String,
+    pub line: String,
+}
 
 /// A Universal Materializer backed by the local OS Process space.
 pub struct LocalProcessMaterializer {
     children: HashMap<String, tokio::process::Child>,
+    db_path: String,
+    hotel_socket: Option<String>,
+    stderr_tx: Option<mpsc::Sender<GuestStderrLine>>,
 }
 
 impl LocalProcessMaterializer {
-    pub fn new() -> Self {
+    pub fn new(db_path: impl Into<String>) -> Self {
         Self {
             children: HashMap::new(),
+            db_path: db_path.into(),
+            hotel_socket: None,
+            stderr_tx: None,
         }
+    }
+
+    /// Supply the hotel's IPC socket path so all spawned guests receive
+    /// PHILOTIC_HOTEL_SOCKET even when the hotel process itself wasn't started
+    /// with that env var set.
+    pub fn with_hotel_socket(mut self, socket: impl Into<String>) -> Self {
+        self.hotel_socket = Some(socket.into());
+        self
+    }
+
+    /// Attach a channel through which guest stderr lines are forwarded for
+    /// storage in the heal_queue table. Must be called before guests spawn.
+    pub fn with_stderr_sink(mut self, tx: mpsc::Sender<GuestStderrLine>) -> Self {
+        self.stderr_tx = Some(tx);
+        self
     }
 
     fn pid_exists(pid: u32) -> bool {
@@ -96,11 +125,51 @@ impl Materializer for LocalProcessMaterializer {
                     }
                 }
             }
+            // Always override with hotel's own socket path.  Prefer the value
+            // supplied at construction time; fall back to the process env (for
+            // cases where the hotel was started with the var already set).
+            let socket_override = self
+                .hotel_socket
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    std::env::var("PHILOTIC_HOTEL_SOCKET")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                });
+            if let Some(socket) = socket_override {
+                command.env("PHILOTIC_HOTEL_SOCKET", socket.trim());
+            }
 
-            let child = command
-                .spawn()
-                .context("Failed to spawn OS child process")?;
+            command.stderr(std::process::Stdio::piped());
+
+            let mut child = command.spawn().with_context(|| {
+                format!(
+                    "Failed to spawn OS child process for guest '{}' using command '{}'",
+                    guest_id, resolved_cmd
+                )
+            })?;
             let child_pid = child.id().unwrap_or(0);
+
+            // Take stderr BEFORE moving child into the map.
+            if let Some(stderr) = child.stderr.take() {
+                let gid = guest_id.to_string();
+                let tx = self.stderr_tx.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        warn!(guest_id = %gid, "stderr: {}", line);
+                        if let Some(ref tx) = tx {
+                            let _ = tx.try_send(GuestStderrLine {
+                                guest_id: gid.clone(),
+                                line,
+                            });
+                        }
+                    }
+                });
+            }
+
             self.children.insert(guest_id.to_string(), child);
 
             Ok(child_pid.to_string())
@@ -129,7 +198,7 @@ impl Materializer for LocalProcessMaterializer {
         // NOTE: In the trait-abstracted world, the GuestManager passes the PID
         // to reclaim_guest. For now, LocalProcessMaterializer opens a throwaway
         // connection for backwards compatibility until the caller is fully refactored.
-        if let Ok(local_graph) = crate::graph::ContextGraph::open("aiua_context.db") {
+        if let Ok(local_graph) = crate::graph::ContextGraph::open(&self.db_path) {
             let conn = local_graph.conn.lock().unwrap();
             let mut stmt =
                 conn.prepare("SELECT active_pid FROM materialized_guests WHERE guest_id = ?")?;
@@ -238,14 +307,29 @@ impl GuestManager {
             );
 
             // --- GHOST RECLAMATION ---
-            if let Some(_pid) = &rec.active_pid {
+            if let Some(ref pid_str) = rec.active_pid {
                 info!(
                     "Context Graph shows Ghost PID {} for Guest [{}]. Reclaiming identity...",
-                    _pid, rec.guest_id
+                    pid_str, rec.guest_id
                 );
-                let mut mat = self.materializer.lock().await;
-                if let Err(e) = mat.reclaim_guest(&rec.guest_id).await {
-                    warn!("Reclamation error for {}: {}", rec.guest_id, e);
+                {
+                    let mut mat = self.materializer.lock().await;
+                    if let Err(e) = mat.reclaim_guest(&rec.guest_id).await {
+                        warn!("Reclamation error for {}: {}", rec.guest_id, e);
+                    }
+                }
+                // Belt-and-suspenders: after a restart the materializer's children map is
+                // empty and the legacy materialized_guests table is unused, so reclaim_guest
+                // may silently skip the kill. Finish the job with a direct signal if the
+                // process is still alive.
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if LocalProcessMaterializer::pid_exists(pid) {
+                        warn!(
+                            "Guest [{}] PID {} survived reclaim_guest; killing directly.",
+                            rec.guest_id, pid
+                        );
+                        LocalProcessMaterializer::terminate_pid(pid);
+                    }
                 }
                 Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
             }
@@ -314,6 +398,10 @@ impl GuestManager {
                 }
             }
         };
+        // Acquire the spawn lock BEFORE reading active_pid so that concurrent callers
+        // see a fresh DB snapshot rather than racing on a stale active_pid=None
+        // (TOCTOU: multiple concurrent ensure_guest_active calls each saw None, each spawned).
+        let mut mat = self.materializer.lock().await;
         let Some(current_rec) =
             Self::refresh_guest_record(self.graph.as_ref(), &self.hotel_name, &effective_id)?
         else {
@@ -322,8 +410,6 @@ impl GuestManager {
         if !current_rec.is_active {
             return Ok(false);
         }
-
-        let mut mat = self.materializer.lock().await;
         if let Some(active_pid) = current_rec.active_pid.as_deref() {
             let is_live = mat.check_status(&current_rec.guest_id, active_pid).await?;
             if is_live {
@@ -683,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_process_materializer_tracks_spawned_child_status() {
-        let mut materializer = LocalProcessMaterializer::new();
+        let mut materializer = LocalProcessMaterializer::new("aiua_context.db");
         let guest_id = "sleepy-guest";
         let pid = materializer
             .spawn_guest(

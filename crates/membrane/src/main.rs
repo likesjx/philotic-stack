@@ -778,7 +778,9 @@ async fn edit_telegram_text(
             } else {
                 warn!(
                     "editMessageText 400: {}",
-                    body.get("description").and_then(|v| v.as_str()).unwrap_or("unknown")
+                    body.get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
                 );
                 false
             }
@@ -1535,11 +1537,13 @@ async fn acquire_telegram_poll_lease(
     ipc_client: &mut PhiloticClient,
     lease_key: &str,
     agent_id: &str,
+    resource_ref: &str,
 ) -> Result<u64> {
     match ipc_client
         .send_request(IpcRequest::AcquireTelegramPollLease {
             lease_key: lease_key.to_string(),
             agent_id: agent_id.to_string(),
+            resource_ref: Some(resource_ref.to_string()),
         })
         .await?
     {
@@ -1578,12 +1582,14 @@ async fn renew_telegram_poll_lease(
     ipc_client: &mut PhiloticClient,
     lease_key: &str,
     agent_id: &str,
+    resource_ref: &str,
     lease_epoch: u64,
 ) -> Result<LeaseRenewResult> {
     match ipc_client
         .send_request(IpcRequest::RenewTelegramPollLease {
             lease_key: lease_key.to_string(),
             agent_id: agent_id.to_string(),
+            resource_ref: Some(resource_ref.to_string()),
             lease_epoch,
         })
         .await?
@@ -1709,21 +1715,25 @@ async fn run_seat_impl(
     // Derive the allowed-users config key from the token key:
     // "telegram_bot_token_{agent_key}" → "telegram_allowed_users_{agent_key}"
     // "telegram_bot_token" (global fallback) → "telegram_allowed_users"
-    let allowed_users_key = if let Some(suffix) = telegram_token_key.strip_prefix("telegram_bot_token_") {
-        format!("telegram_allowed_users_{suffix}")
-    } else {
-        "telegram_allowed_users".to_string()
-    };
+    let allowed_users_key =
+        if let Some(suffix) = telegram_token_key.strip_prefix("telegram_bot_token_") {
+            format!("telegram_allowed_users_{suffix}")
+        } else {
+            "telegram_allowed_users".to_string()
+        };
     let operator_usernames: HashSet<String> = {
-        let config_req = IpcRequest::GetConfig { key: allowed_users_key.clone() };
+        let config_req = IpcRequest::GetConfig {
+            key: allowed_users_key.clone(),
+        };
         match ipc_client.send_request(config_req).await.ok() {
-            Some(IpcResponse::ConfigData { value_json: Some(json_str), .. }) => {
-                serde_json::from_str::<Vec<String>>(&json_str)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|s| s.to_lowercase())
-                    .collect()
-            }
+            Some(IpcResponse::ConfigData {
+                value_json: Some(json_str),
+                ..
+            }) => serde_json::from_str::<Vec<String>>(&json_str)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
             _ => HashSet::new(),
         }
     };
@@ -1740,6 +1750,7 @@ async fn run_seat_impl(
         &mut ipc_client,
         &poll_lease_key,
         &target_agent_id,
+        &telegram_token_key,
     )
     .await
     {
@@ -2267,6 +2278,7 @@ async fn run_seat_impl(
                 &mut ipc_client,
                 &poll_lease_key,
                 &target_agent_id,
+                &telegram_token_key,
                 poll_lease_epoch,
             )
             .await
@@ -2278,8 +2290,18 @@ async fn run_seat_impl(
                 }
                 Ok(LeaseRenewResult::NeedsReacquire) => {
                     // IPC reconnect reset the lease binding; re-acquire and continue polling.
-                    warn!("Poll lease for [{}] lost (no owner after IPC reconnect); re-acquiring...", poll_lease_key);
-                    match acquire_telegram_poll_lease(&mut ipc_client, &poll_lease_key, &target_agent_id).await {
+                    warn!(
+                        "Poll lease for [{}] lost (no owner after IPC reconnect); re-acquiring...",
+                        poll_lease_key
+                    );
+                    match acquire_telegram_poll_lease(
+                        &mut ipc_client,
+                        &poll_lease_key,
+                        &target_agent_id,
+                        &telegram_token_key,
+                    )
+                    .await
+                    {
                         Ok(epoch) => {
                             poll_lease_epoch = epoch;
                             next_lease_renewal = tokio::time::Instant::now()

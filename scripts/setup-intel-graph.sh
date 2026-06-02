@@ -34,6 +34,24 @@ case "$EMBED_DIM" in
         ;;
 esac
 
+# Embedding model configuration
+# Options: 384 (default, fast), 768 (higher quality)
+# Or set PHILOTIC_EMBED_MODEL to a custom HuggingFace repo
+EMBED_DIM="${PHILOTIC_EMBED_DIM:-384}"
+
+case "$EMBED_DIM" in
+    384)
+        EMBED_MODEL="${PHILOTIC_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
+        ;;
+    768)
+        EMBED_MODEL="${PHILOTIC_EMBED_MODEL:-Xenova/all-mpnet-base-v2}"
+        ;;
+    *)
+        EMBED_MODEL="${PHILOTIC_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
+        warn "Unknown PHILOTIC_EMBED_DIM=$EMBED_DIM, using default 384-dim model"
+        ;;
+esac
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'

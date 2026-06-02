@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tracing::instrument;
+use tracing::{debug, instrument};
 
 use crate::engine::MemoryEngine;
 use crate::types::{
@@ -96,6 +96,8 @@ struct WriteRequest {
     tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
     /// Caller-provided idempotency key. MuninnDB returns the existing engram
     /// if a live engram with this key already exists in the vault, rather than
     /// creating a duplicate. Use for identity/system writes that should
@@ -294,6 +296,10 @@ impl MuninnRestEngine {
         }
     }
 
+    fn has_auth_for_vault(&self, vault: &str) -> bool {
+        self.config.vault_tokens.contains_key(vault) || self.config.default_token.is_some()
+    }
+
     /// Merge lens auto-tags into the caller-provided tags.
     async fn apply_lens_tags(&self, mut tags: Vec<String>) -> Vec<String> {
         if let Some(lens) = self.lens.read().await.as_ref() {
@@ -395,8 +401,24 @@ impl MemoryEngine for MuninnRestEngine {
         content: &str,
         tags: Vec<String>,
     ) -> anyhow::Result<EngramRef> {
+        self.remember_with_metadata(scope, concept, content, tags, serde_json::Value::Null)
+            .await
+    }
+
+    async fn remember_with_metadata(
+        &self,
+        scope: MemoryScope,
+        concept: &str,
+        content: &str,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> anyhow::Result<EngramRef> {
         let vault = self.resolver.resolve_primary(&scope);
         let tags = self.apply_lens_tags(tags).await;
+        let metadata = match metadata {
+            serde_json::Value::Null => None,
+            other => Some(other),
+        };
 
         let body = WriteRequest {
             vault: vault.clone(),
@@ -404,6 +426,7 @@ impl MemoryEngine for MuninnRestEngine {
             content: content.to_string(),
             tags,
             confidence: None,
+            metadata,
             idempotent_id: Some(format!("{}:{}", vault, concept)),
         };
 
@@ -550,9 +573,7 @@ impl MemoryEngine for MuninnRestEngine {
         // Use the agent-managed enrichment REST endpoint (promoted from MCP-only).
         // GET candidates for this engram, then POST enrichment back if stages are missing.
         // Falls back gracefully — enrichment is always best-effort in the Attend phase.
-        let candidates_url = self.url(&format!(
-            "/api/enrichment/candidates?vault={vault}&limit=1"
-        ));
+        let candidates_url = self.url(&format!("/api/enrichment/candidates?vault={vault}&limit=1"));
         #[derive(serde::Deserialize)]
         struct Candidate {
             id: String,
@@ -622,8 +643,17 @@ impl MemoryEngine for MuninnRestEngine {
 
         let mut all_engrams = Vec::new();
         let mut total = 0usize;
+        let is_cross_scope = matches!(scope, MemoryScope::CrossScope(_));
 
         for vault in vaults {
+            if is_cross_scope && !self.has_auth_for_vault(&vault) {
+                debug!(
+                    vault = %vault,
+                    "Skipping cross-scope activation for vault without token"
+                );
+                continue;
+            }
+
             let body = ActivateRequest {
                 vault: Some(vault.clone()),
                 context: vec![context.to_string()],
@@ -643,11 +673,15 @@ impl MemoryEngine for MuninnRestEngine {
             for item in &resp.activations {
                 self.cache_vault(&item.id, &vault).await;
             }
-            all_engrams.extend(resp.activations.into_iter().map(Engram::from));
+            all_engrams.extend(resp.activations.into_iter().map(|item| {
+                let mut engram: Engram = item.into();
+                engram.vault_id = vault.clone();
+                engram
+            }));
         }
 
         // If cross-scope, re-sort by confidence descending and truncate.
-        if matches!(scope, MemoryScope::CrossScope(_)) {
+        if is_cross_scope {
             all_engrams.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
             if let Some(m) = max {
                 all_engrams.truncate(m);
@@ -819,5 +853,28 @@ impl MemoryEngine for MuninnRestEngine {
         _scope: MemoryScope,
     ) -> anyhow::Result<mpsc::Receiver<Engram>> {
         anyhow::bail!("MuninnRestEngine: subscribe not available until Phase 5 MBP transport")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cross_scope_resolves_unprovisioned_session_vault_without_auth() {
+        let config = MuninnConfig::local("default")
+            .with_vault_token("self_agent-aria", "self-token")
+            .with_vault_token("user_likesjx", "user-token");
+        let engine = MuninnRestEngine::new(
+            config,
+            VaultResolver {
+                agent_id: "agent-aria".into(),
+                user_id: "likesjx".into(),
+            },
+        );
+
+        assert!(engine.has_auth_for_vault("self_agent-aria"));
+        assert!(engine.has_auth_for_vault("user_likesjx"));
+        assert!(!engine.has_auth_for_vault("session_telegram:7898847424:agent-aria"));
     }
 }

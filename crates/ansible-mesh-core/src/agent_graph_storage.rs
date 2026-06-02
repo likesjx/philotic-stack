@@ -108,6 +108,20 @@ pub struct AgentReflexPreference {
     pub updated_at: u64,
 }
 
+/// A routing pipeline rule declared by an agent.
+///
+/// Stored in a separate table from `reflex_preferences` to prevent pipeline
+/// rule structs from leaking into reflex composition / `reflex_policy_agent_layers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingPipelineRule {
+    pub agent_id: String,
+    pub rule_id: String,
+    #[serde(default)]
+    pub rule_json: serde_json::Value,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
 /// A single entry in the agent experience ledger.
 ///
 /// Feeds the RL training pipeline via the router-listener tap (Seam 5).
@@ -279,6 +293,20 @@ pub trait AgentGraphStorage: Send + Sync {
     /// Return one learned reflex preference by stable key, or `None` if not set.
     fn get_reflex_preference(&self, preference_key: &str) -> Result<Option<AgentReflexPreference>>;
 
+    // ── Routing pipeline rules ───────────────────────────────────────────────
+
+    /// Upsert a routing pipeline rule (replace-by-rule_id semantics).
+    fn upsert_pipeline_rule(&self, rule: &RoutingPipelineRule) -> Result<()>;
+
+    /// Remove a routing pipeline rule by rule_id. Returns true if a row was deleted.
+    fn remove_pipeline_rule(&self, rule_id: &str) -> Result<bool>;
+
+    /// Return all routing pipeline rules for this agent.
+    fn list_pipeline_rules(&self) -> Result<Vec<RoutingPipelineRule>>;
+
+    /// Return one routing pipeline rule by rule_id, or `None` if not found.
+    fn get_pipeline_rule(&self, rule_id: &str) -> Result<Option<RoutingPipelineRule>>;
+
     // ── Resource declarations ────────────────────────────────────────────────
 
     /// Upsert a static resource declaration.
@@ -394,6 +422,14 @@ impl SqliteAgentGraphStorage {
                 config_json      TEXT NOT NULL DEFAULT '{}',
                 updated_at       INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (agent_id, preference_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS routing_pipeline_rules (
+                agent_id      TEXT NOT NULL,
+                rule_id       TEXT NOT NULL,
+                rule_json     TEXT NOT NULL DEFAULT '{}',
+                updated_at    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, rule_id)
             );
 
             CREATE TABLE IF NOT EXISTS resource_declarations (
@@ -778,6 +814,78 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
                 reflexes_json: serde_json::from_str(&reflexes_str).unwrap_or_default(),
                 config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
                 updated_at: row.get(5)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    // ── Routing pipeline rules ───────────────────────────────────────────────
+
+    fn upsert_pipeline_rule(&self, rule: &RoutingPipelineRule) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let rule_str = serde_json::to_string(&rule.rule_json).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT INTO routing_pipeline_rules (agent_id, rule_id, rule_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (agent_id, rule_id) DO UPDATE SET
+               rule_json  = excluded.rule_json,
+               updated_at = excluded.updated_at
+             WHERE excluded.updated_at >= routing_pipeline_rules.updated_at",
+            params![self.agent_id, rule.rule_id, rule_str, Self::now_epoch()],
+        )?;
+        Ok(())
+    }
+
+    fn remove_pipeline_rule(&self, rule_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM routing_pipeline_rules WHERE agent_id = ?1 AND rule_id = ?2",
+            params![self.agent_id, rule_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    fn list_pipeline_rules(&self) -> Result<Vec<RoutingPipelineRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, rule_id, rule_json, updated_at
+             FROM routing_pipeline_rules WHERE agent_id = ?1 ORDER BY rule_id",
+        )?;
+        let rows = stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        let mut rules = Vec::new();
+        for row in rows {
+            let (agent_id, rule_id, rule_str, updated_at) = row?;
+            rules.push(RoutingPipelineRule {
+                agent_id,
+                rule_id,
+                rule_json: serde_json::from_str(&rule_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+        Ok(rules)
+    }
+
+    fn get_pipeline_rule(&self, rule_id: &str) -> Result<Option<RoutingPipelineRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, rule_id, rule_json, updated_at
+             FROM routing_pipeline_rules WHERE agent_id = ?1 AND rule_id = ?2",
+        )?;
+        let mut rows = stmt.query(params![self.agent_id, rule_id])?;
+        if let Some(row) = rows.next()? {
+            let rule_str: String = row.get(2)?;
+            return Ok(Some(RoutingPipelineRule {
+                agent_id: row.get(0)?,
+                rule_id: row.get(1)?,
+                rule_json: serde_json::from_str(&rule_str).unwrap_or_default(),
+                updated_at: row.get(3)?,
             }));
         }
         Ok(None)
@@ -1730,5 +1838,93 @@ mod tests {
         assert_eq!(result.preferences_applied, 1);
         let pref = local.get_tool_preference("new.tool").unwrap().unwrap();
         assert_eq!(pref.preference_level, 1);
+    }
+
+    // ── routing pipeline rules ────────────────────────────────────────────────
+
+    #[test]
+    fn pipeline_rule_upsert_get_list() {
+        let (s, _f) = open_tmp("bjork");
+        let rule = RoutingPipelineRule {
+            agent_id: "bjork".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({
+                "match": { "frame_kind": ["audio", "voice"] },
+                "stages": [{ "capability": "voice.transcribe", "mode": "blob" }],
+                "deliver_as": "user_message"
+            }),
+            updated_at: 0,
+        };
+        s.upsert_pipeline_rule(&rule).unwrap();
+
+        let got = s.get_pipeline_rule("voice-transcribe").unwrap().unwrap();
+        assert_eq!(got.rule_id, "voice-transcribe");
+        assert_eq!(got.rule_json["deliver_as"], "user_message");
+
+        let all = s.list_pipeline_rules().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].rule_id, "voice-transcribe");
+    }
+
+    #[test]
+    fn pipeline_rule_upsert_replaces_by_rule_id() {
+        let (s, _f) = open_tmp("bjork");
+        s.upsert_pipeline_rule(&RoutingPipelineRule {
+            agent_id: "bjork".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({ "deliver_as": "user_message" }),
+            updated_at: 0,
+        })
+        .unwrap();
+        s.upsert_pipeline_rule(&RoutingPipelineRule {
+            agent_id: "bjork".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({ "deliver_as": "tool_result" }),
+            updated_at: 0,
+        })
+        .unwrap();
+
+        let all = s.list_pipeline_rules().unwrap();
+        assert_eq!(all.len(), 1, "upsert must not duplicate rows");
+        assert_eq!(all[0].rule_json["deliver_as"], "tool_result");
+    }
+
+    #[test]
+    fn pipeline_rule_remove_returns_true_when_deleted() {
+        let (s, _f) = open_tmp("bjork");
+        s.upsert_pipeline_rule(&RoutingPipelineRule {
+            agent_id: "bjork".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({}),
+            updated_at: 0,
+        })
+        .unwrap();
+        assert!(s.remove_pipeline_rule("voice-transcribe").unwrap());
+        assert!(s.list_pipeline_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pipeline_rule_remove_returns_false_when_missing() {
+        let (s, _f) = open_tmp("bjork");
+        assert!(!s.remove_pipeline_rule("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn pipeline_rules_do_not_appear_in_reflex_preferences() {
+        // Verify the separation invariant: pipeline rules stored in routing_pipeline_rules
+        // must NOT bleed into list_reflex_preferences() used for reflex composition.
+        let (s, _f) = open_tmp("bjork");
+        s.upsert_pipeline_rule(&RoutingPipelineRule {
+            agent_id: "bjork".into(),
+            rule_id: "voice-transcribe".into(),
+            rule_json: serde_json::json!({ "stages": [] }),
+            updated_at: 0,
+        })
+        .unwrap();
+        let reflex_prefs = s.list_reflex_preferences().unwrap();
+        assert!(
+            reflex_prefs.is_empty(),
+            "pipeline rules must not appear in reflex_preferences"
+        );
     }
 }

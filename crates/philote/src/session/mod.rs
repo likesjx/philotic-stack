@@ -4,13 +4,10 @@ pub use types::*;
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
 use crate::protocol::InboundTaskPayload;
-use crate::reflex::{
-    IngressAction, MaterializationContext, PolicyAssertion, ReflexEngine, ReflexEvent,
-};
+use crate::reflex::{IngressAction, PolicyAssertion, ReflexEngine, ReflexEvent};
 use philotic_client::{
     HandoffBundle, SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -63,6 +60,13 @@ fn first_line_summary(text: &str) -> String {
         .unwrap_or_else(|| "empty".into())
 }
 
+fn json_escape_for_projection(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .trim_matches('"')
+        .to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
@@ -79,6 +83,9 @@ pub struct SessionState {
     pub tool_assembly: ToolAssembly,
     pub recent_turns: Vec<TurnRecord>,
     pub active_turn: Option<WorkingTurn>,
+    /// Durable side-loop records for paracrine conversations opened in this session.
+    /// Nonblocking paracrine remains visible until it closes with a final disposition.
+    pub paracrine_threads: Vec<ParacrineThread>,
     /// Subagents spawned during this session that have not yet been released or aborted.
     pub active_subagents: Vec<SpawnedSubagentRef>,
     /// Working summary carried in from the most recent inbound handoff bundle.
@@ -99,7 +106,8 @@ pub struct SessionState {
     /// The payload preserves session_id, chat_id, and exosome context so the
     /// correct Telegram session/chat is restored when the task is dispatched.
     /// Voice tasks are queued raw and will be transcribed when they reach the front.
-    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload, std::time::Instant)>,
+    pub pending_user_tasks:
+        std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload, std::time::Instant)>,
     /// Optional role name of the queue arbiter.
     /// When set, TEXT tasks queued while a turn is active are routed to this specialist
     /// role via paracrine dispatch for priority evaluation. The arbiter may call
@@ -162,6 +170,7 @@ impl SessionState {
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
+            paracrine_threads: Vec::new(),
             last_handoff_summary: None,
             active_subagents: Vec::new(),
             rules: Vec::new(),
@@ -192,24 +201,29 @@ impl SessionState {
 
     /// Enqueue a user task for deferred processing after the current turn completes.
     pub fn enqueue_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_back((task_id, task, std::time::Instant::now()));
+        self.pending_user_tasks
+            .push_back((task_id, task, std::time::Instant::now()));
     }
 
     /// Prepend a user task to the front of the queue (high priority, arbiter-promoted).
     pub fn prepend_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
-        self.pending_user_tasks.push_front((task_id, task, std::time::Instant::now()));
+        self.pending_user_tasks
+            .push_front((task_id, task, std::time::Instant::now()));
     }
 
     /// Pop the next pending user task, if any. Strips the enqueue timestamp.
     pub fn dequeue_user_task(&mut self) -> Option<(uuid::Uuid, InboundTaskPayload)> {
-        self.pending_user_tasks.pop_front().map(|(id, task, _)| (id, task))
+        self.pending_user_tasks
+            .pop_front()
+            .map(|(id, task, _)| (id, task))
     }
 
     /// Drop any queued tasks older than `max_age_secs`. Returns the number evicted.
     pub fn evict_stale_queued_tasks(&mut self, max_age_secs: u64) -> usize {
         let cutoff = std::time::Duration::from_secs(max_age_secs);
         let before = self.pending_user_tasks.len();
-        self.pending_user_tasks.retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
+        self.pending_user_tasks
+            .retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
         before - self.pending_user_tasks.len()
     }
 
@@ -247,6 +261,69 @@ impl SessionState {
     pub fn clear_pending_tool_call(&mut self) {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.pending_tool_call = None;
+        }
+    }
+
+    pub fn open_paracrine_thread(
+        &mut self,
+        id: String,
+        role: String,
+        goal: String,
+        routing: philotic_client::ParacrineRouting,
+        authority: String,
+        tool_policy: String,
+        approval_scope: String,
+    ) {
+        let origin_turn_id = self
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.clone())
+            .unwrap_or_default();
+        self.paracrine_threads.push(ParacrineThread {
+            id,
+            origin_turn_id,
+            role,
+            goal,
+            status: ParacrineThreadStatus::Open,
+            routing,
+            authority,
+            tool_policy,
+            approval_scope,
+            opened_at: current_unix_ts(),
+            closed_at: None,
+            last_signal: None,
+            final_result: None,
+            close_reason: None,
+        });
+    }
+
+    pub fn close_paracrine_thread(
+        &mut self,
+        id: &str,
+        status: ParacrineThreadStatus,
+        final_result: Option<String>,
+        close_reason: Option<String>,
+    ) {
+        if let Some(thread) = self
+            .paracrine_threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+        {
+            thread.status = status;
+            thread.closed_at = Some(current_unix_ts());
+            thread.last_signal = close_reason.clone();
+            thread.final_result = final_result;
+            thread.close_reason = close_reason;
+        }
+    }
+
+    pub fn signal_paracrine_thread(&mut self, id: &str, signal: String) {
+        if let Some(thread) = self
+            .paracrine_threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+        {
+            thread.last_signal = Some(signal);
         }
     }
 
@@ -355,6 +432,22 @@ impl SessionState {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.provider_repair_attempts += 1;
             turn.provider_repair_attempts
+        } else {
+            0
+        }
+    }
+
+    pub fn streaming_retry_attempts(&self) -> u8 {
+        self.active_turn
+            .as_ref()
+            .map(|turn| turn.streaming_retry_attempts)
+            .unwrap_or(0)
+    }
+
+    pub fn increment_streaming_retry_attempts(&mut self) -> u8 {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.streaming_retry_attempts += 1;
+            turn.streaming_retry_attempts
         } else {
             0
         }
@@ -540,27 +633,44 @@ impl SessionState {
     pub fn register_standing_preapproval(&mut self, tool_name: &str, required_successes: u32) {
         let current = *self.tool_success_streak.get(tool_name).unwrap_or(&0);
         if current >= required_successes {
-            if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
-                self.approval_policy.preapproved_tools.push(tool_name.to_string());
+            if !self
+                .approval_policy
+                .preapproved_tools
+                .contains(&tool_name.to_string())
+            {
+                self.approval_policy
+                    .preapproved_tools
+                    .push(tool_name.to_string());
             }
         } else {
-            self.pending_preapproval_thresholds.insert(tool_name.to_string(), required_successes);
+            self.pending_preapproval_thresholds
+                .insert(tool_name.to_string(), required_successes);
         }
     }
 
     /// Record a successful tool execution for streak tracking.
     /// If the streak hits a registered threshold, grants standing preapproval.
     pub fn record_tool_streak_success(&mut self, tool_name: &str) {
-        let streak = self.tool_success_streak.entry(tool_name.to_string()).or_insert(0);
+        let streak = self
+            .tool_success_streak
+            .entry(tool_name.to_string())
+            .or_insert(0);
         *streak += 1;
         if let Some(&threshold) = self.pending_preapproval_thresholds.get(tool_name) {
             if *streak >= threshold {
                 self.pending_preapproval_thresholds.remove(tool_name);
-                if !self.approval_policy.preapproved_tools.contains(&tool_name.to_string()) {
-                    self.approval_policy.preapproved_tools.push(tool_name.to_string());
+                if !self
+                    .approval_policy
+                    .preapproved_tools
+                    .contains(&tool_name.to_string())
+                {
+                    self.approval_policy
+                        .preapproved_tools
+                        .push(tool_name.to_string());
                     tracing::info!(
                         "ConditionalPreapproval: '{}' earned standing approval after {} successive successes.",
-                        tool_name, *streak
+                        tool_name,
+                        *streak
                     );
                 }
             }
@@ -1305,7 +1415,7 @@ impl SessionState {
     ) -> Option<(String, Value, Value, Vec<ToolDefinition>)> {
         let turn = self.active_turn.as_ref()?;
         let user_content = turn.user_content.clone();
-        let tools = self.tool_assembly.tools_for_model.clone();
+        let tools = self.project_tools_for_turn(&user_content);
         let (prompt, context, context_projection) =
             self.model_request_payloads(&user_content, &tools);
         Some((prompt, context, context_projection, tools))
@@ -1551,8 +1661,50 @@ impl SessionState {
             return Vec::new();
         }
 
+        if !looks_like_memory_write_goal(&normalized) {
+            all_tools.retain(|tool| tool.tool_name != "memory.remember");
+        }
+        if !looks_like_memory_cultivation_goal(&normalized) {
+            all_tools.retain(|tool| tool.tool_name != "memory.cultivate");
+        }
+        if !looks_like_memory_true_up_goal(&normalized) {
+            all_tools.retain(|tool| tool.tool_name != "memory.true_up");
+        }
+        if !looks_like_memory_promotion_goal(&normalized) {
+            all_tools.retain(|tool| tool.tool_name != "memory.promote_candidate");
+        }
+
         if !looks_like_execution_goal(&normalized) {
             all_tools.retain(|tool| tool.class.as_deref() != Some("shell"));
+        }
+
+        // Strip on-demand skill tools whose domain is not signaled by this turn.
+        // Build a reverse map of tool_name → owning on-demand skills once, then
+        // filter: keep a tool only if it has no on-demand owner OR at least one
+        // of its owning skills is relevant for this turn.
+        if !self.bindings.on_demand_skills.is_empty() {
+            // Collect (tool_name, owning_skills) for all on-demand-gated tools.
+            let on_demand_ownership: std::collections::HashMap<&str, Vec<&str>> = {
+                let mut map: std::collections::HashMap<&str, Vec<&str>> =
+                    std::collections::HashMap::new();
+                for skill in &self.bindings.on_demand_skills {
+                    for &tool in crate::catalog::tools_for_skill(skill.as_str()) {
+                        map.entry(tool).or_default().push(skill.as_str());
+                    }
+                }
+                map
+            };
+
+            if !on_demand_ownership.is_empty() {
+                all_tools.retain(
+                    |tool| match on_demand_ownership.get(tool.tool_name.as_str()) {
+                        None => true,
+                        Some(owners) => owners
+                            .iter()
+                            .any(|s| crate::catalog::skill_is_relevant_for_turn(s, &normalized)),
+                    },
+                );
+            }
         }
 
         all_tools
@@ -1695,16 +1847,26 @@ impl SessionState {
             );
         }
 
-        if let Some(graph_content) = self.agent_graph_snapshot.as_deref().filter(|s| !s.is_empty()) {
+        let agent_graph_content = self.project_agent_graph_with_memory_overlay();
+        if !agent_graph_content.is_empty() {
+            let mut source_refs = vec!["agent_graph_snapshot".into()];
+            if self
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| !turn.recalled_memories.is_empty())
+            {
+                source_refs.push("active_turn.recalled_memories.entities".into());
+                source_refs.push("active_turn.recalled_memories.relationships".into());
+            }
             self.push_layer(
                 &mut layers,
                 &mut contributions,
                 ContextLayerId::AgentGraph,
-                "graph_datasource:agent_partition",
+                "graph_datasource:agent_partition+memory_core:entity_overlay",
                 ContextAuthority::Advisory,
                 ContextMutability::Refreshable,
-                graph_content.to_string(),
-                vec!["agent_graph_snapshot".into()],
+                agent_graph_content,
+                source_refs,
                 "graph_candidate",
             );
         }
@@ -1716,12 +1878,15 @@ impl SessionState {
                 agent_id: self.agent_id.clone(),
                 source: self.source.clone(),
                 active_incarnation_id: self.active_incarnation_id.clone(),
-                primary_user_id: None,
+                primary_user_id: self
+                    .active_turn
+                    .as_ref()
+                    .and_then(|turn| turn.primary_user_id.clone()),
                 trigger_kind: "user_message".into(),
                 started_at: None,
             },
             active_step,
-            role_activation: self.role_activation.clone(),
+            role_activation: self.projected_role_activation_for_turn(user_content, projected_tools),
             current_user_message: user_content.to_string(),
             budget: ContextBudget {
                 included_sections: layers.len(),
@@ -1893,36 +2058,52 @@ impl SessionState {
         // tool_history: accumulated (call, result) pairs from the active turn.
         // Always present in the envelope — empty on initial turn, populated on re-entry.
         // Results are truncated to max_tool_result_chars to prevent context overflow.
+        // Oldest entries are dropped first when working_tool_history exceeds max_tool_history_entries.
         let max_result_chars = self
             .settings
             .context_window
             .max_tool_result_chars
             .max(1_000);
+        let max_history_entries = self.settings.context_window.max_tool_history_entries.max(3);
         let tool_history: Vec<Value> = self
             .active_turn
             .as_ref()
             .map(|turn| {
-                turn.working_tool_history
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (call, result))| {
-                        let result_text = if result.content.len() > max_result_chars {
-                            format!(
-                                "{}… [truncated: {} chars total]",
-                                &result.content[..max_result_chars],
-                                result.content.len()
-                            )
-                        } else {
-                            result.content.clone()
-                        };
-                        json!({
-                            "index": i + 1,
-                            "tool_name": call.tool_name,
-                            "arguments": call.arguments,
-                            "result": result_text,
-                        })
-                    })
-                    .collect()
+                let all = &turn.working_tool_history;
+                let total = all.len();
+                let dropped = total.saturating_sub(max_history_entries);
+                let windowed = &all[dropped..];
+
+                let mut entries: Vec<Value> = Vec::with_capacity(windowed.len() + 1);
+                if dropped > 0 {
+                    entries.push(json!({
+                        "index": 0,
+                        "tool_name": "__context_compacted__",
+                        "arguments": {},
+                        "result": format!(
+                            "[Context compacted: {} older tool result(s) omitted to stay within context limits]",
+                            dropped
+                        ),
+                    }));
+                }
+                for (i, (call, result)) in windowed.iter().enumerate() {
+                    let result_text = if result.content.len() > max_result_chars {
+                        format!(
+                            "{}… [truncated: {} chars total]",
+                            &result.content[..max_result_chars],
+                            result.content.len()
+                        )
+                    } else {
+                        result.content.clone()
+                    };
+                    entries.push(json!({
+                        "index": dropped + i + 1,
+                        "tool_name": call.tool_name,
+                        "arguments": call.arguments,
+                        "result": result_text,
+                    }));
+                }
+                entries
             })
             .unwrap_or_default();
 
@@ -1945,6 +2126,87 @@ impl SessionState {
             "tool_history": tool_history,
             "active_plan": active_plan,
         })
+    }
+
+    pub fn model_affordances_for_turn(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> Value {
+        let skills = self
+            .projected_skill_names_for_turn(user_content, projected_tools)
+            .into_iter()
+            .map(|skill| {
+                json!({
+                    "id": skill,
+                    "source": "session_projection",
+                })
+            })
+            .collect::<Vec<_>>();
+        let tools = projected_tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.tool_name,
+                    "class": tool.class,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "skills": skills,
+            "tools": tools,
+        })
+    }
+
+    fn projected_skill_names_for_turn(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> Vec<String> {
+        if self.bindings.effective_skillset.is_empty() {
+            return Vec::new();
+        }
+
+        let normalized = normalized_turn_text(user_content);
+        let projected_tool_names = projected_tools
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        self.bindings
+            .effective_skillset
+            .iter()
+            .filter(|skill| {
+                if self
+                    .bindings
+                    .on_demand_skills
+                    .iter()
+                    .any(|on_demand| on_demand == *skill)
+                {
+                    return crate::catalog::skill_is_relevant_for_turn(skill, &normalized);
+                }
+
+                let implied_tools = crate::catalog::skill_implied_tools(skill);
+                let owned_tools = crate::catalog::tools_for_skill(skill);
+                implied_tools
+                    .iter()
+                    .chain(owned_tools.iter())
+                    .any(|tool| projected_tool_names.contains(tool))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn projected_role_activation_for_turn(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> Option<RoleActivation> {
+        let mut activation = self.role_activation.clone()?;
+        activation.effective_skillset =
+            self.projected_skill_names_for_turn(user_content, projected_tools);
+        activation.effective_skill_guidance.clear();
+        Some(activation)
     }
 
     fn push_layer(
@@ -2006,19 +2268,6 @@ impl SessionState {
             .filter(|text| !text.is_empty())
         {
             lines.push(soul.to_string());
-        }
-
-        if !self.bindings.effective_skillset.is_empty() {
-            lines.push(format!(
-                "Current skill posture: {}.",
-                self.bindings.effective_skillset.join(", ")
-            ));
-        }
-        if !self.bindings.effective_skill_guidance.is_empty() {
-            lines.push(format!(
-                "\n[Skill guidance]\n{}",
-                self.bindings.effective_skill_guidance.join("\n\n")
-            ));
         }
 
         if let Some(role_activation) = self.role_activation.as_ref() {
@@ -2233,18 +2482,207 @@ impl SessionState {
              (date and time).\n",
         );
         for (i, memory) in turn.recalled_memories.iter().enumerate() {
+            let mut provenance = Vec::new();
+            if let Some(id) = memory.id.as_deref() {
+                provenance.push(format!("id={id}"));
+            }
+            if let Some(vault) = memory.vault_id.as_deref() {
+                provenance.push(format!("vault={vault}"));
+            }
+            if let Some(confidence) = memory.confidence {
+                provenance.push(format!("confidence={confidence:.2}"));
+            }
+            if let Some(trust) = memory.trust.as_deref() {
+                provenance.push(format!("trust={trust}"));
+            }
+            if let Some(reason) = memory.recall_reason.as_deref() {
+                provenance.push(format!("reason={reason}"));
+            }
+
             out.push_str(&format!(
                 "{}. [{}] {}",
                 i + 1,
                 memory.concept,
                 memory.content
             ));
+            if !provenance.is_empty() {
+                out.push_str(&format!(" {{{}}}", provenance.join("; ")));
+            }
             if !memory.tags.is_empty() {
                 out.push_str(&format!(" ({})", memory.tags.join(", ")));
+            }
+            if let Some(summary) = memory.summary.as_deref().filter(|text| !text.is_empty()) {
+                out.push_str(&format!("\n   summary: {summary}"));
+            }
+            let frame = self.memory_spacetime_frame_for(memory);
+            if let Some(temporal_kind) = frame.temporal_kind {
+                out.push_str(&format!("\n   temporal_kind: {}", temporal_kind.as_str()));
+            }
+            if let Some(observed_at) = frame.observed_at {
+                out.push_str(&format!(
+                    "\n   observed_at: {}",
+                    format_memory_timestamp(observed_at)
+                ));
+            }
+            if let Some(last_verified_at) = frame.last_verified_at {
+                out.push_str(&format!(
+                    "\n   last_verified_at: {}",
+                    format_memory_timestamp(last_verified_at)
+                ));
+            }
+            if let Some(valid_from) = frame.valid_from {
+                out.push_str(&format!(
+                    "\n   valid_from: {}",
+                    format_memory_timestamp(valid_from)
+                ));
+            }
+            if let Some(valid_until) = frame.valid_until {
+                out.push_str(&format!(
+                    "\n   valid_until: {}",
+                    format_memory_timestamp(valid_until)
+                ));
+            }
+            if let Some(spatial_scope) = frame.spatial_scope {
+                out.push_str(&format!("\n   spatial_scope: {}", spatial_scope.as_str()));
+            }
+            if let Some(space) = memory_space_summary(&frame) {
+                out.push_str(&format!("\n   space: {space}"));
+            }
+            if let Some(authority) = frame.authority {
+                out.push_str(&format!("\n   authority: {}", authority.as_str()));
+            }
+            if let Some(validation_level) = frame.validation_level {
+                out.push_str(&format!("\n   validation: {}", validation_level.as_str()));
+            }
+            if !memory.entities.is_empty() {
+                out.push_str(&format!("\n   entities: {}", memory.entities.len()));
+            }
+            if !memory.relationships.is_empty() {
+                out.push_str(&format!(
+                    "\n   relationships: {}",
+                    memory.relationships.len()
+                ));
+            }
+            if let Some(annotations) = memory.annotations.as_ref().filter(|v| !v.is_null()) {
+                out.push_str(&format!("\n   annotations: {annotations}"));
             }
             out.push('\n');
         }
         out.trim_end().to_string()
+    }
+
+    fn memory_spacetime_frame_for(&self, memory: &RecalledMemoryRecord) -> MemorySpacetimeFrame {
+        let mut frame = memory.spacetime_frame.clone().unwrap_or_default();
+        if frame.observed_at.is_none() {
+            frame.observed_at = memory.created_at;
+        }
+        if frame.last_verified_at.is_none() {
+            frame.last_verified_at = memory.updated_at;
+        }
+        if frame.temporal_kind.is_none() {
+            frame.temporal_kind = Some(infer_memory_temporal_kind(memory));
+        }
+        if frame.spatial_scope.is_none() {
+            frame.spatial_scope = Some(infer_memory_spatial_scope(memory));
+        }
+        if frame.session_id.is_none() {
+            frame.session_id = Some(self.session_id.clone());
+        }
+        if frame.agent_id.is_none() {
+            frame.agent_id = Some(self.agent_id.clone());
+        }
+        if frame.primary_user_id.is_none() {
+            frame.primary_user_id = self
+                .active_turn
+                .as_ref()
+                .and_then(|turn| turn.primary_user_id.clone());
+        }
+        if frame.authority.is_none() {
+            frame.authority = Some(infer_memory_authority(memory));
+        }
+        frame
+    }
+
+    fn project_agent_graph_with_memory_overlay(&self) -> String {
+        let graph_content = self
+            .agent_graph_snapshot
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let Some(turn) = self.active_turn.as_ref() else {
+            return graph_content
+                .map(|content| format!("[Agent graph]\n{content}"))
+                .unwrap_or_default();
+        };
+
+        let mut entity_lines = Vec::new();
+        let mut relation_lines = Vec::new();
+        for memory in &turn.recalled_memories {
+            let memory_id = memory.id.as_deref().unwrap_or("unknown");
+            let concept = memory.concept.as_str();
+            for entity in &memory.entities {
+                let Some(name) = entity.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let entity_type = entity
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("entity");
+                entity_lines.push(format!(
+                    "MuninnEntity: {{\"name\":\"{}\",\"type\":\"{}\",\"memory_id\":\"{}\",\"concept\":\"{}\"}}",
+                    json_escape_for_projection(name),
+                    json_escape_for_projection(entity_type),
+                    json_escape_for_projection(memory_id),
+                    json_escape_for_projection(concept),
+                ));
+            }
+            for relationship in &memory.relationships {
+                let Some(from) = relationship
+                    .get("from_entity")
+                    .or_else(|| relationship.get("from"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(to) = relationship
+                    .get("to_entity")
+                    .or_else(|| relationship.get("to"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let rel_type = relationship
+                    .get("rel_type")
+                    .or_else(|| relationship.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("relates_to");
+                relation_lines.push(format!(
+                    "MuninnRelation: {{\"from\":\"{}\",\"rel_type\":\"{}\",\"to\":\"{}\",\"memory_id\":\"{}\"}}",
+                    json_escape_for_projection(from),
+                    json_escape_for_projection(rel_type),
+                    json_escape_for_projection(to),
+                    json_escape_for_projection(memory_id),
+                ));
+            }
+        }
+
+        let mut sections = Vec::new();
+        if let Some(content) = graph_content {
+            sections.push(format!("[Agent graph]\n{content}"));
+        }
+        if !entity_lines.is_empty() || !relation_lines.is_empty() {
+            let mut overlay = String::from("[Muninn entity overlay]\n");
+            overlay.push_str(
+                "Advisory continuity hints from recalled memories. Current graph/code truth wins on conflict.\n",
+            );
+            overlay.push_str(&entity_lines.join("\n"));
+            if !entity_lines.is_empty() && !relation_lines.is_empty() {
+                overlay.push('\n');
+            }
+            overlay.push_str(&relation_lines.join("\n"));
+            sections.push(overlay.trim_end().to_string());
+        }
+        sections.join("\n\n")
     }
 
     fn project_session_context(&self, projected_tools: &[ToolDefinition]) -> String {
@@ -2261,12 +2699,6 @@ impl SessionState {
             ));
             if let Some(toolset_profile_ref) = role_activation.toolset_profile_ref.as_deref() {
                 envelope.push_str(&format!("Role toolset profile: {}.\n", toolset_profile_ref));
-            }
-            if !role_activation.effective_skillset.is_empty() {
-                envelope.push_str(&format!(
-                    "Role skillset posture: {}.\n",
-                    role_activation.effective_skillset.join(", ")
-                ));
             }
             if let Some(working_memory_policy) = role_activation.working_memory_policy.as_deref() {
                 envelope.push_str(&format!(
@@ -2292,12 +2724,6 @@ impl SessionState {
             .and_then(|turn| turn.provider_repair_note.as_deref())
         {
             envelope.push_str(&format!("Provider correction: {}.\n", note));
-        }
-        if !self.bindings.effective_toolset.is_empty() {
-            envelope.push_str(&format!(
-                "Effective tools: {}.\n",
-                self.bindings.effective_toolset.join(", ")
-            ));
         }
         if !projected_tools.is_empty() {
             envelope.push_str("Tools available:\n");
@@ -2409,7 +2835,11 @@ impl SessionState {
         }
 
         if !turn.working_tool_history.is_empty() {
-            let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
+            let max_result_chars = self
+                .settings
+                .context_window
+                .max_tool_result_chars
+                .max(1_000);
             lines.push(format!(
                 "Tool history entries in local working state: {}.",
                 turn.working_tool_history.len()
@@ -2465,6 +2895,33 @@ impl SessionState {
                     .to_string()
             };
             lines.push(reentry_hint);
+        }
+        if !self.paracrine_threads.is_empty() {
+            lines.push("\n[Paracrine side loops]".into());
+            for thread in &self.paracrine_threads {
+                lines.push(format!(
+                    "Paracrine thread {id}: role='{role}', status='{status}', routing='{routing:?}', authority='{authority}', tool_policy='{tool_policy}', approval_scope='{approval_scope}', goal='{goal}'.",
+                    id = thread.id,
+                    role = thread.role,
+                    status = thread.status.as_str(),
+                    routing = thread.routing,
+                    authority = thread.authority,
+                    tool_policy = thread.tool_policy,
+                    approval_scope = thread.approval_scope,
+                    goal = thread.goal,
+                ));
+                if let Some(result) = thread.final_result.as_deref() {
+                    lines.push(format!(
+                        "Final paracrine result for {}: {}",
+                        thread.id, result
+                    ));
+                } else if let Some(signal) = thread.last_signal.as_deref() {
+                    lines.push(format!(
+                        "Latest paracrine signal for {}: {}",
+                        thread.id, signal
+                    ));
+                }
+            }
         }
         if turn.pending_tool_call.is_some() {
             lines.push("A tool call is pending.".into());
@@ -2652,6 +3109,7 @@ impl SessionState {
                 "provider_repair_note": turn.provider_repair_note,
                 "provider_repair_attempts": turn.provider_repair_attempts,
                 "fallback_tier": turn.fallback_tier,
+                "streaming_retry_attempts": turn.streaming_retry_attempts,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
@@ -2659,6 +3117,7 @@ impl SessionState {
                 "paracrine_origin": turn.paracrine_origin,
                 "paracrine_reply_session_id": turn.paracrine_reply_session_id,
                 "paracrine_reply_chat_id": turn.paracrine_reply_chat_id,
+                "paracrine_response_routing": turn.paracrine_response_routing,
                 "paracrine_merge_completed": turn.paracrine_merge_completed,
             })
         });
@@ -2689,6 +3148,7 @@ impl SessionState {
             "bindings": self.bindings,
             "tool_success_streak": self.tool_success_streak,
             "pending_preapproval_thresholds": self.pending_preapproval_thresholds,
+            "paracrine_threads": self.paracrine_threads,
             "active_turn": active_turn,
             "parked_approval_turn": parked_approval_turn,
             "parked_plan_turn": parked_plan_turn,
@@ -2783,6 +3243,11 @@ impl SessionState {
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
+        let paracrine_threads = checkpoint
+            .get("paracrine_threads")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<ParacrineThread>>(value).ok())
+            .unwrap_or_default();
         let bindings = checkpoint
             .get("bindings")
             .cloned()
@@ -2828,9 +3293,12 @@ impl SessionState {
             }
             // Discard non-restorable turns — after a restart, in-flight model/tool/voice
             // calls are gone. Restoring them leaves is_turn_active()=true forever.
-            // Only waiting_approval is worth keeping (operator may still resolve it).
-            let phase_str = turn.get("phase").and_then(serde_json::Value::as_str).unwrap_or("queued");
-            if !matches!(phase_str, "waiting_approval") {
+            // Only waiting_approval and waiting_tool are worth keeping across restart.
+            let phase_str = turn
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("queued");
+            if !matches!(phase_str, "waiting_approval" | "waiting_tool") {
                 return None;
             }
             let local_node_id = local_node_id();
@@ -2849,6 +3317,10 @@ impl SessionState {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                primary_user_id: turn
+                    .get("primary_user_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 user_content: turn
                     .get("user_content")
                     .and_then(serde_json::Value::as_str)
@@ -2962,6 +3434,10 @@ impl SessionState {
                     .get("paracrine_reply_chat_id")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                paracrine_response_routing: turn
+                    .get("paracrine_response_routing")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok()),
                 paracrine_merge_completed: turn
                     .get("paracrine_merge_completed")
                     .and_then(serde_json::Value::as_bool)
@@ -2976,6 +3452,10 @@ impl SessionState {
                     .map(str::to_string),
                 fallback_tier: turn
                     .get("fallback_tier")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u8,
+                streaming_retry_attempts: turn
+                    .get("streaming_retry_attempts")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u8,
             })
@@ -3017,6 +3497,7 @@ impl SessionState {
             tool_assembly,
             recent_turns,
             active_turn,
+            paracrine_threads,
             active_subagents: Vec::new(),
             last_handoff_summary: None,
             rules: checkpoint
@@ -3113,6 +3594,69 @@ fn looks_like_execution_goal(normalized: &str) -> bool {
     .any(|keyword| normalized.contains(keyword))
 }
 
+fn looks_like_memory_write_goal(normalized: &str) -> bool {
+    [
+        "remember",
+        "write this down",
+        "store memory",
+        "save memory",
+        "note this",
+        "memory delta",
+        "decision:",
+        "operator preference",
+        "reality gap",
+        "next seam",
+        "closeout",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_memory_cultivation_goal(normalized: &str) -> bool {
+    [
+        "cultivate memory",
+        "memory cultivate",
+        "memory cultivation",
+        "memory maintenance",
+        "memory sweep",
+        "closeout",
+        "memory delta",
+        "true-up",
+        "true up",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_memory_true_up_goal(normalized: &str) -> bool {
+    [
+        "true-up",
+        "true up",
+        "recalibration",
+        "contradiction",
+        "contradictions",
+        "reality gap",
+        "memory gap",
+        "stale memory",
+        "graph mismatch",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_memory_promotion_goal(normalized: &str) -> bool {
+    [
+        "promote memory",
+        "promote candidate",
+        "memory promotion",
+        "make durable",
+        "operator approved",
+        "verified memory",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
 fn normalized_turn_text(user_content: &str) -> String {
     user_content
         .trim()
@@ -3130,7 +3674,7 @@ fn tool_name_matches_goal(tool_name: &str, normalized: &str) -> bool {
     tool_name
         .split(['.', '_', '-'])
         .filter(|part| !part.is_empty())
-        .any(|part| normalized.contains(part))
+        .all(|part| normalized.contains(part))
 }
 
 pub fn session_checkpoint_memory_type(session_id: &str) -> String {
@@ -3208,10 +3752,14 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         .map(|tool_name| {
             let execution_mode = if is_local_agent_tool(tool_name) {
                 "local_agent"
+            } else if is_agent_graph_tool(tool_name) {
+                "agent_graph"
             } else if is_graph_datasource_tool(tool_name) {
                 "datasource"
             } else if is_table_datasource_tool(tool_name) {
                 "table_datasource"
+            } else if is_capability_primitive(tool_name) {
+                "capability_invoke"
             } else if is_pinned_tool(tool_name) {
                 "pinned"
             } else {
@@ -3223,20 +3771,27 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     target_node: local_node_id.clone(),
                     target_role: if execution_mode == "local_agent" {
                         "agent".into()
+                    } else if execution_mode == "agent_graph" {
+                        "agent-graph".into()
                     } else if execution_mode == "datasource" {
                         "graph-datasource".into()
                     } else if execution_mode == "table_datasource" {
                         "table-datasource".into()
+                    } else if execution_mode == "capability_invoke" {
+                        // Hotel routes CapabilityInvoke to the best provider — target_role is unused.
+                        String::new()
                     } else {
                         format!("tool.{tool_name}")
                     },
-                    runner_id: if execution_mode == "local_agent" {
+                    runner_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
+                    {
                         None
                     } else {
                         Some("tool-runner-01".into())
                     },
                     incarnation_id: None,
-                    hotel_id: if execution_mode == "local_agent" {
+                    hotel_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
+                    {
                         None
                     } else {
                         Some(local_node_id.clone())
@@ -3248,10 +3803,14 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
                         "agent_local_tool".into()
+                    } else if execution_mode == "agent_graph" {
+                        "agent_graph_route".into()
                     } else if execution_mode == "datasource" {
                         "graph_datasource_route".into()
                     } else if execution_mode == "table_datasource" {
                         "table_datasource_route".into()
+                    } else if execution_mode == "capability_invoke" {
+                        "capability_invoke_route".into()
                     } else if execution_mode == "pinned" {
                         "default_pinned_route".into()
                     } else {
@@ -3302,7 +3861,12 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
 
     // Always include observer and meta-approval tools — every philote can inspect its own
     // session/hotel and request standing approval for tools it uses regularly.
-    for always in ["session.status", "hotel.status", "hotel.logs", "approval.request_standing"] {
+    for always in [
+        "session.status",
+        "hotel.status",
+        "hotel.logs",
+        "approval.request_standing",
+    ] {
         let always = always.to_string();
         if !toolset.contains(&always) {
             toolset.push(always);
@@ -3318,10 +3882,26 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
         "session.status"
             | "hotel.status"
             | "hotel.logs"
+            | "hotel.perimeter.status"
+            | "hotel.perimeter.refresh"
+            | "hotel.egress.check"
             | "agent.configure"
             | "memory.recall"
             | "memory.remember"
+            | "memory.cultivate"
+            | "memory.true_up"
+            | "memory.promote_candidate"
             | "rule.propose"
+            | "routing.policy.propose"
+            | "routing.reflex.set"
+            | "routing.reflex.get"
+            | "routing.pipeline.set"
+            | "routing.pipeline.remove"
+            | "routing.pipeline.get"
+            | "mcp.provision"
+            | "mcp.revoke"
+            | "mcp.status"
+            | "desktop.observe"
             | "skill.register"
             | "skill.list"
             | "skill.assign"
@@ -3331,11 +3911,29 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "role.create_or_update"
             | "role.list"
             | "role.set_home"
+            | "transport.set_home"
             | "handoff.to_role"
             | "handoff.back"
             | "delegate.whisper"
+            | "delegate.to_peer"
+            | "delegate.to_external_cognitive_peer"
+            | "delegate.merge"
             | "approval.request_standing"
             | "table.add_listener"
+            | "router.stats"
+            | "vision.setup"
+            | "vision.status"
+    )
+}
+
+fn is_agent_graph_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "agent.graph.read"
+            | "agent.graph.write"
+            | "agent.graph.declare"
+            | "agent.graph.recall"
+            | "agent.graph.sync"
     )
 }
 
@@ -3358,14 +3956,20 @@ fn is_table_datasource_tool(tool_name: &str) -> bool {
     )
 }
 
+/// Returns true for any tool name that maps to a normalized capability primitive
+/// (`{modality}.{operation}`). These are dispatched via `IpcRequest::CapabilityInvoke`
+/// so the hotel can route to the best available model-controller.
+fn is_capability_primitive(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "image.ocr" | "image.ground" | "image.describe" | "audio.transcribe"
+    )
+}
+
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list"
-            | "workspace.read"
-            | "workspace.search"
-            | "workspace.write"
-            | "desktop.observe"
+        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
     )
 }
 
@@ -3608,6 +4212,133 @@ fn projection_item(text: &str, source_ref: &str, projection_kind: &str) -> Value
     })
 }
 
+fn format_memory_timestamp(value: u64) -> String {
+    if value >= 1_000_000_000_000 {
+        format!("unix_ms={value}")
+    } else {
+        format!("unix_s={value}")
+    }
+}
+
+fn infer_memory_temporal_kind(memory: &RecalledMemoryRecord) -> MemoryTemporalKind {
+    let haystack = format!(
+        "{} {} {}",
+        memory.memory_type.as_deref().unwrap_or_default(),
+        memory.concept,
+        memory.tags.join(" ")
+    )
+    .to_ascii_lowercase();
+
+    if haystack.contains("decision") {
+        MemoryTemporalKind::Decision
+    } else if haystack.contains("preference") || haystack.contains("operator-preference") {
+        MemoryTemporalKind::Preference
+    } else if haystack.contains("rule") || haystack.contains("protocol") {
+        MemoryTemporalKind::Rule
+    } else if haystack.contains("hypothesis") || haystack.contains("inferred") {
+        MemoryTemporalKind::Hypothesis
+    } else if haystack.contains("gap") || haystack.contains("reality-gap") {
+        MemoryTemporalKind::Gap
+    } else if haystack.contains("checkpoint") || haystack.contains("where-left-off") {
+        MemoryTemporalKind::Checkpoint
+    } else if haystack.contains("event") {
+        MemoryTemporalKind::Event
+    } else {
+        MemoryTemporalKind::State
+    }
+}
+
+fn infer_memory_spatial_scope(memory: &RecalledMemoryRecord) -> MemorySpatialScope {
+    if let Some(vault) = memory.vault_id.as_deref() {
+        if vault.starts_with("user_") {
+            return MemorySpatialScope::User;
+        }
+        if vault.starts_with("session_") {
+            return MemorySpatialScope::Session;
+        }
+        if vault.starts_with("agent_") {
+            return MemorySpatialScope::Agent;
+        }
+    }
+    if memory
+        .tags
+        .iter()
+        .any(|tag| tag == "mesh" || tag == "multi-hotel")
+    {
+        MemorySpatialScope::Mesh
+    } else if memory
+        .tags
+        .iter()
+        .any(|tag| tag == "workspace" || tag == "repo")
+    {
+        MemorySpatialScope::Workspace
+    } else {
+        MemorySpatialScope::Session
+    }
+}
+
+fn infer_memory_authority(memory: &RecalledMemoryRecord) -> MemoryAuthority {
+    match memory.trust.as_deref() {
+        Some("verified") => return MemoryAuthority::VerifiedMemory,
+        Some("external") => return MemoryAuthority::External,
+        Some("untrusted") => return MemoryAuthority::Untrusted,
+        _ => {}
+    }
+
+    let source = memory
+        .source
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if source.contains("runtime") || source.contains("watched") {
+        MemoryAuthority::ObservedRuntime
+    } else if source.contains("repo") || source.contains("code") {
+        MemoryAuthority::ObservedRepo
+    } else if source.contains("graph") {
+        MemoryAuthority::GraphStructured
+    } else if source.contains("user") || source.contains("operator") {
+        MemoryAuthority::UserStated
+    } else {
+        MemoryAuthority::InferredMemory
+    }
+}
+
+fn memory_space_summary(frame: &MemorySpacetimeFrame) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(workspace_path) = frame.workspace_path.as_deref() {
+        parts.push(format!("workspace={workspace_path}"));
+    }
+    if let Some(repo_id) = frame.repo_id.as_deref() {
+        parts.push(format!("repo={repo_id}"));
+    }
+    if let Some(branch) = frame.branch.as_deref() {
+        parts.push(format!("branch={branch}"));
+    }
+    if let Some(worktree_id) = frame.worktree_id.as_deref() {
+        parts.push(format!("worktree={worktree_id}"));
+    }
+    if let Some(hotel_id) = frame.hotel_id.as_deref() {
+        parts.push(format!("hotel={hotel_id}"));
+    }
+    if let Some(node_id) = frame.node_id.as_deref() {
+        parts.push(format!("node={node_id}"));
+    }
+    if let Some(session_id) = frame.session_id.as_deref() {
+        parts.push(format!("session={session_id}"));
+    }
+    if let Some(agent_id) = frame.agent_id.as_deref() {
+        parts.push(format!("agent={agent_id}"));
+    }
+    if let Some(primary_user_id) = frame.primary_user_id.as_deref() {
+        parts.push(format!("user={primary_user_id}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
 fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3671,11 +4402,13 @@ mod tests {
     use super::{
         ActivePlan, ApprovalPolicy, ApprovalRiskHint, ComponentExecutionRoute,
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
-        ContextLayerId, ContextMutability, HookRequest, HookResult, PlanStep, PromotionAction,
-        RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation, SessionBindings,
-        SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn,
-        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
+        ContextLayerId, ContextMutability, HookRequest, HookResult, MemoryAuthority,
+        MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel,
+        ParacrineThreadStatus, PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest,
+        ResponseRouteMode, RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, VoiceDeliveryMode,
+        VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
+        session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
@@ -3685,6 +4418,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "hello".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -3707,10 +4441,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         }
     }
 
@@ -3722,6 +4458,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "hello".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -3744,10 +4481,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3773,6 +4512,71 @@ mod tests {
         // by compose_session_snapshot on every turn.
         assert!(checkpoint.get("component_route_assembly").is_none());
         assert!(checkpoint.get("tool_assembly").is_none());
+    }
+
+    #[test]
+    fn checkpoint_round_trip_preserves_paracrine_response_routing() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut turn = test_working_turn(None);
+        turn.paracrine_origin = Some("paracrine-1".into());
+        turn.paracrine_reply_session_id = Some("source-session".into());
+        turn.paracrine_reply_chat_id = Some("source-chat".into());
+        turn.paracrine_response_routing =
+            Some(philotic_client::ParacrineRouting::EnrichedToolResult);
+        turn.phase = TurnPhase::WaitingTool;
+        state.start_turn(turn);
+
+        let checkpoint = state.checkpoint_json();
+        assert_eq!(
+            checkpoint["active_turn"]["paracrine_response_routing"],
+            "enriched_tool_result"
+        );
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        let restored_turn = restored.active_turn.expect("active turn restored");
+        assert_eq!(
+            restored_turn.paracrine_response_routing,
+            Some(philotic_client::ParacrineRouting::EnrichedToolResult)
+        );
+    }
+
+    #[test]
+    fn paracrine_threads_survive_turn_completion_and_checkpoint_closeout() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(test_working_turn(None));
+        state.open_paracrine_thread(
+            "paracrine-1".into(),
+            "critic".into(),
+            "review the decision".into(),
+            philotic_client::ParacrineRouting::CognitiveReEntry,
+            "advice_only".into(),
+            "read_only".into(),
+            "originating_session".into(),
+        );
+        state.complete_active_turn("main turn finished".into());
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert_eq!(restored.paracrine_threads.len(), 1);
+        assert_eq!(restored.paracrine_threads[0].status.as_str(), "open");
+
+        let mut restored = restored;
+        restored.close_paracrine_thread(
+            "paracrine-1",
+            ParacrineThreadStatus::Completed,
+            Some("use this".into()),
+            Some("cognitive_re_entry".into()),
+        );
+
+        let closed_checkpoint = restored.checkpoint_json();
+        let closed = SessionState::from_checkpoint(&closed_checkpoint).expect("rehydrate state");
+        assert_eq!(closed.paracrine_threads[0].status.as_str(), "completed");
+        assert_eq!(
+            closed.paracrine_threads[0].final_result.as_deref(),
+            Some("use this")
+        );
     }
 
     #[test]
@@ -3852,6 +4656,7 @@ mod tests {
                     execution_mode: "capability".into(),
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
+                    target_capability: None,
                 },
             )]),
         };
@@ -3878,6 +4683,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "hello".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -3900,10 +4706,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.complete_active_turn("hi".into());
@@ -3924,6 +4732,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: audio_payload,
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -3946,10 +4755,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4099,6 +4910,7 @@ mod tests {
                 preferred_hotel_id: None,
                 preferred_environment_id: None,
                 allowed_tool_runner_incarnations: Vec::new(),
+                on_demand_skills: Vec::new(),
             }
         );
         assert_eq!(state.recent_turns.len(), 1);
@@ -4270,6 +5082,35 @@ mod tests {
         assert!(props.contains_key("command"));
         assert!(props.contains_key("working_dir"));
         assert!(props.contains_key("timeout_secs"));
+    }
+
+    #[test]
+    fn delegate_whisper_catalog_exposes_blocking_paracrine_mode() {
+        use crate::catalog::tool_catalog;
+        let catalog = tool_catalog();
+        let entry = catalog
+            .get("delegate.whisper")
+            .expect("delegate.whisper in catalog");
+        let props = entry
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties object");
+        assert!(props.contains_key("wait_for_response"));
+        assert!(props.contains_key("authority"));
+        assert!(props.contains_key("tool_policy"));
+        assert!(props.contains_key("approval_scope"));
+        let routing_enum = props
+            .get("routing")
+            .and_then(|v| v.get("enum"))
+            .and_then(|v| v.as_array())
+            .expect("routing enum");
+        assert!(
+            routing_enum
+                .iter()
+                .any(|value| value.as_str() == Some("enriched_tool_result")),
+            "routing enum must expose enriched_tool_result"
+        );
     }
 
     #[test]
@@ -4613,11 +5454,14 @@ mod tests {
             preferred_hotel_id: None,
             preferred_environment_id: None,
             allowed_tool_runner_incarnations: Vec::new(),
+            on_demand_skills: Vec::new(),
         };
 
         let prompt = state.build_prompt("status");
         assert!(prompt.contains("Session status: paused."));
-        assert!(prompt.contains("Effective tools: echo."));
+        assert!(!prompt.contains("Effective tools: echo."));
+        assert!(prompt.contains("Tools available:"));
+        assert!(prompt.contains("echo"));
         assert!(prompt.contains("Workspace: workspace://main."));
         assert!(
             prompt
@@ -4669,6 +5513,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-ctx-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "status".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -4700,10 +5545,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let projection = state.build_context_projection("status");
@@ -4767,6 +5614,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-ctx-2".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "status".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -4789,10 +5637,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let prompt = state.build_prompt("status");
@@ -4823,8 +5673,52 @@ mod tests {
         assert!(prompt.contains("Active role posture: developer."));
         assert!(prompt.contains("Role addendum: Focus on implementation and code changes."));
         assert!(prompt.contains("Role toolset profile: codex."));
-        assert!(prompt.contains("Role skillset posture: planning, implementation."));
+        assert!(!prompt.contains("Role skillset posture: planning, implementation."));
         assert!(prompt.contains("Role working-memory policy: role_local."));
+    }
+
+    #[test]
+    fn model_affordances_project_visible_tools_without_raw_inventory_prompt_dump() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("workspace.read");
+        state.add_tool_binding("memory.recall");
+        state.add_tool_binding("memory.remember");
+        state.bindings.effective_skillset = vec!["context.synthesize".into(), "memory".into()];
+        state.bindings.on_demand_skills = vec!["context.synthesize".into()];
+
+        let projected = state.project_tools_for_turn("Help me plan the next memory slice");
+        let prompt =
+            state.build_prompt_with_tools("Help me plan the next memory slice", &projected);
+        let affordances =
+            state.model_affordances_for_turn("Help me plan the next memory slice", &projected);
+
+        assert!(!prompt.contains("Effective tools:"));
+        assert!(!prompt.contains("Current skill posture:"));
+        assert!(!prompt.contains("context.synthesize, memory"));
+        assert!(
+            affordances["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "echo")
+        );
+        assert!(
+            affordances["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["id"] == "memory")
+        );
+        assert!(
+            !affordances["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["id"] == "context.synthesize")
+        );
     }
 
     #[test]
@@ -4850,6 +5744,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-handoff-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "implement the fix".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -4872,10 +5767,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4930,6 +5827,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-subagent-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "break this into a small worker task".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -4952,10 +5850,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5333,7 +6233,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_observe_gets_pinned_desktop_route() {
+    fn desktop_observe_gets_local_agent_route() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.clear_tool_bindings();
@@ -5344,13 +6244,27 @@ mod tests {
             .resolve_tool_route("desktop.observe")
             .expect("desktop.observe route should exist");
 
-        assert_eq!(route.execution_mode, "pinned");
-        assert_eq!(route.task_runner_kind.as_deref(), Some("desktop"));
-        assert_eq!(route.target_role, "tool.desktop.observe");
-        assert_eq!(
-            route.selection_reason.as_deref(),
-            Some("default_pinned_route")
-        );
+        assert_eq!(route.execution_mode, "local_agent");
+        assert_eq!(route.target_role, "agent");
+        assert_eq!(route.selection_reason.as_deref(), Some("agent_local_tool"));
+    }
+
+    #[test]
+    fn agent_graph_tools_route_to_agent_graph_role() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("agent.graph.read");
+        state.rebuild_default_tool_assembly();
+
+        let route = state
+            .resolve_tool_route("agent.graph.read")
+            .expect("agent.graph.read route should exist");
+
+        assert_eq!(route.execution_mode, "agent_graph");
+        assert_eq!(route.target_role, "agent-graph");
+        assert_eq!(route.runner_id, None);
+        assert_eq!(route.selection_reason.as_deref(), Some("agent_graph_route"));
     }
 
     #[test]
@@ -5423,6 +6337,93 @@ mod tests {
     }
 
     #[test]
+    fn memory_write_tool_is_hidden_without_write_intent() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("memory.recall");
+        state.add_tool_binding("memory.remember");
+        state.add_tool_binding("workspace.read");
+
+        let projected = state.project_tools_for_turn("Help me plan the next memory slice");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(projected_names.contains(&"memory.recall"));
+        assert!(projected_names.contains(&"workspace.read"));
+        assert!(!projected_names.contains(&"memory.remember"));
+    }
+
+    #[test]
+    fn memory_write_intent_can_project_remember_tool() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("memory.recall");
+        state.add_tool_binding("memory.remember");
+
+        let projected =
+            state.project_tools_for_turn("remember operator preference for short closeouts");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(projected_names.contains(&"memory.remember"));
+    }
+
+    #[test]
+    fn advanced_memory_tools_require_matching_intent() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("memory.recall");
+        state.add_tool_binding("memory.cultivate");
+        state.add_tool_binding("memory.true_up");
+        state.add_tool_binding("memory.promote_candidate");
+
+        let projected = state.project_tools_for_turn("Help me think through the memory design");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(projected_names.contains(&"memory.recall"));
+        assert!(!projected_names.contains(&"memory.cultivate"));
+        assert!(!projected_names.contains(&"memory.true_up"));
+        assert!(!projected_names.contains(&"memory.promote_candidate"));
+
+        let projected = state.project_tools_for_turn(
+            "Run a memory true-up and cultivate memory gaps before closeout",
+        );
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(projected_names.contains(&"memory.cultivate"));
+        assert!(projected_names.contains(&"memory.true_up"));
+        assert!(!projected_names.contains(&"memory.promote_candidate"));
+    }
+
+    #[test]
+    fn reentry_context_uses_projected_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        let mut turn = test_working_turn(None);
+        turn.user_content = "What do you think about this architecture?".into();
+        state.start_turn(turn);
+
+        let (_, _, _, tools) = state
+            .build_reentry_context_envelope()
+            .expect("active turn should produce reentry envelope");
+
+        assert!(tools.is_empty());
+    }
+
+    #[test]
     fn execution_intent_keeps_shell_tools_visible() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -5474,6 +6475,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "hello".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -5496,10 +6498,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5527,6 +6531,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "list workspace files".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -5549,10 +6554,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.push_tool_history(
@@ -5595,6 +6602,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "read the README".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -5617,10 +6625,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         state.push_tool_history(
@@ -5664,6 +6674,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-voice-1".into(),
             chat_id: "123".into(),
+            primary_user_id: None,
             user_content: "User sent a Telegram voice message.".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -5686,10 +6697,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let reentry = state
@@ -5936,6 +6949,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-memory".into(),
             chat_id: "chat-memory".into(),
+            primary_user_id: None,
             user_content: "continue the memory work".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -5946,10 +6960,17 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: vec![RecalledMemoryRecord {
+                id: Some("01MEMORY".into()),
+                vault_id: Some("user_chat-memory".into()),
                 concept: "memory-architecture".into(),
                 content: "User prefers deterministic bounded recall over broad automatic dumps."
                     .into(),
                 tags: vec!["memory".into(), "preference".into()],
+                confidence: Some(0.91),
+                trust: Some("verified".into()),
+                entities: vec![serde_json::json!({"name": "Muninn", "type": "memory_system"})],
+                recall_reason: Some("meaningful_user_turn".into()),
+                ..Default::default()
             }],
             active_plan: None,
             consecutive_step_failures: 0,
@@ -5963,10 +6984,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -5981,6 +7004,121 @@ mod tests {
             .expect("recalled memory entry should render text");
         assert!(text.contains("[Recalled memory]"));
         assert!(text.contains("memory-architecture"));
+        assert!(text.contains("id=01MEMORY"));
+        assert!(text.contains("vault=user_chat-memory"));
+        assert!(text.contains("confidence=0.91"));
+        assert!(text.contains("trust=verified"));
+        assert!(text.contains("entities: 1"));
+    }
+
+    #[test]
+    fn recalled_memory_projects_spacetime_frame() {
+        let mut state = SessionState::new(
+            "sess-frame".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = test_working_turn(None);
+        turn.primary_user_id = Some("jared".into());
+        turn.recalled_memories = vec![RecalledMemoryRecord {
+            id: Some("01FRAME".into()),
+            concept: "deployed-runtime-truth-gap".into(),
+            content: "vps-jane needed a runtime true-up after source changed.".into(),
+            spacetime_frame: Some(MemorySpacetimeFrame {
+                observed_at: Some(1_768_922_400_000),
+                last_verified_at: Some(1_768_922_430_000),
+                temporal_kind: Some(MemoryTemporalKind::Gap),
+                spatial_scope: Some(MemorySpatialScope::Hotel),
+                hotel_id: Some("vps-jane".into()),
+                branch: Some("develop".into()),
+                authority: Some(MemoryAuthority::ObservedRuntime),
+                validation_level: Some(MemoryValidationLevel::WatchedLiveGreen),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        state.start_turn(turn);
+
+        let projection = state.build_context_projection("continue memory work");
+        let context = state.model_context_from_projection(&projection);
+        let recalled_text = context["recalled_memory"]
+            .as_array()
+            .expect("recalled_memory must be an array")[0]["text"]
+            .as_str()
+            .expect("recalled memory should render text");
+
+        assert!(recalled_text.contains("temporal_kind: gap"));
+        assert!(recalled_text.contains("observed_at: unix_ms=1768922400000"));
+        assert!(recalled_text.contains("last_verified_at: unix_ms=1768922430000"));
+        assert!(recalled_text.contains("spatial_scope: hotel"));
+        assert!(recalled_text.contains("space: branch=develop; hotel=vps-jane; session=sess-frame; agent=agent-jane-01; user=jared"));
+        assert!(recalled_text.contains("authority: observed_runtime"));
+        assert!(recalled_text.contains("validation: watched-live-green"));
+    }
+
+    #[test]
+    fn context_projection_carries_primary_user_id() {
+        let mut state = SessionState::new(
+            "sess-user".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = test_working_turn(None);
+        turn.primary_user_id = Some("jared".into());
+        state.start_turn(turn);
+
+        let projection = state.build_context_projection("continue memory work");
+
+        assert_eq!(
+            projection.conversation_turn.primary_user_id.as_deref(),
+            Some("jared")
+        );
+    }
+
+    #[test]
+    fn agent_graph_layer_includes_muninn_entity_overlay() {
+        let mut state = SessionState::new(
+            "sess-overlay".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.agent_graph_snapshot = Some("Task: {\"id\":\"memory-tightening\"}".into());
+        let mut turn = test_working_turn(None);
+        turn.turn_id = "turn-overlay".into();
+        turn.recalled_memories = vec![RecalledMemoryRecord {
+            id: Some("01MEMORY".into()),
+            concept: "memory-architecture".into(),
+            content: "Muninn entity relationships should advise the graph projection.".into(),
+            entities: vec![serde_json::json!({
+                "name": "Muninn",
+                "type": "memory_system"
+            })],
+            relationships: vec![serde_json::json!({
+                "from_entity": "Muninn",
+                "rel_type": "dovetails_with",
+                "to_entity": "Agent Graph"
+            })],
+            ..Default::default()
+        }];
+        state.start_turn(turn);
+
+        let projection = state.build_context_projection("continue memory work");
+        let context = state.model_context_from_projection(&projection);
+        let agent_graph_text = context["memory"]
+            .as_array()
+            .expect("memory channel should exist")
+            .iter()
+            .filter(|item| item["projection_kind"] == "agent_graph")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(agent_graph_text.contains("[Agent graph]"));
+        assert!(agent_graph_text.contains("memory-tightening"));
+        assert!(agent_graph_text.contains("[Muninn entity overlay]"));
+        assert!(agent_graph_text.contains("MuninnEntity"));
+        assert!(agent_graph_text.contains("MuninnRelation"));
+        assert!(agent_graph_text.contains("dovetails_with"));
     }
 
     #[test]
@@ -6003,7 +7141,11 @@ mod tests {
         // Other capabilities are unaffected.
         assert_eq!(
             state.preferred_component_implementation("voice.synthesize"),
-            state.agent_profile.voice_response_policy.provider.as_deref()
+            state
+                .agent_profile
+                .voice_response_policy
+                .provider
+                .as_deref()
         );
         assert_eq!(
             state.preferred_component_implementation("text.generate"),
@@ -6013,8 +7155,11 @@ mod tests {
 
     #[test]
     fn transcription_provider_none_when_not_configured() {
-        let state =
-            SessionState::new("sess-tx2".into(), "agent-bjork-01".into(), "telegram".into());
+        let state = SessionState::new(
+            "sess-tx2".into(),
+            "agent-bjork-01".into(),
+            "telegram".into(),
+        );
         // Default MediaRoutingPolicy has no transcription_provider.
         assert_eq!(
             state.preferred_component_implementation("voice.transcribe"),
@@ -6035,16 +7180,24 @@ mod tests {
         assert_eq!(json["transcription_provider"], "onnx");
 
         let round_tripped: MediaRoutingPolicy = serde_json::from_value(json).unwrap();
-        assert_eq!(round_tripped.transcription_provider.as_deref(), Some("onnx"));
+        assert_eq!(
+            round_tripped.transcription_provider.as_deref(),
+            Some("onnx")
+        );
     }
 
     #[test]
     fn component_route_assembly_takes_precedence_over_transcription_provider() {
-        use crate::session::types::{ComponentExecutionRoute, ComponentRouteAssembly, MediaRoutingPolicy};
+        use crate::session::types::{
+            ComponentExecutionRoute, ComponentRouteAssembly, MediaRoutingPolicy,
+        };
         use std::collections::BTreeMap;
 
-        let mut state =
-            SessionState::new("sess-tx3".into(), "agent-bjork-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-tx3".into(),
+            "agent-bjork-01".into(),
+            "telegram".into(),
+        );
         state.agent_profile.media_routing_policy = MediaRoutingPolicy {
             transcription_provider: Some("onnx".into()),
             ..MediaRoutingPolicy::default()
@@ -6068,7 +7221,11 @@ mod tests {
         // returns None because the route assembly takes the component_route_for_capability path.
         // Callers use resolve_model_execution_target which checks route assembly before falling
         // back to preferred_component_implementation — just assert both APIs are consistent.
-        assert!(state.resolve_component_execution_route("voice.transcribe").is_some());
+        assert!(
+            state
+                .resolve_component_execution_route("voice.transcribe")
+                .is_some()
+        );
     }
 
     fn make_turn_with_plan(plan: ActivePlan) -> WorkingTurn {
@@ -6076,6 +7233,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "c1".into(),
+            primary_user_id: None,
             user_content: "set up roles".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -6098,10 +7256,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         }
     }
 
@@ -6197,6 +7357,7 @@ mod tests {
             task_id: Uuid::nil(),
             turn_id: "turn-x".into(),
             chat_id: "c1".into(),
+            primary_user_id: None,
             user_content: "do something".into(),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
@@ -6219,10 +7380,12 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
             paracrine_merge_completed: false,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            streaming_retry_attempts: 0,
         };
         state.start_turn(turn);
         state.push_tool_history(

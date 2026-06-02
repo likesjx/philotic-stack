@@ -148,6 +148,28 @@ fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "graph_memory_true_up",
+                "description": "Record a memory/graph true-up finding as an audited graph task node linked to affected graph nodes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "finding_id": { "type": "string", "description": "Optional stable finding id. Defaults to a generated UUID." },
+                        "finding_type": { "type": "string", "description": "Finding class, e.g. confirmed, contradicted, stale, missing_memory, underspecified, needs_operator." },
+                        "scope": { "type": "string", "description": "Scope such as session, workspace, hotel, mesh, or global." },
+                        "summary": { "type": "string", "description": "Concise finding summary." },
+                        "muninn_ids": { "type": "array", "items": { "type": "string" }, "description": "Muninn engram ids involved." },
+                        "graph_ids": { "type": "array", "items": { "type": "string" }, "description": "AgentGraph node ids involved." },
+                        "evidence_refs": { "type": "array", "items": { "type": "string" }, "description": "Evidence references such as files, commands, tests, or smoke runs." },
+                        "resolution": { "type": "string", "description": "Resolution or proposed resolution." },
+                        "recommended_action": { "type": "string", "description": "Recommended next action." },
+                        "requires_operator": { "type": "boolean", "description": "Whether operator review is required." },
+                        "agent": { "type": "string", "description": "Agent recording the finding." },
+                        "session": { "type": "string", "description": "Session id." }
+                    },
+                    "required": ["finding_type", "summary"]
+                }
+            },
+            {
                 "name": "graph_create_node",
                 "description": "Create a new node in the graph (proposal, seam, task, decision). The graph is the source of truth for architecture.",
                 "inputSchema": {
@@ -502,6 +524,7 @@ async fn execute_tool(
         "graph_proposals" => tool_graph_proposals(state).await,
         "graph_manage_proposal" => tool_graph_manage_proposal(state, arguments).await,
         "graph_decide" => tool_graph_decide(state, arguments).await,
+        "graph_memory_true_up" => tool_graph_memory_true_up(state, arguments).await,
         "graph_create_node" => tool_graph_create_node(state, arguments).await,
         "graph_update_node" => tool_graph_update_node(state, arguments).await,
         "graph_create_edge" => tool_graph_create_edge(state, arguments).await,
@@ -1004,6 +1027,89 @@ async fn tool_graph_decide(
             "type": "text",
             "text": format!("Decision recorded: {} on {} — {}", action, target_node, reason)
         }]
+    }))
+}
+
+fn string_array_arg(args: &serde_json::Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::trim))
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn tool_graph_memory_true_up(
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let finding_type = args
+        .get("finding_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing required parameter: finding_type"))?;
+    let summary = args
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing required parameter: summary"))?;
+
+    let request = crate::engine::MemoryTrueUpFindingRequest {
+        finding_id: args
+            .get("finding_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        finding_type: finding_type.to_string(),
+        scope: args.get("scope").and_then(|v| v.as_str()).map(String::from),
+        summary: summary.to_string(),
+        muninn_ids: string_array_arg(args, "muninn_ids"),
+        graph_ids: string_array_arg(args, "graph_ids"),
+        evidence_refs: string_array_arg(args, "evidence_refs"),
+        resolution: args
+            .get("resolution")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        recommended_action: args
+            .get("recommended_action")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        requires_operator: args
+            .get("requires_operator")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        agent: args.get("agent").and_then(|v| v.as_str()).map(String::from),
+        session: args
+            .get("session")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    };
+
+    let engine = state.engine.lock().await;
+    let result = engine
+        .record_memory_true_up_finding(request)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "memory_true_up_recorded".to_string(),
+        payload: serde_json::json!({
+            "node_id": result.finding.id,
+            "mutation_id": result.mutation.id,
+        }),
+    });
+
+    Ok(serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "Memory true-up recorded: {} (mutation: {})",
+                result.finding.id,
+                result.mutation.id
+            )
+        }],
+        "finding": result.finding,
+        "mutation": result.mutation,
     }))
 }
 

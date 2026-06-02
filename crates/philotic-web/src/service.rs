@@ -160,7 +160,10 @@ pub async fn start(hotel: String) -> Result<()> {
             .status()
             .context("launchctl bootstrap")?;
         if !status.success() {
-            bail!("launchctl bootstrap failed — check plist at {}", plist.display());
+            bail!(
+                "launchctl bootstrap failed — check plist at {}",
+                plist.display()
+            );
         }
     }
 

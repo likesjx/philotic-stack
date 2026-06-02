@@ -116,7 +116,10 @@ async fn main() -> Result<()> {
 
 fn check_nemo(python_path: &str) -> Result<()> {
     let output = std::process::Command::new(python_path)
-        .args(["-c", "import nemo.collections.asr as nemo_asr; print('nemo_asr ok')"])
+        .args([
+            "-c",
+            "import nemo.collections.asr as nemo_asr; print('nemo_asr ok')",
+        ])
         .output()?;
 
     if output.status.success() {

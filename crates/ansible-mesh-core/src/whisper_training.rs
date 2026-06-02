@@ -156,9 +156,8 @@ impl SqliteWhisperTrainingStorage {
         // Enable WAL for concurrent access with router-listener.
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         // Migrate: add exported_at to existing DBs that predate this column.
-        let _ = conn.execute_batch(
-            "ALTER TABLE whisper_training_samples ADD COLUMN exported_at INTEGER;",
-        );
+        let _ = conn
+            .execute_batch("ALTER TABLE whisper_training_samples ADD COLUMN exported_at INTEGER;");
         conn.execute_batch(
             "
             BEGIN;
@@ -356,7 +355,12 @@ impl WhisperTrainingStorage for SqliteWhisperTrainingStorage {
                 ))
             })?
         };
-        Ok(TrainingStatusCounts { total, uncorrected, eligible, exported })
+        Ok(TrainingStatusCounts {
+            total,
+            uncorrected,
+            eligible,
+            exported,
+        })
     }
 
     fn mark_exported_at(&self, sample_ids: &[String], exported_at: u64) -> Result<()> {
@@ -535,7 +539,9 @@ mod tests {
         s.insert_sample(&make_sample(2)).unwrap();
         s.update_correction("turn-2", "fixed", "operator").unwrap();
 
-        let uncorrected = s.list_filtered(&TrainingFilter::Uncorrected, None, 10).unwrap();
+        let uncorrected = s
+            .list_filtered(&TrainingFilter::Uncorrected, None, 10)
+            .unwrap();
         assert_eq!(uncorrected.len(), 1);
         assert_eq!(uncorrected[0].turn_id, "turn-1");
     }
@@ -548,7 +554,9 @@ mod tests {
         s.insert_sample(&sample).unwrap();
         s.insert_sample(&make_sample(2)).unwrap();
 
-        let aria_only = s.list_filtered(&TrainingFilter::All, Some("aria"), 10).unwrap();
+        let aria_only = s
+            .list_filtered(&TrainingFilter::All, Some("aria"), 10)
+            .unwrap();
         assert_eq!(aria_only.len(), 1);
         assert_eq!(aria_only[0].agent_id, "aria");
     }
@@ -561,7 +569,8 @@ mod tests {
         s.insert_sample(&make_sample(3)).unwrap();
         s.update_correction("turn-2", "fixed", "operator").unwrap();
         s.update_correction("turn-3", "fixed2", "operator").unwrap();
-        s.mark_exported_at(&["sample-0003".to_string()], 1_700_001_000).unwrap();
+        s.mark_exported_at(&["sample-0003".to_string()], 1_700_001_000)
+            .unwrap();
 
         let counts = s.count_status(None).unwrap();
         assert_eq!(counts.total, 3);
@@ -576,9 +585,12 @@ mod tests {
         s.insert_sample(&make_sample(1)).unwrap();
         s.insert_sample(&make_sample(2)).unwrap();
         s.update_correction("turn-1", "fixed", "operator").unwrap();
-        s.mark_exported_at(&["sample-0001".to_string()], 1_700_001_000).unwrap();
+        s.mark_exported_at(&["sample-0001".to_string()], 1_700_001_000)
+            .unwrap();
 
-        let exported = s.list_filtered(&TrainingFilter::Exported, None, 10).unwrap();
+        let exported = s
+            .list_filtered(&TrainingFilter::Exported, None, 10)
+            .unwrap();
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].sample_id, "sample-0001");
         assert!(exported[0].exported_at.is_some());

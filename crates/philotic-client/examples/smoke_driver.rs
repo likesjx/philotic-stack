@@ -29,6 +29,12 @@ async fn main() -> Result<()> {
     .await
     .with_context(|| format!("failed to connect smoke driver to {socket_path}"))?;
 
+    client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: "membrane".into(),
+        })
+        .await?;
+
     let response = client
         .send_request(IpcRequest::EmitTask {
             target_node,

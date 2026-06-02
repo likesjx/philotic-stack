@@ -71,6 +71,9 @@ pub enum EventKind {
     /// hotels replicate it locally and can participate in mesh-coordinated firing.
     /// Payload: `{ "op": "upsert"|"remove", "job": CronJob|null, "job_id": "..." }`.
     CronJobSync,
+    /// Non-secret user identity ghost mirror replicated across hotels so the
+    /// same human can be recognized mesh-wide without copying sessions or secrets.
+    ProjectedUserIdentitySync,
 }
 
 /// The payload definition. Large files must use `BlobRef`.

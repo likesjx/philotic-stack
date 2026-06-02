@@ -105,9 +105,9 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
         }
         "routing_preference" => {
             let preference_key = match args.get("preference_key").and_then(Value::as_str) {
-                Some(value) => value,
+                Some(v) => v,
                 None => {
-                    return json!({"ok": false, "error": "missing 'preference_key'"}).to_string();
+                    return json!({"ok": false, "error": "missing 'preference_key'"}).to_string()
                 }
             };
             let pref = AgentRoutingPreference {
@@ -144,13 +144,13 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
         }
         "reflex_preference" => {
             let preference_key = match args.get("preference_key").and_then(Value::as_str) {
-                Some(value) => value,
+                Some(v) => v,
                 None => {
-                    return json!({"ok": false, "error": "missing 'preference_key'"}).to_string();
+                    return json!({"ok": false, "error": "missing 'preference_key'"}).to_string()
                 }
             };
             let reflexes_json = match args.get("reflexes") {
-                Some(value) if value.is_object() => value.clone(),
+                Some(v) if v.is_object() => v.clone(),
                 Some(_) => {
                     return json!({"ok": false, "error": "'reflexes' must be an object"})
                         .to_string()

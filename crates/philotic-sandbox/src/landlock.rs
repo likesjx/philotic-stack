@@ -12,33 +12,32 @@ const TARGET_ABI: ABI = ABI::V3;
 /// Apply Landlock filesystem restrictions based on the sandbox policy.
 /// Returns Ok(true) if Landlock was applied, Ok(false) if unavailable.
 pub fn apply_landlock(policy: &SandboxPolicy, strict: bool) -> Result<bool> {
-    let status = match Ruleset::new()
+    let status = match Ruleset::default()
         .handle_access(AccessFs::from_all(TARGET_ABI))
         .context("failed to create landlock ruleset")
     {
         Ok(ruleset) => {
+            // add_rule consumes self and does not return it on error, so we must
+            // propagate failures with ? rather than warn-and-continue.  Missing paths
+            // (PathFd failure) are still warned-and-skipped since they're common.
             let mut created = ruleset
                 .create()
                 .context("failed to create landlock ruleset")?;
 
-            // Add read access rules
             for pattern in &policy.filesystem.read_paths {
                 if let Some(path) = resolve_pattern_to_path(pattern) {
                     match PathFd::new(&path) {
                         Ok(fd) => {
                             let access = AccessFs::ReadFile | AccessFs::ReadDir;
-                            if let Err(e) = created.add_rule(PathBeneath::new(fd, access)) {
-                                warn!("landlock: failed to add read rule for {}: {}", path, e);
-                            }
+                            created = created
+                                .add_rule(PathBeneath::new(fd, access))
+                                .context("failed to add read rule")?;
                         }
-                        Err(e) => {
-                            warn!("landlock: cannot open path {}: {}", path, e);
-                        }
+                        Err(e) => warn!("landlock: cannot open path {}: {}", path, e),
                     }
                 }
             }
 
-            // Add write access rules
             for pattern in &policy.filesystem.write_paths {
                 if let Some(path) = resolve_pattern_to_path(pattern) {
                     match PathFd::new(&path) {
@@ -48,30 +47,25 @@ pub fn apply_landlock(policy: &SandboxPolicy, strict: bool) -> Result<bool> {
                                 | AccessFs::WriteFile
                                 | AccessFs::MakeDir
                                 | AccessFs::MakeReg;
-                            if let Err(e) = created.add_rule(PathBeneath::new(fd, access)) {
-                                warn!("landlock: failed to add write rule for {}: {}", path, e);
-                            }
+                            created = created
+                                .add_rule(PathBeneath::new(fd, access))
+                                .context("failed to add write rule")?;
                         }
-                        Err(e) => {
-                            warn!("landlock: cannot open path {}: {}", path, e);
-                        }
+                        Err(e) => warn!("landlock: cannot open path {}: {}", path, e),
                     }
                 }
             }
 
-            // Add execute access rules
             for pattern in &policy.filesystem.execute_paths {
                 if let Some(path) = resolve_pattern_to_path(pattern) {
                     match PathFd::new(&path) {
                         Ok(fd) => {
                             let access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
-                            if let Err(e) = created.add_rule(PathBeneath::new(fd, access)) {
-                                warn!("landlock: failed to add execute rule for {}: {}", path, e);
-                            }
+                            created = created
+                                .add_rule(PathBeneath::new(fd, access))
+                                .context("failed to add execute rule")?;
                         }
-                        Err(e) => {
-                            warn!("landlock: cannot open path {}: {}", path, e);
-                        }
+                        Err(e) => warn!("landlock: cannot open path {}: {}", path, e),
                     }
                 }
             }

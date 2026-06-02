@@ -7,6 +7,7 @@ edition = "2024"
 aes-gcm = "0.10"
 async-trait = "0.1"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
+perimeter-core = { path = "../perimeter-core" }
 memory-core = { path = "../memory-core" }
 anyhow = "1.0"
 base64 = "0.22"
@@ -23,7 +24,7 @@ tracing-subscriber = "0.3"
 uuid = { version = "1.21.0", features = ["v4"] }
 axum = { version = "0.7", features = ["multipart", "ws"] }
 tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
-reqwest = { version = "0.12", features = ["json", "stream", "cookies"] }
+reqwest = { version = "0.12", features = ["json", "stream", "cookies", "multipart"] }
 sha2 = "0.10"
 hex = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

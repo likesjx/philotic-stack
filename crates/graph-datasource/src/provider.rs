@@ -1,9 +1,9 @@
-use crate::transpiler::{transpile_cypher, TranslatedQuery};
-use anyhow::{bail, Result};
+use crate::transpiler::{TranslatedQuery, transpile_cypher};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput, TaskKind};
-use rusqlite::{params, Connection};
-use serde_json::{json, Value};
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -53,7 +53,11 @@ impl SqliteCypherProvider {
     fn execute_cypher(&self, conn: &Connection, query: &str, _params: &Value) -> Result<Value> {
         let translated = transpile_cypher(query)?;
         match translated {
-            TranslatedQuery::InsertNode { id, label, properties } => {
+            TranslatedQuery::InsertNode {
+                id,
+                label,
+                properties,
+            } => {
                 let props_json = serde_json::to_string(&properties)?;
                 conn.execute(
                     "INSERT OR REPLACE INTO ag_node (id, label, properties) VALUES (?, ?, ?)",
@@ -61,7 +65,13 @@ impl SqliteCypherProvider {
                 )?;
                 Ok(json!({"status": "created", "id": id}))
             }
-            TranslatedQuery::InsertEdge { id, source_id, target_id, label, properties } => {
+            TranslatedQuery::InsertEdge {
+                id,
+                source_id,
+                target_id,
+                label,
+                properties,
+            } => {
                 let props_json = serde_json::to_string(&properties)?;
                 conn.execute(
                     "INSERT OR REPLACE INTO ag_edge (id, source_id, target_id, label, properties) VALUES (?, ?, ?, ?, ?)",
@@ -77,32 +87,44 @@ impl SqliteCypherProvider {
                 conn.execute("DELETE FROM ag_edge WHERE id = ?", params![id])?;
                 Ok(json!({"status": "deleted", "id": id}))
             }
-            TranslatedQuery::SelectNodes { label, filters: _ } => {
+            TranslatedQuery::SelectNodes { label, id_filter } => {
                 let mut results = Vec::new();
-                if let Some(l) = label {
-                    let mut stmt =
-                        conn.prepare("SELECT id, label, properties FROM ag_node WHERE label = ?")?;
-                    let rows = stmt.query_map(params![l], |row| {
-                        let id: String = row.get(0)?;
-                        let label: String = row.get(1)?;
-                        let props: String = row.get(2)?;
-                        let properties: Value = serde_json::from_str(&props).unwrap_or(json!({}));
-                        Ok(json!({"id": id, "label": label, "properties": properties}))
-                    })?;
-                    for row in rows {
-                        results.push(row?);
+                let row_to_json = |row: &rusqlite::Row| -> rusqlite::Result<Value> {
+                    let id: String = row.get(0)?;
+                    let label: String = row.get(1)?;
+                    let props: String = row.get(2)?;
+                    let properties: Value = serde_json::from_str(&props).unwrap_or(json!({}));
+                    Ok(json!({"id": id, "label": label, "properties": properties}))
+                };
+                match (label.as_deref(), id_filter.as_deref()) {
+                    (Some(l), Some(id)) => {
+                        let mut stmt = conn.prepare(
+                            "SELECT id, label, properties FROM ag_node WHERE label = ?1 AND id = ?2",
+                        )?;
+                        for row in stmt.query_map(params![l, id], row_to_json)? {
+                            results.push(row?);
+                        }
                     }
-                } else {
-                    let mut stmt = conn.prepare("SELECT id, label, properties FROM ag_node")?;
-                    let rows = stmt.query_map([], |row| {
-                        let id: String = row.get(0)?;
-                        let label: String = row.get(1)?;
-                        let props: String = row.get(2)?;
-                        let properties: Value = serde_json::from_str(&props).unwrap_or(json!({}));
-                        Ok(json!({"id": id, "label": label, "properties": properties}))
-                    })?;
-                    for row in rows {
-                        results.push(row?);
+                    (Some(l), None) => {
+                        let mut stmt = conn.prepare(
+                            "SELECT id, label, properties FROM ag_node WHERE label = ?1",
+                        )?;
+                        for row in stmt.query_map(params![l], row_to_json)? {
+                            results.push(row?);
+                        }
+                    }
+                    (None, Some(id)) => {
+                        let mut stmt = conn
+                            .prepare("SELECT id, label, properties FROM ag_node WHERE id = ?1")?;
+                        for row in stmt.query_map(params![id], row_to_json)? {
+                            results.push(row?);
+                        }
+                    }
+                    (None, None) => {
+                        let mut stmt = conn.prepare("SELECT id, label, properties FROM ag_node")?;
+                        for row in stmt.query_map([], row_to_json)? {
+                            results.push(row?);
+                        }
                     }
                 }
                 Ok(json!(results))

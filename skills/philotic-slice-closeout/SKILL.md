@@ -40,8 +40,14 @@ Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the main job is findi
 6. Summarize the highest honest verification level.
    - If live validation depended on a supervised/installed runtime, confirm installed binary truth and process restart before calling anything `smoke-green` or `watched-live-green`.
 7. Record assumption-vs-reality gaps exposed by the slice.
-8. Commit and push one coherent slice per the commit convention in `AGENTS.md §6`.
-9. State the next seam.
+8. Write the Muninn memory delta for durable context only:
+   - decisions
+   - reality gaps
+   - validation outcomes
+   - next seams
+   - operator preferences
+9. Commit and push one coherent slice per the commit convention in `AGENTS.md §6`.
+10. State the next seam.
 
 ## Output Expectations
 
@@ -50,5 +56,6 @@ Report:
 - what is working
 - what remains intentionally incomplete
 - the verification level
+- the Muninn memory delta, or that no write was needed
 - the commit hash
 - the next seam

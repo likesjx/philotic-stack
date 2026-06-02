@@ -1,10 +1,12 @@
 use crate::controller::{
-    ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
+    BackoffStrategy, ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
     NativeLiveRegistry, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
 };
+use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::router_trace::{
     RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
 };
+use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
 use anyhow::Result;
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
@@ -79,7 +81,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     // Open the router training-tap trace store (always-on; path from env or default).
     let trace_store: Option<Arc<dyn RouterTraceStorage>> = {
         let path = std::env::var("PHILOTIC_ROUTER_TRACE_DB").unwrap_or_else(|_| {
-            let profile = std::env::var("PHILOTIC_PROFILE").unwrap_or_else(|_| "default".to_string());
+            let profile =
+                std::env::var("PHILOTIC_PROFILE").unwrap_or_else(|_| "default".to_string());
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             format!("{home}/.philotic/{profile}/router_traces.db")
         });
@@ -96,6 +99,22 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 None
             }
         }
+    };
+
+    // Open a read-write handle to the context graph for model profile observability.
+    // This is the same DB the hotel daemon owns; model-router opens a sidecar connection
+    // (SQLite WAL allows concurrent writers) to persist latency/error signals.
+    let graph_domain: Option<GraphDomain> = {
+        let path = std::env::var("PHILOTIC_GRAPH_DB_PATH").ok();
+        path.and_then(|p| {
+            SqliteGraphStorage::open(&p)
+                .map(|s| GraphDomain::new(Arc::new(s.adapter())))
+                .map_err(|e| {
+                    warn!("model-router: failed to open graph domain for model profiles: {e}");
+                    e
+                })
+                .ok()
+        })
     };
 
     info!(
@@ -140,6 +159,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             &reply,
                             None,
                             None,
+                            config.guest_id,
                             format!("Model controller could not interpret task: {}", err),
                         )
                         .await?;
@@ -155,6 +175,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             &reply,
                             Some(controller_task.kind.as_str()),
                             None,
+                            config.guest_id,
                             format!(
                                 "Model controller failed to refresh provider config: {}",
                                 err
@@ -184,6 +205,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 &reply,
                                 Some(controller_task.kind.as_str()),
                                 None,
+                                config.guest_id,
                                 format!("No native-live provider available for task: {}", err),
                             )
                             .await?;
@@ -277,25 +299,97 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 &reply,
                                 Some(controller_task.kind.as_str()),
                                 Some(provider.id()),
+                                config.guest_id,
                                 format!("Native-live provider invocation failed: {}", err),
                             )
                             .await?;
                         }
                     }
                 } else {
-                    let provider = match providers.resolve(&controller_task) {
+                    let primary_provider = match providers.resolve(&controller_task) {
                         Ok(provider) => provider,
                         Err(err) => {
-                            // This controller has no provider for this task kind. Skip silently —
-                            // another controller on the same role inbox may support it.
-                            info!(
-                                "Controller [{}] skipping {} task: {}",
+                            // No provider for this task kind. Emit an immediate failure so the
+                            // session is not left hanging waiting for a response that will never
+                            // come. If multiple controllers share the role inbox, the philote will
+                            // take the first successful response and ignore subsequent failures.
+                            warn!(
+                                "Controller [{}] has no provider for {} task — emitting failure: {}",
                                 config.guest_id,
                                 controller_task.kind.as_str(),
                                 err
                             );
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                None,
+                                config.guest_id,
+                                format!("no_provider: {}", err),
+                            )
+                            .await?;
                             continue;
                         }
+                    };
+
+                    // ── Model routing reflex ──────────────────────────────────
+                    // If the resolved provider's operational profile shows degraded
+                    // health, walk the full supporting-provider list and substitute
+                    // the first healthy alternative. Only applies when there is no
+                    // explicit provider_hint — hints are honoured unconditionally.
+                    let provider = if controller_task.provider_hint().is_none() {
+                        let primary_degraded = graph_domain
+                            .as_ref()
+                            .and_then(|gd| {
+                                gd.get_model_profile(primary_provider.id(), &local_node_id())
+                                    .ok()
+                                    .flatten()
+                            })
+                            .map(|p| p.status == "degraded")
+                            .unwrap_or(false);
+
+                        if primary_degraded {
+                            let candidates = providers.all_supporting(&controller_task);
+                            let healthy = candidates.into_iter().find(|p| {
+                                graph_domain
+                                    .as_ref()
+                                    .and_then(|gd| {
+                                        gd.get_model_profile(p.id(), &local_node_id())
+                                            .ok()
+                                            .flatten()
+                                    })
+                                    .map(|prof| prof.status != "degraded")
+                                    .unwrap_or(true) // unknown profile = assume healthy
+                            });
+
+                            if let Some(alt) = healthy {
+                                info!(
+                                    "Routing reflex: [{}] degraded, substituting [{}]",
+                                    primary_provider.id(),
+                                    alt.id()
+                                );
+                                emit_falling_back(
+                                    &mut ipc_client,
+                                    &reply,
+                                    primary_provider.id(),
+                                    alt.id(),
+                                )
+                                .await;
+                                alt
+                            } else {
+                                // All providers degraded — use primary, it may recover.
+                                warn!(
+                                    "Routing reflex: all providers degraded for {}; using primary [{}]",
+                                    controller_task.kind.as_str(),
+                                    primary_provider.id()
+                                );
+                                primary_provider
+                            }
+                        } else {
+                            primary_provider
+                        }
+                    } else {
+                        primary_provider
                     };
 
                     info!(
@@ -307,56 +401,134 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                     let provider_id = provider.id().to_string();
 
-                    // ── Streaming dispatch ────────────────────────────────────
-                    // When the provider supports streaming for this task, spawn a
-                    // background task that forwards tokens to philote via EmitTask.
-                    // The main await still receives the final ProviderOutput.
-                    let provider_result = if provider.supports_streaming(&controller_task) {
-                        let (token_tx, mut token_rx) =
-                            tokio::sync::mpsc::channel::<String>(128);
+                    // ── Dispatch with policy-driven retry ────────────────────
+                    // Each provider declares AttemptPolicy (per-attempt wall-clock cap)
+                    // and RetryPolicy (max attempts + backoff).  The runtime enforces the
+                    // outer timeout and drives the retry loop so providers don't need to
+                    // implement this themselves.
+                    //
+                    // Invariant: attempt_policy.total_secs × retry_policy.max_attempts < 120s
+                    // (philote WaitingModel watchdog), ensuring the controller always
+                    // resolves before the watchdog evicts the turn.
+                    let provider_result = {
+                        let retry = provider.retry_policy();
+                        let attempt_secs = provider.attempt_policy().total_secs;
+                        let mut last_err = anyhow::anyhow!("dispatch: no attempts completed");
+                        let mut result: Option<Result<ProviderOutput>> = None;
 
-                        // Connect the stream IPC client BEFORE starting the SSE fetch so
-                        // the forwarding task is ready to drain tokens the moment they
-                        // arrive.  If we connected lazily (inside the spawned task) there
-                        // is a race where invoke_streaming completes and drops token_tx
-                        // before the task finishes connecting — the channel closes and no
-                        // tokens are ever forwarded.
-                        let stream_identity = GuestIdentity {
-                            guest_id: format!("model-stream-{}", Ulid::new()),
-                            role: config.guest_id.to_string(),
-                            supported_tools: Vec::new(),
-                        };
-                        let stream_ipc_opt = PhiloticClient::connect(stream_identity).await.ok();
-                        let reply_clone = reply.clone();
-                        tokio::spawn(async move {
-                            let Some(mut stream_ipc) = stream_ipc_opt else {
-                                return;
-                            };
-                            while let Some(token) = token_rx.recv().await {
-                                if token.is_empty() {
-                                    continue;
-                                }
-                                let task_json = serde_json::to_string(&json!({
-                                    "action": "streaming_token",
-                                    "session_id": reply_clone.session_id,
-                                    "turn_id": reply_clone.turn_id,
-                                    "chat_id": reply_clone.chat_id,
-                                    "content": token,
-                                }))
-                                .unwrap_or_default();
-                                let _ = stream_ipc
-                                    .send_request(IpcRequest::EmitTask {
-                                        target_node: reply_clone.reply_to.clone(),
-                                        target_role: reply_clone.reply_role.clone(),
-                                        target_guest_id: None,
-                                        task_json,
-                                    })
+                        for attempt in 0u8..retry.max_attempts {
+                            if attempt > 0 {
+                                warn!(
+                                    "Provider [{}] retrying (attempt {}/{})",
+                                    provider.id(),
+                                    attempt + 1,
+                                    retry.max_attempts
+                                );
+                                emit_dispatch_status(&mut ipc_client, &reply, attempt, "retrying")
                                     .await;
+                                if let BackoffStrategy::Linear { step_ms } = retry.backoff {
+                                    tokio::time::sleep(Duration::from_millis(
+                                        step_ms * u64::from(attempt),
+                                    ))
+                                    .await;
+                                }
                             }
-                        });
-                        provider.invoke_streaming(&controller_task, token_tx).await
-                    } else {
-                        provider.invoke(&controller_task).await
+
+                            // Streaming path: spawn a forwarder task for this attempt.
+                            // Connect the stream IPC BEFORE starting the SSE fetch so the
+                            // forwarder is ready to drain tokens immediately on arrival.
+                            let attempt_result = if provider.supports_streaming(&controller_task) {
+                                let (token_tx, mut token_rx) =
+                                    tokio::sync::mpsc::channel::<String>(128);
+                                let stream_identity = GuestIdentity {
+                                    guest_id: format!("model-stream-{}", Ulid::new()),
+                                    role: config.guest_id.to_string(),
+                                    supported_tools: Vec::new(),
+                                };
+                                let stream_ipc_opt =
+                                    PhiloticClient::connect(stream_identity).await.ok();
+                                let reply_clone = reply.clone();
+                                tokio::spawn(async move {
+                                    let Some(mut stream_ipc) = stream_ipc_opt else {
+                                        return;
+                                    };
+                                    while let Some(token) = token_rx.recv().await {
+                                        if token.is_empty() {
+                                            continue;
+                                        }
+                                        let task_json = serde_json::to_string(&json!({
+                                            "action": "streaming_token",
+                                            "session_id": reply_clone.session_id,
+                                            "turn_id": reply_clone.turn_id,
+                                            "chat_id": reply_clone.chat_id,
+                                            "content": token,
+                                        }))
+                                        .unwrap_or_default();
+                                        let _ = stream_ipc
+                                            .send_request(IpcRequest::EmitTask {
+                                                target_node: reply_clone.reply_to.clone(),
+                                                target_role: reply_clone.reply_role.clone(),
+                                                target_guest_id: None,
+                                                task_json,
+                                            })
+                                            .await;
+                                    }
+                                });
+                                tokio::time::timeout(
+                                    Duration::from_secs(attempt_secs),
+                                    provider.invoke_streaming(&controller_task, token_tx),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!(
+                                        "streaming_timeout: attempt exceeded {}s budget",
+                                        attempt_secs
+                                    ))
+                                })
+                            } else {
+                                tokio::time::timeout(
+                                    Duration::from_secs(attempt_secs),
+                                    provider.invoke(&controller_task),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!(
+                                        "streaming_timeout: attempt exceeded {}s budget",
+                                        attempt_secs
+                                    ))
+                                })
+                            };
+
+                            match attempt_result {
+                                Ok(output) => {
+                                    result = Some(Ok(output));
+                                    break;
+                                }
+                                Err(e) => {
+                                    let classified = classify_provider_failure(
+                                        Some(task_kind.as_str()),
+                                        Some(provider.id()),
+                                        &e.to_string(),
+                                    );
+                                    let retryable = classified.retryable.unwrap_or(false);
+                                    let has_more = attempt + 1 < retry.max_attempts;
+                                    if retryable && has_more {
+                                        warn!(
+                                            "Provider [{}] attempt {} failed (retryable, will retry): {}",
+                                            provider.id(),
+                                            attempt + 1,
+                                            e
+                                        );
+                                        last_err = e;
+                                    } else {
+                                        result = Some(Err(e));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        result.unwrap_or(Err(last_err))
                     };
 
                     match provider_result {
@@ -400,13 +572,30 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 model_id,
                                 None,
                             );
+                            if let Some(ref gd) = graph_domain {
+                                if let Err(e) = gd.observe_model_outcome(
+                                    &provider_id,
+                                    &local_node_id(),
+                                    latency_ms,
+                                    true,
+                                ) {
+                                    warn!("observe_model_outcome (success): {e}");
+                                }
+                            }
 
                             // ── Transcription flywheel fan-out ────────────────
                             // After a successful AudioTranscribe, fire a capture
                             // envelope to role=router-listener (if enabled).
                             if controller_task.kind == TaskKind::AudioTranscribe {
-                                if let ProviderOutput::Text { ref content, ref model_gen, .. } = output {
-                                    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref() == Ok("true") {
+                                if let ProviderOutput::Text {
+                                    ref content,
+                                    ref model_gen,
+                                    ..
+                                } = output
+                                {
+                                    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref()
+                                        == Ok("true")
+                                    {
                                         let blob_url = controller_task
                                             .media_attachments()
                                             .first()
@@ -433,7 +622,9 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                             supported_tools: Vec::new(),
                                         };
                                         tokio::spawn(async move {
-                                            if let Ok(mut fanout_ipc) = PhiloticClient::connect(fanout_identity).await {
+                                            if let Ok(mut fanout_ipc) =
+                                                PhiloticClient::connect(fanout_identity).await
+                                            {
                                                 let _ = fanout_ipc
                                                     .send_request(IpcRequest::EmitTask {
                                                         target_node: local_node_id(),
@@ -474,12 +665,23 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 None,
                                 None,
                             );
+                            if let Some(ref gd) = graph_domain {
+                                if let Err(e) = gd.observe_model_outcome(
+                                    &provider_id,
+                                    &local_node_id(),
+                                    latency_ms,
+                                    false,
+                                ) {
+                                    warn!("observe_model_outcome (failure): {e}");
+                                }
+                            }
                             error!("Provider invocation failed: {}", err);
                             emit_failure(
                                 &mut ipc_client,
                                 &reply,
                                 Some(controller_task.kind.as_str()),
                                 Some(provider.id()),
+                                config.guest_id,
                                 format!("Provider invocation failed: {}", err),
                             )
                             .await?;
@@ -792,6 +994,7 @@ async fn emit_failure(
     reply: &ReplyRoute,
     capability: Option<&str>,
     provider: Option<&str>,
+    guest_id: &str,
     message: String,
 ) -> Result<()> {
     let error_payload = classify_provider_failure(capability, provider, &message);
@@ -799,6 +1002,19 @@ async fn emit_failure(
         "Emitting model failure capability={:?} provider={:?}: {}",
         capability, provider, message
     );
+    let raw_text = format!(
+        "[{}][{}] {}: {}",
+        guest_id,
+        capability.unwrap_or("unknown"),
+        provider.unwrap_or("unknown"),
+        message
+    );
+    let _ = ipc_client
+        .send_request(IpcRequest::PushHealEntry {
+            guest_id: guest_id.to_string(),
+            raw_text,
+        })
+        .await;
     let reply_req = IpcRequest::EmitTask {
         target_node: reply.reply_to.clone(),
         target_role: reply.reply_role.clone(),
@@ -827,6 +1043,65 @@ async fn emit_failure(
 
     ipc_client.send_request(reply_req).await?;
     Ok(())
+}
+
+/// Emit a model_dispatch_status event to philote when the routing reflex
+/// substitutes a degraded provider with a healthy fallback.
+async fn emit_falling_back(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    from: &str,
+    to: &str,
+) {
+    let label = format!("_(switching model: {from} \u{2192} {to})_");
+    let task_json = json!({
+        "action": "model_dispatch_status",
+        "content": label,
+        "session_id": reply.session_id,
+        "turn_id": reply.turn_id,
+        "chat_id": reply.chat_id,
+    })
+    .to_string();
+    let _ = ipc_client
+        .send_request(IpcRequest::EmitTask {
+            target_node: reply.reply_to.clone(),
+            target_role: reply.reply_role.clone(),
+            target_guest_id: None,
+            task_json,
+        })
+        .await;
+}
+
+/// Emit a dispatch status event to philote so it can surface transient state
+/// (e.g. "(retrying...)" in the Telegram draft) without a full model_response.
+/// The human-readable label is formatted here and carried in `content` so philote
+/// can forward it without parsing additional fields.
+async fn emit_dispatch_status(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    attempt: u8,
+    kind: &str,
+) {
+    let label = match kind {
+        "retrying" => format!("_(retrying\u{2026} attempt {})_", attempt + 1),
+        other => format!("_({other})_"),
+    };
+    let task_json = json!({
+        "action": "model_dispatch_status",
+        "content": label,
+        "session_id": reply.session_id,
+        "turn_id": reply.turn_id,
+        "chat_id": reply.chat_id,
+    })
+    .to_string();
+    let _ = ipc_client
+        .send_request(IpcRequest::EmitTask {
+            target_node: reply.reply_to.clone(),
+            target_role: reply.reply_role.clone(),
+            target_guest_id: None,
+            task_json,
+        })
+        .await;
 }
 
 fn classify_provider_failure(
@@ -877,6 +1152,19 @@ fn classify_provider_failure(
     // Rate limit (HTTP 429).
     if message.contains("429") || message.contains("rate limit") || message.contains("quota") {
         payload.sub_kind = Some("rate_limit".into());
+        payload.retryable = Some(true);
+        return payload;
+    }
+
+    // Auth/key errors (4xx) — the provider is broken for this tier; escalate.
+    if message.contains("401")
+        || message.contains("403")
+        || message.contains("API key not valid")
+        || message.contains("API key")
+        || message.contains("Unauthorized")
+        || message.contains("Unauthenticated")
+    {
+        payload.sub_kind = Some("provider_error".into());
         payload.retryable = Some(true);
         return payload;
     }

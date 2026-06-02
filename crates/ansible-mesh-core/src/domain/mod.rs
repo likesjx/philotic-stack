@@ -16,18 +16,20 @@
 use crate::cron::CronJob;
 use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
-    RoleIncarnationRecord, RoleReadinessState, RoutingPolicyEvaluationRecord, RoutingPolicyRecord,
-    RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
+    MembraneTransportHomeRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
+    RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, ToolsetProfileRecord,
+    WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
-    SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
-    UserProfile, VaultRegistryEntry, CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT,
-    CONFIG_VAULT_REGISTRY,
+    ProjectedUserIdentityRecord, SecretRecord, SessionEventRecord, SessionParticipantRecord,
+    SessionRecord, SessionTurnRecord, UserProfile, VaultRegistryEntry,
+    CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT, CONFIG_VAULT_REGISTRY,
 };
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use tracing::warn;
 
 mod kinds;
 pub use kinds::*;
@@ -598,11 +600,14 @@ impl GraphDomain {
         let mut out: Vec<SessionTurnRecord> = Vec::new();
         for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_TURN)? {
             if node.node_key.starts_with(&prefix) {
-                out.push(
-                    serde_json::from_value(node.data).context(
-                        "GraphDomain::list_session_turns: deserialize SessionTurnRecord",
-                    )?,
-                );
+                match serde_json::from_value::<SessionTurnRecord>(node.data) {
+                    Ok(record) => out.push(record),
+                    Err(e) => warn!(
+                        node_key = %node.node_key,
+                        error = %e,
+                        "list_session_turns: skipping malformed record"
+                    ),
+                }
             }
         }
         if limit > 0 && out.len() > limit {
@@ -768,6 +773,88 @@ impl GraphDomain {
         Ok(None)
     }
 
+    // ── Membrane transport home methods ──────────────────────────────────────
+
+    fn membrane_transport_home_key(agent_id: &str, transport: &str, resource_ref: &str) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            NODE_KIND_MEMBRANE_TRANSPORT_HOME, agent_id, transport, resource_ref
+        )
+    }
+
+    pub fn upsert_membrane_transport_home(&self, home: &MembraneTransportHomeRecord) -> Result<()> {
+        let data = serde_json::to_value(home).context(
+            "GraphDomain::upsert_membrane_transport_home: serialize MembraneTransportHomeRecord",
+        )?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::membrane_transport_home_key(
+                &home.agent_id,
+                &home.transport,
+                &home.resource_ref,
+            ),
+            kind: NODE_KIND_MEMBRANE_TRANSPORT_HOME.to_string(),
+            label: Some(format!(
+                "{}:{}:{}",
+                home.agent_id, home.transport, home.resource_ref
+            )),
+            data,
+        })
+    }
+
+    pub fn get_membrane_transport_home(
+        &self,
+        agent_id: &str,
+        transport: &str,
+        resource_ref: &str,
+    ) -> Result<Option<MembraneTransportHomeRecord>> {
+        match self.adapter.get_node(&Self::membrane_transport_home_key(
+            agent_id,
+            transport,
+            resource_ref,
+        ))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_membrane_transport_home: deserialize MembraneTransportHomeRecord",
+            )?)),
+        }
+    }
+
+    pub fn list_membrane_transport_homes(
+        &self,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<MembraneTransportHomeRecord>> {
+        let prefix =
+            agent_id.map(|agent_id| format!("{}:{}:", NODE_KIND_MEMBRANE_TRANSPORT_HOME, agent_id));
+        let mut out = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_MEMBRANE_TRANSPORT_HOME)?
+        {
+            if prefix
+                .as_ref()
+                .is_none_or(|prefix| node.node_key.starts_with(prefix))
+            {
+                out.push(serde_json::from_value(node.data).context(
+                    "GraphDomain::list_membrane_transport_homes: deserialize MembraneTransportHomeRecord",
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve explicit graph-owned placement for a membrane transport.
+    ///
+    /// Missing records intentionally resolve to `None`; callers that still have
+    /// transitional config fallbacks must name that fallback at their boundary.
+    pub fn resolve_membrane_transport_home(
+        &self,
+        agent_id: &str,
+        transport: &str,
+        resource_ref: &str,
+    ) -> Result<Option<MembraneTransportHomeRecord>> {
+        self.get_membrane_transport_home(agent_id, transport, resource_ref)
+    }
+
     // ── Secret methods ────────────────────────────────────────────────────────
 
     fn secret_key(secret_ref: &str) -> String {
@@ -825,14 +912,20 @@ impl GraphDomain {
     }
 
     pub fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>> {
-        self.adapter
-            .list_nodes_by_kind(NODE_KIND_ABSTRACT_SKILL)?
-            .into_iter()
-            .map(|n| {
-                serde_json::from_value(n.data)
-                    .context("GraphDomain::list_abstract_skills: deserialize AbstractSkillRecord")
-            })
-            .collect()
+        let mut skills = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_ABSTRACT_SKILL)? {
+            match serde_json::from_value::<AbstractSkillRecord>(node.data.clone()) {
+                Ok(skill) => skills.push(skill),
+                Err(err) => {
+                    warn!(
+                        node_key = %node.node_key,
+                        "Skipping incompatible abstract_skill record during list_abstract_skills: {}",
+                        err
+                    );
+                }
+            }
+        }
+        Ok(skills)
     }
 
     // ── Workflow skill methods ────────────────────────────────────────────────
@@ -921,6 +1014,10 @@ impl GraphDomain {
         format!("{}:{}", NODE_KIND_USER_PROFILE, hotel_name)
     }
 
+    fn projected_user_identity_key(principal_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_PROJECTED_USER_IDENTITY, principal_id)
+    }
+
     pub fn upsert_user_profile(&self, hotel_name: &str, profile: &UserProfile) -> Result<()> {
         let data = serde_json::to_value(profile)
             .context("GraphDomain::upsert_user_profile: serialize UserProfile")?;
@@ -940,6 +1037,64 @@ impl GraphDomain {
                     .context("GraphDomain::get_user_profile: deserialize UserProfile")
             })
             .transpose()
+    }
+
+    pub fn upsert_projected_user_identity(
+        &self,
+        identity: &ProjectedUserIdentityRecord,
+    ) -> Result<()> {
+        let data = serde_json::to_value(identity).context(
+            "GraphDomain::upsert_projected_user_identity: serialize ProjectedUserIdentityRecord",
+        )?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::projected_user_identity_key(&identity.principal_id),
+            kind: NODE_KIND_PROJECTED_USER_IDENTITY.to_string(),
+            label: Some(identity.display_name.clone()),
+            data,
+        })
+    }
+
+    pub fn get_projected_user_identity(
+        &self,
+        principal_id: &str,
+    ) -> Result<Option<ProjectedUserIdentityRecord>> {
+        self.adapter
+            .get_node(&Self::projected_user_identity_key(principal_id))?
+            .map(|n| {
+                serde_json::from_value(n.data).context(
+                    "GraphDomain::get_projected_user_identity: deserialize ProjectedUserIdentityRecord",
+                )
+            })
+            .transpose()
+    }
+
+    pub fn list_projected_user_identities(&self) -> Result<Vec<ProjectedUserIdentityRecord>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_PROJECTED_USER_IDENTITY)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data).context(
+                    "GraphDomain::list_projected_user_identities: deserialize ProjectedUserIdentityRecord",
+                )
+            })
+            .collect()
+    }
+
+    pub fn find_projected_user_identity_for_local_user(
+        &self,
+        local_user_id: &str,
+    ) -> Result<Option<ProjectedUserIdentityRecord>> {
+        let mut matches = self
+            .list_projected_user_identities()?
+            .into_iter()
+            .filter(|identity| identity.local_user_id == local_user_id);
+        let Some(first) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        Ok(Some(first))
     }
 
     // ── Node capabilities ─────────────────────────────────────────────────────
@@ -1232,6 +1387,130 @@ impl GraphDomain {
             out.push(node.data);
         }
         Ok(out)
+    }
+}
+
+// ── Model profile ─────────────────────────────────────────────────────────────
+
+impl GraphDomain {
+    fn model_profile_key(model_ref: &str, node_id: &str) -> String {
+        format!("{}:{}:{}", NODE_KIND_MODEL_PROFILE, model_ref, node_id)
+    }
+
+    /// Upsert a model provider's operational profile.
+    pub fn upsert_model_profile(&self, profile: &ModelProfileRecord) -> Result<()> {
+        let data = serde_json::to_value(profile)
+            .context("GraphDomain::upsert_model_profile: serialize")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::model_profile_key(&profile.model_ref, &profile.node_id),
+            kind: NODE_KIND_MODEL_PROFILE.to_string(),
+            label: Some(format!("{}@{}", profile.model_ref, profile.node_id)),
+            data,
+        })
+    }
+
+    pub fn get_model_profile(
+        &self,
+        model_ref: &str,
+        node_id: &str,
+    ) -> Result<Option<ModelProfileRecord>> {
+        let key = Self::model_profile_key(model_ref, node_id);
+        match self.adapter.get_node(&key)? {
+            Some(node) => Ok(Some(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::get_model_profile: deserialize")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_model_profiles(&self) -> Result<Vec<ModelProfileRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_MODEL_PROFILE)? {
+            out.push(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::list_model_profiles: deserialize")?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Record the outcome of a single dispatch attempt, updating the profile's
+    /// latency_p50_ms (EMA α=0.25) and error_rate (EMA α=0.1).
+    pub fn observe_model_outcome(
+        &self,
+        model_ref: &str,
+        node_id: &str,
+        latency_ms: u64,
+        success: bool,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut profile = self
+            .get_model_profile(model_ref, node_id)?
+            .unwrap_or_else(|| ModelProfileRecord {
+                model_ref: model_ref.to_string(),
+                node_id: node_id.to_string(),
+                provider: model_ref.to_string(),
+                task_kinds: Vec::new(),
+                trust_tier: String::new(),
+                max_context_tokens: 0,
+                latency_p50_ms: latency_ms,
+                error_rate: 0.0,
+                status: "healthy".to_string(),
+                last_healthy_secs: 0,
+                updated_secs: now,
+            });
+
+        // Exponential moving averages
+        const LATENCY_ALPHA: f64 = 0.25;
+        const ERROR_ALPHA: f32 = 0.1;
+        profile.latency_p50_ms = ((1.0 - LATENCY_ALPHA) * profile.latency_p50_ms as f64
+            + LATENCY_ALPHA * latency_ms as f64) as u64;
+        let outcome = if success { 0.0f32 } else { 1.0f32 };
+        profile.error_rate = (1.0 - ERROR_ALPHA) * profile.error_rate + ERROR_ALPHA * outcome;
+
+        if success {
+            profile.last_healthy_secs = now;
+        }
+        profile.status = if profile.error_rate > 0.5 {
+            "degraded".to_string()
+        } else {
+            "healthy".to_string()
+        };
+        profile.updated_secs = now;
+
+        self.upsert_model_profile(&profile)
+    }
+
+    /// Return model profiles for `task_kind` on `node_id`, sorted by health then latency.
+    /// Degraded or unavailable models are included but sorted last.
+    pub fn best_model_for(
+        &self,
+        task_kind: &str,
+        node_id: &str,
+    ) -> Result<Vec<ModelProfileRecord>> {
+        let mut profiles: Vec<ModelProfileRecord> = self
+            .list_model_profiles()?
+            .into_iter()
+            .filter(|p| p.node_id == node_id)
+            .filter(|p| p.task_kinds.is_empty() || p.task_kinds.iter().any(|t| t == task_kind))
+            .collect();
+
+        profiles.sort_by(|a, b| {
+            let a_degraded = a.status != "healthy";
+            let b_degraded = b.status != "healthy";
+            match (a_degraded, b_degraded) {
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => a.latency_p50_ms.cmp(&b.latency_p50_ms),
+            }
+        });
+
+        Ok(profiles)
     }
 }
 
@@ -1611,6 +1890,103 @@ mod tests {
         assert_eq!(by_guest.len(), 1);
     }
 
+    #[test]
+    fn membrane_transport_home_roundtrip_list_and_resolve() {
+        let d = make_domain();
+        let home = MembraneTransportHomeRecord {
+            agent_id: "agent-beacon".to_string(),
+            transport: "telegram".to_string(),
+            resource_ref: "telegram_bot_token_beacon".to_string(),
+            active_home_hotel: "vps-jane".to_string(),
+            standby_hotels: vec!["mbp-jane".to_string(), "mac-jane".to_string()],
+            managed_by_role: "orchestrator".to_string(),
+            lease_type: "telegram_poll".to_string(),
+            failover_policy: "manual-or-explicit-delegation".to_string(),
+            status: crate::graph::MembraneTransportHomeStatus::Active,
+        };
+
+        d.upsert_membrane_transport_home(&home).unwrap();
+
+        let loaded = d
+            .get_membrane_transport_home("agent-beacon", "telegram", "telegram_bot_token_beacon")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.active_home_hotel, "vps-jane");
+        assert!(loaded.is_active_home("vps-jane"));
+        assert!(loaded.is_standby_home("mbp-jane"));
+        assert!(!loaded.is_active_home("mbp-jane"));
+
+        let resolved = d
+            .resolve_membrane_transport_home(
+                "agent-beacon",
+                "telegram",
+                "telegram_bot_token_beacon",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, home);
+
+        assert_eq!(d.list_membrane_transport_homes(None).unwrap().len(), 1);
+        assert_eq!(
+            d.list_membrane_transport_homes(Some("agent-beacon"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(d
+            .list_membrane_transport_homes(Some("agent-bjork"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn membrane_transport_home_is_distinct_from_role_home() {
+        use crate::graph::TurnLoopConfig;
+        let d = make_domain();
+        d.upsert_role_incarnation(&RoleIncarnationRecord {
+            agent_id: "agent-beacon".to_string(),
+            role_name: "orchestrator".to_string(),
+            guest_id: "guest-orchestrator".to_string(),
+            toolset_profile: "default".to_string(),
+            role_identity_addendum: None,
+            role_manifest: None,
+            is_admin: true,
+            readiness_state: RoleReadinessState::Configured,
+            inactive_ttl_seconds: None,
+            turn_loop_config: TurnLoopConfig::default(),
+            home_node: Some("mac-jane".to_string()),
+        })
+        .unwrap();
+        d.upsert_membrane_transport_home(&MembraneTransportHomeRecord {
+            agent_id: "agent-beacon".to_string(),
+            transport: "telegram".to_string(),
+            resource_ref: "telegram_bot_token_beacon".to_string(),
+            active_home_hotel: "vps-jane".to_string(),
+            standby_hotels: vec!["mac-jane".to_string()],
+            managed_by_role: "orchestrator".to_string(),
+            lease_type: "telegram_poll".to_string(),
+            failover_policy: "manual-or-explicit-delegation".to_string(),
+            status: crate::graph::MembraneTransportHomeStatus::Active,
+        })
+        .unwrap();
+
+        let role = d
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .unwrap()
+            .unwrap();
+        let transport_home = d
+            .resolve_membrane_transport_home(
+                "agent-beacon",
+                "telegram",
+                "telegram_bot_token_beacon",
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(role.home_node.as_deref(), Some("mac-jane"));
+        assert_eq!(transport_home.active_home_hotel, "vps-jane");
+    }
+
     // ── Secret ────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1876,6 +2252,56 @@ mod tests {
     }
 
     #[test]
+    fn projected_user_identity_round_trip() {
+        let d = make_domain();
+        let identity = ProjectedUserIdentityRecord {
+            principal_id: "user:google:subject-123".into(),
+            local_user_id: "root-user:mac-jane".into(),
+            home_hotel: "mac-jane".into(),
+            display_name: "Jared Likes".into(),
+            preferred_name: Some("Jared".into()),
+            primary_email: Some("jared@example.com".into()),
+            linked_identities: vec![crate::storage::ProjectedExternalIdentityRecord {
+                provider: "google".into(),
+                provider_subject: "subject-123".into(),
+                email: Some("jared@example.com".into()),
+                login: None,
+                display_name: Some("Jared Likes".into()),
+                verified_at: 123,
+                last_seen_at: 456,
+            }],
+            updated_at: 789,
+        };
+        d.upsert_projected_user_identity(&identity).unwrap();
+        let loaded = d
+            .get_projected_user_identity("user:google:subject-123")
+            .unwrap()
+            .expect("stored projected user identity");
+        assert_eq!(loaded, identity);
+    }
+
+    #[test]
+    fn find_projected_user_identity_for_local_user_returns_unique_match() {
+        let d = make_domain();
+        let identity = ProjectedUserIdentityRecord {
+            principal_id: "user:google:subject-123".into(),
+            local_user_id: "root-user:mac-jane".into(),
+            home_hotel: "mac-jane".into(),
+            display_name: "Jared Likes".into(),
+            preferred_name: Some("Jared".into()),
+            primary_email: Some("jared@example.com".into()),
+            linked_identities: Vec::new(),
+            updated_at: 789,
+        };
+        d.upsert_projected_user_identity(&identity).unwrap();
+        let loaded = d
+            .find_projected_user_identity_for_local_user("root-user:mac-jane")
+            .unwrap()
+            .expect("stored projected user identity");
+        assert_eq!(loaded.principal_id, "user:google:subject-123");
+    }
+
+    #[test]
     fn user_task_round_trip_create_and_get() {
         let d = make_domain();
         let task_id = "task-001";
@@ -1957,9 +2383,12 @@ mod tests {
                 "approval_note": null,
             })
         };
-        d.upsert_user_task(make_task("t1", "session-A"), "t1").unwrap();
-        d.upsert_user_task(make_task("t2", "session-B"), "t2").unwrap();
-        d.upsert_user_task(make_task("t3", "session-A"), "t3").unwrap();
+        d.upsert_user_task(make_task("t1", "session-A"), "t1")
+            .unwrap();
+        d.upsert_user_task(make_task("t2", "session-B"), "t2")
+            .unwrap();
+        d.upsert_user_task(make_task("t3", "session-A"), "t3")
+            .unwrap();
 
         let all = d.list_user_tasks(None, None).unwrap();
         assert_eq!(all.len(), 3);

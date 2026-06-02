@@ -8,7 +8,7 @@
       - curl
     state: present
     update_cache: yes
-  when: ansible_os_family == 'Debian'
+  when: ansible_facts["os_family"] == 'Debian'
 
 # ── Service user ───────────────────────────────────────────────────────────────
 
@@ -64,15 +64,17 @@
     group: "{{ philotic_group }}"
     mode: "0755"
   loop: "{{ philotic_binaries }}"
-  when: not philotic_artifacts_remote
+  when: not (philotic_artifacts_remote | bool)
   notify: Restart philotic-hotel
+  tags: [binary]
 
 - name: Check which remote Philotic binaries are available on host
   stat:
     path: "{{ philotic_artifacts_dir }}/{{ item }}"
   loop: "{{ philotic_binaries }}"
   register: philotic_remote_artifact_stats
-  when: philotic_artifacts_remote
+  when: philotic_artifacts_remote | bool
+  tags: [binary]
 
 - name: Warn about missing remote Philotic binaries
   debug:
@@ -81,8 +83,9 @@
       is not present on the target host.
   loop: "{{ philotic_remote_artifact_stats.results }}"
   when:
-    - philotic_artifacts_remote
+    - philotic_artifacts_remote | bool
     - not item.stat.exists
+  tags: [binary]
 
 - name: Install Philotic binaries (already built on host)
   copy:
@@ -99,8 +102,9 @@
       | map(attribute='item')
       | list
     }}
-  when: philotic_artifacts_remote
+  when: philotic_artifacts_remote | bool
   notify: Restart philotic-hotel
+  tags: [binary]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -111,6 +115,7 @@
     owner: "{{ philotic_user }}"
     group: "{{ philotic_group }}"
     mode: "0600"
+  no_log: true
   notify: Restart philotic-hotel
 
 # ── Agent workspace access ─────────────────────────────────────────────────────
@@ -124,6 +129,7 @@
     mode: "o+rX"
   loop: "{{ philotic_agents | dict2items }}"
   when: item.value.import_workspace is defined
+  no_log: true
   ignore_errors: yes
 
 # ── Tailscale (transitional peer networking) ───────────────────────────────────
@@ -131,6 +137,12 @@
 - name: Check if Tailscale is installed
   command: which tailscale
   register: tailscale_check
+  failed_when: false
+  changed_when: false
+
+- name: Check if UFW is installed
+  command: which ufw
+  register: ufw_check
   failed_when: false
   changed_when: false
 
@@ -149,7 +161,9 @@
     rule: allow
     port: "{{ philotic_beacon_port }}"
     proto: udp
-  when: ansible_os_family == 'Debian'
+  when:
+    - ansible_facts["os_family"] == 'Debian'
+    - ufw_check.rc == 0
   ignore_errors: yes
 
 - name: Allow blob HTTP port (TCP, Tailscale-only — restrict if needed)
@@ -158,7 +172,9 @@
     port: "{{ philotic_blob_port }}"
     proto: tcp
     src: "100.64.0.0/10"  # Tailscale CGNAT range (transitional)
-  when: ansible_os_family == 'Debian'
+  when:
+    - ansible_facts["os_family"] == 'Debian'
+    - ufw_check.rc == 0
   ignore_errors: yes
 
 # ── Secrets ────────────────────────────────────────────────────────────────────
@@ -170,7 +186,62 @@
     owner: "{{ philotic_user }}"
     group: "{{ philotic_group }}"
     mode: "0600"
+  no_log: true
   notify: Restart philotic-hotel
+
+- name: Seed hotel graph/config from mesh-config.json
+  command:
+    argv:
+      - runuser
+      - -u
+      - "{{ philotic_user }}"
+      - --
+      - sh
+      - -lc
+      - "cd {{ philotic_data_dir | quote }} && {{ philotic_bin_dir | quote }}/aiua load --file {{ philotic_etc_dir | quote }}/mesh-config.json --hotel {{ philotic_hotel_runtime_name | quote }}"
+  environment:
+    PHILOTIC_BIN_DIR: "{{ philotic_bin_dir }}"
+    PHILOTIC_HOTEL_SOCKET: "{{ philotic_hotel_socket }}"
+    PHILOTIC_GRAPH_DATABASE_DIR: "{{ philotic_data_dir }}/graphs"
+    PHILOTIC_TABLE_DB: "{{ philotic_data_dir }}/tables"
+    PHILOTIC_ENABLE_RUST_AUTH: "{{ philotic_enable_rust_auth }}"
+    PHILOTIC_ENABLE_RUST_DISPATCHER: "{{ philotic_enable_rust_dispatcher }}"
+    PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE: "{{ philotic_enable_rust_task_lifecycle }}"
+  changed_when: false
+
+- name: Remove stale records for previous hotel identities
+  shell: |
+    set -e
+    sqlite3 {{ (philotic_data_dir ~ '/aiua_context.db') | quote }} <<'SQL'
+    DELETE FROM graph_edges
+      WHERE src_node_key = 'hotel:{{ item }}'
+         OR dst_node_key = 'hotel:{{ item }}'
+         OR src_node_key LIKE 'guest:{{ item }}:%'
+         OR dst_node_key LIKE 'guest:{{ item }}:%'
+         OR src_node_key LIKE 'config:%:{{ item }}'
+         OR dst_node_key LIKE 'config:%:{{ item }}';
+    DELETE FROM graph_nodes
+      WHERE node_key = 'hotel:{{ item }}'
+         OR node_key LIKE 'guest:{{ item }}:%'
+         OR node_key LIKE 'config:%:{{ item }}'
+         OR (kind = 'secret' AND data_json LIKE '%"scope":"hotel:{{ item }}"%')
+         OR (kind = 'config' AND data_json LIKE '%"hotel_name":"{{ item }}"%');
+    DELETE FROM materialized_guests
+      WHERE hotel_name = '{{ item }}'
+         OR guest_id LIKE '{{ item }}:%';
+    DELETE FROM hotels
+      WHERE hotel_name = '{{ item }}';
+    DELETE FROM vault_secrets
+      WHERE scope = 'hotel:{{ item }}';
+    DELETE FROM mesh_events
+      WHERE source_node_id = '{{ item }}-aiua-01'
+         OR target_node_id = '{{ item }}-aiua-01';
+    SQL
+  args:
+    executable: /bin/bash
+  loop: "{{ philotic_hotel_previous_names }}"
+  when: philotic_hotel_previous_names | length > 0
+  changed_when: false
 
 # ── systemd service ────────────────────────────────────────────────────────────
 
@@ -233,6 +304,7 @@
     port: "{{ philotic_onnx_sidecar_port }}"
     proto: tcp
   when:
-    - ansible_os_family == "Debian"
+    - ansible_facts["os_family"] == "Debian"
     - philotic_onnx_sidecar_enabled
+    - ufw_check.rc == 0
   ignore_errors: yes

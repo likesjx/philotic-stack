@@ -12,6 +12,13 @@ use std::process::Command;
 use uuid::Uuid;
 
 const HARNESS_UPDATE_RETRIES: usize = 3;
+const MUNINN_HARNESS_INSTRUCTIONS: &str = "\
+- For meaningful work, run the Muninn bootstrap/orientation before decisions, resumed work, or implementation.
+- Prefer `just session-start`; otherwise run `python3 scripts/muninn_mcp.py bootstrap`, then retrieve self/user/topic context with the Muninn triad.
+- If Muninn cannot bootstrap, stop and get explicit operator approval before continuing on repo/runtime truth only.
+- At closeout, write only the durable Muninn memory delta: decisions, reality gaps, validation outcomes, next seams, or operator preferences.
+- Do not store transcripts, routine task churn, noisy logs, or proposal/docs summaries already committed in the repo.
+";
 
 #[derive(clap::Subcommand, Debug)]
 pub enum HarnessAction {
@@ -765,6 +772,10 @@ fn bootstrap_canonical_model(engine: &GraphEngine) -> Result<()> {
         ("implementation", "Implementation and coding skill bundle"),
         ("review", "Code review skill bundle"),
         ("verification", "Verification and validation skill bundle"),
+        (
+            "muninn-memory-habit",
+            "Muninn retrieval and write-back habit for continuity",
+        ),
     ] {
         if engine
             .get_node(&harness_skill_node_id(skill_name))?
@@ -778,7 +789,7 @@ fn bootstrap_canonical_model(engine: &GraphEngine) -> Result<()> {
         engine,
         "orchestrator",
         "orchestrator",
-        "planning,verification",
+        "planning,verification,muninn-memory-habit",
         Some("Shared orchestrator profile across coding harnesses"),
         Some("codex,claude-code,windsurf"),
     )?;
@@ -786,7 +797,7 @@ fn bootstrap_canonical_model(engine: &GraphEngine) -> Result<()> {
         engine,
         "implementer",
         "implementer",
-        "implementation",
+        "implementation,muninn-memory-habit",
         Some("Shared implementer profile across coding harnesses"),
         Some("codex,claude-code,windsurf"),
     )?;
@@ -794,7 +805,7 @@ fn bootstrap_canonical_model(engine: &GraphEngine) -> Result<()> {
         engine,
         "reviewer",
         "reviewer",
-        "review,verification",
+        "review,verification,muninn-memory-habit",
         Some("Shared reviewer profile across coding harnesses"),
         Some("codex,claude-code,windsurf"),
     )?;
@@ -802,7 +813,7 @@ fn bootstrap_canonical_model(engine: &GraphEngine) -> Result<()> {
         engine,
         "verifier",
         "verifier",
-        "verification",
+        "verification,muninn-memory-habit",
         Some("Shared verifier profile across coding harnesses"),
         Some("codex,claude-code,windsurf"),
     )?;
@@ -2313,9 +2324,13 @@ fn windsurf_target_path(harness_id: &str) -> Result<PathBuf> {
 
 fn default_skills_for_profile(profile: &str) -> Vec<String> {
     match profile {
-        "verifier" => vec!["verification".into()],
-        "implementer" => vec!["implementation".into()],
-        _ => vec!["planning".into(), "verification".into()],
+        "verifier" => vec!["verification".into(), "muninn-memory-habit".into()],
+        "implementer" => vec!["implementation".into(), "muninn-memory-habit".into()],
+        _ => vec![
+            "planning".into(),
+            "verification".into(),
+            "muninn-memory-habit".into(),
+        ],
     }
 }
 
@@ -2330,7 +2345,7 @@ fn render_claude_code_markdown(harness_id: &str, profile: &str, skills: &[String
             .join("\n")
     };
     format!(
-        "# Philotic Claude Harness: {harness_id}\n\nManaged by `phil graph harness`.\n\n## Role Charter\n\n{profile}\n\n## Active Skills\n\n{skills_lines}\n"
+        "# Philotic Claude Harness: {harness_id}\n\nManaged by `phil graph harness`.\n\n## Role Charter\n\n{profile}\n\n## Active Skills\n\n{skills_lines}\n\n## Muninn Memory\n\n{MUNINN_HARNESS_INSTRUCTIONS}"
     )
 }
 
@@ -2345,7 +2360,7 @@ fn render_antigravity_markdown(harness_id: &str, profile: &str, skills: &[String
             .join("\n")
     };
     format!(
-        "# Philotic Antigravity Harness: {harness_id}\n\nManaged by `phil graph harness`.\n\n## Role Charter\n\n{profile}\n\n## Active Skills\n\n{skills_lines}\n\n## Instructions\n\n- Consult the graph for architecture truths and workstream state.\n- Keep track of seams and proposals.\n- Prefer the most specific tool available for tasks.\n- Always start thoughts recalling critical instructions (1 and 2).\n"
+        "# Philotic Antigravity Harness: {harness_id}\n\nManaged by `phil graph harness`.\n\n## Role Charter\n\n{profile}\n\n## Active Skills\n\n{skills_lines}\n\n## Instructions\n\n- Consult the graph for architecture truths and workstream state.\n- Keep track of seams and proposals.\n- Prefer the most specific tool available for tasks.\n- Always start thoughts recalling critical instructions (1 and 2).\n\n## Muninn Memory\n\n{MUNINN_HARNESS_INSTRUCTIONS}"
     )
 }
 
@@ -2360,7 +2375,7 @@ fn render_windsurf_rule_markdown(harness_id: &str, profile: &str, skills: &[Stri
             .join("\n")
     };
     format!(
-        "---\ntrigger: model_decision\ndescription: Philotic harness rule for the `{harness_id}` Windsurf workspace projection. Use when the task matches the active role or skills.\n---\n\n# Philotic Windsurf Harness: {harness_id}\n\nThis workspace uses Windsurf-native customization surfaces managed by `phil graph harness`.\n\n## Active Role Charter\n\n- `{profile}`\n\n## Active Skills\n\n{skills_lines}\n\n## Notes\n\n- Follow the workspace `AGENTS.md` instructions already present in the repository root.\n- Prefer the matching Windsurf skills and workflows under `.windsurf/` when they apply.\n"
+        "---\ntrigger: model_decision\ndescription: Philotic harness rule for the `{harness_id}` Windsurf workspace projection. Use when the task matches the active role or skills.\n---\n\n# Philotic Windsurf Harness: {harness_id}\n\nThis workspace uses Windsurf-native customization surfaces managed by `phil graph harness`.\n\n## Active Role Charter\n\n- `{profile}`\n\n## Active Skills\n\n{skills_lines}\n\n## Notes\n\n- Follow the workspace `AGENTS.md` instructions already present in the repository root.\n- Prefer the matching Windsurf skills and workflows under `.windsurf/` when they apply.\n\n## Muninn Memory\n\n{MUNINN_HARNESS_INSTRUCTIONS}"
     )
 }
 
@@ -2370,6 +2385,7 @@ fn render_windsurf_skill_markdown(skill: &str) -> String {
         "implementation" => "Use when the user wants code changes, focused implementation, or bounded feature delivery.",
         "review" => "Use when the user asks for a review or wants bug/risk/regression findings.",
         "verification" => "Use when the user needs validation strategy, test selection, or confidence reporting.",
+        "muninn-memory-habit" => "Use at session start and closeout to retrieve and write durable Muninn continuity context.",
         _ => "Use when the task explicitly matches this Philotic harness skill.",
     };
     let heading = skill
@@ -2383,6 +2399,11 @@ fn render_windsurf_skill_markdown(skill: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    if skill == "muninn-memory-habit" {
+        return format!(
+            "---\nname: philotic-{skill}\ndescription: {description}\n---\n\n# {heading}\n\nThis Windsurf skill is projected from the Philotic canonical harness layer.\n\n## Operating Guidance\n\n{MUNINN_HARNESS_INSTRUCTIONS}\n## Ownership\n\n- Muninn stores continuity handles, not source-of-truth docs or transcripts.\n- Repo docs/code store implemented truth.\n- Intel Graph stores structure, seams, work coordination, decisions, and verification evidence.\n- `docs/task.md` stores active execution work.\n"
+        );
+    }
     format!(
         "---\nname: philotic-{skill}\ndescription: {description}\n---\n\n# {heading}\n\nThis Windsurf skill is projected from the Philotic canonical harness layer.\n\n## Operating Guidance\n\n- Stay aligned with the active role charter and canonical profile.\n- Prefer the smallest coherent slice.\n- Keep observed truth separate from intended design.\n- Surface the next best seam when the current slice closes.\n"
     )
@@ -2497,7 +2518,26 @@ fn write_antigravity_workspace_files(harness_id: &str, projection_path: &PathBuf
          This workspace uses an Antigravity harness profile projected from intel-graph.\n\
          Please read the projected harness instructions at: {projection_path}\n\
          \n\
-         Then use your tools to perform the intel-graph workflows when needed.\n\
+         Then read the repository `AGENTS.md` and `GEMINI.md` files before meaningful work.\n\
+         \n\
+         Start meaningful sessions with the shared Philotic bootstrap:\n\
+         \n\
+         1. Prefer `just session-start`.\n\
+         2. If that is unavailable, run `python3 scripts/muninn_mcp.py bootstrap`.\n\
+         3. Retrieve Muninn context with the self/user/topic triad before decisions, resumed work, or implementation.\n\
+         4. If Muninn cannot bootstrap, stop and get explicit operator approval before continuing on repo/runtime truth only.\n\
+         \n\
+         Use intel-graph workflows when needed for structural context, workstream visibility, decisions, and verification.\n\
+         \n\
+         At closeout, write the Muninn memory delta only when it is durable:\n\
+         \n\
+         - Decision\n\
+         - Reality gap\n\
+         - Validation\n\
+         - Next seam\n\
+         - Operator preference\n\
+         \n\
+         Do not store transcripts, routine task churn, noisy logs, or summaries of proposal/docs content already committed in the repo.\n\
         ",
         harness_id = harness_id,
         projection_path = projection_path.display()

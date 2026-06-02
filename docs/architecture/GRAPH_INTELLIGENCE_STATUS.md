@@ -150,7 +150,7 @@ last_updated: 2026-03-29
 | `philotic-graph` crate | Not started | SVER-aware driver, CLI (`phil graph`) |
 | `query.rs` module | Not separated | Currently in `engine.rs` |
 | `fleet.rs` | Not started | Agent identity registry |
-| `muninn_bridge.rs` | Not started | Session memory integration |
+| `muninn_bridge.rs` | First slice implemented | Session memory integration now has Philote-side spacetime frames, cultivation reports, promotion gates, and graph true-up finding records from [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md); a dedicated bridge module remains future cleanup once the API stabilizes |
 | `self_model.rs` | Not started | Agent self-reflection queries |
 | Auto-writeback job | Planned | Periodic sync of derived files |
 | ARCH_RULES.md generation | Not started | Aggregate rules from implemented proposals |

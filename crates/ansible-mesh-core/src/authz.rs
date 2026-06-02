@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
 use rusqlite::Connection;
 use sha2::Sha256;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -71,6 +72,12 @@ pub struct NonceTracker {
 
 impl NonceTracker {
     pub fn open(db_path: &str) -> Result<Self> {
+        // A 0-byte file is a corrupted SQLite database that cannot be opened.
+        // Remove it so SQLite can create a fresh database on the next open.
+        let path = Path::new(db_path);
+        if path.exists() && path.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+            let _ = std::fs::remove_file(path);
+        }
         let conn = Connection::open(db_path)?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS mesh_nonces (

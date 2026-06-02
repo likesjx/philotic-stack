@@ -13,8 +13,8 @@
 //! - `Tool` — sends an IPC tool-invocation request to tool-runner and awaits reply.
 //! - `Datasource` — sends a query request to the datasource guest and awaits reply.
 
-use anyhow::Result;
 use ansible_mesh_core::mcp_route::McpRouteTarget;
+use anyhow::Result;
 use serde_json::Value;
 use tracing::info;
 
@@ -59,7 +59,7 @@ impl Dispatcher for StubDispatcher {
         );
 
         let target_label = match route.target() {
-            McpRouteTarget::Philote { agent_id } => format!("philote:{}", agent_id),
+            McpRouteTarget::Philote { agent_id, .. } => format!("philote:{}", agent_id),
             McpRouteTarget::Tool { tool_ref } => format!("tool:{}", tool_ref),
             McpRouteTarget::Datasource { datasource_id } => {
                 format!("datasource:{}", datasource_id)

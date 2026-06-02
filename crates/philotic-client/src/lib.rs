@@ -1,12 +1,14 @@
 pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
+pub use ansible_mesh_core::graph::RoleIncarnationRecord;
 pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
 };
+pub use ansible_mesh_core::storage::AgentIdentityRecord;
 pub use ansible_mesh_core::storage::ComponentManifest;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::ErrorKind;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -147,15 +149,166 @@ pub struct OperatorTargetAgentInventoryView {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentInventoryEntryView {
+    pub guest_id: String,
+    pub role: String,
+    pub hotel: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub component_type: String,
+    pub is_active: bool,
+    pub auto_start: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_pid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<u64>,
+    #[serde(default)]
+    pub component_config: serde_json::Value,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetComponentInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub components: Vec<ComponentInventoryEntryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetComponentMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub guest_id: String,
+    pub operation: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetConfigView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub config: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetConfigMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub key: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretEntryView {
+    pub kind: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub vault_entries: Vec<OperatorTargetSecretEntryView>,
+    #[serde(default)]
+    pub config_refs: Vec<OperatorTargetSecretEntryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetSecretMutationAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_name: Option<String>,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorTargetPlacementView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    pub placement: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetRoleHomeAckView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub agent_id: String,
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_node: Option<String>,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
 pub type DesktopMembraneTargetView = OperatorTargetView;
 pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
 pub type DesktopMembraneTargetGuestInventoryView = OperatorTargetGuestInventoryView;
 pub type DesktopMembraneTargetAgentInventoryView = OperatorTargetAgentInventoryView;
+pub type DesktopMembraneTargetComponentInventoryView = OperatorTargetComponentInventoryView;
 
 pub const OPERATOR_SURFACE_QUERY_ROLE: &str = "management.operator_surface_query";
 pub const OPERATOR_SURFACE_QUERY_REPLY_ROLE: &str = "management.operator_surface_query.reply";
 pub const OPERATOR_SURFACE_QUERY_HANDOFF_KIND: &str = "operator_surface_query";
+pub const OPERATOR_REMOTE_CONFIG_KEYS: &[&str] =
+    &["execution_host", "vault_registry", "tool_runner_registry"];
+pub const OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS: &[&str] =
+    &["execution_host", "tool_runner_registry"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperatorSurfaceQueryHandoff {
@@ -663,6 +816,8 @@ pub enum IpcRequest {
     AcquireTelegramPollLease {
         lease_key: String,
         agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_ref: Option<String>,
     },
     AcquireDesktopMembraneLease {
         lease_key: String,
@@ -688,6 +843,79 @@ pub enum IpcRequest {
     QueryOperatorTargetAgents {
         target_node_id: String,
     },
+    QueryOperatorTargetComponents {
+        target_node_id: String,
+    },
+    QueryOperatorTargetConfig {
+        target_node_id: String,
+    },
+    QueryOperatorTargetSecrets {
+        target_node_id: String,
+    },
+    QueryOperatorTargetPlacement {
+        target_node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default)]
+        required_markers: Vec<String>,
+        #[serde(default)]
+        prefer_locality: bool,
+    },
+    RegisterOperatorTargetComponent {
+        target_node_id: String,
+        manifest: ComponentManifest,
+    },
+    SetOperatorTargetConfig {
+        target_node_id: String,
+        key: String,
+        value_json: String,
+    },
+    RotateOperatorTargetSecret {
+        target_node_id: String,
+        secret_ref: String,
+        plaintext: String,
+    },
+    AddOperatorTargetVaultEntry {
+        target_node_id: String,
+        vault_name: String,
+        plaintext: String,
+        #[serde(default)]
+        allowed_roles: Vec<String>,
+    },
+    SetOperatorTargetRoleHome {
+        target_node_id: String,
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_hotel: Option<String>,
+    },
+    SetTransportHome {
+        agent_id: String,
+        transport: String,
+        resource_ref: String,
+        calling_role: String,
+        target_hotel: String,
+        #[serde(default)]
+        standby_hotels: Vec<String>,
+    },
+    SetOperatorTargetComponentActive {
+        target_node_id: String,
+        guest_id: String,
+        active: bool,
+    },
+    RestartOperatorTargetComponent {
+        target_node_id: String,
+        guest_id: String,
+    },
+    RemoveOperatorTargetComponent {
+        target_node_id: String,
+        guest_id: String,
+    },
     SendOperatorChatTurn {
         target_node_id: String,
         target_agent_id: String,
@@ -701,10 +929,15 @@ pub enum IpcRequest {
         target_node_id: String,
     },
     ListDesktopMembraneAgents,
+    ListDesktopMembraneTargetComponents {
+        target_node_id: String,
+    },
     ListDesktopMembraneTargets,
     RenewTelegramPollLease {
         lease_key: String,
         agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_ref: Option<String>,
         lease_epoch: u64,
     },
     RenewDesktopMembraneLease {
@@ -901,6 +1134,18 @@ pub enum IpcRequest {
         target_guest_id: Option<String>,
         task_json: String,
     },
+    /// Ask the hotel to initiate a WebRTC session offer toward a remote node.
+    StartWebRtcSession {
+        target_node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_guest_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    /// Ask the hotel for the current status of a locally-tracked WebRTC session.
+    GetWebRtcSessionStatus {
+        session_id: String,
+    },
     /// Optimistically push a RAM-based memory apartment update to the Hotel's SQLite Graph
     SyncApartment {
         agent_id: String,
@@ -1022,6 +1267,29 @@ pub enum IpcRequest {
         precedence: i32,
         reflexes_json: serde_json::Value,
         config_json: serde_json::Value,
+    },
+    GetAgentReflexPreferences {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preference_key: Option<String>,
+    },
+    /// Declare or replace a routing pipeline rule for this agent.
+    /// The `rule_id` is the stable key; set with the same rule_id to update.
+    UpsertRoutingPipelineRule {
+        agent_id: String,
+        rule_id: String,
+        rule_json: serde_json::Value,
+    },
+    /// Remove a routing pipeline rule by rule_id.
+    RemoveRoutingPipelineRule {
+        agent_id: String,
+        rule_id: String,
+    },
+    /// Retrieve routing pipeline rules for this agent.
+    GetRoutingPipelineRules {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
     },
     /// Record one successful same-self role handoff observation and let the hotel
     /// fold it into agent-owned reflex posture without making philote read/modify/write
@@ -1169,15 +1437,26 @@ pub enum IpcRequest {
     /// Push an updated route set for one agent to the membrane.
     ///
     /// The membrane replaces all routes owned by `agent_id` with `routes` (LWW).
+    /// The hotel persists the route set and replays it to membrane-mcp on restart.
     /// Responds with [`IpcResponse::McpRoutesAccepted`].
     UpdateMcpRoutes {
         agent_id: String,
         routes: Vec<ansible_mesh_core::mcp_route::McpRouteRecord>,
+        /// Optional vault ref for the bearer token protecting these routes.
+        /// Stored alongside routes so provisioning survives hotel restarts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vault_ref: Option<String>,
     },
     /// Remove all routes owned by an agent from the membrane.
     RevokeMcpRoutes {
         agent_id: String,
     },
+    /// Fetch all persisted MCP route sets from the hotel's context graph.
+    ///
+    /// Returns routes that survived hotel restarts. Membrane-mcp calls this
+    /// during `setup()` to replay provisioned routes without re-provisioning.
+    /// Responds with [`IpcResponse::McpRouteState`].
+    GetMcpRoutes {},
     /// Declare or update a full MCP endpoint configuration.
     ///
     /// The hotel stores the config, fans out an `update_mcp_config` push to
@@ -1193,6 +1472,11 @@ pub enum IpcRequest {
     RevokeMcpEndpoint {
         endpoint_id: String,
         owner_agent_id: String,
+    },
+    /// Return the stored `McpEndpointConfig` for the given endpoint, plus the
+    /// hotel's current perimeter ceiling. Responds with [`IpcResponse::Standard`].
+    GetMcpEndpointStatus {
+        endpoint_id: String,
     },
     // ── Training data admin IPC ───────────────────────────────────────────────
     /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
@@ -1239,6 +1523,26 @@ pub enum IpcRequest {
     /// Return the current status of the Parakeet ASR provider (guest active, nemo available).
     /// Responds with [`IpcResponse::Standard`] (data.status).
     AsrStatus {},
+    // ── Vision provider lifecycle ─────────────────────────────────────────────
+    /// Set up the vision inference provider: verify/install transformers+PIL, write
+    /// component config, register the model-controller-vision guest, and upsert a
+    /// ModelProfileRecord so health-aware routing picks it up.
+    /// Responds with [`IpcResponse::Standard`] (data.message).
+    VisionSetup {
+        /// Florence-2 ONNX repo ID (default: "onnx-community/Florence-2-base-ft").
+        #[serde(default)]
+        repo_id: Option<String>,
+    },
+    /// Return the current status of the vision provider (guest active, backend type).
+    /// Responds with [`IpcResponse::Standard`] (data.status).
+    VisionStatus {},
+    /// Invoke a capability using the normalized input envelope.
+    /// Routes to the healthiest model-controller that declares the task_kind.
+    /// Responds with a stream of [`CapabilityEvent`] frames terminated by Done or Error.
+    /// (Slice 7: hotel streaming router — currently returns NOT_IMPLEMENTED)
+    CapabilityInvoke {
+        request: ansible_mesh_core::capability::CapabilityRequest,
+    },
     /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
     /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
     GracefulShutdown {
@@ -1254,6 +1558,11 @@ pub enum IpcRequest {
         reply_to_node: String,
         /// Role at that node ("membrane", "agent", etc.).
         reply_to_role: String,
+        /// Specific guest_id to target for the reply (e.g. "default:membrane-gateway-astrid").
+        /// When set, the specialist's final send_reply/partial_reply is routed to this exact
+        /// guest rather than fanning out to all subscribers of reply_to_role.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_guest_id: Option<String>,
         /// Materialisation timeout for the target role. `None` uses the hotel default.
         #[serde(default)]
         timeout_secs: Option<u64>,
@@ -1261,9 +1570,42 @@ pub enum IpcRequest {
     /// Return a safe view of hotel state: hotel name, active guests, agent identities.
     /// No secret or credential values are included.
     GetHotelStatus,
+    /// Return the hotel's current network security perimeter snapshot.
+    GetPerimeterStatus,
+    /// Force the hotel's PerimeterService to re-derive the snapshot from live interfaces.
+    RefreshPerimeter,
+    /// Ask the hotel's EgressGateway whether an outbound request is permitted and
+    /// inject vault-backed credentials for the target host if applicable.
+    /// Responds with [`IpcResponse::EgressGrant`].
+    CheckEgress {
+        /// Calling agent's ID (used for vault access decisions).
+        agent_id: String,
+        /// Full target URL (e.g. "https://api.perplexity.ai/chat/completions").
+        target_url: String,
+        /// HTTP method (e.g. "POST").
+        method: String,
+    },
+    /// Ask the hotel to recommend the best execution placement for a role or tool need.
+    BestPlaceToRun {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default)]
+        required_markers: Vec<String>,
+        #[serde(default)]
+        prefer_locality: bool,
+    },
     /// Return the last `lines` lines from the hotel's log file.
     GetHotelLogs {
         lines: u32,
+    },
+    /// Query aggregated routing performance stats from the router trace store.
+    /// `window_secs`: if Some, only include traces from the last N seconds; None = all time.
+    GetRouterStats {
+        window_secs: Option<u64>,
     },
     // ── User Task Engine IPC ──────────────────────────────────────────────────
     /// Create a new durable user task in the hotel context graph.
@@ -1315,6 +1657,119 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
     },
+    /// Push a heal_queue entry from any guest (e.g. model-router on call failure).
+    /// Responds with [`IpcResponse::HealEntryPushed`].
+    PushHealEntry {
+        guest_id: String,
+        raw_text: String,
+    },
+    /// Retrieve pending (unresolved) heal_queue rows for the dispatcher.
+    /// Responds with [`IpcResponse::HealQueuePending`].
+    GetHealQueuePending {
+        #[serde(default = "default_heal_queue_limit")]
+        limit: usize,
+    },
+    /// Write triage decision back onto a heal_queue row.
+    /// Responds with [`IpcResponse::Standard`] (ok=true).
+    TriageHealEntry {
+        id: String,
+        severity: String,
+        pattern_tag: String,
+        heal_action: String,
+    },
+    /// Mark a heal_queue row resolved with the observed outcome.
+    /// Responds with [`IpcResponse::Standard`] (ok=true).
+    ResolveHealEntry {
+        id: String,
+        outcome: String,
+    },
+    // ── Agent migration IPC ───────────────────────────────────────────────────
+    /// Initiate a full agent migration to a remote hotel.
+    ///
+    /// The source hotel bundles the agent's identity, apartments, role incarnations,
+    /// vault entries (decrypted), guests, and agent-specific config, uploads the bundle
+    /// to its blob store, then dispatches it to the destination hotel via the
+    /// OperatorSurface cross-hotel relay.  The source stays active throughout.
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    AgentMigrateToHotel {
+        /// The agent making the request.
+        agent_id: String,
+        /// The hotel the agent wants to move to (e.g. "vps-jane").
+        dest_hotel: String,
+    },
+    /// Apply a serialized [`AgentMigrationBundle`] to the local hotel.
+    ///
+    /// Writes agent identity, apartments, role incarnations, vault entries, guests,
+    /// and config to the local context graph, then materializes the new guests.
+    ///
+    /// Called internally by the `"agent.deploy_bundle"` operator surface handler.
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    ApplyAgentBundle {
+        bundle_json: String,
+    },
+}
+
+fn default_heal_queue_limit() -> usize {
+    50
+}
+
+// ── Agent migration bundle types ─────────────────────────────────────────────
+
+/// A vault secret that travels with an agent during migration.
+/// The plaintext is included so the destination hotel can re-encrypt with its
+/// own vault key.  Only transmit over a trusted network (e.g. Tailscale VPN).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultEntryExport {
+    /// Config key that points at this secret (e.g. `"telegram_bot_token_beacon"`).
+    pub config_key: String,
+    /// Vault name (e.g. `"bjork"`), used to place the entry in the dest vault_registry.
+    pub vault_name: String,
+    /// Decrypted plaintext value.
+    pub plaintext: String,
+    /// Role ACL preserved from the source secret record.
+    #[serde(default)]
+    pub allowed_roles: Vec<String>,
+}
+
+/// A non-vault config entry to replicate verbatim on the destination hotel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigEntryExport {
+    /// Config key without the `"config:"` prefix.
+    pub key: String,
+    /// Raw JSON value string as stored in the context graph.
+    pub value_json: String,
+}
+
+/// A guest record stripped of its hotel prefix, ready to be re-homed on dest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestExport {
+    /// The suffix of the guest_id after the hotel prefix (e.g. `"philote-beacon"`).
+    pub guest_id_suffix: String,
+    pub role: String,
+    /// Raw config_json string from the source GuestRecord.
+    /// The `ApplyAgentBundle` handler replaces occurrences of the source hotel name.
+    pub config_json: String,
+    pub is_active: bool,
+}
+
+/// Full snapshot of an agent suitable for cross-hotel migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMigrationBundle {
+    pub migration_id: String,
+    pub source_hotel: String,
+    /// Stable agent identifier (e.g. `"agent-beacon-01"`).
+    pub agent_id: String,
+    /// Short agent key used in guest ID patterns (e.g. `"beacon"`).
+    pub agent_key: String,
+    pub agent_identity: AgentIdentityRecord,
+    pub apartments: Vec<(String, serde_json::Value)>,
+    pub role_incarnations: Vec<RoleIncarnationRecord>,
+    pub vault_entries: Vec<VaultEntryExport>,
+    pub config_entries: Vec<ConfigEntryExport>,
+    pub guests: Vec<GuestExport>,
+    pub timestamp: u64,
 }
 
 /// Payload for [`IpcResponse::UserProfileData`].
@@ -1327,6 +1782,16 @@ pub enum IpcRequest {
 pub struct UserProfileDataPayload {
     pub timezone: Option<String>,
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_hotel: Option<String>,
+    #[serde(default)]
+    pub linked_providers: Vec<String>,
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -1378,6 +1843,30 @@ pub enum IpcResponse {
     OperatorTargetAgentsView {
         operator_target_agents: OperatorTargetAgentInventoryView,
     },
+    OperatorTargetComponentsView {
+        operator_target_components: OperatorTargetComponentInventoryView,
+    },
+    OperatorTargetConfigView {
+        operator_target_config: OperatorTargetConfigView,
+    },
+    OperatorTargetSecretsView {
+        operator_target_secrets: OperatorTargetSecretInventoryView,
+    },
+    OperatorTargetPlacementView {
+        operator_target_placement: OperatorTargetPlacementView,
+    },
+    OperatorTargetComponentMutationAckView {
+        operator_target_component_mutation: OperatorTargetComponentMutationAckView,
+    },
+    OperatorTargetConfigMutationAckView {
+        operator_target_config_mutation: OperatorTargetConfigMutationAckView,
+    },
+    OperatorTargetSecretMutationAckView {
+        operator_target_secret_mutation: OperatorTargetSecretMutationAckView,
+    },
+    OperatorTargetRoleHomeAckView {
+        operator_target_role_home: OperatorTargetRoleHomeAckView,
+    },
     OperatorChatTurnReply {
         operator_chat_reply: OperatorChatTurnReply,
     },
@@ -1386,6 +1875,9 @@ pub enum IpcResponse {
     },
     DesktopMembraneTargetGuestsView {
         membrane_target_guests: DesktopMembraneTargetGuestInventoryView,
+    },
+    DesktopMembraneTargetComponentsView {
+        membrane_target_components: DesktopMembraneTargetComponentInventoryView,
     },
     DesktopMembraneAgentsView {
         membrane_agents: Vec<DesktopMembraneAgentView>,
@@ -1404,7 +1896,10 @@ pub enum IpcResponse {
         retry_after_ms: Option<u64>,
     },
     HandoffBackAck {
-        handoff_guest_id: String,
+        // Named differently from HandoffAck.handoff_guest_id so the untagged serde
+        // repr can distinguish the two variants (serde tries variants in order; a
+        // missing required field causes the attempt to fail and the next is tried).
+        return_guest_id: String,
         became_active: bool,
     },
     DelegationAck {
@@ -1462,6 +1957,15 @@ pub enum IpcResponse {
         role_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         home_node: Option<String>,
+    },
+    /// Response to [`IpcRequest::SetTransportHome`].
+    TransportHomeSet {
+        agent_id: String,
+        transport: String,
+        resource_ref: String,
+        active_home_hotel: String,
+        #[serde(default)]
+        standby_hotels: Vec<String>,
     },
     /// Response to [`IpcRequest::ExecuteWorkflow`].
     WorkflowExecutionOk {
@@ -1589,6 +2093,20 @@ pub enum IpcResponse {
     /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
     /// This prevents this variant from swallowing `MemoryConfig` responses.
     UserProfileData(UserProfileDataPayload),
+    /// Response to [`IpcRequest::GetAgentReflexPreferences`].
+    AgentReflexPreferences {
+        rows: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::GetRoutingPipelineRules`].
+    /// Uses `pipeline_rules` (not `rules`) to distinguish from [`RuleList`] in untagged serde.
+    RoutingPipelineRules {
+        pipeline_rules: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::GetMcpRoutes`].
+    /// Contains all persisted route sets, keyed by agent_id.
+    McpRouteState {
+        agents: Vec<PersistedMcpRouteEntry>,
+    },
     UserTaskCreated {
         user_task_id: String,
     },
@@ -1602,13 +2120,63 @@ pub enum IpcResponse {
     UserTaskList {
         user_tasks: Vec<serde_json::Value>,
     },
+    /// Response to [`IpcRequest::GetPerimeterStatus`] and [`IpcRequest::RefreshPerimeter`].
+    /// `snapshot_json` is the serialized [`ansible_mesh_core::PerimeterSnapshot`].
+    PerimeterStatus {
+        snapshot_json: String,
+    },
+    /// Hotel → guest broadcast: the hotel's network security perimeter ceiling changed.
+    /// Sent to ALL connected guests via the broadcast channel when the perimeter shifts.
+    /// Guests should react by re-evaluating in-flight work, adjusting routing assumptions,
+    /// or propagating the shift to their own listeners.
+    PerimeterShift {
+        previous: ansible_mesh_core::ExposureTier,
+        current: ansible_mesh_core::ExposureTier,
+    },
+    /// Response to [`IpcRequest::CheckEgress`].
+    EgressGrant {
+        /// Whether the request is permitted.
+        allowed: bool,
+        /// Set to `true` when the policy matched `AllowWithAudit`.
+        audit: bool,
+        /// If `allowed` is false, the reason for denial.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deny_reason: Option<String>,
+        /// Headers to inject into the outbound request (e.g. `Authorization: Bearer <token>`).
+        /// Only populated when `allowed` is true and a vault credential was resolved.
+        #[serde(default)]
+        inject_headers: std::collections::HashMap<String, String>,
+    },
+    /// Response to [`IpcRequest::PushHealEntry`].
+    HealEntryPushed {
+        id: String,
+    },
+    /// Response to [`IpcRequest::GetHealQueuePending`].
+    HealQueuePending {
+        rows: Vec<ansible_mesh_core::heal_queue::HealQueueRow>,
+    },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
     /// Placing it last ensures it only wins when no other variant can match.
+    RouterStats {
+        stats: Vec<ansible_mesh_core::router_trace::ProviderStats>,
+        /// Unix epoch seconds of the query.
+        generated_at: u64,
+    },
     MemoryConfig {
         config_json: Option<String>,
     },
+}
+
+/// One agent's persisted route set, as returned by [`IpcResponse::McpRouteState`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedMcpRouteEntry {
+    pub agent_id: String,
+    pub routes: Vec<ansible_mesh_core::mcp_route::McpRouteRecord>,
+    /// Vault ref for the bearer token, if one was supplied at provisioning time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_ref: Option<String>,
 }
 
 impl IpcResponse {
@@ -1669,6 +2237,10 @@ pub fn is_ipc_disconnect(err: &anyhow::Error) -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+pub fn is_graceful_shutdown(resp: &IpcResponse) -> bool {
+    matches!(resp, IpcResponse::GracefulShutdown { .. })
 }
 
 impl PhiloticClient {
@@ -1797,14 +2369,25 @@ impl PhiloticClient {
     fn is_push_message(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::InboundTask { .. } | IpcResponse::ApartmentUpdate { .. }
+            IpcResponse::InboundTask { .. }
+                | IpcResponse::ApartmentUpdate { .. }
+                | IpcResponse::GracefulShutdown { .. }
         )
     }
 
     fn is_ignorable_push(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::UserProfileData(_) | IpcResponse::NetworkState { .. }
+            IpcResponse::UserProfileData(_)
+                | IpcResponse::NetworkState { .. }
+                // Lease notifications may be broadcast or arrive out-of-band on any connection.
+                // They are never the expected response to an unrelated request, so skip them.
+                | IpcResponse::McpMembraneLease { .. }
+                | IpcResponse::DesktopMembraneLease { .. }
+                | IpcResponse::TelegramPollLeaseStatus { .. }
+                | IpcResponse::DesktopMembraneLeaseStatus { .. }
+                | IpcResponse::DiscordGatewayLease { .. }
+                | IpcResponse::DiscordGatewayLeaseStatus { .. }
         )
     }
 

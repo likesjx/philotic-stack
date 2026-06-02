@@ -1,13 +1,17 @@
 ---
-# jane-vps — beacon-test-hotel
-philotic_hotel_name: "beacon-test-hotel"
+# jane-vps — canonical hotel name
+philotic_hotel_name: "vps-jane"
+philotic_hotel_canonical_name: "vps-jane"
+philotic_hotel_previous_names:
+  - "beacon-test-hotel"
+philotic_oidc_public_base_url: "https://brain.jaredlikes.com"
 philotic_default_model: "gemini-flash-latest"
 philotic_repo_branch: "codex/hegemon-membrane-slice"
 
 # Agents
 philotic_agents:
   beacon:
-    agent_id: "agent-beacon-01"
+    agent_id: "agent-beacon"
     persona_name: "Beacon"
     import_workspace: "/home/deploy/apps/jane/data/workspace-chief-of-staff"
     telegram:
@@ -36,16 +40,16 @@ philotic_artifacts_dir: "/opt/philotic/src/target/release"
 
 # Mesh
 philotic_backbone_peers:
-  - name: "default"
+  - name: "mac-jane"
     host: "100.64.230.106"
     beacon_port: 24849
     blob_port: 24850
     execution_port: 24851
   - name: "mbp-jane"
     host: "100.79.239.64"
-    beacon_port: 13104
-    blob_port: 13105
-    execution_port: 13106
+    beacon_port: 13106
+    blob_port: 13107
+    execution_port: 13108
 
 philotic_enable_rust_auth: "1"
 philotic_enable_rust_dispatcher: "1"

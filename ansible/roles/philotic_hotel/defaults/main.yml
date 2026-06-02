@@ -1,6 +1,8 @@
 ---
 # Hotel identity
 philotic_hotel_name: "default"
+philotic_hotel_runtime_name: "{{ philotic_hotel_canonical_name | default(philotic_hotel_name) }}"
+philotic_hotel_previous_names: []
 
 # Install paths
 philotic_install_dir: "/opt/philotic"
@@ -20,19 +22,38 @@ philotic_group: "philotic"
 philotic_artifacts_dir: "{{ playbook_dir }}/../dist"
 philotic_artifacts_remote: false
 philotic_binaries:
-  - ansible
+  - aiua
+  - philote
+  - philote-worker
   - membrane
+  - membrane-telegram
+  - membrane-mcp
+  - graph-runner
+  - graph-datasource
+  - table-datasource
+  - router-listener
+  - agent-datasource
+  - tool-runner
   - agent-core
+  - hegemon
   - model-router
+  - model-controller-gemini
+  - model-controller-elevenlabs
+  - model-controller-openai
+  - model-controller-mlx
+  - heal-dispatcher
   - model-controller-onnx
+  - philotic-web
 
 # Runtime ports
 philotic_beacon_port: 8999       # UDP — inter-hotel mesh
 philotic_blob_port: 9001         # TCP — blob HTTP store
 philotic_hotel_port: 9000        # IPC listen port
 
-# IPC socket (default; override to move out of /tmp for hardened deployments)
-philotic_hotel_socket: "/tmp/philotic-ansible.sock"
+# IPC socket and runtime dir. Keep this out of /tmp so systemd hardening does not
+# strand the control socket behind a private mount namespace.
+philotic_runtime_dir: "/run/philotic"
+philotic_hotel_socket: "{{ philotic_runtime_dir }}/{{ philotic_hotel_runtime_name }}.sock"
 
 # Mesh auth
 philotic_enable_rust_auth: "1"
@@ -44,6 +65,9 @@ philotic_backbone_peers: []
 
 # Agent config projected into mesh-config.json — defaults to empty (no guests)
 philotic_agents: {}
+
+# Optional hotel-scoped auth/config overlays projected into mesh-config.json
+philotic_oidc_public_base_url: ""
 
 # Log level
 philotic_rust_log: "info"

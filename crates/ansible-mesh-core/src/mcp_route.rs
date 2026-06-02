@@ -41,7 +41,13 @@ pub struct McpRouteRecord {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum McpRouteTarget {
     /// Route to a running philote (cognitive loop guest).
-    Philote { agent_id: String },
+    /// `target_node` pins the dispatch to a specific hotel node_id for cross-hotel routing.
+    /// When absent the dispatch is local (same hotel as membrane-mcp).
+    Philote {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_node: Option<String>,
+    },
     /// Route to a tool-runner tool ref (e.g. `"bash.exec@1"`).
     Tool { tool_ref: String },
     /// Route to a datasource guest (e.g. `"graph-datasource-01"`).
@@ -135,6 +141,11 @@ mod tests {
     fn route_target_variants() {
         round_trip(&McpRouteTarget::Philote {
             agent_id: "bjork-01".into(),
+            target_node: None,
+        });
+        round_trip(&McpRouteTarget::Philote {
+            agent_id: "bjork-01".into(),
+            target_node: Some("local-telegram-aiua-01".into()),
         });
         round_trip(&McpRouteTarget::Tool {
             tool_ref: "bash.exec@1".into(),
@@ -173,6 +184,7 @@ mod tests {
             }),
             target: McpRouteTarget::Philote {
                 agent_id: "bjork-01".into(),
+                target_node: None,
             },
             security: McpRouteSecurity {
                 auth: McpAuthScheme::BearerToken {

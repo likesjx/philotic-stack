@@ -19,6 +19,7 @@ pub const NODE_KIND_SESSION_PARTICIPANT: &str = "session_participant";
 pub const NODE_KIND_SESSION_TURN: &str = "session_turn";
 pub const NODE_KIND_SESSION_EVENT: &str = "session_event";
 pub const NODE_KIND_ROLE_INCARNATION: &str = "role_incarnation";
+pub const NODE_KIND_MEMBRANE_TRANSPORT_HOME: &str = "membrane_transport_home";
 pub const NODE_KIND_SECRET: &str = "secret";
 pub const NODE_KIND_ABSTRACT_SKILL: &str = "abstract_skill";
 pub const NODE_KIND_WORKFLOW_SKILL: &str = "workflow_skill";
@@ -28,4 +29,8 @@ pub const NODE_KIND_CONFIG: &str = "config";
 pub const NODE_KIND_APARTMENT: &str = "apartment";
 pub const NODE_KIND_CRON_JOB: &str = "cron_job";
 pub const NODE_KIND_USER_PROFILE: &str = "user_profile";
+pub const NODE_KIND_PROJECTED_USER_IDENTITY: &str = "projected_user_identity";
 pub const NODE_KIND_USER_TASK: &str = "user_task";
+
+// Model graph (doc:model-graph-flywheel / doc:hardened-model-dispatch)
+pub const NODE_KIND_MODEL_PROFILE: &str = "model_profile";

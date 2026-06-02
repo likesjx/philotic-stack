@@ -110,7 +110,7 @@ async fn emit_fire_and_forget(
             target_guest_id: None,
             task_json: serde_json::json!({
                 "tool_name": tool_name,
-                "args": args
+                "arguments": args
             })
             .to_string(),
         })

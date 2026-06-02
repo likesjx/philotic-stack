@@ -6,7 +6,7 @@
 //!
 //! Run with: `cargo test -p agent-graph-runner`
 
-use agent_graph_runner::tools;
+use agent_datasource::tools;
 use ansible_mesh_core::agent_graph_storage::SqliteAgentGraphStorage;
 use serde_json::json;
 use tempfile::NamedTempFile;

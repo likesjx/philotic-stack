@@ -93,7 +93,7 @@ fn set_dot_path(obj: &mut serde_json::Map<String, Value>, path: &str, value: Val
 fn target_parts(target: &ansible_mesh_core::mcp_route::McpRouteTarget) -> (String, String) {
     use ansible_mesh_core::mcp_route::McpRouteTarget;
     match target {
-        McpRouteTarget::Philote { agent_id } => ("philote".into(), agent_id.clone()),
+        McpRouteTarget::Philote { agent_id, .. } => ("philote".into(), agent_id.clone()),
         McpRouteTarget::Tool { tool_ref } => ("tool".into(), tool_ref.clone()),
         McpRouteTarget::Datasource { datasource_id } => {
             ("datasource".into(), datasource_id.clone())
@@ -136,7 +136,9 @@ pub fn apply_outbound(spec: &McpToolSpec, response: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ansible_mesh_core::mcp_endpoint::{FieldMapping, McpInboundTransform, McpOutboundTransform, McpToolSpec};
+    use ansible_mesh_core::mcp_endpoint::{
+        FieldMapping, McpInboundTransform, McpOutboundTransform, McpToolSpec,
+    };
     use ansible_mesh_core::mcp_route::McpRouteTarget;
     use serde_json::json;
 
@@ -160,7 +162,10 @@ mod tests {
     #[test]
     fn field_map_single_key() {
         let spec = make_spec(
-            vec![FieldMapping { from: "query".into(), to: "payload.q".into() }],
+            vec![FieldMapping {
+                from: "query".into(),
+                to: "payload.q".into(),
+            }],
             McpOutboundTransform::PassThrough,
         );
         let args = json!({ "query": "hello world" });
@@ -182,8 +187,14 @@ mod tests {
     fn field_map_missing_source_skipped() {
         let spec = make_spec(
             vec![
-                FieldMapping { from: "present".into(), to: "out.present".into() },
-                FieldMapping { from: "missing".into(), to: "out.missing".into() },
+                FieldMapping {
+                    from: "present".into(),
+                    to: "out.present".into(),
+                },
+                FieldMapping {
+                    from: "missing".into(),
+                    to: "out.missing".into(),
+                },
             ],
             McpOutboundTransform::PassThrough,
         );
@@ -195,14 +206,24 @@ mod tests {
 
     #[test]
     fn outbound_extract_string_field() {
-        let spec = make_spec(vec![], McpOutboundTransform::Extract { path: "results.0.text".into() });
+        let spec = make_spec(
+            vec![],
+            McpOutboundTransform::Extract {
+                path: "results.0.text".into(),
+            },
+        );
         let response = json!({ "results": [{ "text": "found it" }] }).to_string();
         assert_eq!(apply_outbound(&spec, &response), "found it");
     }
 
     #[test]
     fn outbound_extract_missing_returns_raw() {
-        let spec = make_spec(vec![], McpOutboundTransform::Extract { path: "does.not.exist".into() });
+        let spec = make_spec(
+            vec![],
+            McpOutboundTransform::Extract {
+                path: "does.not.exist".into(),
+            },
+        );
         let response = json!({ "ok": true }).to_string();
         assert_eq!(apply_outbound(&spec, &response), response);
     }

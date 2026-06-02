@@ -1,11 +1,12 @@
+use crate::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
 use crate::NodeCapabilities;
-use anyhow::{Context, Result, bail};
-use base64::Engine;
+use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -56,6 +57,43 @@ pub struct MeshJoinRequestPayload {
 pub struct MeshMembershipAcceptPayload {
     pub payload: MeshJoinRequestPayload,
     pub signature_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshMemberRecord {
+    pub hotel_name: String,
+    pub capabilities: NodeCapabilities,
+    pub mesh_host: String,
+    pub mesh_port: u16,
+    pub blob_port: u16,
+    pub execution_port: u16,
+    pub member_pubkey_b64: String,
+    pub member_fingerprint: String,
+    pub member_transport_pubkey_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_via: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_at: Option<u64>,
+    pub membership_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshMembershipSyncPayload {
+    pub mesh_id: String,
+    pub issued_at: u64,
+    pub records: Vec<MeshMemberRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshCatalogSyncPayload {
+    pub mesh_id: String,
+    pub issued_at: u64,
+    #[serde(default)]
+    pub abstract_tools: Vec<AbstractToolRecord>,
+    #[serde(default)]
+    pub abstract_skills: Vec<AbstractSkillRecord>,
+    #[serde(default)]
+    pub toolset_profiles: Vec<ToolsetProfileRecord>,
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -141,11 +179,19 @@ pub fn derive_transport_session_key(
     private_key_hex: &str,
     peer_public_key_b64: &str,
 ) -> Result<String> {
+    derive_transport_shared_key(invite_nonce, private_key_hex, peer_public_key_b64)
+}
+
+pub fn derive_transport_shared_key(
+    context_salt: &str,
+    private_key_hex: &str,
+    peer_public_key_b64: &str,
+) -> Result<String> {
     let local_secret = transport_secret_from_hex(private_key_hex)?;
     let peer_public = transport_public_from_base64url(peer_public_key_b64)?;
     let shared_secret = local_secret.diffie_hellman(&peer_public);
     let mut output = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(invite_nonce.as_bytes()), shared_secret.as_bytes())
+    Hkdf::<Sha256>::new(Some(context_salt.as_bytes()), shared_secret.as_bytes())
         .expand(b"philotic-mesh-peer-auth-v1", &mut output)
         .map_err(|_| anyhow::anyhow!("derive peer mesh auth key from X25519 shared secret"))?;
     Ok(hex::encode(output))
@@ -157,7 +203,11 @@ fn sign_canonical<T: Serialize>(value: &T, signing_key: &SigningKey) -> Result<S
     Ok(URL_SAFE_NO_PAD.encode(signature.to_bytes()))
 }
 
-fn verify_canonical<T: Serialize>(value: &T, signature_b64: &str, public_key_b64: &str) -> Result<()> {
+fn verify_canonical<T: Serialize>(
+    value: &T,
+    signature_b64: &str,
+    public_key_b64: &str,
+) -> Result<()> {
     let canonical = serde_json::to_vec(value).context("serialize signed mesh payload")?;
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature_b64)
@@ -379,5 +429,57 @@ mod tests {
                 .expect("joiner should derive auth key");
 
         assert_eq!(inviter_key, joiner_key);
+    }
+
+    #[test]
+    fn deterministic_transport_shared_key_matches_for_both_peers() {
+        let (alpha_private, alpha_public) = generate_transport_keypair();
+        let (beta_private, beta_public) = generate_transport_keypair();
+        let context = "philotic-mesh-peer-v2:alpha-aiua-01:beta-aiua-01";
+
+        let alpha_key = derive_transport_shared_key(context, &alpha_private, &beta_public).unwrap();
+        let beta_key = derive_transport_shared_key(context, &beta_private, &alpha_public).unwrap();
+
+        assert_eq!(alpha_key, beta_key);
+    }
+
+    #[test]
+    fn mesh_catalog_sync_round_trips_shared_catalog_records() {
+        let payload = MeshCatalogSyncPayload {
+            mesh_id: "default".into(),
+            issued_at: 123,
+            abstract_tools: vec![AbstractToolRecord {
+                tool_name: "hotel.best_place_to_run".into(),
+                description: "placement helper".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                class: "config".into(),
+                tool_markers: vec![],
+            }],
+            abstract_skills: vec![AbstractSkillRecord {
+                skill_name: "role.governance".into(),
+                description: "govern roles".into(),
+                implied_tools: vec!["hotel.best_place_to_run".into()],
+                ..Default::default()
+            }],
+            toolset_profiles: vec![ToolsetProfileRecord {
+                profile_name: "admin".into(),
+                allowed_tools: vec!["hotel.best_place_to_run".into()],
+                allowed_classes: vec!["config".into()],
+                allowed_skills: vec!["role.governance".into()],
+                on_demand_skills: vec![],
+                description: Some("admin defaults".into()),
+            }],
+        };
+
+        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
+        let decoded: MeshCatalogSyncPayload =
+            serde_json::from_slice(&encoded).expect("payload should decode");
+        assert_eq!(decoded.mesh_id, "default");
+        assert_eq!(
+            decoded.abstract_tools[0].tool_name,
+            "hotel.best_place_to_run"
+        );
+        assert_eq!(decoded.abstract_skills[0].skill_name, "role.governance");
+        assert_eq!(decoded.toolset_profiles[0].profile_name, "admin");
     }
 }

@@ -1,8 +1,10 @@
-use anyhow::{Context, Result};
 use ansible_mesh_core::whisper_training::{
     SqliteWhisperTrainingStorage, WhisperTrainingSample, WhisperTrainingStorage,
 };
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use anyhow::{Context, Result};
+use philotic_client::{
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_graceful_shutdown, is_ipc_disconnect,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -126,7 +128,10 @@ async fn run_connect_and_listen() -> Result<()> {
     info!("router-listener connected to hotel IPC");
 
     let config = load_config(&mut ipc).await;
-    info!(has_config = config.is_some(), "router-listener config loaded");
+    info!(
+        has_config = config.is_some(),
+        "router-listener config loaded"
+    );
 
     // Fall back to env-based whisper config when no structured config is present.
     let whisper_store = build_legacy_whisper_store().await.ok();
@@ -138,6 +143,10 @@ async fn run_connect_and_listen() -> Result<()> {
 
     loop {
         let msg = ipc.recv_task().await?;
+        if is_graceful_shutdown(&msg) {
+            info!("router-listener: received graceful shutdown from hotel");
+            return Ok(());
+        }
         let IpcResponse::InboundTask { task_json, .. } = msg else {
             continue;
         };
@@ -150,7 +159,7 @@ async fn run_connect_and_listen() -> Result<()> {
             }
         };
 
-        let kind = envelope.get("kind").and_then(Value::as_str).unwrap_or("");
+        let kind = envelope.get("kind").and_then(|v| v.as_str()).unwrap_or("");
 
         // Config-driven path.
         if let Some(ref cfg) = config {
@@ -232,9 +241,7 @@ async fn handle_event(
                 .whisper_db
                 .as_deref()
                 .unwrap_or("whisper_training.db");
-            let audio_dir = PathBuf::from(
-                handler.audio_dir.as_deref().unwrap_or("training_audio"),
-            );
+            let audio_dir = PathBuf::from(handler.audio_dir.as_deref().unwrap_or("training_audio"));
             if let Ok(store) = SqliteWhisperTrainingStorage::open(db) {
                 let store: Arc<dyn WhisperTrainingStorage> = Arc::new(store);
                 if let Ok(capture) = serde_json::from_value(envelope.clone()) {
@@ -304,10 +311,7 @@ fn run_adapter(script: &str, envelope: &Value) -> Option<Value> {
 }
 
 async fn emit_table_insert(ipc: &mut PhiloticClient, handler: &EventHandlerConfig, row: Value) {
-    let target_role = handler
-        .target_role
-        .as_deref()
-        .unwrap_or("table-datasource");
+    let target_role = handler.target_role.as_deref().unwrap_or("table-datasource");
     let table_name = match handler.table_name.as_deref() {
         Some(t) => t.to_string(),
         None => {
@@ -343,8 +347,8 @@ async fn emit_table_insert(ipc: &mut PhiloticClient, handler: &EventHandlerConfi
 // ── Legacy whisper helpers ────────────────────────────────────────────────────
 
 async fn build_legacy_whisper_store() -> Result<Arc<dyn WhisperTrainingStorage>> {
-    let db_path = std::env::var("PHILOTIC_TRAINING_DB")
-        .unwrap_or_else(|_| "whisper_training.db".to_string());
+    let db_path =
+        std::env::var("PHILOTIC_TRAINING_DB").unwrap_or_else(|_| "whisper_training.db".to_string());
     let audio_dir = PathBuf::from(
         std::env::var("PHILOTIC_TRAINING_AUDIO_DIR")
             .unwrap_or_else(|_| "training_audio".to_string()),
@@ -373,12 +377,12 @@ async fn handle_whisper_capture(
                         Some(dest.to_string_lossy().to_string())
                     }
                     Err(e) => {
-                        warn!("failed to write audio file: {e}");
+                        warn!("router-listener: failed to write audio file: {e}");
                         None
                     }
                 },
                 Err(e) => {
-                    warn!("failed to read audio response body: {e}");
+                    warn!("router-listener: failed to read audio response body: {e}");
                     None
                 }
             },
@@ -395,8 +399,7 @@ async fn handle_whisper_capture(
         None
     };
 
-    let auto_eligible =
-        std::env::var("PHILOTIC_TRAINING_AUTO_ELIGIBLE").as_deref() == Ok("true");
+    let auto_eligible = std::env::var("PHILOTIC_TRAINING_AUTO_ELIGIBLE").as_deref() == Ok("true");
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

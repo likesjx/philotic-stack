@@ -11,10 +11,12 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
+media-codec = { path = "../media-codec" }
 media-prep = { path = "../media-prep" }
 mlx-runner = { path = "../mlx-runner" }
 parakeet-runner = { path = "../parakeet-runner" }
 onnx-runner = { path = "../onnx-runner" }
+datasource = { path = "../datasource" }
 philotic-client = { path = "../philotic-client" }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
