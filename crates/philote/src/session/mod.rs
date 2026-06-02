@@ -2064,11 +2064,7 @@ impl SessionState {
             .context_window
             .max_tool_result_chars
             .max(1_000);
-        let max_history_entries = self
-            .settings
-            .context_window
-            .max_tool_history_entries
-            .max(3);
+        let max_history_entries = self.settings.context_window.max_tool_history_entries.max(3);
         let tool_history: Vec<Value> = self
             .active_turn
             .as_ref()
@@ -3915,6 +3911,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "role.create_or_update"
             | "role.list"
             | "role.set_home"
+            | "transport.set_home"
             | "handoff.to_role"
             | "handoff.back"
             | "delegate.whisper"

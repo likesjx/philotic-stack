@@ -81,7 +81,10 @@ impl VisionBackend {
             .map_err(|e| anyhow::anyhow!("encoder opt level: {e}"))?
             .commit_from_file(&handle.encoder_path)
             .with_context(|| {
-                format!("load Florence-2 encoder from {}", handle.encoder_path.display())
+                format!(
+                    "load Florence-2 encoder from {}",
+                    handle.encoder_path.display()
+                )
             })?;
 
         let decoder = Session::builder()
@@ -90,7 +93,10 @@ impl VisionBackend {
             .map_err(|e| anyhow::anyhow!("decoder opt level: {e}"))?
             .commit_from_file(&handle.decoder_path)
             .with_context(|| {
-                format!("load Florence-2 decoder from {}", handle.decoder_path.display())
+                format!(
+                    "load Florence-2 decoder from {}",
+                    handle.decoder_path.display()
+                )
             })?;
 
         let tokenizer = Tokenizer::from_file(&handle.tokenizer_path)
@@ -154,14 +160,16 @@ impl VisionBackend {
             .encode(prompt, true)
             .map_err(|e| anyhow::anyhow!("tokenize prompt: {e}"))?;
 
-        let input_ids: Vec<i64> =
-            encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let attention_mask: Vec<i64> =
-            encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
+        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let attention_mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&m| m as i64)
+            .collect();
         let seq_len = input_ids.len();
 
-        let ids_arr = Array2::from_shape_vec([1, seq_len], input_ids.clone())
-            .context("shape input_ids")?;
+        let ids_arr =
+            Array2::from_shape_vec([1, seq_len], input_ids.clone()).context("shape input_ids")?;
         let mask_arr = Array2::from_shape_vec([1, seq_len], attention_mask.clone())
             .context("shape attention_mask")?;
 
@@ -189,7 +197,11 @@ impl VisionBackend {
                 .try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("extract encoder output: {e}"))?;
             let dims: &[i64] = &shape;
-            anyhow::ensure!(dims.len() == 3, "expected 3D encoder output, got {}D", dims.len());
+            anyhow::ensure!(
+                dims.len() == 3,
+                "expected 3D encoder output, got {}D",
+                dims.len()
+            );
             (data.to_vec(), dims[1] as usize, dims[2] as usize)
         };
 
@@ -215,15 +227,13 @@ impl VisionBackend {
             let ids_tensor = Tensor::<i64>::from_array(ids_arr)
                 .map_err(|e| anyhow::anyhow!("decoder input_ids tensor: {e}"))?;
 
-            let enc_arr =
-                Array3::from_shape_vec([1, enc_seq, enc_hidden], enc_data.to_vec())
-                    .context("shape encoder_hidden_states")?;
+            let enc_arr = Array3::from_shape_vec([1, enc_seq, enc_hidden], enc_data.to_vec())
+                .context("shape encoder_hidden_states")?;
             let enc_tensor = Tensor::<f32>::from_array(enc_arr)
                 .map_err(|e| anyhow::anyhow!("encoder_hidden_states tensor: {e}"))?;
 
-            let enc_mask_arr =
-                Array2::from_shape_vec([1, enc_mask.len()], enc_mask.to_vec())
-                    .context("shape encoder_attention_mask")?;
+            let enc_mask_arr = Array2::from_shape_vec([1, enc_mask.len()], enc_mask.to_vec())
+                .context("shape encoder_attention_mask")?;
             let enc_mask_tensor = Tensor::<i64>::from_array(enc_mask_arr)
                 .map_err(|e| anyhow::anyhow!("encoder_attention_mask tensor: {e}"))?;
 
@@ -249,9 +259,7 @@ impl VisionBackend {
                 data[offset..offset + vocab]
                     .iter()
                     .enumerate()
-                    .max_by(|(_, a), (_, b)| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, _)| i as i64)
                     .unwrap_or(BART_EOS_ID)
             };
@@ -278,8 +286,7 @@ impl VisionBackend {
     /// Extract all text from the image using Florence-2's OCR task.
     pub fn ocr(&self, image_bytes: &[u8]) -> Result<OcrOutput> {
         let pixel_values = self.preprocess_image(image_bytes)?;
-        let (enc_data, enc_seq, enc_hidden, enc_mask) =
-            self.run_encoder(pixel_values, "<OCR>")?;
+        let (enc_data, enc_seq, enc_hidden, enc_mask) = self.run_encoder(pixel_values, "<OCR>")?;
         let token_ids = self.greedy_decode(&enc_data, enc_seq, enc_hidden, &enc_mask)?;
         let text = self.decode_tokens(&token_ids)?;
 
@@ -297,8 +304,7 @@ impl VisionBackend {
             "<REFERRING_EXPRESSION_SEGMENTATION>{}</REFERRING_EXPRESSION_SEGMENTATION>",
             query
         );
-        let (enc_data, enc_seq, enc_hidden, enc_mask) =
-            self.run_encoder(pixel_values, &prompt)?;
+        let (enc_data, enc_seq, enc_hidden, enc_mask) = self.run_encoder(pixel_values, &prompt)?;
         let token_ids = self.greedy_decode(&enc_data, enc_seq, enc_hidden, &enc_mask)?;
         let decoded = self.decode_tokens(&token_ids)?;
         let results = parse_loc_tokens(&decoded, query);

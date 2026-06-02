@@ -9,8 +9,7 @@ use std::sync::Arc;
 use tracing::info;
 
 fn guest_id() -> String {
-    std::env::var("PHILOTIC_VISION_GUEST_ID")
-        .unwrap_or_else(|_| "vision-01".to_string())
+    std::env::var("PHILOTIC_VISION_GUEST_ID").unwrap_or_else(|_| "vision-01".to_string())
 }
 
 fn vision_repo_id() -> String {
@@ -96,7 +95,9 @@ impl DatasourceProvider for OnnxVisionProvider {
                         .get("query")
                         .and_then(Value::as_str)
                         .unwrap_or("object");
-                    let out = backend.ground(&image_bytes, query).context("Florence-2 grounding")?;
+                    let out = backend
+                        .ground(&image_bytes, query)
+                        .context("Florence-2 grounding")?;
                     let boxes: Vec<Value> = out
                         .results
                         .iter()

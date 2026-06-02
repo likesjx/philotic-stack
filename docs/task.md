@@ -693,6 +693,12 @@ Seam IDs: `multi-hotel-route-consistency`, `cross-host-distributed-validation`, 
   - define “membrane home hotel” posture and failover expectations
   - keep laptop hotels mesh-visible and reachable without making them poller perimeters by default
   - prove reply/approval routing when ingress lives on `jane-vps` and cognition lives elsewhere
+- [ ] Implement [MEMBRANE_TRANSPORT_HOME_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_TRANSPORT_HOME_PROPOSAL.md) as the transport-agnostic version of that placement policy:
+  - [x] add graph-owned `membrane_transport_home` records for agent/transport/resource bindings
+  - [x] add governed `transport.set_home` control-plane mutation separate from `role.set_home`
+  - [x] make Telegram lease acquire/renew enforce active-home plus lease authority before acting
+  - [ ] make all membrane startup paths expose standby state before acting
+  - reconcile deployment/materialization from graph truth so YAML cannot resurrect old membrane homes
 - [ ] Define the first remote materialization ceremony:
   - mesh-visible intent
   - deterministic winning target selection

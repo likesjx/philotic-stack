@@ -579,6 +579,10 @@ vps-push:
 vps-config:
     cd ansible && ansible-playbook -i inventory/hosts.ini deploy_hotel.yml --limit jane-vps --skip-tags binary
 
+# Check that vps-jane host_vars peer ports match the live context graph.
+vps-port-drift-check:
+    ./scripts/check-hotel-port-drift.py --host-vars ansible/host_vars/jane-vps.yml --ssh-target vps-jane
+
 # Deploy to all hotel nodes: local (bjork) + mbp-jane + vps-jane.
 push-all:
     just local-push

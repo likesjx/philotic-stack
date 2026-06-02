@@ -16,8 +16,9 @@
 use crate::cron::CronJob;
 use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
-    ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState, RoutingPolicyEvaluationRecord,
-    RoutingPolicyRecord, RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
+    MembraneTransportHomeRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
+    RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, ToolsetProfileRecord,
+    WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
@@ -27,8 +28,8 @@ use crate::storage::{
 };
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
-use tracing::warn;
 use std::sync::Arc;
+use tracing::warn;
 
 mod kinds;
 pub use kinds::*;
@@ -599,11 +600,14 @@ impl GraphDomain {
         let mut out: Vec<SessionTurnRecord> = Vec::new();
         for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_TURN)? {
             if node.node_key.starts_with(&prefix) {
-                out.push(
-                    serde_json::from_value(node.data).context(
-                        "GraphDomain::list_session_turns: deserialize SessionTurnRecord",
-                    )?,
-                );
+                match serde_json::from_value::<SessionTurnRecord>(node.data) {
+                    Ok(record) => out.push(record),
+                    Err(e) => warn!(
+                        node_key = %node.node_key,
+                        error = %e,
+                        "list_session_turns: skipping malformed record"
+                    ),
+                }
             }
         }
         if limit > 0 && out.len() > limit {
@@ -767,6 +771,88 @@ impl GraphDomain {
             }
         }
         Ok(None)
+    }
+
+    // ── Membrane transport home methods ──────────────────────────────────────
+
+    fn membrane_transport_home_key(agent_id: &str, transport: &str, resource_ref: &str) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            NODE_KIND_MEMBRANE_TRANSPORT_HOME, agent_id, transport, resource_ref
+        )
+    }
+
+    pub fn upsert_membrane_transport_home(&self, home: &MembraneTransportHomeRecord) -> Result<()> {
+        let data = serde_json::to_value(home).context(
+            "GraphDomain::upsert_membrane_transport_home: serialize MembraneTransportHomeRecord",
+        )?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::membrane_transport_home_key(
+                &home.agent_id,
+                &home.transport,
+                &home.resource_ref,
+            ),
+            kind: NODE_KIND_MEMBRANE_TRANSPORT_HOME.to_string(),
+            label: Some(format!(
+                "{}:{}:{}",
+                home.agent_id, home.transport, home.resource_ref
+            )),
+            data,
+        })
+    }
+
+    pub fn get_membrane_transport_home(
+        &self,
+        agent_id: &str,
+        transport: &str,
+        resource_ref: &str,
+    ) -> Result<Option<MembraneTransportHomeRecord>> {
+        match self.adapter.get_node(&Self::membrane_transport_home_key(
+            agent_id,
+            transport,
+            resource_ref,
+        ))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_membrane_transport_home: deserialize MembraneTransportHomeRecord",
+            )?)),
+        }
+    }
+
+    pub fn list_membrane_transport_homes(
+        &self,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<MembraneTransportHomeRecord>> {
+        let prefix =
+            agent_id.map(|agent_id| format!("{}:{}:", NODE_KIND_MEMBRANE_TRANSPORT_HOME, agent_id));
+        let mut out = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_MEMBRANE_TRANSPORT_HOME)?
+        {
+            if prefix
+                .as_ref()
+                .is_none_or(|prefix| node.node_key.starts_with(prefix))
+            {
+                out.push(serde_json::from_value(node.data).context(
+                    "GraphDomain::list_membrane_transport_homes: deserialize MembraneTransportHomeRecord",
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve explicit graph-owned placement for a membrane transport.
+    ///
+    /// Missing records intentionally resolve to `None`; callers that still have
+    /// transitional config fallbacks must name that fallback at their boundary.
+    pub fn resolve_membrane_transport_home(
+        &self,
+        agent_id: &str,
+        transport: &str,
+        resource_ref: &str,
+    ) -> Result<Option<MembraneTransportHomeRecord>> {
+        self.get_membrane_transport_home(agent_id, transport, resource_ref)
     }
 
     // ── Secret methods ────────────────────────────────────────────────────────
@@ -1402,14 +1488,16 @@ impl GraphDomain {
 
     /// Return model profiles for `task_kind` on `node_id`, sorted by health then latency.
     /// Degraded or unavailable models are included but sorted last.
-    pub fn best_model_for(&self, task_kind: &str, node_id: &str) -> Result<Vec<ModelProfileRecord>> {
+    pub fn best_model_for(
+        &self,
+        task_kind: &str,
+        node_id: &str,
+    ) -> Result<Vec<ModelProfileRecord>> {
         let mut profiles: Vec<ModelProfileRecord> = self
             .list_model_profiles()?
             .into_iter()
             .filter(|p| p.node_id == node_id)
-            .filter(|p| {
-                p.task_kinds.is_empty() || p.task_kinds.iter().any(|t| t == task_kind)
-            })
+            .filter(|p| p.task_kinds.is_empty() || p.task_kinds.iter().any(|t| t == task_kind))
             .collect();
 
         profiles.sort_by(|a, b| {
@@ -1800,6 +1888,103 @@ mod tests {
 
         let by_guest = d.list_role_incarnations_by_guest_id("guest-1").unwrap();
         assert_eq!(by_guest.len(), 1);
+    }
+
+    #[test]
+    fn membrane_transport_home_roundtrip_list_and_resolve() {
+        let d = make_domain();
+        let home = MembraneTransportHomeRecord {
+            agent_id: "agent-beacon".to_string(),
+            transport: "telegram".to_string(),
+            resource_ref: "telegram_bot_token_beacon".to_string(),
+            active_home_hotel: "vps-jane".to_string(),
+            standby_hotels: vec!["mbp-jane".to_string(), "mac-jane".to_string()],
+            managed_by_role: "orchestrator".to_string(),
+            lease_type: "telegram_poll".to_string(),
+            failover_policy: "manual-or-explicit-delegation".to_string(),
+            status: crate::graph::MembraneTransportHomeStatus::Active,
+        };
+
+        d.upsert_membrane_transport_home(&home).unwrap();
+
+        let loaded = d
+            .get_membrane_transport_home("agent-beacon", "telegram", "telegram_bot_token_beacon")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.active_home_hotel, "vps-jane");
+        assert!(loaded.is_active_home("vps-jane"));
+        assert!(loaded.is_standby_home("mbp-jane"));
+        assert!(!loaded.is_active_home("mbp-jane"));
+
+        let resolved = d
+            .resolve_membrane_transport_home(
+                "agent-beacon",
+                "telegram",
+                "telegram_bot_token_beacon",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, home);
+
+        assert_eq!(d.list_membrane_transport_homes(None).unwrap().len(), 1);
+        assert_eq!(
+            d.list_membrane_transport_homes(Some("agent-beacon"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(d
+            .list_membrane_transport_homes(Some("agent-bjork"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn membrane_transport_home_is_distinct_from_role_home() {
+        use crate::graph::TurnLoopConfig;
+        let d = make_domain();
+        d.upsert_role_incarnation(&RoleIncarnationRecord {
+            agent_id: "agent-beacon".to_string(),
+            role_name: "orchestrator".to_string(),
+            guest_id: "guest-orchestrator".to_string(),
+            toolset_profile: "default".to_string(),
+            role_identity_addendum: None,
+            role_manifest: None,
+            is_admin: true,
+            readiness_state: RoleReadinessState::Configured,
+            inactive_ttl_seconds: None,
+            turn_loop_config: TurnLoopConfig::default(),
+            home_node: Some("mac-jane".to_string()),
+        })
+        .unwrap();
+        d.upsert_membrane_transport_home(&MembraneTransportHomeRecord {
+            agent_id: "agent-beacon".to_string(),
+            transport: "telegram".to_string(),
+            resource_ref: "telegram_bot_token_beacon".to_string(),
+            active_home_hotel: "vps-jane".to_string(),
+            standby_hotels: vec!["mac-jane".to_string()],
+            managed_by_role: "orchestrator".to_string(),
+            lease_type: "telegram_poll".to_string(),
+            failover_policy: "manual-or-explicit-delegation".to_string(),
+            status: crate::graph::MembraneTransportHomeStatus::Active,
+        })
+        .unwrap();
+
+        let role = d
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .unwrap()
+            .unwrap();
+        let transport_home = d
+            .resolve_membrane_transport_home(
+                "agent-beacon",
+                "telegram",
+                "telegram_bot_token_beacon",
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(role.home_node.as_deref(), Some("mac-jane"));
+        assert_eq!(transport_home.active_home_hotel, "vps-jane");
     }
 
     // ── Secret ────────────────────────────────────────────────────────────────

@@ -3,11 +3,11 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
 pub mod adapter;
-pub mod capability;
 pub mod agent;
 pub mod agent_graph_storage;
 pub mod authz;
 pub mod beacon;
+pub mod capability;
 pub mod catalog_rights;
 pub mod cron;
 pub mod cursor;
@@ -87,7 +87,9 @@ pub struct NodeConstraints {
 
 /// Ordered trust levels for network exposure. Higher = more exposed = more enforcement.
 /// Used as a ceiling on hotel listeners and as a required field on MCP endpoint configs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ExposureTier {
     /// Loopback/UDS only. IPC-equivalent trust. No auth ever required.

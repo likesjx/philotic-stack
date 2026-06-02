@@ -17,7 +17,6 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use ansible_mesh_core::ExposureTier;
 use crate::auth::{AllotmentTracker, VaultHashCache, VaultResolver, authorize_call};
 use crate::protocol::{
     InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse, McpToolDescriptor,
@@ -26,6 +25,7 @@ use crate::protocol::{
 };
 use crate::routing::{SharedEndpointTable, SharedRoutingTable};
 use crate::transform;
+use ansible_mesh_core::ExposureTier;
 
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Approval-required routes park the HTTP connection for up to 5 minutes.
@@ -122,9 +122,11 @@ async fn handle_mcp(
                 "error": { "code": -32001, "message": message }
             });
             return (
-                axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
+                axum::http::StatusCode::from_u16(status)
+                    .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
                 axum::Json(body),
-            ).into_response();
+            )
+                .into_response();
         }
     }
 

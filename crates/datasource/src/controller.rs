@@ -62,16 +62,10 @@ impl DatasourceTask {
 
         Ok(Self {
             kind,
-            provider: get("provider")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            provider: get("provider").and_then(Value::as_str).map(str::to_string),
             db: get("db").and_then(Value::as_str).map(str::to_string),
-            graph_id: get("graph_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            query: get("query")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            graph_id: get("graph_id").and_then(Value::as_str).map(str::to_string),
+            query: get("query").and_then(Value::as_str).map(str::to_string),
             // For ToolExecutionPayload dispatch, the entire arguments object serves as
             // parameters when no explicit "parameters" key is present.
             parameters: get("parameters")

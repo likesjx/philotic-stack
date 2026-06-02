@@ -1,9 +1,9 @@
 ---
 title: Philotic Seam Registry
 doc_type: workflow
-domain: '`tooling-execution`'
+domain: workflow-docs
 status: active
-last_updated: 2026-04-10
+last_updated: 2026-05-29
 tags:
 - seams
 - ids
@@ -16,6 +16,7 @@ related_docs:
 - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
 - GRAPH_AS_SOURCE_OF_TRUTH.md
 - GLOSSARY.md
+task_refs:
 - docs/task.md
 ---
 
@@ -55,6 +56,9 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `session-preapproval-ux` | `runtime-sessions` | [APPROVAL_UX_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/APPROVAL_UX_PROPOSAL.md) | `docs/task.md` → `Approval UX evolution` |
 | `telegram-poll-lease` | `membrane-transport` | [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) | smoke-green | `docs/task.md` → Telegram poll ownership slices |
 | `delegated-telegram-polling` | `membrane-transport` | [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) | `docs/task.md` → `Telegram poll lease mesh authority` |
+| `membrane-transport-home` | `membrane-transport` | MEMBRANE_TRANSPORT_HOME_PROPOSAL (intel-graph) | proposed | `docs/task.md` → `New Project: Multi-Hotel Component Distribution` |
+| `mesh-visible-poll-authority` | `membrane-transport` | MEMBRANE_TRANSPORT_HOME_PROPOSAL (intel-graph) | proposed | `docs/task.md` → `Telegram poll lease mesh authority` and transport-home follow-ons |
+| `membrane-materialization` | `membrane-transport` | [MCP_MEMBRANE_GATEWAY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MCP_MEMBRANE_GATEWAY_PROPOSAL.md) | proposed | `docs/task.md` → membrane materialization and transport-home follow-ons |
 | `webhook-security-contract` | `membrane-transport` | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) | `docs/task.md` → Telegram integration follow-on work |
 | `watched-live-telegram-validation` | `membrane-transport` | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) | `docs/task.md` → Telegram watched-live follow-ons |
 | `a2a-membrane-contract` | `membrane-transport` | [MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md) | `docs/task.md` → external membrane transport follow-ons |

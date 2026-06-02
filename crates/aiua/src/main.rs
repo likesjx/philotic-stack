@@ -63,6 +63,40 @@ fn profile_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".philotic").join(profile))
 }
 
+fn agent_graph_db_path(agent_id: &str) -> Option<String> {
+    if let Ok(dir) = std::env::var("PHILOTIC_AGENT_GRAPH_DATABASE_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(
+                PathBuf::from(dir)
+                    .join(format!("agent-graph-{agent_id}.db"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+
+    if let Ok(dir) = std::env::var("PHILOTIC_GRAPH_DATABASE_DIR") {
+        if !dir.trim().is_empty() {
+            let graph_dir = PathBuf::from(dir);
+            let data_dir = graph_dir.parent().unwrap_or(graph_dir.as_path());
+            return Some(
+                data_dir
+                    .join("agent-graphs")
+                    .join(format!("agent-graph-{agent_id}.db"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+
+    profile_dir().map(|dir| {
+        dir.join("agent-graphs")
+            .join(format!("agent-graph-{agent_id}.db"))
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::EventEnvelope;
 use auth::AuthCommand;
@@ -2282,6 +2316,20 @@ fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRe
     let hotel = default_hotel_record(hotel_name);
     let socket_path = hotel.ipc_socket_path;
     let guest_id = format!("{hotel_name}:agent-graph-{}", profile.agent_id);
+    let mut env = serde_json::json!({
+        "PHILOTIC_AGENT_ID": profile.agent_id,
+        "PHILOTIC_GRAPH_RUNNER_ID": guest_id,
+        "PHILOTIC_HOTEL_SOCKET": socket_path,
+        "PHILOTIC_IPC_SOCKET": socket_path
+    });
+    if let Some(db_path) = agent_graph_db_path(&profile.agent_id) {
+        if let Some(env) = env.as_object_mut() {
+            env.insert(
+                "PHILOTIC_AGENT_GRAPH_DB".into(),
+                serde_json::Value::String(db_path),
+            );
+        }
+    }
     GuestRecord {
         hotel_name: hotel_name.to_string(),
         guest_id: guest_id.clone(),
@@ -2289,12 +2337,7 @@ fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRe
         config_json: serde_json::json!({
             "command": "agent-datasource",
             "args": [],
-            "env": {
-                "PHILOTIC_AGENT_ID": profile.agent_id,
-                "PHILOTIC_GRAPH_RUNNER_ID": guest_id,
-                "PHILOTIC_HOTEL_SOCKET": socket_path,
-                "PHILOTIC_IPC_SOCKET": socket_path
-            }
+            "env": env
         })
         .to_string(),
         is_active: true,
@@ -2306,7 +2349,11 @@ fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRe
 /// Hotel-level shared guests: one membrane for all agents, plus model controllers.
 /// `blob_port` must come from the stored hotel record (via `reconcile_hotel_record`),
 /// not from `default_hotel_record`, to avoid writing a stale hash-derived URL.
-fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile], blob_port: u16) -> Vec<GuestRecord> {
+fn hotel_shared_guests(
+    hotel_name: &str,
+    profiles: &[AgentProfile],
+    blob_port: u16,
+) -> Vec<GuestRecord> {
     let hotel = default_hotel_record(hotel_name);
     let socket_path = hotel.ipc_socket_path;
     let blob_base_url = format!("http://127.0.0.1:{}", blob_port);
@@ -2551,7 +2598,11 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile], blob_port: u
 /// Legacy single-profile seed — used in tests that expect the old per-profile layout.
 #[cfg(test)]
 fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<GuestRecord> {
-    let mut guests = hotel_shared_guests(hotel_name, std::slice::from_ref(profile), default_hotel_record(hotel_name).blob_port);
+    let mut guests = hotel_shared_guests(
+        hotel_name,
+        std::slice::from_ref(profile),
+        default_hotel_record(hotel_name).blob_port,
+    );
     guests.push(agent_guests_for_profile(hotel_name, profile));
     guests.push(agent_graph_runner_guest(hotel_name, profile));
     guests
@@ -3145,6 +3196,44 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "transport.set_home".into(),
+            description: "Pin an external membrane transport resource to the one hotel that may \
+                          own its inbound poller or gateway. This is separate from role.set_home: \
+                          roles may run elsewhere while a single stable hotel owns scarce \
+                          transport ingress. Requires transport, resource_ref, target_hotel, \
+                          and reason; standby_hotels is optional."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "transport": {
+                        "type": "string",
+                        "description": "Transport implementation name, e.g. 'telegram', 'discord', or 'desktop'."
+                    },
+                    "resource_ref": {
+                        "type": "string",
+                        "description": "Stable transport resource reference, such as a bot token key."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "Hotel node_id/name that should own the active poller or gateway."
+                    },
+                    "standby_hotels": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional standby hotels allowed for explicit future failover."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this transport belongs on this hotel."
+                    }
+                },
+                "required": ["transport", "resource_ref", "target_hotel", "reason"]
+            }),
+            class: "config".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
             tool_name: "bash.exec".into(),
             description: "Last-resort shell execution. Runs a shell command and returns stdout, \
                           stderr, and exit code. Use ONLY when no Philotic-native tool can \
@@ -3542,6 +3631,8 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             description: "Govern role definitions and placement for the current agent identity. \
                           Call role.list first to see the current roster, then use role.configure \
                           to update a role or role.set_home to pin a role to a specific hotel. \
+                          Use transport.set_home for external membrane ownership such as Telegram \
+                          pollers; it is distinct from role placement. \
                           Reason explicitly about purpose, capability posture, handoff behavior, \
                           and limits before proposing any change.".into(),
             implied_tools: vec![
@@ -3549,6 +3640,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "role.list".into(),
                 "role.configure".into(),
                 "role.set_home".into(),
+                "transport.set_home".into(),
                 "agent.configure".into(),
             ],
             ..Default::default()
@@ -3962,6 +4054,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "role.create_or_update".into(),
                 "role.list".into(),
                 "role.set_home".into(),
+                "transport.set_home".into(),
                 "rule.propose".into(),
                 "routing.policy.propose".into(),
                 "mcp.provision".into(),
@@ -4110,6 +4203,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "role.create_or_update".into(),
                 "role.list".into(),
                 "role.set_home".into(),
+                "transport.set_home".into(),
                 "rule.propose".into(),
                 "routing.policy.propose".into(),
                 "mcp.provision".into(),
@@ -4295,6 +4389,7 @@ Your roles are pre-configured and persist in the hotel database. They survive re
 - Use role.list to see your full role roster, their toolset profiles, and readiness state.
 - Use role.configure to update an existing role's manifest, toolset profile, or loop config.
 - Use role.set_home to pin a role to a specific hotel (or clear the pin to run on this hotel).
+- Use transport.set_home to pin external membrane ingress (Telegram, Discord, desktop chat) to one active hotel.
 - Do NOT create new roles speculatively — the roster is set by the operator. If you need a new role, surface the request explicitly and wait for operator approval.
 - After any role update, hand off only when the operator asked to use it immediately.
 
@@ -6502,7 +6597,11 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         all_desired_guests.push(agent_guests_for_profile(hotel_name, profile));
         all_desired_guests.push(agent_graph_runner_guest(hotel_name, profile));
     }
-    all_desired_guests.extend(hotel_shared_guests(hotel_name, &all_profiles, hotel.blob_port));
+    all_desired_guests.extend(hotel_shared_guests(
+        hotel_name,
+        &all_profiles,
+        hotel.blob_port,
+    ));
 
     deactivate_legacy_managed_guests(
         &graph_domain,
@@ -7608,6 +7707,41 @@ mod tests {
             std::env::remove_var("PHILOTIC_PROFILE");
             std::env::remove_var("PHILOTIC_GRAPH_DATABASE_DIR");
             std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn agent_graph_guest_uses_writable_data_dir() {
+        unsafe {
+            std::env::set_var("PHILOTIC_GRAPH_DATABASE_DIR", "/opt/philotic/data/graphs");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DATABASE_DIR");
+            std::env::remove_var("PHILOTIC_PROFILE");
+        }
+
+        let guests = guest_seed_for_profile(
+            "beacon-test-hotel",
+            &AgentProfile {
+                agent_key: "beacon".into(),
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+                import_workspace: None,
+                is_admin: false,
+                orchestrator_turn_loop_config: None,
+            },
+        );
+        let agent_graph = guests
+            .iter()
+            .find(|guest| guest.role == "agent-graph")
+            .expect("agent graph guest");
+        let config: serde_json::Value = serde_json::from_str(&agent_graph.config_json).unwrap();
+
+        assert_eq!(
+            config["env"]["PHILOTIC_AGENT_GRAPH_DB"].as_str(),
+            Some("/opt/philotic/data/agent-graphs/agent-graph-agent-beacon.db")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_GRAPH_DATABASE_DIR");
         }
     }
 

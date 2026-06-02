@@ -1497,7 +1497,11 @@ pub struct AttemptPolicy {
 
 impl Default for AttemptPolicy {
     fn default() -> Self {
-        Self { connect_secs: 20, idle_secs: 10, total_secs: 35 }
+        Self {
+            connect_secs: 20,
+            idle_secs: 10,
+            total_secs: 35,
+        }
     }
 }
 
@@ -1518,7 +1522,12 @@ pub struct RetryableErrorClass {
 
 impl Default for RetryableErrorClass {
     fn default() -> Self {
-        Self { network_reset: true, streaming_timeout: true, provider_5xx: true, rate_limit: false }
+        Self {
+            network_reset: true,
+            streaming_timeout: true,
+            provider_5xx: true,
+            rate_limit: false,
+        }
     }
 }
 
@@ -1533,7 +1542,11 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { max_attempts: 2, backoff: BackoffStrategy::Linear { step_ms: 500 }, retryable: RetryableErrorClass::default() }
+        Self {
+            max_attempts: 2,
+            backoff: BackoffStrategy::Linear { step_ms: 500 },
+            retryable: RetryableErrorClass::default(),
+        }
     }
 }
 
@@ -1544,10 +1557,14 @@ pub trait ModelProvider: Send + Sync {
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput>;
 
     /// Per-attempt timing budget.  The runtime enforces `total_secs` as an outer timeout.
-    fn attempt_policy(&self) -> AttemptPolicy { AttemptPolicy::default() }
+    fn attempt_policy(&self) -> AttemptPolicy {
+        AttemptPolicy::default()
+    }
 
     /// Retry budget.  Invariant: `attempt_policy().total_secs × retry_policy().max_attempts < 120s`.
-    fn retry_policy(&self) -> RetryPolicy { RetryPolicy::default() }
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
 
     /// Whether this provider supports streaming token delivery for the given task.
     /// When true, the runtime may call `invoke_streaming` instead of `invoke`.

@@ -39,6 +39,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "agent.configure",
             "role.create_or_update",
             "role.set_home",
+            "transport.set_home",
         ],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &[
@@ -115,6 +116,7 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "agent.configure",
             "role.create_or_update",
             "role.set_home",
+            "transport.set_home",
             "hotel.best_place_to_run",
         ],
         "role.authoring" => &["role.create_or_update"],
@@ -1181,6 +1183,48 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["role_name", "reason"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "transport.set_home".into(),
+        ToolDefinition {
+            tool_name: "transport.set_home".into(),
+            description: "Pin an external membrane transport resource to the one hotel that may \
+                          own its inbound poller or gateway. Use this for scarce ingress like \
+                          Telegram long polling, Discord gateway sessions, or desktop chat \
+                          surfaces. This is separate from role.set_home: roles may run elsewhere \
+                          while a single stable hotel owns the transport. Requires operator \
+                          approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "transport": {
+                        "type": "string",
+                        "description": "Transport implementation name, e.g. 'telegram', 'discord', or 'desktop'."
+                    },
+                    "resource_ref": {
+                        "type": "string",
+                        "description": "Stable transport resource reference, such as a bot token key."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "Hotel node_id/name that should own the active poller or gateway."
+                    },
+                    "standby_hotels": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional standby hotels allowed for explicit future failover."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this transport belongs on this hotel. Required for operator visibility."
+                    }
+                },
+                "required": ["transport", "resource_ref", "target_hotel", "reason"]
             }),
             class: Some("config".into()),
         },

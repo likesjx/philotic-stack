@@ -1547,11 +1547,13 @@ async fn acquire_telegram_poll_lease(
     ipc_client: &mut PhiloticClient,
     lease_key: &str,
     agent_id: &str,
+    resource_ref: &str,
 ) -> Result<u64> {
     match ipc_client
         .send_request(IpcRequest::AcquireTelegramPollLease {
             lease_key: lease_key.to_string(),
             agent_id: agent_id.to_string(),
+            resource_ref: Some(resource_ref.to_string()),
         })
         .await?
     {
@@ -1579,12 +1581,14 @@ async fn renew_telegram_poll_lease(
     ipc_client: &mut PhiloticClient,
     lease_key: &str,
     agent_id: &str,
+    resource_ref: &str,
     lease_epoch: u64,
 ) -> Result<u64> {
     match ipc_client
         .send_request(IpcRequest::RenewTelegramPollLease {
             lease_key: lease_key.to_string(),
             agent_id: agent_id.to_string(),
+            resource_ref: Some(resource_ref.to_string()),
             lease_epoch,
         })
         .await?
@@ -1702,6 +1706,7 @@ async fn run_seat_impl(
         &mut ipc_client,
         &poll_lease_key,
         &target_agent_id,
+        &telegram_token_key,
     )
     .await
     {
@@ -2209,6 +2214,7 @@ async fn run_seat_impl(
                 &mut ipc_client,
                 &poll_lease_key,
                 &target_agent_id,
+                &telegram_token_key,
                 poll_lease_epoch,
             )
             .await

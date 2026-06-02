@@ -605,7 +605,7 @@ fn should_escalate_tier(error: &TaskErrorPayload) -> bool {
 }
 
 /// Default tier ordering when none is configured in TurnLoopConfig.
-const DEFAULT_FALLBACK_TIERS: &[&str] = &["model", "model.local"];
+const DEFAULT_FALLBACK_TIERS: &[&str] = &["model", "model.ollama", "model.local"];
 
 /// Model role for a given tier index. Falls back gracefully when index is out of range.
 fn role_for_tier<'a>(configured_tiers: &'a [String], tier: u8) -> &'a str {
@@ -2375,7 +2375,8 @@ impl AgentRuntime {
                         // re-authentication. Log and let the turn complete — the fence on
                         // the listener side will enforce on the next inbound request.
                         warn!(
-                            ?previous, ?current,
+                            ?previous,
+                            ?current,
                             "Security perimeter ceiling raised — stricter enforcement now active"
                         );
                     } else {
@@ -4847,12 +4848,11 @@ impl AgentRuntime {
                         ok: true,
                         data: Some(result),
                         ..
-                    } => serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| result.to_string()),
+                    } => {
+                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+                    }
                     IpcResponse::Standard {
-                        ok: false,
-                        message,
-                        ..
+                        ok: false, message, ..
                     } => format!("Capability call failed: {message}"),
                     other => format!(
                         "Unexpected hotel response for capability '{}': {other:?}",
@@ -9621,10 +9621,7 @@ impl AgentRuntime {
                 .await
             }
             "agent.migrate_to" => {
-                let dest_hotel = match payload
-                    .arguments
-                    .get("dest_hotel")
-                    .and_then(|v| v.as_str())
+                let dest_hotel = match payload.arguments.get("dest_hotel").and_then(|v| v.as_str())
                 {
                     Some(h) => h.to_string(),
                     None => {
@@ -9645,18 +9642,27 @@ impl AgentRuntime {
                     })
                     .await;
                 let content = match result {
-                    Ok(IpcResponse::Standard { ok: true, message, .. }) => if message.is_empty() {
-                        format!("Migration to '{}' dispatched.", dest_hotel)
-                    } else {
-                        message
-                    },
-                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => {
+                        if message.is_empty() {
+                            format!("Migration to '{}' dispatched.", dest_hotel)
+                        } else {
+                            message
+                        }
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
                         return self
                             .fail_active_turn(
                                 payload.session_id,
                                 payload.turn_id,
                                 if message.is_empty() {
-                                    format!("agent.migrate_to: migration to '{}' failed", dest_hotel)
+                                    format!(
+                                        "agent.migrate_to: migration to '{}' failed",
+                                        dest_hotel
+                                    )
                                 } else {
                                     message
                                 },
@@ -10709,6 +10715,173 @@ impl AgentRuntime {
                 }
             }
 
+            "transport.set_home" => {
+                let args = payload.arguments.as_object();
+                let transport = args
+                    .and_then(|a| a.get("transport"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let resource_ref = args
+                    .and_then(|a| a.get("resource_ref"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let target_hotel = args
+                    .and_then(|a| a.get("target_hotel"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let standby_hotels = args
+                    .and_then(|a| a.get("standby_hotels"))
+                    .and_then(|v| v.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let reason = args
+                    .and_then(|a| a.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(transport) = transport else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "transport.set_home: missing required argument 'transport'".into(),
+                        )
+                        .await;
+                };
+                let Some(resource_ref) = resource_ref else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "transport.set_home: missing required argument 'resource_ref'".into(),
+                        )
+                        .await;
+                };
+                let Some(target_hotel) = target_hotel else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "transport.set_home: missing required argument 'target_hotel'".into(),
+                        )
+                        .await;
+                };
+                let Some(reason) = reason else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "transport.set_home: missing required argument 'reason'".into(),
+                        )
+                        .await;
+                };
+
+                let calling_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .unwrap_or_else(|| "orchestrator".into());
+
+                let _ = reason;
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::SetTransportHome {
+                        agent_id: self.agent_id.clone(),
+                        transport: transport.clone(),
+                        resource_ref: resource_ref.clone(),
+                        calling_role,
+                        target_hotel: target_hotel.clone(),
+                        standby_hotels,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::TransportHomeSet {
+                        transport,
+                        resource_ref,
+                        active_home_hotel,
+                        standby_hotels,
+                        ..
+                    }) => {
+                        let standby = if standby_hotels.is_empty() {
+                            "no standby hotels".to_string()
+                        } else {
+                            format!("standby hotels: {}", standby_hotels.join(", "))
+                        };
+                        (
+                            format!(
+                                "Transport '{transport}' resource '{resource_ref}' now homes on hotel '{active_home_hotel}' ({standby})."
+                            ),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "transport.set_home",
+                            msg,
+                            Some("SET_TRANSPORT_HOME_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "transport.set_home: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("transport.set_home: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
+            }
+
             "role.list" => {
                 let (content, tool_err) = match self
                     .ipc_client
@@ -11388,8 +11561,7 @@ impl AgentRuntime {
                             .get("libs_available")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        let guest_id =
-                            data.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?");
+                        let guest_id = data.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?");
                         let profile_status = data
                             .get("model_profile_status")
                             .and_then(|v| v.as_str())
@@ -12015,11 +12187,7 @@ impl AgentRuntime {
                 };
                 let mut handoff_back_attempt = 0u32;
                 let (content, tool_err) = loop {
-                    match self
-                        .ipc_client
-                        .send_request(handoff_back_req.clone())
-                        .await
-                    {
+                    match self.ipc_client.send_request(handoff_back_req.clone()).await {
                         Ok(IpcResponse::HandoffBackAck {
                             return_guest_id, ..
                         }) => {
@@ -13610,7 +13778,11 @@ impl AgentRuntime {
 
             // ── mcp.status ───────────────────────────────────────────────────
             "mcp.status" => {
-                let endpoint_id = match payload.arguments.get("endpoint_id").and_then(|v| v.as_str()) {
+                let endpoint_id = match payload
+                    .arguments
+                    .get("endpoint_id")
+                    .and_then(|v| v.as_str())
+                {
                     Some(s) if !s.trim().is_empty() => s.to_string(),
                     _ => {
                         return self

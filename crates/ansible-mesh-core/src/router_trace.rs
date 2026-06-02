@@ -289,36 +289,38 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
 
         let mut stats: Vec<ProviderStats> = buckets
             .into_iter()
-            .map(|((provider_id, task_kind), (total, successes, mut latencies))| {
-                let failures = total - successes;
-                let success_rate = if total == 0 {
-                    0.0
-                } else {
-                    successes as f64 / total as f64
-                };
-                let avg_latency_ms = if latencies.is_empty() {
-                    None
-                } else {
-                    Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
-                };
-                let p90_latency_ms = if latencies.is_empty() {
-                    None
-                } else {
-                    latencies.sort_unstable();
-                    let idx = (latencies.len() as f64 * 0.90) as usize;
-                    Some(latencies[idx.min(latencies.len() - 1)])
-                };
-                ProviderStats {
-                    provider_id,
-                    task_kind,
-                    total_calls: total,
-                    success_count: successes,
-                    failure_count: failures,
-                    success_rate,
-                    avg_latency_ms,
-                    p90_latency_ms,
-                }
-            })
+            .map(
+                |((provider_id, task_kind), (total, successes, mut latencies))| {
+                    let failures = total - successes;
+                    let success_rate = if total == 0 {
+                        0.0
+                    } else {
+                        successes as f64 / total as f64
+                    };
+                    let avg_latency_ms = if latencies.is_empty() {
+                        None
+                    } else {
+                        Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64)
+                    };
+                    let p90_latency_ms = if latencies.is_empty() {
+                        None
+                    } else {
+                        latencies.sort_unstable();
+                        let idx = (latencies.len() as f64 * 0.90) as usize;
+                        Some(latencies[idx.min(latencies.len() - 1)])
+                    };
+                    ProviderStats {
+                        provider_id,
+                        task_kind,
+                        total_calls: total,
+                        success_count: successes,
+                        failure_count: failures,
+                        success_rate,
+                        avg_latency_ms,
+                        p90_latency_ms,
+                    }
+                },
+            )
             .collect();
 
         stats.sort_by(|a, b| {
@@ -458,12 +460,17 @@ mod tests {
     fn provider_stats_aggregates_success_and_failure() {
         let (s, _f) = open_tmp();
         // 3 gemini successes + 1 failure for text.generate
-        s.record_trace(&make_record(1, "gemini", "aria", "success")).unwrap();
-        s.record_trace(&make_record(2, "gemini", "aria", "success")).unwrap();
-        s.record_trace(&make_record(3, "gemini", "aria", "success")).unwrap();
-        s.record_trace(&make_record(4, "gemini", "aria", "failure")).unwrap();
+        s.record_trace(&make_record(1, "gemini", "aria", "success"))
+            .unwrap();
+        s.record_trace(&make_record(2, "gemini", "aria", "success"))
+            .unwrap();
+        s.record_trace(&make_record(3, "gemini", "aria", "success"))
+            .unwrap();
+        s.record_trace(&make_record(4, "gemini", "aria", "failure"))
+            .unwrap();
         // 1 elevenlabs success for text.generate
-        s.record_trace(&make_record(5, "elevenlabs", "aria", "success")).unwrap();
+        s.record_trace(&make_record(5, "elevenlabs", "aria", "success"))
+            .unwrap();
 
         let stats = s.provider_stats(None).unwrap();
         let gemini = stats

@@ -19,6 +19,7 @@ pub const NODE_KIND_SESSION_PARTICIPANT: &str = "session_participant";
 pub const NODE_KIND_SESSION_TURN: &str = "session_turn";
 pub const NODE_KIND_SESSION_EVENT: &str = "session_event";
 pub const NODE_KIND_ROLE_INCARNATION: &str = "role_incarnation";
+pub const NODE_KIND_MEMBRANE_TRANSPORT_HOME: &str = "membrane_transport_home";
 pub const NODE_KIND_SECRET: &str = "secret";
 pub const NODE_KIND_ABSTRACT_SKILL: &str = "abstract_skill";
 pub const NODE_KIND_WORKFLOW_SKILL: &str = "workflow_skill";

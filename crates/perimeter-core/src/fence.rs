@@ -5,7 +5,10 @@ use ansible_mesh_core::ExposureTier;
 pub enum IngressDecision {
     Allow,
     /// Request denied by the fence. `status` is the HTTP status code (401/403).
-    Deny { status: u16, message: String },
+    Deny {
+        status: u16,
+        message: String,
+    },
 }
 
 impl IngressDecision {

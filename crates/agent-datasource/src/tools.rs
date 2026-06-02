@@ -106,16 +106,33 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
         "routing_preference" => {
             let preference_key = match args.get("preference_key").and_then(Value::as_str) {
                 Some(v) => v,
-                None => return json!({"ok": false, "error": "missing 'preference_key'"}).to_string(),
+                None => {
+                    return json!({"ok": false, "error": "missing 'preference_key'"}).to_string()
+                }
             };
             let pref = AgentRoutingPreference {
                 agent_id: agent_id.to_string(),
                 preference_key: preference_key.to_string(),
-                stage_kind: args.get("stage_kind").and_then(Value::as_str).map(str::to_string),
-                capability: args.get("capability").and_then(Value::as_str).map(str::to_string),
-                provider_hint: args.get("provider_hint").and_then(Value::as_str).map(str::to_string),
-                model_ref: args.get("model_ref").and_then(Value::as_str).map(str::to_string),
-                preference_level: args.get("preference_level").and_then(Value::as_i64).unwrap_or(0) as i32,
+                stage_kind: args
+                    .get("stage_kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                capability: args
+                    .get("capability")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                provider_hint: args
+                    .get("provider_hint")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                model_ref: args
+                    .get("model_ref")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                preference_level: args
+                    .get("preference_level")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32,
                 weight: args.get("weight").and_then(Value::as_i64).unwrap_or(0) as i32,
                 config_json: args.get("config").cloned().unwrap_or_else(|| json!({})),
                 updated_at: 0,
@@ -128,11 +145,16 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
         "reflex_preference" => {
             let preference_key = match args.get("preference_key").and_then(Value::as_str) {
                 Some(v) => v,
-                None => return json!({"ok": false, "error": "missing 'preference_key'"}).to_string(),
+                None => {
+                    return json!({"ok": false, "error": "missing 'preference_key'"}).to_string()
+                }
             };
             let reflexes_json = match args.get("reflexes") {
                 Some(v) if v.is_object() => v.clone(),
-                Some(_) => return json!({"ok": false, "error": "'reflexes' must be an object"}).to_string(),
+                Some(_) => {
+                    return json!({"ok": false, "error": "'reflexes' must be an object"})
+                        .to_string()
+                }
                 None => return json!({"ok": false, "error": "missing 'reflexes'"}).to_string(),
             };
             let pref = AgentReflexPreference {

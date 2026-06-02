@@ -163,9 +163,12 @@ mod tests {
 
     #[test]
     fn default_allow_permits() {
-        let policies = [(ExposureTier::Internet, internet_policy(EgressDefaultAction::Allow))]
-            .into_iter()
-            .collect();
+        let policies = [(
+            ExposureTier::Internet,
+            internet_policy(EgressDefaultAction::Allow),
+        )]
+        .into_iter()
+        .collect();
         assert_eq!(
             evaluate_egress_policy(&policies, &req("https://api.example.com/v1")),
             EgressDecision::Allow
@@ -174,10 +177,15 @@ mod tests {
 
     #[test]
     fn default_deny_blocks() {
-        let policies = [(ExposureTier::Internet, internet_policy(EgressDefaultAction::Deny))]
-            .into_iter()
-            .collect();
-        assert!(!evaluate_egress_policy(&policies, &req("https://api.example.com/v1")).is_allowed());
+        let policies = [(
+            ExposureTier::Internet,
+            internet_policy(EgressDefaultAction::Deny),
+        )]
+        .into_iter()
+        .collect();
+        assert!(
+            !evaluate_egress_policy(&policies, &req("https://api.example.com/v1")).is_allowed()
+        );
     }
 
     #[test]
@@ -185,7 +193,9 @@ mod tests {
         let mut policy = internet_policy(EgressDefaultAction::Allow);
         policy.denied_hosts = vec!["api.example.com".into()];
         let policies = [(ExposureTier::Internet, policy)].into_iter().collect();
-        assert!(!evaluate_egress_policy(&policies, &req("https://api.example.com/v1")).is_allowed());
+        assert!(
+            !evaluate_egress_policy(&policies, &req("https://api.example.com/v1")).is_allowed()
+        );
     }
 
     #[test]
@@ -201,15 +211,19 @@ mod tests {
         let mut policy = internet_policy(EgressDefaultAction::Allow);
         policy.allowed_hosts = vec!["api.example.com".into()];
         let policies = [(ExposureTier::Internet, policy)].into_iter().collect();
-        assert!(!evaluate_egress_policy(&policies, &req("https://other.example.com/v1")).is_allowed());
+        assert!(
+            !evaluate_egress_policy(&policies, &req("https://other.example.com/v1")).is_allowed()
+        );
     }
 
     #[test]
     fn audit_variant_is_allowed() {
-        let policies =
-            [(ExposureTier::Internet, internet_policy(EgressDefaultAction::AllowWithAudit))]
-                .into_iter()
-                .collect();
+        let policies = [(
+            ExposureTier::Internet,
+            internet_policy(EgressDefaultAction::AllowWithAudit),
+        )]
+        .into_iter()
+        .collect();
         let decision = evaluate_egress_policy(&policies, &req("https://api.example.com/v1"));
         assert!(decision.is_allowed());
         assert_eq!(decision, EgressDecision::AllowWithAudit);
@@ -217,7 +231,10 @@ mod tests {
 
     #[test]
     fn host_parsing() {
-        assert_eq!(host_from_url("https://api.perplexity.ai/chat"), Some("api.perplexity.ai"));
+        assert_eq!(
+            host_from_url("https://api.perplexity.ai/chat"),
+            Some("api.perplexity.ai")
+        );
         assert_eq!(host_from_url("http://localhost:8080/v1"), Some("localhost"));
         assert_eq!(host_from_url("https://example.com"), Some("example.com"));
     }

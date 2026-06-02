@@ -8,7 +8,7 @@
       - curl
     state: present
     update_cache: yes
-  when: ansible_os_family == 'Debian'
+  when: ansible_facts["os_family"] == 'Debian'
 
 # ── Service user ───────────────────────────────────────────────────────────────
 
@@ -115,6 +115,7 @@
     owner: "{{ philotic_user }}"
     group: "{{ philotic_group }}"
     mode: "0600"
+  no_log: true
   notify: Restart philotic-hotel
 
 # ── Agent workspace access ─────────────────────────────────────────────────────
@@ -128,6 +129,7 @@
     mode: "o+rX"
   loop: "{{ philotic_agents | dict2items }}"
   when: item.value.import_workspace is defined
+  no_log: true
   ignore_errors: yes
 
 # ── Tailscale (transitional peer networking) ───────────────────────────────────
@@ -135,6 +137,12 @@
 - name: Check if Tailscale is installed
   command: which tailscale
   register: tailscale_check
+  failed_when: false
+  changed_when: false
+
+- name: Check if UFW is installed
+  command: which ufw
+  register: ufw_check
   failed_when: false
   changed_when: false
 
@@ -153,7 +161,9 @@
     rule: allow
     port: "{{ philotic_beacon_port }}"
     proto: udp
-  when: ansible_os_family == 'Debian'
+  when:
+    - ansible_facts["os_family"] == 'Debian'
+    - ufw_check.rc == 0
   ignore_errors: yes
 
 - name: Allow blob HTTP port (TCP, Tailscale-only — restrict if needed)
@@ -162,7 +172,9 @@
     port: "{{ philotic_blob_port }}"
     proto: tcp
     src: "100.64.0.0/10"  # Tailscale CGNAT range (transitional)
-  when: ansible_os_family == 'Debian'
+  when:
+    - ansible_facts["os_family"] == 'Debian'
+    - ufw_check.rc == 0
   ignore_errors: yes
 
 # ── Secrets ────────────────────────────────────────────────────────────────────
@@ -174,6 +186,7 @@
     owner: "{{ philotic_user }}"
     group: "{{ philotic_group }}"
     mode: "0600"
+  no_log: true
   notify: Restart philotic-hotel
 
 - name: Seed hotel graph/config from mesh-config.json
@@ -291,6 +304,7 @@
     port: "{{ philotic_onnx_sidecar_port }}"
     proto: tcp
   when:
-    - ansible_os_family == "Debian"
+    - ansible_facts["os_family"] == "Debian"
     - philotic_onnx_sidecar_enabled
+    - ufw_check.rc == 0
   ignore_errors: yes

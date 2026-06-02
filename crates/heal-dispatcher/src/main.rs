@@ -1,8 +1,7 @@
-use anyhow::Result;
 use ansible_mesh_core::heal_queue::HealQueueRow;
+use anyhow::Result;
 use philotic_client::{
-    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_graceful_shutdown,
-    is_ipc_disconnect,
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_graceful_shutdown, is_ipc_disconnect,
 };
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -51,8 +50,8 @@ async fn run() -> Result<()> {
     // Optional: Ollama base URL for Gemma-powered classification.
     let ollama_url = std::env::var("PHILOTIC_OLLAMA_URL")
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let ollama_model = std::env::var("PHILOTIC_HEAL_MODEL")
-        .unwrap_or_else(|_| "gemma3:4b".to_string());
+    let ollama_model =
+        std::env::var("PHILOTIC_HEAL_MODEL").unwrap_or_else(|_| "gemma3:4b".to_string());
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -93,7 +92,10 @@ async fn dispatch_cycle(
         return Ok(());
     }
 
-    info!(count = rows.len(), "heal-dispatcher: processing pending entries");
+    info!(
+        count = rows.len(),
+        "heal-dispatcher: processing pending entries"
+    );
 
     for row in rows {
         process_row(ipc, http, ollama_url, ollama_model, &row).await;
@@ -175,7 +177,11 @@ async fn classify(
 fn rule_classify(text: &str) -> Option<(String, String, String)> {
     let t = text.to_lowercase();
     if t.contains("connection refused") || t.contains("econnrefused") {
-        return Some(("high".into(), "connection_refused".into(), "restart_guest".into()));
+        return Some((
+            "high".into(),
+            "connection_refused".into(),
+            "restart_guest".into(),
+        ));
     }
     if t.contains("401 unauthorized") || t.contains("unauthorized") {
         return Some(("high".into(), "auth_failure".into(), "escalate".into()));
@@ -243,11 +249,7 @@ Output only the JSON object, no other text."#
 
 // ── Action executor ───────────────────────────────────────────────────────────
 
-async fn execute_action(
-    ipc: &mut PhiloticClient,
-    guest_id: &str,
-    heal_action: &str,
-) -> String {
+async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &str) -> String {
     match heal_action {
         "restart_guest" => {
             info!(guest_id, "heal-dispatcher: requesting guest restart");
@@ -271,7 +273,10 @@ async fn execute_action(
             }
         }
         "escalate" => {
-            warn!(guest_id, "heal-dispatcher: escalating — operator attention required");
+            warn!(
+                guest_id,
+                "heal-dispatcher: escalating — operator attention required"
+            );
             "escalated".into()
         }
         _ => "noop".into(),

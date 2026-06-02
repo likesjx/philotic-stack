@@ -94,7 +94,9 @@ impl CapabilityRequest {
 
     /// Convenience: add a text input.
     pub fn with_text(mut self, content: impl Into<String>) -> Self {
-        self.inputs.push(CapabilityInput::Text { content: content.into() });
+        self.inputs.push(CapabilityInput::Text {
+            content: content.into(),
+        });
         self
     }
 
@@ -128,12 +130,16 @@ impl CapabilityRequest {
 
     /// Return the first image input, if any.
     pub fn first_image(&self) -> Option<&CapabilityInput> {
-        self.inputs.iter().find(|i| matches!(i, CapabilityInput::Image { .. }))
+        self.inputs
+            .iter()
+            .find(|i| matches!(i, CapabilityInput::Image { .. }))
     }
 
     /// Return the first audio input, if any.
     pub fn first_audio(&self) -> Option<&CapabilityInput> {
-        self.inputs.iter().find(|i| matches!(i, CapabilityInput::Audio { .. }))
+        self.inputs
+            .iter()
+            .find(|i| matches!(i, CapabilityInput::Audio { .. }))
     }
 }
 
@@ -179,7 +185,9 @@ pub enum CapabilityEvent {
 
 impl CapabilityEvent {
     pub fn chunk(delta: impl Into<String>) -> Self {
-        Self::Chunk { delta: delta.into() }
+        Self::Chunk {
+            delta: delta.into(),
+        }
     }
 
     pub fn result(data: Value) -> Self {
@@ -195,7 +203,10 @@ impl CapabilityEvent {
     }
 
     pub fn error(message: impl Into<String>, code: Option<String>) -> Self {
-        Self::Error { message: message.into(), code }
+        Self::Error {
+            message: message.into(),
+            code,
+        }
     }
 
     pub fn is_terminal(&self) -> bool {

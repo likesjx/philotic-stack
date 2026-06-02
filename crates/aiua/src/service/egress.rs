@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::ExposureTier;
+use ansible_mesh_core::domain::GraphDomain;
 use async_trait::async_trait;
 use perimeter_core::egress::{
     EgressCredential, EgressDecision, EgressGateway, EgressPolicy, EgressRequest,
@@ -42,10 +42,7 @@ impl EgressGateway for HotelEgressGateway {
         evaluate_egress_policy(&self.policies, request)
     }
 
-    async fn inject_credentials(
-        &self,
-        request: &mut EgressRequest,
-    ) -> anyhow::Result<()> {
+    async fn inject_credentials(&self, request: &mut EgressRequest) -> anyhow::Result<()> {
         let policy = match self.policies.get(&request.tier) {
             Some(p) => p,
             None => return Ok(()),

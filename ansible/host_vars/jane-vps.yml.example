@@ -16,16 +16,11 @@ philotic_backbone_peers:
     beacon_port: 24849
     blob_port: 24850
     execution_port: 24851
-  - name: "local-telegram"
-    host: "100.64.230.106"
-    beacon_port: 16370
-    blob_port: 16370
-    execution_port: 16371
   - name: "mbp-jane"
     host: "100.79.239.64"
-    beacon_port: 13104
-    blob_port: 13105
-    execution_port: 13106
+    beacon_port: 13106
+    blob_port: 13107
+    execution_port: 13108
 
 # Agent configuration projected into mesh-config.json.
 # Do not put secrets here — reference vault variables instead.

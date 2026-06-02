@@ -424,13 +424,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     attempt + 1,
                                     retry.max_attempts
                                 );
-                                emit_dispatch_status(
-                                    &mut ipc_client,
-                                    &reply,
-                                    attempt,
-                                    "retrying",
-                                )
-                                .await;
+                                emit_dispatch_status(&mut ipc_client, &reply, attempt, "retrying")
+                                    .await;
                                 if let BackoffStrategy::Linear { step_ms } = retry.backoff {
                                     tokio::time::sleep(Duration::from_millis(
                                         step_ms * u64::from(attempt),
@@ -578,7 +573,12 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 None,
                             );
                             if let Some(ref gd) = graph_domain {
-                                if let Err(e) = gd.observe_model_outcome(&provider_id, &local_node_id(), latency_ms, true) {
+                                if let Err(e) = gd.observe_model_outcome(
+                                    &provider_id,
+                                    &local_node_id(),
+                                    latency_ms,
+                                    true,
+                                ) {
                                     warn!("observe_model_outcome (success): {e}");
                                 }
                             }
@@ -666,7 +666,12 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 None,
                             );
                             if let Some(ref gd) = graph_domain {
-                                if let Err(e) = gd.observe_model_outcome(&provider_id, &local_node_id(), latency_ms, false) {
+                                if let Err(e) = gd.observe_model_outcome(
+                                    &provider_id,
+                                    &local_node_id(),
+                                    latency_ms,
+                                    false,
+                                ) {
                                     warn!("observe_model_outcome (failure): {e}");
                                 }
                             }

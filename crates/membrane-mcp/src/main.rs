@@ -241,7 +241,11 @@ impl MembraneGuest for McpMembrane {
             // provides a secondary update in case the inbox push races or is missed.
             let current = *current;
             *self.state.ingress_tier.write().unwrap() = current;
-            info!(?previous, ?current, "Ingress fence tier updated from PerimeterShift broadcast");
+            info!(
+                ?previous,
+                ?current,
+                "Ingress fence tier updated from PerimeterShift broadcast"
+            );
             return Ok(true);
         }
 
@@ -396,7 +400,9 @@ async fn main() -> Result<()> {
     let endpoint_table = new_shared_endpoint_table();
 
     // Default to Local (safest). Updated via update_perimeter push once the hotel connects.
-    let ingress_tier = Arc::new(std::sync::RwLock::new(ansible_mesh_core::ExposureTier::Local));
+    let ingress_tier = Arc::new(std::sync::RwLock::new(
+        ansible_mesh_core::ExposureTier::Local,
+    ));
 
     let state = Arc::new(MembraneState {
         routing_table: table,

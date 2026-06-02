@@ -53,15 +53,16 @@ fn is_tailscale_cgnat(addr: Ipv4Addr) -> bool {
 
 fn is_rfc1918(addr: Ipv4Addr) -> bool {
     let o = addr.octets();
-    o[0] == 10
-        || (o[0] == 172 && (o[1] & 0xF0) == 16)
-        || (o[0] == 192 && o[1] == 168)
+    o[0] == 10 || (o[0] == 172 && (o[1] & 0xF0) == 16) || (o[0] == 192 && o[1] == 168)
 }
 
 pub enum ClassifyResult {
     Definite(ExposureTier),
     /// Classification succeeded but required a conservative assumption — caller should log.
-    Conservative { tier: ExposureTier, reason: &'static str },
+    Conservative {
+        tier: ExposureTier,
+        reason: &'static str,
+    },
 }
 
 impl ClassifyResult {

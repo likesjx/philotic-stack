@@ -97,12 +97,12 @@ pub(crate) struct RoleSubscriber {
 }
 
 #[cfg(not(test))]
-const TELEGRAM_POLL_LEASE_TTL_SECS: u64 = 45;
+const TELEGRAM_POLL_LEASE_TTL_SECS: u64 = 90;
 #[cfg(test)]
 const TELEGRAM_POLL_LEASE_TTL_SECS: u64 = 1;
 
 #[cfg(not(test))]
-const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 45;
+const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 90;
 #[cfg(test)]
 const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 1;
 
@@ -112,7 +112,7 @@ const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 900;
 const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 5;
 
 #[cfg(not(test))]
-const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 45;
+const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 90;
 #[cfg(test)]
 const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 1;
 
@@ -3708,21 +3708,24 @@ impl IpcServer {
                 .any(|hotel| hotel == local_hotel_name)
     }
 
+    /// Returns:
+    /// - `Ok(Some(true))`  — transport home registered and matches this hotel
+    /// - `Ok(Some(false))` — transport home registered but points elsewhere → MISMATCH
+    /// - `Ok(None)`        — no transport home registered; caller should apply authority check
+    /// - `Err(e)`          — DB lookup error
     fn hotel_may_poll_transport_home(
         graph: &GraphDomain,
-        agent_identity: &ansible_mesh_core::storage::AgentIdentityRecord,
         agent_id: &str,
         transport: &str,
         resource_ref: &str,
         local_hotel_name: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<bool>, String> {
         match graph.resolve_membrane_transport_home(agent_id, transport, resource_ref) {
-            Ok(Some(home)) => Ok(home.status == MembraneTransportHomeStatus::Active
-                && home.active_home_hotel == local_hotel_name),
-            Ok(None) => Ok(Self::hotel_may_poll_for_agent(
-                agent_identity,
-                local_hotel_name,
+            Ok(Some(home)) => Ok(Some(
+                home.status == MembraneTransportHomeStatus::Active
+                    && home.active_home_hotel == local_hotel_name,
             )),
+            Ok(None) => Ok(None),
             Err(err) => Err(err.to_string()),
         }
     }
@@ -6923,14 +6926,13 @@ impl IpcServer {
                 let transport_resource_ref = resource_ref.as_deref().unwrap_or(&lease_key);
                 match Self::hotel_may_poll_transport_home(
                     graph,
-                    &agent_identity,
                     &agent_id,
                     "telegram",
                     transport_resource_ref,
                     &local_hotel_name,
                 ) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(Some(true)) => {}
+                    Ok(Some(false)) => {
                         return IpcResponse::error(
                             "telegram_poll_lease",
                             "LEASE_TRANSPORT_HOME_MISMATCH",
@@ -6939,6 +6941,18 @@ impl IpcServer {
                                 local_hotel_name, agent_id, transport_resource_ref
                             ),
                         );
+                    }
+                    Ok(None) => {
+                        if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
+                            return IpcResponse::error(
+                                "telegram_poll_lease",
+                                "LEASE_FOREIGN_AUTHORITY",
+                                format!(
+                                    "agent [{}] is owned by hotel [{}] and hotel [{}] is not authorized",
+                                    agent_id, agent_identity.authority_hotel, local_hotel_name
+                                ),
+                            );
+                        }
                     }
                     Err(err) => {
                         return IpcResponse::error(
@@ -7052,14 +7066,13 @@ impl IpcServer {
                 let transport_resource_ref = resource_ref.as_deref().unwrap_or(&lease_key);
                 match Self::hotel_may_poll_transport_home(
                     graph,
-                    &agent_identity,
                     &agent_id,
                     "telegram",
                     transport_resource_ref,
                     &local_hotel_name,
                 ) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(Some(true)) => {}
+                    Ok(Some(false)) => {
                         return IpcResponse::error(
                             "telegram_poll_lease",
                             "LEASE_TRANSPORT_HOME_MISMATCH",
@@ -7068,6 +7081,18 @@ impl IpcServer {
                                 local_hotel_name, agent_id, transport_resource_ref
                             ),
                         );
+                    }
+                    Ok(None) => {
+                        if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
+                            return IpcResponse::error(
+                                "telegram_poll_lease",
+                                "LEASE_FOREIGN_AUTHORITY",
+                                format!(
+                                    "agent [{}] is owned by hotel [{}] and hotel [{}] is not authorized",
+                                    agent_id, agent_identity.authority_hotel, local_hotel_name
+                                ),
+                            );
+                        }
                     }
                     Err(err) => {
                         return IpcResponse::error(

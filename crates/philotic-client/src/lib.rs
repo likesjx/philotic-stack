@@ -1,11 +1,11 @@
 pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
+pub use ansible_mesh_core::graph::RoleIncarnationRecord;
 pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
 };
-pub use ansible_mesh_core::storage::ComponentManifest;
 pub use ansible_mesh_core::storage::AgentIdentityRecord;
-pub use ansible_mesh_core::graph::RoleIncarnationRecord;
+pub use ansible_mesh_core::storage::ComponentManifest;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -816,6 +816,8 @@ pub enum IpcRequest {
     AcquireTelegramPollLease {
         lease_key: String,
         agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_ref: Option<String>,
     },
     AcquireDesktopMembraneLease {
         lease_key: String,
@@ -892,6 +894,15 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_hotel: Option<String>,
     },
+    SetTransportHome {
+        agent_id: String,
+        transport: String,
+        resource_ref: String,
+        calling_role: String,
+        target_hotel: String,
+        #[serde(default)]
+        standby_hotels: Vec<String>,
+    },
     SetOperatorTargetComponentActive {
         target_node_id: String,
         guest_id: String,
@@ -925,6 +936,8 @@ pub enum IpcRequest {
     RenewTelegramPollLease {
         lease_key: String,
         agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource_ref: Option<String>,
         lease_epoch: u64,
     },
     RenewDesktopMembraneLease {
@@ -1944,6 +1957,15 @@ pub enum IpcResponse {
         role_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         home_node: Option<String>,
+    },
+    /// Response to [`IpcRequest::SetTransportHome`].
+    TransportHomeSet {
+        agent_id: String,
+        transport: String,
+        resource_ref: String,
+        active_home_hotel: String,
+        #[serde(default)]
+        standby_hotels: Vec<String>,
     },
     /// Response to [`IpcRequest::ExecuteWorkflow`].
     WorkflowExecutionOk {

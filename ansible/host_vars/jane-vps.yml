@@ -11,7 +11,7 @@ philotic_repo_branch: "codex/hegemon-membrane-slice"
 # Agents
 philotic_agents:
   beacon:
-    agent_id: "agent-beacon-01"
+    agent_id: "agent-beacon"
     persona_name: "Beacon"
     import_workspace: "/home/deploy/apps/jane/data/workspace-chief-of-staff"
     telegram:
@@ -45,16 +45,11 @@ philotic_backbone_peers:
     beacon_port: 24849
     blob_port: 24850
     execution_port: 24851
-  - name: "local-telegram"
-    host: "100.64.230.106"
-    beacon_port: 16370
-    blob_port: 16370
-    execution_port: 16371
   - name: "mbp-jane"
     host: "100.79.239.64"
-    beacon_port: 13104
-    blob_port: 13105
-    execution_port: 13106
+    beacon_port: 13106
+    blob_port: 13107
+    execution_port: 13108
 
 philotic_enable_rust_auth: "1"
 philotic_enable_rust_dispatcher: "1"

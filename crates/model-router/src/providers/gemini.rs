@@ -1,5 +1,5 @@
 use crate::controller::{
-    AttemptPolicy, AttachmentInput, ControllerTask, ModelProvider, NativeLiveProvider,
+    AttachmentInput, AttemptPolicy, ControllerTask, ModelProvider, NativeLiveProvider,
     NativeLiveTurnOutput, ProviderOutput, RetryPolicy, TaskKind,
 };
 use anyhow::{Context, Result, bail};
@@ -675,12 +675,17 @@ impl GeminiProvider {
             }
             let bytes = response.bytes().await?.to_vec();
             if mime_type.starts_with("audio/") {
-                let normalized =
-                    normalize_audio(bytes, &mime_type, CodecProvider::Gemini, self.codec_cache.as_ref(), "ffmpeg")
-                        .await
-                        .with_context(|| {
-                            format!("media-codec: failed to normalize audio [{mime_type}] for Gemini")
-                        })?;
+                let normalized = normalize_audio(
+                    bytes,
+                    &mime_type,
+                    CodecProvider::Gemini,
+                    self.codec_cache.as_ref(),
+                    "ffmpeg",
+                )
+                .await
+                .with_context(|| {
+                    format!("media-codec: failed to normalize audio [{mime_type}] for Gemini")
+                })?;
                 parts.push(json!({
                     "inline_data": {
                         "mime_type": normalized.mime_type,
@@ -1215,7 +1220,11 @@ impl GeminiProvider {
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join("");
-        if combined.is_empty() { None } else { Some(combined) }
+        if combined.is_empty() {
+            None
+        } else {
+            Some(combined)
+        }
     }
 
     /// Parse one SSE line and return the full chunk Value if it contains a `functionCall`
@@ -1367,7 +1376,11 @@ impl ModelProvider for GeminiProvider {
         // total_secs must be >= STREAMING_TOTAL_SECS (provider's internal cap).
         // Invariant: total_secs × retry_policy.max_attempts < philote watchdog (120s).
         // 35 × 2 = 70s < 120s ✓
-        AttemptPolicy { connect_secs: STREAMING_CONNECT_SECS, idle_secs: STREAMING_IDLE_SECS, total_secs: 35 }
+        AttemptPolicy {
+            connect_secs: STREAMING_CONNECT_SECS,
+            idle_secs: STREAMING_IDLE_SECS,
+            total_secs: 35,
+        }
     }
 
     fn retry_policy(&self) -> RetryPolicy {
@@ -1375,7 +1388,12 @@ impl ModelProvider for GeminiProvider {
         RetryPolicy {
             max_attempts: 2,
             backoff: BackoffStrategy::Linear { step_ms: 800 },
-            retryable: RetryableErrorClass { network_reset: true, streaming_timeout: true, provider_5xx: true, rate_limit: false },
+            retryable: RetryableErrorClass {
+                network_reset: true,
+                streaming_timeout: true,
+                provider_5xx: true,
+                rate_limit: false,
+            },
         }
     }
 

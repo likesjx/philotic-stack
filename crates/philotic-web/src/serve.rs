@@ -3720,7 +3720,14 @@ async fn handle_mesh_invite_create(
         )
             .into_response();
     }
-    match ipc_create_mesh_invite(&state.socket, state.hotel.as_str(), body.mesh_host.trim(), body.ttl_secs).await {
+    match ipc_create_mesh_invite(
+        &state.socket,
+        state.hotel.as_str(),
+        body.mesh_host.trim(),
+        body.ttl_secs,
+    )
+    .await
+    {
         Ok(data) => Json(json!({
             "ok": true,
             "hotel_name": state.hotel.as_str(),
@@ -5267,9 +5274,7 @@ async fn ipc_create_mesh_invite(
             ..
         } => Ok(data),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
-        other => Err(anyhow!(
-            "unexpected mesh invite response: {other:?}"
-        )),
+        other => Err(anyhow!("unexpected mesh invite response: {other:?}")),
     }
 }
 

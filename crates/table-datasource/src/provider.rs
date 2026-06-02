@@ -51,7 +51,10 @@ impl SqliteTableProvider {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         info!(db = name, path = %path.display(), "table-datasource opened DB");
         let conn = Arc::new(Mutex::new(conn));
-        self.pool.lock().unwrap().insert(name.to_string(), conn.clone());
+        self.pool
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), conn.clone());
         Ok(conn)
     }
 
@@ -186,17 +189,20 @@ fn query_table(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
 
 // ── table.insert / table.upsert ───────────────────────────────────────────────
 
-fn insert_row(conn: &Connection, task: &DatasourceTask, or_replace: bool) -> Result<ProviderOutput> {
+fn insert_row(
+    conn: &Connection,
+    task: &DatasourceTask,
+    or_replace: bool,
+) -> Result<ProviderOutput> {
     let table = task
         .graph_id
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("table.insert/upsert requires graph_id (table name)"))?;
     validate_identifier(table)?;
 
-    let row = task
-        .parameters
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("table.insert/upsert requires parameters as JSON object (row)"))?;
+    let row = task.parameters.as_object().ok_or_else(|| {
+        anyhow::anyhow!("table.insert/upsert requires parameters as JSON object (row)")
+    })?;
 
     if row.is_empty() {
         bail!("table.insert/upsert row cannot be empty");
@@ -204,7 +210,11 @@ fn insert_row(conn: &Connection, task: &DatasourceTask, or_replace: bool) -> Res
 
     let cols: Vec<&str> = row.keys().map(String::as_str).collect();
     let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
-    let keyword = if or_replace { "INSERT OR REPLACE" } else { "INSERT" };
+    let keyword = if or_replace {
+        "INSERT OR REPLACE"
+    } else {
+        "INSERT"
+    };
     let sql = format!(
         "{keyword} INTO {table} ({cols}) VALUES ({vals})",
         cols = cols.join(", "),
@@ -277,7 +287,10 @@ fn update_rows(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
     let sql = if where_part.is_empty() {
         format!("UPDATE {table} SET {}", set_clauses.join(", "))
     } else {
-        format!("UPDATE {table} SET {} WHERE {where_part}", set_clauses.join(", "))
+        format!(
+            "UPDATE {table} SET {} WHERE {where_part}",
+            set_clauses.join(", ")
+        )
     };
 
     let affected = conn.execute(
@@ -285,7 +298,9 @@ fn update_rows(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
         rusqlite::params_from_iter(all_values.iter().map(|v| v.as_ref())),
     )?;
 
-    Ok(ProviderOutput::ResultSet(json!({ "rows_affected": affected })))
+    Ok(ProviderOutput::ResultSet(
+        json!({ "rows_affected": affected }),
+    ))
 }
 
 // ── table.delete ─────────────────────────────────────────────────────────────
@@ -314,17 +329,16 @@ fn delete_rows(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
         rusqlite::params_from_iter(owned_params.iter().map(|v| v.as_ref())),
     )?;
 
-    Ok(ProviderOutput::ResultSet(json!({ "rows_affected": affected })))
+    Ok(ProviderOutput::ResultSet(
+        json!({ "rows_affected": affected }),
+    ))
 }
 
 // ── table.list ───────────────────────────────────────────────────────────────
 
 fn list_dbs(provider: &SqliteTableProvider, _task: &DatasourceTask) -> Result<ProviderOutput> {
     let pool = provider.pool.lock().unwrap();
-    let dbs: Vec<Value> = pool
-        .keys()
-        .map(|name| json!({ "db": name }))
-        .collect();
+    let dbs: Vec<Value> = pool.keys().map(|name| json!({ "db": name })).collect();
     Ok(ProviderOutput::ResultSet(json!({ "databases": dbs })))
 }
 
@@ -633,7 +647,9 @@ mod tests {
             "table.exec",
             None,
             None,
-            Some("CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, status INTEGER DEFAULT 0)"),
+            Some(
+                "CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, status INTEGER DEFAULT 0)",
+            ),
             json!({}),
         ))
         .await
@@ -662,7 +678,9 @@ mod tests {
             .await
             .unwrap();
 
-        let ProviderOutput::ResultSet(r) = out else { panic!() };
+        let ProviderOutput::ResultSet(r) = out else {
+            panic!()
+        };
         assert_eq!(r["rows_affected"], 1);
 
         let query_out = p
@@ -675,7 +693,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        let ProviderOutput::ResultSet(Value::Array(rows)) = query_out else { panic!() };
+        let ProviderOutput::ResultSet(Value::Array(rows)) = query_out else {
+            panic!()
+        };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], "b");
     }
@@ -695,9 +715,15 @@ mod tests {
         .unwrap();
 
         for id in ["x", "y", "z"] {
-            p.invoke(&make_task("table.insert", None, Some("items"), None, json!({"id": id})))
-                .await
-                .unwrap();
+            p.invoke(&make_task(
+                "table.insert",
+                None,
+                Some("items"),
+                None,
+                json!({"id": id}),
+            ))
+            .await
+            .unwrap();
         }
 
         let out = p
@@ -710,7 +736,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        let ProviderOutput::ResultSet(r) = out else { panic!() };
+        let ProviderOutput::ResultSet(r) = out else {
+            panic!()
+        };
         assert_eq!(r["rows_affected"], 1);
 
         let query_out = p
@@ -723,7 +751,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        let ProviderOutput::ResultSet(Value::Array(rows)) = query_out else { panic!() };
+        let ProviderOutput::ResultSet(Value::Array(rows)) = query_out else {
+            panic!()
+        };
         assert_eq!(rows[0]["n"], 2);
     }
 
@@ -763,7 +793,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        let ProviderOutput::ResultSet(Value::Array(rows)) = out else { panic!() };
+        let ProviderOutput::ResultSet(Value::Array(rows)) = out else {
+            panic!()
+        };
         assert_eq!(rows[0]["n"], 0, "db_beta must be empty");
     }
 
@@ -896,7 +928,13 @@ mod tests {
         .unwrap();
 
         let out = p
-            .invoke(&make_task("table.schema", None, Some("meta"), None, json!({})))
+            .invoke(&make_task(
+                "table.schema",
+                None,
+                Some("meta"),
+                None,
+                json!({}),
+            ))
             .await
             .unwrap();
         let ProviderOutput::ResultSet(s) = out else {

@@ -312,6 +312,61 @@ impl RoleIncarnationRecord {
     }
 }
 
+/// Lifecycle state for an externally polled membrane transport home.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MembraneTransportHomeStatus {
+    #[default]
+    Active,
+    Paused,
+    Retired,
+    Blocked,
+}
+
+impl MembraneTransportHomeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Retired => "retired",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// Declares the single active hotel that may poll an external membrane transport.
+///
+/// Node kind: `membrane_transport_home`.
+/// Node key: `membrane_transport_home:{agent_id}:{transport}:{resource_ref}`.
+///
+/// This is deliberately distinct from [`RoleIncarnationRecord::home_node`]:
+/// role homes place cognitive/runtime guests, while transport homes place
+/// scarce external ingress like Telegram long polling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MembraneTransportHomeRecord {
+    pub agent_id: String,
+    pub transport: String,
+    pub resource_ref: String,
+    pub active_home_hotel: String,
+    #[serde(default)]
+    pub standby_hotels: Vec<String>,
+    pub managed_by_role: String,
+    pub lease_type: String,
+    pub failover_policy: String,
+    #[serde(default)]
+    pub status: MembraneTransportHomeStatus,
+}
+
+impl MembraneTransportHomeRecord {
+    pub fn is_active_home(&self, hotel_name: &str) -> bool {
+        self.status == MembraneTransportHomeStatus::Active && self.active_home_hotel == hotel_name
+    }
+
+    pub fn is_standby_home(&self, hotel_name: &str) -> bool {
+        self.standby_hotels.iter().any(|hotel| hotel == hotel_name)
+    }
+}
+
 /// A durable behavioral constraint stored in the context graph.
 ///
 /// Node kind: `rule`. Node key: `rule:{rule_id}`.
