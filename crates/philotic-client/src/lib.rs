@@ -1220,6 +1220,9 @@ pub enum IpcRequest {
     },
     /// Request the hotel's loaded MuninnDB configuration (vault tokens included).
     FetchMemoryConfig,
+    /// Force the hotel to re-probe MuninnDB reachability immediately and broadcast the result.
+    /// Responds with [`IpcResponse::MuninnStatus`].
+    RefreshMemoryConfig,
     /// Register a graph instance with the hotel's ODS so it can route graph_id → instance_id.
     /// Sent by the graph-runner on startup (for all existing graphs) and after each graph.create.
     RegisterGraphInstance {
@@ -2084,6 +2087,14 @@ pub enum IpcResponse {
     NetworkState {
         online: bool,
     },
+    /// Hotel → guest broadcast: MuninnDB reachability state changed.
+    /// Also the direct response to [`IpcRequest::RefreshMemoryConfig`].
+    /// When `available=false`, guests should fall back to `NullMemoryEngine`.
+    /// When `available=true`, guests should resume using the configured engine.
+    MuninnStatus {
+        available: bool,
+        endpoint: String,
+    },
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.
     ///
@@ -2380,6 +2391,7 @@ impl PhiloticClient {
             response,
             IpcResponse::UserProfileData(_)
                 | IpcResponse::NetworkState { .. }
+                | IpcResponse::MuninnStatus { .. }
                 // Lease notifications may be broadcast or arrive out-of-band on any connection.
                 // They are never the expected response to an unrelated request, so skip them.
                 | IpcResponse::McpMembraneLease { .. }

@@ -932,9 +932,12 @@ pub struct IpcServer {
     training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
     heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
     webrtc_signal_tx: Option<mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
-    /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
+    /// Broadcast channel for hotel-wide push events (e.g. NetworkState, MuninnStatus).
     /// The sender is cloned into each `handle_client` task for forwarding.
     network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
+    /// Tracks whether MuninnDB was reachable on the most recent probe. Shared with the
+    /// probe loop and per-connection handlers for inline `RefreshMemoryConfig` probes.
+    muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
     /// In-process channel for operator surface query tasks.
     /// When set, tasks addressed to `OPERATOR_SURFACE_QUERY_ROLE` are sent here
     /// instead of through the UDS inbox registry, eliminating the self-connection.
@@ -3881,6 +3884,7 @@ impl IpcServer {
             heal_queue: None,
             webrtc_signal_tx: None,
             network_broadcast,
+            muninn_reachable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             operator_surface_tx: None,
             perimeter_svc: None,
             egress_gw: None,
@@ -3996,6 +4000,17 @@ impl IpcServer {
             });
         }
 
+        // MuninnDB reachability probe — checks every 60s and broadcasts MuninnStatus on flip.
+        // Pushes to heal queue when the endpoint goes down so the heal-dispatcher can act.
+        if let Some(cfg) = self.muninn_config.clone() {
+            let reachable = self.muninn_reachable.clone();
+            let broadcast_tx = self.network_broadcast.clone();
+            let heal_queue = self.heal_queue.clone();
+            tokio::spawn(async move {
+                Self::run_muninn_probe_loop(cfg, reachable, broadcast_tx, heal_queue).await;
+            });
+        }
+
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -4016,9 +4031,11 @@ impl IpcServer {
                     let registry = self.registry.clone();
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
+                    let muninn_reachable = self.muninn_reachable.clone();
                     let training_storage = self.training_storage.clone();
                     let heal_queue = self.heal_queue.clone();
                     let webrtc_signal_tx = self.webrtc_signal_tx.clone();
+                    let network_broadcast_tx = self.network_broadcast.clone();
                     let network_broadcast_rx = self.network_broadcast.subscribe();
                     let operator_surface_tx = self.operator_surface_tx.clone();
                     let socket_path = self.socket_path.clone();
@@ -4044,10 +4061,12 @@ impl IpcServer {
                             registry,
                             peer_sockets,
                             muninn_config,
+                            muninn_reachable,
                             training_storage,
                             heal_queue,
                             webrtc_signal_tx,
                             network_broadcast_rx,
+                            network_broadcast_tx,
                             operator_surface_tx,
                             socket_path,
                             perimeter_svc,
@@ -4090,12 +4109,14 @@ impl IpcServer {
         registry: Arc<RwLock<NodeRegistry>>,
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+        muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
         training_storage: Option<
             Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
         >,
         heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
         webrtc_signal_tx: Option<mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
+        network_broadcast_tx: tokio::sync::broadcast::Sender<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
         socket_path: String,
         perimeter_svc: Option<Arc<crate::service::perimeter::HotelPerimeterService>>,
@@ -4164,6 +4185,39 @@ impl IpcServer {
                             "FetchMemoryConfig handled"
                         );
                         let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
+                    }
+                    Ok(IpcRequest::RefreshMemoryConfig) => {
+                        let endpoint = muninn_config
+                            .as_deref()
+                            .map(|c| c.base_url.clone())
+                            .unwrap_or_default();
+                        let available = if endpoint.is_empty() {
+                            false
+                        } else {
+                            let http = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5))
+                                .build()
+                                .unwrap_or_default();
+                            Self::probe_muninn_endpoint(&http, &endpoint).await
+                        };
+                        let was =
+                            muninn_reachable.swap(available, std::sync::atomic::Ordering::Relaxed);
+                        if available != was {
+                            let _ = network_broadcast_tx.send(IpcResponse::MuninnStatus {
+                                available,
+                                endpoint: endpoint.clone(),
+                            });
+                            if !available {
+                                if let Some(hq) = heal_queue.as_deref() {
+                                    let msg = format!(
+                                        "MuninnDB unreachable: connection refused at {endpoint}"
+                                    );
+                                    let _ = hq.push_error("hotel", &msg);
+                                }
+                            }
+                        }
+                        info!(available, "RefreshMemoryConfig probe complete");
+                        let _ = outbound_tx.send(IpcResponse::MuninnStatus { available, endpoint });
                     }
                     Ok(IpcRequest::GetPerimeterStatus) => {
                         use perimeter_core::service::PerimeterService as _;
@@ -5414,6 +5468,59 @@ impl IpcServer {
     }
 
     // ── end Golgi routing pipeline ────────────────────────────────────────────
+
+    // ── MuninnDB reachability probe ───────────────────────────────────────────
+
+    /// Returns `true` if the MuninnDB REST endpoint answers any HTTP request.
+    /// A connection error (refused, timeout) returns `false`; any HTTP response returns `true`.
+    async fn probe_muninn_endpoint(http: &reqwest::Client, endpoint: &str) -> bool {
+        match http.get(endpoint).send().await {
+            Ok(_) => true,
+            Err(e) if e.is_connect() || e.is_timeout() => false,
+            Err(_) => true, // redirect, TLS, etc. — server exists
+        }
+    }
+
+    /// Periodic MuninnDB probe loop. Spawned at hotel boot when MuninnDB is configured.
+    /// Checks every 60 seconds; on state flip broadcasts `MuninnStatus` to all guests and
+    /// pushes a heal-queue entry when the endpoint goes down.
+    async fn run_muninn_probe_loop(
+        config: Arc<memory_core::MuninnConfig>,
+        reachable: Arc<std::sync::atomic::AtomicBool>,
+        broadcast_tx: tokio::sync::broadcast::Sender<IpcResponse>,
+        heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+    ) {
+        let endpoint = config.base_url.clone();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let available = Self::probe_muninn_endpoint(&http, &endpoint).await;
+            let was = reachable.swap(available, std::sync::atomic::Ordering::Relaxed);
+            if available != was {
+                info!(available, endpoint = %endpoint, "MuninnDB reachability changed");
+                let _ = broadcast_tx.send(IpcResponse::MuninnStatus {
+                    available,
+                    endpoint: endpoint.clone(),
+                });
+                if !available {
+                    if let Some(hq) = heal_queue.as_deref() {
+                        let msg =
+                            format!("MuninnDB unreachable: connection refused at {endpoint}");
+                        if let Err(e) = hq.push_error("hotel", &msg) {
+                            warn!(error = %e, "Failed to push MuninnDB outage to heal queue");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── end MuninnDB reachability probe ───────────────────────────────────────
 
     fn configured_local_guest_exists(
         graph: &GraphDomain,
@@ -9854,10 +9961,10 @@ impl IpcServer {
                 )
             }
             // Handled before process_request is called (in handle_client).
-            IpcRequest::FetchMemoryConfig => IpcResponse::error(
+            IpcRequest::FetchMemoryConfig | IpcRequest::RefreshMemoryConfig => IpcResponse::error(
                 "memory",
                 "UNREACHABLE",
-                "FetchMemoryConfig dispatched early",
+                "FetchMemoryConfig/RefreshMemoryConfig dispatched early",
             ),
             IpcRequest::ListTrainingSamples { .. }
             | IpcRequest::CorrectTrainingSample { .. }

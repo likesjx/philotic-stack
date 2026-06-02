@@ -3891,6 +3891,8 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "memory.cultivate"
             | "memory.true_up"
             | "memory.promote_candidate"
+            | "memory.fix"
+            | "memory.status"
             | "rule.propose"
             | "routing.policy.propose"
             | "routing.reflex.set"

@@ -176,6 +176,14 @@ async fn classify(
 
 fn rule_classify(text: &str) -> Option<(String, String, String)> {
     let t = text.to_lowercase();
+    // MuninnDB outage — hotel pushes this exact phrase; handle before generic connection_refused.
+    if t.contains("muninndb unreachable") {
+        return Some((
+            "high".into(),
+            "muninn_unreachable".into(),
+            "refresh_memory_config".into(),
+        ));
+    }
     if t.contains("connection refused") || t.contains("econnrefused") {
         return Some((
             "high".into(),
@@ -269,6 +277,31 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
                 Err(e) => {
                     warn!(guest_id, "restart request error: {e}");
                     "restart_error".into()
+                }
+            }
+        }
+        "refresh_memory_config" => {
+            info!(guest_id, "heal-dispatcher: triggering immediate MuninnDB probe");
+            match ipc
+                .send_request(IpcRequest::RefreshMemoryConfig)
+                .await
+            {
+                Ok(IpcResponse::MuninnStatus { available, endpoint }) => {
+                    if available {
+                        info!(guest_id, endpoint = %endpoint, "MuninnDB probe succeeded — memory restored");
+                        "memory_restored".into()
+                    } else {
+                        warn!(guest_id, endpoint = %endpoint, "MuninnDB still unreachable after probe");
+                        "still_unreachable".into()
+                    }
+                }
+                Ok(resp) => {
+                    warn!(guest_id, ?resp, "refresh_memory_config got unexpected response");
+                    "probe_failed".into()
+                }
+                Err(e) => {
+                    warn!(guest_id, "refresh_memory_config IPC error: {e}");
+                    "probe_error".into()
                 }
             }
         }
