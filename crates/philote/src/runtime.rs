@@ -2226,6 +2226,10 @@ impl AgentRuntime {
         self.register_mcp_routes().await;
 
         loop {
+            // Run the watchdog every loop, not only on an idle receive timeout. A busy
+            // inbox must not keep a stuck active turn alive indefinitely.
+            self.evict_timed_out_turns().await;
+
             // Dispatch any tasks that were dequeued from a session's pending_user_tasks
             // after the previous turn completed. Processed before blocking on IPC so that
             // back-to-back voice memos are handled in order without additional round-trips.
@@ -2338,8 +2342,10 @@ impl AgentRuntime {
                             }
                         }
                         Ok(task) if task.action.as_deref() == Some("datasource_response") => {
+                            let task_ref = task.clone();
                             if let Err(err) = self.handle_datasource_response(task).await {
-                                warn!("Failed to handle datasource_response: {}", err);
+                                error!("Failed to handle datasource_response: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
                         Ok(task) if task.command.as_deref() == Some("context.capture") => {
@@ -4780,8 +4786,24 @@ impl AgentRuntime {
             // Store the tool call on the active turn BEFORE dispatching so that when the
             // result returns, handle_tool_result can recover the full (name + arguments)
             // pair for the working_tool_history. Without this, the fallback uses empty args.
-            if let Some(state) = self.sessions.get_mut(&session_id) {
+            let pending_checkpoint = if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.set_pending_tool_call(tool_call.clone());
+                state.set_active_turn_phase(TurnPhase::WaitingTool);
+                Some((
+                    state.checkpoint_memory_type(),
+                    state.checkpoint_json(),
+                    state.clone(),
+                ))
+            } else {
+                None
+            };
+            if let Some((checkpoint_memory_type, checkpoint_json, index_state)) =
+                pending_checkpoint
+            {
+                self.ipc_client
+                    .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+                    .await?;
+                self.sync_session_index(&index_state).await?;
             }
 
             // Emit a status message to membrane so the user sees what's happening.
@@ -4901,12 +4923,38 @@ impl AgentRuntime {
             Some(session_id) => session_id.to_string(),
             None => return Ok(()),
         };
-        let turn_id = match task.turn_id.as_deref().filter(|s| !s.is_empty()) {
-            Some(turn_id) => turn_id.to_string(),
-            None => return Ok(()),
+        let (turn_id, pending_tool_name) = {
+            let active_turn = self
+                .sessions
+                .get(&session_id)
+                .and_then(|state| state.active_turn.as_ref());
+            let pending_tool_name = active_turn
+                .and_then(|turn| turn.pending_tool_call.as_ref())
+                .map(|tool| tool.tool_name.clone());
+            let turn_id = task
+                .turn_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| active_turn.map(|turn| turn.turn_id.clone()));
+            let Some(turn_id) = turn_id else {
+                warn!(
+                    session_id = %session_id,
+                    "Dropping tool result without turn_id and without active turn"
+                );
+                return Ok(());
+            };
+            (turn_id, pending_tool_name)
         };
+        let tool_name = task
+            .tool_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .or(pending_tool_name)
+            .or_else(|| task.capability.clone().filter(|name| !name.is_empty()))
+            .unwrap_or_else(|| "unknown".into());
         let tool_result = ToolResult {
-            tool_name: task.tool_name.clone().unwrap_or_else(|| "unknown".into()),
+            tool_name,
             content: task.content.clone().unwrap_or_default(),
         };
 
@@ -7541,6 +7589,30 @@ impl AgentRuntime {
                 .unwrap_or(true);
 
         if !is_preload {
+            let active_turn = self
+                .sessions
+                .get(&session_id)
+                .and_then(|state| state.active_turn.as_ref());
+            let pending_tool_name = active_turn
+                .and_then(|turn| turn.pending_tool_call.as_ref())
+                .map(|tool| tool.tool_name.clone());
+            let turn_id = task
+                .turn_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .or_else(|| active_turn.map(|turn| turn.turn_id.clone()));
+            let chat_id = task
+                .chat_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .or_else(|| active_turn.map(|turn| turn.chat_id.clone()));
+            let tool_name = task
+                .tool_name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .or(pending_tool_name)
+                .or_else(|| task.capability.clone().filter(|name| !name.is_empty()));
+
             // Convert datasource success/failure into a tool_result the model can read.
             let content = if let Some(ref err) = task.error {
                 format!(
@@ -7560,9 +7632,9 @@ impl AgentRuntime {
                     action: Some("tool_result".into()),
                     content: Some(content),
                     session_id: task.session_id.clone(),
-                    turn_id: task.turn_id.clone(),
-                    chat_id: task.chat_id.clone(),
-                    tool_name: task.tool_name.clone(),
+                    turn_id,
+                    chat_id,
+                    tool_name,
                     ..Default::default()
                 })
                 .await;
