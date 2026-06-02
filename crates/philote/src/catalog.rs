@@ -48,6 +48,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "memory.cultivate",
             "memory.true_up",
             "memory.promote_candidate",
+            "memory.status",
+            "memory.fix",
         ],
         "routing.refinement" => &[
             "session.status",
@@ -2026,6 +2028,36 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 },
                 "required": ["candidate"]
             }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.status".into(),
+        ToolDefinition {
+            tool_name: "memory.status".into(),
+            description: "Report the current MuninnDB connection status: whether the hotel has \
+                          the endpoint configured, whether it was reachable on the last probe, \
+                          and how many vaults are registered. Use before memory.recall/remember \
+                          if you suspect a connection issue."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.fix".into(),
+        ToolDefinition {
+            tool_name: "memory.fix".into(),
+            description: "Diagnose and recover MuninnDB memory connectivity. Triggers an \
+                          immediate hotel-side reachability probe and returns the result. \
+                          If the probe succeeds, memory tools are re-enabled. If it fails, \
+                          the outage is recorded in the heal queue for dispatcher action. \
+                          Use when memory.recall or memory.remember report errors or when \
+                          memory.status shows unreachable."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
             class: Some("memory".into()),
         },
     );

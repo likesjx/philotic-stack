@@ -1441,6 +1441,9 @@ pub struct AgentRuntime {
     sessions: HashMap<String, SessionState>,
     /// MuninnDB config fetched from hotel at startup. None = NullMemoryEngine.
     muninn_config: Option<MuninnConfig>,
+    /// Tracks hotel-broadcast MuninnDB reachability. False = hotel reported endpoint down.
+    /// When false, `memory_engine_for` returns None even if `muninn_config` is set.
+    muninn_available: bool,
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
@@ -1471,6 +1474,7 @@ impl AgentRuntime {
             agent_id: agent_id.into(),
             sessions: HashMap::new(),
             muninn_config: None,
+            muninn_available: true,
             configured_roles: HashMap::new(),
             default_agent_profile: AgentProfile::default(),
             pending_drains: std::collections::VecDeque::new(),
@@ -1725,7 +1729,11 @@ impl AgentRuntime {
     }
 
     /// Build a `MuninnRestEngine` scoped to the given agent and user.
+    /// Returns `None` if MuninnDB is not configured or the hotel has reported it unreachable.
     fn memory_engine_for(&self, agent_id: &str, user_id: &str) -> Option<MuninnRestEngine> {
+        if !self.muninn_available {
+            return None;
+        }
         self.muninn_config.clone().map(|cfg| {
             MuninnRestEngine::new(
                 cfg,
@@ -2371,6 +2379,17 @@ impl AgentRuntime {
                         warn!("Network offline — routing text.generate to local fallback tier");
                     } else {
                         info!("Network restored — cloud model tiers re-enabled");
+                    }
+                }
+                Ok(Ok(IpcResponse::MuninnStatus { available, endpoint })) => {
+                    self.muninn_available = available;
+                    if !available {
+                        warn!(
+                            endpoint = %endpoint,
+                            "MuninnDB unreachable — memory tools will return empty until restored"
+                        );
+                    } else {
+                        info!(endpoint = %endpoint, "MuninnDB restored — memory tools re-enabled");
                     }
                 }
                 Ok(Ok(IpcResponse::PerimeterShift { previous, current })) => {
@@ -13033,6 +13052,79 @@ impl AgentRuntime {
                     error: None,
                     tool_name: Some(payload.tool_name),
                     arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "memory.status" => {
+                let content = match &self.muninn_config {
+                    Some(cfg) => {
+                        let status = if self.muninn_available {
+                            "connected"
+                        } else {
+                            "unreachable"
+                        };
+                        format!(
+                            "MuninnDB {status} — endpoint: {}, {} vault(s) configured.",
+                            cfg.base_url,
+                            cfg.vault_tokens.len()
+                        )
+                    }
+                    None => "MuninnDB not configured on this hotel.".into(),
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "memory.fix" => {
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RefreshMemoryConfig)
+                    .await
+                {
+                    Ok(IpcResponse::MuninnStatus { available, endpoint }) => {
+                        self.muninn_available = available;
+                        let msg = if available {
+                            format!("MuninnDB probe succeeded — connected to {endpoint}. Memory tools re-enabled.")
+                        } else {
+                            format!("MuninnDB probe failed — {endpoint} is unreachable. Hotel will retry every 60s. Outage recorded in heal queue.")
+                        };
+                        (msg, None)
+                    }
+                    Ok(_) => ("MuninnDB probe response unrecognized.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("memory.fix: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
