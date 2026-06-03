@@ -2400,6 +2400,9 @@ impl PhiloticClient {
                 | IpcResponse::DesktopMembraneLeaseStatus { .. }
                 | IpcResponse::DiscordGatewayLease { .. }
                 | IpcResponse::DiscordGatewayLeaseStatus { .. }
+                // MCP route state may arrive out-of-band if another connection triggers a
+                // GetMcpRoutes while this connection is in recv_task. Skip rather than crash.
+                | IpcResponse::McpRouteState { .. }
         )
     }
 
