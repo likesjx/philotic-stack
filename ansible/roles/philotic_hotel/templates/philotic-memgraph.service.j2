@@ -1,0 +1,21 @@
+[Unit]
+Description=Philotic Memgraph Central Cypher Store
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+
+ExecStartPre=-/usr/bin/docker rm -f {{ philotic_memgraph_container_name }}
+ExecStart=/usr/bin/docker run --rm \
+  --name {{ philotic_memgraph_container_name }} \
+  --publish {{ philotic_memgraph_host }}:{{ philotic_memgraph_port }}:7687 \
+  --volume {{ philotic_memgraph_data_dir }}:/var/opt/memgraph \
+  {{ philotic_memgraph_image }}
+ExecStop=/usr/bin/docker stop {{ philotic_memgraph_container_name }}
+
+[Install]
+WantedBy=multi-user.target

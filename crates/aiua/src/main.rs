@@ -2397,6 +2397,19 @@ fn hotel_shared_guests(
                 serde_json::Value::String(pdir.join("graphs").to_string_lossy().into_owned()),
             );
         }
+        for key in [
+            "PHILOTIC_GRAPH_PROVIDER",
+            "PHILOTIC_MEMGRAPH_URI",
+            "PHILOTIC_MEMGRAPH_USER",
+            "PHILOTIC_MEMGRAPH_PASSWORD",
+            "PHILOTIC_MEMGRAPH_DB",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    env.insert(key.into(), serde_json::Value::String(value));
+                }
+            }
+        }
     }
 
     // Build the agent roster JSON for the single membrane

@@ -3,10 +3,17 @@ name = "graph-datasource"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["memgraph-provider"]
+kuzu-provider = ["dep:kuzu"]
+memgraph-provider = ["dep:neo4rs"]
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 datasource = { path = "../datasource" }
+kuzu = { version = "0.11.3", optional = true, default-features = false }
+neo4rs = { version = "0.9.0-rc.9", optional = true }
 regex = "1.10"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1.0"
@@ -14,3 +21,6 @@ tokio = { version = "1.42", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

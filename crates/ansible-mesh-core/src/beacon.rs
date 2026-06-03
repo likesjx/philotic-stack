@@ -185,7 +185,7 @@ impl BeaconDaemon {
                     return;
                 }
 
-                self.dispatch_message(msg).await;
+                self.dispatch_message(msg, src).await;
             }
             Err(e) => {
                 error!("Failed to decode BeaconMessage from {}: {}", src, e);
@@ -193,7 +193,7 @@ impl BeaconDaemon {
         }
     }
 
-    async fn dispatch_message(&self, msg: BeaconMessage) {
+    async fn dispatch_message(&self, msg: BeaconMessage, src: SocketAddr) {
         match msg.msg_type {
             MsgType::Heartbeat => {
                 if let Ok(payload) = serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
@@ -203,10 +203,29 @@ impl BeaconDaemon {
                     );
                     let mut registry = self.registry.write().await;
                     registry.observe_heartbeat(
-                        payload.capabilities,
+                        payload.capabilities.clone(),
                         payload.execution_reachability,
                         payload.node_health,
                     );
+                    // Reconcile stored mesh_port if the heartbeat arrived from a different port.
+                    // This self-heals boot-time port conflicts without manual DB edits.
+                    // We do NOT update mesh_host from src.ip() — Tailscale routing makes
+                    // the observed source IP unreliable vs. the stored Tailscale address.
+                    if let Ok(hotels) = self.graph.list_hotels() {
+                        if let Some(mut hotel) = hotels
+                            .into_iter()
+                            .find(|h| h.capabilities.node_id == payload.capabilities.node_id)
+                        {
+                            if hotel.mesh_port != src.port() {
+                                info!(
+                                    "Reconciling mesh_port for {}: {} → {}",
+                                    hotel.hotel_name, hotel.mesh_port, src.port()
+                                );
+                                hotel.mesh_port = src.port();
+                                let _ = self.graph.upsert_hotel(&hotel);
+                            }
+                        }
+                    }
                 }
             }
             MsgType::CapabilitySync => {
@@ -246,5 +265,120 @@ impl BeaconDaemon {
             .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::GraphDomain;
+    use crate::heartbeat::HeartbeatPayload;
+    use crate::registry::NodeRegistry;
+    use crate::sqlite_storage::SqliteGraphStorage;
+    use crate::storage::HotelRecord;
+    use crate::{BeaconMessage, MsgType, NodeCapabilities, NodeConstraints};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
+
+    fn test_caps(node_id: &str) -> NodeCapabilities {
+        NodeCapabilities {
+            node_id: node_id.to_string(),
+            roles: vec![],
+            models: vec![],
+            tools: vec![],
+            constraints: NodeConstraints::default(),
+        }
+    }
+
+    fn test_hotel(hotel_name: &str, node_id: &str, mesh_port: u16) -> HotelRecord {
+        HotelRecord {
+            hotel_name: hotel_name.to_string(),
+            capabilities: test_caps(node_id),
+            mesh_host: Some("100.79.239.64".to_string()),
+            mesh_port,
+            blob_port: mesh_port + 1,
+            execution_port: mesh_port + 2,
+            ipc_socket_path: "/tmp/philotic-aiua.sock".to_string(),
+            active_pid: None,
+        }
+    }
+
+    fn heartbeat_msg(node_id: &str) -> BeaconMessage {
+        let payload = HeartbeatPayload {
+            capabilities: test_caps(node_id),
+            execution_reachability: None,
+            node_health: None,
+        };
+        BeaconMessage {
+            version: 1,
+            msg_id: Uuid::new_v4(),
+            src_node: node_id.to_string(),
+            dest_node: "broadcast".to_string(),
+            msg_type: MsgType::Heartbeat,
+            seq: 0,
+            total: 1,
+            payload: serde_json::to_vec(&payload).unwrap(),
+            timestamp: 0,
+            hmac: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reconciles_mesh_port() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+
+        // Peer stored at port 9100 (stale, pre-conflict-resolution value)
+        graph.upsert_hotel(&test_hotel("mbp-jane", "mbp-jane-aiua-01", 9100)).unwrap();
+
+        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::channel(8);
+        let daemon = BeaconDaemon::bind_with_registry(
+            "127.0.0.1:0",
+            test_caps("mac-jane-aiua-01"),
+            inbox_tx,
+            graph.clone(),
+            "",
+            false,
+            Arc::new(RwLock::new(NodeRegistry::new())),
+        )
+        .await
+        .unwrap();
+
+        // Heartbeat arrives from source port 9106 (the actual resolved port)
+        let src: SocketAddr = "100.79.239.64:9106".parse().unwrap();
+        daemon.dispatch_message(heartbeat_msg("mbp-jane-aiua-01"), src).await;
+
+        let hotel = graph.get_hotel("mbp-jane").unwrap().unwrap();
+        assert_eq!(hotel.mesh_port, 9106, "mesh_port should be reconciled to the observed source port");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_no_write_on_port_match() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+
+        graph.upsert_hotel(&test_hotel("mbp-jane", "mbp-jane-aiua-01", 9106)).unwrap();
+
+        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::channel(8);
+        let daemon = BeaconDaemon::bind_with_registry(
+            "127.0.0.1:0",
+            test_caps("mac-jane-aiua-01"),
+            inbox_tx,
+            graph.clone(),
+            "",
+            false,
+            Arc::new(RwLock::new(NodeRegistry::new())),
+        )
+        .await
+        .unwrap();
+
+        // Heartbeat arrives from the already-correct port
+        let src: SocketAddr = "100.79.239.64:9106".parse().unwrap();
+        daemon.dispatch_message(heartbeat_msg("mbp-jane-aiua-01"), src).await;
+
+        let hotel = graph.get_hotel("mbp-jane").unwrap().unwrap();
+        assert_eq!(hotel.mesh_port, 9106, "mesh_port should remain unchanged");
     }
 }
