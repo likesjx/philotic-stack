@@ -2365,6 +2365,12 @@ impl PhiloticClient {
                 self.pending_push.push_back(resp);
                 continue;
             }
+            // Ignorable hotel-wide broadcasts (MuninnStatus, NetworkState, lease events) can
+            // arrive on any connection at any time, including between a request write and its
+            // response read. Skip them here so they don't masquerade as request responses.
+            if Self::is_ignorable_push(&resp) {
+                continue;
+            }
             return Ok(resp);
         }
     }
