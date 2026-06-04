@@ -645,6 +645,149 @@ pub enum PatchRisk {
     High,
 }
 
+impl PatchRisk {
+    pub fn gate(&self) -> PatchGate {
+        match self {
+            Self::Low => PatchGate::SafeAutoUpdate,
+            Self::Medium => PatchGate::ConfirmFirst,
+            Self::High => PatchGate::ProposalOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchGate {
+    SafeAutoUpdate,
+    ConfirmFirst,
+    ProposalOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowthSignalKind {
+    ObservedNeed,
+    DriftFinding,
+    CapabilityGap,
+    GrowthExperiment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftCategory {
+    NaggingTiming,
+    StaleFact,
+    InferredGoalAsCommitment,
+    ProductivityBias,
+    GraphClutter,
+    Overgeneralization,
+    AgentConvenience,
+    ToolAgencyExpansion,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowthSignal {
+    pub signal_id: String,
+    pub kind: GrowthSignalKind,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence_packets: Vec<EvidencePacket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift_category: Option<DriftCategory>,
+}
+
+impl GrowthSignal {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "signal_id", &self.signal_id);
+        require_non_empty(&mut violations, "summary", &self.summary);
+        if matches!(self.kind, GrowthSignalKind::DriftFinding) && self.drift_category.is_none() {
+            violations.push("drift findings require a drift_category".into());
+        }
+        for (idx, packet) in self.evidence_packets.iter().enumerate() {
+            if let Err(err) = packet.validate() {
+                for violation in err.violations {
+                    violations.push(format!("evidence_packets[{idx}].{violation}"));
+                }
+            }
+        }
+        finish_validation(violations)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrowthLoopDisposition {
+    ApplyWithAudit,
+    AwaitOperatorConfirmation,
+    StoreProposalOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowthLoopEvaluation {
+    pub patch_id: String,
+    pub gate: PatchGate,
+    pub disposition: GrowthLoopDisposition,
+    pub requires_operator: bool,
+    #[serde(default)]
+    pub drift_checks: Vec<DriftCategory>,
+    #[serde(default)]
+    pub rationale: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowthLoopPolicy {
+    #[serde(default)]
+    pub always_check_drift: Vec<DriftCategory>,
+}
+
+impl Default for GrowthLoopPolicy {
+    fn default() -> Self {
+        Self {
+            always_check_drift: vec![
+                DriftCategory::NaggingTiming,
+                DriftCategory::StaleFact,
+                DriftCategory::InferredGoalAsCommitment,
+                DriftCategory::ProductivityBias,
+                DriftCategory::ToolAgencyExpansion,
+            ],
+        }
+    }
+}
+
+impl GrowthLoopPolicy {
+    pub fn evaluate_patch(
+        &self,
+        patch: &LifePatchProposalInput,
+    ) -> Result<GrowthLoopEvaluation, ContractError> {
+        validate_patch_proposal(patch)?;
+
+        let gate = patch.risk.gate();
+        let (disposition, requires_operator) = match gate {
+            PatchGate::SafeAutoUpdate => (GrowthLoopDisposition::ApplyWithAudit, false),
+            PatchGate::ConfirmFirst => (
+                GrowthLoopDisposition::AwaitOperatorConfirmation,
+                !patch.operator_approved,
+            ),
+            PatchGate::ProposalOnly => (GrowthLoopDisposition::StoreProposalOnly, true),
+        };
+
+        let mut rationale = vec![format!("{:?} maps to {:?}", patch.risk, gate)];
+        if matches!(gate, PatchGate::ProposalOnly) {
+            rationale.push("proposal-only patches are retained for explicit review".into());
+        }
+
+        Ok(GrowthLoopEvaluation {
+            patch_id: patch.patch_id.clone(),
+            gate,
+            disposition,
+            requires_operator,
+            drift_checks: self.always_check_drift.clone(),
+            rationale,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifeObserveInput {
     pub observation_id: String,
@@ -924,23 +1067,9 @@ impl MemoryGraphRagRunner {
         &self,
         input: LifePatchProposalInput,
     ) -> Result<RunnerPlan, ContractError> {
-        let mut violations = Vec::new();
-        require_non_empty(&mut violations, "patch_id", &input.patch_id);
-        require_non_empty(&mut violations, "summary", &input.summary);
-        require_non_empty(&mut violations, "rationale", &input.rationale);
-        if input.evidence_packets.is_empty() {
-            violations.push("life.patch.propose requires at least one evidence packet".into());
-        }
-        for (idx, packet) in input.evidence_packets.iter().enumerate() {
-            if let Err(err) = packet.validate() {
-                for violation in err.violations {
-                    violations.push(format!("evidence_packets[{idx}].{violation}"));
-                }
-            }
-        }
-        finish_validation(violations)?;
+        let evaluation = GrowthLoopPolicy::default().evaluate_patch(&input)?;
 
-        let requires_operator = matches!(input.risk, PatchRisk::High) && !input.operator_approved;
+        let requires_operator = evaluation.requires_operator;
 
         Ok(RunnerPlan {
             tool_name: LifeGraphToolName::LifePatchPropose,
@@ -949,17 +1078,36 @@ impl MemoryGraphRagRunner {
                 action: "life.patch.propose".into(),
                 payload: serde_json::json!({
                     "datasource_id": self.config.datasource_id,
+                    "growth_evaluation": evaluation,
                     "patch": input,
                 }),
             }],
             requires_operator,
             blocked_reasons: if requires_operator {
-                vec!["high-risk Life Graph patches require operator approval".into()]
+                vec!["Life Graph patch proposal requires operator review for its risk tier".into()]
             } else {
                 Vec::new()
             },
         })
     }
+}
+
+fn validate_patch_proposal(input: &LifePatchProposalInput) -> Result<(), ContractError> {
+    let mut violations = Vec::new();
+    require_non_empty(&mut violations, "patch_id", &input.patch_id);
+    require_non_empty(&mut violations, "summary", &input.summary);
+    require_non_empty(&mut violations, "rationale", &input.rationale);
+    if input.evidence_packets.is_empty() {
+        violations.push("life.patch.propose requires at least one evidence packet".into());
+    }
+    for (idx, packet) in input.evidence_packets.iter().enumerate() {
+        if let Err(err) = packet.validate() {
+            for violation in err.violations {
+                violations.push(format!("evidence_packets[{idx}].{violation}"));
+            }
+        }
+    }
+    finish_validation(violations)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1387,7 +1535,79 @@ mod tests {
         assert!(
             plan.blocked_reasons
                 .iter()
-                .any(|reason| reason.contains("high-risk"))
+                .any(|reason| reason.contains("operator review"))
+        );
+        assert_eq!(
+            plan.steps[0].payload["growth_evaluation"]["gate"],
+            "proposal_only"
+        );
+    }
+
+    #[test]
+    fn growth_policy_allows_low_risk_patch_with_audit() {
+        let policy = GrowthLoopPolicy::default();
+        let evaluation = policy
+            .evaluate_patch(&LifePatchProposalInput {
+                patch_id: "patch:stale-marker".into(),
+                patch_kind: PatchKind::SystemPatch,
+                summary: "Attach stale marker to old open loop.".into(),
+                rationale: "Evidence indicates the loop has not been touched recently.".into(),
+                evidence_packets: vec![evidence_packet()],
+                risk: PatchRisk::Low,
+                operator_approved: false,
+            })
+            .expect("low-risk patch should evaluate");
+
+        assert_eq!(evaluation.gate, PatchGate::SafeAutoUpdate);
+        assert_eq!(
+            evaluation.disposition,
+            GrowthLoopDisposition::ApplyWithAudit
+        );
+        assert!(!evaluation.requires_operator);
+        assert!(evaluation.drift_checks.contains(&DriftCategory::StaleFact));
+    }
+
+    #[test]
+    fn growth_policy_requires_confirmation_for_medium_risk_patch() {
+        let policy = GrowthLoopPolicy::default();
+        let evaluation = policy
+            .evaluate_patch(&LifePatchProposalInput {
+                patch_id: "patch:habit-cadence".into(),
+                patch_kind: PatchKind::AttentionPatch,
+                summary: "Infer a possible habit cadence.".into(),
+                rationale: "Repeated evidence suggests a recurring weekly follow-up pattern."
+                    .into(),
+                evidence_packets: vec![evidence_packet()],
+                risk: PatchRisk::Medium,
+                operator_approved: false,
+            })
+            .expect("medium-risk patch should evaluate");
+
+        assert_eq!(evaluation.gate, PatchGate::ConfirmFirst);
+        assert_eq!(
+            evaluation.disposition,
+            GrowthLoopDisposition::AwaitOperatorConfirmation
+        );
+        assert!(evaluation.requires_operator);
+    }
+
+    #[test]
+    fn drift_findings_require_drift_category() {
+        let signal = GrowthSignal {
+            signal_id: "growth:drift:1".into(),
+            kind: GrowthSignalKind::DriftFinding,
+            summary: "A reminder pattern may be getting intrusive.".into(),
+            evidence_packets: vec![evidence_packet()],
+            drift_category: None,
+        };
+
+        let err = signal
+            .validate()
+            .expect_err("drift finding requires category");
+        assert!(
+            err.violations
+                .iter()
+                .any(|violation| violation.contains("drift_category"))
         );
     }
 }

@@ -86,6 +86,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
   - [x] Land the first runtime boundary: cron payloads with top-level `paracrine_signal` emit `action = "paracrine_signal"` envelopes, and philotes observe them without entering the conversational model path.
 - [ ] Define the Attention Steward SIL as reinforced, situation-aware stewardship instructions with evidence, exceptions, friction, and reinforcement counters.
 - [ ] Define the agentic growth loop for skills, tools, schema, and policy patches with risk-tiered confirmation gates and negative-drift checks.
+  - [x] Add `data-memorygraphrag` growth-loop policy contracts for observed needs, drift findings, capability gaps, growth experiments, patch gates, and drift checks.
 - [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.
 - [ ] Let specialized roles such as Coach consume and contribute to Life Graph OS through governed tools without owning the canonical cross-domain graph posture.
 

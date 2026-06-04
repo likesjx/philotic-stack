@@ -85,10 +85,12 @@ The first Life Graph OS boundary is now partially implemented. Current proof:
 - `life-graph-paracrine-heartbeat`: cron can emit opt-in `paracrine_signal` heartbeats and philotes observe them without model re-entry.
 - `life-graph-evidence-conflict`: `data-memorygraphrag` now defines validated `EvidencePacket` and `ConflictHandoff` contracts.
 - `life-graph-semantic-retrieval`: `data-memorygraphrag` now defines semantic pivot, bounded expansion, policy filter, ranking, and evidence-backed context packet contracts.
+- `life-graph-memorygraphrag-runner`: `data-memorygraphrag` now defines the first Life Graph tool catalog and typed runner planning surface.
+- `life-graph-agentic-growth-loop`: `data-memorygraphrag` now defines patch gates, growth signals, drift categories, and policy evaluation for risk-tiered patch proposals.
 
 Next implementation pressure:
 
-- make `data-memorygraphrag` an actual runner/toolset surface rather than only a contract crate
+- project the `data-memorygraphrag` runner surface through hotel/tool assembly so roles can call `life.*` tools
 - wire semantic retrieval against Memgraph using the schema's vector spaces
 - connect conflict handoff packets to Muninn true-up/review tools
 - keep Attention Steward work coordinated with Claude's active schema/attention lanes
