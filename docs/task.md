@@ -84,6 +84,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [x] Define the paracrine heartbeat signal shape for Life Graph maintenance, including scope, target role-type, priority, expiry, and policy tags.
 - [ ] Build the Attention Steward paracrine subscriber in observe-only mode before broad notifications or autonomous follow-up.
   - [x] Land the first runtime boundary: cron payloads with top-level `paracrine_signal` emit `action = "paracrine_signal"` envelopes, and philotes observe them without entering the conversational model path.
+  - [x] Add the canonical `ParacrineHeartbeatTemplate` registration payload for cron-backed Life Graph signals, including `source_hotel`, ISO `observed_at`, target role-type, subject refs, policy tags, and observe-only heartbeat metadata.
 - [ ] Define the Attention Steward SIL as reinforced, situation-aware stewardship instructions with evidence, exceptions, friction, and reinforcement counters.
 - [ ] Define the agentic growth loop for skills, tools, schema, and policy patches with risk-tiered confirmation gates and negative-drift checks.
   - [x] Add `data-memorygraphrag` growth-loop policy contracts for observed needs, drift findings, capability gaps, growth experiments, patch gates, and drift checks.

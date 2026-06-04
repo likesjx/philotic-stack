@@ -145,6 +145,8 @@ The Attention Steward subscribes to signals where `target_role_type = "attention
 
 The heartbeat engine (seam: `life-graph-paracrine-heartbeat`) delivers signals with this shape:
 
+Life Graph heartbeat registrations should use `ansible_mesh_core::cron::ParacrineHeartbeatTemplate` to generate the cron `payload`. The template produces this subscriber contract and preserves cron interpolation markers for `signal_id`, `source_hotel`, `observed_at`, and trace metadata.
+
 | Field | Type | Description |
 |---|---|---|
 | `signal_id` | `string` | Unique ID for this signal instance |

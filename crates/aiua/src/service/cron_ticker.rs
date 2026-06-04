@@ -428,6 +428,9 @@ fn build_cron_task_json(
         .entry("source_node")
         .or_insert_with(|| serde_json::Value::String(local_node_id.to_string()));
     signal
+        .entry("source_hotel")
+        .or_insert_with(|| serde_json::Value::String(local_node_id.to_string()));
+    signal
         .entry("target_role_type")
         .or_insert_with(|| serde_json::Value::String(job.target_role.clone()));
     signal
@@ -524,6 +527,10 @@ mod tests {
             "life_graph.attention_scan"
         );
         assert_eq!(value["paracrine_signal"]["source_node"], "mac-jane-aiua-01");
+        assert_eq!(
+            value["paracrine_signal"]["source_hotel"],
+            "mac-jane-aiua-01"
+        );
         assert_eq!(
             value["paracrine_signal"]["target_role_type"],
             "attention-steward"
