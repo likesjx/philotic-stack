@@ -73,24 +73,31 @@ There are two similarly named inspirations here:
 
 ## Disposition
 
-`proposed`
+`accepted for current slices`
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
 ## Current Slice
 
-Define the first Life Graph OS boundary before implementation sprawls across memory, graph, and philote code:
+The first Life Graph OS boundary is now partially implemented. Current proof:
 
-- name the canonical node and edge vocabulary for the first useful life graph
-- define how embeddings and vector search participate in retrieval without replacing graph truth
-- map Memgraph GraphRAG and MemGraphRAG architecture patterns onto Philotic's context engine and graph-datasource seams
-- define the first agentic growth loop and drift checks
-- create task seams for schema, attention, semantic retrieval, and self-improving agent patches
+- `life-graph-schema`: V001/V002 schema work is in progress/validation under Claude's active schema lane.
+- `life-graph-paracrine-heartbeat`: cron can emit opt-in `paracrine_signal` heartbeats and philotes observe them without model re-entry.
+- `life-graph-evidence-conflict`: `data-memorygraphrag` now defines validated `EvidencePacket` and `ConflictHandoff` contracts.
+- `life-graph-semantic-retrieval`: `data-memorygraphrag` now defines semantic pivot, bounded expansion, policy filter, ranking, and evidence-backed context packet contracts.
+
+Next implementation pressure:
+
+- make `data-memorygraphrag` an actual runner/toolset surface rather than only a contract crate
+- wire semantic retrieval against Memgraph using the schema's vector spaces
+- connect conflict handoff packets to Muninn true-up/review tools
+- keep Attention Steward work coordinated with Claude's active schema/attention lanes
 
 Current confidence:
 
-- `proposal-only`
-- no implementation proof yet
+- `test-green` for contract slices
+- `schema-live-green` is Claude-owned and should be verified in that lane before Codex depends on it
+- no end-to-end Life Graph runtime proof yet
 
 ## Why This Exists
 
