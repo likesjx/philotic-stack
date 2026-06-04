@@ -2389,6 +2389,11 @@ impl PhiloticClient {
             IpcResponse::InboundTask { .. }
                 | IpcResponse::ApartmentUpdate { .. }
                 | IpcResponse::GracefulShutdown { .. }
+                // Hotel-wide OOB broadcasts: never the expected response to a pending request.
+                // Buffering them here prevents send_request from returning them as a real
+                // response and contaminating subsequent request/response pairs.
+                | IpcResponse::MuninnStatus { .. }
+                | IpcResponse::NetworkState { .. }
         )
     }
 
@@ -2406,6 +2411,7 @@ impl PhiloticClient {
                 | IpcResponse::DesktopMembraneLeaseStatus { .. }
                 | IpcResponse::DiscordGatewayLease { .. }
                 | IpcResponse::DiscordGatewayLeaseStatus { .. }
+                | IpcResponse::Standard { ok: true, .. }
         )
     }
 
