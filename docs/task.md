@@ -85,6 +85,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Build the Attention Steward paracrine subscriber in observe-only mode before broad notifications or autonomous follow-up.
   - [x] Land the first runtime boundary: cron payloads with top-level `paracrine_signal` emit `action = "paracrine_signal"` envelopes, and philotes observe them without entering the conversational model path.
   - [x] Add the canonical `ParacrineHeartbeatTemplate` registration payload for cron-backed Life Graph signals, including `source_hotel`, ISO `observed_at`, target role-type, subject refs, policy tags, and observe-only heartbeat metadata.
+  - [x] Add the observe-only Attention Steward policy decision path: valid signals record observations, new-pattern signals propose SIL entries, expired/non-target/anti-policy signals defer, and philote logs the decision without model re-entry.
 - [ ] Define the Attention Steward SIL as reinforced, situation-aware stewardship instructions with evidence, exceptions, friction, and reinforcement counters.
 - [ ] Define the agentic growth loop for skills, tools, schema, and policy patches with risk-tiered confirmation gates and negative-drift checks.
   - [x] Add `data-memorygraphrag` growth-loop policy contracts for observed needs, drift findings, capability gaps, growth experiments, patch gates, and drift checks.

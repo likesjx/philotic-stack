@@ -2583,30 +2583,42 @@ impl AgentRuntime {
         task: InboundTaskPayload,
         task_id: Uuid,
     ) -> Result<()> {
+        use ansible_mesh_core::attention_steward::{
+            AttentionStewardPolicy, AttentionStewardResponse, AttentionStewardSignal,
+        };
+
         let signal = task
             .paracrine_signal
             .as_ref()
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        let signal_type = signal
-            .get("signal_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("heartbeat");
-        let signal_id = signal
-            .get("signal_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let scope = signal
-            .get("scope")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
+        let attention_signal = match AttentionStewardSignal::from_value(signal) {
+            Ok(signal) => signal,
+            Err(err) => {
+                warn!(
+                    task_id = %task_id,
+                    error = %err,
+                    "paracrine signal deferred: invalid attention steward envelope"
+                );
+                return Ok(());
+            }
+        };
+        let decision = AttentionStewardPolicy::default().evaluate_now(&attention_signal);
+        let response = match decision.response {
+            AttentionStewardResponse::RecordObservation => "record_observation",
+            AttentionStewardResponse::ProposeSilEntry => "propose_sil_entry",
+            AttentionStewardResponse::UpdateSilMetadata => "update_sil_metadata",
+            AttentionStewardResponse::DeferSignal => "defer_signal",
+        };
 
         info!(
             task_id = %task_id,
-            signal_id = %signal_id,
-            signal_type = %signal_type,
-            scope = %scope,
-            "paracrine signal observed"
+            signal_id = %attention_signal.signal_id,
+            signal_type = %attention_signal.signal_type,
+            scope = %attention_signal.scope,
+            response = %response,
+            reason = %decision.reason,
+            "attention steward observed paracrine signal"
         );
 
         Ok(())

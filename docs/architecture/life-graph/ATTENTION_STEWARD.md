@@ -32,6 +32,8 @@ Beacon is the primary Attention Steward for the operator's cross-domain Life Gra
 
 **First-slice posture: observe-only.** The Attention Steward records observations and proposes SIL entries. It does not interrupt the operator, send notifications, or surface reminders until there is enough evidence to trust the timing and tone policy.
 
+Current implementation slice: `ansible_mesh_core::attention_steward` evaluates incoming paracrine signals in observe-only mode, and philote calls that evaluator for `action = "paracrine_signal"` without entering the conversational model path. Memgraph persistence through `life.observe` is still a follow-on runner/provider slice.
+
 ---
 
 ## StewardshipInstruction Node
