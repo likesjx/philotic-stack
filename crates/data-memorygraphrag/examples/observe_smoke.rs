@@ -1,3 +1,4 @@
+use data_memorygraphrag::cypher;
 /// Live smoke test for life.observe → Memgraph MERGE.
 ///
 /// Run with:
@@ -8,16 +9,15 @@
 /// Verify: MATCH (n:Signal {id: "<node_id>"}) RETURN n;
 use data_memorygraphrag::{
     AdjudicationStatus, EvidencePacket, GraphRecordRef, LifeObserveInput, ReliabilityBasis,
-    SourceKind, SourceReliability, SourceRef, ValidationState,
+    SourceKind, SourceRef, SourceReliability, ValidationState,
 };
-use data_memorygraphrag::cypher;
 use neo4rs::{ConfigBuilder, Graph, query};
 use ulid::Ulid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let uri = std::env::var("PHILOTIC_MEMGRAPH_URI")
-        .unwrap_or_else(|_| "100.64.212.8:7687".to_string());
+    let uri =
+        std::env::var("PHILOTIC_MEMGRAPH_URI").unwrap_or_else(|_| "100.64.212.8:7687".to_string());
     let user = std::env::var("PHILOTIC_MEMGRAPH_USER").unwrap_or_default();
     let password = std::env::var("PHILOTIC_MEMGRAPH_PASSWORD").unwrap_or_default();
 

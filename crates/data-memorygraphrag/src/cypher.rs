@@ -49,10 +49,7 @@ pub struct ObserveCypher {
     pub packet_id: String,
 }
 
-pub fn compile_observe(
-    input: &LifeObserveInput,
-    now_iso: &str,
-) -> Result<ObserveCypher, String> {
+pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<ObserveCypher, String> {
     let label = &input.evidence.claim_ref.label;
     if !KNOWN_LABELS.contains(&label.as_str()) {
         return Err(format!("unknown Life Graph label: {label}"));
@@ -156,7 +153,7 @@ mod tests {
     use super::*;
     use crate::{
         AdjudicationStatus, EvidencePacket, GraphRecordRef, LifeObserveInput, ReliabilityBasis,
-        SourceKind, SourceReliability, SourceRef, ValidationState,
+        SourceKind, SourceRef, SourceReliability, ValidationState,
     };
 
     fn minimal_observe_input(label: &str) -> LifeObserveInput {

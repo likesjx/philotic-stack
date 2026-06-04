@@ -5,6 +5,7 @@
 //! contracts into graph writes, context packets, or Muninn true-up requests.
 
 pub mod cypher;
+pub mod projection;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

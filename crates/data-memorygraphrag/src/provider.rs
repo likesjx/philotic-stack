@@ -1,10 +1,17 @@
-use data_memorygraphrag::cypher;
-use data_memorygraphrag::{LifeGraphToolRequest, LifeObserveInput, MemoryGraphRagRunner, RunnerConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use data_memorygraphrag::cypher;
+use data_memorygraphrag::projection;
+use data_memorygraphrag::{
+    LifeGraphToolRequest, LifeObserveInput, MemoryGraphRagRunner, PolicyFilter, RankingWeights,
+    RetrievalContextPacket, RetrievalQuery, RetrievalStrategy, RunnerConfig, SemanticSpace,
+};
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
-use neo4rs::{ConfigBuilder, Graph, query};
-use serde_json::json;
+use neo4rs::{
+    BoltList, BoltMap, BoltNode, BoltRelation, BoltType, BoltUnboundedRelation, ConfigBuilder,
+    Graph, Row, query,
+};
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 struct MemgraphConfig {
@@ -60,6 +67,16 @@ impl LifeGraphProvider {
 
         Ok(Graph::connect(builder.build()?)?)
     }
+
+    async fn execute_cypher(&self, cypher: &str) -> Result<Value> {
+        let graph = self.connect().await?;
+        let mut rows = graph.execute(query(cypher)).await?;
+        let mut output = Vec::new();
+        while let Some(row) = rows.next().await? {
+            output.push(row_to_json(&row)?);
+        }
+        Ok(json!({ "rows": output }))
+    }
 }
 
 #[async_trait]
@@ -75,6 +92,7 @@ impl DatasourceProvider for LifeGraphProvider {
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         match task.kind.as_str() {
             "life.observe" => self.handle_observe(task).await,
+            "life.recall" => self.handle_recall(task).await,
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -91,7 +109,6 @@ impl LifeGraphProvider {
         let input: LifeObserveInput = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.observe parameters as LifeObserveInput")?;
 
-        // Run contract validation via runner.plan() before executing
         let plan = self
             .runner
             .plan(LifeGraphToolRequest::LifeObserve(input.clone()))
@@ -147,4 +164,197 @@ impl LifeGraphProvider {
             "validation_state": compiled.validation_state,
         })))
     }
+
+    async fn handle_recall(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let query_val: RetrievalQuery = serde_json::from_value(task.parameters.clone())
+            .context("failed to parse life.recall parameters as RetrievalQuery")?;
+
+        self.runner
+            .plan(LifeGraphToolRequest::LifeRecall(query_val.clone()))
+            .map_err(|e| anyhow::anyhow!("life.recall plan validation failed: {e}"))?;
+
+        // Embedding vector must be passed inline in the task parameters.
+        let embedding: Vec<f32> = task
+            .parameters
+            .get("embedding")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if embedding.is_empty() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "missing_embedding",
+                "detail": "life.recall requires an inline 'embedding' array in parameters",
+            })));
+        }
+
+        let top_k = query_val.max_context_packets * 3;
+        let min_similarity = 0.3_f32;
+        let now = chrono::Utc::now();
+        let now_iso = now.to_rfc3339();
+
+        let mut all_hits = Vec::new();
+
+        for pivot in &query_val.semantic_pivots {
+            for label in space_labels(&pivot.space) {
+                let index = projection::index_name(&pivot.space, label);
+                let cypher =
+                    projection::semantic_expand_cypher(&index, top_k, &embedding, min_similarity);
+
+                let result = self.execute_cypher(&cypher).await?;
+                let hits = projection::parse_vector_search_rows(&result);
+                all_hits.extend(hits);
+            }
+        }
+
+        let filters = &query_val.policy_filters;
+        let (surviving, _drop_log) = projection::apply_policy_filters(all_hits, filters);
+
+        let weights = &query_val.ranking_weights;
+        let mut scored: Vec<(projection::VectorHit, f32, Vec<PolicyFilter>)> = surviving
+            .into_iter()
+            .map(|hit| {
+                let age_secs = compute_age_secs(hit.prop_str("observed_at"), &now);
+                let score = projection::ranking_score(&hit, weights, age_secs);
+                (hit, score, Vec::new())
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let context_id = format!("ctx:{}", query_val.query_id);
+        let token_budget = query_val.max_context_packets * 200;
+        let packet = projection::project_context_packet(
+            &context_id,
+            &query_val.query_id,
+            query_val.strategy.clone(),
+            scored,
+            Vec::new(),
+            token_budget,
+            &now_iso,
+        );
+
+        info!(
+            query_id = %query_val.query_id,
+            result_count = packet.ranked_packets.len(),
+            "life.recall: context packet projected"
+        );
+
+        let packet_json =
+            serde_json::to_value(&packet).context("failed to serialize RetrievalContextPacket")?;
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "context_packet": packet_json,
+        })))
+    }
+}
+
+/// Map a SemanticSpace to the Memgraph node labels it covers (per V001 migration).
+fn space_labels(space: &SemanticSpace) -> &'static [&'static str] {
+    match space {
+        SemanticSpace::LifeEventSemantic => &["Event", "Signal", "OpenLoop"],
+        SemanticSpace::GoalSystemSemantic => {
+            &["Goal", "System", "Habit", "Project", "Routine", "NextAction"]
+        }
+        SemanticSpace::SkillToolSemantic => &[
+            "GrowthHypothesis",
+            "GrowthExperiment",
+            "DriftFinding",
+            "CapabilityPatch",
+            "SkillPatch",
+            "ToolPatch",
+            "SchemaPatch",
+            "AttentionPatch",
+            "SystemPatch",
+        ],
+        SemanticSpace::RolePersonSemantic => &["Role", "Person", "Value", "Preference", "Concern"],
+        SemanticSpace::MemoryBridgeSemantic => &["Commitment", "Decision"],
+    }
+}
+
+/// Compute seconds elapsed since `observed_at` ISO 8601 string.
+/// Returns 0 on parse failure (treat unknown age as fresh).
+fn compute_age_secs(observed_at: Option<&str>, now: &chrono::DateTime<chrono::Utc>) -> u64 {
+    observed_at
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| {
+            let elapsed = *now - dt.with_timezone(&chrono::Utc);
+            elapsed.num_seconds().max(0) as u64
+        })
+        .unwrap_or(0)
+}
+
+// ── Bolt → JSON conversion (mirrors graph-datasource/memgraph_provider.rs) ────
+
+fn row_to_json(row: &Row) -> Result<Value> {
+    let mut object = serde_json::Map::new();
+    for key in row.keys() {
+        let key = key.value.as_str();
+        let value: BoltType = row.get(key)?;
+        object.insert(key.to_string(), bolt_value_to_json(value));
+    }
+    Ok(Value::Object(object))
+}
+
+fn bolt_value_to_json(value: BoltType) -> Value {
+    match value {
+        BoltType::String(v) => json!(v.value),
+        BoltType::Boolean(v) => json!(v.value),
+        BoltType::Integer(v) => json!(v.value),
+        BoltType::Float(v) => json!(v.value),
+        BoltType::Null(_) => Value::Null,
+        BoltType::List(v) => bolt_list_to_json(v),
+        BoltType::Map(v) => bolt_map_to_json(v),
+        BoltType::Node(v) => bolt_node_to_json(v),
+        BoltType::Relation(v) => bolt_relation_to_json(v),
+        BoltType::UnboundedRelation(v) => bolt_unbounded_relation_to_json(v),
+        BoltType::Bytes(v) => json!(v.value),
+        other => json!({ "kind": "unsupported_bolt_value", "debug": format!("{other:?}") }),
+    }
+}
+
+fn bolt_list_to_json(v: BoltList) -> Value {
+    Value::Array(v.into_iter().map(bolt_value_to_json).collect())
+}
+
+fn bolt_map_to_json(v: BoltMap) -> Value {
+    Value::Object(
+        v.value
+            .into_iter()
+            .map(|(k, val)| (k.value, bolt_value_to_json(val)))
+            .collect(),
+    )
+}
+
+fn bolt_node_to_json(v: BoltNode) -> Value {
+    json!({
+        "kind": "node",
+        "id": v.id.value,
+        "labels": bolt_list_to_json(v.labels),
+        "properties": bolt_map_to_json(v.properties),
+    })
+}
+
+fn bolt_relation_to_json(v: BoltRelation) -> Value {
+    json!({
+        "kind": "relationship",
+        "id": v.id.value,
+        "source": v.start_node_id.value,
+        "target": v.end_node_id.value,
+        "label": v.typ.value,
+        "properties": bolt_map_to_json(v.properties),
+    })
+}
+
+fn bolt_unbounded_relation_to_json(v: BoltUnboundedRelation) -> Value {
+    json!({
+        "kind": "relationship",
+        "id": v.id.value,
+        "label": v.typ.value,
+        "properties": bolt_map_to_json(v.properties),
+    })
 }

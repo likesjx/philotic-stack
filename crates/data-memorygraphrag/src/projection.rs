@@ -153,10 +153,7 @@ pub fn parse_vector_search_rows(result: &Value) -> Vec<VectorHit> {
             .get("properties")
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default()));
-        let similarity = row
-            .get("similarity")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0) as f32;
+        let similarity = row.get("similarity").and_then(Value::as_f64).unwrap_or(0.0) as f32;
 
         hits.push(VectorHit {
             bolt_id,
@@ -188,11 +185,7 @@ pub fn apply_policy_filters(
             match filter {
                 PolicyFilter::ExcludeRetired => {
                     if hit.is_retired() {
-                        reason = Some(format!(
-                            "ExcludeRetired: {} [{}]",
-                            hit.node_id(),
-                            hit.label
-                        ));
+                        reason = Some(format!("ExcludeRetired: {} [{}]", hit.node_id(), hit.label));
                         break;
                     }
                 }
@@ -436,12 +429,8 @@ mod tests {
 
     #[test]
     fn semantic_expand_cypher_embeds_vector_inline() {
-        let cypher = semantic_expand_cypher(
-            "life_event_semantic__OpenLoop",
-            5,
-            &[0.1, 0.2, 0.3],
-            0.4,
-        );
+        let cypher =
+            semantic_expand_cypher("life_event_semantic__OpenLoop", 5, &[0.1, 0.2, 0.3], 0.4);
         assert!(cypher.contains("CALL vector_search.search("));
         assert!(cypher.contains("\"life_event_semantic__OpenLoop\""));
         assert!(cypher.contains(", 5, ["));
@@ -509,8 +498,7 @@ mod tests {
         });
 
         let hits = parse_vector_search_rows(&result);
-        let (surviving, log) =
-            apply_policy_filters(hits, &[PolicyFilter::ExcludeRetired]);
+        let (surviving, log) = apply_policy_filters(hits, &[PolicyFilter::ExcludeRetired]);
 
         assert_eq!(surviving.len(), 1);
         assert_eq!(surviving[0].node_id(), "l:ol:open");
@@ -534,8 +522,7 @@ mod tests {
         });
 
         let hits = parse_vector_search_rows(&result);
-        let (surviving, log) =
-            apply_policy_filters(hits, &[PolicyFilter::RequireEvidence]);
+        let (surviving, log) = apply_policy_filters(hits, &[PolicyFilter::RequireEvidence]);
 
         assert_eq!(surviving.len(), 1);
         assert_eq!(surviving[0].node_id(), "g:strong");
@@ -651,9 +638,6 @@ mod tests {
         assert_eq!(packet.metadata["from_vector_search"], true);
         assert!(packet.metadata["similarity"].as_f64().unwrap() > 0.9);
         assert_eq!(packet.claim_ref.label, "Goal");
-        assert_eq!(
-            packet.adjudication_status,
-            AdjudicationStatus::NotNeeded
-        );
+        assert_eq!(packet.adjudication_status, AdjudicationStatus::NotNeeded);
     }
 }
