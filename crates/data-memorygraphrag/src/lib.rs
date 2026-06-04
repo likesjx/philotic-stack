@@ -4,6 +4,7 @@
 //! keeping `graph-datasource` generic. Runtime adapters can serialize these
 //! contracts into graph writes, context packets, or Muninn true-up requests.
 
+pub mod attention_observer;
 pub mod cypher;
 pub mod projection;
 

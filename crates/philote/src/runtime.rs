@@ -561,6 +561,21 @@ fn graph_datasource_node_id() -> String {
         .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
 }
 
+fn life_graph_runner_node_id() -> String {
+    std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_HOME_HOTEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|hotel| format!("{hotel}-aiua-01"))
+        })
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+}
+
 fn debug_model_requests_enabled() -> bool {
     matches!(
         std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
@@ -2586,6 +2601,7 @@ impl AgentRuntime {
         use ansible_mesh_core::attention_steward::{
             AttentionStewardPolicy, AttentionStewardResponse, AttentionStewardSignal,
         };
+        use data_memorygraphrag::attention_observer;
 
         let signal = task
             .paracrine_signal
@@ -2620,6 +2636,33 @@ impl AgentRuntime {
             reason = %decision.reason,
             "attention steward observed paracrine signal"
         );
+
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        if let Some(observe_input) =
+            attention_observer::decision_to_observe_input(&decision, &attention_signal, &now_iso)
+        {
+            let node_id = local_node_id();
+            let target_node = life_graph_runner_node_id();
+            let task_json = serde_json::json!({
+                "action": "execute_tool",
+                "tool_name": "life.observe",
+                "arguments": serde_json::to_value(&observe_input)?,
+                "reply_to": node_id,
+                "reply_role": "agent",
+                "session_id": "",
+                "turn_id": "",
+                "chat_id": "",
+            });
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node,
+                    target_role: "life-graph-runner".into(),
+                    target_guest_id: None,
+                    task_json: task_json.to_string(),
+                })
+                .await;
+        }
 
         Ok(())
     }
