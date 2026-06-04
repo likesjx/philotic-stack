@@ -3657,6 +3657,8 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_name: "cron.register".into(),
             description: "Register or update a cron job on the hotel. The job fires on a 7-field \
                           cron schedule and delivers a JSON payload to a target role's inbox. \
+                          Include a top-level paracrine_signal object in the payload to emit a \
+                          typed cron-backed paracrine heartbeat signal instead of a legacy cron task. \
                           Use cron.list first to avoid duplicates. Responds with the assigned job_id."
                 .into(),
             input_schema: serde_json::json!({
@@ -3672,7 +3674,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                     },
                     "payload": {
                         "type": "string",
-                        "description": "JSON payload string delivered to the role. Supports {timestamp}, {iso_timestamp}, {job_id}, {node_id}, {target_role} interpolation."
+                        "description": "JSON payload string delivered to the role. Supports {timestamp}, {iso_timestamp}, {job_id}, {node_id}, {target_role} interpolation. If the JSON contains a top-level paracrine_signal object, cron emits action=paracrine_signal with normalized signal metadata."
                     },
                     "guaranteed": {
                         "type": "boolean",

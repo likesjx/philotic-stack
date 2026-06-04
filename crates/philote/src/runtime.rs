@@ -2430,6 +2430,13 @@ impl AgentRuntime {
                                 let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
+                        Ok(task) if task.action.as_deref() == Some("paracrine_signal") => {
+                            // Low-agency heartbeat/background signal. Observe it, but do
+                            // not enter the conversational model path.
+                            if let Err(err) = self.handle_paracrine_signal(task, task_id).await {
+                                warn!("Failed to handle paracrine_signal: {}", err);
+                            }
+                        }
                         Ok(task) if task.action.as_deref() == Some("streaming_token") => {
                             // LLM token fragment emitted by model-router during a streaming
                             // response. Forward immediately to membrane for progressive display.
@@ -2476,7 +2483,10 @@ impl AgentRuntime {
                         info!("Network restored — cloud model tiers re-enabled");
                     }
                 }
-                Ok(Ok(IpcResponse::MuninnStatus { available, endpoint })) => {
+                Ok(Ok(IpcResponse::MuninnStatus {
+                    available,
+                    endpoint,
+                })) => {
                     self.muninn_available = available;
                     if !available {
                         warn!(
@@ -2566,6 +2576,40 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await
+    }
+
+    async fn handle_paracrine_signal(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        let signal = task
+            .paracrine_signal
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let signal_type = signal
+            .get("signal_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("heartbeat");
+        let signal_id = signal
+            .get("signal_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let scope = signal
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        info!(
+            task_id = %task_id,
+            signal_id = %signal_id,
+            signal_type = %signal_type,
+            scope = %scope,
+            "paracrine signal observed"
+        );
+
+        Ok(())
     }
 
     async fn handle_paracrine_response(
@@ -13193,12 +13237,19 @@ impl AgentRuntime {
                     .send_request(IpcRequest::RefreshMemoryConfig)
                     .await
                 {
-                    Ok(IpcResponse::MuninnStatus { available, endpoint }) => {
+                    Ok(IpcResponse::MuninnStatus {
+                        available,
+                        endpoint,
+                    }) => {
                         self.muninn_available = available;
                         let msg = if available {
-                            format!("MuninnDB probe succeeded — connected to {endpoint}. Memory tools re-enabled.")
+                            format!(
+                                "MuninnDB probe succeeded — connected to {endpoint}. Memory tools re-enabled."
+                            )
                         } else {
-                            format!("MuninnDB probe failed — {endpoint} is unreachable. Hotel will retry every 60s. Outage recorded in heal queue.")
+                            format!(
+                                "MuninnDB probe failed — {endpoint} is unreachable. Hotel will retry every 60s. Outage recorded in heal queue."
+                            )
                         };
                         (msg, None)
                     }

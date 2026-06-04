@@ -76,9 +76,10 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
 - [ ] Implement one MemGraphRAG-inspired retrieval strategy: semantic pivot, bounded graph expansion, memory-aware ranking, policy filtering, and context packet projection.
 - [ ] Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.
-- [ ] Define the cron-backed heartbeat job shape for Life Graph maintenance, using the existing distributed cron subsystem as the first durable clock source.
-- [ ] Define the paracrine heartbeat signal shape for Life Graph maintenance, including scope, target role-type, priority, expiry, and policy tags.
+- [x] Define the cron-backed heartbeat job shape for Life Graph maintenance, using the existing distributed cron subsystem as the first durable clock source.
+- [x] Define the paracrine heartbeat signal shape for Life Graph maintenance, including scope, target role-type, priority, expiry, and policy tags.
 - [ ] Build the Attention Steward paracrine subscriber in observe-only mode before broad notifications or autonomous follow-up.
+  - [x] Land the first runtime boundary: cron payloads with top-level `paracrine_signal` emit `action = "paracrine_signal"` envelopes, and philotes observe them without entering the conversational model path.
 - [ ] Define the Attention Steward SIL as reinforced, situation-aware stewardship instructions with evidence, exceptions, friction, and reinforcement counters.
 - [ ] Define the agentic growth loop for skills, tools, schema, and policy patches with risk-tiered confirmation gates and negative-drift checks.
 - [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.

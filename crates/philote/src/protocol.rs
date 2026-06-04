@@ -102,6 +102,11 @@ pub struct InboundTaskPayload {
     /// `paracrine_response` tasks. Carries the paracrine_id and routing hint.
     #[serde(default)]
     pub exosome: Option<serde_json::Value>,
+    /// Typed low-agency signal delivered by the paracrine loop, often from a
+    /// cron-backed heartbeat. These are observed by role-type subscribers and
+    /// should not automatically enter the normal conversational model path.
+    #[serde(default)]
+    pub paracrine_signal: Option<serde_json::Value>,
     /// When true (set by membrane variants with per-route approval gates,
     /// e.g. membrane-mcp), the philote must park this turn as WaitingApproval
     /// before model invocation and emit `approval_required` back to the sender.
@@ -459,6 +464,31 @@ mod tests {
         assert_eq!(
             payload.raw_transport_event,
             Some(serde_json::json!({ "update_id": 1 }))
+        );
+    }
+
+    #[test]
+    fn paracrine_signal_field_deserializes() {
+        let payload: InboundTaskPayload = serde_json::from_value(serde_json::json!({
+            "action": "paracrine_signal",
+            "transport": "cron",
+            "paracrine_signal": {
+                "signal_id": "cron:job-1:1234",
+                "signal_type": "life_graph.attention_scan",
+                "scope": "life_graph",
+                "target_role_type": "attention-steward"
+            }
+        }))
+        .expect("payload should deserialize");
+
+        assert_eq!(payload.action.as_deref(), Some("paracrine_signal"));
+        assert_eq!(
+            payload.paracrine_signal.as_ref().and_then(|signal| {
+                signal
+                    .get("target_role_type")
+                    .and_then(serde_json::Value::as_str)
+            }),
+            Some("attention-steward")
         );
     }
 

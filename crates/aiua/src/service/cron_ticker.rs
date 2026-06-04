@@ -186,13 +186,7 @@ impl CronTicker {
         let payload_data = interpolate_payload(&job.payload, &vars);
 
         let task_id = Uuid::new_v4();
-        let task_json = serde_json::json!({
-            "cron_job_id": job.id,
-            "target_role": job.target_role,
-            "fire_epoch": fire_epoch,
-            "payload": payload_data,
-        })
-        .to_string();
+        let task_json = build_cron_task_json(job, fire_epoch, &self.local_node_id, payload_data);
 
         // Durably append TaskInvoke to the event ledger.
         let task_env = EventEnvelope {
@@ -389,4 +383,153 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn build_cron_task_json(
+    job: &CronJob,
+    fire_epoch: u64,
+    local_node_id: &str,
+    payload_data: String,
+) -> String {
+    let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(&payload_data) else {
+        return serde_json::json!({
+            "cron_job_id": job.id,
+            "target_role": job.target_role,
+            "fire_epoch": fire_epoch,
+            "payload": payload_data,
+        })
+        .to_string();
+    };
+
+    let Some(signal_seed) = payload_json.get("paracrine_signal") else {
+        return serde_json::json!({
+            "cron_job_id": job.id,
+            "target_role": job.target_role,
+            "fire_epoch": fire_epoch,
+            "payload": payload_data,
+        })
+        .to_string();
+    };
+
+    let mut signal = signal_seed
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    signal
+        .entry("signal_id")
+        .or_insert_with(|| serde_json::Value::String(format!("cron:{}:{fire_epoch}", job.id)));
+    signal
+        .entry("signal_type")
+        .or_insert_with(|| serde_json::Value::String("heartbeat".into()));
+    signal
+        .entry("scope")
+        .or_insert_with(|| serde_json::Value::String("hotel".into()));
+    signal
+        .entry("source_node")
+        .or_insert_with(|| serde_json::Value::String(local_node_id.to_string()));
+    signal
+        .entry("target_role_type")
+        .or_insert_with(|| serde_json::Value::String(job.target_role.clone()));
+    signal
+        .entry("cadence")
+        .or_insert_with(|| serde_json::Value::String(job.schedule.clone()));
+    signal
+        .entry("priority")
+        .or_insert_with(|| serde_json::Value::String("normal".into()));
+    signal
+        .entry("observed_at")
+        .or_insert_with(|| serde_json::Value::Number(fire_epoch.into()));
+    signal
+        .entry("policy_tags")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    signal
+        .entry("subject_refs")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+
+    serde_json::json!({
+        "action": "paracrine_signal",
+        "source": "cron-ticker",
+        "transport": "cron",
+        "cron_job_id": job.id,
+        "target_role": job.target_role,
+        "fire_epoch": fire_epoch,
+        "payload": payload_json,
+        "paracrine_signal": serde_json::Value::Object(signal),
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ansible_mesh_core::cron::CronJobSource;
+
+    fn test_job() -> CronJob {
+        CronJob {
+            id: "job-1".into(),
+            schedule: "0 */15 * * * * *".into(),
+            target_role: "attention-steward".into(),
+            target_node_id: None,
+            payload: "{}".into(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at: 1_000,
+            created_at: 900,
+            created_by: CronJobSource::Operator,
+        }
+    }
+
+    #[test]
+    fn cron_payload_without_paracrine_signal_keeps_legacy_task_shape() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{"hello":"world"}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(value["cron_job_id"], "job-1");
+        assert_eq!(value["target_role"], "attention-steward");
+        assert_eq!(value["fire_epoch"], 1_234);
+        assert_eq!(value["payload"], r#"{"hello":"world"}"#);
+        assert!(value.get("action").is_none());
+    }
+
+    #[test]
+    fn cron_payload_with_paracrine_signal_builds_normalized_signal_task() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{
+                "paracrine_signal": {
+                    "signal_type": "life_graph.attention_scan",
+                    "scope": "life_graph",
+                    "policy_tags": ["observe_only"]
+                },
+                "payload_summary": "scan open loops"
+            }"#
+            .into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(value["action"], "paracrine_signal");
+        assert_eq!(value["transport"], "cron");
+        assert_eq!(value["cron_job_id"], "job-1");
+        assert_eq!(value["paracrine_signal"]["signal_id"], "cron:job-1:1234");
+        assert_eq!(
+            value["paracrine_signal"]["signal_type"],
+            "life_graph.attention_scan"
+        );
+        assert_eq!(value["paracrine_signal"]["source_node"], "mac-jane-aiua-01");
+        assert_eq!(
+            value["paracrine_signal"]["target_role_type"],
+            "attention-steward"
+        );
+        assert_eq!(value["paracrine_signal"]["cadence"], "0 */15 * * * * *");
+        assert_eq!(value["paracrine_signal"]["observed_at"], 1_234);
+        assert_eq!(value["paracrine_signal"]["policy_tags"][0], "observe_only");
+    }
 }
