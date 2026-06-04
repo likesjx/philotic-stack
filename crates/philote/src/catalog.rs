@@ -66,6 +66,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "graph.create",
             "graph.query",
             "graph.list",
+            "graph.schema",
             "graph.drop",
             "graph.grant_access",
         ],
@@ -102,6 +103,7 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "graph.create",
             "graph.query",
             "graph.list",
+            "graph.schema",
             "graph.drop",
             "graph.grant_access",
         ],
@@ -387,7 +389,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "properties": {
                     "entity": {
                         "type": "string",
-                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "resource_declarations"],
+                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "reflex_preferences", "resource_declarations"],
                         "description": "The agent-graph entity collection to read."
                     }
                 },
@@ -411,7 +413,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "properties": {
                     "entity": {
                         "type": "string",
-                        "enum": ["tool_preference", "routing_preference"]
+                        "enum": ["tool_preference", "routing_preference", "reflex_preference"]
                     },
                     "tool_name": { "type": "string" },
                     "preference_key": { "type": "string" },
@@ -420,10 +422,90 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "provider_hint": { "type": "string" },
                     "model_ref": { "type": "string" },
                     "preference_level": { "type": "integer" },
+                    "precedence": { "type": "integer" },
+                    "reflexes": { "type": "object" },
                     "weight": { "type": "integer" },
                     "config": {}
                 },
                 "required": ["entity"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.declare".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.declare".into(),
+            description: "Declare an agent-local resource shape in the agent graph. Use this for \
+                          durable cognitive posture about resources the agent expects to use; it \
+                          does not grant hotel authority by itself."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource_type": {
+                        "type": "string",
+                        "description": "Resource type to declare, matching the shared resource enum."
+                    },
+                    "config_hint": {
+                        "type": ["string", "null"],
+                        "description": "Optional configuration hint to store with the declaration."
+                    }
+                },
+                "required": ["resource_type"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.recall".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.recall".into(),
+            description: "Recall recent agent-graph experience traces. Use this to inspect prior \
+                          tool calls, resource requests, model invocations, or approval outcomes \
+                          recorded for this agent."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum number of traces to return."
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "description": "Optional event type filter, such as tool_call."
+                    }
+                }
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.sync".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.sync".into(),
+            description: "Apply an inbound agent-graph snapshot using last-writer-wins merge \
+                          semantics. This is normally used by mesh synchronization rather than \
+                          casual model turns."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "source_node_id": { "type": "string" },
+                    "exported_at": { "type": "integer" },
+                    "preferences": { "type": "array" },
+                    "routing_preferences": { "type": "array" },
+                    "reflex_preferences": { "type": "array" },
+                    "declarations": { "type": "array" }
+                },
+                "required": ["agent_id", "source_node_id", "exported_at", "preferences", "declarations"]
             }),
             class: Some("capability".into()),
         },
@@ -500,6 +582,26 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {}
+            }),
+            class: Some("graph".into()),
+        },
+    );
+
+    m.insert(
+        "graph.schema".into(),
+        ToolDefinition {
+            tool_name: "graph.schema".into(),
+            description: "Inspect the labels and relationship types visible in the active graph \
+                          datasource provider."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Optional graph partition identifier."
+                    }
+                }
             }),
             class: Some("graph".into()),
         },

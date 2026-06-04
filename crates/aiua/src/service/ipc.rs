@@ -11701,7 +11701,6 @@ impl IpcServer {
             }
 
             // ── User Task Engine ──────────────────────────────────────────────
-
             IpcRequest::CreateUserTask {
                 task_id,
                 session_id,

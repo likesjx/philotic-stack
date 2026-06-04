@@ -1,6 +1,8 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
-use ansible_mesh_core::heartbeat::{emit_capability_sync, emit_heartbeat};
+use ansible_mesh_core::heartbeat::{
+    CapabilitySyncPayload, HeartbeatPayload, emit_capability_sync, emit_heartbeat,
+};
 use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
     now_epoch_secs, verify_join_request,
@@ -48,6 +50,20 @@ use service::blob::BlobService;
 use service::cron_ticker::CronTicker;
 use service::ipc::IpcServer;
 use std::sync::Arc;
+
+const DEFAULT_GRAPH_DATASOURCE_HOME_HOTEL: &str = "vps-jane";
+
+fn graph_datasource_home_hotel() -> String {
+    std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_GRAPH_DATASOURCE_HOME_HOTEL.to_string())
+}
+
+fn should_materialize_graph_datasource(hotel_name: &str) -> bool {
+    graph_datasource_home_hotel() == hotel_name
+}
 
 // ── Profile path resolution ────────────────────────────────────────────────
 
@@ -1188,6 +1204,70 @@ fn execution_reachability_for_hotel(
     }
 }
 
+fn hotel_name_from_node_id(node_id: &str) -> Option<String> {
+    node_id
+        .strip_suffix("-aiua-01")
+        .map(|hotel| hotel.trim().to_string())
+        .filter(|hotel| !hotel.is_empty())
+}
+
+fn reconcile_peer_execution_reachability(
+    graph: &GraphDomain,
+    capabilities: &NodeCapabilities,
+    reachability: Option<&ExecutionReachability>,
+) {
+    let Some(reachability) = reachability else {
+        return;
+    };
+    if reachability.host.trim().is_empty() || reachability.port == 0 {
+        return;
+    }
+
+    let mut hotel = graph
+        .list_hotels()
+        .ok()
+        .and_then(|hotels| {
+            hotels
+                .into_iter()
+                .find(|hotel| hotel.capabilities.node_id == capabilities.node_id)
+        })
+        .or_else(|| {
+            hotel_name_from_node_id(&capabilities.node_id).map(|hotel_name| {
+                let mut hotel = default_hotel_record(&hotel_name);
+                hotel.capabilities = capabilities.clone();
+                hotel
+            })
+        });
+
+    let Some(mut hotel) = hotel.take() else {
+        return;
+    };
+
+    let previous_host = hotel.mesh_host.clone();
+    let previous_port = hotel.execution_port;
+    hotel.capabilities = capabilities.clone();
+    hotel.mesh_host = Some(reachability.host.trim().to_string());
+    hotel.execution_port = reachability.port;
+
+    if previous_host != hotel.mesh_host || previous_port != hotel.execution_port {
+        match graph.upsert_hotel(&hotel) {
+            Ok(()) => info!(
+                hotel = %hotel.hotel_name,
+                node = %hotel.capabilities.node_id,
+                host = %hotel.mesh_host.as_deref().unwrap_or(""),
+                execution_port = hotel.execution_port,
+                "Updated peer hotel execution reachability from mesh advertisement"
+            ),
+            Err(err) => warn!(
+                hotel = %hotel.hotel_name,
+                node = %hotel.capabilities.node_id,
+                "Failed to update peer hotel execution reachability: {}",
+                err
+            ),
+        }
+    }
+}
+
 /// Samples local environment vitals for inclusion in the outbound heartbeat.
 /// All fields are best-effort; failures are silently swallowed so a bad sysfs
 /// read never blocks the heartbeat loop.
@@ -1500,6 +1580,28 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
         tokio::spawn(async move {
             while let Some(msg) = inbox_rx.recv().await {
                 match msg.msg_type {
+                    ansible_mesh_core::MsgType::Heartbeat => {
+                        if let Ok(payload) =
+                            serde_json::from_slice::<HeartbeatPayload>(&msg.payload)
+                        {
+                            reconcile_peer_execution_reachability(
+                                inbound_graph.as_ref(),
+                                &payload.capabilities,
+                                payload.execution_reachability.as_ref(),
+                            );
+                        }
+                    }
+                    ansible_mesh_core::MsgType::CapabilitySync => {
+                        if let Ok(payload) =
+                            serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload)
+                        {
+                            reconcile_peer_execution_reachability(
+                                inbound_graph.as_ref(),
+                                &payload.capabilities,
+                                payload.execution_reachability.as_ref(),
+                            );
+                        }
+                    }
                     ansible_mesh_core::MsgType::MeshEventBatch
                     | ansible_mesh_core::MsgType::ExecutionEventBatch => {
                         if let Ok(events) =
@@ -2424,7 +2526,7 @@ fn hotel_shared_guests(
         .collect();
     let roster_json = serde_json::to_string(&roster).unwrap_or_else(|_| "[]".to_string());
 
-    vec![
+    let mut guests = vec![
         GuestRecord {
             hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:membrane-gateway"),
@@ -2605,7 +2707,11 @@ fn hotel_shared_guests(
             active_pid: None,
             last_active_at: None,
         },
-    ]
+    ];
+    if !should_materialize_graph_datasource(hotel_name) {
+        guests.retain(|guest| guest.role != "graph-datasource");
+    }
+    guests
 }
 
 /// Legacy single-profile seed — used in tests that expect the old per-profile layout.
@@ -2960,6 +3066,9 @@ fn deactivate_legacy_managed_guests(
             if desired_ids.contains(guest.guest_id.as_str()) {
                 return false;
             }
+            if guest.role == "graph-datasource" {
+                return true;
+            }
 
             let hotel_prefixed_legacy_guest = guest
                 .guest_id
@@ -2990,6 +3099,35 @@ fn deactivate_legacy_managed_guests(
 
     if !stale.is_empty() {
         graph.seed_guests(hotel_name, &stale)?;
+    }
+
+    Ok(())
+}
+
+fn enforce_graph_datasource_home(graph: &GraphDomain, hotel_name: &str) -> Result<()> {
+    if should_materialize_graph_datasource(hotel_name) {
+        return Ok(());
+    }
+
+    let stale = graph
+        .list_guests(hotel_name, false)?
+        .into_iter()
+        .filter(|guest| guest.role == "graph-datasource" && guest.is_active)
+        .map(|mut guest| {
+            guest.is_active = false;
+            guest.active_pid = None;
+            guest
+        })
+        .collect::<Vec<_>>();
+
+    if !stale.is_empty() {
+        graph.seed_guests(hotel_name, &stale)?;
+        info!(
+            hotel = %hotel_name,
+            count = stale.len(),
+            home = %graph_datasource_home_hotel(),
+            "Deactivated non-home graph-datasource guest(s) before materialization"
+        );
     }
 
     Ok(())
@@ -6798,6 +6936,7 @@ async fn main() -> Result<()> {
         .hotel
         .context("--hotel is required unless using a subcommand such as `aiua load`")?;
 
+    enforce_graph_datasource_home(&graph_domain_arc, &hotel_name)?;
     let seeded_guests = graph_domain_arc.list_guests(&hotel_name, true)?;
     if seeded_guests.is_empty() {
         warn!(
@@ -7553,13 +7692,14 @@ mod tests {
         AgentProfile, StartupTest, agent_identity_record_for_profile, agent_profile_from_config,
         all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
-        enable_guest_test_overrides, execution_reachability_for_hotel,
-        extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
-        hotel_base_port, hotel_ipc_socket_path, local_capability_advertisements,
-        mesh_target_addr_for_node, nearest_available_base_port, resolve_runtime_ports,
-        startup_test_gemini_base_url,
+        enable_guest_test_overrides, enforce_graph_datasource_home,
+        execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
+        guest_supervision_enabled, hotel_base_port, hotel_ipc_socket_path,
+        local_capability_advertisements, mesh_target_addr_for_node, nearest_available_base_port,
+        reconcile_peer_execution_reachability, resolve_runtime_ports, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::domain::GraphDomain;
+    use ansible_mesh_core::registry::ExecutionReachability;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{GuestRecord, HotelRecord};
     use std::sync::Arc;
@@ -7664,7 +7804,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 12); // shared: membrane, model-gemini, model-elevenlabs, model-onnx, tool-runner, graph-runner, graph-datasource, table-datasource, router-listener, mcp-membrane; profile: agent, agent-datasource
+        assert_eq!(guests.len(), 11); // shared guests omit graph-datasource off the configured home hotel; profile: agent, agent-datasource
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
@@ -7679,6 +7819,7 @@ mod tests {
         assert!(guests.iter().any(|guest| guest.role == "model"));
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
+        assert!(!guests.iter().any(|guest| guest.role == "graph-datasource"));
         // Single membrane uses PHILOTIC_AGENT_ROSTER (not per-agent token key)
         let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"]
             .as_str()
@@ -7695,10 +7836,11 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", "/tmp/codex-home");
             std::env::set_var("PHILOTIC_PROFILE", "jane");
+            std::env::remove_var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL");
             std::env::remove_var("PHILOTIC_GRAPH_DATABASE_DIR");
         }
 
-        let guests = default_guest_seed("mbp-jane");
+        let guests = default_guest_seed("vps-jane");
         let graph_datasource = guests
             .iter()
             .find(|guest| guest.role == "graph-datasource")
@@ -7708,7 +7850,7 @@ mod tests {
 
         assert_eq!(
             config["env"]["PHILOTIC_GRAPH_DATASOURCE_ID"].as_str(),
-            Some("mbp-jane:graph-datasource")
+            Some("vps-jane:graph-datasource")
         );
         assert_eq!(config["env"]["PHILOTIC_PROFILE"].as_str(), Some("jane"));
         assert_eq!(
@@ -7721,6 +7863,27 @@ mod tests {
             std::env::remove_var("PHILOTIC_GRAPH_DATABASE_DIR");
             std::env::remove_var("HOME");
         }
+    }
+
+    #[test]
+    fn graph_datasource_guest_defaults_to_vps_jane_home() {
+        unsafe {
+            std::env::remove_var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL");
+        }
+
+        let vps_guests = default_guest_seed("vps-jane");
+        let mac_guests = default_guest_seed("mac-jane");
+
+        assert!(
+            vps_guests
+                .iter()
+                .any(|guest| guest.role == "graph-datasource")
+        );
+        assert!(
+            !mac_guests
+                .iter()
+                .any(|guest| guest.role == "graph-datasource")
+        );
     }
 
     #[test]
@@ -7850,6 +8013,34 @@ mod tests {
         assert_eq!(reachability.protocol, "tcp-framed-v1");
         assert_eq!(reachability.host, "100.64.230.106");
         assert_eq!(reachability.port, hotel.execution_port);
+    }
+
+    #[test]
+    fn peer_execution_reachability_updates_stale_hotel_record() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let mut hotel = default_hotel_record("mac-jane");
+        hotel.mesh_host = Some("100.79.239.64".into());
+        hotel.execution_port = 24_851;
+        let caps = hotel.capabilities.clone();
+        graph.upsert_hotel(&hotel).expect("upsert hotel");
+
+        reconcile_peer_execution_reachability(
+            &graph,
+            &caps,
+            Some(&ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "100.64.230.106".into(),
+                port: 16_371,
+            }),
+        );
+
+        let updated = graph
+            .get_hotel("mac-jane")
+            .expect("get hotel")
+            .expect("hotel exists");
+        assert_eq!(updated.mesh_host.as_deref(), Some("100.64.230.106"));
+        assert_eq!(updated.execution_port, 16_371);
     }
 
     #[test]
@@ -8340,6 +8531,80 @@ mod tests {
             .find(|guest| guest.guest_id == format!("{hotel_name}:hegemon-gateway-jane"))
             .expect("legacy hegemon predecessor guest should remain in graph");
         assert!(!legacy_hegemon.is_active);
+    }
+
+    #[test]
+    fn deactivate_managed_guests_disables_non_home_graph_datasource() {
+        unsafe {
+            std::env::remove_var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL");
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let hotel_name = "mac-jane";
+        let profile = default_agent_profile_for_hotel(hotel_name);
+        let desired = guest_seed_for_profile(hotel_name, &profile);
+        assert!(!desired.iter().any(|guest| guest.role == "graph-datasource"));
+        let stale_graph_datasource = GuestRecord {
+            hotel_name: hotel_name.into(),
+            guest_id: format!("{hotel_name}:graph-datasource"),
+            role: "graph-datasource".into(),
+            config_json: serde_json::json!({ "command": "graph-datasource" }).to_string(),
+            is_active: true,
+            active_pid: Some("4242".into()),
+            last_active_at: None,
+        };
+
+        graph
+            .seed_guests(hotel_name, &[stale_graph_datasource])
+            .expect("seed stale graph datasource");
+
+        deactivate_legacy_managed_guests(&graph, hotel_name, &[profile], &desired)
+            .expect("deactivate stale graph datasource");
+
+        let stored = graph
+            .list_guests(hotel_name, false)
+            .expect("list guests after cleanup");
+        let graph_datasource = stored
+            .iter()
+            .find(|guest| guest.guest_id == format!("{hotel_name}:graph-datasource"))
+            .expect("stale graph datasource remains in graph");
+        assert!(!graph_datasource.is_active);
+        assert_eq!(graph_datasource.active_pid, None);
+    }
+
+    #[test]
+    fn startup_enforcement_disables_non_home_graph_datasource() {
+        unsafe {
+            std::env::remove_var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL");
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let hotel_name = "mac-jane";
+        graph
+            .seed_guests(
+                hotel_name,
+                &[GuestRecord {
+                    hotel_name: hotel_name.into(),
+                    guest_id: format!("{hotel_name}:graph-datasource"),
+                    role: "graph-datasource".into(),
+                    config_json: serde_json::json!({ "command": "graph-datasource" }).to_string(),
+                    is_active: true,
+                    active_pid: Some("4242".into()),
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed stale graph datasource");
+
+        enforce_graph_datasource_home(&graph, hotel_name).expect("enforce placement");
+
+        let graph_datasource = graph
+            .list_guests(hotel_name, false)
+            .expect("list guests")
+            .into_iter()
+            .find(|guest| guest.role == "graph-datasource")
+            .expect("graph datasource");
+        assert!(!graph_datasource.is_active);
+        assert_eq!(graph_datasource.active_pid, None);
     }
 
     #[test]

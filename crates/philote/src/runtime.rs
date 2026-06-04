@@ -546,6 +546,21 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+fn graph_datasource_node_id() -> String {
+    std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_NODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|hotel| format!("{hotel}-aiua-01"))
+        })
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+}
+
 fn debug_model_requests_enabled() -> bool {
     matches!(
         std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
@@ -2214,9 +2229,8 @@ impl AgentRuntime {
                 }
             }
 
-            let reason = format!(
-                "Turn watchdog evicted stuck turn after {elapsed_secs}s in {phase}."
-            );
+            let reason =
+                format!("Turn watchdog evicted stuck turn after {elapsed_secs}s in {phase}.");
             if let Err(e) = self
                 .ipc_client
                 .send_request(IpcRequest::FailTask {
@@ -2897,19 +2911,20 @@ impl AgentRuntime {
             .unwrap_or(false);
 
         if should_preload {
-            let node_id = local_node_id();
+            let local_node_id = local_node_id();
+            let graph_datasource_node_id = graph_datasource_node_id();
             let agent_id = self.agent_id.clone();
             let _ = self
                 .ipc_client
                 .send_request(IpcRequest::EmitTask {
-                    target_node: node_id.clone(),
+                    target_node: graph_datasource_node_id,
                     target_role: "graph-datasource".into(),
                     target_guest_id: None,
                     task_json: serde_json::json!({
                         "action": "graph.query",
                         "graph_id": agent_id,
                         "query": "MATCH (n) RETURN n",
-                        "reply_to": node_id,
+                        "reply_to": local_node_id,
                         "reply_role": "agent",
                         "session_id": session_id,
                         "turn_id": "",
@@ -4897,8 +4912,7 @@ impl AgentRuntime {
             } else {
                 None
             };
-            if let Some((checkpoint_memory_type, checkpoint_json, index_state)) =
-                pending_checkpoint
+            if let Some((checkpoint_memory_type, checkpoint_json, index_state)) = pending_checkpoint
             {
                 self.ipc_client
                     .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)

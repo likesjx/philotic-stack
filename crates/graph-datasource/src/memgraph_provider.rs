@@ -71,6 +71,38 @@ impl MemgraphCypherProvider {
             "rows": output,
         }))
     }
+
+    async fn schema(&self, task: &DatasourceTask) -> Result<JsonValue> {
+        let labels = self
+            .execute_cypher(
+                task,
+                "MATCH (n) UNWIND labels(n) AS label RETURN collect(DISTINCT label) AS labels;",
+            )
+            .await?;
+        let relationship_types = self
+            .execute_cypher(
+                task,
+                "MATCH ()-[r]->() RETURN collect(DISTINCT type(r)) AS relationship_types;",
+            )
+            .await?;
+
+        Ok(json!({
+            "labels": labels
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.get("labels"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "relationship_types": relationship_types
+                .get("rows")
+                .and_then(JsonValue::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.get("relationship_types"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        }))
+    }
 }
 
 #[async_trait]
@@ -102,8 +134,7 @@ impl DatasourceProvider for MemgraphCypherProvider {
                 "uri": self.config.uri,
             }]))),
             TaskKind::Custom(s) if s == "graph.schema" => {
-                let query_text = "CALL db.labels() YIELD label RETURN collect(label) AS labels;";
-                let result = self.execute_cypher(task, query_text).await?;
+                let result = self.schema(task).await?;
                 Ok(ProviderOutput::ResultSet(result))
             }
             TaskKind::GrantAccess => {

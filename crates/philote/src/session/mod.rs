@@ -15,6 +15,21 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+fn graph_datasource_node_id() -> String {
+    std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_NODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|hotel| format!("{hotel}-aiua-01"))
+        })
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+}
+
 fn local_agent_id() -> String {
     std::env::var("PHILOTIC_AGENT_ID").unwrap_or_else(|_| "agent-jane-01".to_string())
 }
@@ -3747,6 +3762,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         .collect::<Vec<_>>();
 
     let local_node_id = local_node_id();
+    let graph_datasource_node_id = graph_datasource_node_id();
     let execution_routes = toolset
         .iter()
         .map(|tool_name| {
@@ -3768,7 +3784,11 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
             (
                 tool_name.clone(),
                 ToolExecutionRoute {
-                    target_node: local_node_id.clone(),
+                    target_node: if execution_mode == "datasource" {
+                        graph_datasource_node_id.clone()
+                    } else {
+                        local_node_id.clone()
+                    },
                     target_role: if execution_mode == "local_agent" {
                         "agent".into()
                     } else if execution_mode == "agent_graph" {
@@ -3942,7 +3962,12 @@ fn is_agent_graph_tool(tool_name: &str) -> bool {
 fn is_graph_datasource_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "graph.query" | "graph.create" | "graph.drop" | "graph.list" | "graph.grant_access"
+        "graph.query"
+            | "graph.create"
+            | "graph.drop"
+            | "graph.list"
+            | "graph.schema"
+            | "graph.grant_access"
     )
 }
 
@@ -5084,6 +5109,48 @@ mod tests {
         assert!(props.contains_key("command"));
         assert!(props.contains_key("working_dir"));
         assert!(props.contains_key("timeout_secs"));
+    }
+
+    #[test]
+    fn catalog_exposes_agent_graph_and_graph_schema_surface() {
+        use crate::catalog::tool_catalog;
+        let catalog = tool_catalog();
+
+        for tool_name in [
+            "agent.graph.read",
+            "agent.graph.write",
+            "agent.graph.declare",
+            "agent.graph.recall",
+            "agent.graph.sync",
+            "graph.schema",
+        ] {
+            assert!(
+                catalog.contains_key(tool_name),
+                "{tool_name} must be in catalog"
+            );
+        }
+
+        let read_entity_enum =
+            catalog["agent.graph.read"].input_schema["properties"]["entity"]["enum"]
+                .as_array()
+                .expect("agent.graph.read entity enum");
+        assert!(
+            read_entity_enum
+                .iter()
+                .any(|value| value.as_str() == Some("reflex_preferences")),
+            "agent.graph.read must expose reflex_preferences"
+        );
+
+        let write_entity_enum =
+            catalog["agent.graph.write"].input_schema["properties"]["entity"]["enum"]
+                .as_array()
+                .expect("agent.graph.write entity enum");
+        assert!(
+            write_entity_enum
+                .iter()
+                .any(|value| value.as_str() == Some("reflex_preference")),
+            "agent.graph.write must expose reflex_preference"
+        );
     }
 
     #[test]
@@ -6267,6 +6334,36 @@ mod tests {
         assert_eq!(route.target_role, "agent-graph");
         assert_eq!(route.runner_id, None);
         assert_eq!(route.selection_reason.as_deref(), Some("agent_graph_route"));
+    }
+
+    #[test]
+    fn graph_datasource_tools_route_to_home_node() {
+        unsafe {
+            std::env::set_var("PHILOTIC_NODE_ID", "mac-jane-aiua-01");
+            std::env::remove_var("PHILOTIC_GRAPH_DATASOURCE_HOME_NODE");
+            std::env::remove_var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL");
+        }
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("graph.query");
+        state.rebuild_default_tool_assembly();
+
+        let route = state
+            .resolve_tool_route("graph.query")
+            .expect("graph.query route should exist");
+
+        assert_eq!(route.execution_mode, "datasource");
+        assert_eq!(route.target_node, "vps-jane-aiua-01");
+        assert_eq!(route.target_role, "graph-datasource");
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("graph_datasource_route")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_NODE_ID");
+        }
     }
 
     #[test]

@@ -227,6 +227,7 @@ impl BeaconDaemon {
                         }
                     }
                 }
+                let _ = self.inbox_tx.send(msg).await;
             }
             MsgType::CapabilitySync => {
                 if let Ok(payload) = serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload) {
@@ -241,6 +242,7 @@ impl BeaconDaemon {
                         payload.advertisements,
                     );
                 }
+                let _ = self.inbox_tx.send(msg).await;
             }
             MsgType::MeshEventBatch
             | MsgType::MeshEventAck
