@@ -11,6 +11,7 @@ tags:
 - work-product
 related_docs:
 - ARCHITECTURE_STATUS.md
+- LIFE_GRAPH_OS_PROPOSAL.md
 - MEMORY_LAYERING_AND_WORK_PRODUCT_SPLIT_PROPOSAL.md
 - GRAPH_DATASOURCE_PHILOTE_PROPOSAL.md
 task_refs:
@@ -50,6 +51,7 @@ as the central graph provider; Kuzu remains a deferred embedded-provider spike.
 - `graph-runner` and `agent-graph-runner` remain the current runtime truth until the dedicated migration seam lands.
 - `SqliteCypherProvider` remains a bridge for installed graph.query behavior, but it must not be expanded into a homegrown Cypher engine.
 - Memgraph is accepted as the preferred current implementation focus for centralized Cypher graph authority.
+- Life Graph OS is a proposed consumer of this provider boundary: it should see `graph.query` and named retrieval strategies, not Bolt hostnames, ports, or database-specific operational detail.
 - Kuzu remains interesting for embedded/local graphs but is blocked by Rust binding/linker and upstream maintenance risk.
 
 ## 1. The Core Vision

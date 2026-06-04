@@ -1,7 +1,7 @@
 [Unit]
 Description=Philotic Memgraph Central Cypher Store
-After=network-online.target docker.service
-Wants=network-online.target
+After=network-online.target tailscaled.service docker.service
+Wants=network-online.target tailscaled.service
 Requires=docker.service
 
 [Service]

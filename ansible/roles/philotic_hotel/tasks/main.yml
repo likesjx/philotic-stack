@@ -10,6 +10,12 @@
     update_cache: yes
   when: ansible_facts["os_family"] == 'Debian'
 
+- name: Check for existing Docker runtime
+  stat:
+    path: /usr/bin/docker
+  register: philotic_docker_runtime
+  when: philotic_memgraph_enabled | bool
+
 - name: Install Docker for Memgraph
   apt:
     name:
@@ -19,6 +25,7 @@
   when:
     - ansible_facts["os_family"] == 'Debian'
     - philotic_memgraph_enabled | bool
+    - not philotic_docker_runtime.stat.exists
 
 # ── Service user ───────────────────────────────────────────────────────────────
 

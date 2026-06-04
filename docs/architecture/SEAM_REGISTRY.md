@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-05-29
+last_updated: 2026-06-04
 tags:
 - seams
 - ids
@@ -118,6 +118,13 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `memory-promotion-gates` | `memory-context` | [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md) | implemented-runtime | `docs/task.md` → `New Project: Memory Cultivation and True-Up` |
 | `memory-engine-contract` | `memory-context` | [MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
 | `graph-muninn-memory-dual-path` | `memory-context` | [MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
+| `life-graph-schema` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Life Graph OS` |
+| `life-graph-memorygraphrag-runner` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Life Graph OS` |
+| `life-graph-attention-steward` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Life Graph OS` |
+| `life-graph-agentic-growth-loop` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Life Graph OS` |
+| `life-graph-semantic-retrieval` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Life Graph OS` |
+| `life-graph-evidence-conflict` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Life Graph OS` |
+| `life-graph-paracrine-heartbeat` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Life Graph OS` |
 | `legacy-agent-import` | `migration-parity` | [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md) | `docs/task.md` → `Next Project: Personality and Context` and migration follow-ons |
 | `recognizable-identity-continuity` | `migration-parity` | [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md) | `docs/task.md` → `Next Project: Personality and Context` and migration follow-ons |
 | `parity-matrix` | `migration-parity` | [OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md) | `docs/task.md` → `New Project: OpenClaw Parity And Migration` |

@@ -3,7 +3,7 @@ title: Pluggable Context Engine Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-06-04
 tags:
 - context
 - engine
@@ -13,6 +13,7 @@ tags:
 related_docs:
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
+- LIFE_GRAPH_OS_PROPOSAL.md
 - MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
 - AGENT_PLUGIN_HOOKS_PROPOSAL.md
 task_refs:
@@ -96,6 +97,7 @@ Philotic is accumulating multiple context sources:
 - imported agent identity bundles
 - graph-backed profile/config
 - memory systems
+- future Life Graph OS context packets with semantic pivots, graph evidence paths, and attention/follow-through signals
 - tool and capability state
 - future external retrieval engines
 

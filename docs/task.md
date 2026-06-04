@@ -62,6 +62,28 @@ Seam IDs: `embedded-cypher-provider`, `central-graph-provider`, `graph-runner-mi
 - [ ] Define the `GraphStore`/provider contract around `query`, `schema`, `validate`, and graph-shaped results.
 - [ ] Decide whether centralized graph authority is Memgraph, Kuzu-per-hotel with mesh sync, or a tiered model with both.
 
+## New Project: Life Graph OS
+
+Proposal: [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md)
+
+Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-attention-steward`, `life-graph-agentic-growth-loop`, `life-graph-semantic-retrieval`, `life-graph-evidence-conflict`, `life-graph-paracrine-heartbeat`
+
+- [ ] Keep `graph-datasource` generic and define `data-memorygraphrag` as the Life Graph / MemoryGraphRAG runner/toolset layer.
+- [ ] Define the first Life Graph schema for `Role`, `Goal`, `System`, `Habit`, `Commitment`, `OpenLoop`, `NextAction`, and `GrowthExperiment`.
+- [ ] Decide whether Life Graph records live as a dedicated datasource partition, central graph labels, or a tiered model.
+- [ ] Add the first Life Graph tool surface: `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+- [ ] Add semantic indexing for Life Graph nodes with a `1536`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
+- [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
+- [ ] Implement one MemGraphRAG-inspired retrieval strategy: semantic pivot, bounded graph expansion, memory-aware ranking, policy filtering, and context packet projection.
+- [ ] Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.
+- [ ] Define the cron-backed heartbeat job shape for Life Graph maintenance, using the existing distributed cron subsystem as the first durable clock source.
+- [ ] Define the paracrine heartbeat signal shape for Life Graph maintenance, including scope, target role-type, priority, expiry, and policy tags.
+- [ ] Build the Attention Steward paracrine subscriber in observe-only mode before broad notifications or autonomous follow-up.
+- [ ] Define the Attention Steward SIL as reinforced, situation-aware stewardship instructions with evidence, exceptions, friction, and reinforcement counters.
+- [ ] Define the agentic growth loop for skills, tools, schema, and policy patches with risk-tiered confirmation gates and negative-drift checks.
+- [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.
+- [ ] Let specialized roles such as Coach consume and contribute to Life Graph OS through governed tools without owning the canonical cross-domain graph posture.
+
 ## New Project: Memory Cultivation and True-Up
 
 Proposal: [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)

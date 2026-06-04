@@ -75,6 +75,8 @@ philotic_memgraph_enabled: false
 philotic_memgraph_image: "memgraph/memgraph:latest"
 philotic_memgraph_container_name: "philotic-memgraph"
 philotic_memgraph_data_dir: "{{ philotic_data_dir }}/memgraph"
+# Host interface address for Bolt. Use a Tailscale IP for central graph services
+# so other hotels can reach Memgraph without exposing it on public interfaces.
 philotic_memgraph_host: "127.0.0.1"
 philotic_memgraph_port: 7687
 philotic_graph_provider: "{{ 'memgraph' if philotic_memgraph_enabled else 'sqlite' }}"
