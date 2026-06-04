@@ -69,9 +69,11 @@ Proposal: [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs
 Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-attention-steward`, `life-graph-agentic-growth-loop`, `life-graph-semantic-retrieval`, `life-graph-evidence-conflict`, `life-graph-paracrine-heartbeat`
 
 - [ ] Keep `graph-datasource` generic and define `data-memorygraphrag` as the Life Graph / MemoryGraphRAG runner/toolset layer.
+  - [x] Add the first `data-memorygraphrag` runner planning surface for `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
 - [ ] Define the first Life Graph schema for `Role`, `Goal`, `System`, `Habit`, `Commitment`, `OpenLoop`, `NextAction`, and `GrowthExperiment`.
 - [ ] Decide whether Life Graph records live as a dedicated datasource partition, central graph labels, or a tiered model.
 - [ ] Add the first Life Graph tool surface: `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+  - [x] Define the tool catalog and typed runner requests/plans in `data-memorygraphrag`; runtime/hotel projection remains next.
 - [ ] Add semantic indexing for Life Graph nodes with a `1536`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
 - [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
 - [ ] Implement one MemGraphRAG-inspired retrieval strategy: semantic pivot, bounded graph expansion, memory-aware ranking, policy filtering, and context packet projection.

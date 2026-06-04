@@ -541,6 +541,427 @@ impl RetrievalContextPacket {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifeGraphToolName {
+    LifeObserve,
+    LifeRecall,
+    LifeCommit,
+    LifeResolve,
+    LifePatchPropose,
+}
+
+impl LifeGraphToolName {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LifeObserve => "life.observe",
+            Self::LifeRecall => "life.recall",
+            Self::LifeCommit => "life.commit",
+            Self::LifeResolve => "life.resolve",
+            Self::LifePatchPropose => "life.patch.propose",
+        }
+    }
+
+    pub fn mutates_graph(&self) -> bool {
+        matches!(
+            self,
+            Self::LifeObserve | Self::LifeCommit | Self::LifeResolve | Self::LifePatchPropose
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeGraphToolSpec {
+    pub name: LifeGraphToolName,
+    pub tool_name: String,
+    pub description: String,
+    pub mutates_graph: bool,
+    pub requires_operator_by_default: bool,
+}
+
+impl LifeGraphToolSpec {
+    fn new(
+        name: LifeGraphToolName,
+        description: impl Into<String>,
+        requires_operator_by_default: bool,
+    ) -> Self {
+        let tool_name = name.as_str().to_string();
+        let mutates_graph = name.mutates_graph();
+        Self {
+            name,
+            tool_name,
+            description: description.into(),
+            mutates_graph,
+            requires_operator_by_default,
+        }
+    }
+}
+
+pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
+    vec![
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeObserve,
+            "Capture a grounded observation as proposed Life Graph evidence.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeRecall,
+            "Build an evidence-backed Life Graph retrieval context packet.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeCommit,
+            "Promote validated evidence into durable Life Graph truth.",
+            true,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeResolve,
+            "Resolve a Life Graph conflict handoff with Muninn/operator policy gates.",
+            true,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifePatchPropose,
+            "Propose a governed Life Graph schema, skill, tool, or policy patch.",
+            true,
+        ),
+    ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchKind {
+    SchemaPatch,
+    SkillPatch,
+    ToolPatch,
+    AttentionPatch,
+    SystemPatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchRisk {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeObserveInput {
+    pub observation_id: String,
+    pub evidence: EvidencePacket,
+    #[serde(default)]
+    pub proposed_graph_refs: Vec<GraphRecordRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeCommitInput {
+    pub evidence: EvidencePacket,
+    pub operator_approved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeResolveInput {
+    pub handoff: ConflictHandoff,
+    pub resolution_summary: String,
+    pub operator_approved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifePatchProposalInput {
+    pub patch_id: String,
+    pub patch_kind: PatchKind,
+    pub summary: String,
+    pub rationale: String,
+    #[serde(default)]
+    pub evidence_packets: Vec<EvidencePacket>,
+    pub risk: PatchRisk,
+    pub operator_approved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tool", content = "input", rename_all = "snake_case")]
+pub enum LifeGraphToolRequest {
+    LifeObserve(LifeObserveInput),
+    LifeRecall(RetrievalQuery),
+    LifeCommit(LifeCommitInput),
+    LifeResolve(LifeResolveInput),
+    LifePatchPropose(LifePatchProposalInput),
+}
+
+impl LifeGraphToolRequest {
+    pub fn tool_name(&self) -> LifeGraphToolName {
+        match self {
+            Self::LifeObserve(_) => LifeGraphToolName::LifeObserve,
+            Self::LifeRecall(_) => LifeGraphToolName::LifeRecall,
+            Self::LifeCommit(_) => LifeGraphToolName::LifeCommit,
+            Self::LifeResolve(_) => LifeGraphToolName::LifeResolve,
+            Self::LifePatchPropose(_) => LifeGraphToolName::LifePatchPropose,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerPlanTarget {
+    GraphDatasource,
+    Muninn,
+    Operator,
+    DataMemoryGraphRag,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerPlanStep {
+    pub target: RunnerPlanTarget,
+    pub action: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerPlan {
+    pub tool_name: LifeGraphToolName,
+    #[serde(default)]
+    pub steps: Vec<RunnerPlanStep>,
+    pub requires_operator: bool,
+    #[serde(default)]
+    pub blocked_reasons: Vec<String>,
+}
+
+impl RunnerPlan {
+    pub fn allowed(&self) -> bool {
+        !self.requires_operator && self.blocked_reasons.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerConfig {
+    pub datasource_id: String,
+    pub default_embedding_model: String,
+}
+
+impl Default for RunnerConfig {
+    fn default() -> Self {
+        Self {
+            datasource_id: "life-graph".into(),
+            default_embedding_model: "text-embedding-3-small".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryGraphRagRunner {
+    pub config: RunnerConfig,
+}
+
+impl Default for MemoryGraphRagRunner {
+    fn default() -> Self {
+        Self {
+            config: RunnerConfig::default(),
+        }
+    }
+}
+
+impl MemoryGraphRagRunner {
+    pub fn new(config: RunnerConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn tool_catalog(&self) -> Vec<LifeGraphToolSpec> {
+        life_graph_tool_catalog()
+    }
+
+    pub fn plan(&self, request: LifeGraphToolRequest) -> Result<RunnerPlan, ContractError> {
+        match request {
+            LifeGraphToolRequest::LifeObserve(input) => self.plan_observe(input),
+            LifeGraphToolRequest::LifeRecall(query) => self.plan_recall(query),
+            LifeGraphToolRequest::LifeCommit(input) => self.plan_commit(input),
+            LifeGraphToolRequest::LifeResolve(input) => self.plan_resolve(input),
+            LifeGraphToolRequest::LifePatchPropose(input) => self.plan_patch_propose(input),
+        }
+    }
+
+    fn plan_observe(&self, input: LifeObserveInput) -> Result<RunnerPlan, ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "observation_id", &input.observation_id);
+        if let Err(err) = input.evidence.validate() {
+            violations.extend(err.violations);
+        }
+        finish_validation(violations)?;
+
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeObserve,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.evidence.propose".into(),
+                payload: serde_json::json!({
+                    "datasource_id": self.config.datasource_id,
+                    "observation_id": input.observation_id,
+                    "evidence": input.evidence,
+                    "proposed_graph_refs": input.proposed_graph_refs,
+                }),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    fn plan_recall(&self, query: RetrievalQuery) -> Result<RunnerPlan, ContractError> {
+        query.validate()?;
+        let max_context_packets = query.max_context_packets;
+
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeRecall,
+            steps: vec![
+                RunnerPlanStep {
+                    target: RunnerPlanTarget::GraphDatasource,
+                    action: "life.retrieve.semantic_expand".into(),
+                    payload: serde_json::json!({
+                        "datasource_id": self.config.datasource_id,
+                        "query": query,
+                    }),
+                },
+                RunnerPlanStep {
+                    target: RunnerPlanTarget::DataMemoryGraphRag,
+                    action: "life.context.project_evidence_packet".into(),
+                    payload: serde_json::json!({
+                        "max_context_packets": max_context_packets,
+                    }),
+                },
+            ],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    fn plan_commit(&self, input: LifeCommitInput) -> Result<RunnerPlan, ContractError> {
+        input.evidence.validate()?;
+        let confirmed = matches!(input.evidence.validation_state, ValidationState::Confirmed);
+        let mut blocked_reasons = Vec::new();
+        if !input.operator_approved && !confirmed {
+            blocked_reasons.push(
+                "life.commit requires confirmed evidence or explicit operator approval".into(),
+            );
+        }
+        if input.evidence.requires_muninn_handoff() {
+            blocked_reasons.push("life.commit blocked while Muninn handoff is required".into());
+        }
+
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeCommit,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.fact.commit".into(),
+                payload: serde_json::json!({
+                    "datasource_id": self.config.datasource_id,
+                    "evidence": input.evidence,
+                }),
+            }],
+            requires_operator: !input.operator_approved && !confirmed,
+            blocked_reasons,
+        })
+    }
+
+    fn plan_resolve(&self, input: LifeResolveInput) -> Result<RunnerPlan, ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(
+            &mut violations,
+            "resolution_summary",
+            &input.resolution_summary,
+        );
+        if let Err(err) = input.handoff.validate() {
+            violations.extend(err.violations);
+        }
+        finish_validation(violations)?;
+
+        let mut steps = vec![RunnerPlanStep {
+            target: RunnerPlanTarget::GraphDatasource,
+            action: "life.conflict.resolve".into(),
+            payload: serde_json::json!({
+                "datasource_id": self.config.datasource_id,
+                "handoff": input.handoff,
+                "resolution_summary": input.resolution_summary,
+            }),
+        }];
+
+        if matches!(
+            input.handoff.requested_muninn_action,
+            MuninnRequestedAction::TrueUp
+                | MuninnRequestedAction::ContradictionReview
+                | MuninnRequestedAction::TrustUpdate
+                | MuninnRequestedAction::Cultivate
+        ) {
+            let muninn_action = match input.handoff.requested_muninn_action {
+                MuninnRequestedAction::TrueUp => "memory.true_up",
+                MuninnRequestedAction::ContradictionReview => "memory.contradiction_review",
+                MuninnRequestedAction::TrustUpdate => "memory.trust_update",
+                MuninnRequestedAction::Cultivate => "memory.cultivate",
+                MuninnRequestedAction::None => "memory.none",
+            };
+            steps.push(RunnerPlanStep {
+                target: RunnerPlanTarget::Muninn,
+                action: muninn_action.into(),
+                payload: serde_json::json!({
+                    "conflict_id": input.handoff.conflict_id,
+                    "muninn_engram_ids": input.handoff.muninn_engram_ids,
+                    "resolution_summary": input.resolution_summary,
+                }),
+            });
+        }
+
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeResolve,
+            steps,
+            requires_operator: input.handoff.requires_operator && !input.operator_approved,
+            blocked_reasons: if input.handoff.requires_operator && !input.operator_approved {
+                vec!["life.resolve requires operator approval for this handoff".into()]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    fn plan_patch_propose(
+        &self,
+        input: LifePatchProposalInput,
+    ) -> Result<RunnerPlan, ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "patch_id", &input.patch_id);
+        require_non_empty(&mut violations, "summary", &input.summary);
+        require_non_empty(&mut violations, "rationale", &input.rationale);
+        if input.evidence_packets.is_empty() {
+            violations.push("life.patch.propose requires at least one evidence packet".into());
+        }
+        for (idx, packet) in input.evidence_packets.iter().enumerate() {
+            if let Err(err) = packet.validate() {
+                for violation in err.violations {
+                    violations.push(format!("evidence_packets[{idx}].{violation}"));
+                }
+            }
+        }
+        finish_validation(violations)?;
+
+        let requires_operator = matches!(input.risk, PatchRisk::High) && !input.operator_approved;
+
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifePatchPropose,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.patch.propose".into(),
+                payload: serde_json::json!({
+                    "datasource_id": self.config.datasource_id,
+                    "patch": input,
+                }),
+            }],
+            requires_operator,
+            blocked_reasons: if requires_operator {
+                vec!["high-risk Life Graph patches require operator approval".into()]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractError {
     pub violations: Vec<String>,
@@ -829,6 +1250,144 @@ mod tests {
         assert_eq!(
             json["ranked_packets"][0]["matched_policy_filters"][0],
             "require_evidence"
+        );
+    }
+
+    #[test]
+    fn runner_catalog_exposes_first_life_graph_tool_surface() {
+        let runner = MemoryGraphRagRunner::default();
+        let catalog = runner.tool_catalog();
+        let tool_names: Vec<_> = catalog.iter().map(|tool| tool.tool_name.as_str()).collect();
+
+        assert_eq!(
+            tool_names,
+            vec![
+                "life.observe",
+                "life.recall",
+                "life.commit",
+                "life.resolve",
+                "life.patch.propose"
+            ]
+        );
+        assert!(
+            !catalog
+                .iter()
+                .find(|tool| tool.tool_name == "life.recall")
+                .expect("recall spec")
+                .mutates_graph
+        );
+    }
+
+    #[test]
+    fn runner_recall_builds_graph_then_context_projection_plan() {
+        let runner = MemoryGraphRagRunner::default();
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeRecall(retrieval_query()))
+            .expect("recall should plan");
+
+        assert_eq!(plan.tool_name, LifeGraphToolName::LifeRecall);
+        assert!(plan.allowed());
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].target, RunnerPlanTarget::GraphDatasource);
+        assert_eq!(plan.steps[0].action, "life.retrieve.semantic_expand");
+        assert_eq!(plan.steps[1].target, RunnerPlanTarget::DataMemoryGraphRag);
+        assert_eq!(plan.steps[1].payload["max_context_packets"], 6);
+    }
+
+    #[test]
+    fn runner_commit_blocks_unconfirmed_evidence_without_operator() {
+        let runner = MemoryGraphRagRunner::default();
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeCommit(LifeCommitInput {
+                evidence: evidence_packet(),
+                operator_approved: false,
+            }))
+            .expect("commit should produce blocked plan");
+
+        assert_eq!(plan.tool_name, LifeGraphToolName::LifeCommit);
+        assert!(!plan.allowed());
+        assert!(
+            plan.blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("confirmed evidence"))
+        );
+    }
+
+    #[test]
+    fn runner_commit_allows_confirmed_evidence() {
+        let runner = MemoryGraphRagRunner::default();
+        let mut evidence = evidence_packet();
+        evidence.validation_state = ValidationState::Confirmed;
+        evidence.adjudication_status = AdjudicationStatus::NotNeeded;
+
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeCommit(LifeCommitInput {
+                evidence,
+                operator_approved: false,
+            }))
+            .expect("confirmed evidence should plan");
+
+        assert!(plan.allowed());
+        assert_eq!(plan.steps[0].action, "life.fact.commit");
+    }
+
+    #[test]
+    fn runner_resolve_adds_muninn_true_up_step() {
+        let runner = MemoryGraphRagRunner::default();
+        let handoff = ConflictHandoff {
+            handoff_id: "handoff:conflict:3".into(),
+            conflict_id: "conflict:open-loop:resolved-vs-active".into(),
+            finding_type: ConflictFindingType::DirectContradiction,
+            summary: "Graph and Muninn disagree about open loop state.".into(),
+            graph_fact_refs: vec![graph_ref("life:open_loop:rowing-follow-up")],
+            evidence_packets: vec![evidence_packet()],
+            muninn_engram_ids: vec!["01KTA0Z5K942VAP9NPAAABH20T".into()],
+            recommended_owner: HandoffOwner::SharedGate,
+            requested_muninn_action: MuninnRequestedAction::TrueUp,
+            risk: ConflictRisk::Medium,
+            requires_operator: false,
+            status: ConflictHandoffStatus::Open,
+            metadata: serde_json::json!({}),
+        };
+
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeResolve(LifeResolveInput {
+                handoff,
+                resolution_summary: "Keep graph fact proposed until Muninn true-up completes."
+                    .into(),
+                operator_approved: false,
+            }))
+            .expect("resolve should plan");
+
+        assert!(plan.allowed());
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[1].target, RunnerPlanTarget::Muninn);
+        assert_eq!(plan.steps[1].action, "memory.true_up");
+    }
+
+    #[test]
+    fn runner_patch_propose_gates_high_risk_patch() {
+        let runner = MemoryGraphRagRunner::default();
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifePatchPropose(
+                LifePatchProposalInput {
+                    patch_id: "patch:identity-merge-policy".into(),
+                    patch_kind: PatchKind::SchemaPatch,
+                    summary: "Tighten identity merge policy.".into(),
+                    rationale: "Nickname-only merges are too risky.".into(),
+                    evidence_packets: vec![evidence_packet()],
+                    risk: PatchRisk::High,
+                    operator_approved: false,
+                },
+            ))
+            .expect("patch proposal should plan");
+
+        assert!(!plan.allowed());
+        assert!(plan.requires_operator);
+        assert!(
+            plan.blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("high-risk"))
         );
     }
 }
