@@ -12,6 +12,8 @@ pub type ConflictId = String;
 pub type GraphRecordId = String;
 pub type MuninnEngramId = String;
 
+pub const LIFE_GRAPH_EMBEDDING_DIMS: usize = 1536;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationState {
@@ -320,6 +322,225 @@ impl ConflictHandoff {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticSpace {
+    LifeEventSemantic,
+    GoalSystemSemantic,
+    SkillToolSemantic,
+    RolePersonSemantic,
+    MemoryBridgeSemantic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalStrategy {
+    SemanticPivot,
+    VectorThenExpand,
+    MemoryAwareGraphRank,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyFilter {
+    ExcludeRetired,
+    ExcludeConflictedUnlessRequested,
+    RequireEvidence,
+    RoleAppropriate,
+    LowAgencyOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticPivot {
+    pub space: SemanticSpace,
+    pub embedding_model: String,
+    pub embedding_dims: usize,
+    pub query_text_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpansionPolicy {
+    pub max_hops: u8,
+    pub max_nodes: usize,
+    #[serde(default)]
+    pub allowed_edge_types: Vec<String>,
+}
+
+impl Default for ExpansionPolicy {
+    fn default() -> Self {
+        Self {
+            max_hops: 2,
+            max_nodes: 32,
+            allowed_edge_types: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RankingWeights {
+    pub semantic_similarity: f32,
+    pub graph_specificity: f32,
+    pub recency: f32,
+    pub confirmation: f32,
+    pub active_commitment: f32,
+}
+
+impl Default for RankingWeights {
+    fn default() -> Self {
+        Self {
+            semantic_similarity: 0.45,
+            graph_specificity: 0.2,
+            recency: 0.1,
+            confirmation: 0.15,
+            active_commitment: 0.1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalQuery {
+    pub query_id: String,
+    pub query_text: String,
+    pub strategy: RetrievalStrategy,
+    #[serde(default)]
+    pub semantic_pivots: Vec<SemanticPivot>,
+    pub expansion_policy: ExpansionPolicy,
+    #[serde(default)]
+    pub policy_filters: Vec<PolicyFilter>,
+    pub ranking_weights: RankingWeights,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_intent: Option<String>,
+    pub max_context_packets: usize,
+}
+
+impl RetrievalQuery {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+
+        require_non_empty(&mut violations, "query_id", &self.query_id);
+        require_non_empty(&mut violations, "query_text", &self.query_text);
+
+        if self.semantic_pivots.is_empty() {
+            violations.push("retrieval query requires at least one semantic_pivot".into());
+        }
+
+        for (idx, pivot) in self.semantic_pivots.iter().enumerate() {
+            require_non_empty(
+                &mut violations,
+                &format!("semantic_pivots[{idx}].embedding_model"),
+                &pivot.embedding_model,
+            );
+            require_non_empty(
+                &mut violations,
+                &format!("semantic_pivots[{idx}].query_text_hash"),
+                &pivot.query_text_hash,
+            );
+            if pivot.embedding_dims != LIFE_GRAPH_EMBEDDING_DIMS {
+                violations.push(format!(
+                    "semantic_pivots[{idx}].embedding_dims must be {LIFE_GRAPH_EMBEDDING_DIMS}"
+                ));
+            }
+        }
+
+        if self.expansion_policy.max_hops > 4 {
+            violations.push("expansion_policy.max_hops must be <= 4".into());
+        }
+        if self.expansion_policy.max_nodes == 0 {
+            violations.push("expansion_policy.max_nodes must be greater than 0".into());
+        }
+        if self.max_context_packets == 0 {
+            violations.push("max_context_packets must be greater than 0".into());
+        }
+
+        require_unit_interval(
+            &mut violations,
+            "ranking_weights.semantic_similarity",
+            self.ranking_weights.semantic_similarity,
+        );
+        require_unit_interval(
+            &mut violations,
+            "ranking_weights.graph_specificity",
+            self.ranking_weights.graph_specificity,
+        );
+        require_unit_interval(
+            &mut violations,
+            "ranking_weights.recency",
+            self.ranking_weights.recency,
+        );
+        require_unit_interval(
+            &mut violations,
+            "ranking_weights.confirmation",
+            self.ranking_weights.confirmation,
+        );
+        require_unit_interval(
+            &mut violations,
+            "ranking_weights.active_commitment",
+            self.ranking_weights.active_commitment,
+        );
+
+        finish_validation(violations)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RankedEvidencePacket {
+    pub packet: EvidencePacket,
+    pub score: f32,
+    #[serde(default)]
+    pub matched_policy_filters: Vec<PolicyFilter>,
+    #[serde(default)]
+    pub evidence_path: Vec<GraphRecordRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalContextPacket {
+    pub context_id: String,
+    pub query_id: String,
+    pub strategy: RetrievalStrategy,
+    #[serde(default)]
+    pub ranked_packets: Vec<RankedEvidencePacket>,
+    #[serde(default)]
+    pub omitted_conflict_ids: Vec<ConflictId>,
+    pub token_budget: usize,
+    pub generated_at: String,
+}
+
+impl RetrievalContextPacket {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+
+        require_non_empty(&mut violations, "context_id", &self.context_id);
+        require_non_empty(&mut violations, "query_id", &self.query_id);
+        require_non_empty(&mut violations, "generated_at", &self.generated_at);
+
+        if self.ranked_packets.is_empty() {
+            violations.push("retrieval context packet requires at least one ranked_packet".into());
+        }
+        if self.token_budget == 0 {
+            violations.push("token_budget must be greater than 0".into());
+        }
+
+        for (idx, ranked) in self.ranked_packets.iter().enumerate() {
+            require_unit_interval(
+                &mut violations,
+                &format!("ranked_packets[{idx}].score"),
+                ranked.score,
+            );
+            if let Err(err) = ranked.packet.validate() {
+                for violation in err.violations {
+                    violations.push(format!("ranked_packets[{idx}].packet.{violation}"));
+                }
+            }
+        }
+
+        finish_validation(violations)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractError {
     pub violations: Vec<String>,
@@ -514,5 +735,100 @@ mod tests {
 
         handoff.requires_operator = true;
         handoff.validate().expect("operator gate completes handoff");
+    }
+
+    fn semantic_pivot() -> SemanticPivot {
+        SemanticPivot {
+            space: SemanticSpace::GoalSystemSemantic,
+            embedding_model: "text-embedding-3-small".into(),
+            embedding_dims: LIFE_GRAPH_EMBEDDING_DIMS,
+            query_text_hash: "sha256:query123".into(),
+            vector_ref: Some("vector:query123".into()),
+        }
+    }
+
+    fn retrieval_query() -> RetrievalQuery {
+        RetrievalQuery {
+            query_id: "retrieval:open-loops:20260604".into(),
+            query_text: "What follow-up loops matter for Beacon today?".into(),
+            strategy: RetrievalStrategy::MemoryAwareGraphRank,
+            semantic_pivots: vec![semantic_pivot()],
+            expansion_policy: ExpansionPolicy {
+                max_hops: 2,
+                max_nodes: 24,
+                allowed_edge_types: vec!["supports".into(), "blocks".into(), "belongs_to".into()],
+            },
+            policy_filters: vec![
+                PolicyFilter::ExcludeRetired,
+                PolicyFilter::ExcludeConflictedUnlessRequested,
+                PolicyFilter::RequireEvidence,
+                PolicyFilter::RoleAppropriate,
+            ],
+            ranking_weights: RankingWeights::default(),
+            active_role: Some("beacon".into()),
+            operator_intent: Some("attention planning".into()),
+            max_context_packets: 6,
+        }
+    }
+
+    #[test]
+    fn retrieval_query_requires_life_graph_embedding_dims() {
+        let mut query = retrieval_query();
+        query.validate().expect("query should be valid");
+
+        query.semantic_pivots[0].embedding_dims = 768;
+        let err = query
+            .validate()
+            .expect_err("query should reject wrong embedding dims");
+        assert!(
+            err.violations
+                .iter()
+                .any(|v| v.contains("embedding_dims must be 1536"))
+        );
+    }
+
+    #[test]
+    fn retrieval_query_bounds_graph_expansion() {
+        let mut query = retrieval_query();
+        query.expansion_policy.max_hops = 5;
+
+        let err = query
+            .validate()
+            .expect_err("query should reject unbounded expansion");
+        assert!(
+            err.violations
+                .iter()
+                .any(|v| v.contains("max_hops must be <= 4"))
+        );
+    }
+
+    #[test]
+    fn retrieval_context_packet_validates_ranked_evidence() {
+        let packet = RetrievalContextPacket {
+            context_id: "context:beacon:open-loops".into(),
+            query_id: "retrieval:open-loops:20260604".into(),
+            strategy: RetrievalStrategy::MemoryAwareGraphRank,
+            ranked_packets: vec![RankedEvidencePacket {
+                packet: evidence_packet(),
+                score: 0.91,
+                matched_policy_filters: vec![PolicyFilter::RequireEvidence],
+                evidence_path: vec![
+                    graph_ref("life:goal:health"),
+                    graph_ref("life:open_loop:rowing-follow-up"),
+                ],
+            }],
+            omitted_conflict_ids: vec![],
+            token_budget: 2_000,
+            generated_at: "2026-06-04T19:36:00Z".into(),
+        };
+
+        packet.validate().expect("context packet should be valid");
+
+        let json = serde_json::to_value(packet).expect("serialize context packet");
+        assert_eq!(json["strategy"], "memory_aware_graph_rank");
+        assert_eq!(
+            json["ranked_packets"][0]["matched_policy_filters"][0],
+            "require_evidence"
+        );
     }
 }

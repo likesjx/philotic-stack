@@ -75,6 +75,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Add semantic indexing for Life Graph nodes with a `1536`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
 - [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
 - [ ] Implement one MemGraphRAG-inspired retrieval strategy: semantic pivot, bounded graph expansion, memory-aware ranking, policy filtering, and context packet projection.
+  - [x] Land the first `data-memorygraphrag` semantic retrieval contracts for semantic pivots, bounded expansion, policy filters, ranking weights, and evidence-backed context packets.
 - [ ] Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.
   - [x] Land the initial `data-memorygraphrag` contract crate with validated `EvidencePacket` and `ConflictHandoff` wire types.
 - [x] Define the cron-backed heartbeat job shape for Life Graph maintenance, using the existing distributed cron subsystem as the first durable clock source.
