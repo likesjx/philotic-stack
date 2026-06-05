@@ -103,10 +103,67 @@ Per-seam open items for the next implementation round:
 
 Cross-cutting next pressure:
 
-- wire `life.*` tools through hotel/tool assembly so philote roles can invoke them
-- embed `life.recall` in Beacon's turn context pipeline (replaces or augments Muninn recall for life-domain turns)
-- connect conflict handoff packets to Muninn `true_up` / `contradiction_review` tools
+- wire `life.*` tools through hotel/tool assembly so philote roles can invoke them (claude-local)
+- embed `life.recall` in Beacon's turn context pipeline (claude-local)
+- complete provider write/resolve/patch surface so Beacon can act on Life Graph facts (Codex)
+- connect conflict handoff packets to Muninn `true_up` / `contradiction_review` tools (Codex)
 - add `life.recall` feedback path (`life.recall.feedback`) for the retrieval flywheel
+
+## Codex Handoff — Group B Provider Completions
+
+All Group B work lives in one file: `crates/data-memorygraphrag/src/provider.rs`.
+Follow the `handle_observe` method (line ~108) as the pattern for every handler below.
+
+### 1. `life.commit` — `handle_commit`
+
+- Parse `LifeCommitInput` from `task.parameters`.
+- Call `runner.plan(LifeGraphToolRequest::LifeCommit(input.clone()))`. If `!plan.allowed()` return blocked.
+- If allowed, run a `MERGE (n:{label} {id: $id}) ON MATCH SET n.validation_state = 'confirmed', n.last_confirmed_at = $now` Cypher against Memgraph using the label and id from `input.evidence.claim_ref`.
+- Return `{ status: "committed", node_id, label, validation_state: "confirmed" }`.
+
+### 2. `life.resolve` — `handle_resolve`
+
+- Parse `LifeResolveInput` from `task.parameters`.
+- Call `runner.plan(...)`. Check `plan.allowed()`.
+- Step 1 of the plan: `life.conflict.resolve` → run `MERGE (n:{label} {id: $id}) ON MATCH SET n.validation_state = 'proposed', n.adjudication_status = 'resolved'` for each `graph_fact_ref` in the handoff.
+- Step 2 (if present in plan): `memory.true_up` / `memory.contradiction_review` / etc. → call Muninn MCP tool `muninn_evolve` or `muninn_decide` with the `conflict_id` and `resolution_summary` as payload. Use the existing Muninn MCP client pattern from the codebase.
+- Return `{ status: "resolved", handoff_id, conflict_id, muninn_step: <step action or "none"> }`.
+
+### 3. `life.patch.propose` — `handle_patch_propose`
+
+- Parse `LifePatchProposalInput` from `task.parameters`.
+- Call `runner.plan(...)`. Check `plan.allowed()`. High-risk patches (`PatchRisk::High`) require `operator_approved: true`.
+- Write the patch as a node of the appropriate `*Patch` label (e.g. `SchemaPatch`, `SkillPatch`) using `MERGE (n:{label} {id: $id}) ON CREATE SET ...` with all fields from `input`: `summary`, `rationale`, `risk`, `status: "proposed"`, provenance fields.
+- Return `{ status: "proposed", patch_id, patch_kind, risk, requires_operator }`.
+
+### 4. Named strategy dispatch in `handle_recall`
+
+Currently `handle_recall` runs a generic multi-label search across all labels in each pivot's space. Extend it to dispatch to named strategy Cypher when `query.operator_intent` matches a known strategy name:
+
+| `operator_intent` | Cypher pattern | Key filters |
+|---|---|---|
+| `"open_loops_by_context"` | Vector pivot on `life_event_semantic__OpenLoop` top_k=10, expand `BLOCKED_BY\|NEEDS_FOLLOWUP\|CONTAINS` depth 1 | `status = 'open'`, `confidence >= 0.3` |
+| `"goals_and_next_actions"` | Vector pivot on `goal_system_semantic__Goal` top_k=8, expand `CONTAINS\|ADVANCES` to `NextAction` | `status IN ['active','paused']` |
+| `"commitments_approaching"` | Direct time query on `Commitment` by `due_at <= $deadline` (no vector), expand `PROMISED_TO` | `status = 'open'` |
+| `"re_entry_context"` | Vector pivot on `life_event_semantic__Event` + `goal_system_semantic__Goal` top_k=6, filter `observed_at >= $gap_since` | recent + `status = 'active'` |
+
+See `docs/architecture/life-graph/SEMANTIC_RETRIEVAL.md` for the full Cypher patterns.
+
+Fall back to the current generic multi-label search for any unrecognised `operator_intent`.
+
+### 5. `life.conflict` detection in `handle_conflict` (new tool kind)
+
+Add `"life.conflict"` to the `invoke` dispatch. Parse two `EvidencePacket`s from `task.parameters["existing"]` and `task.parameters["candidate"]`. Compare `claim_ref.id` + `claim_ref.label` + `validation_state`. Emit a `ConflictHandoff` using `ConflictFindingType::DirectContradiction` if both reference the same node ID with conflicting `validation_state`. Write the conflict as a `CONTRADICTS` edge in Memgraph between the two node IDs. Return the serialised `ConflictHandoff`.
+
+### Reference files for Codex
+
+| File | Purpose |
+|---|---|
+| `crates/data-memorygraphrag/src/provider.rs` | The file to edit; `handle_observe` at line ~108 is the reference pattern |
+| `crates/data-memorygraphrag/src/lib.rs` | All contract types: `LifeCommitInput`, `LifeResolveInput`, `LifePatchProposalInput`, `ConflictHandoff` |
+| `crates/data-memorygraphrag/src/cypher.rs` | Cypher compilation helpers to extend or mirror |
+| `docs/architecture/life-graph/SEMANTIC_RETRIEVAL.md` | Named strategy Cypher patterns (strategies 1–5) |
+| `docs/architecture/life-graph/LIFE_GRAPH_SCHEMA.md` | Node labels, property shapes, provenance envelope fields |
 
 Current confidence:
 
