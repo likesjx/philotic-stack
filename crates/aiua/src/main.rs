@@ -2711,6 +2711,51 @@ fn hotel_shared_guests(
     if !should_materialize_graph_datasource(hotel_name) {
         guests.retain(|guest| guest.role != "graph-datasource");
     }
+
+    // life-graph-runner: paracrine → Memgraph observation pipeline.
+    // Only materialized when a Memgraph URI is available (same gate as graph-datasource).
+    let mut life_graph_env = serde_json::json!({
+        "PHILOTIC_HOTEL_SOCKET": socket_path,
+        "PHILOTIC_NODE_ID": node_id,
+        "PHILOTIC_LIFE_GRAPH_RUNNER_ID": format!("{hotel_name}:life-graph-runner"),
+    });
+    for key in [
+        "PHILOTIC_GRAPH_PROVIDER",
+        "PHILOTIC_MEMGRAPH_URI",
+        "PHILOTIC_MEMGRAPH_USER",
+        "PHILOTIC_MEMGRAPH_PASSWORD",
+        "PHILOTIC_MEMGRAPH_DB",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                if let Some(env) = life_graph_env.as_object_mut() {
+                    env.insert(key.into(), serde_json::Value::String(value));
+                }
+            }
+        }
+    }
+    if life_graph_env
+        .get("PHILOTIC_MEMGRAPH_URI")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
+        guests.push(GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:life-graph-runner"),
+            role: "life-graph-runner".into(),
+            config_json: serde_json::json!({
+                "command": "life-graph-runner",
+                "args": [],
+                "env": life_graph_env
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        });
+    }
+
     guests
 }
 

@@ -565,7 +565,8 @@ vps-push:
       -p graph-datasource \
       -p table-datasource \
       -p router-listener \
-      -p agent-datasource"
+      -p agent-datasource \
+      -p data-memorygraphrag"
 
     echo "▶ Deploying via ansible (binaries from VPS build at ${VPS_BUILD})..."
     cd "${ROOT_DIR}/ansible" && ansible-playbook \
