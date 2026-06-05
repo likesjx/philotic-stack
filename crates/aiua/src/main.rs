@@ -2593,7 +2593,12 @@ fn hotel_shared_guests(
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
                     "PHILOTIC_NODE_ID": node_id.clone(),
                     "PHILOTIC_ONNX_GUEST_ID": format!("{hotel_name}:model-controller-onnx"),
-                    "PHILOTIC_ONNX_SIDECAR_ADDR": format!("127.0.0.1:{}", hotel.blob_port + 4)
+                    "PHILOTIC_ONNX_SIDECAR_ADDR": format!("127.0.0.1:{}", hotel.blob_port + 4),
+                    // Canonical embedding model: Xenova/all-mpnet-base-v2 (768d).
+                    // Fine-tunable via sentence-transformers; bump ONNX_EMBED_REPO to hot-swap.
+                    "PHILOTIC_ONNX_EMBED_REPO": std::env::var("PHILOTIC_ONNX_EMBED_REPO")
+                        .unwrap_or_else(|_| "Xenova/all-mpnet-base-v2".to_string()),
+                    "PHILOTIC_ONNX_PREFER_QUANTIZED": "true"
                 }
             })
             .to_string(),
@@ -2718,6 +2723,8 @@ fn hotel_shared_guests(
         "PHILOTIC_HOTEL_SOCKET": socket_path,
         "PHILOTIC_NODE_ID": node_id,
         "PHILOTIC_LIFE_GRAPH_RUNNER_ID": format!("{hotel_name}:life-graph-runner"),
+        // Point embed-on-write to the hotel ONNX controller's sidecar (same blob_port + 4 formula).
+        "PHILOTIC_ONNX_SIDECAR_ADDR": format!("http://127.0.0.1:{}", hotel.blob_port + 4),
     });
     for key in [
         "PHILOTIC_GRAPH_PROVIDER",
