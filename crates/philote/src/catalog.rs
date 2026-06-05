@@ -2571,8 +2571,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                              "skill_tool_semantic", "role_person_semantic",
                                              "memory_bridge_semantic"]
                                 },
-                                "embedding_model": {"type": "string", "default": "text-embedding-3-small"},
-                                "embedding_dims": {"type": "integer", "default": 1536},
+                                "embedding_model": {"type": "string", "default": "Xenova/all-mpnet-base-v2"},
+                                "embedding_dims": {"type": "integer", "default": 768},
                                 "query_text_hash": {"type": "string"}
                             }
                         }

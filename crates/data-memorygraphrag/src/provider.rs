@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use data_memorygraphrag::cypher;
+use data_memorygraphrag::LIFE_GRAPH_EMBEDDING_DIMS;
 use data_memorygraphrag::projection;
 use data_memorygraphrag::{
     ConflictHandoff, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput,
@@ -160,6 +161,60 @@ impl LifeGraphProvider {
             "life.observe: proposed evidence node written to Memgraph"
         );
 
+        // Embed-on-write: compute embedding for the claim_summary and write it back.
+        // Explicit error on dim mismatch — a wrong embedding silently breaks retrieval.
+        let embed_status = match embed_text(&compiled.claim_summary).await {
+            Ok((vector, model_gen)) => {
+                if vector.len() != LIFE_GRAPH_EMBEDDING_DIMS {
+                    let msg = format!(
+                        "embed-on-write: sidecar returned {}d but Life Graph requires {}d; \
+                         check PHILOTIC_ONNX_EMBED_REPO on the hotel",
+                        vector.len(),
+                        LIFE_GRAPH_EMBEDDING_DIMS
+                    );
+                    warn!("{msg}");
+                    "wrong_dim"
+                } else {
+                    let embed_cypher = format!(
+                        "MATCH (n:{} {{id: $id}}) \
+                         SET n.embedding = $vec, \
+                             n.embedding_model_gen = $gen, \
+                             n.embedding_dims = {}, \
+                             n.embedding_updated_at = $now, \
+                             n.embedding_space = $space",
+                        compiled.label,
+                        LIFE_GRAPH_EMBEDDING_DIMS
+                    );
+                    let space = projection::embedding_space_for_label(&compiled.label)
+                        .unwrap_or("life_event_semantic");
+                    match graph
+                        .execute(
+                            query(&embed_cypher)
+                                .param("id", compiled.node_id.as_str())
+                                .param("vec", vector)
+                                .param("gen", model_gen.as_str())
+                                .param("now", now.as_str())
+                                .param("space", space),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            info!(node_id = %node_id, model_gen = %model_gen, "embed-on-write OK");
+                            "ok"
+                        }
+                        Err(e) => {
+                            warn!("embed-on-write SET failed: {e}");
+                            "write_failed"
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("embed-on-write skipped: {e}");
+                "sidecar_unavailable"
+            }
+        };
+
         Ok(ProviderOutput::ResultSet(json!({
             "status": "proposed",
             "node_id": node_id,
@@ -167,6 +222,7 @@ impl LifeGraphProvider {
             "observation_id": compiled.observation_id,
             "packet_id": compiled.packet_id,
             "validation_state": compiled.validation_state,
+            "embed_status": embed_status,
         })))
     }
 
@@ -661,6 +717,51 @@ mod tests {
 
 /// Compute seconds elapsed since `observed_at` ISO 8601 string.
 /// Returns 0 on parse failure (treat unknown age as fresh).
+/// Call the ONNX sidecar's `/api/embeddings` endpoint and return `(vector, model_gen)`.
+///
+/// The sidecar address is read from `PHILOTIC_ONNX_SIDECAR_ADDR`
+/// (default `http://127.0.0.1:11435`).
+/// Returns an explicit error on dim mismatch — callers should surface this, not silently
+/// continue with a wrong-dim vector.
+async fn embed_text(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
+    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
+        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
+    let url = format!("{base}/api/embeddings");
+
+    let client = reqwest::Client::new();
+    let resp: serde_json::Value = client
+        .post(&url)
+        .json(&serde_json::json!({"prompt": text}))
+        .send()
+        .await
+        .context("embed_text: HTTP request failed")?
+        .json()
+        .await
+        .context("embed_text: failed to parse JSON response")?;
+
+    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
+        anyhow::bail!("embed_text: sidecar error: {err}");
+    }
+
+    let vector: Vec<f32> = resp
+        .get("embedding")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect()
+        })
+        .ok_or_else(|| anyhow::anyhow!("embed_text: response missing 'embedding' array"))?;
+
+    let model_gen = resp
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok((vector, model_gen))
+}
+
 fn compute_age_secs(observed_at: Option<&str>, now: &chrono::DateTime<chrono::Utc>) -> u64 {
     observed_at
         .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())

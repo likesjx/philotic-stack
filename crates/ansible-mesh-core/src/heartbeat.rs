@@ -9,6 +9,23 @@ use uuid::Uuid;
 
 const MAX_SYNC_PAYLOAD_BYTES: usize = 900;
 
+/// A single peer record included in a [`MeshCatalogSyncPayload`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshPeerEntry {
+    pub node_id: String,
+    pub hotel_name: String,
+    pub mesh_host: Option<String>,
+    pub mesh_port: u16,
+}
+
+/// Payload for `MsgType::MeshCatalogSync` sent on reconnect.
+/// Carries the sender's current known-good peer directory so the receiver
+/// can update stale hotel records without waiting for each peer's next heartbeat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshCatalogSyncPayload {
+    pub peers: Vec<MeshPeerEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatPayload {
     pub capabilities: NodeCapabilities,
@@ -93,6 +110,27 @@ pub async fn emit_capability_sync(
     }
 
     Ok(())
+}
+
+/// Emits a `MeshCatalogSync` to a target, carrying the sender's known peer directory.
+/// Used as part of the reconnect handshake so the receiver can fix stale peer addresses.
+pub async fn emit_catalog_sync(
+    socket: &UdpSocket,
+    target: SocketAddr,
+    capabilities: &NodeCapabilities,
+    peers: Vec<MeshPeerEntry>,
+    auth_key: &str,
+) -> Result<()> {
+    let payload = MeshCatalogSyncPayload { peers };
+    emit_signed_message(
+        socket,
+        target,
+        capabilities,
+        MsgType::MeshCatalogSync,
+        serde_json::to_vec(&payload)?,
+        auth_key,
+    )
+    .await
 }
 
 async fn emit_signed_message(

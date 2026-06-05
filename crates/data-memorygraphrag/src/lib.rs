@@ -16,7 +16,10 @@ pub type ConflictId = String;
 pub type GraphRecordId = String;
 pub type MuninnEngramId = String;
 
-pub const LIFE_GRAPH_EMBEDDING_DIMS: usize = 1536;
+/// Canonical embedding dimension for the Life Graph.
+/// Canonical model: Xenova/all-mpnet-base-v2 (768d, sentence-transformers).
+/// Fine-tune on HuggingFace; bump embedding_model_gen to trigger reindex.
+pub const LIFE_GRAPH_EMBEDDING_DIMS: usize = 768;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1349,14 +1352,14 @@ mod tests {
         let mut query = retrieval_query();
         query.validate().expect("query should be valid");
 
-        query.semantic_pivots[0].embedding_dims = 768;
+        query.semantic_pivots[0].embedding_dims = 384;
         let err = query
             .validate()
             .expect_err("query should reject wrong embedding dims");
         assert!(
             err.violations
                 .iter()
-                .any(|v| v.contains("embedding_dims must be 1536"))
+                .any(|v| v.contains("embedding_dims must be 768"))
         );
     }
 

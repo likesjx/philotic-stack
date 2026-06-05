@@ -1,6 +1,8 @@
 use crate::authz::{MeshAuth, NonceTracker};
 use crate::domain::GraphDomain;
-use crate::heartbeat::{CapabilitySyncPayload, HeartbeatPayload, emit_heartbeat};
+use crate::heartbeat::{
+    CapabilitySyncPayload, HeartbeatPayload, MeshCatalogSyncPayload, MeshPeerEntry, emit_catalog_sync, emit_heartbeat,
+};
 use crate::registry::NodeRegistry;
 use crate::{BeaconMessage, MsgType, NodeCapabilities};
 use anyhow::{Context, Result};
@@ -241,13 +243,13 @@ impl BeaconDaemon {
                         }
                     }
 
-                    // Reply with a heartbeat when a peer reconnects (was stale or changed port).
-                    // This gives the reconnecting node our current address immediately rather than
-                    // waiting up to 3s for our next scheduled heartbeat to reach them.
+                    // Reply with a heartbeat + peer catalog when a peer reconnects (was stale or
+                    // changed port). The heartbeat gives the reconnecting node our current address;
+                    // the catalog lets it fix stale entries for ALL other peers in one shot.
+                    // This is the anchor handshake: even if mac-jane doesn't know mbp-jane's new
+                    // port, it can learn it from vps-jane's catalog the moment it re-announces.
                     if port_changed || was_stale {
                         if let Ok(Some(auth_key)) = self.auth_key_for_node(&peer_node_id) {
-                            // Send to the observed source address (correct port + Tailscale IP via src).
-                            // We use src directly here because after reconciliation src is authoritative.
                             if let Err(e) = emit_heartbeat(
                                 &self.socket,
                                 src,
@@ -264,6 +266,40 @@ impl BeaconDaemon {
                                     "Sent reconnect reply heartbeat to {} at {}",
                                     peer_node_id, src
                                 );
+                            }
+
+                            // Send our peer directory so the reconnecting node can update any
+                            // stale peer records in a single round-trip (anchor handshake).
+                            if let Ok(hotels) = self.graph.list_hotels() {
+                                let peers: Vec<MeshPeerEntry> = hotels
+                                    .into_iter()
+                                    .filter(|h| {
+                                        h.capabilities.node_id != self.local_capabilities.node_id
+                                            && h.capabilities.node_id != peer_node_id
+                                    })
+                                    .map(|h| MeshPeerEntry {
+                                        node_id: h.capabilities.node_id.clone(),
+                                        hotel_name: h.hotel_name.clone(),
+                                        mesh_host: h.mesh_host.clone(),
+                                        mesh_port: h.mesh_port,
+                                    })
+                                    .collect();
+                                if !peers.is_empty() {
+                                    if let Err(e) = emit_catalog_sync(
+                                        &self.socket,
+                                        src,
+                                        &self.local_capabilities,
+                                        peers,
+                                        &auth_key,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            "Failed to send reconnect catalog sync to {}: {}",
+                                            src, e
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -285,11 +321,60 @@ impl BeaconDaemon {
                 }
                 let _ = self.inbox_tx.send(msg).await;
             }
+            MsgType::MeshCatalogSync => {
+                // Anchor handshake reply: update stale peer records from the sender's directory.
+                // Only updates mesh_port (port changes are the main drift vector). mesh_host is
+                // only filled in if empty — we trust stored Tailscale IPs over relayed values.
+                if let Ok(payload) =
+                    serde_json::from_slice::<MeshCatalogSyncPayload>(&msg.payload)
+                {
+                    if let Ok(hotels) = self.graph.list_hotels() {
+                        for peer in &payload.peers {
+                            if peer.node_id == self.local_capabilities.node_id {
+                                continue;
+                            }
+                            if let Some(mut hotel) = hotels
+                                .iter()
+                                .find(|h| h.capabilities.node_id == peer.node_id)
+                                .cloned()
+                            {
+                                let mut changed = false;
+                                if hotel.mesh_port != peer.mesh_port {
+                                    info!(
+                                        "Catalog sync from {}: updating mesh_port for {} {} → {}",
+                                        msg.src_node,
+                                        hotel.hotel_name,
+                                        hotel.mesh_port,
+                                        peer.mesh_port
+                                    );
+                                    hotel.mesh_port = peer.mesh_port;
+                                    changed = true;
+                                }
+                                if hotel.mesh_host.as_deref().unwrap_or("").is_empty() {
+                                    if let Some(ref host) = peer.mesh_host {
+                                        if !host.is_empty() {
+                                            info!(
+                                                "Catalog sync from {}: setting mesh_host for {} to {}",
+                                                msg.src_node, hotel.hotel_name, host
+                                            );
+                                            hotel.mesh_host = Some(host.clone());
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                                if changed {
+                                    let _ = self.graph.upsert_hotel(&hotel);
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = self.inbox_tx.send(msg).await;
+            }
             MsgType::MeshEventBatch
             | MsgType::MeshEventAck
             | MsgType::MeshMembershipAccept
             | MsgType::MeshMembershipSync
-            | MsgType::MeshCatalogSync
             | MsgType::WebRtcSignal => {
                 let _ = self.inbox_tx.send(msg).await;
             }

@@ -90,6 +90,9 @@ philotic_rust_log: "info"
 # ONNX Sidecar Configuration
 philotic_onnx_sidecar_enabled: false
 philotic_onnx_sidecar_port: 11435
-philotic_onnx_embed_repo: "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim default
-philotic_onnx_embed_dim: 384
+# Canonical embedding model: Xenova/all-mpnet-base-v2 (768d, sentence-transformers)
+# Fine-tunable on HuggingFace; hot-swap via PHILOTIC_ONNX_EMBED_REPO without restart.
+# embedding_model_gen = "{repo}@{sha8}" — bump triggers Life Graph reindex.
+philotic_onnx_embed_repo: "Xenova/all-mpnet-base-v2"
+philotic_onnx_embed_dim: 768
 philotic_onnx_prefer_quantized: true

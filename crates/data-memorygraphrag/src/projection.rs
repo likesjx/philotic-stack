@@ -61,6 +61,24 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
 
 /// Generates a `CALL vector_search.search(...)` Cypher string.
 ///
+/// Returns the canonical `embedding_space` name for a given Life Graph label,
+/// or `None` if the label has no vector index.
+pub fn embedding_space_for_label(label: &str) -> Option<&'static str> {
+    match label {
+        "Event" | "Signal" | "OpenLoop" => Some("life_event_semantic"),
+        "Goal" | "System" | "Habit" | "Project" | "Routine" | "NextAction" => {
+            Some("goal_system_semantic")
+        }
+        "GrowthHypothesis" | "GrowthExperiment" | "DriftFinding" | "CapabilityPatch"
+        | "SkillPatch" | "ToolPatch" | "SchemaPatch" | "AttentionPatch" | "SystemPatch" => {
+            Some("skill_tool_semantic")
+        }
+        "Role" | "Person" | "Value" | "Preference" | "Concern" => Some("role_person_semantic"),
+        "Commitment" | "Decision" => Some("memory_bridge_semantic"),
+        _ => None,
+    }
+}
+
 /// YIELD names are `node` and `similarity` (no alias) so the parser reads
 /// `result["rows"][i]["node"]` and `result["rows"][i]["similarity"]`.
 ///
