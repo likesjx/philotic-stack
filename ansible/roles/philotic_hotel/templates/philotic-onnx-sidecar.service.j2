@@ -19,8 +19,9 @@ Environment="PHILOTIC_ONNX_SIDECAR_ADDR=0.0.0.0:{{ philotic_onnx_sidecar_port }}
 Environment="PHILOTIC_ONNX_EMBED_REPO={{ philotic_onnx_embed_repo }}"
 Environment="PHILOTIC_ONNX_PREFER_QUANTIZED={{ philotic_onnx_prefer_quantized | lower }}"
 
-# HuggingFace cache for model downloads
-Environment="HF_HOME={{ philotic_data_dir }}/hf-cache"
+# hf_hub (Rust) reads $HOME/.cache/huggingface — must match the philotic user home.
+# HF_HOME is honoured by Python huggingface_hub but NOT by the hf_hub Rust crate.
+Environment="HOME={{ philotic_home_dir }}"
 
 ExecStart={{ philotic_bin_dir }}/model-controller-onnx \
   --sidecar-only \
@@ -37,7 +38,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths={{ philotic_data_dir }}
-ProtectHome=yes
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target

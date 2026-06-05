@@ -14,6 +14,7 @@ philotic_blob_dir: "/opt/philotic/data/blob"
 # Service user (non-root)
 philotic_user: "philotic"
 philotic_group: "philotic"
+philotic_home_dir: "/opt/philotic"  # home for the philotic system user; hf_hub caches models at $HOME/.cache/huggingface
 
 # Artifacts — binaries delivered from the control machine or a CI artifact store.
 # Set philotic_artifacts_dir to the directory containing pre-built Linux binaries.
