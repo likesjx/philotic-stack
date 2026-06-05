@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use data_memorygraphrag::cypher;
 use data_memorygraphrag::projection;
 use data_memorygraphrag::{
-    LifeGraphToolRequest, LifeObserveInput, MemoryGraphRagRunner, PolicyFilter, RetrievalQuery,
-    RunnerConfig,
+    ConflictHandoff, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput,
+    LifePatchProposalInput, LifeResolveInput, MemoryGraphRagRunner, PolicyFilter, RetrievalQuery,
+    RunnerConfig, RunnerPlanTarget, SemanticSpace,
 };
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
 use neo4rs::{
@@ -93,6 +94,10 @@ impl DatasourceProvider for LifeGraphProvider {
         match task.kind.as_str() {
             "life.observe" => self.handle_observe(task).await,
             "life.recall" => self.handle_recall(task).await,
+            "life.commit" => self.handle_commit(task).await,
+            "life.resolve" | "life.conflict.resolve" => self.handle_resolve(task).await,
+            "life.conflict" | "life.conflict.handle" => self.handle_conflict(task).await,
+            "life.patch.propose" => self.handle_patch_propose(task).await,
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -168,10 +173,12 @@ impl LifeGraphProvider {
     async fn handle_recall(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let query_val: RetrievalQuery = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.recall parameters as RetrievalQuery")?;
-
-        self.runner
-            .plan(LifeGraphToolRequest::LifeRecall(query_val.clone()))
-            .map_err(|e| anyhow::anyhow!("life.recall plan validation failed: {e}"))?;
+        let named_strategy = NamedRecallStrategy::from_task(task);
+        if !matches!(named_strategy, NamedRecallStrategy::CommitmentsApproaching) {
+            self.runner
+                .plan(LifeGraphToolRequest::LifeRecall(query_val.clone()))
+                .map_err(|e| anyhow::anyhow!("life.recall plan validation failed: {e}"))?;
+        }
 
         // Embedding vector must be passed inline in the task parameters.
         let embedding: Vec<f32> = task
@@ -185,7 +192,9 @@ impl LifeGraphProvider {
             })
             .unwrap_or_default();
 
-        if embedding.is_empty() {
+        if embedding.is_empty()
+            && !matches!(named_strategy, NamedRecallStrategy::CommitmentsApproaching)
+        {
             return Ok(ProviderOutput::ResultSet(json!({
                 "status": "missing_embedding",
                 "detail": "life.recall requires an inline 'embedding' array in parameters",
@@ -199,15 +208,111 @@ impl LifeGraphProvider {
 
         let mut all_hits = Vec::new();
 
-        for pivot in &query_val.semantic_pivots {
-            for label in projection::labels_for_space(&pivot.space) {
-                let index = projection::index_name(&pivot.space, label);
-                let cypher =
-                    projection::semantic_expand_cypher(&index, top_k, &embedding, min_similarity);
-
+        match named_strategy {
+            NamedRecallStrategy::OpenLoopsByContext => {
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::LifeEventSemantic,
+                    &["OpenLoop"],
+                    top_k.max(10),
+                    0.4,
+                    &embedding,
+                )
+                .await?;
+            }
+            NamedRecallStrategy::GoalsAndNextActions => {
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::GoalSystemSemantic,
+                    &["Goal"],
+                    top_k.max(8),
+                    0.35,
+                    &embedding,
+                )
+                .await?;
+            }
+            NamedRecallStrategy::CommitmentsApproaching => {
+                let due_within_hours = task
+                    .parameters
+                    .get("due_within_hours")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(72);
+                let deadline =
+                    (now + chrono::Duration::hours(due_within_hours as i64)).to_rfc3339();
+                let cypher = commitments_approaching_cypher(&deadline);
                 let result = self.execute_cypher(&cypher).await?;
-                let hits = projection::parse_vector_search_rows(&result);
-                all_hits.extend(hits);
+                all_hits.extend(projection::parse_vector_search_rows(&result));
+
+                if all_hits.len() < 3 && !embedding.is_empty() {
+                    self.extend_vector_hits(
+                        &mut all_hits,
+                        SemanticSpace::MemoryBridgeSemantic,
+                        &["Commitment"],
+                        5,
+                        0.3,
+                        &embedding,
+                    )
+                    .await?;
+                }
+            }
+            NamedRecallStrategy::ReEntryContext => {
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::LifeEventSemantic,
+                    &["Event"],
+                    6,
+                    0.4,
+                    &embedding,
+                )
+                .await?;
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::GoalSystemSemantic,
+                    &["Goal"],
+                    5,
+                    0.35,
+                    &embedding,
+                )
+                .await?;
+            }
+            NamedRecallStrategy::CrossDomainEntanglement => {
+                let domain_a_embedding = embedding_from_key(&task.parameters, "domain_a_embedding")
+                    .unwrap_or_else(|| embedding.clone());
+                let domain_b_embedding = embedding_from_key(&task.parameters, "domain_b_embedding")
+                    .unwrap_or_else(|| embedding.clone());
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::LifeEventSemantic,
+                    &["Signal"],
+                    8,
+                    0.4,
+                    &domain_a_embedding,
+                )
+                .await?;
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::GoalSystemSemantic,
+                    &["Goal"],
+                    8,
+                    0.4,
+                    &domain_b_embedding,
+                )
+                .await?;
+            }
+            NamedRecallStrategy::SemanticPivot => {
+                for pivot in &query_val.semantic_pivots {
+                    for label in projection::labels_for_space(&pivot.space) {
+                        self.extend_vector_hits(
+                            &mut all_hits,
+                            pivot.space.clone(),
+                            &[*label],
+                            top_k,
+                            min_similarity,
+                            &embedding,
+                        )
+                        .await?;
+                    }
+                }
             }
         }
 
@@ -248,8 +353,309 @@ impl LifeGraphProvider {
 
         Ok(ProviderOutput::ResultSet(json!({
             "status": "ok",
+            "named_strategy": named_strategy.as_str(),
             "context_packet": packet_json,
         })))
+    }
+
+    async fn handle_commit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeCommitInput = serde_json::from_value(task.parameters.clone())
+            .context("failed to parse life.commit parameters as LifeCommitInput")?;
+        let plan = self
+            .runner
+            .plan(LifeGraphToolRequest::LifeCommit(input.clone()))
+            .map_err(|e| anyhow::anyhow!("life.commit plan validation failed: {e}"))?;
+        if !plan.allowed() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "blocked",
+                "reasons": plan.blocked_reasons,
+            })));
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let compiled = cypher::compile_commit(&input, &now)
+            .map_err(|e| anyhow::anyhow!("life.commit Cypher compilation failed: {e}"))?;
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(
+                query(&compiled.query)
+                    .param("id", compiled.node_id.as_str())
+                    .param("confirmed_at", compiled.confirmed_at.as_str())
+                    .param("confidence", compiled.confidence)
+                    .param("claim_summary", compiled.claim_summary.as_str())
+                    .param("packet_id", compiled.packet_id.as_str()),
+            )
+            .await?;
+        let first_row = rows.next().await?;
+        let node_id = first_row
+            .as_ref()
+            .and_then(|r| r.get::<String>("id").ok())
+            .unwrap_or_else(|| compiled.node_id.clone());
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "committed",
+            "node_id": node_id,
+            "label": compiled.label,
+            "packet_id": compiled.packet_id,
+            "validation_state": "confirmed",
+        })))
+    }
+
+    async fn handle_conflict(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let handoff_value = task
+            .parameters
+            .get("handoff")
+            .cloned()
+            .unwrap_or_else(|| task.parameters.clone());
+        let handoff: ConflictHandoff = serde_json::from_value(handoff_value)
+            .context("failed to parse life.conflict parameters as ConflictHandoff")?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let compiled = cypher::compile_conflict_handoff(&handoff, &now)
+            .map_err(|e| anyhow::anyhow!("life.conflict Cypher compilation failed: {e}"))?;
+        self.execute_conflict_cypher(&compiled).await?;
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "open",
+            "handoff_id": compiled.handoff_id,
+            "conflict_id": compiled.conflict_id,
+        })))
+    }
+
+    async fn handle_resolve(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeResolveInput = serde_json::from_value(task.parameters.clone())
+            .context("failed to parse life.resolve parameters as LifeResolveInput")?;
+        let plan = self
+            .runner
+            .plan(LifeGraphToolRequest::LifeResolve(input.clone()))
+            .map_err(|e| anyhow::anyhow!("life.resolve plan validation failed: {e}"))?;
+        if !plan.allowed() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "blocked",
+                "reasons": plan.blocked_reasons,
+            })));
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let compiled = cypher::compile_resolve(&input, &now)
+            .map_err(|e| anyhow::anyhow!("life.resolve Cypher compilation failed: {e}"))?;
+        self.execute_conflict_cypher(&compiled).await?;
+
+        let muninn_steps: Vec<_> = plan
+            .steps
+            .into_iter()
+            .filter(|step| step.target == RunnerPlanTarget::Muninn)
+            .collect();
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "resolved",
+            "handoff_id": compiled.handoff_id,
+            "conflict_id": compiled.conflict_id,
+            "muninn_handoff_required": !muninn_steps.is_empty(),
+            "muninn_steps": muninn_steps,
+        })))
+    }
+
+    async fn handle_patch_propose(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifePatchProposalInput = serde_json::from_value(task.parameters.clone())
+            .context("failed to parse life.patch.propose parameters as LifePatchProposalInput")?;
+        let plan = self
+            .runner
+            .plan(LifeGraphToolRequest::LifePatchPropose(input.clone()))
+            .map_err(|e| anyhow::anyhow!("life.patch.propose plan validation failed: {e}"))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let compiled = cypher::compile_patch_proposal(&input, &now)
+            .map_err(|e| anyhow::anyhow!("life.patch.propose Cypher compilation failed: {e}"))?;
+
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(
+                query(&compiled.query)
+                    .param("patch_id", compiled.patch_id.as_str())
+                    .param("patch_kind", compiled.patch_kind.as_str())
+                    .param("summary", compiled.summary.as_str())
+                    .param("rationale", compiled.rationale.as_str())
+                    .param("risk", compiled.risk.as_str())
+                    .param("status", compiled.status.as_str())
+                    .param("proposed_at", compiled.proposed_at.as_str())
+                    .param("patch_json", compiled.patch_json.as_str()),
+            )
+            .await?;
+        let _ = rows.next().await?;
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": if plan.requires_operator { "awaiting_operator" } else { "proposed" },
+            "patch_id": compiled.patch_id,
+            "label": compiled.label,
+            "requires_operator": plan.requires_operator,
+            "blocked_reasons": plan.blocked_reasons,
+        })))
+    }
+
+    async fn execute_conflict_cypher(&self, compiled: &cypher::ConflictCypher) -> Result<()> {
+        let graph = self.connect().await?;
+        let mut q = query(&compiled.query)
+            .param("handoff_id", compiled.handoff_id.as_str())
+            .param("conflict_id", compiled.conflict_id.as_str())
+            .param("summary", compiled.summary.as_str())
+            .param("status", compiled.status.as_str())
+            .param("updated_at", compiled.updated_at.as_str())
+            .param("handoff_json", compiled.handoff_json.as_str());
+        if let Some(summary) = &compiled.resolution_summary {
+            q = q.param("resolution_summary", summary.as_str());
+        }
+        let mut rows = graph.execute(q).await?;
+        let _ = rows.next().await?;
+        Ok(())
+    }
+
+    async fn extend_vector_hits(
+        &self,
+        all_hits: &mut Vec<projection::VectorHit>,
+        space: SemanticSpace,
+        labels: &[&str],
+        top_k: usize,
+        min_similarity: f32,
+        embedding: &[f32],
+    ) -> Result<()> {
+        if embedding.is_empty() {
+            return Ok(());
+        }
+        for label in labels {
+            let index = projection::index_name(&space, label);
+            let cypher =
+                projection::semantic_expand_cypher(&index, top_k, embedding, min_similarity);
+            let result = self.execute_cypher(&cypher).await?;
+            all_hits.extend(projection::parse_vector_search_rows(&result));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedRecallStrategy {
+    SemanticPivot,
+    OpenLoopsByContext,
+    GoalsAndNextActions,
+    CommitmentsApproaching,
+    ReEntryContext,
+    CrossDomainEntanglement,
+}
+
+impl NamedRecallStrategy {
+    fn from_task(task: &DatasourceTask) -> Self {
+        let raw = task
+            .parameters
+            .get("named_strategy")
+            .or_else(|| task.parameters.get("strategy_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        match raw {
+            "open_loops_by_context" => Self::OpenLoopsByContext,
+            "goals_and_next_actions" => Self::GoalsAndNextActions,
+            "commitments_approaching" => Self::CommitmentsApproaching,
+            "re_entry_context" => Self::ReEntryContext,
+            "cross_domain_entanglement" => Self::CrossDomainEntanglement,
+            _ => Self::SemanticPivot,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SemanticPivot => "semantic_pivot",
+            Self::OpenLoopsByContext => "open_loops_by_context",
+            Self::GoalsAndNextActions => "goals_and_next_actions",
+            Self::CommitmentsApproaching => "commitments_approaching",
+            Self::ReEntryContext => "re_entry_context",
+            Self::CrossDomainEntanglement => "cross_domain_entanglement",
+        }
+    }
+}
+
+fn embedding_from_key(parameters: &Value, key: &str) -> Option<Vec<f32>> {
+    parameters.get(key).and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect()
+    })
+}
+
+fn commitments_approaching_cypher(deadline: &str) -> String {
+    format!(
+        concat!(
+            "MATCH (c:Commitment) ",
+            "WHERE c.status = 'open' ",
+            "AND c.due_at IS NOT NULL ",
+            "AND c.due_at <= '{deadline}' ",
+            "AND c.validation_state <> 'retired' ",
+            "RETURN c AS node, 1.0 AS similarity ",
+            "ORDER BY c.due_at ASC LIMIT 10"
+        ),
+        deadline = deadline
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datasource::controller::TaskKind;
+
+    fn task_with_params(parameters: Value) -> DatasourceTask {
+        DatasourceTask {
+            kind: TaskKind::Custom("life.recall".into()),
+            provider: None,
+            db: None,
+            graph_id: None,
+            query: None,
+            parameters,
+            identity: json!({}),
+        }
+    }
+
+    #[test]
+    fn named_recall_strategy_dispatches_all_documented_patterns() {
+        let cases = [
+            (
+                "open_loops_by_context",
+                NamedRecallStrategy::OpenLoopsByContext,
+            ),
+            (
+                "goals_and_next_actions",
+                NamedRecallStrategy::GoalsAndNextActions,
+            ),
+            (
+                "commitments_approaching",
+                NamedRecallStrategy::CommitmentsApproaching,
+            ),
+            ("re_entry_context", NamedRecallStrategy::ReEntryContext),
+            (
+                "cross_domain_entanglement",
+                NamedRecallStrategy::CrossDomainEntanglement,
+            ),
+        ];
+
+        for (name, expected) in cases {
+            let task = task_with_params(json!({ "named_strategy": name }));
+            assert_eq!(NamedRecallStrategy::from_task(&task), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_named_recall_strategy_falls_back_to_semantic_pivot() {
+        let task = task_with_params(json!({ "named_strategy": "surprise_me" }));
+        assert_eq!(
+            NamedRecallStrategy::from_task(&task),
+            NamedRecallStrategy::SemanticPivot
+        );
+    }
+
+    #[test]
+    fn commitments_approaching_cypher_returns_vector_hit_shape() {
+        let cypher = commitments_approaching_cypher("2026-06-08T09:00:00Z");
+
+        assert!(cypher.contains("MATCH (c:Commitment)"));
+        assert!(cypher.contains("c.due_at <= '2026-06-08T09:00:00Z'"));
+        assert!(cypher.contains("RETURN c AS node, 1.0 AS similarity"));
     }
 }
 

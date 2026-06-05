@@ -85,7 +85,7 @@ The first Life Graph OS boundary is now substantially implemented. Current proof
 - `life-graph-paracrine-heartbeat` (`test-green-runtime-boundary`): cron can emit opt-in `paracrine_signal` heartbeats and philotes observe them without model re-entry.
 - `life-graph-evidence-conflict` (`test-green-contracts`): `data-memorygraphrag` defines validated `EvidencePacket` and `ConflictHandoff` contracts with full test coverage.
 - `life-graph-semantic-retrieval` (`spec-and-contracts-green`): 5 named retrieval strategies with Cypher patterns (`SEMANTIC_RETRIEVAL.md`), `RetrievalContextPacket` shape, policy filter rules, composite ranking model, and retrieval flywheel spec. Contracts wired in `data-memorygraphrag`. Commit `e381416`.
-- `life-graph-memorygraphrag-runner` (`projection-complete`): `data-memorygraphrag` runner with full `life.*` tool catalog, planner, and contract validation. `life.observe` MERGE live and verified against Memgraph. `life.recall` projection primitives done (`projection.rs` + `handle_recall`): Cypher generation, VectorHit parser pinned to `bolt_node_to_json` shape, policy filters, ranking, context packet assembly. 32 tests green. Commits `1883ea6`, `0265091`.
+- `life-graph-memorygraphrag-runner` (`provider-handlers-green`): `data-memorygraphrag` runner with full `life.*` tool catalog, planner, and provider handlers for `life.observe`, `life.recall`, `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`. `life.observe` MERGE live and verified against Memgraph. `life.recall` now dispatches the five named strategies from `SEMANTIC_RETRIEVAL.md`. Provider write handlers compile and execute Memgraph MERGE/SET writes for commit, conflict, resolve, and patch proposal flows. 39 tests green. Commits `1883ea6`, `0265091`.
 - `life-graph-agentic-growth-loop` (`test-green-contracts`): `data-memorygraphrag` defines patch gates, growth signals, drift categories, and risk-tiered policy evaluation.
 - `life-graph-attention-steward` (`test-green-observe-policy`): SIL data model (`StewardshipInstruction`), Beacon stewardship contract, observe-only paracrine subscriber interface (8 signal types, 4 response types), anti-policy checklist. Spec at `docs/architecture/life-graph/ATTENTION_STEWARD.md`. Commit `86a730b`.
 
@@ -95,9 +95,9 @@ Per-seam open items for the next implementation round:
 
 | Seam | Open |
 |---|---|
-| `life-graph-memorygraphrag-runner` | (1) Hotel runtime → `life.recall` IPC invocation — philote needs to call the runner with pre-computed embedding; (2) `life.commit`, `life.resolve`, `life.patch.propose` execution handlers in `provider.rs` |
-| `life-graph-semantic-retrieval` | Named strategy dispatch in provider (currently generic multi-label search; `open_loops_by_context`, `goals_and_next_actions`, etc. need dedicated handlers with their specific Cypher patterns) |
-| `life-graph-evidence-conflict` | Runtime conflict detection and `handle_resolve`/`handle_conflict` handlers in provider |
+| `life-graph-memorygraphrag-runner` | Hotel runtime → `life.recall` IPC invocation — philote needs to call the runner with pre-computed embedding |
+| `life-graph-semantic-retrieval` | Named strategy dispatch is provider-green; next is live retrieval quality logging and `life.recall.feedback` |
+| `life-graph-evidence-conflict` | Runtime conflict detection and Muninn `true_up` / `contradiction_review` tool handoff still need wiring; provider `handle_conflict` / `handle_resolve` are test-green |
 | `life-graph-attention-steward` | Active SIL entries and operator confirmation gate in philote (first slice is observe-only; active interruptions unlock after 5 confirmed SIL entries) |
 | `life-graph-agentic-growth-loop` | Growth-loop philote role; background drift detector job |
 
@@ -105,8 +105,8 @@ Cross-cutting next pressure:
 
 - wire `life.*` tools through hotel/tool assembly so philote roles can invoke them (claude-local)
 - embed `life.recall` in Beacon's turn context pipeline (claude-local)
-- complete provider write/resolve/patch surface so Beacon can act on Life Graph facts (Codex)
-- connect conflict handoff packets to Muninn `true_up` / `contradiction_review` tools (Codex)
+- wire provider write/resolve/patch surface through hotel/tool assembly so Beacon can act on Life Graph facts
+- connect conflict handoff packets to Muninn `true_up` / `contradiction_review` tools
 - add `life.recall` feedback path (`life.recall.feedback`) for the retrieval flywheel
 
 ## Codex Handoff — Group B Provider Completions
