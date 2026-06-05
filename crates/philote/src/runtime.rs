@@ -1810,13 +1810,17 @@ impl AgentRuntime {
 
         // Operator override takes precedence.
         let key = format!("__mcp_routes__:{}", self.agent_id);
-        if let Ok(IpcResponse::ConfigData {
+        let mcp_override = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetConfig { key: key.clone() }),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+        if let Some(IpcResponse::ConfigData {
             value_json: Some(json),
             ..
-        }) = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig { key: key.clone() })
-            .await
+        }) = mcp_override
         {
             match serde_json::from_str::<Vec<McpRouteRecord>>(&json) {
                 Ok(r) if !r.is_empty() => {
@@ -1873,17 +1877,19 @@ impl AgentRuntime {
             return;
         }
         let count = routes.len();
-        match self
-            .ipc_client
-            .send_request(IpcRequest::UpdateMcpRoutes {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::UpdateMcpRoutes {
                 agent_id: self.agent_id.clone(),
                 routes,
                 vault_ref: None,
-            })
-            .await
-        {
-            Ok(_) => info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel."),
-            Err(e) => warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes"),
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel."),
+            Ok(Err(e)) => warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes"),
+            Err(_) => warn!(agent_id = %self.agent_id, "MCP route registration timed out (startup race) — continuing"),
         }
     }
 
@@ -2335,17 +2341,19 @@ impl AgentRuntime {
         // Publish command manifest to the hotel so membrane can discover it.
         let manifest = command_manifest(&[]);
         if let Ok(content_json) = serde_json::to_value(&manifest) {
-            match self
-                .ipc_client
-                .send_request(IpcRequest::SyncApartment {
+            let sync_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.ipc_client.send_request(IpcRequest::SyncApartment {
                     agent_id: self.agent_id.clone(),
                     memory_type: "command_manifest".into(),
                     content_json,
-                })
-                .await
-            {
-                Ok(_) => info!("Command manifest published ({} entries).", manifest.len()),
-                Err(e) => warn!("Failed to publish command manifest: {}", e),
+                }),
+            )
+            .await;
+            match sync_result {
+                Ok(Ok(_)) => info!("Command manifest published ({} entries).", manifest.len()),
+                Ok(Err(e)) => warn!("Failed to publish command manifest: {}", e),
+                Err(_) => warn!("Command manifest sync timed out (startup race) — continuing"),
             }
         }
 
