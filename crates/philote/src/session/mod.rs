@@ -30,6 +30,21 @@ fn graph_datasource_node_id() -> String {
         .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
 }
 
+fn life_graph_runner_node_id() -> String {
+    std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_HOME_HOTEL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(|hotel| format!("{hotel}-aiua-01"))
+        })
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+}
+
 fn local_agent_id() -> String {
     std::env::var("PHILOTIC_AGENT_ID").unwrap_or_else(|_| "agent-jane-01".to_string())
 }
@@ -3763,6 +3778,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
 
     let local_node_id = local_node_id();
     let graph_datasource_node_id = graph_datasource_node_id();
+    let life_graph_runner_node_id = life_graph_runner_node_id();
     let execution_routes = toolset
         .iter()
         .map(|tool_name| {
@@ -3772,6 +3788,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                 "agent_graph"
             } else if is_graph_datasource_tool(tool_name) {
                 "datasource"
+            } else if is_life_graph_tool(tool_name) {
+                "life_graph"
             } else if is_table_datasource_tool(tool_name) {
                 "table_datasource"
             } else if is_capability_primitive(tool_name) {
@@ -3786,6 +3804,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                 ToolExecutionRoute {
                     target_node: if execution_mode == "datasource" {
                         graph_datasource_node_id.clone()
+                    } else if execution_mode == "life_graph" {
+                        life_graph_runner_node_id.clone()
                     } else {
                         local_node_id.clone()
                     },
@@ -3795,6 +3815,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         "agent-graph".into()
                     } else if execution_mode == "datasource" {
                         "graph-datasource".into()
+                    } else if execution_mode == "life_graph" {
+                        "life-graph-runner".into()
                     } else if execution_mode == "table_datasource" {
                         "table-datasource".into()
                     } else if execution_mode == "capability_invoke" {
@@ -3827,6 +3849,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         "agent_graph_route".into()
                     } else if execution_mode == "datasource" {
                         "graph_datasource_route".into()
+                    } else if execution_mode == "life_graph" {
+                        "life_graph_runner_route".into()
                     } else if execution_mode == "table_datasource" {
                         "table_datasource_route".into()
                     } else if execution_mode == "capability_invoke" {
@@ -3968,6 +3992,18 @@ fn is_graph_datasource_tool(tool_name: &str) -> bool {
             | "graph.list"
             | "graph.schema"
             | "graph.grant_access"
+    )
+}
+
+fn is_life_graph_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "life.observe"
+            | "life.recall"
+            | "life.commit"
+            | "life.resolve"
+            | "life.conflict"
+            | "life.patch.propose"
     )
 }
 

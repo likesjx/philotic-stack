@@ -2379,5 +2379,302 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         },
     );
 
+    // ── Life Graph OS tools ────────────────────────────────────────────────────
+
+    m.insert(
+        "life.observe".into(),
+        ToolDefinition {
+            tool_name: "life.observe".into(),
+            description: "Propose a grounded observation as a new Life Graph evidence node. \
+                          Use this to record commitments, open loops, goals, habits, events, \
+                          and other lived-reality facts with provenance. \
+                          The node is written to the Life Graph with validation_state=proposed \
+                          and must be confirmed before becoming durable truth."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["observation_id", "evidence"],
+                "properties": {
+                    "observation_id": {
+                        "type": "string",
+                        "description": "Unique ID for this observation (e.g. 'obs:rowing-2026-06-05')."
+                    },
+                    "evidence": {
+                        "type": "object",
+                        "required": ["packet_id", "claim_ref", "claim_summary", "source_refs",
+                                     "confidence", "validation_state", "source_reliability",
+                                     "adjudication_status"],
+                        "properties": {
+                            "packet_id": {
+                                "type": "string",
+                                "description": "Unique ID for this evidence packet."
+                            },
+                            "claim_ref": {
+                                "type": "object",
+                                "required": ["id", "label"],
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": "Life Graph node ID (e.g. 'life:open_loop:rowing')."
+                                    },
+                                    "label": {
+                                        "type": "string",
+                                        "description": "Life Graph node type. Must be one of: \
+                                            Person, Role, Goal, System, Habit, Project, Commitment, \
+                                            OpenLoop, NextAction, Routine, Decision, Preference, Value, \
+                                            Concern, Event, Signal, GrowthHypothesis, GrowthExperiment, \
+                                            DriftFinding, CapabilityPatch, SkillPatch, ToolPatch, \
+                                            SchemaPatch, AttentionPatch, SystemPatch, StewardshipInstruction."
+                                    },
+                                    "datasource": {
+                                        "type": "string",
+                                        "description": "Always 'life-graph'.",
+                                        "default": "life-graph"
+                                    }
+                                }
+                            },
+                            "claim_summary": {
+                                "type": "string",
+                                "description": "One or two sentence summary of what was observed."
+                            },
+                            "source_refs": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["source_id", "source_kind", "reliability"],
+                                    "properties": {
+                                        "source_id": {
+                                            "type": "string",
+                                            "description": "Source membrane or agent ID (e.g. 'membrane:telegram')."
+                                        },
+                                        "source_kind": {
+                                            "type": "string",
+                                            "enum": [
+                                                "operator_confirmation", "membrane_event",
+                                                "muninn_engram", "graph_passage",
+                                                "imported_record", "agent_inference",
+                                                "runtime_observation"
+                                            ]
+                                        },
+                                        "reliability": {
+                                            "type": "object",
+                                            "required": ["score", "basis"],
+                                            "properties": {
+                                                "score": {
+                                                    "type": "number",
+                                                    "minimum": 0, "maximum": 1
+                                                },
+                                                "basis": {
+                                                    "type": "string",
+                                                    "enum": [
+                                                        "operator_confirmed", "direct_observation",
+                                                        "muninn_trust", "imported_authority",
+                                                        "agent_inferred", "unknown"
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0, "maximum": 1,
+                                "description": "Confidence in this claim (0.0–1.0)."
+                            },
+                            "validation_state": {
+                                "type": "string",
+                                "enum": ["inferred", "proposed", "confirmed", "retired", "conflicted"],
+                                "default": "proposed"
+                            },
+                            "source_reliability": {
+                                "type": "number",
+                                "minimum": 0, "maximum": 1
+                            },
+                            "adjudication_status": {
+                                "type": "string",
+                                "enum": [
+                                    "not_needed", "pending", "muninn_first",
+                                    "graph_review", "operator_required", "resolved", "rejected"
+                                ],
+                                "default": "not_needed"
+                            },
+                            "observed_at": {
+                                "type": "string",
+                                "description": "ISO 8601 timestamp when this was observed."
+                            },
+                            "conflict_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "default": []
+                            },
+                            "passage_refs": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                                "default": []
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "default": {}
+                            }
+                        }
+                    },
+                    "proposed_graph_refs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "default": []
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.recall".into(),
+        ToolDefinition {
+            tool_name: "life.recall".into(),
+            description: "Retrieve a context packet from the Life Graph using semantic search. \
+                          Returns ranked evidence nodes relevant to the query. \
+                          Requires an embedding vector (1536-dim) in the 'embedding' field. \
+                          Use operator_intent to select a named strategy: \
+                          'open_loops_by_context', 'goals_and_next_actions', \
+                          'commitments_approaching', 're_entry_context'."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["query_id", "query_text", "strategy", "semantic_pivots",
+                             "expansion_policy", "ranking_weights", "max_context_packets"],
+                "properties": {
+                    "query_id": {"type": "string"},
+                    "query_text": {"type": "string", "description": "Human-language query."},
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["semantic_pivot", "vector_then_expand", "memory_aware_graph_rank"],
+                        "default": "memory_aware_graph_rank"
+                    },
+                    "operator_intent": {
+                        "type": "string",
+                        "description": "Named strategy hint: open_loops_by_context, goals_and_next_actions, commitments_approaching, re_entry_context."
+                    },
+                    "semantic_pivots": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["space", "embedding_model", "embedding_dims", "query_text_hash"],
+                            "properties": {
+                                "space": {
+                                    "type": "string",
+                                    "enum": ["life_event_semantic", "goal_system_semantic",
+                                             "skill_tool_semantic", "role_person_semantic",
+                                             "memory_bridge_semantic"]
+                                },
+                                "embedding_model": {"type": "string", "default": "text-embedding-3-small"},
+                                "embedding_dims": {"type": "integer", "default": 1536},
+                                "query_text_hash": {"type": "string"}
+                            }
+                        }
+                    },
+                    "expansion_policy": {
+                        "type": "object",
+                        "properties": {
+                            "max_hops": {"type": "integer", "default": 2},
+                            "max_nodes": {"type": "integer", "default": 24},
+                            "allowed_edge_types": {"type": "array", "items": {"type": "string"}, "default": []}
+                        }
+                    },
+                    "policy_filters": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["exclude_retired", "exclude_conflicted_unless_requested",
+                                     "require_evidence", "role_appropriate", "low_agency_only"]
+                        },
+                        "default": ["exclude_retired", "require_evidence"]
+                    },
+                    "ranking_weights": {
+                        "type": "object",
+                        "properties": {
+                            "semantic_similarity": {"type": "number", "default": 0.45},
+                            "graph_specificity": {"type": "number", "default": 0.2},
+                            "recency": {"type": "number", "default": 0.1},
+                            "confirmation": {"type": "number", "default": 0.15},
+                            "active_commitment": {"type": "number", "default": 0.1}
+                        }
+                    },
+                    "active_role": {"type": "string"},
+                    "max_context_packets": {"type": "integer", "default": 6}
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.commit".into(),
+        ToolDefinition {
+            tool_name: "life.commit".into(),
+            description: "Promote a validated Life Graph evidence node to confirmed truth. \
+                          Requires either confirmed evidence or explicit operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["evidence", "operator_approved"],
+                "properties": {
+                    "evidence": {
+                        "type": "object",
+                        "description": "The EvidencePacket to commit (same shape as life.observe)."
+                    },
+                    "operator_approved": {
+                        "type": "boolean",
+                        "description": "True if operator has explicitly approved this commit."
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.patch.propose".into(),
+        ToolDefinition {
+            tool_name: "life.patch.propose".into(),
+            description: "Propose a governed Life Graph improvement: schema change, skill update, \
+                          tool addition, attention policy change, or system-level change. \
+                          High-risk patches require operator approval before applying."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["patch_id", "patch_kind", "summary", "rationale", "evidence_packets", "risk"],
+                "properties": {
+                    "patch_id": {"type": "string"},
+                    "patch_kind": {
+                        "type": "string",
+                        "enum": ["schema_patch", "skill_patch", "tool_patch",
+                                 "attention_patch", "system_patch"]
+                    },
+                    "summary": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "evidence_packets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "object"}
+                    },
+                    "risk": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"]
+                    },
+                    "operator_approved": {
+                        "type": "boolean",
+                        "default": false
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
     m
 }
