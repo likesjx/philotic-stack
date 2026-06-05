@@ -33,6 +33,32 @@ pub fn index_name(space: &SemanticSpace, label: &str) -> String {
     format!("{}__{}", prefix, label)
 }
 
+/// All node labels that participate in a given semantic space.
+///
+/// Callers iterate these and query each per-label index. Must stay in sync with
+/// V001 migration index names.
+pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
+    match space {
+        SemanticSpace::LifeEventSemantic => &["Event", "Signal", "OpenLoop"],
+        SemanticSpace::GoalSystemSemantic => {
+            &["Goal", "System", "Habit", "Project", "Routine", "NextAction"]
+        }
+        SemanticSpace::SkillToolSemantic => &[
+            "GrowthHypothesis",
+            "GrowthExperiment",
+            "DriftFinding",
+            "CapabilityPatch",
+            "SkillPatch",
+            "ToolPatch",
+            "SchemaPatch",
+            "AttentionPatch",
+            "SystemPatch",
+        ],
+        SemanticSpace::RolePersonSemantic => &["Role", "Person", "Value", "Preference", "Concern"],
+        SemanticSpace::MemoryBridgeSemantic => &["Commitment", "Decision"],
+    }
+}
+
 /// Generates a `CALL vector_search.search(...)` Cypher string.
 ///
 /// YIELD names are `node` and `similarity` (no alias) so the parser reads

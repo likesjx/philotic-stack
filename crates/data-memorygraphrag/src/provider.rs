@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use data_memorygraphrag::cypher;
 use data_memorygraphrag::projection;
 use data_memorygraphrag::{
-    LifeGraphToolRequest, LifeObserveInput, MemoryGraphRagRunner, PolicyFilter, RankingWeights,
-    RetrievalContextPacket, RetrievalQuery, RetrievalStrategy, RunnerConfig, SemanticSpace,
+    LifeGraphToolRequest, LifeObserveInput, MemoryGraphRagRunner, PolicyFilter, RetrievalQuery,
+    RunnerConfig,
 };
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
 use neo4rs::{
@@ -200,7 +200,7 @@ impl LifeGraphProvider {
         let mut all_hits = Vec::new();
 
         for pivot in &query_val.semantic_pivots {
-            for label in space_labels(&pivot.space) {
+            for label in projection::labels_for_space(&pivot.space) {
                 let index = projection::index_name(&pivot.space, label);
                 let cypher =
                     projection::semantic_expand_cypher(&index, top_k, &embedding, min_similarity);
@@ -250,29 +250,6 @@ impl LifeGraphProvider {
             "status": "ok",
             "context_packet": packet_json,
         })))
-    }
-}
-
-/// Map a SemanticSpace to the Memgraph node labels it covers (per V001 migration).
-fn space_labels(space: &SemanticSpace) -> &'static [&'static str] {
-    match space {
-        SemanticSpace::LifeEventSemantic => &["Event", "Signal", "OpenLoop"],
-        SemanticSpace::GoalSystemSemantic => {
-            &["Goal", "System", "Habit", "Project", "Routine", "NextAction"]
-        }
-        SemanticSpace::SkillToolSemantic => &[
-            "GrowthHypothesis",
-            "GrowthExperiment",
-            "DriftFinding",
-            "CapabilityPatch",
-            "SkillPatch",
-            "ToolPatch",
-            "SchemaPatch",
-            "AttentionPatch",
-            "SystemPatch",
-        ],
-        SemanticSpace::RolePersonSemantic => &["Role", "Person", "Value", "Preference", "Concern"],
-        SemanticSpace::MemoryBridgeSemantic => &["Commitment", "Decision"],
     }
 }
 
