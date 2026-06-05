@@ -1739,28 +1739,43 @@ impl AgentRuntime {
 
     /// Fetch MuninnDB config from hotel IPC and store it for session use.
     async fn fetch_memory_config(&mut self) {
-        info!("Requesting MuninnDB config from hotel...");
-        match self
-            .ipc_client
-            .send_request(IpcRequest::FetchMemoryConfig)
-            .await
-        {
-            Ok(IpcResponse::MemoryConfig {
-                config_json: Some(json),
-            }) => match serde_json::from_str::<MuninnConfig>(&json) {
-                Ok(cfg) => {
-                    info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
-                    self.muninn_config = Some(cfg);
+        // Retry up to 3 times with a 3-second timeout each attempt.
+        // Background: during hotel startup several guests register concurrently. The IPC
+        // response for FetchMemoryConfig can be consumed by a racing guest's send_request
+        // loop before this philote reads it (no per-request correlation ID on this path).
+        // A short timeout + retry window clears that race without hanging indefinitely.
+        for attempt in 1u8..=3 {
+            info!("Requesting MuninnDB config from hotel (attempt {attempt})...");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                self.ipc_client.send_request(IpcRequest::FetchMemoryConfig),
+            )
+            .await;
+            match result {
+                Ok(Ok(IpcResponse::MemoryConfig(config))) if config.config_json.is_some() => {
+                    let json = config.config_json.expect("checked is_some");
+                    match serde_json::from_str::<MuninnConfig>(&json) {
+                        Ok(cfg) => {
+                            info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
+                            self.muninn_config = Some(cfg);
+                        }
+                        Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
+                    }
+                    return;
                 }
-                Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
-            },
-            Ok(IpcResponse::MemoryConfig { config_json: None }) => {
-                info!("Hotel has no MuninnDB config — running without memory");
-            }
-            Ok(_) | Err(_) => {
-                warn!("Unexpected response to FetchMemoryConfig — running without memory");
+                Ok(Ok(IpcResponse::MemoryConfig(config))) if config.config_json.is_none() => {
+                    info!("Hotel has no MuninnDB config — running without memory");
+                    return;
+                }
+                Ok(Ok(_)) | Ok(Err(_)) => {
+                    warn!("Unexpected response to FetchMemoryConfig (attempt {attempt}) — retrying");
+                }
+                Err(_) => {
+                    warn!("FetchMemoryConfig timed out (attempt {attempt}) — response likely consumed by concurrent guest registration; retrying");
+                }
             }
         }
+        warn!("FetchMemoryConfig failed after 3 attempts — running without memory");
     }
 
     /// Build a `MuninnRestEngine` scoped to the given agent and user.
