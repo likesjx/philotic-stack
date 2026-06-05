@@ -2411,7 +2411,6 @@ impl PhiloticClient {
                 | IpcResponse::DesktopMembraneLeaseStatus { .. }
                 | IpcResponse::DiscordGatewayLease { .. }
                 | IpcResponse::DiscordGatewayLeaseStatus { .. }
-                | IpcResponse::Standard { ok: true, .. }
         )
     }
 
