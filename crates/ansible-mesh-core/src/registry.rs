@@ -73,6 +73,15 @@ impl NodeRegistry {
         DEFAULT_NODE_TTL.as_secs()
     }
 
+    /// Returns `true` if the node was not seen recently (stale or first-ever), which means
+    /// the caller should treat the incoming heartbeat as a reconnect event.
+    pub fn is_node_stale(&self, node_id: &str) -> bool {
+        self.nodes
+            .get(node_id)
+            .map(|s| !Self::is_fresh(s))
+            .unwrap_or(true)
+    }
+
     pub fn observe_heartbeat(
         &mut self,
         capabilities: NodeCapabilities,
