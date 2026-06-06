@@ -1523,15 +1523,16 @@ impl AgentRuntime {
     /// Applied to every new session so the correct persona is used from the first message.
     async fn fetch_agent_profile(&mut self) {
         let key = format!("__agent_bundle__:{}", self.agent_id);
-        match self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig { key })
-            .await
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetConfig { key }),
+        )
+        .await
         {
-            Ok(IpcResponse::ConfigData {
+            Ok(Ok(IpcResponse::ConfigData {
                 value_json: Some(json),
                 ..
-            }) => match serde_json::from_str::<AgentProfile>(&json) {
+            })) => match serde_json::from_str::<AgentProfile>(&json) {
                 Ok(mut profile) => {
                     info!(agent_id = %self.agent_id, "Agent profile loaded from hotel.");
                     profile.voice_response_policy.seed_voice_ids();
@@ -1539,27 +1540,31 @@ impl AgentRuntime {
                 }
                 Err(e) => warn!("Failed to parse agent profile bundle: {}", e),
             },
-            Ok(IpcResponse::ConfigData {
+            Ok(Ok(IpcResponse::ConfigData {
                 value_json: None, ..
-            }) => {
+            })) => {
                 info!(agent_id = %self.agent_id, "No agent identity bundle found in hotel — using default profile.");
             }
-            Ok(_) | Err(_) => {
+            Ok(Ok(_)) | Ok(Err(_)) => {
                 warn!("Unexpected response to agent bundle fetch — using default profile.");
+            }
+            Err(_) => {
+                warn!(agent_id = %self.agent_id, "Agent bundle fetch timed out — using default profile.");
             }
         }
 
         // Fetch hotel-level user profile and inject into agent profile when the
         // agent-specific profile doesn't already override the field.
         if let Some(hotel_name) = local_hotel_name() {
-            match self
-                .ipc_client
-                .send_request(IpcRequest::GetUserProfile {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.ipc_client.send_request(IpcRequest::GetUserProfile {
                     hotel_name: hotel_name.clone(),
-                })
-                .await
+                }),
+            )
+            .await
             {
-                Ok(IpcResponse::UserProfileData(p)) => {
+                Ok(Ok(IpcResponse::UserProfileData(p))) => {
                     if self.default_agent_profile.user_timezone.is_none() {
                         if let Some(tz) = p.timezone.clone() {
                             info!(hotel = %hotel_name, tz = %tz, "Injecting user timezone from hotel user profile.");
@@ -1586,8 +1591,11 @@ impl AgentRuntime {
                         }
                     }
                 }
-                Ok(_) | Err(_) => {
+                Ok(Ok(_)) | Ok(Err(_)) => {
                     // Non-fatal — hotel may not have a user profile configured yet.
+                }
+                Err(_) => {
+                    warn!(agent_id = %self.agent_id, "GetUserProfile timed out at startup — continuing without user profile injection.");
                 }
             }
         }
@@ -1595,29 +1603,31 @@ impl AgentRuntime {
         // Apply operator-persisted policy overrides from hotel config keys.
         // These take precedence over the bundle so /voice and agent.configure persist
         // correctly across restarts without requiring a bundle rebuild.
-        if let Ok(IpcResponse::ConfigData {
+        if let Ok(Ok(IpcResponse::ConfigData {
             value_json: Some(ref json),
             ..
-        }) = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig {
+        })) = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetConfig {
                 key: "config:voice_response_policy".into(),
-            })
-            .await
+            }),
+        )
+        .await
         {
             if let Ok(policy) = serde_json::from_str::<VoiceResponsePolicy>(json) {
                 self.default_agent_profile.voice_response_policy = policy;
             }
         }
-        if let Ok(IpcResponse::ConfigData {
+        if let Ok(Ok(IpcResponse::ConfigData {
             value_json: Some(ref json),
             ..
-        }) = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig {
+        })) = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetConfig {
                 key: "config:media_routing_policy".into(),
-            })
-            .await
+            }),
+        )
+        .await
         {
             if let Ok(policy) = serde_json::from_str::<MediaRoutingPolicy>(json) {
                 self.default_agent_profile.media_routing_policy = policy;
@@ -1703,9 +1713,10 @@ impl AgentRuntime {
     async fn fetch_role_names(&mut self) {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            self.ipc_client.send_request(IpcRequest::ListRoleIncarnations {
-                agent_id: self.agent_id.clone(),
-            }),
+            self.ipc_client
+                .send_request(IpcRequest::ListRoleIncarnations {
+                    agent_id: self.agent_id.clone(),
+                }),
         )
         .await;
         match result {
@@ -1772,10 +1783,14 @@ impl AgentRuntime {
                     return;
                 }
                 Ok(Ok(_)) | Ok(Err(_)) => {
-                    warn!("Unexpected response to FetchMemoryConfig (attempt {attempt}) — retrying");
+                    warn!(
+                        "Unexpected response to FetchMemoryConfig (attempt {attempt}) — retrying"
+                    );
                 }
                 Err(_) => {
-                    warn!("FetchMemoryConfig timed out (attempt {attempt}) — response likely consumed by concurrent guest registration; retrying");
+                    warn!(
+                        "FetchMemoryConfig timed out (attempt {attempt}) — response likely consumed by concurrent guest registration; retrying"
+                    );
                 }
             }
         }
@@ -1816,7 +1831,8 @@ impl AgentRuntime {
         let key = format!("__mcp_routes__:{}", self.agent_id);
         let mcp_override = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            self.ipc_client.send_request(IpcRequest::GetConfig { key: key.clone() }),
+            self.ipc_client
+                .send_request(IpcRequest::GetConfig { key: key.clone() }),
         )
         .await
         .ok()
@@ -1891,9 +1907,15 @@ impl AgentRuntime {
         )
         .await;
         match result {
-            Ok(Ok(_)) => info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel."),
-            Ok(Err(e)) => warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes"),
-            Err(_) => warn!(agent_id = %self.agent_id, "MCP route registration timed out (startup race) — continuing"),
+            Ok(Ok(_)) => {
+                info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel.")
+            }
+            Ok(Err(e)) => {
+                warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes")
+            }
+            Err(_) => {
+                warn!(agent_id = %self.agent_id, "MCP route registration timed out (startup race) — continuing")
+            }
         }
     }
 
@@ -1904,7 +1926,8 @@ impl AgentRuntime {
         let list_key = format!("__session_apartments__:{}", self.agent_id);
         let memory_types: Vec<String> = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            self.ipc_client.send_request(IpcRequest::GetConfig { key: list_key }),
+            self.ipc_client
+                .send_request(IpcRequest::GetConfig { key: list_key }),
         )
         .await
         {
@@ -1940,7 +1963,8 @@ impl AgentRuntime {
             let snapshot_key = format!("__session_snapshot__:{session_id}");
             let checkpoint = match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                self.ipc_client.send_request(IpcRequest::GetConfig { key: snapshot_key }),
+                self.ipc_client
+                    .send_request(IpcRequest::GetConfig { key: snapshot_key }),
             )
             .await
             {
@@ -1952,7 +1976,9 @@ impl AgentRuntime {
                     Err(_) => continue,
                 },
                 Err(_) => {
-                    warn!("sweep_stale_session_turns: snapshot fetch timed out for session {session_id} — skipping");
+                    warn!(
+                        "sweep_stale_session_turns: snapshot fetch timed out for session {session_id} — skipping"
+                    );
                     continue;
                 }
                 _ => continue,
