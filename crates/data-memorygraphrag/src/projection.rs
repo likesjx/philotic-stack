@@ -40,9 +40,14 @@ pub fn index_name(space: &SemanticSpace, label: &str) -> String {
 pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
     match space {
         SemanticSpace::LifeEventSemantic => &["Event", "Signal", "OpenLoop"],
-        SemanticSpace::GoalSystemSemantic => {
-            &["Goal", "System", "Habit", "Project", "Routine", "NextAction"]
-        }
+        SemanticSpace::GoalSystemSemantic => &[
+            "Goal",
+            "System",
+            "Habit",
+            "Project",
+            "Routine",
+            "NextAction",
+        ],
         SemanticSpace::SkillToolSemantic => &[
             "GrowthHypothesis",
             "GrowthExperiment",

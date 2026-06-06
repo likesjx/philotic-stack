@@ -54,9 +54,9 @@ Nodes that participate in semantic retrieval carry these additional properties a
 | Property | Type | Description |
 |---|---|---|
 | `embedding` | `list<float>` | The vector. Indexed by the node's vector index. |
-| `embedding_model` | `string` | Model ID used to produce the vector (e.g. `text-embedding-3-small`) |
+| `embedding_model` | `string` | Model ID used to produce the vector (current local baseline: `Xenova/all-mpnet-base-v2`) |
 | `embedding_model_gen` | `int` | Generation counter — increment when the model changes to trigger re-embedding |
-| `embedding_dims` | `int` | Dimension. Must match the vector index config (`1536` baseline) |
+| `embedding_dims` | `int` | Dimension. Must match the vector index config (`768` baseline) |
 | `embedding_hash` | `string` | SHA-256 hex of the raw embedding bytes |
 | `embedding_updated_at` | `string` | ISO 8601 timestamp of last embedding write |
 | `embedding_source_text_hash` | `string` | SHA-256 hex of the source text that was embedded |
@@ -397,7 +397,7 @@ Edge provenance: the full provenance envelope applies to agent-inferred edges. O
 
 ## Vector Spaces
 
-All spaces use dimension `1536` and metric `cos` (cosine similarity). Never mix models or dimensions within a space.
+All spaces use dimension `768` and metric `cos` (cosine similarity). Never mix models or dimensions within a space. V003 migrated the original 1536d indexes to the deployed local ONNX baseline, `Xenova/all-mpnet-base-v2`.
 
 | Space | Node labels | Purpose |
 |---|---|---|

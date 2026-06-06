@@ -29,9 +29,7 @@ pub fn decision_to_observe_input(
             .proposed_sil_entry
             .as_ref()
             .map(|sil| propose_sil_input(sil, signal, now_iso)),
-        AttentionStewardResponse::DeferSignal | AttentionStewardResponse::UpdateSilMetadata => {
-            None
-        }
+        AttentionStewardResponse::DeferSignal | AttentionStewardResponse::UpdateSilMetadata => None,
     }
 }
 
@@ -173,7 +171,10 @@ mod tests {
         let policy = AttentionStewardPolicy::default();
         let decision = policy.evaluate_at(&signal, "2026-06-04T20:01:00Z".parse().unwrap());
 
-        assert_eq!(decision.response, AttentionStewardResponse::RecordObservation);
+        assert_eq!(
+            decision.response,
+            AttentionStewardResponse::RecordObservation
+        );
 
         let input = decision_to_observe_input(&decision, &signal, "2026-06-04T20:01:00Z")
             .expect("RecordObservation should produce input");
@@ -234,9 +235,7 @@ mod tests {
         let decision = policy.evaluate_at(&signal, "2026-06-04T20:01:00Z".parse().unwrap());
 
         assert_eq!(decision.response, AttentionStewardResponse::DeferSignal);
-        assert!(
-            decision_to_observe_input(&decision, &signal, "2026-06-04T20:01:00Z").is_none()
-        );
+        assert!(decision_to_observe_input(&decision, &signal, "2026-06-04T20:01:00Z").is_none());
     }
 
     #[test]

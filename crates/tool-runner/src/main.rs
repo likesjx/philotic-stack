@@ -739,19 +739,20 @@ async fn main() -> Result<()> {
         .send_request(IpcRequest::FetchMemoryConfig)
         .await
     {
-        Ok(IpcResponse::MemoryConfig {
-            config_json: Some(json),
-        }) => match serde_json::from_str::<MuninnConfig>(&json) {
-            Ok(cfg) => {
-                info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "Memory tools enabled");
-                Some(cfg)
+        Ok(IpcResponse::MemoryConfig(config)) if config.config_json.is_some() => {
+            let json = config.config_json.expect("checked is_some");
+            match serde_json::from_str::<MuninnConfig>(&json) {
+                Ok(cfg) => {
+                    info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "Memory tools enabled");
+                    Some(cfg)
+                }
+                Err(e) => {
+                    warn!("Failed to parse MuninnConfig: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                warn!("Failed to parse MuninnConfig: {e}");
-                None
-            }
-        },
-        Ok(IpcResponse::MemoryConfig { config_json: None }) => {
+        }
+        Ok(IpcResponse::MemoryConfig(config)) if config.config_json.is_none() => {
             info!("Memory tools disabled — hotel has no MuninnDB config");
             None
         }

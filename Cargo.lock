@@ -1166,6 +1166,7 @@ dependencies = [
  "chrono",
  "datasource",
  "neo4rs",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

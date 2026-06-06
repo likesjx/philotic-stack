@@ -8,16 +8,16 @@
 /// Verify mechanism: RetrievalContextPacket is returned with status="ok".
 use data_memorygraphrag::projection;
 use data_memorygraphrag::{
-    ExpansionPolicy, PolicyFilter, RankingWeights, RetrievalQuery, RetrievalStrategy,
-    SemanticPivot, SemanticSpace, LIFE_GRAPH_EMBEDDING_DIMS,
+    ExpansionPolicy, LIFE_GRAPH_EMBEDDING_DIMS, PolicyFilter, RankingWeights, RetrievalQuery,
+    RetrievalStrategy, SemanticPivot, SemanticSpace,
 };
 use neo4rs::{ConfigBuilder, Graph, query as neo_query};
 use ulid::Ulid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let uri = std::env::var("PHILOTIC_MEMGRAPH_URI")
-        .unwrap_or_else(|_| "100.64.212.8:7687".to_string());
+    let uri =
+        std::env::var("PHILOTIC_MEMGRAPH_URI").unwrap_or_else(|_| "100.64.212.8:7687".to_string());
     let user = std::env::var("PHILOTIC_MEMGRAPH_USER").unwrap_or_default();
     let password = std::env::var("PHILOTIC_MEMGRAPH_PASSWORD").unwrap_or_default();
 
@@ -85,7 +85,11 @@ async fn main() -> anyhow::Result<()> {
     let (surviving, drop_log) =
         projection::apply_policy_filters(all_hits, &recall_query.policy_filters);
 
-    println!("Policy filter: {} surviving, {} dropped", surviving.len(), drop_log.len());
+    println!(
+        "Policy filter: {} surviving, {} dropped",
+        surviving.len(),
+        drop_log.len()
+    );
 
     let scored: Vec<(projection::VectorHit, f32, Vec<PolicyFilter>)> = surviving
         .into_iter()
@@ -98,8 +102,7 @@ async fn main() -> anyhow::Result<()> {
                     elapsed.num_seconds().max(0) as u64
                 })
                 .unwrap_or(0);
-            let score =
-                projection::ranking_score(&hit, &recall_query.ranking_weights, age_secs);
+            let score = projection::ranking_score(&hit, &recall_query.ranking_weights, age_secs);
             (hit, score, vec![])
         })
         .collect();
@@ -130,18 +133,21 @@ async fn main() -> anyhow::Result<()> {
         for (i, rp) in packet.ranked_packets.iter().enumerate() {
             println!(
                 "  [{}] {} [{}] score={:.3}",
-                i,
-                rp.packet.claim_ref.id,
-                rp.packet.claim_ref.label,
-                rp.score
+                i, rp.packet.claim_ref.id, rp.packet.claim_ref.label, rp.score
             );
         }
     }
 
     // Serialise to confirm JSON shape is valid
     let json = serde_json::to_string_pretty(&packet)?;
-    assert!(json.contains("\"context_id\""), "packet should serialize to JSON with context_id");
-    assert!(json.contains("\"ranked_packets\""), "packet should have ranked_packets array");
+    assert!(
+        json.contains("\"context_id\""),
+        "packet should serialize to JSON with context_id"
+    );
+    assert!(
+        json.contains("\"ranked_packets\""),
+        "packet should have ranked_packets array"
+    );
 
     Ok(())
 }
@@ -149,9 +155,14 @@ async fn main() -> anyhow::Result<()> {
 fn space_labels(space: &SemanticSpace) -> &'static [&'static str] {
     match space {
         SemanticSpace::LifeEventSemantic => &["Event", "Signal", "OpenLoop"],
-        SemanticSpace::GoalSystemSemantic => {
-            &["Goal", "System", "Habit", "Project", "Routine", "NextAction"]
-        }
+        SemanticSpace::GoalSystemSemantic => &[
+            "Goal",
+            "System",
+            "Habit",
+            "Project",
+            "Routine",
+            "NextAction",
+        ],
         SemanticSpace::SkillToolSemantic => &[
             "GrowthHypothesis",
             "GrowthExperiment",

@@ -81,7 +81,7 @@ Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/doc
 
 The first Life Graph OS boundary is now substantially implemented. Current proof:
 
-- `life-graph-schema` (`schema-applied-live`): V001 migration live on Memgraph 3.10.1 vps-jane — 25 node types with uniqueness constraints, 18 property indexes, 25 vector indexes across 5 semantic spaces (1536d cosine). V002 adds `StewardshipInstruction` with 4 property indexes. Commits `2d528c3`, `86a730b`.
+- `life-graph-schema` (`schema-applied-live`): V001 migration live on Memgraph 3.10.1 vps-jane — 25 node types with uniqueness constraints and 18 property indexes. V002 adds `StewardshipInstruction` with 4 property indexes. V003 migrates 25 vector indexes across 5 semantic spaces to the canonical local ONNX baseline: 768d cosine using `Xenova/all-mpnet-base-v2`. Commits `2d528c3`, `86a730b`, `d8ed735`.
 - `life-graph-paracrine-heartbeat` (`test-green-runtime-boundary`): cron can emit opt-in `paracrine_signal` heartbeats and philotes observe them without model re-entry.
 - `life-graph-evidence-conflict` (`test-green-contracts`): `data-memorygraphrag` defines validated `EvidencePacket` and `ConflictHandoff` contracts with full test coverage.
 - `life-graph-semantic-retrieval` (`spec-and-contracts-green`): 5 named retrieval strategies with Cypher patterns (`SEMANTIC_RETRIEVAL.md`), `RetrievalContextPacket` shape, policy filter rules, composite ranking model, and retrieval flywheel spec. Contracts wired in `data-memorygraphrag`. Commit `e381416`.
@@ -392,14 +392,15 @@ Start with Memgraph vector indexes if they are sufficient for the first Life Gra
 
 Use the embeddings flywheel deliberately:
 
-- baseline vector dimension: `1536`
-- preferred high-capacity dimension: `3072` when the selected embedding model supports it without unacceptable latency/cost
-- minimum acceptable dimension for Life Graph OS semantic spaces: `1024`
+- baseline vector dimension: `768`
+- canonical local embedding model: `Xenova/all-mpnet-base-v2`
+- preferred high-capacity dimension: `1536` or `3072` when the selected embedding model supports it without unacceptable latency/cost
+- minimum acceptable dimension for the first local Life Graph OS semantic spaces: `768`
 - never mix dimensions or models inside one `embedding_space`
 - every embedding write records model, generation, dimension, source hash, and retrieval performance metadata
 - re-embedding jobs should be scheduled when model generation changes, source text changes, or retrieval evaluation shows drift
 
-The baseline should be large enough to support durable semantic retrieval across life domains, not just short note lookup. If a local model cannot meet the minimum useful dimension, it can still run degraded/local fallback retrieval, but it should not silently become the canonical Life Graph embedding model.
+The baseline should be large enough to support durable semantic retrieval across life domains, not just short note lookup. The current accepted local baseline is 768d because it is deployed, indexed, and runnable on vps-jane today; larger models remain a future migration when latency, cost, and reindexing are justified.
 
 Add a dedicated vector database only when one of these is proven:
 
@@ -595,7 +596,7 @@ Every recurring drift finding should be able to generate a patch proposal or a r
 1. Keep `graph-datasource` generic and define `data-memorygraphrag` as the Life Graph / MemoryGraphRAG toolset runner.
 2. Define the first Life Graph schema and Cypher migrations for `Role`, `Goal`, `System`, `Habit`, `Commitment`, `OpenLoop`, `NextAction`, and `GrowthExperiment`.
 3. Add a small tool surface: `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
-4. Add semantic indexing for Life Graph nodes with a `1536`-dimension baseline, `embedding_model_gen`, and `embedding_space` fields.
+4. Add semantic indexing for Life Graph nodes with a `768`-dimension baseline, `embedding_model_gen`, and `embedding_space` fields.
 5. Implement one retrieval strategy: semantic pivot plus bounded graph expansion into a context packet.
 6. Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.
 7. Define the cron-backed heartbeat job shape and paracrine signal shape for Life Graph maintenance and role-type subscriptions.

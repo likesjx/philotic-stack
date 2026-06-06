@@ -1797,6 +1797,17 @@ pub struct UserProfileDataPayload {
     pub linked_providers: Vec<String>,
 }
 
+/// Payload for [`IpcResponse::MemoryConfig`].
+///
+/// `MemoryConfig` has an optional value by design, but this wrapper must remain
+/// strict so untagged deserialization does not accidentally classify unrelated
+/// response objects as memory config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfigPayload {
+    pub config_json: Option<String>,
+}
+
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -2166,18 +2177,12 @@ pub enum IpcResponse {
     HealQueuePending {
         rows: Vec<ansible_mesh_core::heal_queue::HealQueueRow>,
     },
-    /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
-    /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
-    /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
-    /// Placing it last ensures it only wins when no other variant can match.
     RouterStats {
         stats: Vec<ansible_mesh_core::router_trace::ProviderStats>,
         /// Unix epoch seconds of the query.
         generated_at: u64,
     },
-    MemoryConfig {
-        config_json: Option<String>,
-    },
+    MemoryConfig(MemoryConfigPayload),
 }
 
 /// One agent's persisted route set, as returned by [`IpcResponse::McpRouteState`].
@@ -2361,6 +2366,9 @@ impl PhiloticClient {
 
         loop {
             let resp = self.read_response().await?;
+            if Self::is_expected_response(&req, &resp) {
+                return Ok(resp);
+            }
             if Self::is_push_message(&resp) {
                 self.pending_push.push_back(resp);
                 continue;
@@ -2381,6 +2389,28 @@ impl PhiloticClient {
             serde_json::from_slice(&buf).context("Failed to decode IpcResponse from Ansible")?;
 
         Ok(resp)
+    }
+
+    fn is_expected_response(req: &IpcRequest, response: &IpcResponse) -> bool {
+        matches!(
+            (req, response),
+            (
+                IpcRequest::AcquireTelegramPollLease { .. }
+                    | IpcRequest::GetTelegramPollLeaseOwner { .. },
+                IpcResponse::TelegramPollLeaseStatus { .. }
+            ) | (
+                IpcRequest::AcquireDesktopMembraneLease { .. }
+                    | IpcRequest::GetDesktopMembraneLeaseOwner { .. },
+                IpcResponse::DesktopMembraneLeaseStatus { .. }
+            ) | (
+                IpcRequest::AcquireDiscordGatewayLease { .. }
+                    | IpcRequest::GetDiscordGatewayLeaseOwner { .. },
+                IpcResponse::DiscordGatewayLeaseStatus { .. }
+            ) | (
+                IpcRequest::GetUserProfile { .. } | IpcRequest::PatchUserProfile { .. },
+                IpcResponse::UserProfileData(_)
+            )
+        )
     }
 
     fn is_push_message(response: &IpcResponse) -> bool {
@@ -2424,6 +2454,13 @@ impl PhiloticClient {
             let resp = self.read_response().await?;
             if Self::is_push_message(&resp) {
                 return Ok(resp);
+            }
+            // Some live EmitTask paths can leave a successful ACK on the stream before
+            // the routed push arrives. While explicitly waiting for a pushed task, this
+            // ACK is only framing noise. Do not add Standard OK to send_request's
+            // ignorable set: that would swallow real request replies such as Register.
+            if matches!(resp, IpcResponse::Standard { ok: true, .. }) {
+                continue;
             }
             if Self::is_ignorable_push(&resp) {
                 continue;
@@ -2541,6 +2578,120 @@ mod tests {
             }
             other => panic!("unexpected decoded response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn standard_response_does_not_decode_as_memory_config() {
+        let bytes = serde_json::to_vec(&IpcResponse::success("reg", None))
+            .expect("serialize standard response");
+        let decoded: IpcResponse =
+            serde_json::from_slice(&bytes).expect("deserialize standard response");
+
+        match decoded {
+            IpcResponse::Standard { ok: true, code, .. } => assert_eq!(code, "OK"),
+            other => panic!("standard response decoded as wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_config_response_roundtrips_strictly() {
+        let response = IpcResponse::MemoryConfig(MemoryConfigPayload {
+            config_json: Some("{\"base_url\":\"http://127.0.0.1:8475\"}".into()),
+        });
+        let bytes = serde_json::to_vec(&response).expect("serialize memory config");
+        let decoded: IpcResponse =
+            serde_json::from_slice(&bytes).expect("deserialize memory config");
+
+        match decoded {
+            IpcResponse::MemoryConfig(config) => {
+                assert!(
+                    config
+                        .config_json
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("base_url")
+                );
+            }
+            other => panic!("memory config decoded as wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn requested_lease_status_responses_are_not_ignored_as_push_noise() {
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::GetTelegramPollLeaseOwner {
+                lease_key: "telegram:bot".into(),
+            },
+            &IpcResponse::TelegramPollLeaseStatus {
+                active: true,
+                lease: None,
+            }
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::AcquireDesktopMembraneLease {
+                lease_key: "desktop:local".into(),
+                port: 49152,
+            },
+            &IpcResponse::DesktopMembraneLeaseStatus {
+                desktop_active: true,
+                desktop_lease: None,
+            }
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::GetDiscordGatewayLeaseOwner {
+                lease_key: "discord:bot".into(),
+            },
+            &IpcResponse::DiscordGatewayLeaseStatus {
+                active: true,
+                lease: None,
+            }
+        ));
+
+        assert!(!PhiloticClient::is_expected_response(
+            &IpcRequest::GetConfig { key: "x".into() },
+            &IpcResponse::TelegramPollLeaseStatus {
+                active: true,
+                lease: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn requested_user_profile_response_is_not_ignored_as_push_noise() {
+        let profile = UserProfileDataPayload {
+            hotel_name: "vps-jane".into(),
+            timezone: Some("America/New_York".into()),
+            display_name: Some("Jared".into()),
+            principal_id: Some("user:jared".into()),
+            preferred_name: Some("Jared".into()),
+            primary_email: None,
+            linked_providers: vec![],
+            user_context_text: None,
+        };
+
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::GetUserProfile {
+                hotel_name: "vps-jane".into(),
+            },
+            &IpcResponse::UserProfileData(profile.clone())
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::PatchUserProfile {
+                hotel_name: "vps-jane".into(),
+                timezone: Some("America/New_York".into()),
+                display_name: None,
+                principal_id: None,
+                preferred_name: None,
+                primary_email: None,
+                linked_providers: None,
+                user_context_text: None,
+            },
+            &IpcResponse::UserProfileData(profile.clone())
+        ));
+        assert!(!PhiloticClient::is_expected_response(
+            &IpcRequest::GetConfig { key: "x".into() },
+            &IpcResponse::UserProfileData(profile)
+        ));
     }
 
     async fn read_frame(stream: &mut tokio::net::UnixStream) -> Vec<u8> {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use data_memorygraphrag::cypher;
 use data_memorygraphrag::LIFE_GRAPH_EMBEDDING_DIMS;
+use data_memorygraphrag::cypher;
 use data_memorygraphrag::projection;
 use data_memorygraphrag::{
     ConflictHandoff, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput,
@@ -181,27 +181,66 @@ impl LifeGraphProvider {
                              n.embedding_model_gen = $gen, \
                              n.embedding_dims = {}, \
                              n.embedding_updated_at = $now, \
-                             n.embedding_space = $space",
-                        compiled.label,
-                        LIFE_GRAPH_EMBEDDING_DIMS
+                             n.embedding_space = $space \
+                         RETURN n.embedding_dims AS embedding_dims, \
+                                size(n.embedding) AS embedding_len",
+                        compiled.label, LIFE_GRAPH_EMBEDDING_DIMS
                     );
                     let space = projection::embedding_space_for_label(&compiled.label)
                         .unwrap_or("life_event_semantic");
+                    let vector_param: Vec<f64> = vector.iter().map(|v| f64::from(*v)).collect();
                     match graph
                         .execute(
                             query(&embed_cypher)
                                 .param("id", compiled.node_id.as_str())
-                                .param("vec", vector)
+                                .param("vec", vector_param)
                                 .param("gen", model_gen.as_str())
                                 .param("now", now.as_str())
                                 .param("space", space),
                         )
                         .await
                     {
-                        Ok(_) => {
-                            info!(node_id = %node_id, model_gen = %model_gen, "embed-on-write OK");
-                            "ok"
-                        }
+                        Ok(mut rows) => match rows.next().await {
+                            Ok(Some(row)) => {
+                                let dims = row
+                                    .get::<i64>("embedding_dims")
+                                    .unwrap_or(LIFE_GRAPH_EMBEDDING_DIMS as i64);
+                                let len = row
+                                    .get::<i64>("embedding_len")
+                                    .unwrap_or(LIFE_GRAPH_EMBEDDING_DIMS as i64);
+                                if dims == LIFE_GRAPH_EMBEDDING_DIMS as i64
+                                    && len == LIFE_GRAPH_EMBEDDING_DIMS as i64
+                                {
+                                    info!(
+                                        node_id = %node_id,
+                                        model_gen = %model_gen,
+                                        dims,
+                                        len,
+                                        "embed-on-write OK"
+                                    );
+                                    "ok"
+                                } else {
+                                    warn!(
+                                        node_id = %node_id,
+                                        dims,
+                                        len,
+                                        "embed-on-write returned unexpected metadata"
+                                    );
+                                    "write_mismatch"
+                                }
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    node_id = %compiled.node_id,
+                                    "embed-on-write matched no Life Graph node"
+                                );
+                                "write_missed"
+                            }
+                            Err(e) => {
+                                warn!("embed-on-write result read failed: {e}");
+                                "write_failed"
+                            }
+                        },
                         Err(e) => {
                             warn!("embed-on-write SET failed: {e}");
                             "write_failed"

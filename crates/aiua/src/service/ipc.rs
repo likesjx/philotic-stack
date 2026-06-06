@@ -43,10 +43,11 @@ use philotic_client::{
     DesktopMembraneGuestView, DesktopMembraneStatusView, DesktopMembraneTargetGuestInventoryView,
     DesktopMembraneTargetReachabilityView, DesktopMembraneTargetStatusView,
     DesktopMembraneTargetView, GuestExport, GuestIdentity, HookRoute, HookSubscription, IpcRequest,
-    IpcResponse, LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
-    OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
-    OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
-    OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
+    IpcResponse, LeaseEnvelope, LeaseStatus, MemoryConfigPayload, OPERATOR_CHAT_REPLY_ROLE,
+    OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
+    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
+    OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView, OperatorChatTurnReply,
+    OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
     OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
@@ -4194,7 +4195,9 @@ impl IpcServer {
                             has_config = config_json.is_some(),
                             "FetchMemoryConfig handled"
                         );
-                        let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
+                        let _ = outbound_tx.send(IpcResponse::MemoryConfig(MemoryConfigPayload {
+                            config_json,
+                        }));
                     }
                     Ok(IpcRequest::RefreshMemoryConfig) => {
                         let endpoint = muninn_config
@@ -4227,7 +4230,10 @@ impl IpcServer {
                             }
                         }
                         info!(available, "RefreshMemoryConfig probe complete");
-                        let _ = outbound_tx.send(IpcResponse::MuninnStatus { available, endpoint });
+                        let _ = outbound_tx.send(IpcResponse::MuninnStatus {
+                            available,
+                            endpoint,
+                        });
                     }
                     Ok(IpcRequest::GetPerimeterStatus) => {
                         use perimeter_core::service::PerimeterService as _;
@@ -5505,8 +5511,7 @@ impl IpcServer {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_default();
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
             let available = Self::probe_muninn_endpoint(&http, &endpoint).await;
@@ -5519,8 +5524,7 @@ impl IpcServer {
                 });
                 if !available {
                     if let Some(hq) = heal_queue.as_deref() {
-                        let msg =
-                            format!("MuninnDB unreachable: connection refused at {endpoint}");
+                        let msg = format!("MuninnDB unreachable: connection refused at {endpoint}");
                         if let Err(e) = hq.push_error("hotel", &msg) {
                             warn!(error = %e, "Failed to push MuninnDB outage to heal queue");
                         }

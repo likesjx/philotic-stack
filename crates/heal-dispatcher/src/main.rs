@@ -281,12 +281,15 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
             }
         }
         "refresh_memory_config" => {
-            info!(guest_id, "heal-dispatcher: triggering immediate MuninnDB probe");
-            match ipc
-                .send_request(IpcRequest::RefreshMemoryConfig)
-                .await
-            {
-                Ok(IpcResponse::MuninnStatus { available, endpoint }) => {
+            info!(
+                guest_id,
+                "heal-dispatcher: triggering immediate MuninnDB probe"
+            );
+            match ipc.send_request(IpcRequest::RefreshMemoryConfig).await {
+                Ok(IpcResponse::MuninnStatus {
+                    available,
+                    endpoint,
+                }) => {
                     if available {
                         info!(guest_id, endpoint = %endpoint, "MuninnDB probe succeeded — memory restored");
                         "memory_restored".into()
@@ -296,7 +299,11 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
                     }
                 }
                 Ok(resp) => {
-                    warn!(guest_id, ?resp, "refresh_memory_config got unexpected response");
+                    warn!(
+                        guest_id,
+                        ?resp,
+                        "refresh_memory_config got unexpected response"
+                    );
                     "probe_failed".into()
                 }
                 Err(e) => {

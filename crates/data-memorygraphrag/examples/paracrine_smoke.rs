@@ -19,12 +19,15 @@ use ulid::Ulid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let uri = std::env::var("PHILOTIC_MEMGRAPH_URI")
-        .unwrap_or_else(|_| "100.64.212.8:7687".to_string());
+    let uri =
+        std::env::var("PHILOTIC_MEMGRAPH_URI").unwrap_or_else(|_| "100.64.212.8:7687".to_string());
     let user = std::env::var("PHILOTIC_MEMGRAPH_USER").unwrap_or_default();
     let password = std::env::var("PHILOTIC_MEMGRAPH_PASSWORD").unwrap_or_default();
 
-    let signal_id = format!("cron:smoke-paracrine:{}", Ulid::new().to_string().to_lowercase());
+    let signal_id = format!(
+        "cron:smoke-paracrine:{}",
+        Ulid::new().to_string().to_lowercase()
+    );
 
     // --- Slice A: RecordObservation → Signal node ---
     let observe_signal = AttentionStewardSignal::from_value(json!({
@@ -51,8 +54,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let now_iso = chrono::Utc::now().to_rfc3339();
-    let observe_input = attention_observer::decision_to_observe_input(&decision, &observe_signal, &now_iso)
-        .expect("RecordObservation should produce LifeObserveInput");
+    let observe_input =
+        attention_observer::decision_to_observe_input(&decision, &observe_signal, &now_iso)
+            .expect("RecordObservation should produce LifeObserveInput");
 
     assert_eq!(observe_input.evidence.claim_ref.label, "Signal");
 
@@ -94,7 +98,10 @@ async fn main() -> anyhow::Result<()> {
     .param("id", compiled.node_id.as_str());
 
     let mut verify_rows = graph.execute(verify_q).await?;
-    let verify_row = verify_rows.next().await?.expect("Signal node should be readable");
+    let verify_row = verify_rows
+        .next()
+        .await?
+        .expect("Signal node should be readable");
     let vs = verify_row.get::<String>("vs").unwrap_or_default();
     let cs = verify_row.get::<String>("cs").unwrap_or_default();
 
@@ -103,8 +110,7 @@ async fn main() -> anyhow::Result<()> {
     println!("✓ Signal node verified: validation_state={vs}");
 
     // --- Slice B: ProposeSilEntry → StewardshipInstruction node ---
-    let sil_signal_id =
-        format!("cron:smoke-sil:{}", Ulid::new().to_string().to_lowercase());
+    let sil_signal_id = format!("cron:smoke-sil:{}", Ulid::new().to_string().to_lowercase());
     let sil_signal = AttentionStewardSignal::from_value(json!({
         "signal_id": sil_signal_id,
         "signal_type": "re_entry_hint",
@@ -127,13 +133,14 @@ async fn main() -> anyhow::Result<()> {
         "new_pattern signal should produce ProposeSilEntry"
     );
 
-    let sil_input = attention_observer::decision_to_observe_input(&sil_decision, &sil_signal, &now_iso)
-        .expect("ProposeSilEntry should produce LifeObserveInput");
+    let sil_input =
+        attention_observer::decision_to_observe_input(&sil_decision, &sil_signal, &now_iso)
+            .expect("ProposeSilEntry should produce LifeObserveInput");
 
     assert_eq!(sil_input.evidence.claim_ref.label, "StewardshipInstruction");
 
-    let sil_compiled =
-        cypher::compile_observe(&sil_input, &now_iso).expect("should compile StewardshipInstruction Cypher");
+    let sil_compiled = cypher::compile_observe(&sil_input, &now_iso)
+        .expect("should compile StewardshipInstruction Cypher");
 
     let sil_q = neo_query(&sil_compiled.query)
         .param("id", sil_compiled.node_id.as_str())
@@ -157,10 +164,9 @@ async fn main() -> anyhow::Result<()> {
     println!("✓ StewardshipInstruction node written: id={sil_written_id}");
 
     // Verify StewardshipInstruction is readable
-    let sil_verify_q = neo_query(
-        "MATCH (n:StewardshipInstruction {id: $id}) RETURN n.validation_state AS vs",
-    )
-    .param("id", sil_compiled.node_id.as_str());
+    let sil_verify_q =
+        neo_query("MATCH (n:StewardshipInstruction {id: $id}) RETURN n.validation_state AS vs")
+            .param("id", sil_compiled.node_id.as_str());
 
     let mut sil_verify_rows = graph.execute(sil_verify_q).await?;
     let sil_verify_row = sil_verify_rows
