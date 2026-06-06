@@ -1701,18 +1701,19 @@ impl AgentRuntime {
     /// on the default agent profile. Called once at startup so every session gets
     /// the authoritative list injected into its system prompt.
     async fn fetch_role_names(&mut self) {
-        match self
-            .ipc_client
-            .send_request(IpcRequest::ListRoleIncarnations {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::ListRoleIncarnations {
                 agent_id: self.agent_id.clone(),
-            })
-            .await
-        {
-            Ok(IpcResponse::Standard {
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(IpcResponse::Standard {
                 ok: true,
                 data: Some(data),
                 ..
-            }) => {
+            })) => {
                 if let Some(roles) = data.get("roles").and_then(|v| v.as_array()) {
                     let names: Vec<String> = roles
                         .iter()
@@ -1730,6 +1731,9 @@ impl AgentRuntime {
                     );
                     self.default_agent_profile.agent_role_names = names;
                 }
+            }
+            Err(_) => {
+                warn!(agent_id = %self.agent_id, "fetch_role_names timed out (startup race) — continuing with empty roster");
             }
             _ => {
                 info!(agent_id = %self.agent_id, "No role incarnations found for delegation roster.");
@@ -1898,15 +1902,20 @@ impl AgentRuntime {
     /// sessions are not blocked before the first inbound message arrives.
     async fn sweep_stale_session_turns(&mut self) {
         let list_key = format!("__session_apartments__:{}", self.agent_id);
-        let memory_types: Vec<String> = match self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig { key: list_key })
-            .await
+        let memory_types: Vec<String> = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetConfig { key: list_key }),
+        )
+        .await
         {
-            Ok(IpcResponse::ConfigData {
+            Ok(Ok(IpcResponse::ConfigData {
                 value_json: Some(json),
                 ..
-            }) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
+            })) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
+            Err(_) => {
+                warn!("sweep_stale_session_turns: apartment list fetch timed out — skipping sweep");
+                return;
+            }
             _ => {
                 return;
             }
@@ -1929,18 +1938,23 @@ impl AgentRuntime {
                 continue;
             };
             let snapshot_key = format!("__session_snapshot__:{session_id}");
-            let checkpoint = match self
-                .ipc_client
-                .send_request(IpcRequest::GetConfig { key: snapshot_key })
-                .await
+            let checkpoint = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.ipc_client.send_request(IpcRequest::GetConfig { key: snapshot_key }),
+            )
+            .await
             {
-                Ok(IpcResponse::ConfigData {
+                Ok(Ok(IpcResponse::ConfigData {
                     value_json: Some(json),
                     ..
-                }) => match serde_json::from_str::<serde_json::Value>(&json) {
+                })) => match serde_json::from_str::<serde_json::Value>(&json) {
                     Ok(v) => v,
                     Err(_) => continue,
                 },
+                Err(_) => {
+                    warn!("sweep_stale_session_turns: snapshot fetch timed out for session {session_id} — skipping");
+                    continue;
+                }
                 _ => continue,
             };
 
