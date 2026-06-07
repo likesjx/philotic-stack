@@ -4984,6 +4984,7 @@ mod tests {
                 preferred_hotel_id: None,
                 preferred_environment_id: None,
                 allowed_tool_runner_incarnations: Vec::new(),
+                allowed_classes: Vec::new(),
                 on_demand_skills: Vec::new(),
             }
         );
@@ -5570,6 +5571,7 @@ mod tests {
             preferred_hotel_id: None,
             preferred_environment_id: None,
             allowed_tool_runner_incarnations: Vec::new(),
+            allowed_classes: Vec::new(),
             on_demand_skills: Vec::new(),
         };
 
