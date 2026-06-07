@@ -26,6 +26,10 @@ philotic_agents:
         - "likesjx"
     model:
       default_model: "{{ philotic_default_model }}"
+    turn_loop_config:
+      fallback_tiers:
+        - "model"
+        - "model.ollama"
     voice_response_policy:
       mode: "off"                          # off | auto | on  (/tts to toggle)
       provider: "elevenlabs"
