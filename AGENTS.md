@@ -593,6 +593,7 @@ The repository contains specialized skills in `skills/` to standardize common wo
 | `retrospective-workflow` | Running seam-based retrospectives and turning lessons into code/process/SVE changes |
 | `muninn-memory-protocol` | Client adapter contract for memory integration |
 | `role-authoring` | Creating or updating agent roles through `role.configure` |
+| `lifegraph-truth-summarizer` | Provenance-aware LifeGraph summaries that separate confirmed graph facts, seeded placeholders, inferred intent, and recommended next structure |
 
 ## 12. Repository-Specific Notes
 
