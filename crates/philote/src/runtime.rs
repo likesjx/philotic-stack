@@ -585,6 +585,219 @@ fn debug_model_requests_enabled() -> bool {
     )
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct DirectLifeObserveCommand {
+    label: String,
+    claim_summary: String,
+    source_id: String,
+    confidence: f64,
+}
+
+fn parse_direct_life_observe_command(content: &str) -> Option<DirectLifeObserveCommand> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let explicit_life_observe = lower.contains("life.observe");
+    let explicit_record_open_loop =
+        lower.contains("record this open loop") || lower.contains("record an open loop");
+    if !explicit_life_observe && !explicit_record_open_loop {
+        return None;
+    }
+
+    let label = extract_direct_life_observe_field(trimmed, "label")
+        .unwrap_or_else(|| {
+            if lower.contains("open loop") {
+                "OpenLoop".into()
+            } else {
+                "Signal".into()
+            }
+        })
+        .trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';' || ch == ':')
+        .to_string();
+
+    let source_id = extract_direct_life_observe_source(trimmed)
+        .unwrap_or_else(|| "membrane:telegram".into())
+        .trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';')
+        .to_string();
+
+    let confidence = extract_direct_life_observe_confidence(trimmed).unwrap_or(0.8);
+
+    let claim_summary = extract_direct_life_observe_claim(trimmed)
+        .unwrap_or_else(|| trimmed.to_string())
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_string();
+
+    if claim_summary.is_empty() {
+        return None;
+    }
+
+    Some(DirectLifeObserveCommand {
+        label,
+        claim_summary,
+        source_id,
+        confidence,
+    })
+}
+
+fn extract_direct_life_observe_claim(content: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let start = lower
+        .find("record this open loop:")
+        .map(|idx| idx + "record this open loop:".len())
+        .or_else(|| {
+            lower
+                .find("record an open loop:")
+                .map(|idx| idx + "record an open loop:".len())
+        })
+        .or_else(|| {
+            lower
+                .find("record this:")
+                .map(|idx| idx + "record this:".len())
+        });
+
+    let mut claim = start
+        .and_then(|idx| content.get(idx..))
+        .map(str::trim)
+        .unwrap_or(content);
+
+    for marker in [" Use label", " use label", " Label", " label "] {
+        if let Some(idx) = claim.find(marker) {
+            claim = claim[..idx].trim();
+            break;
+        }
+    }
+
+    Some(
+        claim
+            .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace())
+            .trim_end_matches('.')
+            .to_string(),
+    )
+}
+
+fn extract_direct_life_observe_field(content: &str, field: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let marker = format!("{field}");
+    let start = lower.find(&marker)?;
+    let after_marker = content.get(start + marker.len()..)?.trim_start();
+    let after_separator = after_marker
+        .strip_prefix(':')
+        .or_else(|| after_marker.strip_prefix('='))
+        .unwrap_or(after_marker)
+        .trim_start();
+    after_separator
+        .split_whitespace()
+        .next()
+        .map(|value| value.trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.'))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_direct_life_observe_source(content: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let marker = "source";
+    let start = lower.find(marker)?;
+    let after_marker = content.get(start + marker.len()..)?.trim_start();
+    let after_separator = after_marker
+        .strip_prefix(':')
+        .or_else(|| after_marker.strip_prefix('='))
+        .unwrap_or(after_marker)
+        .trim_start();
+    let value = after_separator
+        .split_whitespace()
+        .take_while(|word| {
+            let word_lower = word
+                .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
+                .to_lowercase();
+            !matches!(word_lower.as_str(), "confidence" | "label" | "use")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
+        .to_string();
+
+    (!value.is_empty()).then_some(value)
+}
+
+fn extract_direct_life_observe_confidence(content: &str) -> Option<f64> {
+    let lower = content.to_lowercase();
+    let marker = "confidence";
+    let start = lower.find(marker)?;
+    let after_marker = content.get(start + marker.len()..)?.trim_start();
+    let after_separator = after_marker
+        .strip_prefix(':')
+        .or_else(|| after_marker.strip_prefix('='))
+        .unwrap_or(after_marker)
+        .trim_start();
+    after_separator
+        .split_whitespace()
+        .next()
+        .and_then(|value| {
+            value
+                .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
+                .parse::<f64>()
+                .ok()
+        })
+        .map(|value| value.clamp(0.0, 1.0))
+}
+
+fn direct_life_observe_input(
+    command: &DirectLifeObserveCommand,
+    session_id: &str,
+    turn_id: &str,
+    chat_id: &str,
+    agent_id: &str,
+) -> Value {
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let label_id = command.label.to_lowercase();
+    let node_id = format!("life:{}:{suffix}", label_id.replace('_', "-"));
+    let packet_id = format!("evidence:{suffix}");
+    let observation_id = format!("obs:{suffix}");
+
+    serde_json::json!({
+        "observation_id": observation_id,
+        "evidence": {
+            "packet_id": packet_id,
+            "claim_ref": {
+                "id": node_id,
+                "label": command.label,
+                "datasource": "life-graph"
+            },
+            "claim_summary": command.claim_summary,
+            "source_refs": [{
+                "source_id": command.source_id,
+                "source_kind": "runtime_observation",
+                "reliability": {
+                    "score": 0.95,
+                    "basis": "direct_operator_request"
+                }
+            }],
+            "passage_refs": [],
+            "confidence": command.confidence,
+            "validation_state": "proposed",
+            "observed_at": now_iso,
+            "source_reliability": 0.95,
+            "conflict_ids": [],
+            "adjudication_status": "not_needed",
+            "metadata": {
+                "route": "philote_direct_life_observe",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "chat_id": chat_id,
+                "agent_id": agent_id
+            }
+        },
+        "proposed_graph_refs": []
+    })
+}
+
 #[cfg(test)]
 const LOCAL_NODE: &str = "local-aiua-01";
 
@@ -3253,6 +3466,22 @@ impl AgentRuntime {
             }
         }
 
+        if let Some(life_observe) = parse_direct_life_observe_command(&content) {
+            return self
+                .handle_direct_life_observe_command(
+                    task_id,
+                    session_id,
+                    turn_id,
+                    chat_id,
+                    final_reply_to,
+                    final_reply_role,
+                    final_reply_guest_id,
+                    life_observe,
+                    inbound_primary_user_id(&task),
+                )
+                .await;
+        }
+
         let had_voice_input = task
             .message_kind
             .as_deref()
@@ -4199,6 +4428,31 @@ impl AgentRuntime {
                         .map(|t| t.active_plan.is_none())
                         .unwrap_or(false);
                     state.set_active_plan(plan);
+                    // Expand the iteration cap based on declared step count so complex
+                    // plans don't hit the cap mid-execution. 4 iterations per step gives
+                    // headroom for retries/recalls; hard ceiling 50, never shrinks.
+                    let n_steps = state
+                        .active_turn
+                        .as_ref()
+                        .and_then(|t| t.active_plan.as_ref())
+                        .map(|p| p.steps.len() as u32)
+                        .unwrap_or(0);
+                    if n_steps > 0 {
+                        let plan_cap = (n_steps * 4)
+                            .max(state.settings.execution.iteration_cap)
+                            .min(50);
+                        if plan_cap > state.settings.execution.iteration_cap {
+                            info!(
+                                session_id = %session_id,
+                                n_steps,
+                                old_cap = state.settings.execution.iteration_cap,
+                                new_cap = plan_cap,
+                                "Plan-scaled iteration cap"
+                            );
+                            state.settings.execution.iteration_cap = plan_cap;
+                        }
+                    }
+                    // state last used above; NLL ends the borrow before emit_turn_event.
                     if is_first {
                         let _ = self.emit_turn_event(&session_id, "plan_ready", None).await;
                     }
@@ -9286,6 +9540,125 @@ impl AgentRuntime {
             })
             .await?;
         Ok(())
+    }
+
+    async fn handle_direct_life_observe_command(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        turn_id: String,
+        chat_id: String,
+        reply_to: String,
+        reply_role: String,
+        reply_guest_id: Option<String>,
+        command: DirectLifeObserveCommand,
+        user_id: Option<String>,
+    ) -> Result<()> {
+        let route = self.sessions.get(&session_id).and_then(|state| {
+            state
+                .tool_is_enabled("life.observe")
+                .then(|| state.resolve_tool_route("life.observe"))
+                .flatten()
+                .cloned()
+        });
+
+        let Some(route) = route else {
+            warn!(
+                session_id = %session_id,
+                "Direct life.observe command could not run because life.observe is not enabled"
+            );
+            return self
+                .complete_command_without_turn(
+                    command_task_id,
+                    session_id,
+                    turn_id,
+                    chat_id,
+                    reply_to,
+                    reply_role,
+                    reply_guest_id,
+                    "I could not record that because life.observe is not enabled for this session."
+                        .into(),
+                    Some("failed"),
+                    None,
+                )
+                .await;
+        };
+
+        let arguments =
+            direct_life_observe_input(&command, &session_id, &turn_id, &chat_id, &self.agent_id);
+        let payload = ToolExecutionPayload {
+            action: "execute_tool",
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            chat_id: chat_id.clone(),
+            tool_name: "life.observe".into(),
+            arguments: arguments.clone(),
+            execution_mode: route.execution_mode.clone(),
+            agent_id: self.agent_id.clone(),
+            user_id,
+            runner_id: route.runner_id.clone(),
+            incarnation_id: route.incarnation_id.clone(),
+            hotel_id: route.hotel_id.clone(),
+            environment_id: route.environment_id.clone(),
+            task_runner_kind: route.task_runner_kind.clone(),
+            task_runner_config: route.task_runner_config.clone(),
+            selection_reason: route.selection_reason.clone(),
+            workspace_ref: None,
+            task_runner_overlay: None,
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            final_reply_to: reply_to.clone(),
+            final_reply_role: reply_role.clone(),
+            final_reply_guest_id: reply_guest_id.clone(),
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id: command_task_id,
+                state: "waiting_tool".into(),
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": chat_id,
+                    "tool_name": "life.observe",
+                    "direct_route": true,
+                }),
+            })
+            .await?;
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: route.target_node,
+                target_role: route.target_role,
+                target_guest_id: route.incarnation_id.clone(),
+                task_json: serde_json::to_string(&payload)?,
+            })
+            .await?;
+
+        info!(
+            session_id = %session_id,
+            label = %command.label,
+            source_id = %command.source_id,
+            confidence = command.confidence,
+            "Direct life.observe command routed without model turn"
+        );
+
+        self.complete_command_without_turn(
+            command_task_id,
+            session_id,
+            turn_id,
+            chat_id,
+            reply_to,
+            reply_role,
+            reply_guest_id,
+            format!(
+                "Recorded this {} in LifeGraph: {}",
+                command.label, command.claim_summary
+            ),
+            None,
+            None,
+        )
+        .await
     }
 
     fn execute_bound_tool<'a>(
@@ -15713,6 +16086,57 @@ mod tests {
             extract_model_error_payload(&payload).expect("structured payload should be extracted");
         assert_eq!(error.retryable, Some(true));
         assert_eq!(error.code.as_deref(), Some("MODEL_INVALID_TOOL_CALL"));
+    }
+
+    #[test]
+    fn direct_life_observe_parser_handles_telegram_open_loop_request() {
+        let parsed = super::parse_direct_life_observe_command(
+            "Beacon, please use life.observe to record this open loop: \
+             I need to schedule the rowing habit for weekly Saturdays. \
+             Use label OpenLoop, source membrane:telegram, confidence 0.8",
+        )
+        .expect("explicit life.observe request should parse");
+
+        assert_eq!(parsed.label, "OpenLoop");
+        assert_eq!(
+            parsed.claim_summary,
+            "I need to schedule the rowing habit for weekly Saturdays"
+        );
+        assert_eq!(parsed.source_id, "membrane:telegram");
+        assert_eq!(parsed.confidence, 0.8);
+    }
+
+    #[test]
+    fn direct_life_observe_input_has_runner_shape() {
+        let command = super::DirectLifeObserveCommand {
+            label: "OpenLoop".into(),
+            claim_summary: "Schedule rowing habit on weekly Saturdays".into(),
+            source_id: "membrane:telegram".into(),
+            confidence: 0.8,
+        };
+
+        let value = super::direct_life_observe_input(
+            &command,
+            "telegram:123:agent-beacon",
+            "turn-1",
+            "123",
+            "agent-beacon",
+        );
+
+        assert_eq!(value["evidence"]["claim_ref"]["label"], "OpenLoop");
+        assert_eq!(
+            value["evidence"]["claim_summary"],
+            "Schedule rowing habit on weekly Saturdays"
+        );
+        assert_eq!(
+            value["evidence"]["source_refs"][0]["source_id"],
+            "membrane:telegram"
+        );
+        assert_eq!(value["evidence"]["confidence"], 0.8);
+        assert_eq!(
+            value["evidence"]["metadata"]["route"],
+            "philote_direct_life_observe"
+        );
     }
 
     #[test]

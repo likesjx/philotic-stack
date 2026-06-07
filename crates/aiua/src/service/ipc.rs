@@ -11115,19 +11115,23 @@ impl IpcServer {
                         let peer_guests: Vec<serde_json::Value> = state
                             .guests
                             .iter()
-                            .map(|g| serde_json::json!({
-                                "guest_id": g.guest_id,
-                                "role": g.role,
-                                "active": g.active,
-                            }))
+                            .map(|g| {
+                                serde_json::json!({
+                                    "guest_id": g.guest_id,
+                                    "role": g.role,
+                                    "active": g.active,
+                                })
+                            })
                             .collect();
                         let peer_agents: Vec<serde_json::Value> = state
                             .agents
                             .iter()
-                            .map(|a| serde_json::json!({
-                                "agent_id": a.agent_id,
-                                "persona_name": a.persona_name,
-                            }))
+                            .map(|a| {
+                                serde_json::json!({
+                                    "agent_id": a.agent_id,
+                                    "persona_name": a.persona_name,
+                                })
+                            })
                             .collect();
                         serde_json::json!({
                             "hotel_name": state.hotel_name,

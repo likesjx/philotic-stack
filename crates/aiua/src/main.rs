@@ -7451,8 +7451,9 @@ async fn main() -> Result<()> {
     let registry = Arc::new(RwLock::new(NodeRegistry::new()));
 
     // Shared hotel roster snapshot — written by hotel_state_sync task, read by beacon.
-    let local_hotel_state: Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>> =
-        Arc::new(RwLock::new(None));
+    let local_hotel_state: Arc<
+        RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>,
+    > = Arc::new(RwLock::new(None));
 
     // Channel: IPC fires () whenever guest roster changes; broadcast task rebuilds snapshot.
     let (hotel_state_dirty_tx, mut hotel_state_dirty_rx) = mpsc::channel::<()>(8);

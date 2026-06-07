@@ -3903,6 +3903,17 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         }
     }
 
+    // Expand class grants: include every catalog tool whose class is listed.
+    if !bindings.allowed_classes.is_empty() {
+        for (tool_name, def) in crate::catalog::tool_catalog() {
+            if let Some(class) = &def.class {
+                if bindings.allowed_classes.contains(class) && !toolset.contains(tool_name) {
+                    toolset.push(tool_name.clone());
+                }
+            }
+        }
+    }
+
     // Always include observer and meta-approval tools — every philote can inspect its own
     // session/hotel and request standing approval for tools it uses regularly.
     for always in [

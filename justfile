@@ -342,6 +342,11 @@ smoke-embed:
 smoke-graph-runner:
     bash scripts/smoke-graph-runner-roundtrip.sh
 
+# Run the LifeGraph runner through live hotel IPC.
+# Set PHILOTIC_HOTEL_SOCKET, PHILOTIC_TARGET_NODE, and PHILOTIC_REPLY_NODE for remote hotels.
+smoke-life-graph-ipc:
+    cargo run -p philotic-client --example life_graph_ipc_smoke_driver
+
 # Run the agent-graph-runner live smoke (write + declare + sync round-trip, Seams 3 & 4)
 smoke-agent-graph:
     bash scripts/smoke-agent-graph-roundtrip.sh
@@ -539,7 +544,7 @@ vps-push:
     #!/usr/bin/env bash
     set -euo pipefail
     ROOT_DIR="{{justfile_directory()}}"
-    VPS="deploy@jane-vps"
+    VPS="${PHILOTIC_VPS_SSH_TARGET:-deploy@jane-vps}"
     VPS_CODE="/home/deploy/code/philotic-stack"
     VPS_BUILD="${VPS_CODE}/target/release"
 

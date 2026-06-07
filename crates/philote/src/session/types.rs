@@ -1120,6 +1120,11 @@ pub struct SessionBindings {
     pub preferred_environment_id: Option<String>,
     #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
+    /// Tool classes whose catalog members are eligible for this session.
+    /// Populated from the active toolset profile; expanded into concrete tool names
+    /// by `default_visible_toolset` using the local catalog's class annotations.
+    #[serde(default)]
+    pub allowed_classes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

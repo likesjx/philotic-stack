@@ -2659,14 +2659,13 @@ mod tests {
     #[test]
     fn requested_user_profile_response_is_not_ignored_as_push_noise() {
         let profile = UserProfileDataPayload {
-            hotel_name: "vps-jane".into(),
             timezone: Some("America/New_York".into()),
             display_name: Some("Jared".into()),
             principal_id: Some("user:jared".into()),
             preferred_name: Some("Jared".into()),
             primary_email: None,
+            home_hotel: Some("vps-jane".into()),
             linked_providers: vec![],
-            user_context_text: None,
         };
 
         assert!(PhiloticClient::is_expected_response(
@@ -2680,11 +2679,6 @@ mod tests {
                 hotel_name: "vps-jane".into(),
                 timezone: Some("America/New_York".into()),
                 display_name: None,
-                principal_id: None,
-                preferred_name: None,
-                primary_email: None,
-                linked_providers: None,
-                user_context_text: None,
             },
             &IpcResponse::UserProfileData(profile.clone())
         ));

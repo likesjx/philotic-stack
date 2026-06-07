@@ -1,8 +1,8 @@
 use crate::authz::{MeshAuth, NonceTracker};
 use crate::domain::GraphDomain;
 use crate::heartbeat::{
-    CapabilitySyncPayload, HeartbeatPayload, HotelStateSyncPayload, MeshCatalogSyncPayload,
-    MeshPeerEntry, emit_catalog_sync, emit_heartbeat, emit_hotel_state_sync,
+    emit_catalog_sync, emit_heartbeat, emit_hotel_state_sync, CapabilitySyncPayload,
+    HeartbeatPayload, HotelStateSyncPayload, MeshCatalogSyncPayload, MeshPeerEntry,
 };
 use crate::registry::NodeRegistry;
 use crate::{BeaconMessage, MsgType, NodeCapabilities};
@@ -349,8 +349,7 @@ impl BeaconDaemon {
                 // Anchor handshake reply: update stale peer records from the sender's directory.
                 // Only updates mesh_port (port changes are the main drift vector). mesh_host is
                 // only filled in if empty — we trust stored Tailscale IPs over relayed values.
-                if let Ok(payload) =
-                    serde_json::from_slice::<MeshCatalogSyncPayload>(&msg.payload)
+                if let Ok(payload) = serde_json::from_slice::<MeshCatalogSyncPayload>(&msg.payload)
                 {
                     if let Ok(hotels) = self.graph.list_hotels() {
                         for peer in &payload.peers {

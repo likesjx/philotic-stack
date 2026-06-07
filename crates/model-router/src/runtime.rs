@@ -1156,16 +1156,21 @@ fn classify_provider_failure(
         return payload;
     }
 
-    // Auth/key errors (4xx) — the provider is broken for this tier; escalate.
+    let lower_message = message.to_lowercase();
+
+    // Auth/key errors (4xx) — the provider tier is misconfigured, not flaky.
+    // Retrying an expired or invalid key only burns the caller's turn watchdog.
     if message.contains("401")
         || message.contains("403")
-        || message.contains("API key not valid")
-        || message.contains("API key")
-        || message.contains("Unauthorized")
-        || message.contains("Unauthenticated")
+        || lower_message.contains("api key expired")
+        || lower_message.contains("api key not valid")
+        || lower_message.contains("invalid api key")
+        || lower_message.contains("api_key_invalid")
+        || lower_message.contains("unauthorized")
+        || lower_message.contains("unauthenticated")
     {
-        payload.sub_kind = Some("provider_error".into());
-        payload.retryable = Some(true);
+        payload.sub_kind = Some("provider_auth".into());
+        payload.retryable = Some(false);
         return payload;
     }
 
@@ -1312,6 +1317,21 @@ mod failure_tests {
         assert_eq!(payload.kind, "provider_failure");
         assert_eq!(payload.code, None);
         assert_eq!(payload.retryable, None);
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_expired_api_key_non_retryable() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Gemini API error (400): API key expired. Please renew the API key.",
+        );
+
+        assert_eq!(payload.kind, "provider_failure");
+        assert_eq!(payload.provider.as_deref(), Some("gemini"));
+        assert_eq!(payload.capability.as_deref(), Some("text.generate"));
+        assert_eq!(payload.sub_kind.as_deref(), Some("provider_auth"));
+        assert_eq!(payload.retryable, Some(false));
     }
 }
 
