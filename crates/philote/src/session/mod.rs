@@ -6241,6 +6241,26 @@ mod tests {
     }
 
     #[test]
+    fn life_graph_class_routes_to_vps_runner() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.rebuild_default_tool_assembly();
+
+        assert!(state.tool_is_enabled("life.observe"));
+        let route = state
+            .resolve_tool_route("life.observe")
+            .expect("life.observe route should be assembled from life_graph class");
+        assert_eq!(route.target_node, "vps-jane-aiua-01");
+        assert_eq!(route.target_role, "life-graph-runner");
+        assert_eq!(route.execution_mode, "life_graph");
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("life_graph_runner_route")
+        );
+    }
+
+    #[test]
     fn preferred_environment_overrides_live_local_fallback() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());

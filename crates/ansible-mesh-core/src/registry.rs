@@ -302,6 +302,24 @@ impl NodeRegistry {
                     .any(|ad| ad.incarnation_id == guest_id)
         })
     }
+
+    /// Find the node_id hosting a specific guest, checking both live capability advertisements
+    /// and HotelStateSync remote roster entries. Use this for cross-hotel routing lookups.
+    pub fn find_node_id_for_guest(&self, guest_id: &str) -> Option<String> {
+        if let Some(status) = self.find_node_for_incarnation(guest_id) {
+            return Some(status.capabilities.node_id.clone());
+        }
+        self.remote_hotel_states
+            .values()
+            .filter(|state| state.last_seen.elapsed() <= DEFAULT_NODE_TTL)
+            .find(|state| {
+                state
+                    .guests
+                    .iter()
+                    .any(|g| g.guest_id == guest_id && g.active)
+            })
+            .map(|state| state.node_id.clone())
+    }
 }
 
 #[cfg(test)]

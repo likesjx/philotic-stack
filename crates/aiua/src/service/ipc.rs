@@ -5574,6 +5574,144 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
+    /// Park a cross-hotel task and trigger role-philote materialization on this hotel.
+    ///
+    /// Called when a `TaskInvoke` arrives from the mesh with `delivery_target_guest_id` set
+    /// but the target guest has no live inbox subscriber (idle or not yet spawned).
+    pub(crate) async fn park_and_materialize_role_philote(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        mat_req: Option<&Arc<dyn GuestMaterializationRequester>>,
+        source_node: &str,
+        task_id: Uuid,
+        task_json: String,
+        agent_guest_id: &str,
+    ) {
+        // Park the task — flushed when the role philote connects and registers.
+        {
+            let mut guard = parked_inbound.lock().await;
+            guard
+                .entry(agent_guest_id.to_string())
+                .or_default()
+                .push(ParkedInboundTask {
+                    source_node: source_node.to_string(),
+                    task_id,
+                    task_json,
+                    activate_session_id: None,
+                });
+        }
+        info!(
+            agent_guest_id,
+            task_id = %task_id,
+            "Cross-hotel TaskInvoke parked; triggering role-philote materialization."
+        );
+
+        // Resolve the hotel guest record ID from the agent-centric guest_id.
+        let incarnations = graph
+            .list_role_incarnations_by_guest_id(agent_guest_id)
+            .unwrap_or_default();
+        let Some(inc) = incarnations.into_iter().next() else {
+            warn!(
+                agent_guest_id,
+                "No role incarnation found for cross-hotel guest; cannot materialize."
+            );
+            return;
+        };
+        let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            warn!(
+                agent_guest_id,
+                "Cannot determine local hotel name; cannot materialize role philote."
+            );
+            return;
+        };
+        let hotel_guest_id = format!("{}:philote-{}", hotel_name, inc.role_name);
+        let socket_path = graph
+            .list_hotels()
+            .ok()
+            .and_then(|hs| {
+                hs.into_iter()
+                    .find(|h| h.capabilities.node_id == local_node_id)
+                    .map(|h| h.ipc_socket_path)
+            })
+            .unwrap_or_default();
+
+        // Create the hotel guest record if it doesn't already exist.
+        if graph
+            .get_guest(&hotel_name, &hotel_guest_id)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let config_json = serde_json::json!({
+                "command": "philote",
+                "args": [],
+                "env": {
+                    "PHILOTIC_AGENT_ID": inc.agent_id,
+                    "PHILOTIC_ROLE_NAME": inc.role_name,
+                    "PHILOTIC_HOTEL_SOCKET": socket_path,
+                    "PHILOTIC_NODE_ID": local_node_id,
+                }
+            });
+            let rec = ansible_mesh_core::storage::GuestRecord {
+                hotel_name: hotel_name.clone(),
+                guest_id: hotel_guest_id.clone(),
+                role: inc.role_name.clone(),
+                config_json: config_json.to_string(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            };
+            if let Err(e) = graph.seed_guests(&hotel_name, &[rec]) {
+                warn!(
+                    "Failed to seed role-philote guest record [{}]: {e}",
+                    hotel_guest_id
+                );
+            } else {
+                info!("Created role-philote guest record: {}", hotel_guest_id);
+            }
+        }
+
+        if let Some(req) = mat_req {
+            match req.ensure_guest_active(&hotel_guest_id).await {
+                Ok(true) => info!(
+                    "Role-philote [{}] materialization triggered for cross-hotel task.",
+                    hotel_guest_id
+                ),
+                Ok(false) => warn!(
+                    "Role-philote [{}] could not be materialized.",
+                    hotel_guest_id
+                ),
+                Err(e) => warn!(
+                    "Role-philote [{}] materialization error: {e}",
+                    hotel_guest_id
+                ),
+            }
+        }
+    }
+
+    /// Resolve the node_id hosting a guest, with a fallback to `home_node` from the role
+    /// incarnation record. Necessary for the first cross-hotel task before the guest appears
+    /// in HotelStateSync (its hotel guest record may not exist yet on the remote hotel).
+    fn resolve_guest_home_node(
+        graph: &GraphDomain,
+        registry: &NodeRegistry,
+        guest_id: &str,
+    ) -> Option<String> {
+        // 1. Live registry: advertisements (running philote) + HotelStateSync roster.
+        if let Some(node_id) = registry.find_node_id_for_guest(guest_id) {
+            return Some(node_id);
+        }
+        // 2. Fallback: home_node from role incarnation record. home_node stores a node_id
+        // directly (e.g. "mac-jane-aiua-01"), not a hotel name — return it as-is.
+        graph
+            .list_role_incarnations_by_guest_id(guest_id)
+            .unwrap_or_default()
+            .into_iter()
+            .next()?
+            .home_node
+    }
+
     fn local_delivery_provenance_hint(
         session: &SessionRecord,
         local_hotel_name: Option<&str>,
@@ -5704,6 +5842,16 @@ impl IpcServer {
                 }
             }
 
+            if !Self::configured_local_guest_exists(graph, local_node_id, &active_guest_id) {
+                // Active incarnation is not configured on this hotel — it may live on a
+                // remote hotel. Return Deliver directly so EmitTask can reroute via the
+                // mesh registry (HotelStateSync). Do NOT fall back to the local orchestrator,
+                // which would silently drop the intent to use the remote role.
+                return AgentRouteResolution::Deliver(Some(active_guest_id));
+            }
+
+            // Active incarnation is configured locally but not running; try orchestrator
+            // fallback so the user isn't stuck waiting for a respawn.
             if let Some(orchestrator_guest_id) =
                 Self::resolve_orchestrator_guest_id(graph, &session, &live_agent_guests)
             {
@@ -5714,21 +5862,13 @@ impl IpcServer {
                 return AgentRouteResolution::Deliver(Some(orchestrator_guest_id));
             }
 
-            if Self::configured_local_guest_exists(graph, local_node_id, &active_guest_id) {
-                info!(
-                    "Active incarnation [{}] is not registered for session [{}]; parking inbound and requesting materialization.",
-                    active_guest_id, session_id
-                );
-                return AgentRouteResolution::Park {
-                    guest_id: active_guest_id,
-                };
-            }
-
-            warn!(
-                "Active incarnation [{}] is not registered for session [{}], and no live orchestrator fallback was found.",
+            info!(
+                "Active incarnation [{}] is not registered for session [{}]; parking inbound and requesting materialization.",
                 active_guest_id, session_id
             );
-            return AgentRouteResolution::Deliver(Some(active_guest_id));
+            return AgentRouteResolution::Park {
+                guest_id: active_guest_id,
+            };
         }
 
         if let Some(provenance_guest_id) =
@@ -5946,7 +6086,14 @@ impl IpcServer {
             return Ok(false);
         }
         if let Some(session_id) = activate_session_id.as_deref() {
-            Self::update_session_active_incarnation(graph, session_id, guest_id)?;
+            if let Err(err) = Self::update_session_active_incarnation(graph, session_id, guest_id) {
+                // Session may live on a remote hotel; skip the local update rather than
+                // blocking delivery.
+                warn!(
+                    "deliver_live_guest_task: skipping session activation for [{}]: {}",
+                    session_id, err
+                );
+            }
         }
         Self::deliver_inbound_task(
             inboxes,
@@ -6467,6 +6614,83 @@ impl IpcServer {
                     data.clone(),
                 )
                 .await;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Like `deliver_event_envelope`, but parks + materializes the role philote when
+    /// `delivery_target_guest_id` is set and no subscriber is currently connected.
+    /// Called from the mesh inbox loop where the full hotel context is available.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn deliver_event_envelope_or_park(
+        inboxes: &InboxRegistry,
+        event: &EventEnvelope,
+        operator_surface_tx: Option<&mpsc::Sender<String>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        mat_req: Option<&Arc<dyn GuestMaterializationRequester>>,
+    ) -> bool {
+        match (&event.kind, &event.target_agent_id, &event.payload) {
+            (
+                EventKind::TaskInvoke | EventKind::TaskResult,
+                Some(target_role),
+                EventPayload::Inline { data },
+            ) => {
+                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                    if let Some(tx) = operator_surface_tx {
+                        let _ = tx.try_send(data.clone()).ok();
+                        return true;
+                    }
+                }
+                let target_guest_id: Option<String> =
+                    serde_json::from_str::<serde_json::Value>(data)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("delivery_target_guest_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+
+                let is_subscribed = {
+                    let guard = inboxes.lock().await;
+                    let role_subs = guard.get(target_role.as_str()).cloned().unwrap_or_default();
+                    match &target_guest_id {
+                        Some(g) => role_subs.iter().any(|s| s.guest_id == g.as_str()),
+                        None => !role_subs.is_empty(),
+                    }
+                };
+
+                if is_subscribed {
+                    Self::deliver_inbound_task(
+                        inboxes,
+                        &event.source_node_id,
+                        target_role,
+                        target_guest_id.as_deref(),
+                        event.event_id,
+                        data.clone(),
+                    )
+                    .await;
+                } else if let Some(ref agent_guest_id) = target_guest_id {
+                    Self::park_and_materialize_role_philote(
+                        graph,
+                        local_node_id,
+                        parked_inbound,
+                        mat_req,
+                        &event.source_node_id,
+                        event.event_id,
+                        data.clone(),
+                        agent_guest_id,
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        "Cross-hotel task {}: no subscriber for role '{}', no specific guest; task dropped.",
+                        event.event_id, target_role
+                    );
+                }
                 true
             }
             _ => false,
@@ -8278,15 +8502,24 @@ impl IpcServer {
                     &task_json,
                 )
                 .await;
-                // If the caller targeted this node but the guest isn't configured here,
-                // look up the live node via the registry so the mesh dispatcher forwards
-                // the task to the correct hotel automatically.
+                // Compute resolved_target_guest_id BEFORE the auto-reroute block so we can
+                // gate on it — target_guest_id may be None (e.g. membrane sends target_role="agent"
+                // with no explicit guest_id), but resolve_agent_route fills in the active brain/
+                // orchestrator guest from the session's active_incarnation_id.
+                let resolved_target_guest_id = match &route_resolution {
+                    AgentRouteResolution::Deliver(guest_id) => guest_id.clone(),
+                    AgentRouteResolution::Park { guest_id } => Some(guest_id.clone()),
+                };
+                // If the caller targeted this node but the resolved guest isn't configured here,
+                // look up the live node via registry (advertisements + HotelStateSync roster)
+                // so the mesh dispatcher forwards the task to the correct hotel automatically.
                 let target_node = if target_node == local_node_id {
-                    if let Some(ref guest_id) = target_guest_id {
+                    if let Some(ref guest_id) = resolved_target_guest_id {
                         if !Self::configured_local_guest_exists(graph, local_node_id, guest_id) {
                             let reg = registry.read().await;
-                            if let Some(status) = reg.find_node_for_incarnation(guest_id) {
-                                let remote = status.capabilities.node_id.clone();
+                            if let Some(remote) =
+                                Self::resolve_guest_home_node(graph, &reg, guest_id)
+                            {
                                 info!(guest_id, remote, "EmitTask: auto-routing to mesh peer");
                                 remote
                             } else {
@@ -8300,10 +8533,6 @@ impl IpcServer {
                     }
                 } else {
                     target_node
-                };
-                let resolved_target_guest_id = match &route_resolution {
-                    AgentRouteResolution::Deliver(guest_id) => guest_id.clone(),
-                    AgentRouteResolution::Park { guest_id } => Some(guest_id.clone()),
                 };
                 let task_json = if target_node == local_node_id {
                     attach_delivery_context(
@@ -8550,9 +8779,16 @@ impl IpcServer {
                             "Dispatched remote handoff for role '{}' to home_node '{}'",
                             role_name, home_node
                         );
+                        // Update local session active_incarnation_id so subsequent messages
+                        // on this hotel route cross-hotel to the remote role guest.
+                        if let Ok(Some(mut session_rec)) = graph.get_session(&session_id) {
+                            session_rec.active_incarnation_id = Some(target_role.guest_id.clone());
+                            session_rec.updated_at = unix_ts();
+                            let _ = graph.upsert_session(&session_rec);
+                        }
                         return IpcResponse::HandoffAck {
                             handoff_guest_id: target_role.guest_id,
-                            became_active: false,
+                            became_active: true,
                         };
                     }
                 }
@@ -10904,6 +11140,68 @@ impl IpcServer {
                             // The philote that handles this role incarnation registers
                             // with guest_id = "{agent_id}:{role_name}".
                             let role_guest_id = inc.guest_id.clone();
+
+                            // Cross-hotel: if the role's guest is not configured on this hotel,
+                            // look it up in the mesh registry (HotelStateSync) and dispatch
+                            // cross-hotel rather than trying to materialize it locally.
+                            if !Self::configured_local_guest_exists(
+                                graph,
+                                local_node_id,
+                                &role_guest_id,
+                            ) {
+                                let remote_node = {
+                                    let reg = registry.read().await;
+                                    Self::resolve_guest_home_node(graph, &reg, &role_guest_id)
+                                };
+                                if let Some(remote_node) = remote_node {
+                                    // Inject delivery_target_guest_id so the remote hotel
+                                    // routes to the correct brain/specialist philote.
+                                    let remote_task_json = if let Ok(mut v) =
+                                        serde_json::from_str::<serde_json::Value>(&task_json)
+                                    {
+                                        if let Some(obj) = v.as_object_mut() {
+                                            obj.entry("delivery_target_guest_id").or_insert_with(
+                                                || serde_json::json!(role_guest_id),
+                                            );
+                                        }
+                                        serde_json::to_string(&v).unwrap_or(task_json)
+                                    } else {
+                                        task_json
+                                    };
+                                    let env = EventEnvelope {
+                                        event_id: task_id,
+                                        seq: 0,
+                                        source_node_id: local_node_id.to_string(),
+                                        target_node_id: Some(remote_node.clone()),
+                                        source_agent_id: "unknown".into(),
+                                        target_agent_id: Some(role.clone()),
+                                        kind: EventKind::TaskInvoke,
+                                        corr_id: "paracrine".into(),
+                                        attempt: 0,
+                                        created_at: 0,
+                                        expires_at: None,
+                                        payload: EventPayload::Inline {
+                                            data: remote_task_json,
+                                        },
+                                        trace: vec![],
+                                    };
+                                    info!(
+                                        role = %role,
+                                        remote_node = %remote_node,
+                                        role_guest_id = %role_guest_id,
+                                        "ParacrineEmit: cross-hotel dispatch to mesh peer"
+                                    );
+                                    let _ =
+                                        dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
+                                    return IpcResponse::success("paracrine_emit", None);
+                                } else {
+                                    warn!(
+                                        role = %role,
+                                        role_guest_id = %role_guest_id,
+                                        "ParacrineEmit: role guest not found in mesh registry; attempting local materialization"
+                                    );
+                                }
+                            }
 
                             // Park the task — flushed when the role philote connects.
                             {
@@ -15597,6 +15895,18 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
     if toolset.is_empty() {
         toolset.push("echo".into());
     }
+    if let Some(classes) = bindings
+        .get("allowed_classes")
+        .and_then(serde_json::Value::as_array)
+    {
+        for class in classes.iter().filter_map(serde_json::Value::as_str) {
+            for tool in tools_for_allowed_class(class) {
+                if !toolset.iter().any(|existing| existing == tool) {
+                    toolset.push(tool.to_string());
+                }
+            }
+        }
+    }
     let rights = bindings
         .get("effective_rights")
         .and_then(serde_json::Value::as_array)
@@ -15616,6 +15926,20 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
         .into_iter()
         .filter(|tool_name| has_right(&rights, &tool_right(tool_name)))
         .collect()
+}
+
+fn tools_for_allowed_class(class: &str) -> &'static [&'static str] {
+    match class {
+        "life_graph" => &[
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.conflict",
+            "life.patch.propose",
+        ],
+        _ => &[],
+    }
 }
 
 fn shared_tool_receptor_record<'a>(
@@ -20779,6 +21103,20 @@ mod tests {
                 .get("agent.configure")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn default_visible_toolset_expands_life_graph_class() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo"],
+            "allowed_classes": ["life_graph"],
+        });
+
+        let toolset = default_visible_toolset(&bindings);
+
+        assert!(toolset.iter().any(|tool| tool == "echo"));
+        assert!(toolset.iter().any(|tool| tool == "life.observe"));
+        assert!(toolset.iter().any(|tool| tool == "life.recall"));
     }
 
     #[test]

@@ -1664,10 +1664,14 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                             if !events.is_empty() {
                                 let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
                                 for event in &events {
-                                    IpcServer::deliver_event_envelope(
+                                    IpcServer::deliver_event_envelope_or_park(
                                         &inbound_inboxes,
                                         event,
                                         inbound_operator_surface_tx.as_ref(),
+                                        inbound_graph.as_ref(),
+                                        &inbound_local_node_id,
+                                        &inbound_parked,
+                                        inbound_mat_req.as_ref(),
                                     )
                                     .await;
                                     // Cron control-plane broadcasts.

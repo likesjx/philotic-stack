@@ -771,14 +771,14 @@ fn direct_life_observe_input(
                 "datasource": "life-graph"
             },
             "claim_summary": command.claim_summary,
-            "source_refs": [{
-                "source_id": command.source_id,
-                "source_kind": "runtime_observation",
-                "reliability": {
-                    "score": 0.95,
-                    "basis": "direct_operator_request"
-                }
-            }],
+                "source_refs": [{
+                    "source_id": command.source_id,
+                    "source_kind": "runtime_observation",
+                    "reliability": {
+                        "score": 0.95,
+                        "basis": "direct_observation"
+                    }
+                }],
             "passage_refs": [],
             "confidence": command.confidence,
             "validation_state": "proposed",
@@ -795,6 +795,97 @@ fn direct_life_observe_input(
             }
         },
         "proposed_graph_refs": []
+    })
+}
+
+fn direct_life_observe_success_reply(
+    command: &DirectLifeObserveCommand,
+    tool_content: &str,
+) -> String {
+    let content = tool_content.trim();
+    if content.is_empty() {
+        return format!(
+            "Recorded this {} in LifeGraph: {}",
+            command.label, command.claim_summary
+        );
+    }
+
+    match serde_json::from_str::<Value>(content) {
+        Ok(value) => {
+            let node_id = value
+                .pointer("/node_id")
+                .or_else(|| value.pointer("/data/node_id"))
+                .or_else(|| value.pointer("/result/node_id"))
+                .and_then(Value::as_str);
+            if let Some(node_id) = node_id {
+                format!(
+                    "Recorded this {} in LifeGraph: {} (`{}`)",
+                    command.label, command.claim_summary, node_id
+                )
+            } else {
+                format!(
+                    "Recorded this {} in LifeGraph: {}",
+                    command.label, command.claim_summary
+                )
+            }
+        }
+        Err(_) => format!(
+            "Recorded this {} in LifeGraph: {}",
+            command.label, command.claim_summary
+        ),
+    }
+}
+
+fn direct_life_observe_failure_reply(
+    command: &DirectLifeObserveCommand,
+    tool_content: &str,
+) -> String {
+    let detail = tool_content.trim();
+    if detail.is_empty() {
+        return format!(
+            "I tried to record this {} in LifeGraph, but the runner did not return a successful result.",
+            command.label
+        );
+    }
+    format!(
+        "I tried to record this {} in LifeGraph, but the runner failed: {}",
+        command.label, detail
+    )
+}
+
+fn direct_life_observe_command_from_arguments(
+    arguments: &Value,
+) -> Option<DirectLifeObserveCommand> {
+    let evidence = arguments.get("evidence")?;
+    let label = evidence
+        .pointer("/claim_ref/label")
+        .and_then(Value::as_str)
+        .unwrap_or("OpenLoop")
+        .to_string();
+    let claim_summary = evidence
+        .get("claim_summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let source_id = evidence
+        .get("source_refs")
+        .and_then(Value::as_array)
+        .and_then(|refs| refs.first())
+        .and_then(|source| source.get("source_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("membrane:telegram")
+        .to_string();
+    let confidence = evidence
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.8)
+        .clamp(0.0, 1.0);
+
+    Some(DirectLifeObserveCommand {
+        label,
+        claim_summary,
+        source_id,
+        confidence,
     })
 }
 
@@ -5507,6 +5598,50 @@ impl AgentRuntime {
             .map(|t| t.scripted_loop_context.is_some())
             .unwrap_or(false);
 
+        let direct_life_observe_command = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .and_then(|turn| {
+                turn.pending_tool_call.as_ref().and_then(|call| {
+                    (call.tool_name == "life.observe")
+                        .then(|| direct_life_observe_command_from_arguments(&call.arguments))
+                        .flatten()
+                })
+            })
+            .filter(|command| !command.claim_summary.trim().is_empty());
+
+        if let Some(command) = direct_life_observe_command {
+            {
+                let Some(state) = self.sessions.get_mut(&session_id) else {
+                    warn!("Tool result returned for unknown session {}", session_id);
+                    return Ok(());
+                };
+                let tool_call = state
+                    .active_turn
+                    .as_ref()
+                    .and_then(|t| t.pending_tool_call.clone())
+                    .unwrap_or_else(|| ToolCall {
+                        tool_name: tool_result.tool_name.clone(),
+                        arguments: serde_json::json!({}),
+                    });
+                state.push_tool_history(tool_call, tool_result.clone());
+                state.clear_pending_tool_call();
+                if let Some(turn) = state.active_turn.as_mut() {
+                    turn.iteration += 1;
+                }
+            }
+
+            let reply = if step_failed {
+                direct_life_observe_failure_reply(&command, &tool_result.content)
+            } else {
+                direct_life_observe_success_reply(&command, &tool_result.content)
+            };
+            return self
+                .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
+                .await;
+        }
+
         if is_scripted_turn {
             let (checkpoint_memory_type, checkpoint_json, index_state) = {
                 let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -8166,6 +8301,7 @@ impl AgentRuntime {
                     turn_id,
                     chat_id,
                     tool_name,
+                    error: task.error.clone(),
                     ..Default::default()
                 })
                 .await;
@@ -9596,7 +9732,7 @@ impl AgentRuntime {
             arguments: arguments.clone(),
             execution_mode: route.execution_mode.clone(),
             agent_id: self.agent_id.clone(),
-            user_id,
+            user_id: user_id.clone(),
             runner_id: route.runner_id.clone(),
             incarnation_id: route.incarnation_id.clone(),
             hotel_id: route.hotel_id.clone(),
@@ -9612,6 +9748,60 @@ impl AgentRuntime {
             final_reply_role: reply_role.clone(),
             final_reply_guest_id: reply_guest_id.clone(),
         };
+
+        let tool_call = ToolCall {
+            tool_name: "life.observe".into(),
+            arguments: arguments.clone(),
+        };
+        let checkpoint = if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.start_turn(WorkingTurn {
+                task_id: command_task_id,
+                turn_id: turn_id.clone(),
+                chat_id: chat_id.clone(),
+                primary_user_id: user_id.clone(),
+                user_content: format!("life.observe direct command: {}", command.claim_summary),
+                final_reply_to: reply_to.clone(),
+                final_reply_role: reply_role.clone(),
+                final_reply_guest_id: reply_guest_id.clone(),
+                phase: TurnPhase::WaitingTool,
+                iteration: 0,
+                pending_tool_call: Some(tool_call),
+                pending_approval: None,
+                working_tool_history: Vec::new(),
+                recalled_memories: Vec::new(),
+                active_plan: None,
+                consecutive_step_failures: 0,
+                provider_repair_note: None,
+                provider_repair_attempts: 0,
+                pending_text_reply: None,
+                had_voice_input: false,
+                awaiting_transcription_reentry: false,
+                scripted_loop_context: None,
+                associated_paracrine_ids: Vec::new(),
+                paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
+                paracrine_response_routing: None,
+                paracrine_merge_completed: false,
+                plan_confirmed: false,
+                plan_confirm_note: None,
+                fallback_tier: if self.network_offline { 1 } else { 0 },
+                streaming_retry_attempts: 0,
+            });
+            Some((
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            ))
+        } else {
+            None
+        };
+        if let Some((checkpoint_memory_type, checkpoint_json, index_state)) = checkpoint {
+            self.ipc_client
+                .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+                .await?;
+            self.sync_session_index(&index_state).await?;
+        }
 
         self.ipc_client
             .send_request(IpcRequest::UpdateTask {
@@ -9643,23 +9833,7 @@ impl AgentRuntime {
             confidence = command.confidence,
             "Direct life.observe command routed without model turn"
         );
-
-        self.complete_command_without_turn(
-            command_task_id,
-            session_id,
-            turn_id,
-            chat_id,
-            reply_to,
-            reply_role,
-            reply_guest_id,
-            format!(
-                "Recorded this {} in LifeGraph: {}",
-                command.label, command.claim_summary
-            ),
-            None,
-            None,
-        )
-        .await
+        Ok(())
     }
 
     fn execute_bound_tool<'a>(
@@ -15397,6 +15571,9 @@ impl AgentRuntime {
         let new_skillset: Option<Vec<String>> = bindings
             .get("effective_skillset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_allowed_classes: Option<Vec<String>> = bindings
+            .get("allowed_classes")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_component_routes = snapshot
             .get("component_route_assembly")
             .cloned()
@@ -15412,6 +15589,12 @@ impl AgentRuntime {
         if let Some(skillset) = new_skillset {
             if skillset != state.bindings.effective_skillset {
                 state.bindings.effective_skillset = skillset;
+                changed = true;
+            }
+        }
+        if let Some(allowed_classes) = new_allowed_classes {
+            if allowed_classes != state.bindings.allowed_classes {
+                state.bindings.allowed_classes = allowed_classes;
                 changed = true;
             }
         }
