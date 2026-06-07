@@ -841,6 +841,7 @@ fn should_escalate_tier(error: &TaskErrorPayload) -> bool {
         Some("network_error")
             | Some("streaming_timeout")
             | Some("rate_limit")
+            | Some("provider_auth")
             | Some("provider_error")
     ) || (error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
@@ -16193,6 +16194,25 @@ mod tests {
         assert!(should_attempt_provider_repair(&error, Some(&state)));
         state.increment_provider_repair_attempts();
         assert!(!should_attempt_provider_repair(&error, Some(&state)));
+    }
+
+    #[test]
+    fn provider_auth_failure_escalates_fallback_tier_without_same_provider_repair() {
+        let error = TaskErrorPayload {
+            kind: "provider_failure".into(),
+            message: "Gemini API error (400): API key expired. Please renew the API key.".into(),
+            code: None,
+            component: Some("model-router".into()),
+            provider: Some("gemini".into()),
+            capability: Some("text.generate".into()),
+            retryable: Some(false),
+            sub_kind: Some("provider_auth".into()),
+        };
+
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        assert!(!should_attempt_provider_repair(&error, Some(&state)));
+        assert!(super::should_escalate_tier(&error));
     }
 
     #[test]
