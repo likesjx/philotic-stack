@@ -48,6 +48,51 @@ pub struct CapabilitySyncPayload {
     pub chunk_total: u32,
 }
 
+/// One guest entry in a [`HotelStateSyncPayload`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotelStateSyncGuest {
+    pub guest_id: String,
+    pub role: String,
+    pub active: bool,
+}
+
+/// One agent identity entry in a [`HotelStateSyncPayload`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotelStateSyncAgent {
+    pub agent_id: String,
+    pub persona_name: String,
+}
+
+/// Payload for `MsgType::HotelStateSync`.
+/// Broadcast whenever a hotel's guest or agent roster changes so every peer
+/// on the mesh can route to any agent without querying the authority hotel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotelStateSyncPayload {
+    pub node_id: String,
+    pub hotel_name: String,
+    pub guests: Vec<HotelStateSyncGuest>,
+    pub agents: Vec<HotelStateSyncAgent>,
+}
+
+/// Emits a `HotelStateSync` to a target carrying the sender's current guest and agent roster.
+pub async fn emit_hotel_state_sync(
+    socket: &UdpSocket,
+    target: SocketAddr,
+    capabilities: &NodeCapabilities,
+    payload: HotelStateSyncPayload,
+    auth_key: &str,
+) -> Result<()> {
+    emit_signed_message(
+        socket,
+        target,
+        capabilities,
+        MsgType::HotelStateSync,
+        serde_json::to_vec(&payload)?,
+        auth_key,
+    )
+    .await
+}
+
 /// Emits compact heartbeat messages over the given UDP socket to a target address.
 pub async fn emit_heartbeat(
     socket: &UdpSocket,

@@ -1,7 +1,8 @@
 use crate::authz::{MeshAuth, NonceTracker};
 use crate::domain::GraphDomain;
 use crate::heartbeat::{
-    CapabilitySyncPayload, HeartbeatPayload, MeshCatalogSyncPayload, MeshPeerEntry, emit_catalog_sync, emit_heartbeat,
+    CapabilitySyncPayload, HeartbeatPayload, HotelStateSyncPayload, MeshCatalogSyncPayload,
+    MeshPeerEntry, emit_catalog_sync, emit_heartbeat, emit_hotel_state_sync,
 };
 use crate::registry::NodeRegistry;
 use crate::{BeaconMessage, MsgType, NodeCapabilities};
@@ -24,6 +25,9 @@ pub struct BeaconDaemon {
     // and WAL contention on the main context.db under concurrent UDP load.
     nonce_tracker: Option<Mutex<NonceTracker>>,
     enable_rust_auth: bool,
+    /// Shared snapshot of this hotel's current guest+agent roster. Written by aiua
+    /// whenever the roster changes; read by the beacon to include in anchor handshakes.
+    pub local_hotel_state: Arc<RwLock<Option<HotelStateSyncPayload>>>,
 }
 
 impl BeaconDaemon {
@@ -88,6 +92,7 @@ impl BeaconDaemon {
             inbox_tx,
             nonce_tracker,
             enable_rust_auth,
+            local_hotel_state: Arc::new(RwLock::new(None)),
         })
     }
     pub fn socket(&self) -> Arc<UdpSocket> {
@@ -301,6 +306,25 @@ impl BeaconDaemon {
                                     }
                                 }
                             }
+
+                            // Send our hotel roster so the reconnecting peer can immediately
+                            // route to our agents without waiting for the next HotelStateSync.
+                            if let Some(state) = self.local_hotel_state.read().await.clone() {
+                                if let Err(e) = emit_hotel_state_sync(
+                                    &self.socket,
+                                    src,
+                                    &self.local_capabilities,
+                                    state,
+                                    &auth_key,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "Failed to send hotel state sync to {} at {}: {}",
+                                        peer_node_id, src, e
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -370,6 +394,34 @@ impl BeaconDaemon {
                     }
                 }
                 let _ = self.inbox_tx.send(msg).await;
+            }
+            MsgType::HotelStateSync => {
+                if let Ok(payload) = serde_json::from_slice::<HotelStateSyncPayload>(&msg.payload) {
+                    if payload.node_id != self.local_capabilities.node_id {
+                        let mut registry = self.registry.write().await;
+                        registry.observe_hotel_state(
+                            payload.node_id.clone(),
+                            payload.hotel_name.clone(),
+                            payload.guests,
+                            payload.agents,
+                        );
+                        info!(
+                            "Hotel state sync from {} ({}): {} guests, {} agents",
+                            payload.hotel_name,
+                            payload.node_id,
+                            registry
+                                .remote_hotel_states()
+                                .find(|s| s.node_id == payload.node_id)
+                                .map(|s| s.guests.len())
+                                .unwrap_or(0),
+                            registry
+                                .remote_hotel_states()
+                                .find(|s| s.node_id == payload.node_id)
+                                .map(|s| s.agents.len())
+                                .unwrap_or(0),
+                        );
+                    }
+                }
             }
             MsgType::MeshEventBatch
             | MsgType::MeshEventAck

@@ -164,6 +164,8 @@ struct MeshRuntimeContext {
     webrtc_signal_rx: WebRtcSignalReceiver,
     perimeter_svc: Arc<crate::service::perimeter::HotelPerimeterService>,
     ipc_operator_surface_tx: Option<mpsc::Sender<String>>,
+    /// Shared hotel roster snapshot used by BeaconDaemon for anchor handshakes.
+    local_hotel_state: Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>>,
 }
 
 /// Operator surface query worker — receives tasks via in-process channel (no UDS
@@ -1385,6 +1387,58 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
         )
         .await?,
     );
+    *daemon.local_hotel_state.write().await = ctx.local_hotel_state.read().await.clone();
+    // Keep beacon's snapshot in sync: whenever the shared Arc is updated, propagate here.
+    {
+        let beacon_state = daemon.local_hotel_state.clone();
+        let source_state = ctx.local_hotel_state.clone();
+        let mut shutdown_rx = ctx.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let snap = source_state.read().await.clone();
+                        *beacon_state.write().await = snap;
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        });
+    }
+
+    // Proactive hotel-state broadcast: push our roster to all backbone peers every 30s
+    // so they can route to our guests without waiting for an anchor handshake.
+    {
+        use ansible_mesh_core::heartbeat::emit_hotel_state_sync;
+        let hs_socket = daemon.socket();
+        let hs_state = ctx.local_hotel_state.clone();
+        let hs_graph = ctx.graph_domain.clone();
+        let hs_caps = ctx.caps.clone();
+        let mut hs_shutdown = ctx.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let Some(payload) = hs_state.read().await.clone() else { continue };
+                        let targets = match mesh_targets_for_graph(hs_graph.as_ref(), &hs_caps.node_id) {
+                            Ok(t) => t,
+                            Err(e) => { warn!("hotel-state broadcast: failed to resolve targets: {e}"); continue }
+                        };
+                        for (target_node_id, target_addr) in targets {
+                            let Ok(target) = target_addr.parse::<SocketAddr>() else { continue };
+                            let Some(auth_key) = mesh_auth_key_for_node(hs_graph.as_ref(), &target_node_id).ok().flatten() else { continue };
+                            if let Err(e) = emit_hotel_state_sync(&hs_socket, target, &hs_caps, payload.clone(), &auth_key).await {
+                                warn!("hotel-state broadcast to {}: {e}", target_addr);
+                            }
+                        }
+                    }
+                    _ = hs_shutdown.recv() => break,
+                }
+            }
+        });
+    }
 
     let mut inbox_rx = {
         let mut guard = ctx.inbox_rx.lock().await;
@@ -4255,6 +4309,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "hotel.status".into(),
                 "hotel.logs".into(),
+                "hotel.best_place_to_run".into(),
                 "echo".into(),
                 "agent.configure".into(),
                 "role.configure".into(),
@@ -7395,6 +7450,66 @@ async fn main() -> Result<()> {
 
     let registry = Arc::new(RwLock::new(NodeRegistry::new()));
 
+    // Shared hotel roster snapshot — written by hotel_state_sync task, read by beacon.
+    let local_hotel_state: Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>> =
+        Arc::new(RwLock::new(None));
+
+    // Channel: IPC fires () whenever guest roster changes; broadcast task rebuilds snapshot.
+    let (hotel_state_dirty_tx, mut hotel_state_dirty_rx) = mpsc::channel::<()>(8);
+    // Clone for IpcServer — the original is moved into the sync task for the seed send.
+    let ipc_dirty_tx = hotel_state_dirty_tx.clone();
+
+    {
+        use ansible_mesh_core::heartbeat::{
+            HotelStateSyncAgent, HotelStateSyncGuest, HotelStateSyncPayload,
+        };
+        let sync_graph = graph_domain_arc.clone();
+        let sync_hotel = hotel.clone();
+        let sync_caps = caps.clone();
+        let sync_state = local_hotel_state.clone();
+        let mut sync_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            // Seed initial state immediately.
+            let _ = hotel_state_dirty_tx.try_send(());
+            loop {
+                tokio::select! {
+                    Some(()) = hotel_state_dirty_rx.recv() => {
+                        // Drain any queued signals — one broadcast covers all.
+                        while hotel_state_dirty_rx.try_recv().is_ok() {}
+
+                        let guests: Vec<HotelStateSyncGuest> = sync_graph
+                            .list_guests(&sync_hotel.hotel_name, false)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|g| HotelStateSyncGuest {
+                                guest_id: g.guest_id,
+                                role: g.role,
+                                active: g.is_active,
+                            })
+                            .collect();
+                        let agents: Vec<HotelStateSyncAgent> = sync_graph
+                            .list_agent_identities()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|a| HotelStateSyncAgent {
+                                agent_id: a.agent_id,
+                                persona_name: a.persona_name,
+                            })
+                            .collect();
+                        let payload = HotelStateSyncPayload {
+                            node_id: sync_caps.node_id.clone(),
+                            hotel_name: sync_hotel.hotel_name.clone(),
+                            guests,
+                            agents,
+                        };
+                        *sync_state.write().await = Some(payload.clone());
+                    }
+                    _ = sync_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
     // In-process channel: operator surface query tasks are delivered here
     // instead of through UDS self-connection, eliminating the socket leak.
     let (operator_surface_tx, operator_surface_rx) = tokio::sync::mpsc::channel::<String>(128);
@@ -7414,7 +7529,8 @@ async fn main() -> Result<()> {
     .with_registry(registry.clone())
     .with_operator_surface_channel(operator_surface_tx)
     .with_perimeter(perimeter_svc.clone())
-    .with_egress(egress_gw.clone());
+    .with_egress(egress_gw.clone())
+    .with_hotel_state_dirty_tx(ipc_dirty_tx);
     let ipc_server = if let Some(hq) = heal_queue_arc {
         ipc_server.with_heal_queue(hq)
     } else {
@@ -7514,6 +7630,7 @@ async fn main() -> Result<()> {
         webrtc_signal_rx: webrtc_signal_rx.clone(),
         perimeter_svc: perimeter_svc.clone(),
         ipc_operator_surface_tx: Some(inbound_operator_surface_tx),
+        local_hotel_state: local_hotel_state.clone(),
     };
 
     if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {

@@ -947,6 +947,9 @@ pub struct IpcServer {
     perimeter_svc: Option<Arc<crate::service::perimeter::HotelPerimeterService>>,
     /// Hotel egress gateway — wired in via `with_egress()`.
     egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
+    /// Signal channel: send `()` to trigger a hotel-state broadcast to all backbone peers.
+    /// Fired on guest register/deregister so peers stay in sync.
+    hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
 }
 
 struct LoggingLeaseObserver;
@@ -3889,7 +3892,13 @@ impl IpcServer {
             operator_surface_tx: None,
             perimeter_svc: None,
             egress_gw: None,
+            hotel_state_dirty_tx: None,
         }
+    }
+
+    pub fn with_hotel_state_dirty_tx(mut self, tx: mpsc::Sender<()>) -> Self {
+        self.hotel_state_dirty_tx = Some(tx);
+        self
     }
 
     pub fn with_operator_surface_channel(mut self, tx: mpsc::Sender<String>) -> Self {
@@ -4042,6 +4051,7 @@ impl IpcServer {
                     let socket_path = self.socket_path.clone();
                     let perimeter_svc = self.perimeter_svc.clone();
                     let egress_gw = self.egress_gw.clone();
+                    let hotel_state_dirty_tx = self.hotel_state_dirty_tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -4072,6 +4082,7 @@ impl IpcServer {
                             socket_path,
                             perimeter_svc,
                             egress_gw,
+                            hotel_state_dirty_tx,
                         )
                         .await
                         {
@@ -4122,6 +4133,7 @@ impl IpcServer {
         socket_path: String,
         perimeter_svc: Option<Arc<crate::service::perimeter::HotelPerimeterService>>,
         egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
+        hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -4183,6 +4195,12 @@ impl IpcServer {
                     Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
                     Self::remove_mcp_membrane_leases(&mcp_membrane_leases, conn_id).await;
                     Self::remove_discord_gateway_leases(&discord_gateway_leases, conn_id).await;
+                    // A registered guest disconnected — peers need updated roster.
+                    if current_identity.is_some() {
+                        if let Some(ref tx) = hotel_state_dirty_tx {
+                            let _ = tx.try_send(());
+                        }
+                    }
                     let _ = write_task.await;
                     return Ok(());
                 }
@@ -4466,6 +4484,12 @@ impl IpcServer {
                             operator_surface_tx.as_ref(),
                         )
                         .await;
+                        // New guest registered — broadcast updated roster to peers.
+                        if matches!(response, IpcResponse::ComponentRegistered { .. }) {
+                            if let Some(ref tx) = hotel_state_dirty_tx {
+                                let _ = tx.try_send(());
+                            }
+                        }
                         let _ = outbound_tx.send(response);
                         for follow_up in follow_up_responses {
                             let _ = outbound_tx.send(follow_up);
@@ -11084,6 +11108,37 @@ impl IpcServer {
                     })
                     .collect();
 
+                let reg = registry.read().await;
+                let mesh_peers: Vec<serde_json::Value> = reg
+                    .remote_hotel_states()
+                    .map(|state| {
+                        let peer_guests: Vec<serde_json::Value> = state
+                            .guests
+                            .iter()
+                            .map(|g| serde_json::json!({
+                                "guest_id": g.guest_id,
+                                "role": g.role,
+                                "active": g.active,
+                            }))
+                            .collect();
+                        let peer_agents: Vec<serde_json::Value> = state
+                            .agents
+                            .iter()
+                            .map(|a| serde_json::json!({
+                                "agent_id": a.agent_id,
+                                "persona_name": a.persona_name,
+                            }))
+                            .collect();
+                        serde_json::json!({
+                            "hotel_name": state.hotel_name,
+                            "node_id": state.node_id,
+                            "guests": peer_guests,
+                            "agents": peer_agents,
+                        })
+                    })
+                    .collect();
+                drop(reg);
+
                 IpcResponse::success(
                     "hotel_status",
                     Some(serde_json::json!({
@@ -11091,6 +11146,7 @@ impl IpcServer {
                         "node_id": local_node_id,
                         "guests": guests,
                         "agents": agents,
+                        "mesh_peers": mesh_peers,
                     })),
                 )
             }
@@ -13935,6 +13991,9 @@ impl IpcServer {
                     }
                 }
 
+                // Carry allowed_classes so philote can expand class-tagged catalog tools.
+                let allowed_classes = profile.allowed_classes.clone();
+
                 if let Some(obj) = bindings.as_object_mut() {
                     obj.insert("effective_toolset".to_string(), serde_json::json!(toolset));
                     obj.insert(
@@ -13944,11 +14003,18 @@ impl IpcServer {
                     if !on_demand.is_empty() {
                         obj.insert("on_demand_skills".to_string(), serde_json::json!(on_demand));
                     }
+                    if !allowed_classes.is_empty() {
+                        obj.insert(
+                            "allowed_classes".to_string(),
+                            serde_json::json!(allowed_classes),
+                        );
+                    }
                 } else {
                     bindings = serde_json::json!({
                         "effective_toolset": toolset,
                         "effective_skillset": skillset,
                         "on_demand_skills": on_demand,
+                        "allowed_classes": allowed_classes,
                     });
                 }
             }
