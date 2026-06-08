@@ -316,7 +316,8 @@ impl NodeRegistry {
                 state
                     .guests
                     .iter()
-                    .any(|g| g.guest_id == guest_id && g.active)
+                    // Include inactive guests: the remote hotel will materialize them on receipt.
+                    .any(|g| g.guest_id == guest_id)
             })
             .map(|state| state.node_id.clone())
     }
