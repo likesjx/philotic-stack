@@ -1804,6 +1804,11 @@ pub struct AgentRuntime {
     /// NetworkState { online: false }. When true, text.generate is routed directly
     /// to the local model tier without attempting cloud providers.
     network_offline: bool,
+    /// Role name when this runtime is a role-incarnation philote (e.g. "orchestrator",
+    /// "brain"). None for the default agent philote. Used to set reply_to_guest_id on
+    /// paracrine whispers so the specialist's response routes back to this role instance
+    /// rather than to the membrane seat that initiated the user turn.
+    role_name: Option<String>,
 }
 
 impl AgentRuntime {
@@ -1821,7 +1826,12 @@ impl AgentRuntime {
             stuck_turn_signature: HashMap::new(),
             total_active_since: HashMap::new(),
             network_offline: false,
+            role_name: None,
         }
+    }
+
+    pub fn set_role_name(&mut self, rn: impl Into<String>) {
+        self.role_name = Some(rn.into());
     }
 
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
@@ -14127,10 +14137,8 @@ impl AgentRuntime {
 
                 // Log the outbound exosome ID on the active turn so the routing
                 // reflex can correlate the response when it arrives.
-                // Also capture the current session_id, chat_id, and final_reply_guest_id so
-                // the specialist's response is routed back to the exact membrane seat that
-                // owns this conversation — without this, the reply fans out to all membrane
-                // subscribers.
+                // Also capture the current session_id and chat_id so the specialist's
+                // response carries the right conversation context.
                 let (source_session_id, source_chat_id, source_reply_guest_id) = {
                     let mut sess_id = None;
                     let mut chat_id = None;
@@ -14157,6 +14165,19 @@ impl AgentRuntime {
                     source_chat_id,
                 };
 
+                // When reply_to="self" and this runtime is a role incarnation, target
+                // this role's own guest_id so the specialist's paracrine_response routes
+                // back to this philote specifically instead of to the membrane seat that
+                // originally delivered the user turn (which has no paracrine_response handler).
+                let effective_reply_guest_id = if matches!(reply_to_str, "self" | "") {
+                    self.role_name
+                        .as_ref()
+                        .map(|rn| format!("{}:{}", self.agent_id, rn))
+                        .or(source_reply_guest_id)
+                } else {
+                    source_reply_guest_id
+                };
+
                 let emit_result = self
                     .ipc_client
                     .send_request(IpcRequest::ParacrineEmit {
@@ -14164,7 +14185,7 @@ impl AgentRuntime {
                         exosome,
                         reply_to_node,
                         reply_to_role,
-                        reply_to_guest_id: source_reply_guest_id,
+                        reply_to_guest_id: effective_reply_guest_id,
                         timeout_secs: None,
                     })
                     .await;
