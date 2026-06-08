@@ -3829,6 +3829,186 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "life.observe".into(),
+            description: "Write an observation to the life graph. Use to record open loops, \
+                          goals, commitments, signals, or events that matter to the agent or user. \
+                          The life graph stores these nodes in Memgraph for semantic retrieval. \
+                          Embed-on-write is automatic — no embedding input required."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "observation_id": {
+                        "type": "string",
+                        "description": "Optional stable ID for this observation (UUID). Generated if omitted."
+                    },
+                    "evidence": {
+                        "type": "object",
+                        "description": "The observation to write.",
+                        "properties": {
+                            "packet_id": { "type": "string", "description": "Unique evidence packet ID (UUID)." },
+                            "claim_ref": {
+                                "type": "object",
+                                "description": "The graph node this observation is about.",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Stable node ID (use a descriptive slug or UUID)." },
+                                    "label": {
+                                        "type": "string",
+                                        "description": "Graph node label.",
+                                        "enum": ["Signal", "OpenLoop", "Commitment", "Event", "Goal", "Insight"]
+                                    }
+                                },
+                                "required": ["id", "label"]
+                            },
+                            "claim_summary": {
+                                "type": "string",
+                                "description": "Human-readable summary of the observation (embedded for semantic search)."
+                            },
+                            "source_refs": {
+                                "type": "array",
+                                "description": "Sources supporting this observation.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source_id": { "type": "string" },
+                                        "source_kind": { "type": "string", "description": "e.g. agent_observation, conversation, runtime_observation" }
+                                    }
+                                }
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "description": "Confidence in this observation (0.0-1.0).",
+                                "minimum": 0.0,
+                                "maximum": 1.0
+                            },
+                            "validation_state": {
+                                "type": "string",
+                                "description": "Initial validation state.",
+                                "enum": ["proposed", "accepted"]
+                            },
+                            "observed_at": {
+                                "type": "string",
+                                "description": "ISO 8601 timestamp (e.g. 2026-06-08T12:00:00Z)."
+                            }
+                        },
+                        "required": ["packet_id", "claim_ref", "claim_summary", "confidence", "observed_at"]
+                    }
+                },
+                "required": ["evidence"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "life.recall".into(),
+            description: "Retrieve relevant observations, open loops, goals, or commitments from \
+                          the life graph using semantic and graph-based search. Returns a context \
+                          packet with ranked nodes. Use named_strategy to narrow the search: \
+                          'open_loops_by_context' (default), 'goals_and_next_actions', \
+                          'commitments_approaching', 're_entry_context', \
+                          'cross_domain_entanglement'."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query_text": {
+                        "type": "string",
+                        "description": "Natural language query. The life graph embeds this automatically."
+                    },
+                    "named_strategy": {
+                        "type": "string",
+                        "description": "Recall strategy. Defaults to open_loops_by_context.",
+                        "enum": [
+                            "open_loops_by_context",
+                            "goals_and_next_actions",
+                            "commitments_approaching",
+                            "re_entry_context",
+                            "cross_domain_entanglement"
+                        ]
+                    },
+                    "max_context_packets": {
+                        "type": "integer",
+                        "description": "Maximum number of result packets to return. Default 5.",
+                        "minimum": 1,
+                        "maximum": 20
+                    },
+                    "due_within_hours": {
+                        "type": "integer",
+                        "description": "For commitments_approaching strategy: how many hours ahead to look. Default 72."
+                    }
+                },
+                "required": ["query_text"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "life.commit".into(),
+            description: "Commit a proposed observation — advances its validation_state from \
+                          'proposed' to 'accepted'. Use after confirming an observation is correct."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "The life graph node ID to commit." }
+                },
+                "required": ["node_id"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "life.resolve".into(),
+            description: "Mark an open loop or commitment as resolved/closed in the life graph."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "The life graph node ID to resolve." },
+                    "resolution_summary": { "type": "string", "description": "Short note on how it was resolved." }
+                },
+                "required": ["node_id"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "life.conflict".into(),
+            description: "Flag a conflicting observation in the life graph for adjudication."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "The life graph node ID that has a conflict." },
+                    "conflict_summary": { "type": "string", "description": "Description of the conflict." }
+                },
+                "required": ["node_id", "conflict_summary"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "life.patch.propose".into(),
+            description: "Propose a structured patch to an existing life graph node — modify \
+                          properties without overwriting the node. Creates a pending patch record \
+                          for adjudication."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "The life graph node to patch." },
+                    "patch": {
+                        "type": "object",
+                        "description": "Key-value properties to update on the node."
+                    },
+                    "patch_summary": { "type": "string", "description": "Why this patch is proposed." }
+                },
+                "required": ["node_id", "patch", "patch_summary"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
             tool_name: "cron.disable".into(),
             description: "Disable a cron job without removing it. The job record is preserved and \
                           can be re-enabled with cron.enable."
@@ -4384,6 +4564,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "profile.manage".into(),
                 "mcp.manage".into(),
             ],
+            remote_tool_runners: vec![],
             description: Some("Default orchestrator role profile.".into()),
         },
         ToolsetProfileRecord {
@@ -4408,6 +4589,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.knowledge".into(),
             ],
             on_demand_skills: vec![],
+            remote_tool_runners: vec![],
             description: Some("Codex specialist role profile — workspace read access.".into()),
         },
         ToolsetProfileRecord {
@@ -4430,6 +4612,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.knowledge".into(),
             ],
             on_demand_skills: vec![],
+            remote_tool_runners: vec![],
             description: Some("Research specialist role profile — minimal tool surface.".into()),
         },
         ToolsetProfileRecord {
@@ -4450,6 +4633,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
             ],
             on_demand_skills: vec![],
+            remote_tool_runners: vec![],
             description: Some("Bare utility profile — session and echo only.".into()),
         },
         ToolsetProfileRecord {
@@ -4542,6 +4726,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "profile.manage".into(),
             ],
             on_demand_skills: vec![],
+            remote_tool_runners: vec![],
             description: Some(
                 "Admin role profile — full skill crafting, role governance, training data authority, ASR provisioning, vision model provisioning, and cron scheduling.".into(),
             ),
@@ -4574,6 +4759,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
             ],
             on_demand_skills: vec![],
+            remote_tool_runners: vec![],
             description: Some(
                 "Architect specialist role profile — systems, infrastructure, debugging. \
                  bash.exec requires operator approval."
@@ -4598,6 +4784,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
             ],
             on_demand_skills: vec![],
+            remote_tool_runners: vec![],
             description: Some(
                 "Virtuoso specialist role profile — creative and expressive. \
                  Minimal tools, focused on reflection and lyrical output."
@@ -4609,6 +4796,58 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
     for profile in &profiles {
         graph.upsert_toolset_profile(profile)?;
     }
+
+    // If PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE is set, seed the orchestrator
+    // profile with a remote_tool_runners entry pointing at the life-graph-runner
+    // on that node.  This is deployment-specific and intentionally not hardcoded
+    // into the static profile array above.
+    if let Ok(remote_node) = std::env::var("PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE") {
+        let remote_node = remote_node.trim().to_string();
+        if !remote_node.is_empty() {
+            // Derive hotel_id from node by stripping the trailing "-aiua-01" suffix if
+            // present (e.g. "vps-jane-aiua-01" → "vps-jane"), otherwise use as-is.
+            let hotel_id = remote_node
+                .strip_suffix("-aiua-01")
+                .unwrap_or(&remote_node)
+                .to_string();
+            let runner_incarnation_id = format!("{hotel_id}:life-graph-runner");
+            let runner = serde_json::json!({
+                "incarnation_id": runner_incarnation_id,
+                "runner_id": runner_incarnation_id,
+                "hotel_id": hotel_id,
+                "target_node": remote_node,
+                "target_role": "life-graph-runner",
+                "supported_tools": [
+                    "life.observe",
+                    "life.recall",
+                    "life.commit",
+                    "life.resolve",
+                    "life.conflict",
+                    "life.patch.propose"
+                ],
+                "execution_mode": "capability"
+            });
+            if let Ok(Some(mut orchestrator)) = graph.get_toolset_profile("orchestrator") {
+                let already_present = orchestrator
+                    .remote_tool_runners
+                    .iter()
+                    .any(|r| {
+                        r.get("incarnation_id").and_then(|v| v.as_str())
+                            == Some(runner_incarnation_id.as_str())
+                    });
+                if !already_present {
+                    orchestrator.remote_tool_runners.push(runner);
+                    graph.upsert_toolset_profile(&orchestrator)?;
+                    tracing::info!(
+                        node = %remote_node,
+                        hotel = %hotel_id,
+                        "seeded remote life-graph-runner into orchestrator profile"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

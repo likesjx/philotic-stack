@@ -287,14 +287,32 @@ impl LifeGraphProvider {
             })
             .unwrap_or_default();
 
-        if embedding.is_empty()
+        // Auto-embed query_text when the caller didn't supply a pre-computed
+        // embedding.  This lets orchestrator agents call life.recall with just
+        // { query_text, named_strategy } without needing access to the ONNX sidecar.
+        let embedding = if embedding.is_empty()
             && !matches!(named_strategy, NamedRecallStrategy::CommitmentsApproaching)
         {
-            return Ok(ProviderOutput::ResultSet(json!({
-                "status": "missing_embedding",
-                "detail": "life.recall requires an inline 'embedding' array in parameters",
-            })));
-        }
+            let query_text = &query_val.query_text;
+            if query_text.is_empty() {
+                return Ok(ProviderOutput::ResultSet(json!({
+                    "status": "missing_embedding",
+                    "detail": "life.recall requires either an inline 'embedding' array or a non-empty 'query_text' to auto-embed",
+                })));
+            }
+            match embed_text(query_text).await {
+                Ok((auto_vec, _)) => auto_vec,
+                Err(e) => {
+                    warn!("life.recall auto-embed failed, returning empty result: {e}");
+                    return Ok(ProviderOutput::ResultSet(json!({
+                        "status": "embed_failed",
+                        "detail": format!("auto-embedding failed: {e}"),
+                    })));
+                }
+            }
+        } else {
+            embedding
+        };
 
         let top_k = query_val.max_context_packets * 3;
         let min_similarity = 0.3_f32;

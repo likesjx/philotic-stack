@@ -206,6 +206,13 @@ pub struct ToolsetProfileRecord {
     pub on_demand_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Remote datasource guests whose tools should be available to sessions
+    /// using this profile. Each entry is an AllowedIncarnation-compatible JSON
+    /// object (fields: incarnation_id, hotel_id, target_node, target_role,
+    /// supported_tools, execution_mode). Merged into
+    /// `allowed_tool_runner_incarnations` during session snapshot composition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_tool_runners: Vec<serde_json::Value>,
 }
 
 /// A single step in a LoopScript.

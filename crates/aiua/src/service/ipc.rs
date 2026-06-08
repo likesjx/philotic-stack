@@ -14319,6 +14319,40 @@ impl IpcServer {
                         "allowed_classes": allowed_classes,
                     });
                 }
+
+                // Merge profile-level remote_tool_runners into
+                // allowed_tool_runner_incarnations.  Per-session overrides in
+                // summary_json.bindings are preserved; profile entries are
+                // appended only if not already present by incarnation_id.
+                if !profile.remote_tool_runners.is_empty() {
+                    let mut incarnations: Vec<serde_json::Value> = bindings
+                        .get("allowed_tool_runner_incarnations")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for runner in &profile.remote_tool_runners {
+                        let runner_id = runner
+                            .get("incarnation_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if !runner_id.is_empty()
+                            && !incarnations.iter().any(|existing| {
+                                existing
+                                    .get("incarnation_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(runner_id)
+                            })
+                        {
+                            incarnations.push(runner.clone());
+                        }
+                    }
+                    if let Some(obj) = bindings.as_object_mut() {
+                        obj.insert(
+                            "allowed_tool_runner_incarnations".to_string(),
+                            serde_json::Value::Array(incarnations),
+                        );
+                    }
+                }
             }
         }
 
