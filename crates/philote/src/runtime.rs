@@ -14165,15 +14165,18 @@ impl AgentRuntime {
                     source_chat_id,
                 };
 
-                // When reply_to="self" and this runtime is a role incarnation, target
-                // this role's own guest_id so the specialist's paracrine_response routes
-                // back to this philote specifically instead of to the membrane seat that
-                // originally delivered the user turn (which has no paracrine_response handler).
+                // When reply_to="self", target this philote's own guest_id so the
+                // specialist's paracrine_response routes back here specifically instead
+                // of to the membrane seat (which has no paracrine_response handler).
+                // Role incarnations use "{agent_id}:{role_name}"; default philotes use
+                // "{agent_id}" directly.
                 let effective_reply_guest_id = if matches!(reply_to_str, "self" | "") {
-                    self.role_name
-                        .as_ref()
-                        .map(|rn| format!("{}:{}", self.agent_id, rn))
-                        .or(source_reply_guest_id)
+                    Some(
+                        self.role_name
+                            .as_ref()
+                            .map(|rn| format!("{}:{}", self.agent_id, rn))
+                            .unwrap_or_else(|| self.agent_id.clone()),
+                    )
                 } else {
                     source_reply_guest_id
                 };
