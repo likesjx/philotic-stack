@@ -8560,6 +8560,35 @@ impl IpcServer {
                         } else {
                             target_node
                         }
+                    } else if target_role != "agent" {
+                        // No specific guest_id. For non-agent roles, discover the nearest
+                        // mesh peer advertising this role when no local subscriber is active.
+                        let has_local_sub = {
+                            let guard = inboxes.lock().await;
+                            guard
+                                .get(target_role.as_str())
+                                .map(|v| !v.is_empty())
+                                .unwrap_or(false)
+                        };
+                        if !has_local_sub {
+                            let reg = registry.read().await;
+                            if let Some(ad) = reg
+                                .advertisements_for_role(target_role.as_str())
+                                .filter(|ad| ad.node_id != local_node_id)
+                                .min_by_key(|ad| ad.latency_hint_ms.unwrap_or(u32::MAX))
+                            {
+                                info!(
+                                    target_role = target_role.as_str(),
+                                    remote_node = ad.node_id.as_str(),
+                                    "EmitTask: role-based mesh discovery"
+                                );
+                                ad.node_id.clone()
+                            } else {
+                                target_node
+                            }
+                        } else {
+                            target_node
+                        }
                     } else {
                         target_node
                     }

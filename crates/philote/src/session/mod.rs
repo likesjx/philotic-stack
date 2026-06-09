@@ -42,7 +42,7 @@ fn life_graph_runner_node_id() -> String {
                 .filter(|v| !v.is_empty())
                 .map(|hotel| format!("{hotel}-aiua-01"))
         })
-        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+        .unwrap_or_else(local_node_id)
 }
 
 fn local_agent_id() -> String {
