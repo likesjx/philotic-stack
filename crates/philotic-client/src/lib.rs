@@ -701,9 +701,17 @@ impl LeaseEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ParacrineRouting {
+    /// Feed brain's response back into the orchestrator's own paracrine layer as a
+    /// new turn. The orchestrator (e.g. Astrid) reasons about the reply and explicitly
+    /// calls `delegate.merge` to surface it to the user, or completes silently to
+    /// absorb internally. This is the default — it keeps the human out of specialist
+    /// sub-conversations until the orchestrator decides to include them.
+    #[default]
+    ReflectiveReEntry,
     /// Feed the response into a model cognitive re-entry. If an active turn
     /// exists, inject as enriched context; otherwise start a synthesis turn.
-    #[default]
+    /// Always surfaces a reply to Telegram — prefer ReflectiveReEntry unless you
+    /// explicitly want the raw specialist response to go straight to the user.
     CognitiveReEntry,
     /// Replace the "paracrine dispatched" placeholder tool result with the real
     /// response and re-enter the model as if the tool call completed normally.
@@ -747,7 +755,7 @@ pub struct Exosome {
     pub paracrine_id: Option<String>,
     /// How the receiving philote's response should be handled when it arrives
     /// back at the emitter. Declared at dispatch time by the caller.
-    /// Defaults to [`ParacrineRouting::CognitiveReEntry`] if absent.
+    /// Defaults to [`ParacrineRouting::ReflectiveReEntry`] if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_routing: Option<ParacrineRouting>,
     /// The session_id of the conversation that triggered this paracrine.

@@ -3062,7 +3062,7 @@ impl AgentRuntime {
         let routing = exosome
             .as_ref()
             .and_then(|e| e.response_routing.clone())
-            .unwrap_or(ParacrineRouting::CognitiveReEntry);
+            .unwrap_or(ParacrineRouting::ReflectiveReEntry);
 
         // Locate the owning turn by matching paracrine_id against active turns,
         // falling back to the task's session_id field.
@@ -3229,6 +3229,25 @@ impl AgentRuntime {
                     ..task
                 })
                 .await?;
+            }
+
+            ParacrineRouting::ReflectiveReEntry => {
+                // Reflective path: feed brain's reply back into the orchestrator's
+                // own paracrine layer. The exosome's paracrine_id is preserved so
+                // the resulting turn gets paracrine_origin set, which auto-injects
+                // delegate.merge. The orchestrator reasons about the reply and either
+                // calls delegate.merge to surface it or completes silently to absorb.
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("reflective_re_entry".into()),
+                        );
+                    }
+                }
+                self.handle_user_message(task, task_id).await?;
             }
 
             ParacrineRouting::CognitiveReEntry => {
@@ -7241,6 +7260,17 @@ impl AgentRuntime {
                 .paracrine_reply_chat_id
                 .as_deref()
                 .unwrap_or(&completed_turn.chat_id);
+            // Reflective re-entry, top-of-chain: reply_session_id loops back to our
+            // own session, meaning this was Astrid's reflection turn after receiving
+            // brain's response. She chose not to call delegate.merge → absorb silently.
+            if reply_session_id == session_id {
+                info!(
+                    "deliver_text_reply: reflective re-entry turn {} completed without delegate.merge — absorbing silently",
+                    turn_id
+                );
+                self.drain_next_user_task(&attend_session_id);
+                return Ok(());
+            }
             serde_json::json!({
                 "action": "paracrine_response",
                 "session_id": reply_session_id,
@@ -14144,7 +14174,7 @@ impl AgentRuntime {
                 };
 
                 // Parse optional response_routing hint from arguments.
-                // Defaults to CognitiveReEntry if absent or unrecognised.
+                // Defaults to ReflectiveReEntry if absent or unrecognised.
                 let explicit_response_routing =
                     args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
                         serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
@@ -14250,7 +14280,7 @@ impl AgentRuntime {
                             prompt.clone(),
                             response_routing
                                 .clone()
-                                .unwrap_or(ParacrineRouting::CognitiveReEntry),
+                                .unwrap_or(ParacrineRouting::ReflectiveReEntry),
                             authority,
                             tool_policy,
                             approval_scope,
@@ -14412,35 +14442,65 @@ impl AgentRuntime {
                     content.clone()
                 };
 
-                // Fire the paracrine_response into the orchestrator's session.
-                let merge_task = serde_json::json!({
-                    "action": "paracrine_response",
-                    "session_id": reply_session_id,
-                    "turn_id": turn_id,
-                    "chat_id": reply_chat_id,
-                    "content": attributed_content,
-                    "exosome": {
-                        "prompt": "",
-                        "paracrine_id": paracrine_id,
-                        "response_routing": response_routing,
-                        "source_session_id": reply_session_id,
-                        "source_chat_id": reply_chat_id,
-                    },
-                });
-                info!(
-                    session_id = %session_id,
-                    reply_session = %reply_session_id,
-                    "delegate.merge: emitting paracrine_response to orchestrator"
-                );
-                let _ = self
-                    .ipc_client
-                    .send_request(IpcRequest::EmitTask {
-                        target_node: final_reply_to,
-                        target_role: final_reply_role,
-                        target_guest_id: final_reply_guest_id,
-                        task_json: merge_task.to_string(),
-                    })
-                    .await;
+                // Determine position in chain: if reply_session_id == session_id,
+                // this is a top-of-chain reflection turn (Astrid surfacing brain's
+                // reply). Otherwise it's a specialist turn (brain replying to Astrid).
+                let is_top_of_chain = reply_session_id == session_id;
+
+                if is_top_of_chain {
+                    // Reflective surface: emit send_reply directly to membrane so the
+                    // content goes to the user's Telegram chat.
+                    let surface_task = serde_json::json!({
+                        "action": "send_reply",
+                        "session_id": reply_session_id,
+                        "turn_id": turn_id,
+                        "chat_id": reply_chat_id,
+                        "content": attributed_content,
+                    });
+                    info!(
+                        session_id = %session_id,
+                        "delegate.merge: reflective surface — emitting send_reply to membrane"
+                    );
+                    let _ = self
+                        .ipc_client
+                        .send_request(IpcRequest::EmitTask {
+                            target_node: final_reply_to,
+                            target_role: final_reply_role,
+                            target_guest_id: final_reply_guest_id,
+                            task_json: surface_task.to_string(),
+                        })
+                        .await;
+                } else {
+                    // Specialist merge: emit paracrine_response back to the orchestrator.
+                    let merge_task = serde_json::json!({
+                        "action": "paracrine_response",
+                        "session_id": reply_session_id,
+                        "turn_id": turn_id,
+                        "chat_id": reply_chat_id,
+                        "content": attributed_content,
+                        "exosome": {
+                            "prompt": "",
+                            "paracrine_id": paracrine_id,
+                            "response_routing": response_routing,
+                            "source_session_id": reply_session_id,
+                            "source_chat_id": reply_chat_id,
+                        },
+                    });
+                    info!(
+                        session_id = %session_id,
+                        reply_session = %reply_session_id,
+                        "delegate.merge: emitting paracrine_response to orchestrator"
+                    );
+                    let _ = self
+                        .ipc_client
+                        .send_request(IpcRequest::EmitTask {
+                            target_node: final_reply_to,
+                            target_role: final_reply_role,
+                            target_guest_id: final_reply_guest_id,
+                            task_json: merge_task.to_string(),
+                        })
+                        .await;
+                }
 
                 // Return a tool result so the specialist's turn can continue or close.
                 let result_content = format!(
