@@ -5636,13 +5636,21 @@ impl AgentRuntime {
             .map(|t| t.scripted_loop_context.is_some())
             .unwrap_or(false);
 
+        // Only treat an incoming datasource response as the life.observe result when
+        // the response's own tool_name confirms it — prevents a co-occurring
+        // graph-datasource failure (tool_name="unknown") from completing a WaitingTool
+        // turn that is legitimately waiting for the life-graph-runner response.
+        let response_is_life_observe = matches!(
+            tool_result.tool_name.as_str(),
+            "life.observe" | ""
+        );
         let direct_life_observe_command = self
             .sessions
             .get(&session_id)
             .and_then(|s| s.active_turn.as_ref())
             .and_then(|turn| {
                 turn.pending_tool_call.as_ref().and_then(|call| {
-                    (call.tool_name == "life.observe")
+                    (call.tool_name == "life.observe" && response_is_life_observe)
                         .then(|| direct_life_observe_command_from_arguments(&call.arguments))
                         .flatten()
                 })
@@ -8300,6 +8308,19 @@ impl AgentRuntime {
             let pending_tool_name = active_turn
                 .and_then(|turn| turn.pending_tool_call.as_ref())
                 .map(|tool| tool.tool_name.clone());
+
+            // Drop error responses that have no routing context (empty turn_id + chat_id)
+            // and could not identify the originating tool (capability="unknown").
+            // These come from fire-and-forget datasource calls that fail asynchronously;
+            // routing them to the active turn would corrupt the pending tool result.
+            let has_no_context = task.turn_id.as_deref().filter(|s| !s.is_empty()).is_none()
+                && task.chat_id.as_deref().filter(|s| !s.is_empty()).is_none();
+            let is_unattributable_error = task.error.is_some()
+                && task.capability.as_deref().is_none_or(|c| c == "unknown");
+            if has_no_context && is_unattributable_error {
+                return Ok(());
+            }
+
             let turn_id = task
                 .turn_id
                 .clone()

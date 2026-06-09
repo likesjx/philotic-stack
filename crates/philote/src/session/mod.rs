@@ -1229,10 +1229,20 @@ impl SessionState {
         target_role: impl Into<String>,
         target_guest_id: Option<String>,
     ) {
+        // Preserve a specific guest_id already locked in by a transport (e.g. membrane-telegram).
+        // Internal re-entry messages (paracrine_response, tool_result) carry no guest_id, so
+        // they would wipe the membrane target and cause fan-out to all subscribers. Only
+        // overwrite guest_id when the caller provides a specific one.
+        let effective_guest_id = target_guest_id.or_else(|| {
+            self.bindings
+                .transport_reply_target
+                .as_ref()
+                .and_then(|t| t.target_guest_id.clone())
+        });
         self.bindings.transport_reply_target = Some(TransportReplyTargetBinding {
             target_node: target_node.into(),
             target_role: target_role.into(),
-            target_guest_id,
+            target_guest_id: effective_guest_id,
         });
     }
 

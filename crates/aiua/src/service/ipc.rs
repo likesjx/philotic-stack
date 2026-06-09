@@ -3238,6 +3238,11 @@ impl IpcServer {
                 }
                 continue;
             }
+            // turn_status is a progress update (e.g. "waiting_tool"), never the terminal reply.
+            // Skip it and keep waiting for send_reply.
+            if action == "turn_status" {
+                continue;
+            }
             break payload;
         };
         let reply_action = payload
