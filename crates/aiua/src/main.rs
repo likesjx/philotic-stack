@@ -4552,6 +4552,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             // pipelines, graph operations, etc.). Reduces Gemini context from
             // ~47 tool schemas to ~10-15 for typical orchestrator turns.
             on_demand_skills: vec![
+                "life.steward".into(),
                 "cron.manage".into(),
                 "observability.pipeline".into(),
                 "graph.knowledge".into(),

@@ -83,6 +83,14 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
 /// if ANY of its owning skills is active.
 pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
+        "life.steward" => &[
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.conflict",
+            "life.patch.propose",
+        ],
         "cron.manage" => &[
             "cron.register",
             "cron.list",
@@ -141,6 +149,22 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
 pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
     let t = turn_text;
     match skill_name {
+        "life.steward" => {
+            t.contains("life.")
+                || t.contains("lifegraph")
+                || t.contains("life graph")
+                || t.contains("openloop")
+                || t.contains("open loop")
+                || t.contains("signal node")
+                || t.contains("life.observe")
+                || t.contains("life.recall")
+                || t.contains("life.commit")
+                || t.contains("record this")
+                || t.contains("observe this")
+                || t.contains("note this")
+                || t.contains("remember this")
+                || t.contains("log this")
+        }
         "cron.manage" => {
             t.contains("cron")
                 || t.contains("schedule")
