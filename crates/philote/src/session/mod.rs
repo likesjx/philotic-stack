@@ -4107,7 +4107,11 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
             .into_iter()
             .collect::<Vec<_>>()
     } else {
-        bindings.effective_toolset.clone()
+        // Use default_visible_toolset so allowed_classes and skill grants expand
+        // alongside the explicit effective_toolset.  Without this, class-tagged tools
+        // (e.g. life.observe from the life_graph class) would be invisible even when
+        // the profile has allowed_classes: ["life_graph"] and a matching incarnation.
+        default_visible_toolset(bindings)
     };
 
     let catalog = tool_catalog();
@@ -6258,6 +6262,45 @@ mod tests {
             route.selection_reason.as_deref(),
             Some("life_graph_runner_route")
         );
+    }
+
+    #[test]
+    fn life_graph_class_routes_via_incarnation_when_effective_toolset_set() {
+        // Regression: when effective_toolset is non-empty and allowed_tool_runner_incarnations
+        // is also set (e.g. orchestrator profile), allowed_classes must still expand so that
+        // class-tagged tools like life.observe are visible and routed to the incarnation.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "operator-chat".into());
+        state.bindings.effective_toolset = vec!["echo".into(), "bash.exec".into()];
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.bindings.allowed_tool_runner_incarnations = vec![ToolRunnerIncarnationBinding {
+            incarnation_id: "vps-jane:life-graph-runner".into(),
+            runner_id: Some("vps-jane:life-graph-runner".into()),
+            hotel_id: Some("vps-jane".into()),
+            environment_id: None,
+            target_node: Some("vps-jane-aiua-01".into()),
+            target_role: Some("life-graph-runner".into()),
+            supported_tools: vec![
+                "life.observe".into(),
+                "life.recall".into(),
+                "life.commit".into(),
+            ],
+            execution_mode: "capability".into(),
+            availability_state: "live".into(),
+            selection_hint: None,
+        }];
+        state.rebuild_default_tool_assembly();
+
+        assert!(state.tool_is_enabled("echo"), "echo should still be enabled");
+        assert!(
+            state.tool_is_enabled("life.observe"),
+            "life.observe should be enabled via allowed_classes life_graph"
+        );
+        let route = state
+            .resolve_tool_route("life.observe")
+            .expect("life.observe route should be assembled from incarnation");
+        assert_eq!(route.incarnation_id.as_deref(), Some("vps-jane:life-graph-runner"));
+        assert_eq!(route.hotel_id.as_deref(), Some("vps-jane"));
     }
 
     #[test]

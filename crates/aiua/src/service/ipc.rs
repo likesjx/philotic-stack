@@ -848,6 +848,22 @@ fn project_effective_rights(bindings: &serde_json::Value) -> Vec<String> {
     let mut rights = Vec::new();
     rights.extend(toolset.iter().map(|tool_name| tool_right(tool_name)));
     rights.extend(skillset.iter().map(|skill_name| skill_right(skill_name)));
+    // Also project rights for tools that come from allowed_classes expansion.
+    // Without this, class-expanded tools (e.g. life_graph → life.*) would have no
+    // projected right and would be filtered out by the rights check in
+    // compose_tool_assembly_from_incarnations even though the class is explicitly allowed.
+    if let Some(classes) = bindings
+        .get("allowed_classes")
+        .and_then(serde_json::Value::as_array)
+    {
+        for class in classes {
+            if let Some(class_str) = class.as_str() {
+                for tool_name in tools_for_allowed_class(class_str) {
+                    rights.push(tool_right(tool_name));
+                }
+            }
+        }
+    }
     rights.extend(
         declared_component_capabilities(bindings)
             .into_iter()
@@ -3191,6 +3207,17 @@ impl IpcServer {
                 tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
                     .await
                     .map_err(|_| anyhow::anyhow!("timed out waiting for operator chat reply"))??;
+            // MuninnStatus and NetworkState are OOB hotel broadcasts that can arrive
+            // on any connection at any time — skip them, keep waiting for InboundTask.
+            if matches!(
+                reply,
+                IpcResponse::MuninnStatus { .. }
+                    | IpcResponse::NetworkState { .. }
+                    | IpcResponse::ApartmentUpdate { .. }
+                    | IpcResponse::GracefulShutdown { .. }
+            ) {
+                continue;
+            }
             let IpcResponse::InboundTask { task_json, .. } = reply else {
                 anyhow::bail!("unexpected operator chat reply envelope: {reply:?}");
             };
@@ -14144,7 +14171,12 @@ impl IpcServer {
                 .or_else(|| {
                     let source = payload.get("source").and_then(serde_json::Value::as_str)?;
                     let chat_id = payload.get("chat_id")?.as_str()?;
-                    Some(format!("{source}:{chat_id}:agent-jane-01"))
+                    let agent_id = payload
+                        .get("primary_agent_id")
+                        .or_else(|| payload.get("agent_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("agent-jane-01");
+                    Some(format!("{source}:{chat_id}:{agent_id}"))
                 }),
             turn_id: payload
                 .get("turn_id")
@@ -14154,7 +14186,14 @@ impl IpcServer {
                 .get("primary_agent_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
-                .or_else(|| Some("agent-jane-01".to_string())),
+                .or_else(|| {
+                    // agent_id is the canonical field in EmitTask payloads (e.g. operator_chat
+                    // tasks dispatched with agent_id but no primary_agent_id).
+                    payload
+                        .get("agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                }),
             source: payload
                 .get("source")
                 .and_then(serde_json::Value::as_str)

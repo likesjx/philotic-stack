@@ -3908,7 +3908,7 @@ impl AgentRuntime {
                 awaiting_transcription_reentry: false,
                 scripted_loop_context: None,
                 associated_paracrine_ids: Vec::new(),
-                paracrine_origin,
+                paracrine_origin: paracrine_origin.clone(),
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
@@ -3919,6 +3919,34 @@ impl AgentRuntime {
                 streaming_retry_attempts: 0,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
+
+            // Paracrine context: inject delegate.merge into execution_routes so the specialist
+            // can call it without needing it in her toolset profile. The tool is already injected
+            // into tools_for_model by project_tools_for_turn; this adds the matching route so
+            // execute_bound_tool can resolve it.
+            if paracrine_origin.is_some()
+                && !state
+                    .tool_assembly
+                    .execution_routes
+                    .contains_key("delegate.merge")
+            {
+                state.tool_assembly.execution_routes.insert(
+                    "delegate.merge".into(),
+                    ToolExecutionRoute {
+                        target_node: local_node_id(),
+                        target_role: "agent".into(),
+                        runner_id: None,
+                        incarnation_id: None,
+                        hotel_id: None,
+                        environment_id: None,
+                        task_runner_kind: None,
+                        task_runner_config: None,
+                        execution_mode: "local_agent".into(),
+                        availability_state: "live".into(),
+                        selection_reason: Some("paracrine_auto_inject".into()),
+                    },
+                );
+            }
 
             // Activate scripted loop if the current role has a loop_script configured.
             if let Some(loop_script) = state
