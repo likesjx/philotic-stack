@@ -2354,7 +2354,7 @@ impl AgentRuntime {
     /// On eviction: clear the active turn, persist a clean checkpoint, and send the
     /// user a brief notice so they know the session is unblocked.
     async fn evict_timed_out_turns(&mut self) {
-        const WAITING_MODEL_SECS: u64 = 120;
+        const WAITING_MODEL_SECS: u64 = 300;
         const THINKING_SECS: u64 = 90; // post-model, dispatching actions or building reply
         const WAITING_TOOL_SECS: u64 = 90;
         const WAITING_VOICE_SECS: u64 = 60;
