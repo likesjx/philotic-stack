@@ -6696,6 +6696,30 @@ impl IpcServer {
                 };
 
                 if is_subscribed {
+                    // Register the active incarnation so that model_responses for this
+                    // session route back to the correct specialist philote rather than
+                    // falling through to the orchestrator. Without this, a cross-hotel
+                    // paracrine turn's model_response is rerouted to bjork/orchestrator
+                    // because the session's active_incarnation_id was never set via mesh.
+                    if let (Some(guest_id), Some(session_id)) = (
+                        &target_guest_id,
+                        serde_json::from_str::<serde_json::Value>(data)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("session_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                            }),
+                    ) {
+                        if let Err(err) =
+                            Self::update_session_active_incarnation(graph, &session_id, guest_id)
+                        {
+                            warn!(
+                                "deliver_event_envelope_or_park: session activation skipped [{}]: {}",
+                                session_id, err
+                            );
+                        }
+                    }
                     Self::deliver_inbound_task(
                         inboxes,
                         &event.source_node_id,
