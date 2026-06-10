@@ -445,8 +445,17 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     role: config.guest_id.to_string(),
                                     supported_tools: Vec::new(),
                                 };
-                                let stream_ipc_opt =
-                                    PhiloticClient::connect(stream_identity).await.ok();
+                                // 5s timeout on the stream IPC connect: if aiua is busy
+                                // during a retry attempt (e.g. second attempt after first
+                                // timed out), connect could hang indefinitely because it
+                                // precedes the attempt_secs outer timeout on invoke_streaming.
+                                let stream_ipc_opt = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    PhiloticClient::connect(stream_identity),
+                                )
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok());
                                 let reply_clone = reply.clone();
                                 tokio::spawn(async move {
                                     let Some(mut stream_ipc) = stream_ipc_opt else {
@@ -464,14 +473,26 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                             "content": token,
                                         }))
                                         .unwrap_or_default();
-                                        let _ = stream_ipc
-                                            .send_request(IpcRequest::EmitTask {
+                                        // 10s timeout on the ACK from aiua: if the hotel is
+                                        // slow to respond, drop the connection rather than
+                                        // filling the channel and stalling invoke_streaming.
+                                        let send_result = tokio::time::timeout(
+                                            Duration::from_secs(10),
+                                            stream_ipc.send_request(IpcRequest::EmitTask {
                                                 target_node: reply_clone.reply_to.clone(),
                                                 target_role: reply_clone.reply_role.clone(),
                                                 target_guest_id: None,
                                                 task_json,
-                                            })
-                                            .await;
+                                            }),
+                                        )
+                                        .await;
+                                        if send_result.is_err() {
+                                            // Timeout or IPC error — stop forwarding tokens.
+                                            // Dropping token_rx makes future send() calls in
+                                            // invoke_streaming return Err immediately (no block).
+                                            warn!("streaming forwarder: send_request timeout, dropping stream");
+                                            break;
+                                        }
                                     }
                                 });
                                 tokio::time::timeout(

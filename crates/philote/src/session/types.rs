@@ -932,7 +932,7 @@ pub struct ContextWindowPolicy {
 }
 
 fn default_max_tool_result_chars() -> usize {
-    32_768
+    8_192
 }
 
 fn default_max_tool_history_entries() -> usize {
@@ -945,7 +945,7 @@ impl Default for ContextWindowPolicy {
             dialogue_window_minutes: 10,
             dialogue_window_chars: 10_000,
             include_tool_calls: true,
-            max_tool_result_chars: 32_768,
+            max_tool_result_chars: 8_192,
             max_tool_history_entries: 15,
         }
     }
