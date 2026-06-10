@@ -524,10 +524,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "agent_id": { "type": "string" },
                     "source_node_id": { "type": "string" },
                     "exported_at": { "type": "integer" },
-                    "preferences": { "type": "array" },
-                    "routing_preferences": { "type": "array" },
-                    "reflex_preferences": { "type": "array" },
-                    "declarations": { "type": "array" }
+                    "preferences": { "type": "array", "items": { "type": "object" } },
+                    "routing_preferences": { "type": "array", "items": { "type": "object" } },
+                    "reflex_preferences": { "type": "array", "items": { "type": "object" } },
+                    "declarations": { "type": "array", "items": { "type": "object" } }
                 },
                 "required": ["agent_id", "source_node_id", "exported_at", "preferences", "declarations"]
             }),
@@ -1827,7 +1827,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "description": "Ordered list of transform stages. Each stage has: capability (string), \
                                         mode ('blob'|'stream'), collect ('full'|'incremental'), \
                                         output_as ('replace_content'|'append_content'), \
-                                        on_failure ('passthrough'|'drop'|'error')."
+                                        on_failure ('passthrough'|'drop'|'error').",
+                        "items": { "type": "object" }
                     },
                     "deliver_as": {
                         "type": "string",
