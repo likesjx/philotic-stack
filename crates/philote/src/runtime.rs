@@ -3214,6 +3214,11 @@ impl AgentRuntime {
                             task.content.clone(),
                             Some("enriched_tool_result".into()),
                         );
+                        // Reset the iteration counter: the turn was waiting for an external
+                        // response, not thinking. Give it a fresh budget to process the reply.
+                        if let Some(turn) = state.active_turn.as_mut() {
+                            turn.iteration = 0;
+                        }
                     }
                 }
                 self.handle_tool_result(InboundTaskPayload {
@@ -8640,6 +8645,13 @@ impl AgentRuntime {
                 turn_loop_config: role_config.as_ref().map(|c| c.turn_loop_config.clone()),
             };
 
+            if let Some(cap) = activation
+                .turn_loop_config
+                .as_ref()
+                .and_then(|c| c.iteration_cap)
+            {
+                state.settings.execution.iteration_cap = cap.clamp(1, 50);
+            }
             state.role_activation = Some(activation);
             // Carry over the handoff context as the working summary for the new role.
             if let Some(summary) = bundle.working_summary {
@@ -15842,6 +15854,18 @@ impl AgentRuntime {
                             }
                         }
 
+                        // Apply iteration_cap from the restored role's turn_loop_config.
+                        // settings are not persisted in the checkpoint, so this must be
+                        // re-applied every time we restore.
+                        if let Some(cap) = state
+                            .role_activation
+                            .as_ref()
+                            .and_then(|ra| ra.turn_loop_config.as_ref())
+                            .and_then(|c| c.iteration_cap)
+                        {
+                            state.settings.execution.iteration_cap = cap.clamp(1, 50);
+                        }
+
                         self.sessions.insert(session_id.to_string(), state);
                         return Ok(());
                     }
@@ -15864,6 +15888,13 @@ impl AgentRuntime {
         // without requiring an explicit handoff.to_role call.
         if let Some(ref default_role) = self.default_agent_profile.default_role_name.clone() {
             if let Some(activation) = self.fetch_role_activation(default_role).await {
+                if let Some(cap) = activation
+                    .turn_loop_config
+                    .as_ref()
+                    .and_then(|c| c.iteration_cap)
+                {
+                    state.settings.execution.iteration_cap = cap.clamp(1, 50);
+                }
                 state.role_activation = Some(activation);
                 info!(
                     session_id = %session_id,
