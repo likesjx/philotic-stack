@@ -7572,6 +7572,7 @@ async fn main() -> Result<()> {
     // Extract writer thread clones
     let ledger_writer = ledger.clone();
     let tracker_writer = tracker.clone();
+    let local_node_id_writer = caps.node_id.clone();
 
     if flags.enable_rust_task_lifecycle {
         std::thread::spawn(move || {
@@ -7579,6 +7580,16 @@ async fn main() -> Result<()> {
             while let Some(cmd) = dispatcher_rx.blocking_recv() {
                 match cmd {
                     LedgerCommand::AppendLocal(mut evt) => {
+                        // Skip same-hotel events: they're delivered inline and don't need
+                        // durable storage (the outbound dispatcher only queries remote targets).
+                        let is_local = evt
+                            .target_node_id
+                            .as_deref()
+                            .map(|t| t == local_node_id_writer.as_str())
+                            .unwrap_or(true);
+                        if is_local {
+                            continue;
+                        }
                         if let Err(e) = ledger_writer.append_event(&mut evt) {
                             error!(
                                 "Failed to durably commit local event {}: {}",
@@ -7590,20 +7601,36 @@ async fn main() -> Result<()> {
                         events,
                         source_node: _,
                     } => {
-                        let mut max_seq = 0;
+                        // Track the highest LOCAL seq assigned by append_event (not the
+                        // source node's seq) so delete_delivered_events uses the right range.
+                        let mut local_max_seq = 0u64;
                         for mut evt in events {
-                            if evt.seq > max_seq {
-                                max_seq = evt.seq;
+                            match ledger_writer.append_event(&mut evt) {
+                                Ok(local_seq) => {
+                                    if local_seq > local_max_seq {
+                                        local_max_seq = local_seq;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to durably commit inbound event {}: {}",
+                                        evt.event_id, e
+                                    );
+                                }
                             }
-                            if let Err(e) = ledger_writer.append_event(&mut evt) {
-                                error!(
-                                    "Failed to durably commit inbound event {}: {}",
-                                    evt.event_id, e
+                        }
+                        // Events were delivered inline before commit; clean up immediately
+                        // so inbound events don't accumulate in the ledger indefinitely.
+                        if local_max_seq > 0 {
+                            if let Err(e) = ledger_writer
+                                .delete_delivered_events(&local_node_id_writer, local_max_seq)
+                            {
+                                warn!(
+                                    "Failed to vacuum inbound events (seq <= {}): {}",
+                                    local_max_seq, e
                                 );
                             }
                         }
-                        // Typically we would now trigger an ACK back to source_node with max_seq
-                        // For MVP, that logic is built into the mesh receiver hook.
                     }
                     LedgerCommand::ProcessAck {
                         consumer_node_id,
@@ -7625,6 +7652,15 @@ async fn main() -> Result<()> {
                                 "Cursor for node {} advanced to seq {}",
                                 consumer_node_id, acked_seq
                             );
+                            // Delete outbound events for this node that have been acked.
+                            if let Err(e) = ledger_writer
+                                .delete_delivered_events(&consumer_node_id, acked_seq)
+                            {
+                                warn!(
+                                    "Failed to vacuum delivered events for node {} (seq <= {}): {}",
+                                    consumer_node_id, acked_seq, e
+                                );
+                            }
                         }
                     }
                 }

@@ -213,6 +213,15 @@ impl EventStorage for SqliteEventStorage {
 
         Ok(events)
     }
+
+    fn delete_delivered_events(&self, target_node_id: &str, max_seq: u64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM mesh_events WHERE target_node_id = ?1 AND seq <= ?2",
+            params![target_node_id, max_seq],
+        )?;
+        Ok(n)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════

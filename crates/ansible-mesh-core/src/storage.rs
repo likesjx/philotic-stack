@@ -32,6 +32,10 @@ pub trait EventStorage: Send + Sync {
         cursor_seq: u64,
         limit: u32,
     ) -> Result<Vec<EventEnvelope>>;
+
+    /// Delete all events targeting `target_node_id` with `seq <= max_seq`.
+    /// Called after a remote node ACKs delivery (ProcessAck) to reclaim ledger space.
+    fn delete_delivered_events(&self, target_node_id: &str, max_seq: u64) -> Result<usize>;
 }
 
 // ──────────────────────────────────────────────────────────────────────
