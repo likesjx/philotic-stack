@@ -3786,91 +3786,12 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         })
         .collect::<Vec<_>>();
 
-    let local_node_id = local_node_id();
-    let graph_datasource_node_id = graph_datasource_node_id();
-    let life_graph_runner_node_id = life_graph_runner_node_id();
     let execution_routes = toolset
         .iter()
         .map(|tool_name| {
-            let execution_mode = if is_local_agent_tool(tool_name) {
-                "local_agent"
-            } else if is_agent_graph_tool(tool_name) {
-                "agent_graph"
-            } else if is_graph_datasource_tool(tool_name) {
-                "datasource"
-            } else if is_life_graph_tool(tool_name) {
-                "life_graph"
-            } else if is_table_datasource_tool(tool_name) {
-                "table_datasource"
-            } else if is_capability_primitive(tool_name) {
-                "capability_invoke"
-            } else if is_pinned_tool(tool_name) {
-                "pinned"
-            } else {
-                "capability"
-            };
             (
                 tool_name.clone(),
-                ToolExecutionRoute {
-                    target_node: if execution_mode == "datasource" {
-                        graph_datasource_node_id.clone()
-                    } else if execution_mode == "life_graph" {
-                        life_graph_runner_node_id.clone()
-                    } else {
-                        local_node_id.clone()
-                    },
-                    target_role: if execution_mode == "local_agent" {
-                        "agent".into()
-                    } else if execution_mode == "agent_graph" {
-                        "agent-graph".into()
-                    } else if execution_mode == "datasource" {
-                        "graph-datasource".into()
-                    } else if execution_mode == "life_graph" {
-                        "life-graph-runner".into()
-                    } else if execution_mode == "table_datasource" {
-                        "table-datasource".into()
-                    } else if execution_mode == "capability_invoke" {
-                        // Hotel routes CapabilityInvoke to the best provider — target_role is unused.
-                        String::new()
-                    } else {
-                        format!("tool.{tool_name}")
-                    },
-                    runner_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
-                    {
-                        None
-                    } else {
-                        Some("tool-runner-01".into())
-                    },
-                    incarnation_id: None,
-                    hotel_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
-                    {
-                        None
-                    } else {
-                        Some(local_node_id.clone())
-                    },
-                    environment_id: None,
-                    task_runner_kind: task_runner_kind_for_tool(tool_name),
-                    task_runner_config: task_runner_base_config_for_tool(bindings, tool_name),
-                    execution_mode: execution_mode.into(),
-                    availability_state: "live".into(),
-                    selection_reason: Some(if execution_mode == "local_agent" {
-                        "agent_local_tool".into()
-                    } else if execution_mode == "agent_graph" {
-                        "agent_graph_route".into()
-                    } else if execution_mode == "datasource" {
-                        "graph_datasource_route".into()
-                    } else if execution_mode == "life_graph" {
-                        "life_graph_runner_route".into()
-                    } else if execution_mode == "table_datasource" {
-                        "table_datasource_route".into()
-                    } else if execution_mode == "capability_invoke" {
-                        "capability_invoke_route".into()
-                    } else if execution_mode == "pinned" {
-                        "default_pinned_route".into()
-                    } else {
-                        "default_capability_route".into()
-                    }),
-                },
+                default_execution_route_for_tool(bindings, tool_name),
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -4143,7 +4064,9 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
     let execution_routes = visible_tools
         .iter()
         .filter_map(|tool_name| {
-            select_incarnation_route(bindings, tool_name).map(|route| (tool_name.clone(), route))
+            let route = select_incarnation_route(bindings, tool_name)
+                .unwrap_or_else(|| default_execution_route_for_tool(bindings, tool_name));
+            Some((tool_name.clone(), route))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
 
@@ -4164,6 +4087,91 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
         tools_for_model,
         execution_routes,
         policy_annotations,
+    }
+}
+
+fn default_execution_route_for_tool(
+    bindings: &SessionBindings,
+    tool_name: &str,
+) -> ToolExecutionRoute {
+    let local_node_id = local_node_id();
+    let graph_datasource_node_id = graph_datasource_node_id();
+    let life_graph_runner_node_id = life_graph_runner_node_id();
+    let execution_mode = if is_local_agent_tool(tool_name) {
+        "local_agent"
+    } else if is_agent_graph_tool(tool_name) {
+        "agent_graph"
+    } else if is_graph_datasource_tool(tool_name) {
+        "datasource"
+    } else if is_life_graph_tool(tool_name) {
+        "life_graph"
+    } else if is_table_datasource_tool(tool_name) {
+        "table_datasource"
+    } else if is_capability_primitive(tool_name) {
+        "capability_invoke"
+    } else if is_pinned_tool(tool_name) {
+        "pinned"
+    } else {
+        "capability"
+    };
+
+    ToolExecutionRoute {
+        target_node: if execution_mode == "datasource" {
+            graph_datasource_node_id
+        } else if execution_mode == "life_graph" {
+            life_graph_runner_node_id
+        } else {
+            local_node_id.clone()
+        },
+        target_role: if execution_mode == "local_agent" {
+            "agent".into()
+        } else if execution_mode == "agent_graph" {
+            "agent-graph".into()
+        } else if execution_mode == "datasource" {
+            "graph-datasource".into()
+        } else if execution_mode == "life_graph" {
+            "life-graph-runner".into()
+        } else if execution_mode == "table_datasource" {
+            "table-datasource".into()
+        } else if execution_mode == "capability_invoke" {
+            // Hotel routes CapabilityInvoke to the best provider; target_role is unused.
+            String::new()
+        } else {
+            format!("tool.{tool_name}")
+        },
+        runner_id: if execution_mode == "local_agent" || execution_mode == "agent_graph" {
+            None
+        } else {
+            Some("tool-runner-01".into())
+        },
+        incarnation_id: None,
+        hotel_id: if execution_mode == "local_agent" || execution_mode == "agent_graph" {
+            None
+        } else {
+            Some(local_node_id)
+        },
+        environment_id: None,
+        task_runner_kind: task_runner_kind_for_tool(tool_name),
+        task_runner_config: task_runner_base_config_for_tool(bindings, tool_name),
+        execution_mode: execution_mode.into(),
+        availability_state: "live".into(),
+        selection_reason: Some(if execution_mode == "local_agent" {
+            "agent_local_tool".into()
+        } else if execution_mode == "agent_graph" {
+            "agent_graph_route".into()
+        } else if execution_mode == "datasource" {
+            "graph_datasource_route".into()
+        } else if execution_mode == "life_graph" {
+            "life_graph_runner_route".into()
+        } else if execution_mode == "table_datasource" {
+            "table_datasource_route".into()
+        } else if execution_mode == "capability_invoke" {
+            "capability_invoke_route".into()
+        } else if execution_mode == "pinned" {
+            "default_pinned_route".into()
+        } else {
+            "default_capability_route".into()
+        }),
     }
 }
 
@@ -6320,6 +6328,48 @@ mod tests {
             Some("vps-jane:life-graph-runner")
         );
         assert_eq!(route.hotel_id.as_deref(), Some("vps-jane"));
+    }
+
+    #[test]
+    fn incarnation_assembly_preserves_local_agent_routes() {
+        // Regression: binding a remote LifeGraph runner must not make local-agent tools
+        // visible without routes. Beacon hit this as: "Tool role.list has no assembled
+        // execution route" after life_graph runner bindings were seeded.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon-01".into(), "telegram".into());
+        state.bindings.effective_toolset = vec!["role.list".into()];
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.bindings.allowed_tool_runner_incarnations = vec![ToolRunnerIncarnationBinding {
+            incarnation_id: "vps-jane:life-graph-runner".into(),
+            runner_id: Some("vps-jane:life-graph-runner".into()),
+            hotel_id: Some("vps-jane".into()),
+            environment_id: None,
+            target_node: Some("vps-jane-aiua-01".into()),
+            target_role: Some("life-graph-runner".into()),
+            supported_tools: vec![
+                "life.observe".into(),
+                "life.recall".into(),
+                "life.commit".into(),
+            ],
+            execution_mode: "capability".into(),
+            availability_state: "live".into(),
+            selection_hint: None,
+        }];
+        state.rebuild_default_tool_assembly();
+
+        let role_route = state
+            .resolve_tool_route("role.list")
+            .expect("role.list should keep its local-agent route");
+        assert_eq!(role_route.execution_mode, "local_agent");
+        assert_eq!(role_route.target_role, "agent");
+
+        let life_route = state
+            .resolve_tool_route("life.observe")
+            .expect("life.observe should still route to the runner incarnation");
+        assert_eq!(
+            life_route.incarnation_id.as_deref(),
+            Some("vps-jane:life-graph-runner")
+        );
     }
 
     #[test]
