@@ -70,6 +70,15 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "graph.drop",
             "graph.grant_access",
         ],
+        "life.steward" => &[
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.conflict",
+            "life.patch.propose",
+        ],
+        "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
         "imessage-monitor" => &["bash.exec"],
         _ => &[],
     }
@@ -91,6 +100,7 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "life.conflict",
             "life.patch.propose",
         ],
+        "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
         "cron.manage" => &[
             "cron.register",
             "cron.list",
@@ -164,6 +174,17 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("note this")
                 || t.contains("remember this")
                 || t.contains("log this")
+        }
+        "lifegraph.truth_summarizer" => {
+            t.contains("lifegraph")
+                || t.contains("life graph")
+                || t.contains("what is in my graph")
+                || t.contains("what's in my graph")
+                || t.contains("summarize my graph")
+                || t.contains("roles")
+                || t.contains("habits")
+                || t.contains("systems")
+                || t.contains("goals")
         }
         "cron.manage" => {
             t.contains("cron")

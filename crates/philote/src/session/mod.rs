@@ -42,7 +42,7 @@ fn life_graph_runner_node_id() -> String {
                 .filter(|v| !v.is_empty())
                 .map(|hotel| format!("{hotel}-aiua-01"))
         })
-        .unwrap_or_else(local_node_id)
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
 }
 
 fn local_agent_id() -> String {
@@ -6279,8 +6279,11 @@ mod tests {
         // Regression: when effective_toolset is non-empty and allowed_tool_runner_incarnations
         // is also set (e.g. orchestrator profile), allowed_classes must still expand so that
         // class-tagged tools like life.observe are visible and routed to the incarnation.
-        let mut state =
-            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "operator-chat".into());
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-bjork-01".into(),
+            "operator-chat".into(),
+        );
         state.bindings.effective_toolset = vec!["echo".into(), "bash.exec".into()];
         state.bindings.allowed_classes = vec!["life_graph".into()];
         state.bindings.allowed_tool_runner_incarnations = vec![ToolRunnerIncarnationBinding {
@@ -6301,7 +6304,10 @@ mod tests {
         }];
         state.rebuild_default_tool_assembly();
 
-        assert!(state.tool_is_enabled("echo"), "echo should still be enabled");
+        assert!(
+            state.tool_is_enabled("echo"),
+            "echo should still be enabled"
+        );
         assert!(
             state.tool_is_enabled("life.observe"),
             "life.observe should be enabled via allowed_classes life_graph"
@@ -6309,7 +6315,10 @@ mod tests {
         let route = state
             .resolve_tool_route("life.observe")
             .expect("life.observe route should be assembled from incarnation");
-        assert_eq!(route.incarnation_id.as_deref(), Some("vps-jane:life-graph-runner"));
+        assert_eq!(
+            route.incarnation_id.as_deref(),
+            Some("vps-jane:life-graph-runner")
+        );
         assert_eq!(route.hotel_id.as_deref(), Some("vps-jane"));
     }
 

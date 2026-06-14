@@ -86,6 +86,11 @@ philotic_graph_provider: "{{ 'memgraph' if philotic_memgraph_enabled else 'sqlit
 philotic_memgraph_user: ""
 philotic_memgraph_db: ""
 
+# Central LifeGraph runner placement. Hotels may run local philotes while routing
+# life.* tools to the canonical vps-jane runner over the mesh.
+philotic_life_graph_runner_home_node: "vps-jane-aiua-01"
+philotic_remote_life_graph_runner_node: "{{ philotic_life_graph_runner_home_node }}"
+
 # Log level
 philotic_rust_log: "info"
 

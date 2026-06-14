@@ -4389,6 +4389,47 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "life.steward".into(),
+            description: "Use the operator's LifeGraph as a first-class continuity surface. \
+                          Record grounded observations with life.observe, retrieve relevant open \
+                          loops and commitments with life.recall, commit or resolve validated \
+                          facts when appropriate, and propose governed LifeGraph patches when the \
+                          graph, skill, or policy surface needs to grow."
+                .into(),
+            implied_tools: vec![
+                "life.observe".into(),
+                "life.recall".into(),
+                "life.commit".into(),
+                "life.resolve".into(),
+                "life.conflict".into(),
+                "life.patch.propose".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            skill_markers: vec!["governed".into(), "life_graph".into()],
+            field_sources: serde_json::json!({
+                "repo_skill_path": "skills/lifegraph-truth-summarizer/SKILL.md",
+                "workflow": "life.recall -> provenance audit -> life.observe/life.commit/life.resolve/life.patch.propose"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "lifegraph.truth_summarizer".into(),
+            description: "Summarize LifeGraph state with provenance discipline. Separate confirmed \
+                          graph facts from seeded placeholders, inferred intent, and recommended \
+                          next structure before presenting the operator with a planning picture."
+                .into(),
+            implied_tools: vec!["life.recall".into(), "graph.query".into()],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Draft,
+            skill_markers: vec!["governed".into(), "provenance_required".into()],
+            field_sources: serde_json::json!({
+                "required_fields": ["question"],
+                "optional_fields": ["focus_label", "focus_role", "include_next_steps"],
+                "repo_skill_path": "skills/lifegraph-truth-summarizer/SKILL.md",
+                "workflow": "life.recall or graph query -> provenance audit -> truth-banded summary"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "context.synthesize".into(),
             description: "Restore session continuity at the start of a new conversation or after \
                           context compaction. Pull current state from hotel (session.status, \
@@ -4553,6 +4594,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             // ~47 tool schemas to ~10-15 for typical orchestrator turns.
             on_demand_skills: vec![
                 "life.steward".into(),
+                "lifegraph.truth_summarizer".into(),
                 "cron.manage".into(),
                 "observability.pipeline".into(),
                 "graph.knowledge".into(),
@@ -4581,13 +4623,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.create".into(),
                 "graph.list".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "life_graph".into()],
             allowed_skills: vec![
                 "handoff.back".into(),
                 "capability.request".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
                 "graph.knowledge".into(),
+                "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
@@ -4604,13 +4647,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.create".into(),
                 "graph.list".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
                 "handoff.back".into(),
                 "capability.request".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
                 "graph.knowledge".into(),
+                "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
@@ -4627,11 +4671,12 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.create".into(),
                 "graph.list".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
                 "capability.request".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
+                "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
@@ -4707,6 +4752,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron".into(),
                 "mcp".into(),
                 "desktop".into(),
+                "life_graph".into(),
             ],
             allowed_skills: vec![
                 "skill.crafting".into(),
@@ -4725,6 +4771,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.manage".into(),
                 "context.synthesize".into(),
                 "profile.manage".into(),
+                "life.steward".into(),
+                "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
@@ -4751,19 +4799,63 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.create".into(),
                 "graph.list".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into(), "agent_graph".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into(), "agent_graph".into(), "life_graph".into()],
             allowed_skills: vec![
                 "handoff.back".into(),
                 "capability.request".into(),
                 "memory.fix".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
+                "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
             description: Some(
                 "Architect specialist role profile — systems, infrastructure, debugging. \
                  bash.exec requires operator approval."
+                    .into(),
+            ),
+        },
+        ToolsetProfileRecord {
+            profile_name: "brain".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "hotel.status".into(),
+                "hotel.logs".into(),
+                "echo".into(),
+                "skill.list".into(),
+                "role.list".into(),
+                "workspace.list".into(),
+                "workspace.read".into(),
+                "memory.recall".into(),
+                "memory.remember".into(),
+                "agent.graph.read".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
+            ],
+            allowed_classes: vec![
+                "session".into(),
+                "utility".into(),
+                "workspace".into(),
+                "memory".into(),
+                "graph".into(),
+                "agent_graph".into(),
+                "life_graph".into(),
+            ],
+            allowed_skills: vec![
+                "handoff.back".into(),
+                "capability.request".into(),
+                "memory.fix".into(),
+                "context.synthesize".into(),
+                "session.recover".into(),
+                "graph.knowledge".into(),
+                "lifegraph.truth_summarizer".into(),
+            ],
+            on_demand_skills: vec![],
+            remote_tool_runners: vec![],
+            description: Some(
+                "Brain specialist role profile — synthesis, memory, graph reasoning, and LifeGraph context."
                     .into(),
             ),
         },
@@ -4778,11 +4870,12 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.create".into(),
                 "graph.list".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
                 "handoff.back".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
+                "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
@@ -4798,9 +4891,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
         graph.upsert_toolset_profile(profile)?;
     }
 
-    // If PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE is set, seed the orchestrator
+    // If PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE is set, seed every LifeGraph-capable
     // profile with a remote_tool_runners entry pointing at the life-graph-runner
-    // on that node.  This is deployment-specific and intentionally not hardcoded
+    // on that node. This is deployment-specific and intentionally not hardcoded
     // into the static profile array above.
     if let Ok(remote_node) = std::env::var("PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE") {
         let remote_node = remote_node.trim().to_string();
@@ -4828,23 +4921,29 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 ],
                 "execution_mode": "capability"
             });
-            if let Ok(Some(mut orchestrator)) = graph.get_toolset_profile("orchestrator") {
-                let already_present = orchestrator
-                    .remote_tool_runners
+            for mut profile in graph.list_toolset_profiles()? {
+                if !profile
+                    .allowed_classes
                     .iter()
-                    .any(|r| {
-                        r.get("incarnation_id").and_then(|v| v.as_str())
-                            == Some(runner_incarnation_id.as_str())
-                    });
-                if !already_present {
-                    orchestrator.remote_tool_runners.push(runner);
-                    graph.upsert_toolset_profile(&orchestrator)?;
-                    tracing::info!(
-                        node = %remote_node,
-                        hotel = %hotel_id,
-                        "seeded remote life-graph-runner into orchestrator profile"
-                    );
+                    .any(|class| class == "life_graph")
+                {
+                    continue;
                 }
+                let already_present = profile.remote_tool_runners.iter().any(|r| {
+                    r.get("incarnation_id").and_then(|v| v.as_str())
+                        == Some(runner_incarnation_id.as_str())
+                });
+                if already_present {
+                    continue;
+                }
+                profile.remote_tool_runners.push(runner.clone());
+                graph.upsert_toolset_profile(&profile)?;
+                tracing::info!(
+                    node = %remote_node,
+                    hotel = %hotel_id,
+                    profile = %profile.profile_name,
+                    "seeded remote life-graph-runner into LifeGraph-capable profile"
+                );
             }
         }
     }
@@ -7653,8 +7752,8 @@ async fn main() -> Result<()> {
                                 consumer_node_id, acked_seq
                             );
                             // Delete outbound events for this node that have been acked.
-                            if let Err(e) = ledger_writer
-                                .delete_delivered_events(&consumer_node_id, acked_seq)
+                            if let Err(e) =
+                                ledger_writer.delete_delivered_events(&consumer_node_id, acked_seq)
                             {
                                 warn!(
                                     "Failed to vacuum delivered events for node {} (seq <= {}): {}",

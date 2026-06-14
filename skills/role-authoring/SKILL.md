@@ -115,7 +115,7 @@ Provide when available or needed:
 | Field | Required | Notes |
 |---|---|---|
 | `role_name` | Yes | Snake_case or kebab-case. Must be unique per agent. |
-| `toolset_profile` | Yes | One of: `orchestrator`, `admin`, `codex`, `research`, `utility`. |
+| `toolset_profile` | Yes | One of the seeded profiles: `orchestrator`, `admin`, `codex`, `research`, `utility`, `architect`, `brain`, or `virtuoso`. Prefer the narrowest profile that can serve the role. |
 | `reasoning.purpose` | Yes | What this role is for — 1–2 sentences. |
 | `reasoning.toolset_rationale` | Yes | Why this toolset profile was chosen. |
 | `reasoning.handoff_posture_and_limits` | Yes | When and how to hand back to orchestrator. |
