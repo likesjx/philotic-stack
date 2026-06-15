@@ -5265,6 +5265,35 @@ mod tests {
     }
 
     #[test]
+    fn cron_register_catalog_entry_exposes_required_contract() {
+        use crate::catalog::tool_catalog;
+        let catalog = tool_catalog();
+        let entry = catalog
+            .get("cron.register")
+            .expect("cron.register in catalog");
+        let required = entry
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required array");
+        for name in ["schedule", "target_role", "payload"] {
+            assert!(
+                required.iter().any(|v| v.as_str() == Some(name)),
+                "{name} must be required for cron.register"
+            );
+        }
+        let props = entry
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties object");
+        assert!(props.contains_key("schedule"));
+        assert!(props.contains_key("target_role"));
+        assert!(props.contains_key("payload"));
+        assert_eq!(entry.class.as_deref(), Some("cron"));
+    }
+
+    #[test]
     fn catalog_exposes_agent_graph_and_graph_schema_surface() {
         use crate::catalog::tool_catalog;
         let catalog = tool_catalog();

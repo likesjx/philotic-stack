@@ -1017,6 +1017,80 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "cron.register".into(),
+        ToolDefinition {
+            tool_name: "cron.register".into(),
+            description: "Register a cron job on the hotel. Use cron.list first to avoid \
+                          duplicates. The schedule is a 7-field cron expression and the payload \
+                          is a JSON string delivered to the target role."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schedule": {
+                        "type": "string",
+                        "description": "7-field cron expression: <sec> <min> <hour> <dom> <month> <dow> <year>. Example: \"0 0 7 * * * *\" for 7:00 AM daily."
+                    },
+                    "target_role": {
+                        "type": "string",
+                        "description": "Role name whose inbox receives the trigger payload, such as orchestrator."
+                    },
+                    "payload": {
+                        "type": "string",
+                        "description": "JSON payload string delivered to the role. Include enough context for the recipient to act without extra lookup."
+                    },
+                    "guaranteed": {
+                        "type": "boolean",
+                        "description": "Mesh-coordinated delivery flag. Optional; defaults to false."
+                    }
+                },
+                "required": ["schedule", "target_role", "payload"]
+            }),
+            class: Some("cron".into()),
+        },
+    );
+
+    m.insert(
+        "cron.list".into(),
+        ToolDefinition {
+            tool_name: "cron.list".into(),
+            description: "List cron jobs registered on this hotel, including schedule, target \
+                          role, enabled state, and next fire time."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("cron".into()),
+        },
+    );
+
+    for (tool_name, verb) in [
+        ("cron.enable", "Re-enable"),
+        ("cron.disable", "Disable"),
+        ("cron.remove", "Remove"),
+    ] {
+        m.insert(
+            tool_name.into(),
+            ToolDefinition {
+                tool_name: tool_name.into(),
+                description: format!("{verb} a cron job by id."),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "The cron job UUID."
+                        }
+                    },
+                    "required": ["job_id"]
+                }),
+                class: Some("cron".into()),
+            },
+        );
+    }
+
+    m.insert(
         "skill.register".into(),
         ToolDefinition {
             tool_name: "skill.register".into(),
