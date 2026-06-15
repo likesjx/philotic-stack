@@ -3989,6 +3989,11 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "router.stats"
             | "vision.setup"
             | "vision.status"
+            | "cron.register"
+            | "cron.list"
+            | "cron.enable"
+            | "cron.disable"
+            | "cron.remove"
     )
 }
 
@@ -5981,6 +5986,20 @@ mod tests {
         assert!(projected_names.contains("skill.assign"));
         assert!(projected_names.contains("handoff.to_role"));
         assert!(projected_names.contains("cron.register"));
+        assert_eq!(
+            state
+                .resolve_tool_route("cron.list")
+                .expect("cron.list should have an execution route")
+                .execution_mode,
+            "local_agent"
+        );
+        assert_eq!(
+            state
+                .resolve_tool_route("cron.register")
+                .expect("cron.register should have an execution route")
+                .execution_mode,
+            "local_agent"
+        );
 
         let affordances = state.model_affordances_for_turn(user_content, &projected);
         let projected_skills = affordances["skills"]
