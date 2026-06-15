@@ -4683,6 +4683,34 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             description: Some("Bare utility profile — session and echo only.".into()),
         },
         ToolsetProfileRecord {
+            profile_name: "scheduler".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "skill.list".into(),
+                "role.list".into(),
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
+            ],
+            allowed_classes: vec!["session".into(), "utility".into(), "cron".into()],
+            allowed_skills: vec![
+                "handoff.back".into(),
+                "capability.request".into(),
+                "context.synthesize".into(),
+                "session.recover".into(),
+                "cron.manage".into(),
+            ],
+            on_demand_skills: vec![],
+            remote_tool_runners: vec![],
+            description: Some(
+                "Scheduler specialist role profile — narrow cron scheduling and handoff-back authority."
+                    .into(),
+            ),
+        },
+        ToolsetProfileRecord {
             profile_name: "admin".into(),
             allowed_tools: vec![
                 "session.status".into(),
