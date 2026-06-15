@@ -5792,22 +5792,32 @@ impl IpcServer {
         target_guest_id: Option<String>,
         task_json: &str,
     ) -> AgentRouteResolution {
-        if target_role != "agent" || target_guest_id.is_some() {
+        if target_role != "agent" {
             return AgentRouteResolution::Deliver(target_guest_id);
         }
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
-            return AgentRouteResolution::Deliver(None);
+            return AgentRouteResolution::Deliver(target_guest_id);
         };
         let session_id = payload
             .get("session_id")
             .and_then(serde_json::Value::as_str);
         let Some(session_id) = session_id else {
-            return AgentRouteResolution::Deliver(None);
+            return AgentRouteResolution::Deliver(target_guest_id);
         };
         let session = graph.get_session(session_id).ok().flatten();
         let Some(session) = session else {
-            return AgentRouteResolution::Deliver(None);
+            return AgentRouteResolution::Deliver(target_guest_id);
         };
+        if let Some(explicit_guest_id) = target_guest_id.as_deref() {
+            let targets_base_agent = session
+                .primary_agent_id
+                .as_deref()
+                .map(|agent_id| explicit_guest_id == agent_id)
+                .unwrap_or(false);
+            if !targets_base_agent {
+                return AgentRouteResolution::Deliver(target_guest_id);
+            }
+        }
         let local_hotel_name = Self::local_hotel_name(graph, local_node_id);
 
         let live_agent_guests: Vec<String> = {
@@ -17950,6 +17960,114 @@ mod tests {
             .await
             .is_err(),
             "stale embedded delivery_target_guest_id must not receive the task"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_routes_base_agent_target_to_active_incarnation() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-base-target".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:developer".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut base_agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("base agent connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let task_payload = serde_json::json!({
+            "session_id": "sess-role-base-target",
+            "source": "telegram",
+            "chat_id": "123",
+            "content": "route base target to active developer"
+        })
+        .to_string();
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-jane-01".into()),
+                task_json: task_payload,
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
+                .await
+                .expect("developer should receive task before timeout")
+                .expect("developer recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route base target to active developer");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
+            }
+            other => panic!("unexpected developer inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(200), base_agent.recv_task())
+                .await
+                .is_err(),
+            "base-agent target must follow the active incarnation instead"
         );
 
         unsafe {
