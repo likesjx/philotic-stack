@@ -236,6 +236,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
         "role.governance" => {
             t.contains("create role")
                 || t.contains("update role")
+                || (t.contains("provision") && t.contains("role"))
+                || (t.contains("equip") && t.contains("role"))
                 || t.contains("configure agent")
                 || t.contains("best place to run")
                 || t.contains("place role")
@@ -248,6 +250,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
             t.contains("create role")
                 || t.contains("update role")
                 || t.contains("author role")
+                || (t.contains("provision") && t.contains("role"))
+                || (t.contains("equip") && t.contains("role"))
                 || t.contains("role.create")
                 || t.contains("role manifest")
                 || t.contains("new role")
@@ -260,6 +264,9 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("create skill")
                 || t.contains("add skill")
                 || t.contains("assign skill")
+                || (t.contains("equip") && t.contains("skill"))
+                || t.contains("with skill")
+                || t.contains("cron.manage")
                 || t.contains("revoke skill")
         }
         "context.synthesize" => {

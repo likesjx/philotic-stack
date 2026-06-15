@@ -5862,6 +5862,58 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_role_provisioning_projects_authoring_and_skill_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        state.clear_tool_bindings();
+        for tool in [
+            "role.list",
+            "role.create_or_update",
+            "skill.list",
+            "skill.register",
+            "skill.assign",
+            "cron.register",
+            "cron.list",
+        ] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.effective_skillset = vec![
+            "handoff.to_role".into(),
+            "role.authoring".into(),
+            "skill.authoring".into(),
+            "cron.manage".into(),
+        ];
+        state.bindings.on_demand_skills = vec![
+            "role.authoring".into(),
+            "skill.authoring".into(),
+            "cron.manage".into(),
+        ];
+
+        let user_content =
+            "Provision the Chronos role and equip her with the cron.manage skill for scheduling.";
+        let projected = state.project_tools_for_turn(user_content);
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(projected_names.contains("role.create_or_update"));
+        assert!(projected_names.contains("skill.assign"));
+        assert!(projected_names.contains("cron.register"));
+
+        let affordances = state.model_affordances_for_turn(user_content, &projected);
+        let projected_skills = affordances["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|skill| skill["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(projected_skills.contains("role.authoring"));
+        assert!(projected_skills.contains("skill.authoring"));
+        assert!(projected_skills.contains("cron.manage"));
+    }
+
+    #[test]
     fn same_identity_handoff_bundle_carries_live_session_context() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
