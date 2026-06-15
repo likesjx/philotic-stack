@@ -789,8 +789,13 @@ fn attach_delivery_context(
     obj.entry("delivery_target_role".to_string())
         .or_insert_with(|| serde_json::json!(target_role));
     if let Some(target_guest_id) = target_guest_id {
-        obj.entry("delivery_target_guest_id".to_string())
-            .or_insert_with(|| serde_json::json!(target_guest_id));
+        // The router has already resolved the canonical destination for this
+        // envelope. Replace any stale embedded delivery hint so a role switch
+        // cannot split the user turn and model response across two philotes.
+        obj.insert(
+            "delivery_target_guest_id".to_string(),
+            serde_json::json!(target_guest_id),
+        );
     }
     serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
 }
@@ -17260,6 +17265,7 @@ mod tests {
                 allowed_classes: vec!["session".into(), "workspace".into()],
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: Some("Codex specialist role profile — workspace read access.".into()),
             })
             .expect("seed toolset profile");
@@ -17832,6 +17838,118 @@ mod tests {
             .await
             .is_err(),
             "orchestrator should not receive task when developer is active incarnation"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_overwrites_stale_embedded_guest_with_active_incarnation() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-stale-guest".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:developer".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let task_payload = serde_json::json!({
+            "session_id": "sess-role-stale-guest",
+            "source": "telegram",
+            "chat_id": "123",
+            "content": "route to active developer",
+            "delivery_target_guest_id": "agent-jane:orchestrator"
+        })
+        .to_string();
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: task_payload,
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
+                .await
+                .expect("developer should receive task before timeout")
+                .expect("developer recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route to active developer");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
+            }
+            other => panic!("unexpected developer inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                orchestrator.recv_task()
+            )
+            .await
+            .is_err(),
+            "stale embedded delivery_target_guest_id must not receive the task"
         );
 
         unsafe {
@@ -20885,6 +21003,7 @@ mod tests {
                 allowed_classes: vec!["session".into()],
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("toolset profile should seed");
@@ -23921,6 +24040,7 @@ mod tests {
                 allowed_classes: vec!["workflow".into()],
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: Some("Implementation-focused role lens.".into()),
             })
             .expect("toolset profile should seed");
@@ -28318,6 +28438,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed toolset profile");
@@ -28415,6 +28536,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec!["research".into(), "handoff.back".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed toolset profile with skills");
@@ -28516,6 +28638,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed empty toolset profile");
@@ -28604,6 +28727,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec!["research".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed profile with research already present");
@@ -28706,6 +28830,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed toolset profile");
@@ -28791,6 +28916,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed toolset profile");
