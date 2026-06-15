@@ -1694,7 +1694,45 @@ impl SessionState {
             .cloned()
             .collect::<Vec<_>>();
         if !explicitly_named.is_empty() {
-            return explicitly_named;
+            if !looks_like_multi_tool_workflow(&normalized) {
+                return explicitly_named;
+            }
+
+            let mut projected = explicitly_named;
+            let mut add_tool = |tool_name: &str| {
+                if projected.iter().any(|tool| tool.tool_name == tool_name) {
+                    return;
+                }
+                if let Some(tool) = all_tools.iter().find(|tool| tool.tool_name == tool_name) {
+                    projected.push(tool.clone());
+                }
+            };
+
+            for skill in self
+                .bindings
+                .effective_skillset
+                .iter()
+                .chain(self.bindings.on_demand_skills.iter())
+            {
+                if crate::catalog::skill_is_relevant_for_turn(skill, &normalized) {
+                    for &tool_name in crate::catalog::skill_implied_tools(skill) {
+                        add_tool(tool_name);
+                    }
+                    for &tool_name in crate::catalog::tools_for_skill(skill) {
+                        add_tool(tool_name);
+                    }
+                }
+            }
+
+            if normalized.contains("handoff")
+                || normalized.contains("hand off")
+                || normalized.contains("hand-off")
+            {
+                add_tool("handoff.to_role");
+                add_tool("handoff.back");
+            }
+
+            return projected;
         }
 
         if looks_like_conversational_goal(&normalized) {
@@ -2204,7 +2242,8 @@ impl SessionState {
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> Vec<String> {
-        if self.bindings.effective_skillset.is_empty() {
+        if self.bindings.effective_skillset.is_empty() && self.bindings.on_demand_skills.is_empty()
+        {
             return Vec::new();
         }
 
@@ -2213,7 +2252,8 @@ impl SessionState {
             .iter()
             .map(|tool| tool.tool_name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        self.bindings
+        let mut projected_skills = self
+            .bindings
             .effective_skillset
             .iter()
             .filter(|skill| {
@@ -2234,7 +2274,24 @@ impl SessionState {
                     .any(|tool| projected_tool_names.contains(tool))
             })
             .cloned()
-            .collect()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for skill in &self.bindings.on_demand_skills {
+            if !crate::catalog::skill_is_relevant_for_turn(skill, &normalized) {
+                continue;
+            }
+            let implied_tools = crate::catalog::skill_implied_tools(skill);
+            let owned_tools = crate::catalog::tools_for_skill(skill);
+            if implied_tools
+                .iter()
+                .chain(owned_tools.iter())
+                .any(|tool| projected_tool_names.contains(tool))
+            {
+                projected_skills.insert(skill.clone());
+            }
+        }
+
+        projected_skills.into_iter().collect()
     }
 
     fn projected_role_activation_for_turn(
@@ -3692,6 +3749,27 @@ fn looks_like_memory_promotion_goal(normalized: &str) -> bool {
         "make durable",
         "operator approved",
         "verified memory",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_multi_tool_workflow(normalized: &str) -> bool {
+    [
+        " and ",
+        " then ",
+        " also ",
+        "handoff",
+        "hand off",
+        "hand-off",
+        "delegate",
+        "equip",
+        "assign",
+        "schedule",
+        "recurring",
+        "daily",
+        "weekly",
+        "provision",
     ]
     .iter()
     .any(|phrase| normalized.contains(phrase))
@@ -5872,25 +5950,27 @@ mod tests {
             "skill.list",
             "skill.register",
             "skill.assign",
+            "handoff.to_role",
+            "handoff.back",
             "cron.register",
             "cron.list",
         ] {
             state.add_tool_binding(tool);
         }
-        state.bindings.effective_skillset = vec![
-            "handoff.to_role".into(),
-            "role.authoring".into(),
-            "skill.authoring".into(),
-            "cron.manage".into(),
-        ];
+        state.bindings.effective_skillset = vec!["handoff.to_role".into(), "handoff.back".into()];
         state.bindings.on_demand_skills = vec![
             "role.authoring".into(),
             "skill.authoring".into(),
             "cron.manage".into(),
         ];
 
-        let user_content =
-            "Provision the Chronos role and equip her with the cron.manage skill for scheduling.";
+        let user_content = concat!(
+            "Beacon, please provision a new role named Chronos for scheduling and recurring rituals. ",
+            "Use role.create_or_update to create or update the role with the cron-capable profile ",
+            "or the narrowest available profile that can use cron tools. ",
+            "Equip Chronos with the cron.manage skill if needed. ",
+            "Then hand off to Chronos and have her schedule my Daily Check-In for 7:00 AM America/New_York."
+        );
         let projected = state.project_tools_for_turn(user_content);
         let projected_names = projected
             .iter()
@@ -5899,6 +5979,7 @@ mod tests {
 
         assert!(projected_names.contains("role.create_or_update"));
         assert!(projected_names.contains("skill.assign"));
+        assert!(projected_names.contains("handoff.to_role"));
         assert!(projected_names.contains("cron.register"));
 
         let affordances = state.model_affordances_for_turn(user_content, &projected);
