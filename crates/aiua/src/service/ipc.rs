@@ -9061,6 +9061,37 @@ impl IpcServer {
                             );
                         }
                     };
+                let readiness = match Self::ensure_role_materialized(
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    local_node_id,
+                    &target_role_record.agent_id,
+                    &target_role_record.role_name,
+                )
+                .await
+                {
+                    Ok(readiness) => readiness,
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "handoff_back",
+                            "HANDOFF_BACK_MATERIALIZATION_FAILED",
+                            err.to_string(),
+                        );
+                    }
+                };
+                if matches!(
+                    readiness,
+                    RoleReadinessState::Configured
+                        | RoleReadinessState::Materializing
+                        | RoleReadinessState::Materialized
+                ) {
+                    return IpcResponse::HandoffPending {
+                        role_name: target_role,
+                        readiness: readiness.as_str().into(),
+                        retry_after_ms: Some(250),
+                    };
+                }
                 let target_guest_id = target_role_record.guest_id.clone();
                 let task_id = Uuid::new_v4();
 
@@ -9119,13 +9150,11 @@ impl IpcServer {
                 .to_string();
                 let task_json =
                     attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
-                match Self::queue_or_deliver_guest_task(
+                match Self::deliver_live_guest_task(
                     graph,
                     inboxes,
-                    parked_inbound,
-                    materialization_requester,
                     local_node_id,
-                    "agent",
+                    &target_role_record.routing_role(),
                     &target_guest_id,
                     task_id,
                     task_json,
@@ -9133,10 +9162,34 @@ impl IpcServer {
                 )
                 .await
                 {
-                    Ok(active) => IpcResponse::HandoffBackAck {
-                        return_guest_id: target_guest_id,
-                        became_active: active,
-                    },
+                    Ok(true) => {
+                        if let Err(err) = graph.set_role_incarnation_readiness(
+                            &target_role_record.agent_id,
+                            &target_role_record.role_name,
+                            RoleReadinessState::ActiveInSession,
+                        ) {
+                            warn!(
+                                "Failed to mark return role [{}] active in session: {}",
+                                target_role_record.role_name, err
+                            );
+                        }
+                        IpcResponse::HandoffBackAck {
+                            return_guest_id: target_guest_id,
+                            became_active: true,
+                        }
+                    }
+                    Ok(false) => {
+                        let _ = graph.set_role_incarnation_readiness(
+                            &target_role_record.agent_id,
+                            &target_role_record.role_name,
+                            RoleReadinessState::Materializing,
+                        );
+                        IpcResponse::HandoffPending {
+                            role_name: target_role_record.role_name,
+                            readiness: RoleReadinessState::Materializing.as_str().into(),
+                            retry_after_ms: Some(250),
+                        }
+                    }
                     Err(err) => IpcResponse::error(
                         "handoff_back",
                         "HANDOFF_DELIVERY_FAILED",
@@ -18064,9 +18117,12 @@ mod tests {
         }
 
         assert!(
-            tokio::time::timeout(tokio::time::Duration::from_millis(200), base_agent.recv_task())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                base_agent.recv_task()
+            )
+            .await
+            .is_err(),
             "base-agent target must follow the active incarnation instead"
         );
 
@@ -29209,6 +29265,15 @@ mod tests {
             other => panic!("unexpected handoff back response: {other:?}"),
         }
 
+        let session = graph
+            .get_session("sess-handoff-back")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.active_incarnation_id.as_deref(),
+            Some("agent-beacon-01:orchestrator")
+        );
+
         // Orchestrator inbox must receive the "handoff_return" task.
         let delivered = tokio::time::timeout(
             tokio::time::Duration::from_secs(1),
@@ -29333,6 +29398,14 @@ mod tests {
             matches!(response, IpcResponse::HandoffBackAck { ref return_guest_id, .. } if return_guest_id == "agent-beacon-01:orchestrator"),
             "default return_to must route to orchestrator, got: {response:?}"
         );
+        let session = graph
+            .get_session("sess-handoff-back-default")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.active_incarnation_id.as_deref(),
+            Some("agent-beacon-01:orchestrator")
+        );
 
         // Orchestrator should still receive the task.
         let delivered = tokio::time::timeout(
@@ -29345,6 +29418,123 @@ mod tests {
         assert!(
             matches!(delivered, IpcResponse::InboundTask { ref task_json, .. } if task_json.contains("handoff_return")),
             "delivered task must contain handoff_return action"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_back_materializes_configured_orchestrator_before_return() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-handoff-back-materialize".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon-01".into()),
+                active_incarnation_id: Some("agent-beacon-01:developer".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("888".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("orchestrator role should seed");
+
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester.clone());
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+
+        let response = developer
+            .send_request(IpcRequest::HandoffBack {
+                session_id: "sess-handoff-back-materialize".into(),
+                summary: "task complete, returning to orchestrator".into(),
+                return_to: None,
+            })
+            .await
+            .expect("handoff back request");
+
+        match response {
+            IpcResponse::HandoffPending { role_name, .. } => {
+                assert_eq!(role_name, "orchestrator");
+            }
+            other => panic!("expected pending handoff back, got: {other:?}"),
+        }
+        assert_eq!(requester.calls.load(Ordering::SeqCst), 1);
+        let session = graph
+            .get_session("sess-handoff-back-materialize")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.active_incarnation_id.as_deref(),
+            Some("agent-beacon-01:developer")
         );
 
         unsafe {
