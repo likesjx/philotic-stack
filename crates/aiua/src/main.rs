@@ -2683,6 +2683,24 @@ fn hotel_shared_guests(
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:heal-dispatcher"),
+            role: "heal-dispatcher".into(),
+            config_json: serde_json::json!({
+                "command": "heal-dispatcher",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_HEAL_DISPATCHER_ID": format!("{hotel_name}:heal-dispatcher")
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:graph-runner"),
             role: "tool.graph".into(),
             config_json: serde_json::json!({
