@@ -1,8 +1,6 @@
 use ansible_mesh_core::heal_queue::HealQueueRow;
 use anyhow::Result;
-use philotic_client::{
-    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_graceful_shutdown, is_ipc_disconnect,
-};
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -58,19 +56,12 @@ async fn run() -> Result<()> {
 
     let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     loop {
-        tokio::select! {
-            msg = ipc.recv_task() => {
-                let msg = msg?;
-                if is_graceful_shutdown(&msg) {
-                    info!("heal-dispatcher: graceful shutdown received");
-                    return Ok(());
-                }
+        interval.tick().await;
+        if let Err(e) = dispatch_cycle(&mut ipc, &http, &ollama_url, &ollama_model).await {
+            if is_ipc_disconnect(&e) {
+                return Err(e);
             }
-            _ = interval.tick() => {
-                if let Err(e) = dispatch_cycle(&mut ipc, &http, &ollama_url, &ollama_model).await {
-                    warn!("heal-dispatcher cycle error: {e:#}");
-                }
-            }
+            warn!("heal-dispatcher cycle error: {e:#}");
         }
     }
 }
@@ -194,6 +185,16 @@ fn rule_classify(text: &str) -> Option<(String, String, String)> {
     if t.contains("401 unauthorized") || t.contains("unauthorized") {
         return Some(("high".into(), "auth_failure".into(), "escalate".into()));
     }
+    if t.contains("api key expired") || t.contains("key expired") {
+        return Some(("high".into(), "api_key_expired".into(), "escalate".into()));
+    }
+    if t.contains("no_provider") || t.contains("no provider registered") {
+        return Some((
+            "high".into(),
+            "provider_unavailable".into(),
+            "escalate".into(),
+        ));
+    }
     if t.contains("panicked") || t.contains("thread 'main' panicked") {
         return Some(("critical".into(), "panic".into(), "restart_guest".into()));
     }
@@ -202,6 +203,23 @@ fn rule_classify(text: &str) -> Option<(String, String, String)> {
     }
     if t.contains("timed out") || t.contains("timeout") {
         return Some(("medium".into(), "timeout".into(), "noop".into()));
+    }
+    if t.contains("failed to open agent graph sqlite database")
+        || t.contains("unable to open database file")
+        || t.contains("unable to open the database file")
+    {
+        return Some((
+            "high".into(),
+            "database_open_failed".into(),
+            "escalate".into(),
+        ));
+    }
+    if t.contains("media-codec") || t.contains("failed to normalize audio") {
+        return Some((
+            "medium".into(),
+            "media_codec_failed".into(),
+            "escalate".into(),
+        ));
     }
     if t.contains("no such file") || t.contains("enoent") {
         return Some(("high".into(), "missing_file".into(), "escalate".into()));
