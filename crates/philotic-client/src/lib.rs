@@ -2123,6 +2123,18 @@ pub enum IpcResponse {
     /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
     /// This prevents this variant from swallowing `MemoryConfig` responses.
     UserProfileData(UserProfileDataPayload),
+    /// Response to [`IpcRequest::PushHealEntry`].
+    HealEntryPushed {
+        id: String,
+    },
+    /// Response to [`IpcRequest::GetHealQueuePending`].
+    ///
+    /// Keep this before generic `rows: Vec<Value>` response shapes in this
+    /// untagged enum, otherwise typed heal queue rows deserialize as generic
+    /// rows and callers never see `HealQueuePending`.
+    HealQueuePending {
+        rows: Vec<ansible_mesh_core::heal_queue::HealQueueRow>,
+    },
     /// Response to [`IpcRequest::GetAgentReflexPreferences`].
     AgentReflexPreferences {
         rows: Vec<serde_json::Value>,
@@ -2176,14 +2188,6 @@ pub enum IpcResponse {
         /// Only populated when `allowed` is true and a vault credential was resolved.
         #[serde(default)]
         inject_headers: std::collections::HashMap<String, String>,
-    },
-    /// Response to [`IpcRequest::PushHealEntry`].
-    HealEntryPushed {
-        id: String,
-    },
-    /// Response to [`IpcRequest::GetHealQueuePending`].
-    HealQueuePending {
-        rows: Vec<ansible_mesh_core::heal_queue::HealQueueRow>,
     },
     RouterStats {
         stats: Vec<ansible_mesh_core::router_trace::ProviderStats>,
@@ -2694,6 +2698,33 @@ mod tests {
             &IpcRequest::GetConfig { key: "x".into() },
             &IpcResponse::UserProfileData(profile)
         ));
+    }
+
+    #[test]
+    fn heal_queue_rows_deserialize_as_heal_queue_response() {
+        let json = r#"{
+            "rows": [{
+                "id": "01KVDDMB1YZRG327NJG2HNFXH6",
+                "guest_id": "vps-jane:agent-graph-agent-beacon",
+                "timestamp": 1781788191,
+                "raw_text": "Error: Failed to open agent graph SQLite database",
+                "severity": "unknown",
+                "status": "pending",
+                "pattern_tag": null,
+                "heal_action": null,
+                "outcome": null
+            }]
+        }"#;
+
+        let response: IpcResponse = serde_json::from_str(json).expect("decode heal queue response");
+        match response {
+            IpcResponse::HealQueuePending { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "01KVDDMB1YZRG327NJG2HNFXH6");
+                assert_eq!(rows[0].guest_id, "vps-jane:agent-graph-agent-beacon");
+            }
+            other => panic!("expected HealQueuePending, got {other:?}"),
+        }
     }
 
     async fn read_frame(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
