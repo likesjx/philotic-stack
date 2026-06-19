@@ -4713,13 +4713,20 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.disable".into(),
                 "cron.remove".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "cron".into()],
+            allowed_classes: vec![
+                "session".into(),
+                "utility".into(),
+                "cron".into(),
+                "life_graph".into(),
+            ],
             allowed_skills: vec![
                 "handoff.back".into(),
                 "capability.request".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
                 "cron.manage".into(),
+                "life.steward".into(),
+                "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
@@ -8295,7 +8302,8 @@ mod tests {
         execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
         guest_supervision_enabled, hotel_base_port, hotel_ipc_socket_path,
         local_capability_advertisements, mesh_target_addr_for_node, nearest_available_base_port,
-        reconcile_peer_execution_reachability, resolve_runtime_ports, startup_test_gemini_base_url,
+        reconcile_peer_execution_reachability, resolve_runtime_ports, seed_toolset_profiles,
+        startup_test_gemini_base_url,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::registry::ExecutionReachability;
@@ -8482,6 +8490,33 @@ mod tests {
             !mac_guests
                 .iter()
                 .any(|guest| guest.role == "graph-datasource")
+        );
+    }
+
+    #[test]
+    fn scheduler_profile_carries_life_graph_class() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        let scheduler = graph
+            .get_toolset_profile("scheduler")
+            .expect("read scheduler profile")
+            .expect("scheduler profile should exist");
+
+        assert!(
+            scheduler
+                .allowed_classes
+                .iter()
+                .any(|class| class == "life_graph"),
+            "scheduler/Chronos roles must be able to record and recall LifeGraph context"
+        );
+        assert!(
+            scheduler
+                .allowed_skills
+                .iter()
+                .any(|skill| skill == "lifegraph.truth_summarizer")
         );
     }
 
