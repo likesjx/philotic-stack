@@ -6106,6 +6106,29 @@ impl IpcServer {
         })
     }
 
+    /// Normalize a freshly-registered cron job's `target_role` to the inbox routing key
+    /// (`role:{agent_id}:{role_name}`, matching `RoleIncarnationRecord::routing_role`) that
+    /// `deliver_inbound_task`/`SubscribeInbox` actually key on. Agents calling `cron.register`
+    /// almost always mean "my own role of that name" when they pass a bare role name like
+    /// `"orchestrator"` — resolve it against the registering guest's own role incarnations so
+    /// the job is deliverable, instead of silently persisting a key that can never match.
+    fn normalize_cron_target_role(graph: &GraphDomain, job: &mut ansible_mesh_core::cron::CronJob) {
+        if job.target_role.starts_with("role:") {
+            return;
+        }
+        let ansible_mesh_core::cron::CronJobSource::Guest(agent_id) = &job.created_by else {
+            return;
+        };
+        if graph
+            .get_role_incarnation(agent_id, &job.target_role)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            job.target_role = format!("role:{agent_id}:{}", job.target_role);
+        }
+    }
+
     async fn role_route_is_live(
         inboxes: &InboxRegistry,
         routing_role: &str,
@@ -11171,7 +11194,8 @@ impl IpcServer {
                 IpcResponse::success("seed_remote_incarnation", None)
             }
             // ── Cron scheduler ──────────────────────────────────────────────
-            IpcRequest::RegisterCronJob { job } => {
+            IpcRequest::RegisterCronJob { mut job } => {
+                Self::normalize_cron_target_role(graph, &mut job);
                 info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
                 match graph.upsert_cron_job(&job) {
                     Ok(_) => {
@@ -16692,6 +16716,7 @@ mod tests {
     use ansible_mesh_core::agent_graph_storage::{
         AgentGraphStorage, AgentReflexPreference, AgentRoutingPreference, SqliteAgentGraphStorage,
     };
+    use ansible_mesh_core::cron::{CronJob, CronJobSource};
     use ansible_mesh_core::graph::{
         MembraneTransportHomeRecord, RoleIncarnationRecord, TurnLoopConfig,
     };
@@ -16907,6 +16932,72 @@ mod tests {
         assert_eq!(components[0]["component_type"], "membrane");
         assert_eq!(components[0]["auto_start"], true);
         assert_eq!(components[0]["component_config"]["guild_id"], "1234");
+    }
+
+    fn test_cron_job(target_role: &str, agent_id: &str) -> CronJob {
+        CronJob {
+            id: "job-1".into(),
+            schedule: "0 0 7 * * * *".into(),
+            target_role: target_role.into(),
+            target_node_id: None,
+            payload: "{}".into(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at: 0,
+            created_at: 0,
+            created_by: CronJobSource::Guest(agent_id.into()),
+        }
+    }
+
+    #[test]
+    fn normalize_cron_target_role_resolves_bare_role_name_to_routing_key() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: true,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let mut job = test_cron_job("orchestrator", "agent-beacon");
+        IpcServer::normalize_cron_target_role(&graph, &mut job);
+
+        assert_eq!(job.target_role, "role:agent-beacon:orchestrator");
+    }
+
+    #[test]
+    fn normalize_cron_target_role_leaves_unresolvable_role_untouched() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        // No role incarnation seeded for "agent-beacon"/"orchestrator" — normalization
+        // should leave the bare string alone rather than guess.
+        let mut job = test_cron_job("orchestrator", "agent-beacon");
+        IpcServer::normalize_cron_target_role(&graph, &mut job);
+
+        assert_eq!(job.target_role, "orchestrator");
+    }
+
+    #[test]
+    fn normalize_cron_target_role_is_idempotent_for_already_qualified_roles() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        let mut job = test_cron_job("role:agent-beacon:orchestrator", "agent-beacon");
+        IpcServer::normalize_cron_target_role(&graph, &mut job);
+
+        assert_eq!(job.target_role, "role:agent-beacon:orchestrator");
     }
 
     #[test]

@@ -25,7 +25,8 @@
 //! [`ansible_mesh_core::cron::interpolate_payload`].
 
 use crate::LedgerCommand;
-use crate::service::ipc::InboxRegistry;
+use crate::service::guest_manager::GuestMaterializationRequester;
+use crate::service::ipc::{InboxRegistry, ParkedInboundRegistry};
 use ansible_mesh_core::cron::{
     CronInterpolationVars, CronJob, interpolate_payload, next_fire_after,
 };
@@ -46,6 +47,8 @@ pub struct CronTicker {
     /// Per-hotel stagger offset for guaranteed jobs (ms).
     /// Derived from `PHILOTIC_CRON_OFFSET_SECS * 1000`. Default 0.
     offset_ms: u64,
+    parked_inbound: ParkedInboundRegistry,
+    materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
 }
 
 impl CronTicker {
@@ -55,6 +58,8 @@ impl CronTicker {
         inboxes: InboxRegistry,
         local_node_id: impl Into<String>,
         offset_ms: u64,
+        parked_inbound: ParkedInboundRegistry,
+        materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     ) -> Self {
         Self {
             graph,
@@ -62,7 +67,21 @@ impl CronTicker {
             inboxes,
             local_node_id: local_node_id.into(),
             offset_ms,
+            parked_inbound,
+            materialization_requester,
         }
+    }
+
+    /// Resolve a cron job's `target_role` (expected shape: `role:{agent_id}:{role_name}`,
+    /// matching [`ansible_mesh_core::graph::RoleIncarnationRecord::routing_role`]) to the
+    /// concrete guest ID that owns that role incarnation, if one is configured.
+    fn resolve_target_guest_id(graph: &GraphDomain, target_role: &str) -> Option<String> {
+        let (agent_id, role_name) = target_role.strip_prefix("role:")?.split_once(':')?;
+        graph
+            .get_role_incarnation(agent_id, role_name)
+            .ok()
+            .flatten()
+            .map(|record| record.guest_id)
     }
 
     pub async fn run(self) {
@@ -219,16 +238,47 @@ impl CronTicker {
             return;
         }
 
-        // Deliver to the role inbox (local delivery).
-        crate::service::ipc::IpcServer::deliver_inbound_task(
-            &self.inboxes,
-            &self.local_node_id,
-            &job.target_role,
-            None,
-            task_id,
-            task_json,
-        )
-        .await;
+        // Deliver to the role inbox (local delivery). If the target role resolves to a
+        // configured guest that isn't currently subscribed (e.g. an on-demand role
+        // incarnation that hasn't been spawned yet), park the task and trigger
+        // materialization instead of dropping it ledger-only — mirrors the cross-hotel
+        // TaskInvoke path in `IpcServer::deliver_event_envelope_or_park`.
+        let target_guest_id = Self::resolve_target_guest_id(&self.graph, &job.target_role);
+        let is_subscribed = {
+            let guard = self.inboxes.lock().await;
+            let role_subs = guard.get(job.target_role.as_str()).cloned().unwrap_or_default();
+            match &target_guest_id {
+                Some(guest_id) => role_subs.iter().any(|s| s.guest_id == *guest_id),
+                None => !role_subs.is_empty(),
+            }
+        };
+
+        match (&target_guest_id, is_subscribed) {
+            (Some(guest_id), false) => {
+                crate::service::ipc::IpcServer::park_and_materialize_role_philote(
+                    &self.graph,
+                    &self.local_node_id,
+                    &self.parked_inbound,
+                    self.materialization_requester.as_ref(),
+                    &self.local_node_id,
+                    task_id,
+                    task_json,
+                    guest_id,
+                )
+                .await;
+            }
+            _ => {
+                crate::service::ipc::IpcServer::deliver_inbound_task(
+                    &self.inboxes,
+                    &self.local_node_id,
+                    &job.target_role,
+                    target_guest_id.as_deref(),
+                    task_id,
+                    task_json,
+                )
+                .await;
+            }
+        }
 
         info!(
             "CronTicker: fired job {} → role={} epoch={}",
