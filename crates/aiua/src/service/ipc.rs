@@ -5727,6 +5727,62 @@ impl IpcServer {
         }
     }
 
+    /// Park a task for a *local* role incarnation and trigger its materialization, flushed
+    /// when the role philote registers under `role_record.guest_id` (single-process role
+    /// incarnations live inside the base philote, spawned/woken via `ensure_role_materialized`
+    /// — unlike [`Self::park_and_materialize_role_philote`], which targets the cross-hotel
+    /// dedicated-process naming scheme and does not wake an already-configured local guest).
+    pub(crate) async fn park_and_materialize_local_role(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        mat_req: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        source_node: &str,
+        task_id: Uuid,
+        task_json: String,
+        role_record: &RoleIncarnationRecord,
+    ) {
+        {
+            let mut guard = parked_inbound.lock().await;
+            guard
+                .entry(role_record.guest_id.clone())
+                .or_default()
+                .push(ParkedInboundTask {
+                    source_node: source_node.to_string(),
+                    task_id,
+                    task_json,
+                    activate_session_id: None,
+                });
+        }
+        info!(
+            guest_id = %role_record.guest_id,
+            task_id = %task_id,
+            "Local role-incarnation task parked; triggering on-demand materialization."
+        );
+
+        match Self::ensure_role_materialized(
+            graph,
+            inboxes,
+            mat_req,
+            local_node_id,
+            &role_record.agent_id,
+            &role_record.role_name,
+        )
+        .await
+        {
+            Ok(readiness) => info!(
+                guest_id = %role_record.guest_id,
+                ?readiness,
+                "Local role-incarnation materialization requested."
+            ),
+            Err(e) => warn!(
+                guest_id = %role_record.guest_id,
+                "Local role-incarnation materialization failed: {e}"
+            ),
+        }
+    }
+
     /// Resolve the node_id hosting a guest, with a fallback to `home_node` from the role
     /// incarnation record. Necessary for the first cross-hotel task before the guest appears
     /// in HotelStateSync (its hotel guest record may not exist yet on the remote hotel).
@@ -6210,7 +6266,7 @@ impl IpcServer {
             .is_some_and(Self::pid_exists))
     }
 
-    async fn ensure_role_materialized(
+    pub(crate) async fn ensure_role_materialized(
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
