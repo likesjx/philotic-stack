@@ -2700,6 +2700,28 @@ mod tests {
     }
 
     #[test]
+    fn user_profile_data_is_never_treated_as_an_ignorable_push() {
+        // UserProfileData is always a direct, synchronous reply to GetUserProfile/
+        // PatchUserProfile on the same connection — the hotel never broadcasts it
+        // unprompted. Treating it as ignorable here previously made send_request
+        // skip its own response and loop forever waiting for one that would never
+        // come (regression: a prior commit hung every GetUserProfile call).
+        let profile = UserProfileDataPayload {
+            timezone: None,
+            display_name: None,
+            principal_id: None,
+            preferred_name: None,
+            primary_email: None,
+            home_hotel: None,
+            linked_providers: vec![],
+        };
+
+        assert!(!PhiloticClient::is_ignorable_push(&IpcResponse::UserProfileData(
+            profile
+        )));
+    }
+
+    #[test]
     fn heal_queue_rows_deserialize_as_heal_queue_response() {
         let json = r#"{
             "rows": [{
