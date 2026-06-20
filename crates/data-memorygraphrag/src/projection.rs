@@ -150,6 +150,8 @@ impl VectorHit {
         self.prop_str("title")
             .or_else(|| self.prop_str("name"))
             .or_else(|| self.prop_str("description"))
+            .or_else(|| self.prop_str("claim_summary"))
+            .or_else(|| self.prop_str("summary"))
             .unwrap_or("")
     }
 

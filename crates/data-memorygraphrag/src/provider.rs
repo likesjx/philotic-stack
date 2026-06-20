@@ -430,17 +430,24 @@ impl LifeGraphProvider {
         }
 
         let filters = &query_val.policy_filters;
-        let (surviving, _drop_log) = projection::apply_policy_filters(all_hits, filters);
-
         let weights = &query_val.ranking_weights;
-        let mut scored: Vec<(projection::VectorHit, f32, Vec<PolicyFilter>)> = surviving
-            .into_iter()
-            .map(|hit| {
-                let age_secs = compute_age_secs(hit.prop_str("observed_at"), &now);
-                let score = projection::ranking_score(&hit, weights, age_secs);
-                (hit, score, Vec::new())
-            })
-            .collect();
+        let mut scored = score_hits(all_hits, filters, weights, &now);
+
+        let fallback_used = if scored.is_empty() {
+            let fallback_labels = named_strategy.fallback_labels(&query_val);
+            if fallback_labels.is_empty() {
+                false
+            } else {
+                let limit = query_val.max_context_packets.max(1) * 3;
+                let cypher = raw_recall_fallback_cypher(&fallback_labels, limit);
+                let result = self.execute_cypher(&cypher).await?;
+                let fallback_hits = projection::parse_vector_search_rows(&result);
+                scored = score_hits(fallback_hits, filters, weights, &now);
+                !scored.is_empty()
+            }
+        } else {
+            false
+        };
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let context_id = format!("ctx:{}", query_val.query_id);
@@ -458,6 +465,7 @@ impl LifeGraphProvider {
         info!(
             query_id = %query_val.query_id,
             result_count = packet.ranked_packets.len(),
+            fallback_used,
             "life.recall: context packet projected"
         );
 
@@ -467,6 +475,7 @@ impl LifeGraphProvider {
         Ok(ProviderOutput::ResultSet(json!({
             "status": "ok",
             "named_strategy": named_strategy.as_str(),
+            "fallback_used": fallback_used,
             "context_packet": packet_json,
         })))
     }
@@ -660,6 +669,7 @@ impl NamedRecallStrategy {
             .parameters
             .get("named_strategy")
             .or_else(|| task.parameters.get("strategy_name"))
+            .or_else(|| task.parameters.get("operator_intent"))
             .and_then(Value::as_str)
             .unwrap_or("");
 
@@ -673,6 +683,30 @@ impl NamedRecallStrategy {
         }
     }
 
+    fn fallback_labels(self, query: &RetrievalQuery) -> Vec<&'static str> {
+        match self {
+            Self::SemanticPivot => query
+                .semantic_pivots
+                .iter()
+                .flat_map(|pivot| projection::labels_for_space(&pivot.space).iter().copied())
+                .collect(),
+            Self::OpenLoopsByContext => vec!["OpenLoop"],
+            Self::GoalsAndNextActions => {
+                vec![
+                    "Goal",
+                    "Habit",
+                    "System",
+                    "Project",
+                    "Routine",
+                    "NextAction",
+                ]
+            }
+            Self::CommitmentsApproaching => vec!["Commitment"],
+            Self::ReEntryContext => vec!["OpenLoop", "Goal", "Habit", "System", "Role"],
+            Self::CrossDomainEntanglement => vec!["Signal", "Goal"],
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::SemanticPivot => "semantic_pivot",
@@ -683,6 +717,45 @@ impl NamedRecallStrategy {
             Self::CrossDomainEntanglement => "cross_domain_entanglement",
         }
     }
+}
+
+fn score_hits(
+    hits: Vec<projection::VectorHit>,
+    filters: &[PolicyFilter],
+    weights: &data_memorygraphrag::RankingWeights,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Vec<(projection::VectorHit, f32, Vec<PolicyFilter>)> {
+    let (surviving, _drop_log) = projection::apply_policy_filters(hits, filters);
+    surviving
+        .into_iter()
+        .map(|hit| {
+            let age_secs = compute_age_secs(hit.prop_str("observed_at"), now);
+            let score = projection::ranking_score(&hit, weights, age_secs);
+            (hit, score, Vec::new())
+        })
+        .collect()
+}
+
+fn raw_recall_fallback_cypher(labels: &[&str], limit: usize) -> String {
+    let labels = labels
+        .iter()
+        .map(|label| format!("'{label}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        concat!(
+            "MATCH (n) ",
+            "WHERE any(label IN labels(n) WHERE label IN [{labels}]) ",
+            "AND coalesce(n.validation_state, 'inferred') <> 'retired' ",
+            "AND coalesce(n.status, '') <> 'retired' ",
+            "AND coalesce(n.status, '') <> 'done' ",
+            "RETURN n AS node, 0.25 AS similarity ",
+            "ORDER BY coalesce(n.observed_at, n.created_at, '') DESC ",
+            "LIMIT {limit}"
+        ),
+        labels = labels,
+        limit = limit
+    )
 }
 
 fn embedding_from_key(parameters: &Value, key: &str) -> Option<Vec<f32>> {
@@ -754,12 +827,32 @@ mod tests {
     }
 
     #[test]
+    fn operator_intent_dispatches_named_recall_strategy() {
+        let task = task_with_params(json!({ "operator_intent": "goals_and_next_actions" }));
+        assert_eq!(
+            NamedRecallStrategy::from_task(&task),
+            NamedRecallStrategy::GoalsAndNextActions
+        );
+    }
+
+    #[test]
     fn unknown_named_recall_strategy_falls_back_to_semantic_pivot() {
         let task = task_with_params(json!({ "named_strategy": "surprise_me" }));
         assert_eq!(
             NamedRecallStrategy::from_task(&task),
             NamedRecallStrategy::SemanticPivot
         );
+    }
+
+    #[test]
+    fn raw_recall_fallback_returns_vector_hit_shape() {
+        let cypher = raw_recall_fallback_cypher(&["Goal", "Habit"], 6);
+
+        assert!(cypher.contains("MATCH (n)"));
+        assert!(cypher.contains("'Goal'"));
+        assert!(cypher.contains("'Habit'"));
+        assert!(cypher.contains("RETURN n AS node, 0.25 AS similarity"));
+        assert!(cypher.contains("LIMIT 6"));
     }
 
     #[test]
