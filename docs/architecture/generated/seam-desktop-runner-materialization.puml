@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-runner-materialization
+
+rectangle "desktop-runner-materialization" as desktop_runner_materialization #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-oracle-routing
+
+rectangle "model-oracle-routing" as model_oracle_routing #Orange {
+}
+
+
+@enduml

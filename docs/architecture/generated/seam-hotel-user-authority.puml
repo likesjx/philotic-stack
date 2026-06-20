@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - hotel-user-authority
+
+rectangle "hotel-user-authority" as hotel_user_authority #Orange {
+}
+
+
+@enduml

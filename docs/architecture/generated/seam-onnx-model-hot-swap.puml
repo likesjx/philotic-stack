@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - onnx-model-hot-swap
+
+rectangle "onnx-model-hot-swap" as onnx_model_hot_swap #Orange {
+}
+
+
+@enduml

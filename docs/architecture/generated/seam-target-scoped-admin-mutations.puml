@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - target-scoped-admin-mutations
+
+rectangle "target-scoped-admin-mutations" as target_scoped_admin_mutations #Orange {
+}
+
+
+@enduml

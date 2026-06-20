@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-promotion-gates
+
+rectangle "memory-promotion-gates" as memory_promotion_gates #Orange {
+}
+
+
+@enduml

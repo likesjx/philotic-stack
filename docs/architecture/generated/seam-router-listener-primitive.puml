@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - router-listener-primitive
+
+rectangle "router-listener-primitive" as router_listener_primitive #Orange {
+}
+
+
+@enduml

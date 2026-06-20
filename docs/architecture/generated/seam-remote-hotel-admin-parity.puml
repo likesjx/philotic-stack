@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - remote-hotel-admin-parity
+
+rectangle "remote-hotel-admin-parity" as remote_hotel_admin_parity #Orange {
+}
+
+
+@enduml

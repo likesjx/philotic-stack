@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - admin-session-posture
+
+rectangle "admin-session-posture" as admin_session_posture #Orange {
+}
+
+
+@enduml

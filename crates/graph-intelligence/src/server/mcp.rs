@@ -489,7 +489,7 @@ async fn handle_mcp(
                 "tools": {}
             },
             "serverInfo": {
-                "name": "graph-intelligence",
+                "name": "intel-graph",
                 "version": "0.1.0"
             }
         })),

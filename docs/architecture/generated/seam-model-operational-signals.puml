@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-operational-signals
+
+rectangle "model-operational-signals" as model_operational_signals #Orange {
+}
+
+
+@enduml

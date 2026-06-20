@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - pairwise-mesh-membership-vs-global-convergence
+
+rectangle "pairwise-mesh-membership-vs-global-convergence" as pairwise_mesh_membership_vs_global_convergence #Orange {
+}
+
+
+@enduml

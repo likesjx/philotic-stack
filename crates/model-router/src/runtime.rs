@@ -490,7 +490,9 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                             // Timeout or IPC error — stop forwarding tokens.
                                             // Dropping token_rx makes future send() calls in
                                             // invoke_streaming return Err immediately (no block).
-                                            warn!("streaming forwarder: send_request timeout, dropping stream");
+                                            warn!(
+                                                "streaming forwarder: send_request timeout, dropping stream"
+                                            );
                                             break;
                                         }
                                     }
@@ -643,17 +645,22 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                             supported_tools: Vec::new(),
                                         };
                                         tokio::spawn(async move {
-                                            if let Ok(mut fanout_ipc) =
-                                                PhiloticClient::connect(fanout_identity).await
-                                            {
-                                                let _ = fanout_ipc
-                                                    .send_request(IpcRequest::EmitTask {
+                                            let connect = tokio::time::timeout(
+                                                Duration::from_secs(5),
+                                                PhiloticClient::connect(fanout_identity),
+                                            )
+                                            .await;
+                                            if let Ok(Ok(mut fanout_ipc)) = connect {
+                                                let _ = tokio::time::timeout(
+                                                    Duration::from_secs(10),
+                                                    fanout_ipc.send_request(IpcRequest::EmitTask {
                                                         target_node: local_node_id(),
                                                         target_role: "router-listener".to_string(),
                                                         target_guest_id: None,
                                                         task_json: capture_json,
-                                                    })
-                                                    .await;
+                                                    }),
+                                                )
+                                                .await;
                                             }
                                         });
                                     }
@@ -952,7 +959,9 @@ async fn emit_text_response(
         .to_string(),
     };
 
-    ipc_client.send_request(reply_req).await?;
+    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("emit_text_response: ipc ack timeout after 30s"))??;
     Ok(())
 }
 
@@ -985,7 +994,9 @@ async fn emit_tool_call_response(
         .to_string(),
     };
 
-    ipc_client.send_request(reply_req).await?;
+    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("emit_tool_call_response: ipc ack timeout after 30s"))??;
     Ok(())
 }
 
@@ -1030,12 +1041,14 @@ async fn emit_failure(
         provider.unwrap_or("unknown"),
         message
     );
-    let _ = ipc_client
-        .send_request(IpcRequest::PushHealEntry {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        ipc_client.send_request(IpcRequest::PushHealEntry {
             guest_id: guest_id.to_string(),
             raw_text,
-        })
-        .await;
+        }),
+    )
+    .await;
     let reply_req = IpcRequest::EmitTask {
         target_node: reply.reply_to.clone(),
         target_role: reply.reply_role.clone(),
@@ -1062,7 +1075,9 @@ async fn emit_failure(
         .to_string(),
     };
 
-    ipc_client.send_request(reply_req).await?;
+    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("emit_failure: ipc ack timeout after 30s"))??;
     Ok(())
 }
 
@@ -1083,14 +1098,16 @@ async fn emit_falling_back(
         "chat_id": reply.chat_id,
     })
     .to_string();
-    let _ = ipc_client
-        .send_request(IpcRequest::EmitTask {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        ipc_client.send_request(IpcRequest::EmitTask {
             target_node: reply.reply_to.clone(),
             target_role: reply.reply_role.clone(),
             target_guest_id: None,
             task_json,
-        })
-        .await;
+        }),
+    )
+    .await;
 }
 
 /// Emit a dispatch status event to philote so it can surface transient state
@@ -1115,14 +1132,16 @@ async fn emit_dispatch_status(
         "chat_id": reply.chat_id,
     })
     .to_string();
-    let _ = ipc_client
-        .send_request(IpcRequest::EmitTask {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        ipc_client.send_request(IpcRequest::EmitTask {
             target_node: reply.reply_to.clone(),
             target_role: reply.reply_role.clone(),
             target_guest_id: None,
             task_json,
-        })
-        .await;
+        }),
+    )
+    .await;
 }
 
 fn classify_provider_failure(

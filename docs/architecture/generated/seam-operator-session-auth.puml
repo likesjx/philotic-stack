@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - operator-session-auth
+
+rectangle "operator-session-auth" as operator_session_auth #Orange {
+}
+
+
+@enduml

@@ -18,8 +18,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string());
     let target_node =
         std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "mac-jane-aiua-01".to_string());
-    let target_agent = std::env::var("PHILOTIC_TARGET_AGENT")
-        .unwrap_or_else(|_| "agent-bjork-01".to_string());
+    let target_agent =
+        std::env::var("PHILOTIC_TARGET_AGENT").unwrap_or_else(|_| "agent-bjork-01".to_string());
 
     let operator_session_id = format!("smoke-agent-turn-{}", Uuid::new_v4().simple());
     let content = "Use the life.observe tool to record this open loop: \
@@ -30,11 +30,14 @@ async fn main() -> Result<()> {
     eprintln!("smoke: sending turn to {target_agent} @ {target_node}");
     eprintln!("smoke: session_id={operator_session_id}");
 
-    let mut client = SmokeIpc::connect(&socket_path, GuestIdentity {
-        guest_id: format!("agent-turn-smoke-{}", Uuid::new_v4().simple()),
-        role: "agent-turn-smoke".into(),
-        supported_tools: Vec::new(),
-    })
+    let mut client = SmokeIpc::connect(
+        &socket_path,
+        GuestIdentity {
+            guest_id: format!("agent-turn-smoke-{}", Uuid::new_v4().simple()),
+            role: "agent-turn-smoke".into(),
+            supported_tools: Vec::new(),
+        },
+    )
     .await
     .context("failed to connect IPC socket")?;
 
@@ -55,13 +58,18 @@ async fn main() -> Result<()> {
     .context("IPC SendOperatorChatTurn failed")?;
 
     match response {
-        IpcResponse::OperatorChatTurnReply { operator_chat_reply } => {
+        IpcResponse::OperatorChatTurnReply {
+            operator_chat_reply,
+        } => {
             let reply = &operator_chat_reply.content;
             eprintln!("smoke: turn completed ✓");
             eprintln!("smoke: turn_id={}", operator_chat_reply.turn_id);
             eprintln!("smoke: session_id={}", operator_chat_reply.session_id);
             eprintln!("smoke: reply_action={}", operator_chat_reply.reply_action);
-            eprintln!("smoke: observed_events={:?}", operator_chat_reply.observed_events);
+            eprintln!(
+                "smoke: observed_events={:?}",
+                operator_chat_reply.observed_events
+            );
             println!("agent turn reply: {reply}");
             if reply.is_empty() {
                 bail!("agent turn reply was empty — turn may have failed");
@@ -79,8 +87,7 @@ struct SmokeIpc {
 
 impl SmokeIpc {
     async fn connect(socket_path: &str, identity: GuestIdentity) -> Result<Self> {
-        let client =
-            philotic_client::PhiloticClient::connect_at(socket_path, identity).await?;
+        let client = philotic_client::PhiloticClient::connect_at(socket_path, identity).await?;
         Ok(Self { client })
     }
 

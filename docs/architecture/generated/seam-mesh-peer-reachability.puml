@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mesh-peer-reachability
+
+rectangle "mesh-peer-reachability" as mesh_peer_reachability #Orange {
+}
+
+
+@enduml

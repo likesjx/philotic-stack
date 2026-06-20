@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - philote-user-projection
+
+rectangle "philote-user-projection" as philote_user_projection #Orange {
+}
+
+
+@enduml

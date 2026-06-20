@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - life-graph-attention-steward
+
+rectangle "life-graph-attention-steward" as life_graph_attention_steward #Orange {
+}
+
+
+@enduml

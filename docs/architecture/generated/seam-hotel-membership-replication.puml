@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - hotel-membership-replication
+
+rectangle "hotel-membership-replication" as hotel_membership_replication #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - multi-hotel-runtime-rollout
+
+rectangle "multi-hotel-runtime-rollout" as multi_hotel_runtime_rollout #Orange {
+}
+
+
+@enduml

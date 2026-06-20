@@ -768,6 +768,26 @@ intel-graph-search query limit="10":
 intel-graph-ui:
     open http://127.0.0.1:8900
 
+# Rebuild the graphify tree-sitter code graph (offline, no LLM)
+graphify-update:
+    graphify update .
+
+# Watch the repo and rebuild the graphify graph on code changes
+graphify-watch:
+    graphify watch .
+
+# Query the graphify graph: shortest path between two nodes
+graphify-path a b:
+    graphify path "{{a}}" "{{b}}"
+
+# Explain a node and its neighbors in the graphify graph
+graphify-explain node:
+    graphify explain "{{node}}"
+
+# Bridge graphify call edges into the intel-graph (run after graphify-update)
+graphify-bridge:
+    python3 scripts/graphify_bridge.py
+
 # Close active workstream with summary and disposition
 close-workstream:
     #!/usr/bin/env bash

@@ -972,6 +972,80 @@ If no tool is needed, reply with structured JSON containing display_text, spoken
     )
 }
 
+fn low_progress_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "agent.graph.read"
+            | "hotel.logs"
+            | "hotel.status"
+            | "mcp.status"
+            | "memory.status"
+            | "role.list"
+            | "session.status"
+            | "skill.list"
+    )
+}
+
+fn duplicate_tool_skip(result: &ToolResult) -> bool {
+    result.content.starts_with("[Duplicate call skipped]")
+}
+
+fn recent_low_progress_tool_run(turn: &WorkingTurn) -> usize {
+    turn.working_tool_history
+        .iter()
+        .rev()
+        .take_while(|(call, result)| {
+            low_progress_tool_name(&call.tool_name) || duplicate_tool_skip(result)
+        })
+        .count()
+}
+
+fn loop_stop_reason(turn: &WorkingTurn, iteration_cap: u32) -> Option<&'static str> {
+    let recent_low_progress = recent_low_progress_tool_run(turn);
+    if turn.iteration >= 4 && recent_low_progress >= 4 {
+        return Some("the last several tool calls only inspected status or repeated previous work");
+    }
+
+    if iteration_cap.saturating_sub(turn.iteration) <= 1 && recent_low_progress >= 2 {
+        return Some("the turn is close to its iteration limit without new forward progress");
+    }
+
+    None
+}
+
+fn loop_stop_fallback_reply(
+    user_content: &str,
+    history: &[(ToolCall, ToolResult)],
+    reason: &str,
+) -> String {
+    let mut tools = Vec::new();
+    for (call, _) in history.iter().rev() {
+        if !tools.iter().any(|name: &String| name == &call.tool_name) {
+            tools.push(call.tool_name.clone());
+        }
+        if tools.len() >= 5 {
+            break;
+        }
+    }
+    tools.reverse();
+
+    let tool_text = if tools.is_empty() {
+        "no completed tool calls".to_string()
+    } else {
+        tools.join(", ")
+    };
+    let request = user_content.trim();
+    let request_text = if request.is_empty() {
+        "this turn".to_string()
+    } else {
+        format!("\"{}\"", request.chars().take(160).collect::<String>())
+    };
+
+    format!(
+        "I'm going to stop this turn instead of looping: {reason}. I had been working on {request_text} and the recent tool path was: {tool_text}.\n\nI can keep going from here, but the next step needs to be a more specific action rather than another status check."
+    )
+}
+
 #[derive(Debug, Clone)]
 struct MemoryCandidate {
     concept: String,
@@ -1956,18 +2030,28 @@ impl AgentRuntime {
         &mut self,
         role_name: &str,
     ) -> Option<crate::session::RoleActivation> {
-        match self
-            .ipc_client
-            .send_request(IpcRequest::ListRoleIncarnations {
-                agent_id: self.agent_id.clone(),
-            })
-            .await
-        {
-            Ok(IpcResponse::Standard {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client
+                .send_request(IpcRequest::ListRoleIncarnations {
+                    agent_id: self.agent_id.clone(),
+                }),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(IpcResponse::Standard {
+            ok: false,
+            code: String::new(),
+            message: String::new(),
+            corr_id: String::new(),
+            data: None,
+        }) {
+            IpcResponse::Standard {
                 ok: true,
                 data: Some(data),
                 ..
-            }) => {
+            } => {
                 let roles = data.get("roles").and_then(|v| v.as_array())?;
                 let rec = roles
                     .iter()
@@ -4687,6 +4771,31 @@ impl AgentRuntime {
                 .await
             }
             AgentAction::ToolCall(tool_call) => {
+                let forced_stop_reply = self.sessions.get(&session_id).and_then(|state| {
+                    let turn = state.active_turn.as_ref()?;
+                    let iteration_cap = state.settings.execution.iteration_cap;
+                    let reason = if turn.iteration >= iteration_cap {
+                        Some("the turn reached its maximum tool-iteration limit")
+                    } else {
+                        loop_stop_reason(turn, iteration_cap)
+                    }?;
+                    Some(loop_stop_fallback_reply(
+                        &turn.user_content,
+                        &turn.working_tool_history,
+                        reason,
+                    ))
+                });
+
+                if let Some(reply) = forced_stop_reply {
+                    warn!(
+                        session_id = %session_id,
+                        tool_name = %tool_call.tool_name,
+                        "Suppressing tool call after loop stop condition; delivering fallback reply."
+                    );
+                    return self
+                        .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
+                        .await;
+                }
                 self.handle_tool_call(session_id, turn_id, tool_call).await
             }
             AgentAction::RequestApproval(approval) => {
@@ -5196,14 +5305,17 @@ impl AgentRuntime {
             status,
         };
 
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.ipc_client.send_request(IpcRequest::EmitTask {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
                 target_guest_id: final_reply_guest_id,
                 task_json: serde_json::to_string(&payload)?,
-            })
-            .await?;
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("emit_turn_status: ipc ack timeout after 10s"))??;
 
         Ok(())
     }
@@ -5484,15 +5596,39 @@ impl AgentRuntime {
             };
             if let Some((checkpoint_memory_type, checkpoint_json, index_state)) = pending_checkpoint
             {
-                self.ipc_client
-                    .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-                    .await?;
-                self.sync_session_index(&index_state).await?;
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.ipc_client.sync_apartment(
+                        &self.agent_id,
+                        &checkpoint_memory_type,
+                        checkpoint_json,
+                    ),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("sync_apartment: ipc ack timeout after 15s"))
+                .and_then(|r| r)
+                {
+                    warn!("route_tool_call_execution: sync_apartment failed: {e}; continuing");
+                }
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.sync_session_index(&index_state),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("sync_session_index: ipc ack timeout after 15s"))
+                .and_then(|r| r)
+                {
+                    warn!("route_tool_call_execution: sync_session_index failed: {e}; continuing");
+                }
             }
 
             // Emit a status message to membrane so the user sees what's happening.
             let status_label = tool_status_label(&tool_call.tool_name);
-            let _ = self.emit_turn_status(&session_id, status_label).await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.emit_turn_status(&session_id, status_label),
+            )
+            .await;
 
             let tool_req = ToolExecutionPayload {
                 action: "execute_tool",
@@ -5578,14 +5714,17 @@ impl AgentRuntime {
                     .await;
             }
 
-            self.ipc_client
-                .send_request(IpcRequest::EmitTask {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                self.ipc_client.send_request(IpcRequest::EmitTask {
                     target_node: route.target_node,
                     target_role: route.target_role,
                     target_guest_id: route.incarnation_id.clone(),
                     task_json: serde_json::to_string(&tool_req)?,
-                })
-                .await?;
+                }),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("tool dispatch: ipc ack timeout after 30s"))??;
 
             Ok(())
         })
@@ -5664,10 +5803,8 @@ impl AgentRuntime {
         // the response's own tool_name confirms it — prevents a co-occurring
         // graph-datasource failure (tool_name="unknown") from completing a WaitingTool
         // turn that is legitimately waiting for the life-graph-runner response.
-        let response_is_life_observe = matches!(
-            tool_result.tool_name.as_str(),
-            "life.observe" | ""
-        );
+        let response_is_life_observe =
+            matches!(tool_result.tool_name.as_str(), "life.observe" | "");
         let direct_life_observe_command = self
             .sessions
             .get(&session_id)
@@ -5801,12 +5938,53 @@ impl AgentRuntime {
 
             let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
             let iteration_cap = state.settings.execution.iteration_cap;
+            let stop_reason = state
+                .active_turn
+                .as_ref()
+                .and_then(|turn| loop_stop_reason(turn, iteration_cap));
 
             if consecutive_failures >= stall_threshold {
                 Err(format!(
                     "Stall detected: {consecutive_failures} consecutive step failures \
                      (threshold: {stall_threshold}). Surfacing to user."
                 ))
+            } else if let Some(stop_reason) = stop_reason {
+                // No-progress stop: give the model one stripped-tool chance to answer
+                // before the hard cap. This catches diagnostic/status spirals while
+                // preserving the useful evidence already collected.
+                warn!(
+                    session_id = %session_id,
+                    iteration,
+                    iteration_cap,
+                    stop_reason,
+                    "Session reached loop stop condition; doing final no-tool wrap-up."
+                );
+                is_finalizing = true;
+                match state.build_reentry_context_envelope() {
+                    Some((mut prompt, context, context_projection, _tools)) => {
+                        prompt.push_str(&format!(
+                            "\n\n[Loop control: {stop_reason}. Do not call any more tools. \
+                             Review the tool history and provide your final response to the user now.]"
+                        ));
+                        let active_turn = state.active_turn.as_ref().expect("turn exists");
+                        Ok((
+                            prompt,
+                            context,
+                            context_projection,
+                            active_turn.task_id,
+                            active_turn.user_content.clone(),
+                            active_turn.chat_id.clone(),
+                            active_turn.final_reply_to.clone(),
+                            active_turn.final_reply_role.clone(),
+                            active_turn.final_reply_guest_id.clone(),
+                            vec![], // strip tools — forces text-only reply
+                            state.checkpoint_memory_type(),
+                            state.checkpoint_json(),
+                            state.clone(),
+                        ))
+                    }
+                    None => Err("Active turn vanished at loop stop wrap-up".into()),
+                }
             } else if iteration == iteration_cap {
                 // Soft cap: one final no-tool call so the model can wrap up gracefully.
                 warn!(
@@ -5944,6 +6122,27 @@ impl AgentRuntime {
                     // stall/hard-cap hit — emit loop_recovering so observers know we stopped
                     let _ = self
                         .emit_turn_event(&session_id, "loop_recovering", None)
+                        .await;
+                }
+                let fallback_reply = if msg.contains("maximum tool iterations") {
+                    self.sessions.get(&session_id).and_then(|state| {
+                        let turn = state.active_turn.as_ref()?;
+                        Some(loop_stop_fallback_reply(
+                            &turn.user_content,
+                            &turn.working_tool_history,
+                            "the turn reached its maximum tool-iteration limit",
+                        ))
+                    })
+                } else {
+                    None
+                };
+                if let Some(reply) = fallback_reply {
+                    warn!(
+                        session_id = %session_id,
+                        "Delivering loop-stop fallback instead of failing active turn."
+                    );
+                    return self
+                        .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
                         .await;
                 }
                 self.fail_active_turn(session_id, turn_id, msg).await
@@ -8350,8 +8549,8 @@ impl AgentRuntime {
             // routing them to the active turn would corrupt the pending tool result.
             let has_no_context = task.turn_id.as_deref().filter(|s| !s.is_empty()).is_none()
                 && task.chat_id.as_deref().filter(|s| !s.is_empty()).is_none();
-            let is_unattributable_error = task.error.is_some()
-                && task.capability.as_deref().is_none_or(|c| c == "unknown");
+            let is_unattributable_error =
+                task.error.is_some() && task.capability.as_deref().is_none_or(|c| c == "unknown");
             if has_no_context && is_unattributable_error {
                 return Ok(());
             }
@@ -15684,12 +15883,17 @@ impl AgentRuntime {
     /// This ensures tool grants and runtime routing changes take effect immediately on the next
     /// message without requiring a session restart or reconnect.
     async fn refresh_bindings_from_snapshot(&mut self, session_id: &str) {
-        let response = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig {
+        let response = match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.ipc_client.send_request(IpcRequest::GetConfig {
                 key: format!("__session_snapshot__:{session_id}"),
-            })
-            .await;
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => return, // timeout — skip the bindings refresh
+        };
 
         let snapshot = match response {
             Ok(IpcResponse::ConfigData {
@@ -15774,10 +15978,26 @@ impl AgentRuntime {
                 None => format!("__session_snapshot__:{session_id}"),
             }
         };
-        let response = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig { key: snapshot_key })
-            .await?;
+        let response = match tokio::time::timeout(
+            Duration::from_secs(15),
+            self.ipc_client
+                .send_request(IpcRequest::GetConfig { key: snapshot_key }),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                warn!(
+                    session_id = %session_id,
+                    "ensure_session_loaded: GetConfig timed out after 15s — starting fresh session"
+                );
+                IpcResponse::ConfigData {
+                    key: String::new(),
+                    value_json: None,
+                }
+            }
+        };
 
         if let IpcResponse::ConfigData {
             value_json: Some(value_json),
@@ -15916,17 +16136,19 @@ impl AgentRuntime {
         agent_id: &str,
         state: &mut SessionState,
     ) {
-        match ipc_client
-            .send_request(IpcRequest::ListRules {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            ipc_client.send_request(IpcRequest::ListRules {
                 agent_id: agent_id.to_string(),
-            })
-            .await
+            }),
+        )
+        .await
         {
-            Ok(IpcResponse::RuleList { rules }) => {
+            Ok(Ok(IpcResponse::RuleList { rules })) => {
                 state.rules = rules;
             }
             Ok(_) | Err(_) => {
-                // Non-fatal: session proceeds without rules if the hotel is unavailable.
+                // Non-fatal: session proceeds without rules if the hotel is unavailable or times out.
             }
         }
     }
@@ -16060,11 +16282,12 @@ mod tests {
     use super::{
         AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
         extract_model_error_payload, format_role_command_reply, format_roles_report,
-        media_analysis_attachments, normalized_user_content, parse_memory_candidate,
-        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
+        loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments,
+        normalized_user_content, parse_memory_candidate, resolve_media_routing,
+        resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
-    use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
+    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
     };
@@ -16110,6 +16333,64 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
         }
+    }
+
+    fn push_test_tool(turn: &mut WorkingTurn, tool_name: &str, content: &str) {
+        turn.working_tool_history.push((
+            ToolCall {
+                tool_name: tool_name.into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: tool_name.into(),
+                content: content.into(),
+            },
+        ));
+        turn.iteration += 1;
+    }
+
+    #[test]
+    fn loop_stop_reason_detects_low_progress_diagnostic_run() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        for tool_name in ["hotel.status", "role.list", "skill.list", "session.status"] {
+            push_test_tool(&mut turn, tool_name, "ok");
+        }
+
+        let reason = loop_stop_reason(&turn, 10).expect("diagnostic run should stop");
+        assert!(reason.contains("status"));
+    }
+
+    #[test]
+    fn loop_stop_reason_allows_non_diagnostic_progress() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        for tool_name in [
+            "hotel.status",
+            "life.recall",
+            "memory.recall",
+            "life.observe",
+        ] {
+            push_test_tool(&mut turn, tool_name, "ok");
+        }
+
+        assert!(loop_stop_reason(&turn, 10).is_none());
+    }
+
+    #[test]
+    fn loop_stop_fallback_names_recent_tool_path() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.user_content = "let's try that again".into();
+        push_test_tool(&mut turn, "hotel.status", "ok");
+        push_test_tool(&mut turn, "session.status", "ok");
+
+        let reply = loop_stop_fallback_reply(
+            &turn.user_content,
+            &turn.working_tool_history,
+            "the turn reached its maximum tool-iteration limit",
+        );
+
+        assert!(reply.contains("instead of looping"));
+        assert!(reply.contains("hotel.status, session.status"));
+        assert!(reply.contains("let's try that again"));
     }
 
     #[test]

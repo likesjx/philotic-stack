@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-system-boundary
+
+rectangle "desktop-system-boundary" as desktop_system_boundary #Orange {
+}
+
+
+@enduml

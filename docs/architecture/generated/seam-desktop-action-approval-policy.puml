@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-action-approval-policy
+
+rectangle "desktop-action-approval-policy" as desktop_action_approval_policy #Orange {
+}
+
+
+@enduml

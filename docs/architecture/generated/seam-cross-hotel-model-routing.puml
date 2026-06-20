@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cross-hotel-model-routing
+
+rectangle "cross-hotel-model-routing" as cross_hotel_model_routing #Orange {
+}
+
+
+@enduml

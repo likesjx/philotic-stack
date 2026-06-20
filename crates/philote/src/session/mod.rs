@@ -63,6 +63,45 @@ fn sanitize_turn_content_for_history(content: &str) -> String {
     content.to_string()
 }
 
+fn dropped_active_turn_record(checkpoint: &serde_json::Value) -> Option<TurnRecord> {
+    let turn = checkpoint.get("active_turn")?;
+    if turn.is_null() {
+        return None;
+    }
+
+    let phase = turn
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("queued");
+    if matches!(phase, "waiting_approval" | "waiting_tool") {
+        return None;
+    }
+
+    let user_content = turn
+        .get("user_content")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_turn_content_for_history)
+        .filter(|content| !content.trim().is_empty())?;
+    let turn_id = turn
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dropped-active-turn")
+        .to_string();
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    Some(TurnRecord {
+        turn_id,
+        user_content,
+        assistant_content: Some(format!(
+            "[Previous turn ended in phase '{phase}' before a final usable answer. If the user asks to retry, resume this request instead of treating the retry as a new topic.]"
+        )),
+        created_at,
+    })
+}
+
 fn sanitize_timezone_for_prompt(raw: &str) -> Option<String> {
     let tz = raw.trim();
     if tz.is_empty() || tz.len() > 128 {
@@ -1667,7 +1706,8 @@ impl SessionState {
             return all_tools;
         }
 
-        let normalized = normalized_turn_text(user_content);
+        let normalized_current = normalized_turn_text(user_content);
+        let normalized = self.projection_relevance_text(&normalized_current);
         if normalized.is_empty() {
             return all_tools;
         }
@@ -1735,7 +1775,9 @@ impl SessionState {
             return projected;
         }
 
-        if looks_like_conversational_goal(&normalized) {
+        if looks_like_conversational_goal(&normalized)
+            && !looks_like_retry_goal(&normalized_current)
+        {
             return Vec::new();
         }
 
@@ -1786,6 +1828,25 @@ impl SessionState {
         }
 
         all_tools
+    }
+
+    fn projection_relevance_text(&self, normalized_current: &str) -> String {
+        if !looks_like_retry_goal(normalized_current) {
+            return normalized_current.to_string();
+        }
+
+        let mut parts = vec![normalized_current.to_string()];
+        if let Some(previous) = self.recent_turns.last() {
+            parts.push(normalized_turn_text(&previous.user_content));
+            if let Some(assistant_content) = previous.assistant_content.as_deref() {
+                parts.push(normalized_turn_text(assistant_content));
+            }
+        }
+        parts
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     pub fn build_prompt(&self, user_content: &str) -> String {
@@ -3360,7 +3421,7 @@ impl SessionState {
             .and_then(|value| serde_json::from_value::<ComponentRouteAssembly>(value).ok())
             .unwrap_or_default();
 
-        let recent_turns = checkpoint
+        let mut recent_turns = checkpoint
             .get("recent_turns")
             .and_then(serde_json::Value::as_array)
             .map(|turns| {
@@ -3383,6 +3444,20 @@ impl SessionState {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+
+        if let Some(dropped) = dropped_active_turn_record(checkpoint) {
+            let already_recorded = recent_turns
+                .iter()
+                .any(|turn| turn.turn_id == dropped.turn_id);
+            if !already_recorded {
+                recent_turns.push(dropped);
+                let window_size = AgentSettings::default().memory.memory_window_size.max(1);
+                if recent_turns.len() > window_size {
+                    let drain = recent_turns.len() - window_size;
+                    recent_turns.drain(0..drain);
+                }
+            }
+        }
 
         let active_turn = checkpoint.get("active_turn").and_then(|turn| {
             if turn.is_null() {
@@ -3665,6 +3740,23 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
         ]
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn looks_like_retry_goal(normalized: &str) -> bool {
+    [
+        "try again",
+        "retry",
+        "again?",
+        "again",
+        "one more time",
+        "rerun",
+        "run it again",
+        "do it again",
+        "let's try that again",
+        "lets try that again",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
 }
 
 fn looks_like_execution_goal(normalized: &str) -> bool {
@@ -4585,9 +4677,9 @@ mod tests {
         MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel,
         ParacrineThreadStatus, PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest,
         ResponseRouteMode, RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
-        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, VoiceDeliveryMode,
-        VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
-        session_checkpoint_memory_type,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, TurnRecord,
+        VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings,
+        merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
@@ -4717,6 +4809,39 @@ mod tests {
         assert_eq!(
             restored_turn.paracrine_response_routing,
             Some(philotic_client::ParacrineRouting::EnrichedToolResult)
+        );
+    }
+
+    #[test]
+    fn failed_active_turn_is_preserved_as_retry_context_on_restore() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut turn = test_working_turn(None);
+        turn.phase = TurnPhase::Failed;
+        turn.user_content = "Use life.recall to inspect my LifeGraph roles".into();
+        state.start_turn(turn);
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+
+        assert!(
+            restored.active_turn.is_none(),
+            "failed turn should not stay active after restore"
+        );
+        let retry_context = restored
+            .recent_turns
+            .last()
+            .expect("failed turn should become retry context");
+        assert_eq!(
+            retry_context.user_content,
+            "Use life.recall to inspect my LifeGraph roles"
+        );
+        assert!(
+            retry_context
+                .assistant_content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resume this request")
         );
     }
 
@@ -5093,7 +5218,11 @@ mod tests {
                 on_demand_skills: Vec::new(),
             }
         );
-        assert_eq!(state.recent_turns.len(), 1);
+        // The dropped "waiting_model" active turn (not resumable across restart) is
+        // appended as a continuity record alongside the original recent_turns entry.
+        assert_eq!(state.recent_turns.len(), 2);
+        assert_eq!(state.recent_turns[1].turn_id, "turn-2");
+        assert_eq!(state.recent_turns[1].user_content, "status?");
         assert!(state.active_turn.is_none());
         assert_eq!(state.tool_assembly.tools_for_model[0].tool_name, "echo");
         assert_eq!(
@@ -6761,6 +6890,31 @@ mod tests {
             "\"Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.\"",
         );
         assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn retry_turn_projects_tools_from_failed_lifegraph_context() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.rebuild_default_tool_assembly();
+        state.recent_turns.push(TurnRecord {
+            turn_id: "failed-turn".into(),
+            user_content: "Use life.recall to inspect my LifeGraph roles and goals".into(),
+            assistant_content: Some(
+                "[Previous turn ended in phase 'failed' before a final usable answer. If the user asks to retry, resume this request instead of treating the retry as a new topic.]"
+                    .into(),
+            ),
+            created_at: 1,
+        });
+
+        let projected = state.project_tools_for_turn("try again?");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(projected_names.contains(&"life.recall"));
     }
 
     #[test]

@@ -330,8 +330,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "session.status".into(),
         ToolDefinition {
             tool_name: "session.status".into(),
-            description: "Returns a summary of the current session state, including the active \
-                          session ID, turn count, approval policy, and active tool runners."
+            description: "Diagnostic only. Returns a summary of this conversation session: active \
+                          session ID, turn state, approval policy, and active tool runners. Use \
+                          only when the operator asks about session/tool availability or when \
+                          debugging routing. Do not use as a default first step for domain work."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -345,12 +347,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "hotel.status".into(),
         ToolDefinition {
             tool_name: "hotel.status".into(),
-            description: "Returns a safe view of the hotel's current state: hotel name, node ID, \
-                          active and inactive guests (with roles), and registered agent identities. \
-                          No credentials, API keys, or secret values are included. Use this to \
-                          understand what guests are running, which agents are registered, and \
-                          whether the hotel is healthy. Always prefer this over bash.exec for \
-                          hotel introspection."
+            description: "Diagnostic only. Returns a safe view of the hotel's current state: \
+                          hotel name, node ID, active/inactive guests, and registered agent \
+                          identities. Use when the operator asks about hotel health, guest \
+                          placement, or runtime debugging. Do not use for ordinary memory, \
+                          LifeGraph, or planning questions."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -432,9 +433,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "agent.graph.read".into(),
         ToolDefinition {
             tool_name: "agent.graph.read".into(),
-            description: "Read structured state from the agent's own graph substrate. Use this \
-                          to inspect agent-local preferences, declarations, and other cognitive \
-                          policy records without reaching into hotel-owned authority."
+            description: "Read agent-local operating preferences and declarations from the \
+                          agent graph. This is not the operator LifeGraph and not the repo intel \
+                          graph. Use only for agent policy such as tool_preferences, routing, \
+                          resource grants, or reflex preferences."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1145,9 +1147,27 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "skill.list".into(),
         ToolDefinition {
             tool_name: "skill.list".into(),
-            description: "Lists all registered skills in the hotel's skill catalog, including their \
-                          validation states and implied tools. Use to browse available skills before \
-                          assigning them to a role."
+            description: "Configuration inspection only. Lists registered skills in the hotel's \
+                          skill catalog, including validation states and implied tools. Use when \
+                          the operator asks to inspect or assign skills. Do not call just to decide \
+                          how to answer a normal user request."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "role.list".into(),
+        ToolDefinition {
+            tool_name: "role.list".into(),
+            description: "Configuration inspection only. Lists configured roles and active role \
+                          incarnations for this agent/hotel. Use when the operator asks which \
+                          roles exist, which role is active, or when debugging role routing. Do \
+                          not use as a generic discovery step before answering domain questions."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1995,8 +2015,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             tool_name: "memory.recall".into(),
             description: "Retrieve memories relevant to a query from the agent's long-term \
                           autobiographical store (MuninnDB). Returns the most salient engrams \
-                          based on semantic + graph activation. Use when the current context \
-                          is insufficient and prior knowledge may apply."
+                          based on semantic + graph activation. Use for prior conversation, \
+                          operator preferences, and agent continuity. For roles, goals, habits, \
+                          systems, open loops, or commitments in the operator's LifeGraph, prefer \
+                          life.recall."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -2662,12 +2684,13 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "life.recall".into(),
         ToolDefinition {
             tool_name: "life.recall".into(),
-            description: "Retrieve a context packet from the Life Graph using semantic search. \
-                          Returns ranked evidence nodes relevant to the query. \
-                          Requires an embedding vector (1536-dim) in the 'embedding' field. \
-                          Use operator_intent to select a named strategy: \
-                          'open_loops_by_context', 'goals_and_next_actions', \
-                          'commitments_approaching', 're_entry_context'."
+            description: "Retrieve context from the operator's LifeGraph: roles, goals, habits, \
+                          systems, open loops, commitments, and next actions. Use this whenever \
+                          the operator asks what is in the LifeGraph or asks about life structure. \
+                          Provide query_text and, when useful, operator_intent; the runner can use \
+                          text/fallback recall when an embedding is not available. Named intents: \
+                          open_loops_by_context, goals_and_next_actions, commitments_approaching, \
+                          re_entry_context."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -2804,4 +2827,52 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_catalog;
+
+    #[test]
+    fn role_list_has_specific_model_facing_description() {
+        let catalog = tool_catalog();
+        let role_list = catalog.get("role.list").expect("role.list catalog entry");
+
+        assert!(
+            role_list
+                .description
+                .contains("Configuration inspection only")
+        );
+        assert!(!role_list.description.contains("Execute the role.list tool"));
+        assert_eq!(role_list.input_schema["type"], "object");
+    }
+
+    #[test]
+    fn life_recall_description_does_not_require_model_generated_embedding() {
+        let catalog = tool_catalog();
+        let life_recall = catalog
+            .get("life.recall")
+            .expect("life.recall catalog entry");
+
+        assert!(life_recall.description.contains("operator's LifeGraph"));
+        assert!(life_recall.description.contains("text/fallback recall"));
+        assert!(
+            !life_recall
+                .description
+                .contains("Requires an embedding vector")
+        );
+    }
+
+    #[test]
+    fn diagnostic_tool_descriptions_are_explicitly_diagnostic() {
+        let catalog = tool_catalog();
+        for name in ["session.status", "hotel.status", "skill.list"] {
+            let tool = catalog.get(name).expect("cataloged diagnostic tool");
+            assert!(
+                tool.description.contains("Diagnostic only")
+                    || tool.description.contains("Configuration inspection only"),
+                "{name} should tell the model it is an inspection tool"
+            );
+        }
+    }
 }

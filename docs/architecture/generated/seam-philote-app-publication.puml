@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - philote-app-publication
+
+rectangle "philote-app-publication" as philote_app_publication #Orange {
+}
+
+
+@enduml

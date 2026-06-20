@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cross-hotel-role-transport
+
+rectangle "cross-hotel-role-transport" as cross_hotel_role_transport #Orange {
+}
+
+
+@enduml
