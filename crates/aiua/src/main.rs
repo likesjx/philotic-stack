@@ -3800,7 +3800,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                     },
                     "target_role": {
                         "type": "string",
-                        "description": "Role name whose inbox receives the trigger payload."
+                        "description": "Name of one of YOUR OWN configured roles (e.g. \"orchestrator\") whose inbox receives the trigger payload — the hotel resolves it to that role's routing key automatically. The target role's guest does not need to be running already: the hotel will materialize it on fire if needed. Use role.list to see your available roles."
                     },
                     "payload": {
                         "type": "string",
@@ -8026,6 +8026,8 @@ async fn main() -> Result<()> {
             ipc_inboxes.clone(),
             caps.node_id.clone(),
             cron_offset_ms,
+            ipc_parked_inbound.clone(),
+            ipc_materialization_requester.clone(),
         );
         tokio::spawn(async move {
             cron_ticker.run().await;
