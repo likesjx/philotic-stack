@@ -862,6 +862,7 @@ fn infer_response_target_guest_id_for_agent_task(
     target_role: &str,
     target_guest_id: Option<&str>,
     task_json: &str,
+    live_agent_guests: &[String],
 ) -> Option<String> {
     response_like_agent_action_for_task(target_role, target_guest_id, task_json)?;
     let payload = serde_json::from_str::<serde_json::Value>(task_json).ok()?;
@@ -874,7 +875,29 @@ fn infer_response_target_guest_id_for_agent_task(
         .get("session_id")
         .and_then(serde_json::Value::as_str)?;
     let session = graph.get_session(session_id).ok().flatten()?;
-    session.active_incarnation_id.or(session.primary_agent_id)
+
+    let is_registered = |guest_id: &str| live_agent_guests.iter().any(|live| live == guest_id);
+
+    if let Some(active_guest_id) = session.active_incarnation_id.clone() {
+        if is_registered(&active_guest_id) {
+            return Some(active_guest_id);
+        }
+
+        // Active incarnation isn't actually live right now (e.g. a single-process
+        // philote handling all roles under its base agent_id) — mirror the inbound
+        // resolver's fallback so the response isn't silently parked ledger-only.
+        if let Some(orchestrator_guest_id) =
+            IpcServer::resolve_orchestrator_guest_id(graph, &session, live_agent_guests)
+        {
+            warn!(
+                "Active incarnation [{}] is not registered for session [{}]; routing response to orchestrator guest [{}] instead.",
+                active_guest_id, session_id, orchestrator_guest_id
+            );
+            return Some(orchestrator_guest_id);
+        }
+    }
+
+    session.primary_agent_id
 }
 
 fn declared_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
@@ -8662,11 +8685,21 @@ impl IpcServer {
                     &task_json,
                 );
                 let target_guest_id = if target_guest_id.is_none() {
+                    let live_agent_guests: Vec<String> = {
+                        let guard = inboxes.lock().await;
+                        guard
+                            .get(target_role.as_str())
+                            .into_iter()
+                            .flatten()
+                            .map(|subscriber| subscriber.guest_id.clone())
+                            .collect()
+                    };
                     let inferred = infer_response_target_guest_id_for_agent_task(
                         graph,
                         &target_role,
                         None,
                         &task_json,
+                        &live_agent_guests,
                     );
                     if let Some(ref guest_id) = inferred {
                         info!(
@@ -17337,6 +17370,129 @@ mod tests {
         IPC_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn response_task_json(session_id: &str) -> String {
+        serde_json::json!({
+            "session_id": session_id,
+            "action": "model_response",
+            "content": "hi"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn infer_response_target_reroutes_to_base_agent_when_active_incarnation_not_live() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-beacon-stuck".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        // Only the base agent guest is actually live — the role-incarnation guest
+        // (agent-beacon:orchestrator) recorded on the session is not registered,
+        // reproducing the 2026-06-22 "beacon got stuck" incident.
+        let live_agent_guests = vec!["agent-beacon".to_string()];
+
+        let resolved = infer_response_target_guest_id_for_agent_task(
+            &graph,
+            "agent",
+            None,
+            &response_task_json("sess-beacon-stuck"),
+            &live_agent_guests,
+        );
+
+        assert_eq!(resolved, Some("agent-beacon".to_string()));
+    }
+
+    #[test]
+    fn infer_response_target_keeps_active_incarnation_when_live() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-active-live".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let live_agent_guests = vec!["agent-beacon:orchestrator".to_string()];
+
+        let resolved = infer_response_target_guest_id_for_agent_task(
+            &graph,
+            "agent",
+            None,
+            &response_task_json("sess-active-live"),
+            &live_agent_guests,
+        );
+
+        assert_eq!(resolved, Some("agent-beacon:orchestrator".to_string()));
+    }
+
+    #[test]
+    fn infer_response_target_honors_explicit_return_route_even_when_not_live() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-explicit-route".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        // No guest is live at all, but the payload carries an explicit ReturnRoute —
+        // that deliberate routing decision must be honored as-is (park, don't reroute).
+        let live_agent_guests: Vec<String> = vec![];
+        let task_json = serde_json::json!({
+            "session_id": "sess-explicit-route",
+            "action": "model_response",
+            "content": "hi",
+            "return_route": { "guest_id": "agent-beacon:developer" }
+        })
+        .to_string();
+
+        let resolved = infer_response_target_guest_id_for_agent_task(
+            &graph,
+            "agent",
+            None,
+            &task_json,
+            &live_agent_guests,
+        );
+
+        assert_eq!(resolved, Some("agent-beacon:developer".to_string()));
     }
 
     #[tokio::test]
