@@ -8819,15 +8819,27 @@ impl IpcServer {
                     }
                     _ => task_json,
                 };
-                let route_resolution = Self::resolve_agent_route(
-                    graph,
-                    inboxes,
-                    local_node_id,
-                    &target_role,
-                    target_guest_id.clone(),
-                    &task_json,
-                )
-                .await;
+                // Response-like payloads already went through
+                // infer_response_target_guest_id_for_agent_task above, which is the
+                // authoritative resolver for outbound responses. Don't also run them
+                // through resolve_agent_route: that resolver re-derives from
+                // session.active_incarnation_id whenever the resolved guest_id equals
+                // primary_agent_id (its "targets_base_agent" case, meant for fresh
+                // inbound task delivery) and would clobber the inferred fallback right
+                // back to the unregistered active incarnation it was meant to avoid.
+                let route_resolution = if response_like_agent_action.is_some() {
+                    AgentRouteResolution::Deliver(target_guest_id.clone())
+                } else {
+                    Self::resolve_agent_route(
+                        graph,
+                        inboxes,
+                        local_node_id,
+                        &target_role,
+                        target_guest_id.clone(),
+                        &task_json,
+                    )
+                    .await
+                };
                 // Compute resolved_target_guest_id BEFORE the auto-reroute block so we can
                 // gate on it — target_guest_id may be None (e.g. membrane sends target_role="agent"
                 // with no explicit guest_id), but resolve_agent_route fills in the active brain/
@@ -18636,6 +18648,107 @@ mod tests {
                 assert_eq!(payload["delivery_target_guest_id"], "agent-jane");
             }
             other => panic!("unexpected jane inbound response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_response_like_payload_falls_back_to_live_base_agent() {
+        // Regression test for the "beacon got stuck" incident (2026-06-22): a
+        // response-like EmitTask whose session.active_incarnation_id points at a
+        // non-live role guest must be delivered to the live base agent guest, not
+        // re-derived back to the unregistered incarnation by resolve_agent_route's
+        // "targets_base_agent" special case (which is meant for fresh inbound task
+        // delivery, not for payloads that already went through response inference).
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-beacon-stuck-e2e".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("7898847424".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        // Only the base agent guest is live — agent-beacon:orchestrator never
+        // connected, matching the live incident exactly.
+        let mut base_agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("base agent connect");
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "model-router-smoke".into(),
+            role: "model-router".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "model_response",
+                    "session_id": "sess-beacon-stuck-e2e",
+                    "content": "fix verification reply"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit response-like task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            base_agent.recv_task(),
+        )
+        .await
+        .expect("base agent should receive response before timeout — must not park ledger-only")
+        .expect("base agent recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["action"], "model_response");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-beacon");
+            }
+            other => panic!("unexpected base agent inbound response: {other:?}"),
         }
 
         unsafe {
