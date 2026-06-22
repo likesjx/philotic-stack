@@ -390,6 +390,87 @@ pub struct TaskErrorPayload {
     pub sub_kind: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReturnRoute {
+    pub node: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+impl ReturnRoute {
+    pub fn from_task(
+        task: &serde_json::Value,
+        default_node: impl Into<String>,
+        default_role: impl Into<String>,
+    ) -> Self {
+        let default_node = default_node.into();
+        let default_role = default_role.into();
+        let object = task
+            .get("return_route")
+            .and_then(serde_json::Value::as_object);
+
+        let read = |field: &str| -> Option<String> {
+            object
+                .and_then(|route| route.get(field))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| match field {
+                    "node" => task.get("reply_to").and_then(serde_json::Value::as_str),
+                    "role" => task.get("reply_role").and_then(serde_json::Value::as_str),
+                    "session_id" => task.get("session_id").and_then(serde_json::Value::as_str),
+                    "turn_id" => task.get("turn_id").and_then(serde_json::Value::as_str),
+                    "correlation_id" => task
+                        .get("correlation_id")
+                        .and_then(serde_json::Value::as_str),
+                    _ => None,
+                })
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        };
+
+        let node = read("node").unwrap_or(default_node);
+        let role = read("role").unwrap_or(default_role);
+        let guest_id = object
+            .and_then(|route| route.get("guest_id"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                object
+                    .and_then(|route| route.get("guest"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                task.get("reply_guest_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                (role == "agent")
+                    .then(|| task.get("agent_id").and_then(serde_json::Value::as_str))
+                    .flatten()
+            })
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+
+        Self {
+            node,
+            role,
+            guest_id,
+            session_id: read("session_id"),
+            turn_id: read("turn_id"),
+            correlation_id: read("correlation_id"),
+        }
+    }
+
+    pub fn as_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+}
+
 impl TaskErrorPayload {
     pub fn provider_failure(
         component: impl Into<String>,
@@ -3020,5 +3101,64 @@ mod tests {
     fn disconnect_detection_matches_unexpected_eof() {
         let err = anyhow::Error::new(std::io::Error::from(ErrorKind::UnexpectedEof));
         assert!(is_ipc_disconnect(&err));
+    }
+
+    #[test]
+    fn return_route_reads_typed_route_before_compat_fields() {
+        let task = serde_json::json!({
+            "reply_to": "compat-node",
+            "reply_role": "agent",
+            "reply_guest_id": "compat-guest",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "return_route": {
+                "node": "typed-node",
+                "role": "agent",
+                "guest_id": "typed-guest",
+                "session_id": "typed-session",
+                "turn_id": "typed-turn",
+                "correlation_id": "corr-1"
+            }
+        });
+
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.node, "typed-node");
+        assert_eq!(route.role, "agent");
+        assert_eq!(route.guest_id.as_deref(), Some("typed-guest"));
+        assert_eq!(route.session_id.as_deref(), Some("typed-session"));
+        assert_eq!(route.turn_id.as_deref(), Some("typed-turn"));
+        assert_eq!(route.correlation_id.as_deref(), Some("corr-1"));
+    }
+
+    #[test]
+    fn return_route_reads_compat_fields_and_agent_fallback() {
+        let task = serde_json::json!({
+            "reply_to": "compat-node",
+            "reply_role": "agent",
+            "agent_id": "agent-jane",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        });
+
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.node, "compat-node");
+        assert_eq!(route.role, "agent");
+        assert_eq!(route.guest_id.as_deref(), Some("agent-jane"));
+        assert_eq!(route.session_id.as_deref(), Some("session-1"));
+        assert_eq!(route.turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn return_route_agent_id_fallback_is_agent_role_only() {
+        let task = serde_json::json!({
+            "reply_to": "compat-node",
+            "reply_role": "membrane",
+            "agent_id": "agent-jane"
+        });
+
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.node, "compat-node");
+        assert_eq!(route.role, "membrane");
+        assert_eq!(route.guest_id, None);
     }
 }

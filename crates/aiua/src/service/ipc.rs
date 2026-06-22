@@ -800,6 +800,83 @@ fn attach_delivery_context(
     serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
 }
 
+fn is_response_like_agent_action(action: &str) -> bool {
+    matches!(
+        action,
+        "model_response"
+            | "tool_result"
+            | "datasource_response"
+            | "paracrine_response"
+            | "approval_resolution"
+            | "handoff_bundle"
+    )
+}
+
+fn explicit_response_guest_from_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("return_route")
+        .and_then(|route| route.get("guest_id"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("return_route")
+                .and_then(|route| route.get("guest"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("return_route")
+                .and_then(|route| route.get("reply_guest_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("delivery_target_guest_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("reply_guest_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| payload.get("agent_id").and_then(serde_json::Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn response_like_agent_action_for_task(
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: &str,
+) -> Option<String> {
+    if target_role != "agent" || target_guest_id.is_some() {
+        return None;
+    }
+    let payload = serde_json::from_str::<serde_json::Value>(task_json).ok()?;
+    let action = payload.get("action").and_then(serde_json::Value::as_str)?;
+    is_response_like_agent_action(action).then(|| action.to_string())
+}
+
+fn infer_response_target_guest_id_for_agent_task(
+    graph: &GraphDomain,
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: &str,
+) -> Option<String> {
+    response_like_agent_action_for_task(target_role, target_guest_id, task_json)?;
+    let payload = serde_json::from_str::<serde_json::Value>(task_json).ok()?;
+
+    if let Some(guest_id) = explicit_response_guest_from_payload(&payload) {
+        return Some(guest_id);
+    }
+
+    let session_id = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)?;
+    let session = graph.get_session(session_id).ok().flatten()?;
+    session.active_incarnation_id.or(session.primary_agent_id)
+}
+
 fn declared_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
     let mut capabilities =
         BTreeSet::from(["media.analyze".to_string(), "text.generate".to_string()]);
@@ -5611,6 +5688,31 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn park_and_materialize_local_role(
+        graph: &GraphDomain,
+        _inboxes: &InboxRegistry,
+        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        mat_req: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        source_node: &str,
+        task_id: Uuid,
+        task_json: String,
+        record: &RoleIncarnationRecord,
+    ) {
+        Self::park_and_materialize_role_philote(
+            graph,
+            local_node_id,
+            parked_inbound,
+            mat_req,
+            source_node,
+            task_id,
+            task_json,
+            &record.guest_id,
+        )
+        .await;
+    }
+
     /// Park a cross-hotel task and trigger role-philote materialization on this hotel.
     ///
     /// Called when a `TaskInvoke` arrives from the mesh with `delivery_target_guest_id` set
@@ -5619,7 +5721,7 @@ impl IpcServer {
         graph: &GraphDomain,
         local_node_id: &str,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
-        mat_req: Option<&Arc<dyn GuestMaterializationRequester>>,
+        mat_req: Option<&dyn GuestMaterializationRequester>,
         source_node: &str,
         task_id: Uuid,
         task_json: String,
@@ -6693,7 +6795,7 @@ impl IpcServer {
         graph: &GraphDomain,
         local_node_id: &str,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
-        mat_req: Option<&Arc<dyn GuestMaterializationRequester>>,
+        mat_req: Option<&dyn GuestMaterializationRequester>,
     ) -> bool {
         match (&event.kind, &event.target_agent_id, &event.payload) {
             (
@@ -8500,6 +8602,57 @@ impl IpcServer {
                 target_guest_id,
                 task_json,
             } => {
+                let response_like_agent_action = response_like_agent_action_for_task(
+                    &target_role,
+                    target_guest_id.as_deref(),
+                    &task_json,
+                );
+                let target_guest_id = if target_guest_id.is_none() {
+                    let inferred = infer_response_target_guest_id_for_agent_task(
+                        graph,
+                        &target_role,
+                        None,
+                        &task_json,
+                    );
+                    if let Some(ref guest_id) = inferred {
+                        info!(
+                            target_role = target_role.as_str(),
+                            guest_id = guest_id.as_str(),
+                            "EmitTask: inferred explicit guest target for response-like agent payload"
+                        );
+                    }
+                    inferred
+                } else {
+                    target_guest_id
+                };
+                if target_guest_id.is_none() {
+                    if let Some(action) = response_like_agent_action {
+                        let message = format!(
+                            "response-like action [{action}] targeted role [agent] without a concrete return guest"
+                        );
+                        warn!(
+                            action = action.as_str(),
+                            target_role = target_role.as_str(),
+                            target_node = target_node.as_str(),
+                            "EmitTask rejected unresolved response return route"
+                        );
+                        if let Some(hq) = heal_queue {
+                            if let Err(err) = hq.push_error("aiua.response_return_route", &message)
+                            {
+                                warn!(
+                                    error = %err,
+                                    "Failed to push unresolved response route to heal queue"
+                                );
+                            }
+                        }
+                        return IpcResponse::error(
+                            "emit_task",
+                            "RESPONSE_ROUTE_UNRESOLVED",
+                            message,
+                        );
+                    }
+                }
+
                 // Short-circuit operator surface queries to the in-process channel,
                 // eliminating the UDS self-connection and its socket leak.
                 // Only short-circuit for local-node targets; cross-hotel queries must
@@ -18029,6 +18182,246 @@ mod tests {
             .is_err(),
             "stale embedded delivery_target_guest_id must not receive the task"
         );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_targets_response_like_agent_payload_to_originating_guest() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut jane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("jane connect");
+        let mut aria = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-aria".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("aria connect");
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "life-graph-runner-smoke".into(),
+            role: "life-graph-runner".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "datasource_response",
+                    "agent_id": "agent-jane",
+                    "session_id": "telegram:7898847424:agent-jane",
+                    "turn_id": "turn-lifegraph",
+                    "chat_id": "7898847424",
+                    "tool_name": "life.recall",
+                    "result": {
+                        "status": "success"
+                    }
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit response-like task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(tokio::time::Duration::from_secs(1), jane.recv_task())
+            .await
+            .expect("jane should receive response before timeout")
+            .expect("jane recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["action"], "datasource_response");
+                assert_eq!(payload["tool_name"], "life.recall");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane");
+            }
+            other => panic!("unexpected jane inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(200), aria.recv_task())
+                .await
+                .is_err(),
+            "broad agent routing must not deliver response-like payloads to unrelated agents"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_targets_response_like_agent_payload_from_return_route() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut jane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("jane connect");
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "model-router-smoke".into(),
+            role: "model-router".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "model_response",
+                    "return_route": {
+                        "node": "local-aiua-01",
+                        "role": "agent",
+                        "guest_id": "agent-jane",
+                        "session_id": "telegram:7898847424:agent-jane",
+                        "turn_id": "turn-model"
+                    },
+                    "agent_action": {
+                        "kind": "respond",
+                        "content": "ok"
+                    }
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit response-like task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+        let delivered = tokio::time::timeout(tokio::time::Duration::from_secs(1), jane.recv_task())
+            .await
+            .expect("jane should receive response before timeout")
+            .expect("jane recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["action"], "model_response");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane");
+            }
+            other => panic!("unexpected jane inbound response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_rejects_unresolved_response_like_agent_payload() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "model-router-smoke".into(),
+            role: "model-router".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "model_response",
+                    "session_id": "missing-session",
+                    "agent_action": {
+                        "kind": "respond",
+                        "content": "ok"
+                    }
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit response-like task");
+
+        match response {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => {
+                assert_eq!(code, "RESPONSE_ROUTE_UNRESOLVED");
+            }
+            other => panic!("expected unresolved route error, got {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

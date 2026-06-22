@@ -42,6 +42,16 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
   - [ ] keep WebRTC as optional peer session transport after signaling, not the graph or membership sync plane
   - [ ] classify the canonical mesh-shared graph projection in code instead of relying on operator intuition
 - [ ] Recover a single known-good live mesh runtime path across `bjork`, `mbp-jane`, and `jane-vps`.
+- [x] Make response return routing core according to [RESPONSE_RETURN_ROUTE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RESPONSE_RETURN_ROUTE_PROPOSAL.md):
+  - [x] patch `philote` to emit `reply_guest_id` for model-driven and direct LifeGraph tool calls
+  - [x] patch `datasource` to target `reply_guest_id` for success and failure responses
+  - [x] patch `aiua` to infer explicit guest targets for response-like `agent` payloads before normal role routing
+  - [x] add a focused regression for `datasource_response` returning to the originating agent guest
+  - [x] migrate remaining runners to a shared typed `ReturnRoute`
+  - [x] reject unrecoverable broad `agent` responses with structured routing errors
+  - [x] expose response-route failures as structured IPC errors and heal queue entries
+  - [ ] deploy `ReturnRoute` compatibility slice across live hotels and remove flat reply fields after rollout
+  - [ ] expose response-route heal entries in first-class operator diagnostics
 - [ ] Redeploy `jane-vps` through Ansible with a real Linux build and re-smoke mesh visibility from Bjork.
 - [ ] Prove roaming peer auto-reconnect live by validating observed-endpoint reconciliation against stale peer graph records.
 - [ ] Feed hotel-owned router traces and mesh events into the desktop event log through `philotic-web` so mesh/routing failures are visible without live journal spelunking.
@@ -75,6 +85,8 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Add the first Life Graph tool surface: `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
   - [x] Define the tool catalog and typed runner requests/plans in `data-memorygraphrag`; runtime/hotel projection remains next.
   - [x] Implement provider handlers for `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`, mirroring `handle_observe` with runner gates and Memgraph MERGE/SET writes.
+  - [x] Add a clean external MCP surface: keep Perplexity `context.capture` routed to Muninn continuity memory, add `mcp-surface-hygiene`, enforce auth on config-driven `membrane-mcp` tools, and provide a separate LifeGraph endpoint provisioner for governed `life.recall` / opt-in `life.observe`.
+  - [ ] Deploy and smoke the LifeGraph MCP endpoint against the live `life-graph-runner` before claiming `watched-live-green`.
 - [ ] Add semantic indexing for Life Graph nodes with a `768`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
 - [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
 - [ ] Implement one MemGraphRAG-inspired retrieval strategy: semantic pivot, bounded graph expansion, memory-aware ranking, policy filtering, and context packet projection.

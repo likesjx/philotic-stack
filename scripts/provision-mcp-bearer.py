@@ -102,30 +102,33 @@ def main():
     import time
     now = int(time.time())
 
-    # Build the route record
+    # Build the route record. This is intentionally a Muninn continuity capture
+    # route, not a LifeGraph write path.
     route = {
         "agent_id": AGENT_ID,
         "tool_name": "context.capture",
         "description": (
-            "Save context, notes, or memories from Perplexity to the knowledge system "
-            "(Muninn, agent-graph, Obsidian). Accepts any text the assistant wants to preserve."
+            "Capture Perplexity context into Muninn continuity memory. "
+            "Use for notes, decisions, references, and memory-worthy context that should be "
+            "retrievable across sessions. This does not write to the operator LifeGraph; "
+            "use the governed life.* tools for LifeGraph observations, recalls, or patches."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "The context or note to capture."
+                    "description": "The Perplexity context, note, decision, or reference to store in Muninn."
                 },
                 "category": {
                     "type": "string",
-                    "description": "How to classify and route the content.",
+                    "description": "Muninn memory category for retrieval and filtering.",
                     "enum": ["memory", "note", "decision", "reference"]
                 },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional tags for retrieval."
+                    "description": "Optional Muninn retrieval tags. Do not use tags to imply LifeGraph truth."
                 }
             },
             "required": ["content"]

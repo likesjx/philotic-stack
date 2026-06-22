@@ -1671,7 +1671,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                         inbound_graph.as_ref(),
                                         &inbound_local_node_id,
                                         &inbound_parked,
-                                        inbound_mat_req.as_ref(),
+                                        inbound_mat_req.as_deref(),
                                     )
                                     .await;
                                     // Cron control-plane broadcasts.

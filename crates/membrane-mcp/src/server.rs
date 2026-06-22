@@ -26,6 +26,7 @@ use crate::protocol::{
 use crate::routing::{SharedEndpointTable, SharedRoutingTable};
 use crate::transform;
 use ansible_mesh_core::ExposureTier;
+use ansible_mesh_core::mcp_route::McpAuthScheme;
 
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Approval-required routes park the HTTP connection for up to 5 minutes.
@@ -232,6 +233,23 @@ async fn handle_tools_call(
             }
         };
 
+        let auth_scheme = tool_spec.auth.clone().unwrap_or(McpAuthScheme::None);
+        let caller = match authorize_call(
+            tool_name,
+            &auth_scheme,
+            auth_header,
+            is_loopback,
+            &state.vault_cache,
+            state.vault.as_ref(),
+            &state.allotment,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(tool = tool_name, err = %e, "config-driven auth rejected");
+                return JsonRpcResponse::err(id, error_code::PERMISSION_DENIED, e.to_string());
+            }
+        };
+
         // Pre-approval check: apply_inbound tells us the action; check rules.
         let inbound = match transform::apply_inbound(&tool_spec, &args) {
             Ok(r) => r,
@@ -251,10 +269,11 @@ async fn handle_tools_call(
         };
 
         let turn_id = Uuid::new_v4().to_string();
-        let session_id = format!("mcp-{}-{}", tool_spec.name, &turn_id[..8]);
+        let session_id = format!("mcp-{}-{}", caller.token_id, &turn_id[..8]);
 
         info!(
             tool = tool_name,
+            caller_id = %caller.token_id,
             action = %inbound.action,
             target_kind = %inbound.target_kind,
             target_id = %inbound.target_id,
@@ -267,7 +286,7 @@ async fn handle_tools_call(
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             sender: SenderInfo {
-                id: Some("mcp-caller".into()),
+                id: Some(caller.token_id.clone()),
                 display_name: None,
                 username: None,
                 is_operator: false,
