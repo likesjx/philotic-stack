@@ -182,6 +182,24 @@ impl McpEndpointTable {
         })
     }
 
+    /// Tool descriptors visible to a caller after endpoint-level auth filtering.
+    pub fn visible_tool_descriptors(
+        &self,
+        mut is_visible: impl FnMut(&McpToolSpec) -> bool,
+    ) -> Vec<McpToolDescriptor> {
+        self.config.as_ref().map_or(vec![], |c| {
+            c.tools
+                .iter()
+                .filter(|tool| is_visible(tool))
+                .map(|t| McpToolDescriptor {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.input_schema.clone(),
+                })
+                .collect()
+        })
+    }
+
     /// Look up a tool spec by name.
     pub fn find_tool(&self, name: &str) -> Option<&McpToolSpec> {
         self.config.as_ref()?.tools.iter().find(|t| t.name == name)

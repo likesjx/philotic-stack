@@ -17,7 +17,10 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::auth::{AllotmentTracker, VaultHashCache, VaultResolver, authorize_call};
+use crate::auth::{
+    AllotmentTracker, VaultHashCache, VaultResolver, authorize_call, extract_bearer,
+    verify_bearer_token,
+};
 use crate::protocol::{
     InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse, McpToolDescriptor,
     ServerCapabilities, ServerInfo, ToolCallParams, ToolCallResult, ToolsCapability,
@@ -150,7 +153,7 @@ async fn handle_mcp(
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id, req.params),
         "ping" => JsonRpcResponse::ok(id, json!({})),
-        "tools/list" => handle_tools_list(&state, id, auth_header).await,
+        "tools/list" => handle_tools_list(&state, id, auth_header, is_loopback).await,
         "tools/call" => handle_tools_call(&state, id, req.params, auth_header, is_loopback).await,
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
@@ -186,14 +189,34 @@ async fn handle_tools_list(
     state: &SharedState,
     id: Value,
     auth_header: Option<&str>,
+    is_loopback: bool,
 ) -> JsonRpcResponse {
     // Prefer config-driven endpoint table; fall back to legacy route table.
     let endpoint = state.endpoint_table.read().await;
     let tools: Vec<McpToolDescriptor> = if endpoint.is_active() {
-        endpoint.tool_descriptors()
+        let bearer = extract_bearer(auth_header);
+        endpoint.visible_tool_descriptors(|tool| {
+            let auth_scheme = tool.auth.as_ref().unwrap_or(&McpAuthScheme::None);
+            match auth_scheme {
+                McpAuthScheme::BearerToken { grants } => bearer
+                    .and_then(|token| {
+                        verify_bearer_token(
+                            &tool.name,
+                            token,
+                            grants,
+                            &state.vault_cache,
+                            state.vault.as_ref(),
+                        )
+                        .ok()
+                    })
+                    .is_some(),
+                McpAuthScheme::None => is_loopback,
+                McpAuthScheme::HmacSha256 { .. } => false,
+            }
+        })
     } else {
         drop(endpoint);
-        let caller_id = crate::auth::extract_bearer(auth_header);
+        let caller_id = extract_bearer(auth_header);
         let table = state.routing_table.read().await;
         table.visible_descriptors(caller_id)
     };
