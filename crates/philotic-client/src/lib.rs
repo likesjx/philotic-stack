@@ -2500,6 +2500,10 @@ impl PhiloticClient {
                     | IpcRequest::GetDiscordGatewayLeaseOwner { .. },
                 IpcResponse::DiscordGatewayLeaseStatus { .. }
             ) | (
+                IpcRequest::AcquireMcpMembraneLease { .. }
+                    | IpcRequest::RenewMcpMembraneLease { .. },
+                IpcResponse::McpMembraneLease { .. }
+            ) | (
                 IpcRequest::GetUserProfile { .. } | IpcRequest::PatchUserProfile { .. },
                 IpcResponse::UserProfileData(_)
             )
@@ -2797,9 +2801,9 @@ mod tests {
             linked_providers: vec![],
         };
 
-        assert!(!PhiloticClient::is_ignorable_push(&IpcResponse::UserProfileData(
-            profile
-        )));
+        assert!(!PhiloticClient::is_ignorable_push(
+            &IpcResponse::UserProfileData(profile)
+        ));
     }
 
     #[test]

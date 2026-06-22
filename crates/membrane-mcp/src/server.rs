@@ -46,6 +46,9 @@ pub struct MembraneState {
     /// Hotel node ID — used as `final_reply_to` so replies route back
     /// through the local hotel to the mcp-membrane role.
     pub node_id: String,
+    /// Concrete membrane guest ID for this listener. Reply routing must target
+    /// the specific endpoint guest, not the broad mcp-membrane role.
+    pub guest_id: String,
     /// Channel into the runtime's IPC dispatch loop.
     pub inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// Pending tool-call responses keyed by turn_id.
@@ -310,7 +313,7 @@ async fn handle_tools_call(
             requires_approval,
             final_reply_to: Some(state.node_id.clone()),
             final_reply_role: Some("mcp-membrane".into()),
-            final_reply_guest_id: None,
+            final_reply_guest_id: Some(state.guest_id.clone()),
         };
 
         let (tx, rx) = oneshot::channel::<String>();
@@ -433,7 +436,7 @@ async fn handle_tools_call(
         requires_approval,
         final_reply_to: Some(state.node_id.clone()),
         final_reply_role: Some("mcp-membrane".into()),
-        final_reply_guest_id: None,
+        final_reply_guest_id: Some(state.guest_id.clone()),
     };
 
     let (tx, rx) = oneshot::channel::<String>();

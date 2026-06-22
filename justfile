@@ -549,7 +549,7 @@ vps-push:
     VPS_BUILD="${VPS_CODE}/target/release"
 
     echo "▶ Syncing source to ${VPS}:${VPS_CODE}..."
-    rsync -az --delete \
+    rsync -az --delete --checksum --no-times \
       --exclude='.git' \
       --exclude='target/' \
       --exclude='dist/' \

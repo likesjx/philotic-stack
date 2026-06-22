@@ -157,22 +157,6 @@ impl MembraneGuest for McpMembrane {
             }
         }
 
-        // Replay any routes that were persisted before this restart.
-        match client.send_request(IpcRequest::GetMcpRoutes {}).await {
-            Ok(IpcResponse::McpRouteState { agents }) if !agents.is_empty() => {
-                let mut table = self.state.routing_table.write().await;
-                for entry in &agents {
-                    table.upsert_agent_routes(&entry.agent_id, entry.routes.clone());
-                }
-                info!(
-                    count = agents.len(),
-                    "replayed persisted MCP routes on startup"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),
-        }
-
         // Start HTTP server (detached task).
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         let router =
@@ -188,6 +172,70 @@ impl MembraneGuest for McpMembrane {
                 Err(e) => error!(err = %e, "MCP HTTP server bind failed"),
             }
         });
+
+        // Replay any routes/config that were persisted before this restart.
+        // This must not block the listener from coming up: an endpoint provision
+        // can materialize this guest after the first config push already raced
+        // past an empty inbox.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.send_request(IpcRequest::GetMcpRoutes {}),
+        )
+        .await
+        {
+            Ok(Ok(IpcResponse::McpRouteState { agents })) if !agents.is_empty() => {
+                let mut table = self.state.routing_table.write().await;
+                for entry in &agents {
+                    table.upsert_agent_routes(&entry.agent_id, entry.routes.clone());
+                }
+                info!(
+                    count = agents.len(),
+                    "replayed persisted MCP routes on startup"
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),
+            Err(_) => {
+                warn!("GetMcpRoutes timed out — listener remains active with empty route table")
+            }
+        }
+
+        if let Some(endpoint_id) = self
+            .lease_key_value
+            .strip_prefix("mcp-membrane-")
+            .map(str::to_string)
+        {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client.send_request(IpcRequest::GetMcpEndpointStatus { endpoint_id }),
+            )
+            .await
+            {
+                Ok(Ok(IpcResponse::Standard {
+                    ok: true,
+                    data: Some(data),
+                    ..
+                })) => {
+                    if let Some(config) = data
+                        .get("config")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    {
+                        let mut table = self.state.endpoint_table.write().await;
+                        table.update(config);
+                        info!("replayed persisted MCP endpoint config on startup");
+                    }
+                    if let Some(tier) = data
+                        .get("hotel_ceiling")
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    {
+                        *self.state.ingress_tier.write().unwrap() = tier;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(err = %e, "GetMcpEndpointStatus failed"),
+                Err(_) => warn!("GetMcpEndpointStatus timed out — waiting for config push"),
+            }
+        }
 
         Ok(())
     }
@@ -265,6 +313,39 @@ impl MembraneGuest for McpMembrane {
         };
 
         match action {
+            "datasource_response" => {
+                let Some(turn_id) = payload
+                    .get("turn_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                else {
+                    warn!("datasource_response push missing turn_id");
+                    return Ok(false);
+                };
+
+                let content = if let Some(result) = payload.get("result") {
+                    serde_json::to_string(result)
+                        .unwrap_or_else(|_| serde_json::json!({ "result": result }).to_string())
+                } else if let Some(error) = payload.get("error") {
+                    serde_json::json!({ "error": error }).to_string()
+                } else {
+                    warn!(turn_id, "datasource_response push missing result/error");
+                    return Ok(false);
+                };
+
+                let sender = {
+                    let mut pending = self.state.pending_responses.lock().await;
+                    pending.remove(&turn_id)
+                };
+
+                if let Some(tx) = sender {
+                    let _ = tx.send(content);
+                } else {
+                    warn!(turn_id, "datasource_response: no pending receiver for turn");
+                }
+
+                Ok(true)
+            }
             "update_mcp_routes" => {
                 let agent_id = payload
                     .get("agent_id")
@@ -416,6 +497,7 @@ async fn main() -> Result<()> {
             }),
         }),
         node_id: args.node_id.clone(),
+        guest_id: args.guest_id.clone(),
         inbound_tx,
         pending_responses,
         ingress_tier,

@@ -455,7 +455,7 @@ mod tests {
             requires_approval: false,
             final_reply_to: Some("vps-jane-aiua-01".into()),
             final_reply_role: Some("mcp-membrane".into()),
-            final_reply_guest_id: None,
+            final_reply_guest_id: Some("mcp-membrane-lifegraph-readonly".into()),
         }
     }
 
@@ -476,5 +476,6 @@ mod tests {
         assert_eq!(payload["arguments"]["query_text"], "open loops");
         assert_eq!(payload["reply_to"], "vps-jane-aiua-01");
         assert_eq!(payload["reply_role"], "mcp-membrane");
+        assert_eq!(payload["reply_guest_id"], "mcp-membrane-lifegraph-readonly");
     }
 }
