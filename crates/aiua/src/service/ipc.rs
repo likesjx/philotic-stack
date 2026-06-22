@@ -5688,31 +5688,6 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn park_and_materialize_local_role(
-        graph: &GraphDomain,
-        _inboxes: &InboxRegistry,
-        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
-        mat_req: Option<&dyn GuestMaterializationRequester>,
-        local_node_id: &str,
-        source_node: &str,
-        task_id: Uuid,
-        task_json: String,
-        record: &RoleIncarnationRecord,
-    ) {
-        Self::park_and_materialize_role_philote(
-            graph,
-            local_node_id,
-            parked_inbound,
-            mat_req,
-            source_node,
-            task_id,
-            task_json,
-            &record.guest_id,
-        )
-        .await;
-    }
-
     /// Park a cross-hotel task and trigger role-philote materialization on this hotel.
     ///
     /// Called when a `TaskInvoke` arrives from the mesh with `delivery_target_guest_id` set
