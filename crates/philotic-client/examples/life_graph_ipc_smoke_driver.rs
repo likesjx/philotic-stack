@@ -101,7 +101,9 @@ async fn execute_life_tool(
         .send_request(IpcRequest::EmitTask {
             target_node: target_node.to_string(),
             target_role: "life-graph-runner".into(),
-            target_guest_id: None,
+            target_guest_id: std::env::var("PHILOTIC_TARGET_GUEST_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             task_json: json!({
                 "action": "execute_tool",
                 "tool_name": tool_name,

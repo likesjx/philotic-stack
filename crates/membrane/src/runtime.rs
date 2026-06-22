@@ -248,14 +248,25 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let target_guest_id = envelope
+    let hinted_target_id = envelope
         .raw_transport
         .get("target_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let payload = serde_json::json!({
+    let target_kind = envelope
+        .raw_transport
+        .get("target_kind")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    let (target_role, target_guest_id) = resolve_target(target_kind, hinted_target_id);
+
+    let payload = if target_kind == Some("datasource") {
+        datasource_payload(&envelope, transport)
+    } else {
+        serde_json::json!({
         "session_id":             envelope.session_id,
         "turn_id":                envelope.turn_id,
         "content":                envelope.content,
@@ -270,24 +281,71 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
         "final_reply_to":         envelope.final_reply_to,
         "final_reply_role":       envelope.final_reply_role,
         "final_reply_guest_id":   envelope.final_reply_guest_id,
-    });
+        })
+    };
 
     let req = if let Some(node) = target_node {
         // Route to a specific remote hotel via mesh dispatch.
         IpcRequest::EmitTask {
             target_node: node,
-            target_role: "agent".into(),
+            target_role,
             target_guest_id,
             task_json: payload.to_string(),
         }
     } else {
         IpcRequest::CreateTask {
-            target_role: "agent".into(),
+            target_role,
             payload,
         }
     };
     client.send_request(req).await?;
     Ok(())
+}
+
+fn resolve_target(
+    target_kind: Option<&str>,
+    hinted_target_id: Option<String>,
+) -> (String, Option<String>) {
+    match target_kind {
+        Some("datasource") => (
+            hinted_target_id.unwrap_or_else(|| "graph-datasource".into()),
+            None,
+        ),
+        Some("tool") => ("tool-runner".into(), hinted_target_id),
+        Some("philote") => ("agent".into(), hinted_target_id),
+        _ => ("agent".into(), hinted_target_id),
+    }
+}
+
+fn datasource_payload(envelope: &InboundEnvelope, transport: Option<String>) -> serde_json::Value {
+    let content: serde_json::Value =
+        serde_json::from_str(&envelope.content).unwrap_or_else(|_| serde_json::json!({}));
+    let tool_name = content
+        .get("action")
+        .and_then(|v| v.as_str())
+        .or(envelope.command.as_deref())
+        .unwrap_or("execute_tool");
+    let arguments = content
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    serde_json::json!({
+        "action": "execute_tool",
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "session_id": envelope.session_id,
+        "turn_id": envelope.turn_id,
+        "chat_id": envelope.sender.id.as_deref().unwrap_or(&envelope.session_id),
+        "transport": transport,
+        "sender_id": envelope.sender.id,
+        "sender_username": envelope.sender.username,
+        "raw_transport_event": envelope.raw_transport,
+        "requires_approval": envelope.requires_approval,
+        "reply_to": envelope.final_reply_to,
+        "reply_role": envelope.final_reply_role,
+        "reply_guest_id": envelope.final_reply_guest_id,
+    })
 }
 
 /// Extract an [`OutboundReply`] from a hotel push message if it contains
@@ -357,5 +415,66 @@ fn extract_outbound_reply(msg: &IpcResponse) -> Option<OutboundReply> {
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::SenderInfo;
+
+    fn mcp_datasource_envelope() -> InboundEnvelope {
+        InboundEnvelope {
+            session_id: "mcp-lifegraph".into(),
+            turn_id: "turn-1".into(),
+            sender: SenderInfo {
+                id: Some("lifegraph-reader".into()),
+                display_name: None,
+                username: None,
+                is_operator: false,
+            },
+            content: serde_json::json!({
+                "action": "life.recall",
+                "payload": {
+                    "query_text": "open loops",
+                    "max_context_packets": 3
+                },
+                "target_kind": "datasource",
+                "target_id": "life-graph-runner"
+            })
+            .to_string(),
+            attachments: vec![],
+            command: Some("life.recall".into()),
+            reply_to: Some("turn-1".into()),
+            raw_transport: serde_json::json!({
+                "transport": "mcp",
+                "tool": "life.recall",
+                "target_kind": "datasource",
+                "target_id": "life-graph-runner"
+            }),
+            requires_approval: false,
+            final_reply_to: Some("vps-jane-aiua-01".into()),
+            final_reply_role: Some("mcp-membrane".into()),
+            final_reply_guest_id: None,
+        }
+    }
+
+    #[test]
+    fn datasource_target_routes_to_named_role() {
+        let (role, guest_id) = resolve_target(Some("datasource"), Some("life-graph-runner".into()));
+        assert_eq!(role, "life-graph-runner");
+        assert_eq!(guest_id, None);
+    }
+
+    #[test]
+    fn datasource_payload_is_runner_compatible() {
+        let envelope = mcp_datasource_envelope();
+        let payload = datasource_payload(&envelope, Some("mcp".into()));
+
+        assert_eq!(payload["action"], "execute_tool");
+        assert_eq!(payload["tool_name"], "life.recall");
+        assert_eq!(payload["arguments"]["query_text"], "open loops");
+        assert_eq!(payload["reply_to"], "vps-jane-aiua-01");
+        assert_eq!(payload["reply_role"], "mcp-membrane");
     }
 }

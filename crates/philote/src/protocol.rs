@@ -1,5 +1,5 @@
 use crate::session::{TaskRunnerBaseConfig, ToolDefinition};
-use philotic_client::{HandoffBundle, TaskErrorPayload};
+use philotic_client::{HandoffBundle, ReturnRoute, TaskErrorPayload};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -273,8 +273,12 @@ pub struct ToolExecutionPayload {
     pub workspace_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_runner_overlay: Option<TaskRunnerOverlay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_route: Option<ReturnRoute>,
     pub reply_to: String,
     pub reply_role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_guest_id: Option<String>,
     pub final_reply_to: String,
     pub final_reply_role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,6 +317,7 @@ impl InboundTaskPayload {
 mod tests {
     use super::{InboundTaskPayload, TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment};
     use crate::session::TaskRunnerBaseConfig;
+    use philotic_client::ReturnRoute;
 
     #[test]
     fn session_id_defaults_from_source_and_chat() {
@@ -558,8 +563,17 @@ mod tests {
             }),
             agent_id: "agent-jane-01".into(),
             user_id: None,
+            return_route: Some(ReturnRoute {
+                node: "local-aiua-01".into(),
+                role: "agent".into(),
+                guest_id: Some("agent-jane-01".into()),
+                session_id: Some("sess-1".into()),
+                turn_id: Some("turn-1".into()),
+                correlation_id: None,
+            }),
             reply_to: "local-aiua-01".into(),
             reply_role: "agent".into(),
+            reply_guest_id: Some("agent-jane-01".into()),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
@@ -578,5 +592,7 @@ mod tests {
         );
         assert_eq!(json["task_runner_overlay"]["max_read_bytes"], 4096);
         assert_eq!(json["task_runner_overlay"]["max_search_results"], 25);
+        assert_eq!(json["return_route"]["guest_id"], "agent-jane-01");
+        assert_eq!(json["reply_guest_id"], "agent-jane-01");
     }
 }

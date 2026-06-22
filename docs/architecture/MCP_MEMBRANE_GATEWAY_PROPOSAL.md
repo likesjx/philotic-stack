@@ -1,9 +1,9 @@
 ---
 title: MCP Membrane Gateway — Philote-Configured, Transform-Driven
 doc_type: proposal
-domain: protocol-gateway
+domain: membrane-transport
 status: proposed
-last_updated: 2026-04-22
+last_updated: 2026-06-22
 tags:
   - mcp
   - membrane
@@ -25,6 +25,8 @@ related_docs:
   - GUEST_PRIMITIVE_PATTERN.md
   - ARCHITECTURE.md
   - PORT_BLUEPRINT.md
+  - LIFE_GRAPH_OS_PROPOSAL.md
+  - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
 source_of_truth_targets:
   - docs/architecture/MCP_MEMBRANE_GATEWAY_PROPOSAL.md
 ---
@@ -66,6 +68,31 @@ philotes) without the configuring philote being involved in the hot path.
 The philote's turn that calls `mcp.provision` is the authorization event. The
 pre-approval rules embedded in the config carry that authority forward so that
 future requests matching the declared envelope shape are not blocked.
+
+## Surface Hygiene
+
+The MCP membrane exposes a deliberately small external surface. It should not
+blur continuity memory, LifeGraph evidence, and raw graph/runtime operations.
+
+Use [mcp-surface-hygiene](/Users/jaredlikes/code/philotic-stack/skills/mcp-surface-hygiene/SKILL.md)
+when reviewing or provisioning MCP endpoints.
+
+Current boundary rules:
+
+- `context.capture` is a Perplexity-to-Muninn continuity route. It stores notes,
+  decisions, references, and memory-worthy context in Muninn. It does not write
+  to the operator LifeGraph.
+- `life.recall` may be exposed as a governed read path for LifeGraph context
+  packets.
+- `life.observe` may be exposed only when the description says it proposes
+  evidence with `validation_state=proposed`; it must not sound like confirmed
+  truth.
+- `life.commit`, `life.resolve`, and raw graph mutation tools remain unavailable
+  to ordinary external clients unless an admin endpoint has explicit
+  operator-approved preapproval rules.
+- Separate endpoints are preferred when clients need different authority levels,
+  for example `perplexity-memory` for Muninn capture and `lifegraph-readonly`
+  for LifeGraph recall.
 
 ## Architecture
 

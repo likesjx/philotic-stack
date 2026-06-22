@@ -9,7 +9,8 @@ use ansible_mesh_core::router_trace::{
 use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
 use anyhow::Result;
 use philotic_client::{
-    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute, TaskErrorPayload,
+    is_ipc_disconnect,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -38,8 +39,7 @@ pub struct ControllerGuestConfig {
 
 #[derive(Debug, Clone)]
 struct ReplyRoute {
-    reply_to: String,
-    reply_role: String,
+    return_route: ReturnRoute,
     final_reply_to: String,
     final_reply_role: String,
     final_reply_guest_id: Option<String>,
@@ -467,6 +467,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         }
                                         let task_json = serde_json::to_string(&json!({
                                             "action": "streaming_token",
+                                            "return_route": reply_clone.return_route.as_json(),
+                                            "reply_guest_id": reply_clone.return_route.guest_id,
                                             "session_id": reply_clone.session_id,
                                             "turn_id": reply_clone.turn_id,
                                             "chat_id": reply_clone.chat_id,
@@ -479,9 +481,12 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         let send_result = tokio::time::timeout(
                                             Duration::from_secs(10),
                                             stream_ipc.send_request(IpcRequest::EmitTask {
-                                                target_node: reply_clone.reply_to.clone(),
-                                                target_role: reply_clone.reply_role.clone(),
-                                                target_guest_id: None,
+                                                target_node: reply_clone.return_route.node.clone(),
+                                                target_role: reply_clone.return_route.role.clone(),
+                                                target_guest_id: reply_clone
+                                                    .return_route
+                                                    .guest_id
+                                                    .clone(),
                                                 task_json,
                                             }),
                                         )
@@ -921,9 +926,9 @@ async fn emit_text_response(
     response: ControllerResponseEnvelope,
 ) -> Result<()> {
     let reply_req = IpcRequest::EmitTask {
-        target_node: reply.reply_to.clone(),
-        target_role: reply.reply_role.clone(),
-        target_guest_id: None,
+        target_node: reply.return_route.node.clone(),
+        target_role: reply.return_route.role.clone(),
+        target_guest_id: reply.return_route.guest_id.clone(),
         task_json: json!({
             "action": "model_response",
             "agent_action": {
@@ -948,6 +953,8 @@ async fn emit_text_response(
                     "provider_output": response.provider_output,
                 }
             },
+            "return_route": reply.return_route.as_json(),
+            "reply_guest_id": reply.return_route.guest_id,
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
@@ -973,9 +980,9 @@ async fn emit_tool_call_response(
     model_result: Option<Value>,
 ) -> Result<()> {
     let reply_req = IpcRequest::EmitTask {
-        target_node: reply.reply_to.clone(),
-        target_role: reply.reply_role.clone(),
-        target_guest_id: None,
+        target_node: reply.return_route.node.clone(),
+        target_role: reply.return_route.role.clone(),
+        target_guest_id: reply.return_route.guest_id.clone(),
         task_json: json!({
             "action": "model_response",
             "agent_action": {
@@ -984,6 +991,8 @@ async fn emit_tool_call_response(
                 "arguments": arguments,
                 "model_result": model_result,
             },
+            "return_route": reply.return_route.as_json(),
+            "reply_guest_id": reply.return_route.guest_id,
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
@@ -1050,9 +1059,9 @@ async fn emit_failure(
     )
     .await;
     let reply_req = IpcRequest::EmitTask {
-        target_node: reply.reply_to.clone(),
-        target_role: reply.reply_role.clone(),
-        target_guest_id: None,
+        target_node: reply.return_route.node.clone(),
+        target_role: reply.return_route.role.clone(),
+        target_guest_id: reply.return_route.guest_id.clone(),
         task_json: json!({
             "action": "model_response",
             "agent_action": {
@@ -1064,6 +1073,8 @@ async fn emit_failure(
                 }
             },
             "error": serde_json::to_value(&error_payload)?,
+            "return_route": reply.return_route.as_json(),
+            "reply_guest_id": reply.return_route.guest_id,
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
@@ -1093,6 +1104,8 @@ async fn emit_falling_back(
     let task_json = json!({
         "action": "model_dispatch_status",
         "content": label,
+        "return_route": reply.return_route.as_json(),
+        "reply_guest_id": reply.return_route.guest_id,
         "session_id": reply.session_id,
         "turn_id": reply.turn_id,
         "chat_id": reply.chat_id,
@@ -1101,9 +1114,9 @@ async fn emit_falling_back(
     let _ = tokio::time::timeout(
         Duration::from_secs(10),
         ipc_client.send_request(IpcRequest::EmitTask {
-            target_node: reply.reply_to.clone(),
-            target_role: reply.reply_role.clone(),
-            target_guest_id: None,
+            target_node: reply.return_route.node.clone(),
+            target_role: reply.return_route.role.clone(),
+            target_guest_id: reply.return_route.guest_id.clone(),
             task_json,
         }),
     )
@@ -1127,6 +1140,8 @@ async fn emit_dispatch_status(
     let task_json = json!({
         "action": "model_dispatch_status",
         "content": label,
+        "return_route": reply.return_route.as_json(),
+        "reply_guest_id": reply.return_route.guest_id,
         "session_id": reply.session_id,
         "turn_id": reply.turn_id,
         "chat_id": reply.chat_id,
@@ -1135,9 +1150,9 @@ async fn emit_dispatch_status(
     let _ = tokio::time::timeout(
         Duration::from_secs(10),
         ipc_client.send_request(IpcRequest::EmitTask {
-            target_node: reply.reply_to.clone(),
-            target_role: reply.reply_role.clone(),
-            target_guest_id: None,
+            target_node: reply.return_route.node.clone(),
+            target_role: reply.return_route.role.clone(),
+            target_guest_id: reply.return_route.guest_id.clone(),
             task_json,
         }),
     )
@@ -1283,17 +1298,9 @@ fn record_routing_trace(
 impl ReplyRoute {
     fn from_task(task: &Value) -> Self {
         let local_node_id = local_node_id();
+        let return_route = ReturnRoute::from_task(task, &local_node_id, "agent");
         Self {
-            reply_to: task
-                .get("reply_to")
-                .and_then(Value::as_str)
-                .unwrap_or(&local_node_id)
-                .to_string(),
-            reply_role: task
-                .get("reply_role")
-                .and_then(Value::as_str)
-                .unwrap_or("agent")
-                .to_string(),
+            return_route,
             final_reply_to: task
                 .get("final_reply_to")
                 .and_then(Value::as_str)

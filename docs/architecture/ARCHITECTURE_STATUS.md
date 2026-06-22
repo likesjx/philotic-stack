@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-06-04
+last_updated: 2026-06-22
 tags:
 - source-of-truth
 - current-state
@@ -25,6 +25,7 @@ related_docs:
 - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
 - MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md
 - MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
+- RESPONSE_RETURN_ROUTE_PROPOSAL.md
 - HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md
 - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
 task_refs:
@@ -128,9 +129,11 @@ Primary references:
 - the hotel advertises local capability availability and can route to remote execution advertisements when local implementations are unavailable
 - inter-hotel execution transport is now distinct from raw UDP beacon payload bodies
 - reply routing remains session-owned through the membrane boundary
+- response-like payloads returning to `target_role = "agent"` must resolve to a concrete guest before delivery; `aiua` now repairs missing guest targets from `return_route.guest_id`, `delivery_target_guest_id`, `reply_guest_id`, `agent_id`, or session state, rejects unrecoverable broad responses with `RESPONSE_ROUTE_UNRESOLVED`, and shared `ReturnRoute` is the canonical DTO while flat reply fields remain as rollout compatibility
 
 Primary references:
 - [INTER_HOTEL_ROUTING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/INTER_HOTEL_ROUTING_PROPOSAL.md)
+- [RESPONSE_RETURN_ROUTE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RESPONSE_RETURN_ROUTE_PROPOSAL.md)
 - [NATIVE_OVERLAY_VPN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/NATIVE_OVERLAY_VPN_PROPOSAL.md)
 - [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md)
 
