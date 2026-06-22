@@ -6874,6 +6874,17 @@ impl IpcServer {
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         mat_req: Option<&dyn GuestMaterializationRequester>,
     ) -> bool {
+        // An event explicitly addressed to a different node arrived in this hotel's mesh
+        // inbox (gossiped/relayed batch). It is not ours to deliver or park here — doing so
+        // previously caused a hotel to try materializing a remote hotel's infrastructure
+        // guest (e.g. another hotel's life-graph-runner) as a dormant role incarnation. That
+        // can never succeed since such guest_ids have no role_incarnation record, leaving the
+        // task permanently parked until the turn watchdog timed it out ~90s later.
+        if let Some(target_node) = event.target_node_id.as_deref() {
+            if target_node != local_node_id {
+                return false;
+            }
+        }
         match (&event.kind, &event.target_agent_id, &event.payload) {
             (
                 EventKind::TaskInvoke | EventKind::TaskResult,
@@ -17505,6 +17516,67 @@ mod tests {
         );
 
         assert_eq!(resolved, Some("agent-beacon:developer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn deliver_event_envelope_or_park_ignores_events_addressed_to_another_node() {
+        // Regression: a mesh inbox batch can carry events explicitly addressed to a
+        // different node (e.g. gossiped/relayed). Previously this hotel would try to
+        // park-and-materialize the guest locally, which can never succeed for a remote
+        // hotel's infrastructure guest (e.g. life-graph-runner) since it has no
+        // role_incarnation record — the task parked forever until the turn watchdog
+        // evicted it ~90s later. The function must skip entirely for foreign-targeted events.
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: "vps-jane-aiua-01".into(),
+            target_node_id: Some("vps-jane-aiua-01".into()),
+            source_agent_id: "unknown".into(),
+            target_agent_id: Some("life-graph-runner".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: "test".into(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({
+                    "delivery_target_guest_id": "vps-jane:life-graph-runner",
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+
+        let delivered = IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &event,
+            None,
+            &graph,
+            "mbp-jane-aiua-01",
+            &parked_inbound,
+            Some(&mat_req),
+        )
+        .await;
+
+        assert!(
+            !delivered,
+            "event addressed to a different node must not be handled here"
+        );
+        assert_eq!(
+            mat_req.calls.load(Ordering::SeqCst),
+            0,
+            "must not attempt materialization for a foreign-targeted event"
+        );
+        assert!(
+            parked_inbound.lock().await.is_empty(),
+            "must not park a task that belongs to a different node"
+        );
     }
 
     #[tokio::test]
