@@ -56,6 +56,20 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 - [ ] Prove roaming peer auto-reconnect live by validating observed-endpoint reconciliation against stale peer graph records.
 - [ ] Feed hotel-owned router traces and mesh events into the desktop event log through `philotic-web` so mesh/routing failures are visible without live journal spelunking.
 
+## New Project: Model Graph Catalog Refresh
+
+Proposal: [MODEL_GRAPH_CATALOG_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_CATALOG_PROPOSAL.md)
+
+Seam IDs: `model-catalog-schema`, `model-catalog-seed`, `model-catalog-projection`, `turn-routing-catalog-input`
+
+- [ ] Treat `origin/codex/model-graph-catalog` as stale source material, not a merge target.
+- [ ] Audit the stale branch and classify changed files as catalog schema, catalog projection, unrelated runtime drift, test-only update, or obsolete conflict.
+- [ ] Re-slice the provider-neutral model catalog schema onto current `develop`.
+- [ ] Seed the minimal supported provider families: Gemini, OpenAI, Ollama-compatible, ElevenLabs, ONNX, and MLX.
+- [ ] Add focused schema/seed tests and run touched-crate checks before merging.
+- [ ] Add one read-only projection surface before any routing integration.
+- [ ] Delete `origin/codex/model-graph-catalog` after valid catalog work lands or is explicitly abandoned.
+
 ## New Project: Cypher-First Graph Datasource
 
 Proposal: [GRAPH_DATASOURCE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DATASOURCE_PROPOSAL.md)
