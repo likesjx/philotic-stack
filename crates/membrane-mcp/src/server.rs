@@ -216,9 +216,24 @@ async fn handle_tools_list(
         })
     } else {
         drop(endpoint);
-        let caller_id = extract_bearer(auth_header);
+        let bearer = extract_bearer(auth_header);
         let table = state.routing_table.read().await;
-        table.visible_descriptors(caller_id)
+        table.visible_descriptors_by(|route| match &route.record.security.auth {
+            McpAuthScheme::BearerToken { grants } => bearer
+                .and_then(|token| {
+                    verify_bearer_token(
+                        &route.record.tool_name,
+                        token,
+                        grants,
+                        &state.vault_cache,
+                        state.vault.as_ref(),
+                    )
+                    .ok()
+                })
+                .is_some(),
+            McpAuthScheme::None => is_loopback,
+            McpAuthScheme::HmacSha256 { .. } => false,
+        })
     };
 
     JsonRpcResponse::ok(id, serde_json::to_value(ToolsListResult { tools }).unwrap())
