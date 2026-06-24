@@ -3700,6 +3700,34 @@ impl SessionState {
     }
 }
 
+/// Returns true if `phrase` appears in `text` as a standalone word/phrase, not as a
+/// substring of a larger word — e.g. "ok" must not match inside "look" or "took".
+fn contains_word_boundary(text: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(idx) = text[start..].find(phrase) {
+        let abs_start = start + idx;
+        let abs_end = abs_start + phrase.len();
+        let before_ok = text[..abs_start]
+            .chars()
+            .next_back()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        let after_ok = text[abs_end..]
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_start + 1;
+        if start >= text.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn looks_like_conversational_goal(normalized: &str) -> bool {
     normalized.contains('?')
         || [
@@ -3723,7 +3751,7 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
             "sounds good",
         ]
         .iter()
-        .any(|phrase| normalized.contains(phrase))
+        .any(|phrase| contains_word_boundary(normalized, phrase))
         || [
             "what",
             "why",
@@ -3739,7 +3767,14 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
             "can we talk",
         ]
         .iter()
-        .any(|prefix| normalized.starts_with(prefix))
+        .any(|prefix| {
+            normalized.starts_with(prefix)
+                && normalized[prefix.len()..]
+                    .chars()
+                    .next()
+                    .map(|c| !c.is_alphanumeric())
+                    .unwrap_or(true)
+        })
 }
 
 fn looks_like_retry_goal(normalized: &str) -> bool {
@@ -6890,6 +6925,33 @@ mod tests {
             "\"Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.\"",
         );
         assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn natural_lifegraph_request_is_not_treated_as_conversational() {
+        // Regression: Jane's real-world phrase "please take a look at the lifegraph
+        // now and see whtat we have there." was projecting zero tools because
+        // looks_like_conversational_goal's plain substring match for "ok" matched
+        // inside "look" — the word "look" contains "ok" as a substring, so the
+        // filler-phrase heuristic falsely treated the whole request as conversational
+        // chit-chat and the model never even saw life.recall as an available tool.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.rebuild_default_tool_assembly();
+
+        let projected = state.project_tools_for_turn(
+            "please take a look at the lifegraph now and see whtat we have there.",
+        );
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            projected_names.contains("life.recall"),
+            "expected life.recall to survive tool projection, got {projected_names:?}"
+        );
     }
 
     #[test]
