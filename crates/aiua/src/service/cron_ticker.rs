@@ -81,7 +81,10 @@ impl CronTicker {
         target_role: &str,
     ) -> Option<RoleIncarnationRecord> {
         let (agent_id, role_name) = target_role.strip_prefix("role:")?.split_once(':')?;
-        graph.get_role_incarnation(agent_id, role_name).ok().flatten()
+        graph
+            .get_role_incarnation(agent_id, role_name)
+            .ok()
+            .flatten()
     }
 
     pub async fn run(self) {
@@ -245,7 +248,10 @@ impl CronTicker {
         let target_role_record = Self::resolve_target_role_record(&self.graph, &job.target_role);
         let is_subscribed = {
             let guard = self.inboxes.lock().await;
-            let role_subs = guard.get(job.target_role.as_str()).cloned().unwrap_or_default();
+            let role_subs = guard
+                .get(job.target_role.as_str())
+                .cloned()
+                .unwrap_or_default();
             match &target_role_record {
                 Some(record) => role_subs.iter().any(|s| s.guest_id == record.guest_id),
                 None => !role_subs.is_empty(),
@@ -699,9 +705,7 @@ mod tests {
         let guest = graph
             .get_guest("local-hotel", "agent-test:orchestrator")
             .expect("get_guest should not error")
-            .expect(
-                "on-demand materialization should have upserted the local role guest record",
-            );
+            .expect("on-demand materialization should have upserted the local role guest record");
         assert!(
             guest.is_active,
             "materialization must flip the dormant role guest active, not leave it dead"

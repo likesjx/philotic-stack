@@ -3,7 +3,8 @@
 
 use crate::{
     ConflictHandoff, ConflictHandoffStatus, LifeCommitInput, LifeObserveInput,
-    LifePatchProposalInput, LifeResolveInput, PatchKind, SourceKind, ValidationState,
+    LifePatchProposalInput, LifeResolveInput, PatchKind, RetrievalFeedbackInput,
+    RetrievalFeedbackRating, SourceKind, ValidationState,
 };
 
 const KNOWN_LABELS: &[&str] = &[
@@ -87,6 +88,22 @@ pub struct PatchProposalCypher {
     pub status: String,
     pub proposed_at: String,
     pub patch_json: String,
+}
+
+#[derive(Debug)]
+pub struct RecallFeedbackCypher {
+    pub query: String,
+    pub feedback_id: String,
+    pub packet_id: String,
+    pub rating: String,
+    pub query_summary: String,
+    pub note: String,
+    pub candidate_count: i64,
+    pub connected_candidate_count: i64,
+    pub connectivity_ratio: Option<f64>,
+    pub feedback_json: String,
+    pub evaluation_json: String,
+    pub observed_at: String,
 }
 
 pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<ObserveCypher, String> {
@@ -289,6 +306,52 @@ pub fn compile_patch_proposal(
     })
 }
 
+pub fn compile_recall_feedback(
+    input: &RetrievalFeedbackInput,
+    growth_evaluation: &serde_json::Value,
+    now_iso: &str,
+) -> Result<RecallFeedbackCypher, String> {
+    input.validate().map_err(|e| e.to_string())?;
+    let feedback_json = serde_json::to_string(input).map_err(|e| e.to_string())?;
+    let evaluation_json = serde_json::to_string(growth_evaluation).map_err(|e| e.to_string())?;
+    let connectivity_ratio = input.connectivity_ratio().map(f64::from);
+
+    Ok(RecallFeedbackCypher {
+        query: concat!(
+            "MERGE (s:Signal {id: $feedback_id}) ",
+            "SET s.signal_type = 'life.recall.feedback', ",
+            "s.packet_id = $packet_id, ",
+            "s.rating = $rating, ",
+            "s.query_summary = $query_summary, ",
+            "s.note = $note, ",
+            "s.candidate_count = $candidate_count, ",
+            "s.connected_candidate_count = $connected_candidate_count, ",
+            "s.connectivity_ratio = $connectivity_ratio, ",
+            "s.feedback_json = $feedback_json, ",
+            "s.growth_evaluation_json = $evaluation_json, ",
+            "s.source_membrane = 'agent:memorygraphrag', ",
+            "s.provenance = 'runtime_observation', ",
+            "s.confidence = 1.0, ",
+            "s.validation_state = 'confirmed', ",
+            "s.observed_at = $observed_at, ",
+            "s.last_confirmed_at = $observed_at ",
+            "RETURN s.id AS id, s.rating AS rating"
+        )
+        .to_string(),
+        feedback_id: input.feedback_id.clone(),
+        packet_id: input.packet_id.clone(),
+        rating: feedback_rating_str(&input.rating).to_string(),
+        query_summary: input.query_summary.clone().unwrap_or_default(),
+        note: input.note.clone().unwrap_or_default(),
+        candidate_count: input.candidate_count as i64,
+        connected_candidate_count: input.connected_candidate_count as i64,
+        connectivity_ratio,
+        feedback_json,
+        evaluation_json,
+        observed_at: now_iso.to_string(),
+    })
+}
+
 fn source_kind_to_provenance(kind: &SourceKind) -> String {
     match kind {
         SourceKind::OperatorConfirmation => "operator_confirmed",
@@ -346,12 +409,24 @@ fn patch_kind_str(kind: &PatchKind) -> &'static str {
     }
 }
 
+fn feedback_rating_str(rating: &RetrievalFeedbackRating) -> &'static str {
+    match rating {
+        RetrievalFeedbackRating::Useful => "useful",
+        RetrievalFeedbackRating::Stale => "stale",
+        RetrievalFeedbackRating::Missing => "missing",
+        RetrievalFeedbackRating::Noisy => "noisy",
+        RetrievalFeedbackRating::Overconfident => "overconfident",
+        RetrievalFeedbackRating::Disconnected => "disconnected",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         AdjudicationStatus, EvidencePacket, GraphRecordRef, LifeObserveInput, ReliabilityBasis,
-        SourceKind, SourceRef, SourceReliability, ValidationState,
+        RetrievalFeedbackInput, RetrievalFeedbackRating, SourceKind, SourceRef, SourceReliability,
+        ValidationState,
     };
 
     fn minimal_observe_input(label: &str) -> LifeObserveInput {
@@ -561,5 +636,36 @@ mod tests {
         assert_eq!(compiled.patch_kind, "attention_patch");
         assert!(compiled.query.contains("MERGE (p:AttentionPatch"));
         assert!(compiled.patch_json.contains("Dampen"));
+    }
+
+    #[test]
+    fn compile_recall_feedback_writes_signal_with_growth_evaluation() {
+        let feedback = RetrievalFeedbackInput {
+            feedback_id: "feedback:recall:1".into(),
+            packet_id: "packet:recall:1".into(),
+            query_summary: Some("Re-enter LifeGraph work".into()),
+            rating: RetrievalFeedbackRating::Disconnected,
+            note: Some("Good facts, but they were not connected to the active project.".into()),
+            candidate_count: 4,
+            connected_candidate_count: 1,
+            missing_context_refs: vec![],
+            noisy_node_refs: vec![],
+            stale_node_refs: vec![],
+            evidence_packets: vec![minimal_observe_input("Signal").evidence],
+        };
+        let growth_evaluation = serde_json::json!({
+            "disposition": "apply_with_audit",
+            "rationale": ["low connected-candidate ratio"]
+        });
+
+        let compiled =
+            compile_recall_feedback(&feedback, &growth_evaluation, "2026-06-22T10:00:00Z").unwrap();
+
+        assert_eq!(compiled.feedback_id, "feedback:recall:1");
+        assert_eq!(compiled.rating, "disconnected");
+        assert_eq!(compiled.connectivity_ratio, Some(0.25));
+        assert!(compiled.query.contains("MERGE (s:Signal"));
+        assert!(compiled.feedback_json.contains("packet:recall:1"));
+        assert!(compiled.evaluation_json.contains("apply_with_audit"));
     }
 }

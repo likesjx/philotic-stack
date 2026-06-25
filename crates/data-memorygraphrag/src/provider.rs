@@ -4,9 +4,11 @@ use data_memorygraphrag::LIFE_GRAPH_EMBEDDING_DIMS;
 use data_memorygraphrag::cypher;
 use data_memorygraphrag::projection;
 use data_memorygraphrag::{
-    ConflictHandoff, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput,
-    LifePatchProposalInput, LifeResolveInput, MemoryGraphRagRunner, PolicyFilter, RetrievalQuery,
-    RunnerConfig, RunnerPlanTarget, SemanticSpace,
+    AdjudicationStatus, ConflictHandoff, EvidencePacket, GraphRecordRef, LifeCommitInput,
+    LifeGraphToolRequest, LifeObserveInput, LifePatchProposalInput, LifeResolveInput,
+    MemoryGraphRagRunner, PatchKind, PatchRisk, PolicyFilter, ReliabilityBasis,
+    RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery, RunnerConfig,
+    RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef, SourceReliability, ValidationState,
 };
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
 use neo4rs::{
@@ -95,6 +97,7 @@ impl DatasourceProvider for LifeGraphProvider {
         match task.kind.as_str() {
             "life.observe" => self.handle_observe(task).await,
             "life.recall" => self.handle_recall(task).await,
+            "life.recall.feedback" => self.handle_recall_feedback(task).await,
             "life.commit" => self.handle_commit(task).await,
             "life.resolve" | "life.conflict.resolve" => self.handle_resolve(task).await,
             "life.conflict" | "life.conflict.handle" => self.handle_conflict(task).await,
@@ -613,6 +616,98 @@ impl LifeGraphProvider {
         })))
     }
 
+    async fn handle_recall_feedback(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: RetrievalFeedbackInput = serde_json::from_value(task.parameters.clone())
+            .context("failed to parse life.recall.feedback parameters as RetrievalFeedbackInput")?;
+        let plan = self
+            .runner
+            .plan(LifeGraphToolRequest::LifeRecallFeedback(input.clone()))
+            .map_err(|e| anyhow::anyhow!("life.recall.feedback plan validation failed: {e}"))?;
+
+        let growth_evaluation = plan
+            .steps
+            .first()
+            .and_then(|step| step.payload.get("growth_evaluation"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let compiled = cypher::compile_recall_feedback(&input, &growth_evaluation, &now)
+            .map_err(|e| anyhow::anyhow!("life.recall.feedback Cypher compilation failed: {e}"))?;
+
+        let graph = self.connect().await?;
+        let mut q = query(&compiled.query)
+            .param("feedback_id", compiled.feedback_id.as_str())
+            .param("packet_id", compiled.packet_id.as_str())
+            .param("rating", compiled.rating.as_str())
+            .param("query_summary", compiled.query_summary.as_str())
+            .param("note", compiled.note.as_str())
+            .param("candidate_count", compiled.candidate_count)
+            .param(
+                "connected_candidate_count",
+                compiled.connected_candidate_count,
+            )
+            .param("feedback_json", compiled.feedback_json.as_str())
+            .param("evaluation_json", compiled.evaluation_json.as_str())
+            .param("observed_at", compiled.observed_at.as_str());
+        if let Some(ratio) = compiled.connectivity_ratio {
+            q = q.param("connectivity_ratio", ratio);
+        } else {
+            q = q.param("connectivity_ratio", 0.0_f64);
+        }
+        let mut rows = graph.execute(q).await?;
+        let _ = rows.next().await?;
+
+        let generated_patch = recall_feedback_patch_proposal(&input);
+        let generated_patch_summary = if let Some(patch) = &generated_patch {
+            let compiled_patch = cypher::compile_patch_proposal(patch, &now).map_err(|e| {
+                anyhow::anyhow!("life.recall.feedback patch Cypher compilation failed: {e}")
+            })?;
+            let mut patch_rows = graph
+                .execute(
+                    query(&compiled_patch.query)
+                        .param("patch_id", compiled_patch.patch_id.as_str())
+                        .param("patch_kind", compiled_patch.patch_kind.as_str())
+                        .param("summary", compiled_patch.summary.as_str())
+                        .param("rationale", compiled_patch.rationale.as_str())
+                        .param("risk", compiled_patch.risk.as_str())
+                        .param("status", compiled_patch.status.as_str())
+                        .param("proposed_at", compiled_patch.proposed_at.as_str())
+                        .param("patch_json", compiled_patch.patch_json.as_str()),
+                )
+                .await?;
+            let _ = patch_rows.next().await?;
+            Some(json!({
+                "patch_id": compiled_patch.patch_id,
+                "patch_kind": compiled_patch.patch_kind,
+                "label": compiled_patch.label,
+                "risk": compiled_patch.risk,
+                "status": compiled_patch.status,
+            }))
+        } else {
+            None
+        };
+
+        let improvement_steps: Vec<_> = plan
+            .steps
+            .iter()
+            .filter(|step| step.action == "life.graph.improvement_candidates")
+            .cloned()
+            .collect();
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": if plan.requires_operator { "awaiting_operator" } else { "recorded" },
+            "feedback_id": compiled.feedback_id,
+            "packet_id": compiled.packet_id,
+            "rating": compiled.rating,
+            "connectivity_ratio": compiled.connectivity_ratio,
+            "growth_evaluation": growth_evaluation,
+            "improvement_steps": improvement_steps,
+            "generated_patch": generated_patch_summary,
+            "requires_operator": plan.requires_operator,
+        })))
+    }
+
     async fn execute_conflict_cypher(&self, compiled: &cypher::ConflictCypher) -> Result<()> {
         let graph = self.connect().await?;
         let mut q = query(&compiled.query)
@@ -781,6 +876,102 @@ fn commitments_approaching_cypher(deadline: &str) -> String {
     )
 }
 
+fn recall_feedback_patch_proposal(
+    input: &RetrievalFeedbackInput,
+) -> Option<LifePatchProposalInput> {
+    let (patch_kind, risk, summary, rationale) = match input.rating {
+        RetrievalFeedbackRating::Useful => return None,
+        RetrievalFeedbackRating::Disconnected => (
+            PatchKind::SystemPatch,
+            PatchRisk::Low,
+            "Add bridge/ranking maintenance for disconnected LifeGraph recall.".to_string(),
+            "Recall returned candidates that were not connected enough to the active context; propose bridge-building or ranking maintenance grounded in feedback.".to_string(),
+        ),
+        RetrievalFeedbackRating::Missing => (
+            PatchKind::SystemPatch,
+            PatchRisk::Low,
+            "Add capture or bridge maintenance for missing LifeGraph context.".to_string(),
+            "Recall missed expected context; propose capture, bridge, or ontology-gap review without confirming new facts.".to_string(),
+        ),
+        RetrievalFeedbackRating::Noisy => (
+            PatchKind::SystemPatch,
+            PatchRisk::Low,
+            "Dampen noisy LifeGraph recall paths.".to_string(),
+            "Recall included noisy candidates; propose ranking or bridge dampening for low-value hubs.".to_string(),
+        ),
+        RetrievalFeedbackRating::Stale => (
+            PatchKind::SystemPatch,
+            PatchRisk::Low,
+            "Review stale LifeGraph recall facts.".to_string(),
+            "Recall surfaced stale facts; propose stale-marker or confirmation review before reuse.".to_string(),
+        ),
+        RetrievalFeedbackRating::Overconfident => (
+            PatchKind::AttentionPatch,
+            PatchRisk::Medium,
+            "Require confirmation for overconfident LifeGraph recall.".to_string(),
+            "Recall presented inferred context too strongly; require operator confirmation before reinforcing this retrieval pattern.".to_string(),
+        ),
+    };
+
+    let evidence = if input.evidence_packets.is_empty() {
+        vec![feedback_signal_evidence(input)]
+    } else {
+        input.evidence_packets.clone()
+    };
+
+    Some(LifePatchProposalInput {
+        patch_id: format!(
+            "patch:recall-feedback:{}",
+            input.feedback_id.replace(':', "-")
+        ),
+        patch_kind,
+        summary,
+        rationale,
+        evidence_packets: evidence,
+        risk,
+        operator_approved: false,
+    })
+}
+
+fn feedback_signal_evidence(input: &RetrievalFeedbackInput) -> EvidencePacket {
+    EvidencePacket {
+        packet_id: format!("evidence:{}", input.feedback_id),
+        claim_ref: GraphRecordRef {
+            id: input.feedback_id.clone(),
+            label: "Signal".into(),
+            datasource: Some("life-graph".into()),
+        },
+        claim_summary: format!(
+            "LifeGraph recall feedback {:?} for packet {}.",
+            input.rating, input.packet_id
+        ),
+        source_refs: vec![SourceRef {
+            source_id: "agent:memorygraphrag".into(),
+            source_kind: SourceKind::RuntimeObservation,
+            reliability: SourceReliability {
+                score: 1.0,
+                basis: ReliabilityBasis::DirectObservation,
+            },
+            uri: None,
+            captured_at: None,
+        }],
+        passage_refs: vec![],
+        confidence: 1.0,
+        validation_state: ValidationState::Confirmed,
+        observed_at: None,
+        valid_time_range: None,
+        source_reliability: 1.0,
+        conflict_ids: vec![],
+        adjudication_status: AdjudicationStatus::NotNeeded,
+        metadata: json!({
+            "packet_id": input.packet_id,
+            "query_summary": input.query_summary,
+            "rating": input.rating,
+            "connectivity_ratio": input.connectivity_ratio(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,6 +1033,59 @@ mod tests {
             NamedRecallStrategy::from_task(&task),
             NamedRecallStrategy::SemanticPivot
         );
+    }
+
+    fn feedback_input(rating: RetrievalFeedbackRating) -> RetrievalFeedbackInput {
+        RetrievalFeedbackInput {
+            feedback_id: "feedback:recall:1".into(),
+            packet_id: "packet:recall:1".into(),
+            query_summary: Some("Re-enter LifeGraph work".into()),
+            rating,
+            note: Some("Feedback from a turn.".into()),
+            candidate_count: 4,
+            connected_candidate_count: 1,
+            missing_context_refs: vec!["life:goal:graph".into()],
+            noisy_node_refs: vec![GraphRecordRef {
+                id: "life:project:too-generic".into(),
+                label: "Project".into(),
+                datasource: Some("life-graph".into()),
+            }],
+            stale_node_refs: vec![GraphRecordRef {
+                id: "life:open_loop:old".into(),
+                label: "OpenLoop".into(),
+                datasource: Some("life-graph".into()),
+            }],
+            evidence_packets: vec![],
+        }
+    }
+
+    #[test]
+    fn useful_recall_feedback_does_not_generate_patch() {
+        let feedback = feedback_input(RetrievalFeedbackRating::Useful);
+        assert!(recall_feedback_patch_proposal(&feedback).is_none());
+    }
+
+    #[test]
+    fn disconnected_recall_feedback_generates_low_risk_system_patch() {
+        let feedback = feedback_input(RetrievalFeedbackRating::Disconnected);
+        let patch = recall_feedback_patch_proposal(&feedback)
+            .expect("disconnected feedback should create patch proposal");
+
+        assert_eq!(patch.patch_kind, PatchKind::SystemPatch);
+        assert_eq!(patch.risk, PatchRisk::Low);
+        assert_eq!(patch.evidence_packets[0].claim_ref.label, "Signal");
+        assert!(patch.summary.contains("disconnected"));
+    }
+
+    #[test]
+    fn overconfident_recall_feedback_generates_confirmation_gated_patch() {
+        let feedback = feedback_input(RetrievalFeedbackRating::Overconfident);
+        let patch = recall_feedback_patch_proposal(&feedback)
+            .expect("overconfident feedback should create patch proposal");
+
+        assert_eq!(patch.patch_kind, PatchKind::AttentionPatch);
+        assert_eq!(patch.risk, PatchRisk::Medium);
+        assert!(patch.rationale.contains("operator confirmation"));
     }
 
     #[test]
