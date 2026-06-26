@@ -452,13 +452,27 @@ fn build_cron_task_json(
     };
 
     let Some(signal_seed) = payload_json.get("paracrine_signal") else {
-        return serde_json::json!({
+        // Promote message → content so the philote runtime's handle_user_message can dispatch
+        // the turn. Also propagate routing fields (session_id, chat_id, source, transport)
+        // from the inner payload so that the reply routes back to the right channel/chat.
+        let content = payload_json
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut outer = serde_json::json!({
             "cron_job_id": job.id,
             "target_role": job.target_role,
             "fire_epoch": fire_epoch,
             "payload": payload_data,
-        })
-        .to_string();
+            "content": content,
+            "source": "cron",
+        });
+        for key in ["chat_id", "session_id", "source", "transport", "thread_id"] {
+            if let Some(val) = payload_json.get(key) {
+                outer[key] = val.clone();
+            }
+        }
+        return outer.to_string();
     };
 
     let mut signal = signal_seed
@@ -548,6 +562,44 @@ mod tests {
         assert_eq!(value["fire_epoch"], 1_234);
         assert_eq!(value["payload"], r#"{"hello":"world"}"#);
         assert!(value.get("action").is_none());
+    }
+
+    #[test]
+    fn cron_payload_with_message_promotes_content_and_routing_fields() {
+        let payload = r#"{
+            "event": "daily_check_in",
+            "message": "Good morning! Please run the morning check-in.",
+            "chat_id": "7898847424",
+            "source": "telegram",
+            "session_id": "telegram:7898847424:agent-beacon"
+        }"#;
+        let task = build_cron_task_json(&test_job(), 9_999, "vps-jane-aiua-01", payload.into());
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(
+            value["content"],
+            "Good morning! Please run the morning check-in."
+        );
+        assert_eq!(value["chat_id"], "7898847424");
+        assert_eq!(value["source"], "telegram");
+        assert_eq!(value["session_id"], "telegram:7898847424:agent-beacon");
+        assert_eq!(value["cron_job_id"], "job-1");
+        assert_eq!(value["fire_epoch"], 9_999);
+        assert!(value.get("action").is_none());
+    }
+
+    #[test]
+    fn cron_payload_without_message_uses_empty_content() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{"event": "ping"}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(value["content"], "");
+        assert_eq!(value["source"], "cron");
     }
 
     #[test]
