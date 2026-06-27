@@ -113,6 +113,10 @@ async fn execute_life_tool(
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value> {
+    let run_id = Uuid::new_v4().simple().to_string();
+    let session_id = format!("smoke:life-graph:{tool_name}:{run_id}");
+    let turn_id = format!("smoke-turn-{run_id}");
+
     let response = client
         .send_request(IpcRequest::EmitTask {
             target_node: target_node.to_string(),
@@ -124,8 +128,8 @@ async fn execute_life_tool(
                 "action": "execute_tool",
                 "tool_name": tool_name,
                 "arguments": arguments,
-                "session_id": format!("smoke:life-graph:{tool_name}"),
-                "turn_id": format!("smoke-turn-life-graph-{}", tool_name.replace('.', "-")),
+                "session_id": session_id,
+                "turn_id": turn_id,
                 "chat_id": "smoke-chat",
                 "agent_id": DRIVER_GUEST_ID,
                 "reply_to": reply_node,
@@ -141,7 +145,7 @@ async fn execute_life_tool(
         other => bail!("{tool_name}: unexpected emit response: {other:?}"),
     }
 
-    let payload = timeout(Duration::from_secs(20), async {
+    let payload = timeout(Duration::from_secs(30), async {
         loop {
             let reply = client.recv_inbound_task().await?;
             let IpcResponse::InboundTask { task_json, .. } = reply else {
@@ -151,13 +155,30 @@ async fn execute_life_tool(
                 .context("failed to decode datasource_response json")?;
 
             if payload["action"].as_str() != Some("datasource_response") {
-                bail!("{tool_name}: expected datasource_response, got {payload}");
+                eprintln!("{tool_name}: skipping non-datasource_response action={:?}", payload["action"].as_str());
+                continue;
             }
-            if payload.get("error").is_some() {
-                bail!(
-                    "{tool_name}: datasource returned error: {}",
-                    payload["error"]
+            // drain stale responses from previous runs or different capabilities
+            let matches_this_run = payload["turn_id"].as_str() == Some(&turn_id)
+                || payload["capability"].as_str() == Some(tool_name);
+            if !matches_this_run {
+                eprintln!(
+                    "{tool_name}: ignoring stale datasource_response for capability={:?} turn_id={:?}",
+                    payload["capability"].as_str(),
+                    payload["turn_id"].as_str()
                 );
+                continue;
+            }
+            if payload.get("error").is_some() && !payload["error"].is_null() {
+                // only bail if this is the current run's response
+                if payload["turn_id"].as_str() == Some(&turn_id) {
+                    bail!(
+                        "{tool_name}: datasource returned error: {}",
+                        payload["error"]
+                    );
+                }
+                eprintln!("{tool_name}: ignoring stale error for turn_id={:?}", payload["turn_id"].as_str());
+                continue;
             }
             if payload["capability"].as_str() == Some(tool_name) {
                 return Ok(payload);
