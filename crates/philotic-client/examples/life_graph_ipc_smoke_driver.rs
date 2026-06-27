@@ -73,6 +73,22 @@ async fn main() -> Result<()> {
         .map(Vec::len)
         .unwrap_or_default();
     println!("life.recall IPC ok   result_count={result_count}");
+
+    let context_id = packet["context_id"]
+        .as_str()
+        .context("life.recall context packet missing context_id")?
+        .to_string();
+    let feedback_payload = execute_life_tool(
+        &mut client,
+        &target_node,
+        &reply_node,
+        "life.recall.feedback",
+        feedback_input(&context_id),
+    )
+    .await?;
+    assert_success_capability(&feedback_payload, "life.recall.feedback")?;
+    println!("life.recall.feedback IPC ok  context_id={context_id}");
+
     println!("life graph IPC smoke passed");
     Ok(())
 }
@@ -97,6 +113,10 @@ async fn execute_life_tool(
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value> {
+    let run_id = Uuid::new_v4().simple().to_string();
+    let session_id = format!("smoke:life-graph:{tool_name}:{run_id}");
+    let turn_id = format!("smoke-turn-{run_id}");
+
     let response = client
         .send_request(IpcRequest::EmitTask {
             target_node: target_node.to_string(),
@@ -108,8 +128,8 @@ async fn execute_life_tool(
                 "action": "execute_tool",
                 "tool_name": tool_name,
                 "arguments": arguments,
-                "session_id": format!("smoke:life-graph:{tool_name}"),
-                "turn_id": format!("smoke-turn-life-graph-{}", tool_name.replace('.', "-")),
+                "session_id": session_id,
+                "turn_id": turn_id,
                 "chat_id": "smoke-chat",
                 "agent_id": DRIVER_GUEST_ID,
                 "reply_to": reply_node,
@@ -125,25 +145,52 @@ async fn execute_life_tool(
         other => bail!("{tool_name}: unexpected emit response: {other:?}"),
     }
 
-    let reply = timeout(Duration::from_secs(20), client.recv_inbound_task())
-        .await
-        .with_context(|| format!("{tool_name}: timed out waiting for datasource_response"))??;
+    let payload = timeout(Duration::from_secs(30), async {
+        loop {
+            let reply = client.recv_inbound_task().await?;
+            let IpcResponse::InboundTask { task_json, .. } = reply else {
+                bail!("{tool_name}: unexpected reply envelope: {reply:?}");
+            };
+            let payload: Value = serde_json::from_str(&task_json)
+                .context("failed to decode datasource_response json")?;
 
-    let IpcResponse::InboundTask { task_json, .. } = reply else {
-        bail!("{tool_name}: unexpected reply envelope: {reply:?}");
-    };
-    let payload: Value =
-        serde_json::from_str(&task_json).context("failed to decode datasource_response json")?;
-
-    if payload["action"].as_str() != Some("datasource_response") {
-        bail!("{tool_name}: expected datasource_response, got {payload}");
-    }
-    if payload.get("error").is_some() {
-        bail!(
-            "{tool_name}: datasource returned error: {}",
-            payload["error"]
-        );
-    }
+            if payload["action"].as_str() != Some("datasource_response") {
+                eprintln!("{tool_name}: skipping non-datasource_response action={:?}", payload["action"].as_str());
+                continue;
+            }
+            // drain stale responses from previous runs or different capabilities
+            let matches_this_run = payload["turn_id"].as_str() == Some(&turn_id)
+                || payload["capability"].as_str() == Some(tool_name);
+            if !matches_this_run {
+                eprintln!(
+                    "{tool_name}: ignoring stale datasource_response for capability={:?} turn_id={:?}",
+                    payload["capability"].as_str(),
+                    payload["turn_id"].as_str()
+                );
+                continue;
+            }
+            if payload.get("error").is_some() && !payload["error"].is_null() {
+                // only bail if this is the current run's response
+                if payload["turn_id"].as_str() == Some(&turn_id) {
+                    bail!(
+                        "{tool_name}: datasource returned error: {}",
+                        payload["error"]
+                    );
+                }
+                eprintln!("{tool_name}: ignoring stale error for turn_id={:?}", payload["turn_id"].as_str());
+                continue;
+            }
+            if payload["capability"].as_str() == Some(tool_name) {
+                return Ok(payload);
+            }
+            eprintln!(
+                "{tool_name}: ignoring stale datasource_response for capability={:?}",
+                payload["capability"].as_str()
+            );
+        }
+    })
+    .await
+    .with_context(|| format!("{tool_name}: timed out waiting for datasource_response"))??;
 
     Ok(payload)
 }
@@ -236,6 +283,20 @@ fn recall_input() -> Value {
         "operator_intent": "open_loops_by_context",
         "max_context_packets": 5,
         "embedding": embedding
+    })
+}
+
+fn feedback_input(context_id: &str) -> Value {
+    json!({
+        "feedback_id": format!("smoke-feedback-{}", Uuid::new_v4().simple()),
+        "packet_id": context_id,
+        "rating": "useful",
+        "candidate_count": 1,
+        "connected_candidate_count": 1,
+        "missing_context_refs": [],
+        "noisy_node_refs": [],
+        "stale_node_refs": [],
+        "evidence_packets": []
     })
 }
 

@@ -16411,6 +16411,7 @@ fn tools_for_allowed_class(class: &str) -> &'static [&'static str] {
         "life_graph" => &[
             "life.observe",
             "life.recall",
+            "life.recall.feedback",
             "life.commit",
             "life.resolve",
             "life.conflict",
@@ -18806,13 +18807,13 @@ mod tests {
 
         assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
 
-        let delivered = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            base_agent.recv_task(),
-        )
-        .await
-        .expect("base agent should receive response before timeout — must not park ledger-only")
-        .expect("base agent recv should succeed");
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), base_agent.recv_task())
+                .await
+                .expect(
+                    "base agent should receive response before timeout — must not park ledger-only",
+                )
+                .expect("base agent recv should succeed");
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
                 let payload: serde_json::Value =
@@ -22557,6 +22558,7 @@ mod tests {
         assert!(toolset.iter().any(|tool| tool == "echo"));
         assert!(toolset.iter().any(|tool| tool == "life.observe"));
         assert!(toolset.iter().any(|tool| tool == "life.recall"));
+        assert!(toolset.iter().any(|tool| tool == "life.recall.feedback"));
     }
 
     #[test]

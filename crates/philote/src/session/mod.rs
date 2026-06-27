@@ -1775,8 +1775,20 @@ impl SessionState {
             return projected;
         }
 
+        // An on-demand or effective skill being relevant for this turn means the user
+        // is asking for something that skill's tools can do — even if the phrasing also
+        // happens to trip the conversational-filler heuristic (e.g. "what's in my
+        // lifegraph?" matches both the "what" prefix and life.steward's relevance check).
+        // Tool-bearing intent wins so the model isn't left with zero tools to act on it.
+        let on_demand_relevant = self
+            .bindings
+            .effective_skillset
+            .iter()
+            .chain(self.bindings.on_demand_skills.iter())
+            .any(|skill| crate::catalog::skill_is_relevant_for_turn(skill, &normalized));
         if looks_like_conversational_goal(&normalized)
             && !looks_like_retry_goal(&normalized_current)
+            && !on_demand_relevant
         {
             return Vec::new();
         }
@@ -2563,8 +2575,8 @@ impl SessionState {
 
     pub fn project_knowledge(
         &self,
-        _user_content: &str,
-        _projected_tools: &[ToolDefinition],
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
     ) -> String {
         let mut sections = Vec::new();
 
@@ -2621,7 +2633,39 @@ impl SessionState {
             sections.push(format!("[Memory seed]\n{memory_summary}"));
         }
 
+        if Self::should_project_lifegraph_stewardship(user_content, projected_tools) {
+            sections.push(
+                "[LifeGraph stewardship]\n\
+                 Use life.recall before answering when the turn involves life structure, \
+                 re-entry, follow-through, goals, habits, commitments, open loops, or the \
+                 operator's LifeGraph. After the recalled packet proves useful, stale, missing, \
+                 noisy, overconfident, or disconnected, record life.recall.feedback so the graph \
+                 can improve bridge/ranking/attention behavior without silently confirming new truth."
+                    .to_string(),
+            );
+        }
+
         sections.join("\n\n")
+    }
+
+    fn should_project_lifegraph_stewardship(
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> bool {
+        let projected_tool_names = projected_tools
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !projected_tool_names.contains("life.recall")
+            || !projected_tool_names.contains("life.recall.feedback")
+        {
+            return false;
+        }
+
+        crate::catalog::skill_is_relevant_for_turn(
+            "life.steward",
+            &normalized_turn_text(user_content),
+        )
     }
 
     fn project_recalled_memory(&self) -> String {
@@ -4152,6 +4196,7 @@ fn is_life_graph_tool(tool_name: &str) -> bool {
         tool_name,
         "life.observe"
             | "life.recall"
+            | "life.recall.feedback"
             | "life.commit"
             | "life.resolve"
             | "life.conflict"
@@ -6615,6 +6660,7 @@ mod tests {
         state.rebuild_default_tool_assembly();
 
         assert!(state.tool_is_enabled("life.observe"));
+        assert!(state.tool_is_enabled("life.recall.feedback"));
         let route = state
             .resolve_tool_route("life.observe")
             .expect("life.observe route should be assembled from life_graph class");
@@ -6625,6 +6671,12 @@ mod tests {
             route.selection_reason.as_deref(),
             Some("life_graph_runner_route")
         );
+        let feedback_route = state
+            .resolve_tool_route("life.recall.feedback")
+            .expect("life.recall.feedback route should be assembled from life_graph class");
+        assert_eq!(feedback_route.target_node, "vps-jane-aiua-01");
+        assert_eq!(feedback_route.target_role, "life-graph-runner");
+        assert_eq!(feedback_route.execution_mode, "life_graph");
     }
 
     #[test]
@@ -6649,6 +6701,7 @@ mod tests {
             supported_tools: vec![
                 "life.observe".into(),
                 "life.recall".into(),
+                "life.recall.feedback".into(),
                 "life.commit".into(),
             ],
             execution_mode: "capability".into(),
@@ -6665,6 +6718,10 @@ mod tests {
             state.tool_is_enabled("life.observe"),
             "life.observe should be enabled via allowed_classes life_graph"
         );
+        assert!(
+            state.tool_is_enabled("life.recall.feedback"),
+            "life.recall.feedback should be enabled via allowed_classes life_graph"
+        );
         let route = state
             .resolve_tool_route("life.observe")
             .expect("life.observe route should be assembled from incarnation");
@@ -6673,6 +6730,137 @@ mod tests {
             Some("vps-jane:life-graph-runner")
         );
         assert_eq!(route.hotel_id.as_deref(), Some("vps-jane"));
+        let feedback_route = state
+            .resolve_tool_route("life.recall.feedback")
+            .expect("life.recall.feedback route should be assembled from incarnation");
+        assert_eq!(
+            feedback_route.incarnation_id.as_deref(),
+            Some("vps-jane:life-graph-runner")
+        );
+        assert_eq!(feedback_route.hotel_id.as_deref(), Some("vps-jane"));
+    }
+
+    #[test]
+    fn lifegraph_capable_turn_projects_recall_feedback_guidance() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon-01".into(), "telegram".into());
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.rebuild_default_tool_assembly();
+
+        let prompt = state.build_prompt("Help me re-enter my LifeGraph open loops.");
+
+        assert!(prompt.contains("[LifeGraph stewardship]"));
+        assert!(prompt.contains("Use life.recall before answering"));
+        assert!(prompt.contains("life.recall.feedback"));
+    }
+
+    #[test]
+    fn natural_lifegraph_request_is_not_treated_as_conversational() {
+        // Regression: Jane's real-world phrase "please take a look at the lifegraph
+        // now and see whtat we have there." was getting zero tools because
+        // looks_like_conversational_goal's plain substring match for "ok" matched
+        // inside "look", and the message also starts with no recognized prefix but
+        // contains no '?' — the bug was specifically the "ok"-in-"look" false
+        // positive. This asserts the fix at the project_tools_for_turn level (not
+        // just the inner heuristic) so a regression can't hide behind an unrelated
+        // exemption.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.recall.feedback"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+
+        let projected = state.project_tools_for_turn(
+            "please take a look at the lifegraph now and see whtat we have there.",
+        );
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            projected_names.contains("life.recall"),
+            "expected life.recall to survive tool projection, got {projected_names:?}"
+        );
+    }
+
+    #[test]
+    fn what_phrasing_lifegraph_query_is_not_treated_as_conversational() {
+        // Broader generalization: "what's in my lifegraph?" trips both the '?' check
+        // and the "what" prefix in looks_like_conversational_goal, but it is also
+        // relevant to an active on-demand skill, so it must not collapse to zero tools.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.recall.feedback"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+
+        let projected = state.project_tools_for_turn("what's in my lifegraph?");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            projected_names.contains("life.recall"),
+            "expected life.recall to survive tool projection, got {projected_names:?}"
+        );
+    }
+
+    #[test]
+    fn live_graph_typo_is_not_treated_as_conversational() {
+        // Regression: Jane's real production turn "Alright, can you take a look at
+        // the live graph and see what we have on for today?" zeroed every tool
+        // because "live graph" is a one-letter typo of "life graph"/"lifegraph" and
+        // matched none of life.steward's keywords, so the '?' conversational-filler
+        // gate fired with no on_demand_relevant escape valve. Jane then hallucinated
+        // a confident answer about LifeGraph contents with zero tool access. Widen
+        // the keyword match instead of weakening the conversational gate itself
+        // (which has its own deliberately-tested zero-tools behavior).
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.recall.feedback"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+
+        let projected = state.project_tools_for_turn(
+            "Alright, can you take a look at the live graph and see what we have on for today?",
+        );
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            projected_names.contains("life.recall"),
+            "expected life.recall to survive tool projection, got {projected_names:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_conversational_reply_still_gets_zero_tools() {
+        // Make sure the generalization in project_tools_for_turn didn't gut the
+        // conversational gate itself — plain filler with no skill relevance still
+        // collapses to zero tools.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.recall.feedback"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+
+        let projected = state.project_tools_for_turn("thanks, that looks great!");
+        assert!(
+            projected.is_empty(),
+            "expected ordinary thanks/filler turn to still collapse to zero tools, got {:?}",
+            projected
+                .iter()
+                .map(|t| t.tool_name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -6694,6 +6882,7 @@ mod tests {
             supported_tools: vec![
                 "life.observe".into(),
                 "life.recall".into(),
+                "life.recall.feedback".into(),
                 "life.commit".into(),
             ],
             execution_mode: "capability".into(),
@@ -6713,6 +6902,13 @@ mod tests {
             .expect("life.observe should still route to the runner incarnation");
         assert_eq!(
             life_route.incarnation_id.as_deref(),
+            Some("vps-jane:life-graph-runner")
+        );
+        let feedback_route = state
+            .resolve_tool_route("life.recall.feedback")
+            .expect("life.recall.feedback should still route to the runner incarnation");
+        assert_eq!(
+            feedback_route.incarnation_id.as_deref(),
             Some("vps-jane:life-graph-runner")
         );
     }
@@ -6928,13 +7124,16 @@ mod tests {
     }
 
     #[test]
-    fn natural_lifegraph_request_is_not_treated_as_conversational() {
+    fn natural_lifegraph_request_via_allowed_classes_is_not_treated_as_conversational() {
         // Regression: Jane's real-world phrase "please take a look at the lifegraph
         // now and see whtat we have there." was projecting zero tools because
         // looks_like_conversational_goal's plain substring match for "ok" matched
         // inside "look" — the word "look" contains "ok" as a substring, so the
         // filler-phrase heuristic falsely treated the whole request as conversational
         // chit-chat and the model never even saw life.recall as an available tool.
+        // Same scenario as natural_lifegraph_request_is_not_treated_as_conversational
+        // above, but exercised through the allowed_classes -> rebuild_default_tool_assembly
+        // path instead of explicit tool bindings + on_demand_skills.
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.bindings.allowed_classes = vec!["life_graph".into()];

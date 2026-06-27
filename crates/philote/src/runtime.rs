@@ -13,8 +13,8 @@ use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors, MediaRoutingPolicy,
     MemoryAuthority, MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope,
     MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, RecalledMemoryRecord,
-    SessionState, ToolDefinition, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index,
+    SessionState, ToolDefinition, ToolExecutionRoute, ToolRunnerIncarnationBinding, TtsMode,
+    VoiceResponsePolicy, WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -1831,6 +1831,92 @@ fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json:
     lines.join("\n")
 }
 
+fn push_unique_string(target: &mut Vec<String>, value: &str) -> bool {
+    if target.iter().any(|existing| existing == value) {
+        return false;
+    }
+    target.push(value.to_string());
+    true
+}
+
+fn merge_profile_string_list(
+    profile: &serde_json::Value,
+    field: &str,
+    target: &mut Vec<String>,
+) -> bool {
+    profile
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .fold(false, |changed, item| {
+                    push_unique_string(target, item) || changed
+                })
+        })
+        .unwrap_or(false)
+}
+
+fn merge_toolset_profile_into_session_bindings(
+    state: &mut SessionState,
+    profile: &serde_json::Value,
+) -> bool {
+    let mut changed = false;
+
+    changed |= merge_profile_string_list(
+        profile,
+        "allowed_tools",
+        &mut state.bindings.effective_toolset,
+    );
+    changed |= merge_profile_string_list(
+        profile,
+        "allowed_skills",
+        &mut state.bindings.effective_skillset,
+    );
+    changed |= merge_profile_string_list(
+        profile,
+        "on_demand_skills",
+        &mut state.bindings.on_demand_skills,
+    );
+    changed |= merge_profile_string_list(
+        profile,
+        "allowed_classes",
+        &mut state.bindings.allowed_classes,
+    );
+
+    if let Some(runners) = profile
+        .get("remote_tool_runners")
+        .and_then(serde_json::Value::as_array)
+    {
+        for runner in runners {
+            let Ok(binding) =
+                serde_json::from_value::<ToolRunnerIncarnationBinding>(runner.clone())
+            else {
+                continue;
+            };
+            if binding.incarnation_id.is_empty() {
+                continue;
+            }
+            if state
+                .bindings
+                .allowed_tool_runner_incarnations
+                .iter()
+                .any(|existing| existing.incarnation_id == binding.incarnation_id)
+            {
+                continue;
+            }
+            state
+                .bindings
+                .allowed_tool_runner_incarnations
+                .push(binding);
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 /// Locally cached role configuration, populated when `role.configure` succeeds.
 /// Used to reconstruct `RoleActivation` on inbound handoff without an IPC round-trip.
 #[derive(Debug, Clone)]
@@ -2103,6 +2189,57 @@ impl AgentRuntime {
                 );
                 None
             }
+        }
+    }
+
+    async fn hydrate_bindings_from_toolset_profile(
+        &mut self,
+        state: &mut SessionState,
+        profile_name: &str,
+    ) {
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetToolsetProfile {
+                profile_name: profile_name.to_string(),
+            }),
+        )
+        .await;
+
+        let profile = match response {
+            Ok(Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(profile),
+                ..
+            })) => profile,
+            Ok(Ok(IpcResponse::Standard { ok: true, .. })) => return,
+            Ok(Ok(other)) => {
+                warn!(
+                    agent_id = %self.agent_id,
+                    profile = %profile_name,
+                    "Unexpected GetToolsetProfile response while hydrating fresh session: {other:?}"
+                );
+                return;
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    agent_id = %self.agent_id,
+                    profile = %profile_name,
+                    "GetToolsetProfile failed while hydrating fresh session: {err}"
+                );
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    agent_id = %self.agent_id,
+                    profile = %profile_name,
+                    "GetToolsetProfile timed out while hydrating fresh session."
+                );
+                return;
+            }
+        };
+
+        if merge_toolset_profile_into_session_bindings(state, &profile) {
+            state.rebuild_default_tool_assembly();
         }
     }
 
@@ -10139,9 +10276,24 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: route.target_node,
                 target_role: route.target_role,
-                target_guest_id: route.incarnation_id.clone(),
+                target_guest_id: if route.execution_mode == "life_graph" {
+                    None
+                } else {
+                    route.incarnation_id.clone()
+                },
                 task_json: serde_json::to_string(&payload)?,
             })
+            .await?;
+
+        let node_id = arguments
+            .pointer("/evidence/claim_ref/id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("life:unknown");
+        let reply_content = format!(
+            "Recorded this {} in LifeGraph: {} (`{}`)",
+            command.label, command.claim_summary, node_id
+        );
+        self.complete_local_command(session_id.clone(), turn_id.clone(), reply_content)
             .await?;
 
         info!(
@@ -16124,8 +16276,15 @@ impl AgentRuntime {
         // Auto-activate the agent's default role incarnation on fresh sessions so the
         // correct manifest, toolset, and skill guidance are present from turn zero
         // without requiring an explicit handoff.to_role call.
-        if let Some(ref default_role) = self.default_agent_profile.default_role_name.clone() {
-            if let Some(activation) = self.fetch_role_activation(default_role).await {
+        let default_role = self
+            .default_agent_profile
+            .default_role_name
+            .clone()
+            .filter(|role| !role.trim().is_empty())
+            .unwrap_or_else(|| "orchestrator".into());
+        {
+            if let Some(activation) = self.fetch_role_activation(&default_role).await {
+                let toolset_profile_ref = activation.toolset_profile_ref.clone();
                 if let Some(cap) = activation
                     .turn_loop_config
                     .as_ref()
@@ -16134,6 +16293,10 @@ impl AgentRuntime {
                     state.settings.execution.iteration_cap = cap.clamp(1, 50);
                 }
                 state.role_activation = Some(activation);
+                if let Some(profile_name) = toolset_profile_ref.as_deref() {
+                    self.hydrate_bindings_from_toolset_profile(&mut state, profile_name)
+                        .await;
+                }
                 info!(
                     session_id = %session_id,
                     role = %default_role,
@@ -16301,8 +16464,9 @@ mod tests {
         AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
         extract_model_error_payload, format_role_command_reply, format_roles_report,
         loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments,
-        normalized_user_content, parse_memory_candidate, resolve_media_routing,
-        resolve_model_execution_target, should_attempt_provider_repair,
+        merge_toolset_profile_into_session_bindings, normalized_user_content,
+        parse_memory_candidate, resolve_media_routing, resolve_model_execution_target,
+        should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
@@ -16365,6 +16529,52 @@ mod tests {
             },
         ));
         turn.iteration += 1;
+    }
+
+    #[test]
+    fn fresh_session_profile_merge_projects_life_graph_tools() {
+        let mut state = SessionState::new(
+            "operator-chat:fresh:agent-jane".into(),
+            "agent-jane".into(),
+            "operator_chat".into(),
+        );
+        let profile = serde_json::json!({
+            "profile_name": "orchestrator",
+            "allowed_tools": ["session.status"],
+            "allowed_skills": [],
+            "on_demand_skills": [],
+            "allowed_classes": ["life_graph"],
+            "remote_tool_runners": [{
+                "incarnation_id": "vps-jane:life-graph-runner",
+                "runner_id": "vps-jane:life-graph-runner",
+                "hotel_id": "vps-jane-aiua-01",
+                "target_node": "vps-jane-aiua-01",
+                "target_role": "life-graph-runner",
+                "supported_tools": [
+                    "life.observe",
+                    "life.recall",
+                    "life.recall.feedback"
+                ],
+                "execution_mode": "life_graph",
+                "availability_state": "live"
+            }]
+        });
+
+        assert!(merge_toolset_profile_into_session_bindings(
+            &mut state, &profile
+        ));
+        state.rebuild_default_tool_assembly();
+
+        for tool in ["life.observe", "life.recall", "life.recall.feedback"] {
+            assert!(state.tool_is_enabled(tool), "{tool} should be visible");
+            assert_eq!(
+                state
+                    .resolve_tool_route(tool)
+                    .map(|route| route.execution_mode.as_str()),
+                Some("life_graph"),
+                "{tool} should route through the LifeGraph runner"
+            );
+        }
     }
 
     #[test]

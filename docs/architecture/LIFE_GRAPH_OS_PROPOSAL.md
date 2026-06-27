@@ -2,8 +2,8 @@
 title: Life Graph OS Proposal
 doc_type: proposal
 domain: memory-context
-status: proposed
-last_updated: 2026-06-05
+status: accepted-current-slice
+last_updated: 2026-06-24
 tags:
 - life-graph
 - context-engine
@@ -85,7 +85,7 @@ The first Life Graph OS boundary is now substantially implemented. Current proof
 - `life-graph-paracrine-heartbeat` (`test-green-runtime-boundary`): cron can emit opt-in `paracrine_signal` heartbeats and philotes observe them without model re-entry.
 - `life-graph-evidence-conflict` (`test-green-contracts`): `data-memorygraphrag` defines validated `EvidencePacket` and `ConflictHandoff` contracts with full test coverage.
 - `life-graph-semantic-retrieval` (`spec-and-contracts-green`): 5 named retrieval strategies with Cypher patterns (`SEMANTIC_RETRIEVAL.md`), `RetrievalContextPacket` shape, policy filter rules, composite ranking model, and retrieval flywheel spec. Contracts wired in `data-memorygraphrag`. Commit `e381416`.
-- `life-graph-memorygraphrag-runner` (`provider-handlers-green`): `data-memorygraphrag` runner with full `life.*` tool catalog, planner, and provider handlers for `life.observe`, `life.recall`, `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`. `life.observe` MERGE live and verified against Memgraph. `life.recall` now dispatches the five named strategies from `SEMANTIC_RETRIEVAL.md`. Provider write handlers compile and execute Memgraph MERGE/SET writes for commit, conflict, resolve, and patch proposal flows. 39 tests green. Commits `1883ea6`, `0265091`.
+- `life-graph-memorygraphrag-runner` (`provider-handlers-green`): `data-memorygraphrag` runner with full `life.*` tool catalog, planner, and provider handlers for `life.observe`, `life.recall`, `life.recall.feedback`, `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`. `life.observe` MERGE live and verified against Memgraph. `life.recall` now dispatches the five named strategies from `SEMANTIC_RETRIEVAL.md`. Provider write handlers compile and execute Memgraph MERGE/SET writes for commit, conflict, resolve, patch proposal, and recall-feedback flows. Commits `1883ea6`, `0265091`.
 - `life-graph-philote-access` (`watched-live-green`): all seeded role profiles (`orchestrator`, `admin`, `codex`, `research`, `utility`, `architect`, `brain`, `virtuoso`) now carry the `life_graph` class and a vps-jane remote runner binding. mac-jane, mbp-jane, and vps-jane were deployed/restarted and live-smoked through `life.observe`/`life.recall` to the canonical vps-jane LifeGraph runner.
 - `life-graph-agentic-growth-loop` (`test-green-contracts`): `data-memorygraphrag` defines patch gates, growth signals, drift categories, and risk-tiered policy evaluation.
 - `life-graph-attention-steward` (`test-green-observe-policy`): SIL data model (`StewardshipInstruction`), Beacon stewardship contract, observe-only paracrine subscriber interface (8 signal types, 4 response types), anti-policy checklist. Spec at `docs/architecture/life-graph/ATTENTION_STEWARD.md`. Commit `86a730b`.
@@ -96,8 +96,8 @@ Per-seam open items for the next implementation round:
 
 | Seam | Open |
 |---|---|
-| `life-graph-memorygraphrag-runner` | Retrieval quality logging and `life.recall.feedback`; basic hotel IPC invocation is live-smoked |
-| `life-graph-semantic-retrieval` | Named strategy dispatch is provider-green; next is live retrieval quality logging and `life.recall.feedback` |
+| `life-graph-memorygraphrag-runner` | `life.recall.feedback` is provider/test-green and now emits governed patch proposals; next is live smoke through hotel IPC and patch review UX |
+| `life-graph-semantic-retrieval` | Named strategy dispatch is provider-green; next is retrieval quality aggregation, ranking/bridge tuning, and live feedback smoke |
 | `life-graph-evidence-conflict` | Runtime conflict detection and Muninn `true_up` / `contradiction_review` tool handoff still need wiring; provider `handle_conflict` / `handle_resolve` are test-green |
 | `life-graph-attention-steward` | Active SIL entries and operator confirmation gate in philote (first slice is observe-only; active interruptions unlock after 5 confirmed SIL entries) |
 | `life-graph-agentic-growth-loop` | Growth-loop philote role; background drift detector job |
@@ -106,7 +106,7 @@ Cross-cutting next pressure:
 
 - embed `life.recall` in Beacon's turn context pipeline (claude-local)
 - connect conflict handoff packets to Muninn `true_up` / `contradiction_review` tools
-- add `life.recall` feedback path (`life.recall.feedback`) for the retrieval flywheel
+- live-smoke `life.recall.feedback` through hotel IPC and expose the resulting patch proposals for Beacon/operator review
 
 ## Codex Handoff — Group B Provider Completions
 
@@ -285,7 +285,7 @@ The Life Graph OS-specific runner should be `data-memorygraphrag` until a better
 - named retrieval strategies
 - evidence packet assembly
 - conflict detection and adjudication requests
-- Life Graph tool projection such as `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`
+- Life Graph tool projection such as `life.observe`, `life.recall`, `life.recall.feedback`, `life.commit`, `life.resolve`, and `life.patch.propose`
 - policy-aware write plans that can be executed through `graph-datasource`
 
 This keeps the substrate reusable for project graphs, agent work graphs, and future domain graphs while giving Life Graph OS a coherent memory-specific capability layer.
@@ -420,6 +420,14 @@ Semantic retrieval should improve through observed use:
 4. apply only low-risk ranking/bridge improvements automatically
 5. require Beacon or operator confirmation for schema changes, identity merges, and attention-policy changes
 
+Current implementation: `life.recall.feedback` records retrieval feedback as a confirmed `Signal`
+node with packet ID, rating, candidate connectivity ratio, raw feedback JSON, and growth
+evaluation JSON. Ratings include `useful`, `stale`, `missing`, `noisy`, `overconfident`,
+and `disconnected`. Disconnected, missing, stale, and noisy feedback now generate low-risk
+system patch proposals for bridge/ranking maintenance; overconfident feedback generates a
+medium-risk attention patch proposal that requires confirmation before tuning can reinforce
+the pattern.
+
 ## Memgraph GraphRAG Applicability
 
 Memgraph's GraphRAG direction is relevant because it treats retrieval as graph-native composition: semantic pivots, graph expansion, ranking, and prompt/context assembly can be expressed close to the database instead of orchestrated as many scattered calls.
@@ -541,6 +549,7 @@ The baseline should be conservative enough to build trust and instrumented enoug
 - For the first slice, Attention Steward consumes paracrine heartbeat signals in observe-only mode.
 - No autonomous broad notifications until observe-only evidence shows the timing and tone policy is helpful.
 - Agents may auto-attach evidence, mark stale low-risk facts, and propose bridge/ranking improvements.
+- Retrieval feedback may automatically record reward/friction signals and propose low-risk connectivity improvements; it may not confirm identity/value/goal changes.
 - Agents may not auto-create identity, values, broad goals, notification policy, or new autonomous tool access.
 - New habits, recurring commitments, and role-level attention patterns require confirmation until reinforced across repeated evidence.
 - Every write path records provenance, confidence, validation level, and rollback/audit metadata.
@@ -594,7 +603,7 @@ Every recurring drift finding should be able to generate a patch proposal or a r
 
 1. Keep `graph-datasource` generic and define `data-memorygraphrag` as the Life Graph / MemoryGraphRAG toolset runner.
 2. Define the first Life Graph schema and Cypher migrations for `Role`, `Goal`, `System`, `Habit`, `Commitment`, `OpenLoop`, `NextAction`, and `GrowthExperiment`.
-3. Add a small tool surface: `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+3. Add a small tool surface: `life.observe`, `life.recall`, `life.recall.feedback`, `life.commit`, `life.resolve`, and `life.patch.propose`.
 4. Add semantic indexing for Life Graph nodes with a `768`-dimension baseline, `embedding_model_gen`, and `embedding_space` fields.
 5. Implement one retrieval strategy: semantic pivot plus bounded graph expansion into a context packet.
 6. Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.

@@ -93,16 +93,21 @@ Proposal: [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs
 Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-attention-steward`, `life-graph-agentic-growth-loop`, `life-graph-semantic-retrieval`, `life-graph-evidence-conflict`, `life-graph-paracrine-heartbeat`
 
 - [ ] Keep `graph-datasource` generic and define `data-memorygraphrag` as the Life Graph / MemoryGraphRAG runner/toolset layer.
-  - [x] Add the first `data-memorygraphrag` runner planning surface for `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+  - [x] Add the first `data-memorygraphrag` runner planning surface for `life.observe`, `life.recall`, `life.recall.feedback`, `life.commit`, `life.resolve`, and `life.patch.propose`.
 - [ ] Define the first Life Graph schema for `Role`, `Goal`, `System`, `Habit`, `Commitment`, `OpenLoop`, `NextAction`, and `GrowthExperiment`.
 - [ ] Decide whether Life Graph records live as a dedicated datasource partition, central graph labels, or a tiered model.
-- [ ] Add the first Life Graph tool surface: `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
-  - [x] Define the tool catalog and typed runner requests/plans in `data-memorygraphrag`; runtime/hotel projection remains next.
+- [ ] Add the first Life Graph tool surface: `life.observe`, `life.recall`, `life.recall.feedback`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+  - [x] Define the tool catalog and typed runner requests/plans in `data-memorygraphrag`.
+  - [x] Wire runtime/hotel projection: `life.recall.feedback` in `philote`'s tool catalog, abstract tool/skill seeding, toolset-profile `remote_tool_runners` bindings, and `aiua`'s `tools_for_allowed_class("life_graph")`.
+  - [x] Hydrate a fresh session's bindings (`effective_toolset`/`on_demand_skills`/`allowed_classes`/`remote_tool_runners`) from its role's toolset profile on first activation, so cold sessions get correct LifeGraph tool access from turn zero instead of relying on partial defaults.
+  - [x] Harden `project_tools_for_turn`'s conversational-filler gate: an `on_demand_relevant` escape valve keeps LifeGraph (and other on-demand-skill) tools visible when the turn matches the skill's keywords even if it also looks like a question/filler phrase, and `life.steward`/`lifegraph.truth_summarizer` keyword matching now tolerates the "live graph" typo of "life graph"/"lifegraph". Root-caused from a real production denial spiral where Jane lost all tool access on every question-containing turn and hallucinated LifeGraph contents instead.
   - [x] Implement provider handlers for `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`, mirroring `handle_observe` with runner gates and Memgraph MERGE/SET writes.
   - [x] Add a clean external MCP surface: keep Perplexity `context.capture` routed to Muninn continuity memory, add `mcp-surface-hygiene`, enforce auth on config-driven `membrane-mcp` tools, and provide a separate LifeGraph endpoint provisioner for governed `life.recall` / opt-in `life.observe`.
   - [x] Deploy and smoke the LifeGraph MCP endpoint against the live `life-graph-runner` before claiming `watched-live-green`.
 - [ ] Add semantic indexing for Life Graph nodes with a `768`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
 - [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
+  - [x] Add `life.recall.feedback` contracts/provider handler to record retrieval reward/friction as `Signal` nodes and emit governed improvement-candidate steps from usefulness, staleness, missing context, noise, overconfidence, and low connectivity.
+  - [x] Consume `life.recall.feedback` improvement-candidate steps into concrete bridge/ranking/attention patch proposals.
 - [ ] Implement one MemGraphRAG-inspired retrieval strategy: semantic pivot, bounded graph expansion, memory-aware ranking, policy filtering, and context packet projection.
   - [x] Land the first `data-memorygraphrag` semantic retrieval contracts for semantic pivots, bounded expansion, policy filters, ranking weights, and evidence-backed context packets.
   - [x] Add provider dispatch for the five named retrieval strategies from `SEMANTIC_RETRIEVAL.md`: `open_loops_by_context`, `goals_and_next_actions`, `commitments_approaching`, `re_entry_context`, and `cross_domain_entanglement`.
@@ -118,6 +123,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Define the Attention Steward SIL as reinforced, situation-aware stewardship instructions with evidence, exceptions, friction, and reinforcement counters.
 - [ ] Define the agentic growth loop for skills, tools, schema, and policy patches with risk-tiered confirmation gates and negative-drift checks.
   - [x] Add `data-memorygraphrag` growth-loop policy contracts for observed needs, drift findings, capability gaps, growth experiments, patch gates, and drift checks.
+  - [x] Wire retrieval feedback into the growth-loop policy so disconnected/missing/noisy/stale packets reinforce safe maintenance while overconfident packets require operator confirmation.
 - [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.
 - [ ] Let specialized roles such as Coach consume and contribute to Life Graph OS through governed tools without owning the canonical cross-domain graph posture.
 
