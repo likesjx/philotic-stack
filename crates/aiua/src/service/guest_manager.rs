@@ -358,12 +358,37 @@ impl GuestManager {
 
         info!("--- END UNIVERSAL MATERIALIZATION ---");
 
-        // Detach a task to wait for the universal shutdown signal broadcast
-        let _materializer_clone = self.materializer.clone();
+        // Detach a task to reap all active guests on shutdown
+        let materializer_clone = self.materializer.clone();
+        let graph_clone = self.graph.clone();
+        let hotel_clone = self.hotel_name.clone();
         tokio::spawn(async move {
             let _ = shutdown_rx.recv().await;
             info!("Universal Dematerialization Shutdown Triggered. Reaping active Guests...");
-            // In a real implementation we would iterate and call reclaim_guest() on all active IDs.
+            
+            if let Ok(all_guests) = graph_clone.list_guests(&hotel_clone, false) {
+                for rec in all_guests {
+                    if rec.is_active {
+                        info!("Shutdown: Reclaiming guest [{}]...", rec.guest_id);
+                        let mut mat = materializer_clone.lock().await;
+                        if let Err(e) = mat.reclaim_guest(&rec.guest_id).await {
+                            warn!("Shutdown: Failed to reclaim guest [{}]: {}", rec.guest_id, e);
+                        }
+                        drop(mat);
+                        
+                        // Belt-and-suspenders: kill directly if PID still exists
+                        if let Some(active_pid) = rec.active_pid.as_deref() {
+                            if let Ok(pid) = active_pid.parse::<u32>() {
+                                if LocalProcessMaterializer::pid_exists(pid) {
+                                    info!("Shutdown: Killing guest [{}] PID {} directly.", rec.guest_id, pid);
+                                    LocalProcessMaterializer::terminate_pid(pid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            info!("Universal Dematerialization complete.");
         });
 
         Ok(())
@@ -537,6 +562,16 @@ impl GuestManager {
                                 "Supervisor: reclaim during stale active guest cleanup failed for [{}]: {}",
                                 rec.guest_id, e
                             );
+                        }
+                        // Belt-and-suspenders: if PID still exists after reclaim_guest, kill directly.
+                        if let Ok(pid) = active_pid.parse::<u32>() {
+                            if LocalProcessMaterializer::pid_exists(pid) {
+                                warn!(
+                                    "Supervisor: Guest [{}] PID {} survived reclaim_guest; killing directly.",
+                                    rec.guest_id, pid
+                                );
+                                LocalProcessMaterializer::terminate_pid(pid);
+                            }
                         }
                         Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
                         should_spawn = true;

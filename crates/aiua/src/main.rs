@@ -2792,6 +2792,12 @@ fn hotel_shared_guests(
     if !should_materialize_graph_datasource(hotel_name) {
         guests.retain(|guest| guest.role != "graph-datasource");
     }
+    // Gate the default membrane-mcp: only auto-materialize if MCP_MEMBRANE_REQUIRED is set.
+    // Otherwise it's spawned on-demand by ProvisionMcpEndpoint. This prevents unnecessary
+    // process spawning and orphan accumulation when MCP endpoints are not in use.
+    if std::env::var("MCP_MEMBRANE_REQUIRED").is_err() {
+        guests.retain(|guest| !(guest.role == "mcp-membrane" && guest.guest_id.ends_with(":membrane-mcp")));
+    }
 
     // life-graph-runner: paracrine → Memgraph observation pipeline.
     // Only materialized when a Memgraph URI is available (same gate as graph-datasource).
