@@ -3961,6 +3961,52 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "life.recall.feedback".into(),
+            description: "Record retrieval reward or friction for a LifeGraph recall packet. \
+                          Ratings such as useful, stale, missing, noisy, overconfident, or \
+                          disconnected help the graph propose safe bridge/ranking/attention \
+                          improvements without confirming new life truth."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "feedback_id": { "type": "string", "description": "Unique feedback event ID." },
+                    "packet_id": { "type": "string", "description": "Retrieval packet ID being evaluated." },
+                    "query_summary": { "type": "string", "description": "Short summary of the original recall query." },
+                    "rating": {
+                        "type": "string",
+                        "enum": ["useful", "stale", "missing", "noisy", "overconfident", "disconnected"]
+                    },
+                    "note": { "type": "string", "description": "Brief reason for the rating." },
+                    "candidate_count": { "type": "integer", "minimum": 0 },
+                    "connected_candidate_count": { "type": "integer", "minimum": 0 },
+                    "missing_context_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": []
+                    },
+                    "noisy_node_refs": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "default": []
+                    },
+                    "stale_node_refs": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "default": []
+                    },
+                    "evidence_packets": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "default": []
+                    }
+                },
+                "required": ["feedback_id", "packet_id", "rating"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: vec!["feedback".into(), "self_improving".into()],
+        },
+        AbstractToolRecord {
             tool_name: "life.commit".into(),
             description: "Commit a proposed observation — advances its validation_state from \
                           'proposed' to 'accepted'. Use after confirming an observation is correct."
@@ -4417,6 +4463,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             implied_tools: vec![
                 "life.observe".into(),
                 "life.recall".into(),
+                "life.recall.feedback".into(),
                 "life.commit".into(),
                 "life.resolve".into(),
                 "life.conflict".into(),
@@ -4426,7 +4473,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             skill_markers: vec!["governed".into(), "life_graph".into()],
             field_sources: serde_json::json!({
                 "repo_skill_path": "skills/lifegraph-truth-summarizer/SKILL.md",
-                "workflow": "life.recall -> provenance audit -> life.observe/life.commit/life.resolve/life.patch.propose"
+                "workflow": "life.recall -> provenance audit -> life.recall.feedback/life.observe/life.commit/life.resolve/life.patch.propose"
             }),
             ..Default::default()
         },
@@ -4967,6 +5014,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "supported_tools": [
                     "life.observe",
                     "life.recall",
+                    "life.recall.feedback",
                     "life.commit",
                     "life.resolve",
                     "life.conflict",
@@ -8520,6 +8568,66 @@ mod tests {
                 .iter()
                 .any(|skill| skill == "lifegraph.truth_summarizer")
         );
+    }
+
+    #[test]
+    fn life_graph_profiles_seed_remote_runner_with_full_toolset() {
+        unsafe {
+            std::env::set_var("PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE", "vps-jane-aiua-01");
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        let profiles = graph
+            .list_toolset_profiles()
+            .expect("list toolset profiles");
+        let life_graph_profiles = profiles
+            .iter()
+            .filter(|profile| {
+                profile
+                    .allowed_classes
+                    .iter()
+                    .any(|class| class == "life_graph")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            !life_graph_profiles.is_empty(),
+            "seeded philote profiles should include LifeGraph-capable profiles"
+        );
+        for profile in life_graph_profiles {
+            let runner = profile
+                .remote_tool_runners
+                .iter()
+                .find(|runner| {
+                    runner
+                        .get("incarnation_id")
+                        .and_then(|value| value.as_str())
+                        == Some("vps-jane:life-graph-runner")
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "LifeGraph-capable profile {} should carry remote life-graph-runner",
+                        profile.profile_name
+                    )
+                });
+            let supported_tools = runner
+                .get("supported_tools")
+                .and_then(|value| value.as_array())
+                .expect("supported_tools array");
+            assert!(
+                supported_tools
+                    .iter()
+                    .any(|tool| tool.as_str() == Some("life.recall.feedback")),
+                "{} runner binding should include life.recall.feedback",
+                profile.profile_name
+            );
+        }
+        unsafe {
+            std::env::remove_var("PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE");
+        }
     }
 
     #[test]

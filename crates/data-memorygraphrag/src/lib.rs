@@ -553,6 +553,7 @@ impl RetrievalContextPacket {
 pub enum LifeGraphToolName {
     LifeObserve,
     LifeRecall,
+    LifeRecallFeedback,
     LifeCommit,
     LifeResolve,
     LifePatchPropose,
@@ -563,6 +564,7 @@ impl LifeGraphToolName {
         match self {
             Self::LifeObserve => "life.observe",
             Self::LifeRecall => "life.recall",
+            Self::LifeRecallFeedback => "life.recall.feedback",
             Self::LifeCommit => "life.commit",
             Self::LifeResolve => "life.resolve",
             Self::LifePatchPropose => "life.patch.propose",
@@ -572,7 +574,11 @@ impl LifeGraphToolName {
     pub fn mutates_graph(&self) -> bool {
         matches!(
             self,
-            Self::LifeObserve | Self::LifeCommit | Self::LifeResolve | Self::LifePatchPropose
+            Self::LifeObserve
+                | Self::LifeRecallFeedback
+                | Self::LifeCommit
+                | Self::LifeResolve
+                | Self::LifePatchPropose
         )
     }
 }
@@ -614,6 +620,11 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
         LifeGraphToolSpec::new(
             LifeGraphToolName::LifeRecall,
             "Build an evidence-backed Life Graph retrieval context packet.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeRecallFeedback,
+            "Record retrieval quality feedback and emit governed graph-improvement signals.",
             false,
         ),
         LifeGraphToolSpec::new(
@@ -730,6 +741,87 @@ pub enum GrowthLoopDisposition {
     StoreProposalOnly,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalFeedbackRating {
+    Useful,
+    Stale,
+    Missing,
+    Noisy,
+    Overconfident,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalFeedbackInput {
+    pub feedback_id: String,
+    pub packet_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_summary: Option<String>,
+    pub rating: RetrievalFeedbackRating,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub candidate_count: usize,
+    #[serde(default)]
+    pub connected_candidate_count: usize,
+    #[serde(default)]
+    pub missing_context_refs: Vec<String>,
+    #[serde(default)]
+    pub noisy_node_refs: Vec<GraphRecordRef>,
+    #[serde(default)]
+    pub stale_node_refs: Vec<GraphRecordRef>,
+    #[serde(default)]
+    pub evidence_packets: Vec<EvidencePacket>,
+}
+
+impl RetrievalFeedbackInput {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "feedback_id", &self.feedback_id);
+        require_non_empty(&mut violations, "packet_id", &self.packet_id);
+
+        if self.connected_candidate_count > self.candidate_count {
+            violations
+                .push("connected_candidate_count must not exceed candidate_count".to_string());
+        }
+
+        if matches!(self.rating, RetrievalFeedbackRating::Missing)
+            && self.missing_context_refs.is_empty()
+        {
+            violations.push("missing feedback requires at least one missing_context_ref".into());
+        }
+
+        if matches!(self.rating, RetrievalFeedbackRating::Noisy) && self.noisy_node_refs.is_empty()
+        {
+            violations.push("noisy feedback requires at least one noisy_node_ref".into());
+        }
+
+        if matches!(self.rating, RetrievalFeedbackRating::Stale) && self.stale_node_refs.is_empty()
+        {
+            violations.push("stale feedback requires at least one stale_node_ref".into());
+        }
+
+        for (idx, packet) in self.evidence_packets.iter().enumerate() {
+            if let Err(err) = packet.validate() {
+                for violation in err.violations {
+                    violations.push(format!("evidence_packets[{idx}].{violation}"));
+                }
+            }
+        }
+
+        finish_validation(violations)
+    }
+
+    pub fn connectivity_ratio(&self) -> Option<f32> {
+        if self.candidate_count == 0 {
+            None
+        } else {
+            Some(self.connected_candidate_count as f32 / self.candidate_count as f32)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GrowthLoopEvaluation {
     pub patch_id: String,
@@ -793,6 +885,81 @@ impl GrowthLoopPolicy {
             rationale,
         })
     }
+
+    pub fn evaluate_retrieval_feedback(
+        &self,
+        feedback: &RetrievalFeedbackInput,
+    ) -> Result<GrowthLoopEvaluation, ContractError> {
+        feedback.validate()?;
+
+        let mut rationale = vec![format!(
+            "{:?} retrieval feedback captured for {}",
+            feedback.rating, feedback.packet_id
+        )];
+        let mut drift_checks = self.always_check_drift.clone();
+        let mut requires_operator = false;
+        let mut disposition = GrowthLoopDisposition::ApplyWithAudit;
+
+        match feedback.rating {
+            RetrievalFeedbackRating::Useful => {
+                rationale
+                    .push("positive signal reinforces current retrieval and bridge policy".into());
+            }
+            RetrievalFeedbackRating::Disconnected => {
+                rationale.push(
+                    "disconnected candidates indicate bridge/ranking improvement pressure".into(),
+                );
+                drift_checks.push(DriftCategory::GraphClutter);
+            }
+            RetrievalFeedbackRating::Missing => {
+                rationale
+                    .push("missing context should propose bridge or capture improvements".into());
+            }
+            RetrievalFeedbackRating::Noisy => {
+                rationale.push(
+                    "noisy context should dampen low-value hubs or over-broad bridges".into(),
+                );
+                drift_checks.push(DriftCategory::GraphClutter);
+            }
+            RetrievalFeedbackRating::Stale => {
+                rationale.push("stale context should mark facts for review before reuse".into());
+                drift_checks.push(DriftCategory::StaleFact);
+            }
+            RetrievalFeedbackRating::Overconfident => {
+                rationale
+                    .push("overconfident context requires confirmation before promotion".into());
+                drift_checks.push(DriftCategory::InferredGoalAsCommitment);
+                requires_operator = true;
+                disposition = GrowthLoopDisposition::AwaitOperatorConfirmation;
+            }
+        }
+
+        if let Some(ratio) = feedback.connectivity_ratio() {
+            rationale.push(format!("connectivity_ratio={ratio:.2}"));
+            if ratio < 0.5 {
+                rationale.push(
+                    "low connected-candidate ratio should propose bridge-building work".into(),
+                );
+                drift_checks.push(DriftCategory::GraphClutter);
+            }
+        }
+
+        drift_checks.sort_by_key(|category| format!("{category:?}"));
+        drift_checks.dedup();
+
+        Ok(GrowthLoopEvaluation {
+            patch_id: format!("feedback:{}", feedback.feedback_id),
+            gate: if requires_operator {
+                PatchGate::ConfirmFirst
+            } else {
+                PatchGate::SafeAutoUpdate
+            },
+            disposition,
+            requires_operator,
+            drift_checks,
+            rationale,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -833,6 +1000,7 @@ pub struct LifePatchProposalInput {
 pub enum LifeGraphToolRequest {
     LifeObserve(LifeObserveInput),
     LifeRecall(RetrievalQuery),
+    LifeRecallFeedback(RetrievalFeedbackInput),
     LifeCommit(LifeCommitInput),
     LifeResolve(LifeResolveInput),
     LifePatchPropose(LifePatchProposalInput),
@@ -843,6 +1011,7 @@ impl LifeGraphToolRequest {
         match self {
             Self::LifeObserve(_) => LifeGraphToolName::LifeObserve,
             Self::LifeRecall(_) => LifeGraphToolName::LifeRecall,
+            Self::LifeRecallFeedback(_) => LifeGraphToolName::LifeRecallFeedback,
             Self::LifeCommit(_) => LifeGraphToolName::LifeCommit,
             Self::LifeResolve(_) => LifeGraphToolName::LifeResolve,
             Self::LifePatchPropose(_) => LifeGraphToolName::LifePatchPropose,
@@ -924,6 +1093,9 @@ impl MemoryGraphRagRunner {
         match request {
             LifeGraphToolRequest::LifeObserve(input) => self.plan_observe(input),
             LifeGraphToolRequest::LifeRecall(query) => self.plan_recall(query),
+            LifeGraphToolRequest::LifeRecallFeedback(feedback) => {
+                self.plan_recall_feedback(feedback)
+            }
             LifeGraphToolRequest::LifeCommit(input) => self.plan_commit(input),
             LifeGraphToolRequest::LifeResolve(input) => self.plan_resolve(input),
             LifeGraphToolRequest::LifePatchPropose(input) => self.plan_patch_propose(input),
@@ -1008,6 +1180,44 @@ impl MemoryGraphRagRunner {
             }],
             requires_operator: !input.operator_approved && !confirmed,
             blocked_reasons,
+        })
+    }
+
+    fn plan_recall_feedback(
+        &self,
+        feedback: RetrievalFeedbackInput,
+    ) -> Result<RunnerPlan, ContractError> {
+        let evaluation = GrowthLoopPolicy::default().evaluate_retrieval_feedback(&feedback)?;
+        let mut steps = vec![RunnerPlanStep {
+            target: RunnerPlanTarget::GraphDatasource,
+            action: "life.recall.feedback".into(),
+            payload: serde_json::json!({
+                "datasource_id": self.config.datasource_id,
+                "feedback": feedback,
+                "growth_evaluation": evaluation,
+            }),
+        }];
+
+        if matches!(
+            evaluation.disposition,
+            GrowthLoopDisposition::ApplyWithAudit
+                | GrowthLoopDisposition::AwaitOperatorConfirmation
+        ) {
+            steps.push(RunnerPlanStep {
+                target: RunnerPlanTarget::DataMemoryGraphRag,
+                action: "life.graph.improvement_candidates".into(),
+                payload: serde_json::json!({
+                    "feedback_id": steps[0].payload["feedback"]["feedback_id"].clone(),
+                    "growth_evaluation": evaluation,
+                }),
+            });
+        }
+
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeRecallFeedback,
+            steps,
+            requires_operator: evaluation.requires_operator,
+            blocked_reasons: Vec::new(),
         })
     }
 
@@ -1419,6 +1629,7 @@ mod tests {
             vec![
                 "life.observe",
                 "life.recall",
+                "life.recall.feedback",
                 "life.commit",
                 "life.resolve",
                 "life.patch.propose"
@@ -1429,6 +1640,13 @@ mod tests {
                 .iter()
                 .find(|tool| tool.tool_name == "life.recall")
                 .expect("recall spec")
+                .mutates_graph
+        );
+        assert!(
+            catalog
+                .iter()
+                .find(|tool| tool.tool_name == "life.recall.feedback")
+                .expect("recall feedback spec")
                 .mutates_graph
         );
     }
@@ -1447,6 +1665,80 @@ mod tests {
         assert_eq!(plan.steps[0].action, "life.retrieve.semantic_expand");
         assert_eq!(plan.steps[1].target, RunnerPlanTarget::DataMemoryGraphRag);
         assert_eq!(plan.steps[1].payload["max_context_packets"], 6);
+    }
+
+    #[test]
+    fn runner_recall_feedback_records_reward_signal_and_improvement_candidates() {
+        let runner = MemoryGraphRagRunner::default();
+        let feedback = RetrievalFeedbackInput {
+            feedback_id: "feedback:lifegraph:1".into(),
+            packet_id: "packet:lifegraph:1".into(),
+            query_summary: Some("LifeGraph self-improvement".into()),
+            rating: RetrievalFeedbackRating::Disconnected,
+            note: Some("Returned facts were relevant but not connected to current goals.".into()),
+            candidate_count: 6,
+            connected_candidate_count: 2,
+            missing_context_refs: vec![],
+            noisy_node_refs: vec![],
+            stale_node_refs: vec![],
+            evidence_packets: vec![evidence_packet()],
+        };
+
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeRecallFeedback(feedback))
+            .expect("feedback should plan");
+
+        assert_eq!(plan.tool_name, LifeGraphToolName::LifeRecallFeedback);
+        assert!(plan.allowed());
+        assert_eq!(plan.steps[0].action, "life.recall.feedback");
+        assert_eq!(
+            plan.steps[0].payload["growth_evaluation"]["disposition"],
+            "apply_with_audit"
+        );
+        assert_eq!(
+            plan.steps[0].payload["growth_evaluation"]["gate"],
+            "safe_auto_update"
+        );
+        assert_eq!(plan.steps[1].action, "life.graph.improvement_candidates");
+        assert!(
+            plan.steps[0].payload["growth_evaluation"]["rationale"]
+                .as_array()
+                .expect("rationale array")
+                .iter()
+                .any(|entry| entry
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("connectivity_ratio=0.33"))
+        );
+    }
+
+    #[test]
+    fn runner_recall_feedback_requires_confirmation_when_overconfident() {
+        let runner = MemoryGraphRagRunner::default();
+        let feedback = RetrievalFeedbackInput {
+            feedback_id: "feedback:lifegraph:overconfident".into(),
+            packet_id: "packet:lifegraph:2".into(),
+            query_summary: Some("Infer commitments".into()),
+            rating: RetrievalFeedbackRating::Overconfident,
+            note: Some("The packet presented an inferred goal as if it were confirmed.".into()),
+            candidate_count: 3,
+            connected_candidate_count: 3,
+            missing_context_refs: vec![],
+            noisy_node_refs: vec![],
+            stale_node_refs: vec![],
+            evidence_packets: vec![evidence_packet()],
+        };
+
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeRecallFeedback(feedback))
+            .expect("feedback should plan");
+
+        assert!(!plan.allowed());
+        assert!(plan.requires_operator);
+        assert_eq!(
+            plan.steps[0].payload["growth_evaluation"]["disposition"],
+            "await_operator_confirmation"
+        );
     }
 
     #[test]

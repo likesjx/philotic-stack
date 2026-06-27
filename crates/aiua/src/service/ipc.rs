@@ -16411,6 +16411,7 @@ fn tools_for_allowed_class(class: &str) -> &'static [&'static str] {
         "life_graph" => &[
             "life.observe",
             "life.recall",
+            "life.recall.feedback",
             "life.commit",
             "life.resolve",
             "life.conflict",
@@ -22557,6 +22558,7 @@ mod tests {
         assert!(toolset.iter().any(|tool| tool == "echo"));
         assert!(toolset.iter().any(|tool| tool == "life.observe"));
         assert!(toolset.iter().any(|tool| tool == "life.recall"));
+        assert!(toolset.iter().any(|tool| tool == "life.recall.feedback"));
     }
 
     #[test]

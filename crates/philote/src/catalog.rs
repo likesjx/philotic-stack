@@ -73,6 +73,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
         "life.steward" => &[
             "life.observe",
             "life.recall",
+            "life.recall.feedback",
             "life.commit",
             "life.resolve",
             "life.conflict",
@@ -95,6 +96,7 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
         "life.steward" => &[
             "life.observe",
             "life.recall",
+            "life.recall.feedback",
             "life.commit",
             "life.resolve",
             "life.conflict",
@@ -165,9 +167,19 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("life graph")
                 || t.contains("openloop")
                 || t.contains("open loop")
+                || t.contains("re-enter")
+                || t.contains("reenter")
+                || t.contains("re-entry")
+                || t.contains("follow-through")
+                || t.contains("follow through")
+                || t.contains("commitment")
+                || t.contains("commitments")
+                || t.contains("goals")
+                || t.contains("habits")
                 || t.contains("signal node")
                 || t.contains("life.observe")
                 || t.contains("life.recall")
+                || t.contains("life.recall.feedback")
                 || t.contains("life.commit")
                 || t.contains("record this")
                 || t.contains("observe this")
@@ -2763,6 +2775,76 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "life.recall.feedback".into(),
+        ToolDefinition {
+            tool_name: "life.recall.feedback".into(),
+            description: "Record whether a LifeGraph recall packet was useful, stale, missing \
+                          context, noisy, overconfident, or disconnected. Use this after a \
+                          LifeGraph recall result influences or fails to influence the turn so \
+                          the graph can improve bridge/ranking/attention behavior without \
+                          silently confirming new life truth."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["feedback_id", "packet_id", "rating"],
+                "properties": {
+                    "feedback_id": {
+                        "type": "string",
+                        "description": "Unique ID for this retrieval feedback event."
+                    },
+                    "packet_id": {
+                        "type": "string",
+                        "description": "The RetrievalContextPacket or recall packet ID being evaluated."
+                    },
+                    "query_summary": {
+                        "type": "string",
+                        "description": "Short summary of the original recall query."
+                    },
+                    "rating": {
+                        "type": "string",
+                        "enum": ["useful", "stale", "missing", "noisy", "overconfident", "disconnected"]
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Brief reason for the rating."
+                    },
+                    "candidate_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0
+                    },
+                    "connected_candidate_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0
+                    },
+                    "missing_context_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": []
+                    },
+                    "noisy_node_refs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "default": []
+                    },
+                    "stale_node_refs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "default": []
+                    },
+                    "evidence_packets": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "default": []
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
         "life.commit".into(),
         ToolDefinition {
             tool_name: "life.commit".into(),
@@ -2831,7 +2913,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_catalog;
+    use super::{skill_implied_tools, tool_catalog};
 
     #[test]
     fn role_list_has_specific_model_facing_description() {
@@ -2860,6 +2942,22 @@ mod tests {
             !life_recall
                 .description
                 .contains("Requires an embedding vector")
+        );
+    }
+
+    #[test]
+    fn life_graph_feedback_tool_is_model_visible_and_skill_granted() {
+        let catalog = tool_catalog();
+        let feedback = catalog
+            .get("life.recall.feedback")
+            .expect("life.recall.feedback catalog entry");
+
+        assert_eq!(feedback.class.as_deref(), Some("life_graph"));
+        assert!(feedback.description.contains("recall packet"));
+        assert!(
+            skill_implied_tools("life.steward")
+                .iter()
+                .any(|tool| *tool == "life.recall.feedback")
         );
     }
 

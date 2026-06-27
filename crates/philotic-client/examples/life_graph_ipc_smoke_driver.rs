@@ -72,7 +72,22 @@ async fn main() -> Result<()> {
         .as_array()
         .map(Vec::len)
         .unwrap_or_default();
+    let context_id = packet["context_id"]
+        .as_str()
+        .context("life.recall context packet missing context_id")?
+        .to_string();
     println!("life.recall IPC ok   result_count={result_count}");
+
+    let feedback_payload = execute_life_tool(
+        &mut client,
+        &target_node,
+        &reply_node,
+        "life.recall.feedback",
+        feedback_input(&context_id),
+    )
+    .await?;
+    assert_success_capability(&feedback_payload, "life.recall.feedback")?;
+    println!("life.recall.feedback IPC ok  context_id={context_id}");
     println!("life graph IPC smoke passed");
     Ok(())
 }
@@ -236,6 +251,20 @@ fn recall_input() -> Value {
         "operator_intent": "open_loops_by_context",
         "max_context_packets": 5,
         "embedding": embedding
+    })
+}
+
+fn feedback_input(context_id: &str) -> Value {
+    json!({
+        "feedback_id": format!("smoke-feedback-{}", Uuid::new_v4().simple()),
+        "packet_id": context_id,
+        "rating": "useful",
+        "candidate_count": 1,
+        "connected_candidate_count": 1,
+        "missing_context_refs": [],
+        "noisy_node_refs": [],
+        "stale_node_refs": [],
+        "evidence_packets": []
     })
 }
 
