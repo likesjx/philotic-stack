@@ -922,6 +922,7 @@ fn graph_storage_toolset_profile_round_trip() {
         allowed_skills: vec!["handoff.to_role".into()],
         on_demand_skills: vec![],
         description: Some("Core orchestrator profile.".into()),
+        remote_tool_runners: vec![],
     };
 
     store.upsert_toolset_profile(&profile).unwrap();
