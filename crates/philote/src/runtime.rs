@@ -546,6 +546,36 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+fn graph_datasource_node_id() -> String {
+    std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_NODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|hotel| format!("{hotel}-aiua-01"))
+        })
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+}
+
+fn life_graph_runner_node_id() -> String {
+    std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_HOME_HOTEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|hotel| format!("{hotel}-aiua-01"))
+        })
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+}
+
 fn debug_model_requests_enabled() -> bool {
     matches!(
         std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
@@ -553,6 +583,310 @@ fn debug_model_requests_enabled() -> bool {
             .as_deref(),
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
     )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DirectLifeObserveCommand {
+    label: String,
+    claim_summary: String,
+    source_id: String,
+    confidence: f64,
+}
+
+fn parse_direct_life_observe_command(content: &str) -> Option<DirectLifeObserveCommand> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let explicit_life_observe = lower.contains("life.observe");
+    let explicit_record_open_loop =
+        lower.contains("record this open loop") || lower.contains("record an open loop");
+    if !explicit_life_observe && !explicit_record_open_loop {
+        return None;
+    }
+
+    let label = extract_direct_life_observe_field(trimmed, "label")
+        .unwrap_or_else(|| {
+            if lower.contains("open loop") {
+                "OpenLoop".into()
+            } else {
+                "Signal".into()
+            }
+        })
+        .trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';' || ch == ':')
+        .to_string();
+
+    let source_id = extract_direct_life_observe_source(trimmed)
+        .unwrap_or_else(|| "membrane:telegram".into())
+        .trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';')
+        .to_string();
+
+    let confidence = extract_direct_life_observe_confidence(trimmed).unwrap_or(0.8);
+
+    let claim_summary = extract_direct_life_observe_claim(trimmed)
+        .unwrap_or_else(|| trimmed.to_string())
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_string();
+
+    if claim_summary.is_empty() {
+        return None;
+    }
+
+    Some(DirectLifeObserveCommand {
+        label,
+        claim_summary,
+        source_id,
+        confidence,
+    })
+}
+
+fn extract_direct_life_observe_claim(content: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let start = lower
+        .find("record this open loop:")
+        .map(|idx| idx + "record this open loop:".len())
+        .or_else(|| {
+            lower
+                .find("record an open loop:")
+                .map(|idx| idx + "record an open loop:".len())
+        })
+        .or_else(|| {
+            lower
+                .find("record this:")
+                .map(|idx| idx + "record this:".len())
+        });
+
+    let mut claim = start
+        .and_then(|idx| content.get(idx..))
+        .map(str::trim)
+        .unwrap_or(content);
+
+    for marker in [" Use label", " use label", " Label", " label "] {
+        if let Some(idx) = claim.find(marker) {
+            claim = claim[..idx].trim();
+            break;
+        }
+    }
+
+    Some(
+        claim
+            .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace())
+            .trim_end_matches('.')
+            .to_string(),
+    )
+}
+
+fn extract_direct_life_observe_field(content: &str, field: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let marker = format!("{field}");
+    let start = lower.find(&marker)?;
+    let after_marker = content.get(start + marker.len()..)?.trim_start();
+    let after_separator = after_marker
+        .strip_prefix(':')
+        .or_else(|| after_marker.strip_prefix('='))
+        .unwrap_or(after_marker)
+        .trim_start();
+    after_separator
+        .split_whitespace()
+        .next()
+        .map(|value| value.trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.'))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_direct_life_observe_source(content: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let marker = "source";
+    let start = lower.find(marker)?;
+    let after_marker = content.get(start + marker.len()..)?.trim_start();
+    let after_separator = after_marker
+        .strip_prefix(':')
+        .or_else(|| after_marker.strip_prefix('='))
+        .unwrap_or(after_marker)
+        .trim_start();
+    let value = after_separator
+        .split_whitespace()
+        .take_while(|word| {
+            let word_lower = word
+                .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
+                .to_lowercase();
+            !matches!(word_lower.as_str(), "confidence" | "label" | "use")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
+        .to_string();
+
+    (!value.is_empty()).then_some(value)
+}
+
+fn extract_direct_life_observe_confidence(content: &str) -> Option<f64> {
+    let lower = content.to_lowercase();
+    let marker = "confidence";
+    let start = lower.find(marker)?;
+    let after_marker = content.get(start + marker.len()..)?.trim_start();
+    let after_separator = after_marker
+        .strip_prefix(':')
+        .or_else(|| after_marker.strip_prefix('='))
+        .unwrap_or(after_marker)
+        .trim_start();
+    after_separator
+        .split_whitespace()
+        .next()
+        .and_then(|value| {
+            value
+                .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
+                .parse::<f64>()
+                .ok()
+        })
+        .map(|value| value.clamp(0.0, 1.0))
+}
+
+fn direct_life_observe_input(
+    command: &DirectLifeObserveCommand,
+    session_id: &str,
+    turn_id: &str,
+    chat_id: &str,
+    agent_id: &str,
+) -> Value {
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let label_id = command.label.to_lowercase();
+    let node_id = format!("life:{}:{suffix}", label_id.replace('_', "-"));
+    let packet_id = format!("evidence:{suffix}");
+    let observation_id = format!("obs:{suffix}");
+
+    serde_json::json!({
+        "observation_id": observation_id,
+        "evidence": {
+            "packet_id": packet_id,
+            "claim_ref": {
+                "id": node_id,
+                "label": command.label,
+                "datasource": "life-graph"
+            },
+            "claim_summary": command.claim_summary,
+                "source_refs": [{
+                    "source_id": command.source_id,
+                    "source_kind": "runtime_observation",
+                    "reliability": {
+                        "score": 0.95,
+                        "basis": "direct_observation"
+                    }
+                }],
+            "passage_refs": [],
+            "confidence": command.confidence,
+            "validation_state": "proposed",
+            "observed_at": now_iso,
+            "source_reliability": 0.95,
+            "conflict_ids": [],
+            "adjudication_status": "not_needed",
+            "metadata": {
+                "route": "philote_direct_life_observe",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "chat_id": chat_id,
+                "agent_id": agent_id
+            }
+        },
+        "proposed_graph_refs": []
+    })
+}
+
+fn direct_life_observe_success_reply(
+    command: &DirectLifeObserveCommand,
+    tool_content: &str,
+) -> String {
+    let content = tool_content.trim();
+    if content.is_empty() {
+        return format!(
+            "Recorded this {} in LifeGraph: {}",
+            command.label, command.claim_summary
+        );
+    }
+
+    match serde_json::from_str::<Value>(content) {
+        Ok(value) => {
+            let node_id = value
+                .pointer("/node_id")
+                .or_else(|| value.pointer("/data/node_id"))
+                .or_else(|| value.pointer("/result/node_id"))
+                .and_then(Value::as_str);
+            if let Some(node_id) = node_id {
+                format!(
+                    "Recorded this {} in LifeGraph: {} (`{}`)",
+                    command.label, command.claim_summary, node_id
+                )
+            } else {
+                format!(
+                    "Recorded this {} in LifeGraph: {}",
+                    command.label, command.claim_summary
+                )
+            }
+        }
+        Err(_) => format!(
+            "Recorded this {} in LifeGraph: {}",
+            command.label, command.claim_summary
+        ),
+    }
+}
+
+fn direct_life_observe_failure_reply(
+    command: &DirectLifeObserveCommand,
+    tool_content: &str,
+) -> String {
+    let detail = tool_content.trim();
+    if detail.is_empty() {
+        return format!(
+            "I tried to record this {} in LifeGraph, but the runner did not return a successful result.",
+            command.label
+        );
+    }
+    format!(
+        "I tried to record this {} in LifeGraph, but the runner failed: {}",
+        command.label, detail
+    )
+}
+
+fn direct_life_observe_command_from_arguments(
+    arguments: &Value,
+) -> Option<DirectLifeObserveCommand> {
+    let evidence = arguments.get("evidence")?;
+    let label = evidence
+        .pointer("/claim_ref/label")
+        .and_then(Value::as_str)
+        .unwrap_or("OpenLoop")
+        .to_string();
+    let claim_summary = evidence
+        .get("claim_summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?
+        .to_string();
+    let source_id = evidence
+        .get("source_refs")
+        .and_then(Value::as_array)
+        .and_then(|refs| refs.first())
+        .and_then(|source| source.get("source_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("membrane:telegram")
+        .to_string();
+    let confidence = evidence
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.8)
+        .clamp(0.0, 1.0);
+
+    Some(DirectLifeObserveCommand {
+        label,
+        claim_summary,
+        source_id,
+        confidence,
+    })
 }
 
 #[cfg(test)]
@@ -598,6 +932,7 @@ fn should_escalate_tier(error: &TaskErrorPayload) -> bool {
         Some("network_error")
             | Some("streaming_timeout")
             | Some("rate_limit")
+            | Some("provider_auth")
             | Some("provider_error")
     ) || (error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
@@ -634,6 +969,80 @@ fn provider_repair_note(error: &TaskErrorPayload) -> String {
         "The previous {provider} response attempted a tool call but returned an invalid tool payload. \
 If you call a tool, output a complete tool_call object with a non-empty arguments object containing every required field. \
 If no tool is needed, reply with structured JSON containing display_text, spoken_text, and memory_candidate"
+    )
+}
+
+fn low_progress_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "agent.graph.read"
+            | "hotel.logs"
+            | "hotel.status"
+            | "mcp.status"
+            | "memory.status"
+            | "role.list"
+            | "session.status"
+            | "skill.list"
+    )
+}
+
+fn duplicate_tool_skip(result: &ToolResult) -> bool {
+    result.content.starts_with("[Duplicate call skipped]")
+}
+
+fn recent_low_progress_tool_run(turn: &WorkingTurn) -> usize {
+    turn.working_tool_history
+        .iter()
+        .rev()
+        .take_while(|(call, result)| {
+            low_progress_tool_name(&call.tool_name) || duplicate_tool_skip(result)
+        })
+        .count()
+}
+
+fn loop_stop_reason(turn: &WorkingTurn, iteration_cap: u32) -> Option<&'static str> {
+    let recent_low_progress = recent_low_progress_tool_run(turn);
+    if turn.iteration >= 4 && recent_low_progress >= 4 {
+        return Some("the last several tool calls only inspected status or repeated previous work");
+    }
+
+    if iteration_cap.saturating_sub(turn.iteration) <= 1 && recent_low_progress >= 2 {
+        return Some("the turn is close to its iteration limit without new forward progress");
+    }
+
+    None
+}
+
+fn loop_stop_fallback_reply(
+    user_content: &str,
+    history: &[(ToolCall, ToolResult)],
+    reason: &str,
+) -> String {
+    let mut tools = Vec::new();
+    for (call, _) in history.iter().rev() {
+        if !tools.iter().any(|name: &String| name == &call.tool_name) {
+            tools.push(call.tool_name.clone());
+        }
+        if tools.len() >= 5 {
+            break;
+        }
+    }
+    tools.reverse();
+
+    let tool_text = if tools.is_empty() {
+        "no completed tool calls".to_string()
+    } else {
+        tools.join(", ")
+    };
+    let request = user_content.trim();
+    let request_text = if request.is_empty() {
+        "this turn".to_string()
+    } else {
+        format!("\"{}\"", request.chars().take(160).collect::<String>())
+    };
+
+    format!(
+        "I'm going to stop this turn instead of looping: {reason}. I had been working on {request_text} and the recent tool path was: {tool_text}.\n\nI can keep going from here, but the next step needs to be a more specific action rather than another status check."
     )
 }
 
@@ -1441,6 +1850,9 @@ pub struct AgentRuntime {
     sessions: HashMap<String, SessionState>,
     /// MuninnDB config fetched from hotel at startup. None = NullMemoryEngine.
     muninn_config: Option<MuninnConfig>,
+    /// Tracks hotel-broadcast MuninnDB reachability. False = hotel reported endpoint down.
+    /// When false, `memory_engine_for` returns None even if `muninn_config` is set.
+    muninn_available: bool,
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
@@ -1453,6 +1865,10 @@ pub struct AgentRuntime {
     /// Reconciled on every watchdog tick — entries are added on first observation
     /// and removed when the session is no longer in a waiting phase.
     stuck_turn_first_seen: HashMap<String, std::time::Instant>,
+    /// Signature of the exact wait state currently being timed per session.
+    /// Includes turn id, phase, iteration, and pending tool name so productive
+    /// model/tool progress resets the watchdog timer.
+    stuck_turn_signature: HashMap<String, String>,
     /// Tracks when any active turn started, regardless of phase. Used as a
     /// catch-all eviction budget — a turn that stays active for too long in any
     /// phase (including InProgress) will be forcibly evicted. Separate from
@@ -1462,6 +1878,11 @@ pub struct AgentRuntime {
     /// NetworkState { online: false }. When true, text.generate is routed directly
     /// to the local model tier without attempting cloud providers.
     network_offline: bool,
+    /// Role name when this runtime is a role-incarnation philote (e.g. "orchestrator",
+    /// "brain"). None for the default agent philote. Used to set reply_to_guest_id on
+    /// paracrine whispers so the specialist's response routes back to this role instance
+    /// rather than to the membrane seat that initiated the user turn.
+    role_name: Option<String>,
 }
 
 impl AgentRuntime {
@@ -1471,28 +1892,36 @@ impl AgentRuntime {
             agent_id: agent_id.into(),
             sessions: HashMap::new(),
             muninn_config: None,
+            muninn_available: true,
             configured_roles: HashMap::new(),
             default_agent_profile: AgentProfile::default(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
+            stuck_turn_signature: HashMap::new(),
             total_active_since: HashMap::new(),
             network_offline: false,
+            role_name: None,
         }
+    }
+
+    pub fn set_role_name(&mut self, rn: impl Into<String>) {
+        self.role_name = Some(rn.into());
     }
 
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
     /// Applied to every new session so the correct persona is used from the first message.
     async fn fetch_agent_profile(&mut self) {
         let key = format!("__agent_bundle__:{}", self.agent_id);
-        match self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig { key })
-            .await
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetConfig { key }),
+        )
+        .await
         {
-            Ok(IpcResponse::ConfigData {
+            Ok(Ok(IpcResponse::ConfigData {
                 value_json: Some(json),
                 ..
-            }) => match serde_json::from_str::<AgentProfile>(&json) {
+            })) => match serde_json::from_str::<AgentProfile>(&json) {
                 Ok(mut profile) => {
                     info!(agent_id = %self.agent_id, "Agent profile loaded from hotel.");
                     profile.voice_response_policy.seed_voice_ids();
@@ -1500,27 +1929,31 @@ impl AgentRuntime {
                 }
                 Err(e) => warn!("Failed to parse agent profile bundle: {}", e),
             },
-            Ok(IpcResponse::ConfigData {
+            Ok(Ok(IpcResponse::ConfigData {
                 value_json: None, ..
-            }) => {
+            })) => {
                 info!(agent_id = %self.agent_id, "No agent identity bundle found in hotel — using default profile.");
             }
-            Ok(_) | Err(_) => {
+            Ok(Ok(_)) | Ok(Err(_)) => {
                 warn!("Unexpected response to agent bundle fetch — using default profile.");
+            }
+            Err(_) => {
+                warn!(agent_id = %self.agent_id, "Agent bundle fetch timed out — using default profile.");
             }
         }
 
         // Fetch hotel-level user profile and inject into agent profile when the
         // agent-specific profile doesn't already override the field.
         if let Some(hotel_name) = local_hotel_name() {
-            match self
-                .ipc_client
-                .send_request(IpcRequest::GetUserProfile {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.ipc_client.send_request(IpcRequest::GetUserProfile {
                     hotel_name: hotel_name.clone(),
-                })
-                .await
+                }),
+            )
+            .await
             {
-                Ok(IpcResponse::UserProfileData(p)) => {
+                Ok(Ok(IpcResponse::UserProfileData(p))) => {
                     if self.default_agent_profile.user_timezone.is_none() {
                         if let Some(tz) = p.timezone.clone() {
                             info!(hotel = %hotel_name, tz = %tz, "Injecting user timezone from hotel user profile.");
@@ -1547,8 +1980,11 @@ impl AgentRuntime {
                         }
                     }
                 }
-                Ok(_) | Err(_) => {
+                Ok(Ok(_)) | Ok(Err(_)) => {
                     // Non-fatal — hotel may not have a user profile configured yet.
+                }
+                Err(_) => {
+                    warn!(agent_id = %self.agent_id, "GetUserProfile timed out at startup — continuing without user profile injection.");
                 }
             }
         }
@@ -1556,29 +1992,31 @@ impl AgentRuntime {
         // Apply operator-persisted policy overrides from hotel config keys.
         // These take precedence over the bundle so /voice and agent.configure persist
         // correctly across restarts without requiring a bundle rebuild.
-        if let Ok(IpcResponse::ConfigData {
+        if let Ok(Ok(IpcResponse::ConfigData {
             value_json: Some(ref json),
             ..
-        }) = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig {
+        })) = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetConfig {
                 key: "config:voice_response_policy".into(),
-            })
-            .await
+            }),
+        )
+        .await
         {
             if let Ok(policy) = serde_json::from_str::<VoiceResponsePolicy>(json) {
                 self.default_agent_profile.voice_response_policy = policy;
             }
         }
-        if let Ok(IpcResponse::ConfigData {
+        if let Ok(Ok(IpcResponse::ConfigData {
             value_json: Some(ref json),
             ..
-        }) = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig {
+        })) = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::GetConfig {
                 key: "config:media_routing_policy".into(),
-            })
-            .await
+            }),
+        )
+        .await
         {
             if let Ok(policy) = serde_json::from_str::<MediaRoutingPolicy>(json) {
                 self.default_agent_profile.media_routing_policy = policy;
@@ -1592,18 +2030,28 @@ impl AgentRuntime {
         &mut self,
         role_name: &str,
     ) -> Option<crate::session::RoleActivation> {
-        match self
-            .ipc_client
-            .send_request(IpcRequest::ListRoleIncarnations {
-                agent_id: self.agent_id.clone(),
-            })
-            .await
-        {
-            Ok(IpcResponse::Standard {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.ipc_client
+                .send_request(IpcRequest::ListRoleIncarnations {
+                    agent_id: self.agent_id.clone(),
+                }),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(IpcResponse::Standard {
+            ok: false,
+            code: String::new(),
+            message: String::new(),
+            corr_id: String::new(),
+            data: None,
+        }) {
+            IpcResponse::Standard {
                 ok: true,
                 data: Some(data),
                 ..
-            }) => {
+            } => {
                 let roles = data.get("roles").and_then(|v| v.as_array())?;
                 let rec = roles
                     .iter()
@@ -1662,18 +2110,20 @@ impl AgentRuntime {
     /// on the default agent profile. Called once at startup so every session gets
     /// the authoritative list injected into its system prompt.
     async fn fetch_role_names(&mut self) {
-        match self
-            .ipc_client
-            .send_request(IpcRequest::ListRoleIncarnations {
-                agent_id: self.agent_id.clone(),
-            })
-            .await
-        {
-            Ok(IpcResponse::Standard {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ipc_client
+                .send_request(IpcRequest::ListRoleIncarnations {
+                    agent_id: self.agent_id.clone(),
+                }),
+        )
+        .await;
+        match result {
+            Ok(Ok(IpcResponse::Standard {
                 ok: true,
                 data: Some(data),
                 ..
-            }) => {
+            })) => {
                 if let Some(roles) = data.get("roles").and_then(|v| v.as_array()) {
                     let names: Vec<String> = roles
                         .iter()
@@ -1692,6 +2142,9 @@ impl AgentRuntime {
                     self.default_agent_profile.agent_role_names = names;
                 }
             }
+            Err(_) => {
+                warn!(agent_id = %self.agent_id, "fetch_role_names timed out (startup race) — continuing with empty roster");
+            }
             _ => {
                 info!(agent_id = %self.agent_id, "No role incarnations found for delegation roster.");
             }
@@ -1700,32 +2153,55 @@ impl AgentRuntime {
 
     /// Fetch MuninnDB config from hotel IPC and store it for session use.
     async fn fetch_memory_config(&mut self) {
-        info!("Requesting MuninnDB config from hotel...");
-        match self
-            .ipc_client
-            .send_request(IpcRequest::FetchMemoryConfig)
-            .await
-        {
-            Ok(IpcResponse::MemoryConfig {
-                config_json: Some(json),
-            }) => match serde_json::from_str::<MuninnConfig>(&json) {
-                Ok(cfg) => {
-                    info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
-                    self.muninn_config = Some(cfg);
+        // Retry up to 3 times with a 3-second timeout each attempt.
+        // Background: during hotel startup several guests register concurrently. The IPC
+        // response for FetchMemoryConfig can be consumed by a racing guest's send_request
+        // loop before this philote reads it (no per-request correlation ID on this path).
+        // A short timeout + retry window clears that race without hanging indefinitely.
+        for attempt in 1u8..=3 {
+            info!("Requesting MuninnDB config from hotel (attempt {attempt})...");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                self.ipc_client.send_request(IpcRequest::FetchMemoryConfig),
+            )
+            .await;
+            match result {
+                Ok(Ok(IpcResponse::MemoryConfig(config))) if config.config_json.is_some() => {
+                    let json = config.config_json.expect("checked is_some");
+                    match serde_json::from_str::<MuninnConfig>(&json) {
+                        Ok(cfg) => {
+                            info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
+                            self.muninn_config = Some(cfg);
+                        }
+                        Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
+                    }
+                    return;
                 }
-                Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
-            },
-            Ok(IpcResponse::MemoryConfig { config_json: None }) => {
-                info!("Hotel has no MuninnDB config — running without memory");
-            }
-            Ok(_) | Err(_) => {
-                warn!("Unexpected response to FetchMemoryConfig — running without memory");
+                Ok(Ok(IpcResponse::MemoryConfig(config))) if config.config_json.is_none() => {
+                    info!("Hotel has no MuninnDB config — running without memory");
+                    return;
+                }
+                Ok(Ok(_)) | Ok(Err(_)) => {
+                    warn!(
+                        "Unexpected response to FetchMemoryConfig (attempt {attempt}) — retrying"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "FetchMemoryConfig timed out (attempt {attempt}) — response likely consumed by concurrent guest registration; retrying"
+                    );
+                }
             }
         }
+        warn!("FetchMemoryConfig failed after 3 attempts — running without memory");
     }
 
     /// Build a `MuninnRestEngine` scoped to the given agent and user.
+    /// Returns `None` if MuninnDB is not configured or the hotel has reported it unreachable.
     fn memory_engine_for(&self, agent_id: &str, user_id: &str) -> Option<MuninnRestEngine> {
+        if !self.muninn_available {
+            return None;
+        }
         self.muninn_config.clone().map(|cfg| {
             MuninnRestEngine::new(
                 cfg,
@@ -1752,13 +2228,18 @@ impl AgentRuntime {
 
         // Operator override takes precedence.
         let key = format!("__mcp_routes__:{}", self.agent_id);
-        if let Ok(IpcResponse::ConfigData {
+        let mcp_override = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ipc_client
+                .send_request(IpcRequest::GetConfig { key: key.clone() }),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+        if let Some(IpcResponse::ConfigData {
             value_json: Some(json),
             ..
-        }) = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig { key: key.clone() })
-            .await
+        }) = mcp_override
         {
             match serde_json::from_str::<Vec<McpRouteRecord>>(&json) {
                 Ok(r) if !r.is_empty() => {
@@ -1815,17 +2296,25 @@ impl AgentRuntime {
             return;
         }
         let count = routes.len();
-        match self
-            .ipc_client
-            .send_request(IpcRequest::UpdateMcpRoutes {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ipc_client.send_request(IpcRequest::UpdateMcpRoutes {
                 agent_id: self.agent_id.clone(),
                 routes,
                 vault_ref: None,
-            })
-            .await
-        {
-            Ok(_) => info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel."),
-            Err(e) => warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes"),
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => {
+                info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel.")
+            }
+            Ok(Err(e)) => {
+                warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes")
+            }
+            Err(_) => {
+                warn!(agent_id = %self.agent_id, "MCP route registration timed out (startup race) — continuing")
+            }
         }
     }
 
@@ -1834,15 +2323,21 @@ impl AgentRuntime {
     /// sessions are not blocked before the first inbound message arrives.
     async fn sweep_stale_session_turns(&mut self) {
         let list_key = format!("__session_apartments__:{}", self.agent_id);
-        let memory_types: Vec<String> = match self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig { key: list_key })
-            .await
+        let memory_types: Vec<String> = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.ipc_client
+                .send_request(IpcRequest::GetConfig { key: list_key }),
+        )
+        .await
         {
-            Ok(IpcResponse::ConfigData {
+            Ok(Ok(IpcResponse::ConfigData {
                 value_json: Some(json),
                 ..
-            }) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
+            })) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
+            Err(_) => {
+                warn!("sweep_stale_session_turns: apartment list fetch timed out — skipping sweep");
+                return;
+            }
             _ => {
                 return;
             }
@@ -1865,18 +2360,26 @@ impl AgentRuntime {
                 continue;
             };
             let snapshot_key = format!("__session_snapshot__:{session_id}");
-            let checkpoint = match self
-                .ipc_client
-                .send_request(IpcRequest::GetConfig { key: snapshot_key })
-                .await
+            let checkpoint = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.ipc_client
+                    .send_request(IpcRequest::GetConfig { key: snapshot_key }),
+            )
+            .await
             {
-                Ok(IpcResponse::ConfigData {
+                Ok(Ok(IpcResponse::ConfigData {
                     value_json: Some(json),
                     ..
-                }) => match serde_json::from_str::<serde_json::Value>(&json) {
+                })) => match serde_json::from_str::<serde_json::Value>(&json) {
                     Ok(v) => v,
                     Err(_) => continue,
                 },
+                Err(_) => {
+                    warn!(
+                        "sweep_stale_session_turns: snapshot fetch timed out for session {session_id} — skipping"
+                    );
+                    continue;
+                }
                 _ => continue,
             };
 
@@ -1935,7 +2438,7 @@ impl AgentRuntime {
     /// On eviction: clear the active turn, persist a clean checkpoint, and send the
     /// user a brief notice so they know the session is unblocked.
     async fn evict_timed_out_turns(&mut self) {
-        const WAITING_MODEL_SECS: u64 = 120;
+        const WAITING_MODEL_SECS: u64 = 300;
         const THINKING_SECS: u64 = 90; // post-model, dispatching actions or building reply
         const WAITING_TOOL_SECS: u64 = 90;
         const WAITING_VOICE_SECS: u64 = 60;
@@ -1965,46 +2468,78 @@ impl AgentRuntime {
             .retain(|id, _| self.sessions.contains_key(id));
 
         // Step 1: reconcile stuck_turn_first_seen against current session state.
-        // Add sessions newly in a waiting phase; remove those that are no longer waiting.
+        // Add sessions newly in a waiting phase; reset when the exact wait signature changes.
         // Parked approval turns count as waiting (they live in parked_approval_turn, not active_turn).
         let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
         for session_id in &session_ids {
-            let is_waiting = self
-                .sessions
-                .get(session_id)
-                .map(|s| {
-                    let active_waiting = s
-                        .active_turn
-                        .as_ref()
-                        .map(|t| {
-                            matches!(
-                                t.phase,
-                                TurnPhase::WaitingModel
-                                    | TurnPhase::Thinking
-                                    | TurnPhase::WaitingTool
-                                    | TurnPhase::WaitingVoice
-                            )
-                        })
-                        .unwrap_or(false);
-                    active_waiting || s.has_parked_approval_turn()
-                })
-                .unwrap_or(false);
+            let wait_signature = self.sessions.get(session_id).and_then(|s| {
+                if let Some(turn) = s.active_turn.as_ref() {
+                    if matches!(
+                        turn.phase,
+                        TurnPhase::WaitingModel
+                            | TurnPhase::Thinking
+                            | TurnPhase::WaitingTool
+                            | TurnPhase::WaitingVoice
+                    ) {
+                        let pending_tool = turn
+                            .pending_tool_call
+                            .as_ref()
+                            .map(|tool| tool.tool_name.as_str())
+                            .unwrap_or("-");
+                        return Some(format!(
+                            "active:{}:{:?}:{}:{}",
+                            turn.turn_id, turn.phase, turn.iteration, pending_tool
+                        ));
+                    }
+                }
+                if let Some(turn) = s.parked_approval_turn.as_ref() {
+                    return Some(format!("parked_approval:{}", turn.turn_id));
+                }
+                if let Some(turn) = s.parked_plan_turn.as_ref() {
+                    return Some(format!("parked_plan:{}", turn.turn_id));
+                }
+                None
+            });
 
-            if is_waiting {
-                self.stuck_turn_first_seen
-                    .entry(session_id.clone())
-                    .or_insert(now);
+            if let Some(signature) = wait_signature {
+                let signature_changed = self
+                    .stuck_turn_signature
+                    .get(session_id)
+                    .map(|current| current != &signature)
+                    .unwrap_or(true);
+                if signature_changed {
+                    self.stuck_turn_first_seen.insert(session_id.clone(), now);
+                    self.stuck_turn_signature
+                        .insert(session_id.clone(), signature);
+                } else {
+                    self.stuck_turn_first_seen
+                        .entry(session_id.clone())
+                        .or_insert(now);
+                }
             } else {
                 self.stuck_turn_first_seen.remove(session_id);
+                self.stuck_turn_signature.remove(session_id);
             }
         }
         // Also remove entries for sessions that no longer exist.
         self.stuck_turn_first_seen
             .retain(|id, _| self.sessions.contains_key(id));
+        self.stuck_turn_signature
+            .retain(|id, _| self.sessions.contains_key(id));
 
         // Step 2: collect sessions whose waiting turn has exceeded the deadline.
         // Parked approval turns (in parked_approval_turn) use WAITING_APPROVAL_SECS.
-        let timed_out: Vec<(String, String, String, Option<String>, String, String, u64)> = self
+        let timed_out: Vec<(
+            String,
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            u64,
+        )> = self
             .sessions
             .iter()
             .filter_map(|(session_id, state)| {
@@ -2015,6 +2550,8 @@ impl AgentRuntime {
                     if elapsed >= WAITING_APPROVAL_SECS {
                         return Some((
                             session_id.clone(),
+                            turn.task_id,
+                            turn.turn_id.clone(),
                             turn.final_reply_to.clone(),
                             turn.final_reply_role.clone(),
                             turn.final_reply_guest_id.clone(),
@@ -2030,6 +2567,8 @@ impl AgentRuntime {
                     if elapsed >= WAITING_APPROVAL_SECS {
                         return Some((
                             session_id.clone(),
+                            turn.task_id,
+                            turn.turn_id.clone(),
                             turn.final_reply_to.clone(),
                             turn.final_reply_role.clone(),
                             turn.final_reply_guest_id.clone(),
@@ -2062,6 +2601,8 @@ impl AgentRuntime {
                 }
                 Some((
                     session_id.clone(),
+                    turn.task_id,
+                    turn.turn_id.clone(),
                     turn.final_reply_to.clone(),
                     turn.final_reply_role.clone(),
                     turn.final_reply_guest_id.clone(),
@@ -2076,7 +2617,17 @@ impl AgentRuntime {
         // in any phase (including InProgress) that wasn't already caught above.
         let already_caught: std::collections::HashSet<String> =
             timed_out.iter().map(|(id, ..)| id.clone()).collect();
-        let catch_all: Vec<(String, String, String, Option<String>, String, String, u64)> = self
+        let catch_all: Vec<(
+            String,
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            u64,
+        )> = self
             .total_active_since
             .iter()
             .filter_map(|(session_id, &started)| {
@@ -2091,6 +2642,8 @@ impl AgentRuntime {
                 let turn = state.active_turn.as_ref()?;
                 Some((
                     session_id.clone(),
+                    turn.task_id,
+                    turn.turn_id.clone(),
                     turn.final_reply_to.clone(),
                     turn.final_reply_role.clone(),
                     turn.final_reply_guest_id.clone(),
@@ -2103,8 +2656,17 @@ impl AgentRuntime {
         let timed_out: Vec<_> = timed_out.into_iter().chain(catch_all).collect();
 
         // Step 3: evict.
-        for (session_id, reply_to, reply_role, reply_guest_id, chat_id, phase, elapsed_secs) in
-            timed_out
+        for (
+            session_id,
+            task_id,
+            turn_id,
+            reply_to,
+            reply_role,
+            reply_guest_id,
+            chat_id,
+            phase,
+            elapsed_secs,
+        ) in timed_out
         {
             let has_pending_tool = self
                 .sessions
@@ -2121,6 +2683,7 @@ impl AgentRuntime {
             );
 
             self.stuck_turn_first_seen.remove(&session_id);
+            self.stuck_turn_signature.remove(&session_id);
             self.total_active_since.remove(&session_id);
 
             if let Some(state) = self.sessions.get_mut(&session_id) {
@@ -2141,6 +2704,20 @@ impl AgentRuntime {
                 }
             }
 
+            let reason =
+                format!("Turn watchdog evicted stuck turn after {elapsed_secs}s in {phase}.");
+            if let Err(e) = self
+                .ipc_client
+                .send_request(IpcRequest::FailTask {
+                    task_id,
+                    error_code: "TURN_WATCHDOG_TIMEOUT".into(),
+                    reason: reason.clone(),
+                })
+                .await
+            {
+                warn!("Turn watchdog: failed to mark task failed: {}", e);
+            }
+
             // Notify the user that the session is unblocked.
             let notify_req = IpcRequest::EmitTask {
                 target_node: reply_to,
@@ -2149,6 +2726,7 @@ impl AgentRuntime {
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,
+                    "turn_id": turn_id,
                     "chat_id": chat_id,
                     "content": "*(I seem to have gotten stuck waiting for a response. The session is unblocked — please try again.)*",
                     "final": true,
@@ -2202,17 +2780,19 @@ impl AgentRuntime {
         // Publish command manifest to the hotel so membrane can discover it.
         let manifest = command_manifest(&[]);
         if let Ok(content_json) = serde_json::to_value(&manifest) {
-            match self
-                .ipc_client
-                .send_request(IpcRequest::SyncApartment {
+            let sync_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.ipc_client.send_request(IpcRequest::SyncApartment {
                     agent_id: self.agent_id.clone(),
                     memory_type: "command_manifest".into(),
                     content_json,
-                })
-                .await
-            {
-                Ok(_) => info!("Command manifest published ({} entries).", manifest.len()),
-                Err(e) => warn!("Failed to publish command manifest: {}", e),
+                }),
+            )
+            .await;
+            match sync_result {
+                Ok(Ok(_)) => info!("Command manifest published ({} entries).", manifest.len()),
+                Ok(Err(e)) => warn!("Failed to publish command manifest: {}", e),
+                Err(_) => warn!("Command manifest sync timed out (startup race) — continuing"),
             }
         }
 
@@ -2327,6 +2907,13 @@ impl AgentRuntime {
                                 let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
+                        Ok(task) if task.action.as_deref() == Some("paracrine_signal") => {
+                            // Low-agency heartbeat/background signal. Observe it, but do
+                            // not enter the conversational model path.
+                            if let Err(err) = self.handle_paracrine_signal(task, task_id).await {
+                                warn!("Failed to handle paracrine_signal: {}", err);
+                            }
+                        }
                         Ok(task) if task.action.as_deref() == Some("streaming_token") => {
                             // LLM token fragment emitted by model-router during a streaming
                             // response. Forward immediately to membrane for progressive display.
@@ -2371,6 +2958,20 @@ impl AgentRuntime {
                         warn!("Network offline — routing text.generate to local fallback tier");
                     } else {
                         info!("Network restored — cloud model tiers re-enabled");
+                    }
+                }
+                Ok(Ok(IpcResponse::MuninnStatus {
+                    available,
+                    endpoint,
+                })) => {
+                    self.muninn_available = available;
+                    if !available {
+                        warn!(
+                            endpoint = %endpoint,
+                            "MuninnDB unreachable — memory tools will return empty until restored"
+                        );
+                    } else {
+                        info!(endpoint = %endpoint, "MuninnDB restored — memory tools re-enabled");
                     }
                 }
                 Ok(Ok(IpcResponse::PerimeterShift { previous, current })) => {
@@ -2454,6 +3055,80 @@ impl AgentRuntime {
         self.sync_session_index(&index_state).await
     }
 
+    async fn handle_paracrine_signal(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        use ansible_mesh_core::attention_steward::{
+            AttentionStewardPolicy, AttentionStewardResponse, AttentionStewardSignal,
+        };
+        use data_memorygraphrag::attention_observer;
+
+        let signal = task
+            .paracrine_signal
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let attention_signal = match AttentionStewardSignal::from_value(signal) {
+            Ok(signal) => signal,
+            Err(err) => {
+                warn!(
+                    task_id = %task_id,
+                    error = %err,
+                    "paracrine signal deferred: invalid attention steward envelope"
+                );
+                return Ok(());
+            }
+        };
+        let decision = AttentionStewardPolicy::default().evaluate_now(&attention_signal);
+        let response = match decision.response {
+            AttentionStewardResponse::RecordObservation => "record_observation",
+            AttentionStewardResponse::ProposeSilEntry => "propose_sil_entry",
+            AttentionStewardResponse::UpdateSilMetadata => "update_sil_metadata",
+            AttentionStewardResponse::DeferSignal => "defer_signal",
+        };
+
+        info!(
+            task_id = %task_id,
+            signal_id = %attention_signal.signal_id,
+            signal_type = %attention_signal.signal_type,
+            scope = %attention_signal.scope,
+            response = %response,
+            reason = %decision.reason,
+            "attention steward observed paracrine signal"
+        );
+
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        if let Some(observe_input) =
+            attention_observer::decision_to_observe_input(&decision, &attention_signal, &now_iso)
+        {
+            let node_id = local_node_id();
+            let target_node = life_graph_runner_node_id();
+            let task_json = serde_json::json!({
+                "action": "execute_tool",
+                "tool_name": "life.observe",
+                "arguments": serde_json::to_value(&observe_input)?,
+                "reply_to": node_id,
+                "reply_role": "agent",
+                "session_id": "",
+                "turn_id": "",
+                "chat_id": "",
+            });
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node,
+                    target_role: "life-graph-runner".into(),
+                    target_guest_id: None,
+                    task_json: task_json.to_string(),
+                })
+                .await;
+        }
+
+        Ok(())
+    }
+
     async fn handle_paracrine_response(
         &mut self,
         task: InboundTaskPayload,
@@ -2471,7 +3146,7 @@ impl AgentRuntime {
         let routing = exosome
             .as_ref()
             .and_then(|e| e.response_routing.clone())
-            .unwrap_or(ParacrineRouting::CognitiveReEntry);
+            .unwrap_or(ParacrineRouting::ReflectiveReEntry);
 
         // Locate the owning turn by matching paracrine_id against active turns,
         // falling back to the task's session_id field.
@@ -2623,6 +3298,11 @@ impl AgentRuntime {
                             task.content.clone(),
                             Some("enriched_tool_result".into()),
                         );
+                        // Reset the iteration counter: the turn was waiting for an external
+                        // response, not thinking. Give it a fresh budget to process the reply.
+                        if let Some(turn) = state.active_turn.as_mut() {
+                            turn.iteration = 0;
+                        }
                     }
                 }
                 self.handle_tool_result(InboundTaskPayload {
@@ -2638,6 +3318,25 @@ impl AgentRuntime {
                     ..task
                 })
                 .await?;
+            }
+
+            ParacrineRouting::ReflectiveReEntry => {
+                // Reflective path: feed brain's reply back into the orchestrator's
+                // own paracrine layer. The exosome's paracrine_id is preserved so
+                // the resulting turn gets paracrine_origin set, which auto-injects
+                // delegate.merge. The orchestrator reasons about the reply and either
+                // calls delegate.merge to surface it or completes silently to absorb.
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("reflective_re_entry".into()),
+                        );
+                    }
+                }
+                self.handle_user_message(task, task_id).await?;
             }
 
             ParacrineRouting::CognitiveReEntry => {
@@ -2797,19 +3496,20 @@ impl AgentRuntime {
             .unwrap_or(false);
 
         if should_preload {
-            let node_id = local_node_id();
+            let local_node_id = local_node_id();
+            let graph_datasource_node_id = graph_datasource_node_id();
             let agent_id = self.agent_id.clone();
             let _ = self
                 .ipc_client
                 .send_request(IpcRequest::EmitTask {
-                    target_node: node_id.clone(),
+                    target_node: graph_datasource_node_id,
                     target_role: "graph-datasource".into(),
                     target_guest_id: None,
                     task_json: serde_json::json!({
                         "action": "graph.query",
                         "graph_id": agent_id,
                         "query": "MATCH (n) RETURN n",
-                        "reply_to": node_id,
+                        "reply_to": local_node_id,
                         "reply_role": "agent",
                         "session_id": session_id,
                         "turn_id": "",
@@ -2974,6 +3674,22 @@ impl AgentRuntime {
                         .await;
                 }
             }
+        }
+
+        if let Some(life_observe) = parse_direct_life_observe_command(&content) {
+            return self
+                .handle_direct_life_observe_command(
+                    task_id,
+                    session_id,
+                    turn_id,
+                    chat_id,
+                    final_reply_to,
+                    final_reply_role,
+                    final_reply_guest_id,
+                    life_observe,
+                    inbound_primary_user_id(&task),
+                )
+                .await;
         }
 
         let had_voice_input = task
@@ -3300,7 +4016,7 @@ impl AgentRuntime {
                 awaiting_transcription_reentry: false,
                 scripted_loop_context: None,
                 associated_paracrine_ids: Vec::new(),
-                paracrine_origin,
+                paracrine_origin: paracrine_origin.clone(),
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
@@ -3311,6 +4027,34 @@ impl AgentRuntime {
                 streaming_retry_attempts: 0,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
+
+            // Paracrine context: inject delegate.merge into execution_routes so the specialist
+            // can call it without needing it in her toolset profile. The tool is already injected
+            // into tools_for_model by project_tools_for_turn; this adds the matching route so
+            // execute_bound_tool can resolve it.
+            if paracrine_origin.is_some()
+                && !state
+                    .tool_assembly
+                    .execution_routes
+                    .contains_key("delegate.merge")
+            {
+                state.tool_assembly.execution_routes.insert(
+                    "delegate.merge".into(),
+                    ToolExecutionRoute {
+                        target_node: local_node_id(),
+                        target_role: "agent".into(),
+                        runner_id: None,
+                        incarnation_id: None,
+                        hotel_id: None,
+                        environment_id: None,
+                        task_runner_kind: None,
+                        task_runner_config: None,
+                        execution_mode: "local_agent".into(),
+                        availability_state: "live".into(),
+                        selection_reason: Some("paracrine_auto_inject".into()),
+                    },
+                );
+            }
 
             // Activate scripted loop if the current role has a loop_script configured.
             if let Some(loop_script) = state
@@ -3922,6 +4666,31 @@ impl AgentRuntime {
                         .map(|t| t.active_plan.is_none())
                         .unwrap_or(false);
                     state.set_active_plan(plan);
+                    // Expand the iteration cap based on declared step count so complex
+                    // plans don't hit the cap mid-execution. 4 iterations per step gives
+                    // headroom for retries/recalls; hard ceiling 50, never shrinks.
+                    let n_steps = state
+                        .active_turn
+                        .as_ref()
+                        .and_then(|t| t.active_plan.as_ref())
+                        .map(|p| p.steps.len() as u32)
+                        .unwrap_or(0);
+                    if n_steps > 0 {
+                        let plan_cap = (n_steps * 4)
+                            .max(state.settings.execution.iteration_cap)
+                            .min(50);
+                        if plan_cap > state.settings.execution.iteration_cap {
+                            info!(
+                                session_id = %session_id,
+                                n_steps,
+                                old_cap = state.settings.execution.iteration_cap,
+                                new_cap = plan_cap,
+                                "Plan-scaled iteration cap"
+                            );
+                            state.settings.execution.iteration_cap = plan_cap;
+                        }
+                    }
+                    // state last used above; NLL ends the borrow before emit_turn_event.
                     if is_first {
                         let _ = self.emit_turn_event(&session_id, "plan_ready", None).await;
                     }
@@ -4002,6 +4771,31 @@ impl AgentRuntime {
                 .await
             }
             AgentAction::ToolCall(tool_call) => {
+                let forced_stop_reply = self.sessions.get(&session_id).and_then(|state| {
+                    let turn = state.active_turn.as_ref()?;
+                    let iteration_cap = state.settings.execution.iteration_cap;
+                    let reason = if turn.iteration >= iteration_cap {
+                        Some("the turn reached its maximum tool-iteration limit")
+                    } else {
+                        loop_stop_reason(turn, iteration_cap)
+                    }?;
+                    Some(loop_stop_fallback_reply(
+                        &turn.user_content,
+                        &turn.working_tool_history,
+                        reason,
+                    ))
+                });
+
+                if let Some(reply) = forced_stop_reply {
+                    warn!(
+                        session_id = %session_id,
+                        tool_name = %tool_call.tool_name,
+                        "Suppressing tool call after loop stop condition; delivering fallback reply."
+                    );
+                    return self
+                        .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
+                        .await;
+                }
                 self.handle_tool_call(session_id, turn_id, tool_call).await
             }
             AgentAction::RequestApproval(approval) => {
@@ -4511,14 +5305,17 @@ impl AgentRuntime {
             status,
         };
 
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.ipc_client.send_request(IpcRequest::EmitTask {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
                 target_guest_id: final_reply_guest_id,
                 task_json: serde_json::to_string(&payload)?,
-            })
-            .await?;
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("emit_turn_status: ipc ack timeout after 10s"))??;
 
         Ok(())
     }
@@ -4797,23 +5594,46 @@ impl AgentRuntime {
             } else {
                 None
             };
-            if let Some((checkpoint_memory_type, checkpoint_json, index_state)) =
-                pending_checkpoint
+            if let Some((checkpoint_memory_type, checkpoint_json, index_state)) = pending_checkpoint
             {
-                self.ipc_client
-                    .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-                    .await?;
-                self.sync_session_index(&index_state).await?;
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.ipc_client.sync_apartment(
+                        &self.agent_id,
+                        &checkpoint_memory_type,
+                        checkpoint_json,
+                    ),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("sync_apartment: ipc ack timeout after 15s"))
+                .and_then(|r| r)
+                {
+                    warn!("route_tool_call_execution: sync_apartment failed: {e}; continuing");
+                }
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    self.sync_session_index(&index_state),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("sync_session_index: ipc ack timeout after 15s"))
+                .and_then(|r| r)
+                {
+                    warn!("route_tool_call_execution: sync_session_index failed: {e}; continuing");
+                }
             }
 
             // Emit a status message to membrane so the user sees what's happening.
             let status_label = tool_status_label(&tool_call.tool_name);
-            let _ = self.emit_turn_status(&session_id, status_label).await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.emit_turn_status(&session_id, status_label),
+            )
+            .await;
 
             let tool_req = ToolExecutionPayload {
                 action: "execute_tool",
-                session_id,
-                turn_id,
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
                 chat_id,
                 tool_name: tool_call.tool_name,
                 arguments: tool_call.arguments,
@@ -4840,8 +5660,17 @@ impl AgentRuntime {
                         max_search_results: None,
                     }
                 }),
+                return_route: Some(philotic_client::ReturnRoute {
+                    node: local_node_id(),
+                    role: "agent".into(),
+                    guest_id: Some(self.agent_id.clone()),
+                    session_id: Some(session_id.clone()),
+                    turn_id: Some(turn_id.clone()),
+                    correlation_id: None,
+                }),
                 reply_to: local_node_id(),
                 reply_role: "agent".into(),
+                reply_guest_id: Some(self.agent_id.clone()),
                 final_reply_to,
                 final_reply_role,
                 final_reply_guest_id,
@@ -4894,14 +5723,17 @@ impl AgentRuntime {
                     .await;
             }
 
-            self.ipc_client
-                .send_request(IpcRequest::EmitTask {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                self.ipc_client.send_request(IpcRequest::EmitTask {
                     target_node: route.target_node,
                     target_role: route.target_role,
                     target_guest_id: route.incarnation_id.clone(),
                     task_json: serde_json::to_string(&tool_req)?,
-                })
-                .await?;
+                }),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("tool dispatch: ipc ack timeout after 30s"))??;
 
             Ok(())
         })
@@ -4975,6 +5807,56 @@ impl AgentRuntime {
             .and_then(|s| s.active_turn.as_ref())
             .map(|t| t.scripted_loop_context.is_some())
             .unwrap_or(false);
+
+        // Only treat an incoming datasource response as the life.observe result when
+        // the response's own tool_name confirms it — prevents a co-occurring
+        // graph-datasource failure (tool_name="unknown") from completing a WaitingTool
+        // turn that is legitimately waiting for the life-graph-runner response.
+        let response_is_life_observe =
+            matches!(tool_result.tool_name.as_str(), "life.observe" | "");
+        let direct_life_observe_command = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .and_then(|turn| {
+                turn.pending_tool_call.as_ref().and_then(|call| {
+                    (call.tool_name == "life.observe" && response_is_life_observe)
+                        .then(|| direct_life_observe_command_from_arguments(&call.arguments))
+                        .flatten()
+                })
+            })
+            .filter(|command| !command.claim_summary.trim().is_empty());
+
+        if let Some(command) = direct_life_observe_command {
+            {
+                let Some(state) = self.sessions.get_mut(&session_id) else {
+                    warn!("Tool result returned for unknown session {}", session_id);
+                    return Ok(());
+                };
+                let tool_call = state
+                    .active_turn
+                    .as_ref()
+                    .and_then(|t| t.pending_tool_call.clone())
+                    .unwrap_or_else(|| ToolCall {
+                        tool_name: tool_result.tool_name.clone(),
+                        arguments: serde_json::json!({}),
+                    });
+                state.push_tool_history(tool_call, tool_result.clone());
+                state.clear_pending_tool_call();
+                if let Some(turn) = state.active_turn.as_mut() {
+                    turn.iteration += 1;
+                }
+            }
+
+            let reply = if step_failed {
+                direct_life_observe_failure_reply(&command, &tool_result.content)
+            } else {
+                direct_life_observe_success_reply(&command, &tool_result.content)
+            };
+            return self
+                .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
+                .await;
+        }
 
         if is_scripted_turn {
             let (checkpoint_memory_type, checkpoint_json, index_state) = {
@@ -5065,12 +5947,53 @@ impl AgentRuntime {
 
             let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
             let iteration_cap = state.settings.execution.iteration_cap;
+            let stop_reason = state
+                .active_turn
+                .as_ref()
+                .and_then(|turn| loop_stop_reason(turn, iteration_cap));
 
             if consecutive_failures >= stall_threshold {
                 Err(format!(
                     "Stall detected: {consecutive_failures} consecutive step failures \
                      (threshold: {stall_threshold}). Surfacing to user."
                 ))
+            } else if let Some(stop_reason) = stop_reason {
+                // No-progress stop: give the model one stripped-tool chance to answer
+                // before the hard cap. This catches diagnostic/status spirals while
+                // preserving the useful evidence already collected.
+                warn!(
+                    session_id = %session_id,
+                    iteration,
+                    iteration_cap,
+                    stop_reason,
+                    "Session reached loop stop condition; doing final no-tool wrap-up."
+                );
+                is_finalizing = true;
+                match state.build_reentry_context_envelope() {
+                    Some((mut prompt, context, context_projection, _tools)) => {
+                        prompt.push_str(&format!(
+                            "\n\n[Loop control: {stop_reason}. Do not call any more tools. \
+                             Review the tool history and provide your final response to the user now.]"
+                        ));
+                        let active_turn = state.active_turn.as_ref().expect("turn exists");
+                        Ok((
+                            prompt,
+                            context,
+                            context_projection,
+                            active_turn.task_id,
+                            active_turn.user_content.clone(),
+                            active_turn.chat_id.clone(),
+                            active_turn.final_reply_to.clone(),
+                            active_turn.final_reply_role.clone(),
+                            active_turn.final_reply_guest_id.clone(),
+                            vec![], // strip tools — forces text-only reply
+                            state.checkpoint_memory_type(),
+                            state.checkpoint_json(),
+                            state.clone(),
+                        ))
+                    }
+                    None => Err("Active turn vanished at loop stop wrap-up".into()),
+                }
             } else if iteration == iteration_cap {
                 // Soft cap: one final no-tool call so the model can wrap up gracefully.
                 warn!(
@@ -5208,6 +6131,27 @@ impl AgentRuntime {
                     // stall/hard-cap hit — emit loop_recovering so observers know we stopped
                     let _ = self
                         .emit_turn_event(&session_id, "loop_recovering", None)
+                        .await;
+                }
+                let fallback_reply = if msg.contains("maximum tool iterations") {
+                    self.sessions.get(&session_id).and_then(|state| {
+                        let turn = state.active_turn.as_ref()?;
+                        Some(loop_stop_fallback_reply(
+                            &turn.user_content,
+                            &turn.working_tool_history,
+                            "the turn reached its maximum tool-iteration limit",
+                        ))
+                    })
+                } else {
+                    None
+                };
+                if let Some(reply) = fallback_reply {
+                    warn!(
+                        session_id = %session_id,
+                        "Delivering loop-stop fallback instead of failing active turn."
+                    );
+                    return self
+                        .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
                         .await;
                 }
                 self.fail_active_turn(session_id, turn_id, msg).await
@@ -6529,6 +7473,17 @@ impl AgentRuntime {
                 .paracrine_reply_chat_id
                 .as_deref()
                 .unwrap_or(&completed_turn.chat_id);
+            // Reflective re-entry, top-of-chain: reply_session_id loops back to our
+            // own session, meaning this was Astrid's reflection turn after receiving
+            // brain's response. She chose not to call delegate.merge → absorb silently.
+            if reply_session_id == session_id {
+                info!(
+                    "deliver_text_reply: reflective re-entry turn {} completed without delegate.merge — absorbing silently",
+                    turn_id
+                );
+                self.drain_next_user_task(&attend_session_id);
+                return Ok(());
+            }
             serde_json::json!({
                 "action": "paracrine_response",
                 "session_id": reply_session_id,
@@ -7596,6 +8551,19 @@ impl AgentRuntime {
             let pending_tool_name = active_turn
                 .and_then(|turn| turn.pending_tool_call.as_ref())
                 .map(|tool| tool.tool_name.clone());
+
+            // Drop error responses that have no routing context (empty turn_id + chat_id)
+            // and could not identify the originating tool (capability="unknown").
+            // These come from fire-and-forget datasource calls that fail asynchronously;
+            // routing them to the active turn would corrupt the pending tool result.
+            let has_no_context = task.turn_id.as_deref().filter(|s| !s.is_empty()).is_none()
+                && task.chat_id.as_deref().filter(|s| !s.is_empty()).is_none();
+            let is_unattributable_error =
+                task.error.is_some() && task.capability.as_deref().is_none_or(|c| c == "unknown");
+            if has_no_context && is_unattributable_error {
+                return Ok(());
+            }
+
             let turn_id = task
                 .turn_id
                 .clone()
@@ -7635,6 +8603,7 @@ impl AgentRuntime {
                     turn_id,
                     chat_id,
                     tool_name,
+                    error: task.error.clone(),
                     ..Default::default()
                 })
                 .await;
@@ -7884,6 +8853,13 @@ impl AgentRuntime {
                 turn_loop_config: role_config.as_ref().map(|c| c.turn_loop_config.clone()),
             };
 
+            if let Some(cap) = activation
+                .turn_loop_config
+                .as_ref()
+                .and_then(|c| c.iteration_cap)
+            {
+                state.settings.execution.iteration_cap = cap.clamp(1, 50);
+            }
             state.role_activation = Some(activation);
             // Carry over the handoff context as the working summary for the new role.
             if let Some(summary) = bundle.working_summary {
@@ -9009,6 +9985,172 @@ impl AgentRuntime {
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
+        Ok(())
+    }
+
+    async fn handle_direct_life_observe_command(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        turn_id: String,
+        chat_id: String,
+        reply_to: String,
+        reply_role: String,
+        reply_guest_id: Option<String>,
+        command: DirectLifeObserveCommand,
+        user_id: Option<String>,
+    ) -> Result<()> {
+        let route = self.sessions.get(&session_id).and_then(|state| {
+            state
+                .tool_is_enabled("life.observe")
+                .then(|| state.resolve_tool_route("life.observe"))
+                .flatten()
+                .cloned()
+        });
+
+        let Some(route) = route else {
+            warn!(
+                session_id = %session_id,
+                "Direct life.observe command could not run because life.observe is not enabled"
+            );
+            return self
+                .complete_command_without_turn(
+                    command_task_id,
+                    session_id,
+                    turn_id,
+                    chat_id,
+                    reply_to,
+                    reply_role,
+                    reply_guest_id,
+                    "I could not record that because life.observe is not enabled for this session."
+                        .into(),
+                    Some("failed"),
+                    None,
+                )
+                .await;
+        };
+
+        let arguments =
+            direct_life_observe_input(&command, &session_id, &turn_id, &chat_id, &self.agent_id);
+        let payload = ToolExecutionPayload {
+            action: "execute_tool",
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            chat_id: chat_id.clone(),
+            tool_name: "life.observe".into(),
+            arguments: arguments.clone(),
+            execution_mode: route.execution_mode.clone(),
+            agent_id: self.agent_id.clone(),
+            user_id: user_id.clone(),
+            runner_id: route.runner_id.clone(),
+            incarnation_id: route.incarnation_id.clone(),
+            hotel_id: route.hotel_id.clone(),
+            environment_id: route.environment_id.clone(),
+            task_runner_kind: route.task_runner_kind.clone(),
+            task_runner_config: route.task_runner_config.clone(),
+            selection_reason: route.selection_reason.clone(),
+            workspace_ref: None,
+            task_runner_overlay: None,
+            return_route: Some(philotic_client::ReturnRoute {
+                node: local_node_id(),
+                role: "agent".into(),
+                guest_id: Some(self.agent_id.clone()),
+                session_id: Some(session_id.clone()),
+                turn_id: Some(turn_id.clone()),
+                correlation_id: None,
+            }),
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            reply_guest_id: Some(self.agent_id.clone()),
+            final_reply_to: reply_to.clone(),
+            final_reply_role: reply_role.clone(),
+            final_reply_guest_id: reply_guest_id.clone(),
+        };
+
+        let tool_call = ToolCall {
+            tool_name: "life.observe".into(),
+            arguments: arguments.clone(),
+        };
+        let checkpoint = if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.start_turn(WorkingTurn {
+                task_id: command_task_id,
+                turn_id: turn_id.clone(),
+                chat_id: chat_id.clone(),
+                primary_user_id: user_id.clone(),
+                user_content: format!("life.observe direct command: {}", command.claim_summary),
+                final_reply_to: reply_to.clone(),
+                final_reply_role: reply_role.clone(),
+                final_reply_guest_id: reply_guest_id.clone(),
+                phase: TurnPhase::WaitingTool,
+                iteration: 0,
+                pending_tool_call: Some(tool_call),
+                pending_approval: None,
+                working_tool_history: Vec::new(),
+                recalled_memories: Vec::new(),
+                active_plan: None,
+                consecutive_step_failures: 0,
+                provider_repair_note: None,
+                provider_repair_attempts: 0,
+                pending_text_reply: None,
+                had_voice_input: false,
+                awaiting_transcription_reentry: false,
+                scripted_loop_context: None,
+                associated_paracrine_ids: Vec::new(),
+                paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
+                paracrine_response_routing: None,
+                paracrine_merge_completed: false,
+                plan_confirmed: false,
+                plan_confirm_note: None,
+                fallback_tier: if self.network_offline { 1 } else { 0 },
+                streaming_retry_attempts: 0,
+            });
+            Some((
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            ))
+        } else {
+            None
+        };
+        if let Some((checkpoint_memory_type, checkpoint_json, index_state)) = checkpoint {
+            self.ipc_client
+                .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+                .await?;
+            self.sync_session_index(&index_state).await?;
+        }
+
+        self.ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id: command_task_id,
+                state: "waiting_tool".into(),
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": chat_id,
+                    "tool_name": "life.observe",
+                    "direct_route": true,
+                }),
+            })
+            .await?;
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: route.target_node,
+                target_role: route.target_role,
+                target_guest_id: route.incarnation_id.clone(),
+                task_json: serde_json::to_string(&payload)?,
+            })
+            .await?;
+
+        info!(
+            session_id = %session_id,
+            label = %command.label,
+            source_id = %command.source_id,
+            confidence = command.confidence,
+            "Direct life.observe command routed without model turn"
+        );
         Ok(())
     }
 
@@ -13041,6 +14183,86 @@ impl AgentRuntime {
                 .await
             }
 
+            "memory.status" => {
+                let content = match &self.muninn_config {
+                    Some(cfg) => {
+                        let status = if self.muninn_available {
+                            "connected"
+                        } else {
+                            "unreachable"
+                        };
+                        format!(
+                            "MuninnDB {status} — endpoint: {}, {} vault(s) configured.",
+                            cfg.base_url,
+                            cfg.vault_tokens.len()
+                        )
+                    }
+                    None => "MuninnDB not configured on this hotel.".into(),
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "memory.fix" => {
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RefreshMemoryConfig)
+                    .await
+                {
+                    Ok(IpcResponse::MuninnStatus {
+                        available,
+                        endpoint,
+                    }) => {
+                        self.muninn_available = available;
+                        let msg = if available {
+                            format!(
+                                "MuninnDB probe succeeded — connected to {endpoint}. Memory tools re-enabled."
+                            )
+                        } else {
+                            format!(
+                                "MuninnDB probe failed — {endpoint} is unreachable. Hotel will retry every 60s. Outage recorded in heal queue."
+                            )
+                        };
+                        (msg, None)
+                    }
+                    Ok(_) => ("MuninnDB probe response unrecognized.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("memory.fix: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             "rule.propose" => {
                 let description = payload
                     .arguments
@@ -13181,7 +14403,7 @@ impl AgentRuntime {
                 };
 
                 // Parse optional response_routing hint from arguments.
-                // Defaults to CognitiveReEntry if absent or unrecognised.
+                // Defaults to ReflectiveReEntry if absent or unrecognised.
                 let explicit_response_routing =
                     args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
                         serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
@@ -13223,10 +14445,8 @@ impl AgentRuntime {
 
                 // Log the outbound exosome ID on the active turn so the routing
                 // reflex can correlate the response when it arrives.
-                // Also capture the current session_id, chat_id, and final_reply_guest_id so
-                // the specialist's response is routed back to the exact membrane seat that
-                // owns this conversation — without this, the reply fans out to all membrane
-                // subscribers.
+                // Also capture the current session_id and chat_id so the specialist's
+                // response carries the right conversation context.
                 let (source_session_id, source_chat_id, source_reply_guest_id) = {
                     let mut sess_id = None;
                     let mut chat_id = None;
@@ -13253,6 +14473,22 @@ impl AgentRuntime {
                     source_chat_id,
                 };
 
+                // When reply_to="self", target this philote's own guest_id so the
+                // specialist's paracrine_response routes back here specifically instead
+                // of to the membrane seat (which has no paracrine_response handler).
+                // Role incarnations use "{agent_id}:{role_name}"; default philotes use
+                // "{agent_id}" directly.
+                let effective_reply_guest_id = if matches!(reply_to_str, "self" | "") {
+                    Some(
+                        self.role_name
+                            .as_ref()
+                            .map(|rn| format!("{}:{}", self.agent_id, rn))
+                            .unwrap_or_else(|| self.agent_id.clone()),
+                    )
+                } else {
+                    source_reply_guest_id
+                };
+
                 let emit_result = self
                     .ipc_client
                     .send_request(IpcRequest::ParacrineEmit {
@@ -13260,7 +14496,7 @@ impl AgentRuntime {
                         exosome,
                         reply_to_node,
                         reply_to_role,
-                        reply_to_guest_id: source_reply_guest_id,
+                        reply_to_guest_id: effective_reply_guest_id,
                         timeout_secs: None,
                     })
                     .await;
@@ -13273,7 +14509,7 @@ impl AgentRuntime {
                             prompt.clone(),
                             response_routing
                                 .clone()
-                                .unwrap_or(ParacrineRouting::CognitiveReEntry),
+                                .unwrap_or(ParacrineRouting::ReflectiveReEntry),
                             authority,
                             tool_policy,
                             approval_scope,
@@ -13435,35 +14671,65 @@ impl AgentRuntime {
                     content.clone()
                 };
 
-                // Fire the paracrine_response into the orchestrator's session.
-                let merge_task = serde_json::json!({
-                    "action": "paracrine_response",
-                    "session_id": reply_session_id,
-                    "turn_id": turn_id,
-                    "chat_id": reply_chat_id,
-                    "content": attributed_content,
-                    "exosome": {
-                        "prompt": "",
-                        "paracrine_id": paracrine_id,
-                        "response_routing": response_routing,
-                        "source_session_id": reply_session_id,
-                        "source_chat_id": reply_chat_id,
-                    },
-                });
-                info!(
-                    session_id = %session_id,
-                    reply_session = %reply_session_id,
-                    "delegate.merge: emitting paracrine_response to orchestrator"
-                );
-                let _ = self
-                    .ipc_client
-                    .send_request(IpcRequest::EmitTask {
-                        target_node: final_reply_to,
-                        target_role: final_reply_role,
-                        target_guest_id: final_reply_guest_id,
-                        task_json: merge_task.to_string(),
-                    })
-                    .await;
+                // Determine position in chain: if reply_session_id == session_id,
+                // this is a top-of-chain reflection turn (Astrid surfacing brain's
+                // reply). Otherwise it's a specialist turn (brain replying to Astrid).
+                let is_top_of_chain = reply_session_id == session_id;
+
+                if is_top_of_chain {
+                    // Reflective surface: emit send_reply directly to membrane so the
+                    // content goes to the user's Telegram chat.
+                    let surface_task = serde_json::json!({
+                        "action": "send_reply",
+                        "session_id": reply_session_id,
+                        "turn_id": turn_id,
+                        "chat_id": reply_chat_id,
+                        "content": attributed_content,
+                    });
+                    info!(
+                        session_id = %session_id,
+                        "delegate.merge: reflective surface — emitting send_reply to membrane"
+                    );
+                    let _ = self
+                        .ipc_client
+                        .send_request(IpcRequest::EmitTask {
+                            target_node: final_reply_to,
+                            target_role: final_reply_role,
+                            target_guest_id: final_reply_guest_id,
+                            task_json: surface_task.to_string(),
+                        })
+                        .await;
+                } else {
+                    // Specialist merge: emit paracrine_response back to the orchestrator.
+                    let merge_task = serde_json::json!({
+                        "action": "paracrine_response",
+                        "session_id": reply_session_id,
+                        "turn_id": turn_id,
+                        "chat_id": reply_chat_id,
+                        "content": attributed_content,
+                        "exosome": {
+                            "prompt": "",
+                            "paracrine_id": paracrine_id,
+                            "response_routing": response_routing,
+                            "source_session_id": reply_session_id,
+                            "source_chat_id": reply_chat_id,
+                        },
+                    });
+                    info!(
+                        session_id = %session_id,
+                        reply_session = %reply_session_id,
+                        "delegate.merge: emitting paracrine_response to orchestrator"
+                    );
+                    let _ = self
+                        .ipc_client
+                        .send_request(IpcRequest::EmitTask {
+                            target_node: final_reply_to,
+                            target_role: final_reply_role,
+                            target_guest_id: final_reply_guest_id,
+                            task_json: merge_task.to_string(),
+                        })
+                        .await;
+                }
 
                 // Return a tool result so the specialist's turn can continue or close.
                 let result_content = format!(
@@ -14635,12 +15901,17 @@ impl AgentRuntime {
     /// This ensures tool grants and runtime routing changes take effect immediately on the next
     /// message without requiring a session restart or reconnect.
     async fn refresh_bindings_from_snapshot(&mut self, session_id: &str) {
-        let response = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig {
+        let response = match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.ipc_client.send_request(IpcRequest::GetConfig {
                 key: format!("__session_snapshot__:{session_id}"),
-            })
-            .await;
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => return, // timeout — skip the bindings refresh
+        };
 
         let snapshot = match response {
             Ok(IpcResponse::ConfigData {
@@ -14667,6 +15938,9 @@ impl AgentRuntime {
         let new_skillset: Option<Vec<String>> = bindings
             .get("effective_skillset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_allowed_classes: Option<Vec<String>> = bindings
+            .get("allowed_classes")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_component_routes = snapshot
             .get("component_route_assembly")
             .cloned()
@@ -14682,6 +15956,12 @@ impl AgentRuntime {
         if let Some(skillset) = new_skillset {
             if skillset != state.bindings.effective_skillset {
                 state.bindings.effective_skillset = skillset;
+                changed = true;
+            }
+        }
+        if let Some(allowed_classes) = new_allowed_classes {
+            if allowed_classes != state.bindings.allowed_classes {
+                state.bindings.allowed_classes = allowed_classes;
                 changed = true;
             }
         }
@@ -14716,10 +15996,26 @@ impl AgentRuntime {
                 None => format!("__session_snapshot__:{session_id}"),
             }
         };
-        let response = self
-            .ipc_client
-            .send_request(IpcRequest::GetConfig { key: snapshot_key })
-            .await?;
+        let response = match tokio::time::timeout(
+            Duration::from_secs(15),
+            self.ipc_client
+                .send_request(IpcRequest::GetConfig { key: snapshot_key }),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                warn!(
+                    session_id = %session_id,
+                    "ensure_session_loaded: GetConfig timed out after 15s — starting fresh session"
+                );
+                IpcResponse::ConfigData {
+                    key: String::new(),
+                    value_json: None,
+                }
+            }
+        };
 
         if let IpcResponse::ConfigData {
             value_json: Some(value_json),
@@ -14796,6 +16092,18 @@ impl AgentRuntime {
                             }
                         }
 
+                        // Apply iteration_cap from the restored role's turn_loop_config.
+                        // settings are not persisted in the checkpoint, so this must be
+                        // re-applied every time we restore.
+                        if let Some(cap) = state
+                            .role_activation
+                            .as_ref()
+                            .and_then(|ra| ra.turn_loop_config.as_ref())
+                            .and_then(|c| c.iteration_cap)
+                        {
+                            state.settings.execution.iteration_cap = cap.clamp(1, 50);
+                        }
+
                         self.sessions.insert(session_id.to_string(), state);
                         return Ok(());
                     }
@@ -14818,6 +16126,13 @@ impl AgentRuntime {
         // without requiring an explicit handoff.to_role call.
         if let Some(ref default_role) = self.default_agent_profile.default_role_name.clone() {
             if let Some(activation) = self.fetch_role_activation(default_role).await {
+                if let Some(cap) = activation
+                    .turn_loop_config
+                    .as_ref()
+                    .and_then(|c| c.iteration_cap)
+                {
+                    state.settings.execution.iteration_cap = cap.clamp(1, 50);
+                }
                 state.role_activation = Some(activation);
                 info!(
                     session_id = %session_id,
@@ -14839,17 +16154,19 @@ impl AgentRuntime {
         agent_id: &str,
         state: &mut SessionState,
     ) {
-        match ipc_client
-            .send_request(IpcRequest::ListRules {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            ipc_client.send_request(IpcRequest::ListRules {
                 agent_id: agent_id.to_string(),
-            })
-            .await
+            }),
+        )
+        .await
         {
-            Ok(IpcResponse::RuleList { rules }) => {
+            Ok(Ok(IpcResponse::RuleList { rules })) => {
                 state.rules = rules;
             }
             Ok(_) | Err(_) => {
-                // Non-fatal: session proceeds without rules if the hotel is unavailable.
+                // Non-fatal: session proceeds without rules if the hotel is unavailable or times out.
             }
         }
     }
@@ -14983,11 +16300,12 @@ mod tests {
     use super::{
         AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
         extract_model_error_payload, format_role_command_reply, format_roles_report,
-        media_analysis_attachments, normalized_user_content, parse_memory_candidate,
-        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
+        loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments,
+        normalized_user_content, parse_memory_candidate, resolve_media_routing,
+        resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
-    use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
+    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
     };
@@ -15033,6 +16351,64 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
         }
+    }
+
+    fn push_test_tool(turn: &mut WorkingTurn, tool_name: &str, content: &str) {
+        turn.working_tool_history.push((
+            ToolCall {
+                tool_name: tool_name.into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: tool_name.into(),
+                content: content.into(),
+            },
+        ));
+        turn.iteration += 1;
+    }
+
+    #[test]
+    fn loop_stop_reason_detects_low_progress_diagnostic_run() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        for tool_name in ["hotel.status", "role.list", "skill.list", "session.status"] {
+            push_test_tool(&mut turn, tool_name, "ok");
+        }
+
+        let reason = loop_stop_reason(&turn, 10).expect("diagnostic run should stop");
+        assert!(reason.contains("status"));
+    }
+
+    #[test]
+    fn loop_stop_reason_allows_non_diagnostic_progress() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        for tool_name in [
+            "hotel.status",
+            "life.recall",
+            "memory.recall",
+            "life.observe",
+        ] {
+            push_test_tool(&mut turn, tool_name, "ok");
+        }
+
+        assert!(loop_stop_reason(&turn, 10).is_none());
+    }
+
+    #[test]
+    fn loop_stop_fallback_names_recent_tool_path() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.user_content = "let's try that again".into();
+        push_test_tool(&mut turn, "hotel.status", "ok");
+        push_test_tool(&mut turn, "session.status", "ok");
+
+        let reply = loop_stop_fallback_reply(
+            &turn.user_content,
+            &turn.working_tool_history,
+            "the turn reached its maximum tool-iteration limit",
+        );
+
+        assert!(reply.contains("instead of looping"));
+        assert!(reply.contains("hotel.status, session.status"));
+        assert!(reply.contains("let's try that again"));
     }
 
     #[test]
@@ -15360,6 +16736,57 @@ mod tests {
     }
 
     #[test]
+    fn direct_life_observe_parser_handles_telegram_open_loop_request() {
+        let parsed = super::parse_direct_life_observe_command(
+            "Beacon, please use life.observe to record this open loop: \
+             I need to schedule the rowing habit for weekly Saturdays. \
+             Use label OpenLoop, source membrane:telegram, confidence 0.8",
+        )
+        .expect("explicit life.observe request should parse");
+
+        assert_eq!(parsed.label, "OpenLoop");
+        assert_eq!(
+            parsed.claim_summary,
+            "I need to schedule the rowing habit for weekly Saturdays"
+        );
+        assert_eq!(parsed.source_id, "membrane:telegram");
+        assert_eq!(parsed.confidence, 0.8);
+    }
+
+    #[test]
+    fn direct_life_observe_input_has_runner_shape() {
+        let command = super::DirectLifeObserveCommand {
+            label: "OpenLoop".into(),
+            claim_summary: "Schedule rowing habit on weekly Saturdays".into(),
+            source_id: "membrane:telegram".into(),
+            confidence: 0.8,
+        };
+
+        let value = super::direct_life_observe_input(
+            &command,
+            "telegram:123:agent-beacon",
+            "turn-1",
+            "123",
+            "agent-beacon",
+        );
+
+        assert_eq!(value["evidence"]["claim_ref"]["label"], "OpenLoop");
+        assert_eq!(
+            value["evidence"]["claim_summary"],
+            "Schedule rowing habit on weekly Saturdays"
+        );
+        assert_eq!(
+            value["evidence"]["source_refs"][0]["source_id"],
+            "membrane:telegram"
+        );
+        assert_eq!(value["evidence"]["confidence"], 0.8);
+        assert_eq!(
+            value["evidence"]["metadata"]["route"],
+            "philote_direct_life_observe"
+        );
+    }
+
+    #[test]
     fn retryable_provider_failure_allows_single_repair_attempt() {
         let error = TaskErrorPayload {
             kind: "provider_failure".into(),
@@ -15413,6 +16840,25 @@ mod tests {
         assert!(should_attempt_provider_repair(&error, Some(&state)));
         state.increment_provider_repair_attempts();
         assert!(!should_attempt_provider_repair(&error, Some(&state)));
+    }
+
+    #[test]
+    fn provider_auth_failure_escalates_fallback_tier_without_same_provider_repair() {
+        let error = TaskErrorPayload {
+            kind: "provider_failure".into(),
+            message: "Gemini API error (400): API key expired. Please renew the API key.".into(),
+            code: None,
+            component: Some("model-router".into()),
+            provider: Some("gemini".into()),
+            capability: Some("text.generate".into()),
+            retryable: Some(false),
+            sub_kind: Some("provider_auth".into()),
+        };
+
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        assert!(!should_attempt_provider_repair(&error, Some(&state)));
+        assert!(super::should_escalate_tier(&error));
     }
 
     #[test]

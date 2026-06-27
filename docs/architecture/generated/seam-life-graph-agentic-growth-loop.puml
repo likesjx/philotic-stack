@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - life-graph-agentic-growth-loop
+
+rectangle "life-graph-agentic-growth-loop" as life_graph_agentic_growth_loop #Orange {
+}
+
+
+@enduml

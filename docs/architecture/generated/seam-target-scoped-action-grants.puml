@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - target-scoped-action-grants
+
+rectangle "target-scoped-action-grants" as target_scoped_action_grants #Orange {
+}
+
+
+@enduml

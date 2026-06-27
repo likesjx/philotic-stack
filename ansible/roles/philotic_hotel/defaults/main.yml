@@ -14,6 +14,7 @@ philotic_blob_dir: "/opt/philotic/data/blob"
 # Service user (non-root)
 philotic_user: "philotic"
 philotic_group: "philotic"
+philotic_home_dir: "/opt/philotic"  # home for the philotic system user; hf_hub caches models at $HOME/.cache/huggingface
 
 # Artifacts — binaries delivered from the control machine or a CI artifact store.
 # Set philotic_artifacts_dir to the directory containing pre-built Linux binaries.
@@ -33,6 +34,7 @@ philotic_binaries:
   - table-datasource
   - router-listener
   - agent-datasource
+  - life-graph-runner
   - tool-runner
   - agent-core
   - hegemon
@@ -41,6 +43,7 @@ philotic_binaries:
   - model-controller-elevenlabs
   - model-controller-openai
   - model-controller-mlx
+  - model-controller-ollama
   - heal-dispatcher
   - model-controller-onnx
   - philotic-web
@@ -69,12 +72,34 @@ philotic_agents: {}
 # Optional hotel-scoped auth/config overlays projected into mesh-config.json
 philotic_oidc_public_base_url: ""
 
+# Central Cypher graph provider. When enabled, graph-datasource can target a
+# local Memgraph Bolt endpoint while agents still see the same graph.query tool.
+philotic_memgraph_enabled: false
+philotic_memgraph_image: "memgraph/memgraph:latest"
+philotic_memgraph_container_name: "philotic-memgraph"
+philotic_memgraph_data_dir: "{{ philotic_data_dir }}/memgraph"
+# Host interface address for Bolt. Use a Tailscale IP for central graph services
+# so other hotels can reach Memgraph without exposing it on public interfaces.
+philotic_memgraph_host: "127.0.0.1"
+philotic_memgraph_port: 7687
+philotic_graph_provider: "{{ 'memgraph' if philotic_memgraph_enabled else 'sqlite' }}"
+philotic_memgraph_user: ""
+philotic_memgraph_db: ""
+
+# Central LifeGraph runner placement. Hotels may run local philotes while routing
+# life.* tools to the canonical vps-jane runner over the mesh.
+philotic_life_graph_runner_home_node: "vps-jane-aiua-01"
+philotic_remote_life_graph_runner_node: "{{ philotic_life_graph_runner_home_node }}"
+
 # Log level
 philotic_rust_log: "info"
 
 # ONNX Sidecar Configuration
 philotic_onnx_sidecar_enabled: false
 philotic_onnx_sidecar_port: 11435
-philotic_onnx_embed_repo: "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim default
-philotic_onnx_embed_dim: 384
+# Canonical embedding model: Xenova/all-mpnet-base-v2 (768d, sentence-transformers)
+# Fine-tunable on HuggingFace; hot-swap via PHILOTIC_ONNX_EMBED_REPO without restart.
+# embedding_model_gen = "{repo}@{sha8}" — bump triggers Life Graph reindex.
+philotic_onnx_embed_repo: "Xenova/all-mpnet-base-v2"
+philotic_onnx_embed_dim: 768
 philotic_onnx_prefer_quantized: true

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-operator-identity
+
+rectangle "desktop-operator-identity" as desktop_operator_identity #Orange {
+}
+
+
+@enduml

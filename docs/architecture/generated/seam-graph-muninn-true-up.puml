@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-muninn-true-up
+
+rectangle "graph-muninn-true-up" as graph_muninn_true_up #Orange {
+}
+
+
+@enduml

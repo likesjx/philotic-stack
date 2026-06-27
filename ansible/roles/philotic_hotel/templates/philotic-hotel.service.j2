@@ -26,6 +26,16 @@ Environment="PHILOTIC_ENABLE_RUST_DISPATCHER={{ philotic_enable_rust_dispatcher 
 Environment="PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE={{ philotic_enable_rust_task_lifecycle }}"
 Environment="PHILOTIC_GRAPH_DB_PATH={{ philotic_data_dir }}/graph-runner.db"
 Environment="PHILOTIC_GRAPH_DATABASE_DIR={{ philotic_data_dir }}/graphs"
+Environment="PHILOTIC_GRAPH_PROVIDER={{ philotic_graph_provider }}"
+Environment="PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE={{ philotic_life_graph_runner_home_node }}"
+Environment="PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE={{ philotic_remote_life_graph_runner_node }}"
+{% if philotic_memgraph_enabled | bool %}
+Environment="PHILOTIC_MEMGRAPH_URI={{ philotic_memgraph_host }}:{{ philotic_memgraph_port }}"
+Environment="PHILOTIC_MEMGRAPH_USER={{ philotic_memgraph_user }}"
+{% if philotic_memgraph_db | length > 0 %}
+Environment="PHILOTIC_MEMGRAPH_DB={{ philotic_memgraph_db }}"
+{% endif %}
+{% endif %}
 Environment="PHILOTIC_TABLE_DB={{ philotic_data_dir }}/tables"
 
 # Mesh PSK — injected from Ansible vault; never stored in plaintext on disk

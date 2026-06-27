@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - membrane-assisted-auth-challenge
+
+rectangle "membrane-assisted-auth-challenge" as membrane_assisted_auth_challenge #Orange {
+}
+
+
+@enduml

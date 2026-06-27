@@ -53,3 +53,15 @@ Tracked defects and known technical debt. Each entry carries status, severity, s
 **Found**: 2026-03-30 (identified in MEMORY.md)
 
 Agent re-entry loop completes multiple tool iterations, but the final synthesized summary response does not reach the user or surface in the final turn result. Re-entry loop works, but the final text generation step may be failing or its output is being dropped.
+
+---
+
+## DEF-005: `aiua` test suite — 10 hung tests, 2 unrelated failures on develop HEAD
+
+**Status**: open
+**Severity**: medium
+**Size**: M
+**Seam**: aiua-test-infra
+**Found**: 2026-06-22
+
+`cargo test -p aiua --release` on unmodified `develop` HEAD (`d2478e8`) hangs indefinitely on 10 tests: `desktop_membrane_lease_can_be_renewed_by_owner`, `desktop_membrane_lease_disconnect_allows_takeover`, `desktop_membrane_lease_release_allows_immediate_takeover`, `desktop_membrane_status_view_comes_from_hotel_record`, `desktop_membrane_target_guest_inventory_reports_failed_remote_query_when_unreachable`, `desktop_membrane_target_status_distinguishes_local_from_remote_observation`, `desktop_membrane_target_views_include_source_and_freshness_attribution`, `discord_lease_injects_membrane_binding`, `e2e_session_round_trip_persists_and_delivers_reply`, `e2e_structured_tool_call_round_trip_persists_and_delivers_reply`. Confirmed via isolated single-threaded run of one test alone (still hangs, so it is not parallel resource contention) and via `git stash` on the same commit (still hangs with the working tree clean). With those 10 skipped via `--skip`, two more fail: `service::ipc::tests::emit_task_falls_back_to_orchestrator_when_active_incarnation_is_unregistered` (timeout waiting for fallback delivery) and `tests::default_guest_seed_injects_hotel_socket_env` (`assertion left == right failed: left: 12, right: 11`) — both reproduce identically with or without unrelated changes, so likely order/state-dependent on which tests ran before them in the filtered set rather than newly broken. Not investigated further; out of scope for `codex/lifegraph-cross-hotel-park`. Suspect for the hangs: several of these tests bind `(dispatcher_tx, _dispatcher_rx)` and never drain `_dispatcher_rx`, so any code path that sends more than the channel capacity (8 or 16) worth of `LedgerCommand`s blocks forever on `dispatcher_tx.send(...).await` — worth checking first.

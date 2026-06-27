@@ -1,0 +1,7 @@
+@startuml
+!theme plain
+
+title Proposal Architecture - doc:resilient-philote-loop-proposal
+
+
+@enduml

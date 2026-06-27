@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use philotic_client::{is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{
+    is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute,
+};
 use serde_json::json;
 use store::sqlite::SqliteGraphStore;
 use store::GraphTableStore;
@@ -162,16 +164,7 @@ async fn main() -> Result<()> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let reply_to = task
-                    .get("reply_to")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&iid)
-                    .to_string();
-                let reply_role = task
-                    .get("reply_role")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("agent")
-                    .to_string();
+                let return_route = ReturnRoute::from_task(&task, &iid, "agent");
                 let final_reply_to = task
                     .get("final_reply_to")
                     .and_then(serde_json::Value::as_str)
@@ -233,11 +226,13 @@ async fn main() -> Result<()> {
 
                 let _ = ipc_client
                     .send_request(IpcRequest::EmitTask {
-                        target_node: reply_to,
-                        target_role: reply_role,
-                        target_guest_id: None,
+                        target_node: return_route.node.clone(),
+                        target_role: return_route.role.clone(),
+                        target_guest_id: return_route.guest_id.clone(),
                         task_json: json!({
                             "action": "tool_result",
+                            "return_route": return_route.as_json(),
+                            "reply_guest_id": return_route.guest_id,
                             "session_id": session_id,
                             "turn_id": turn_id,
                             "chat_id": chat_id,

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - life-graph-memorygraphrag-runner
+
+rectangle "life-graph-memorygraphrag-runner" as life_graph_memorygraphrag_runner #Orange {
+}
+
+
+@enduml

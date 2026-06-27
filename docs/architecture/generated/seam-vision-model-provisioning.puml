@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - vision-model-provisioning
+
+rectangle "vision-model-provisioning" as vision_model_provisioning #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - operator-auth-bootstrap-strategy
+
+rectangle "operator-auth-bootstrap-strategy" as operator_auth_bootstrap_strategy #Orange {
+}
+
+
+@enduml

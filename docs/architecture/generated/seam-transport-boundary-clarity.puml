@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - transport-boundary-clarity
+
+rectangle "transport-boundary-clarity" as transport_boundary_clarity #Orange {
+}
+
+
+@enduml

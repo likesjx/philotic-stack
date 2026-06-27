@@ -1,3 +1,4 @@
+use crate::heartbeat::{HotelStateSyncAgent, HotelStateSyncGuest};
 use crate::{NodeCapabilities, NodeHealthSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -50,11 +51,24 @@ struct PendingCapabilitySync {
     started_at: Instant,
 }
 
+/// In-memory snapshot of a remote hotel's guest and agent roster.
+/// Populated from `HotelStateSync` beacon messages; never persisted to DB.
+#[derive(Debug, Clone)]
+pub struct RemoteHotelState {
+    pub hotel_name: String,
+    pub node_id: String,
+    pub guests: Vec<HotelStateSyncGuest>,
+    pub agents: Vec<HotelStateSyncAgent>,
+    pub last_seen: Instant,
+}
+
 /// Registry for storing and querying known mesh nodes.
 #[derive(Debug, Default)]
 pub struct NodeRegistry {
     nodes: HashMap<String, NodeStatus>,
     pending_capability_syncs: HashMap<(String, Uuid), PendingCapabilitySync>,
+    /// In-memory roster of remote hotels, keyed by node_id.
+    remote_hotel_states: HashMap<String, RemoteHotelState>,
 }
 
 impl NodeRegistry {
@@ -62,6 +76,7 @@ impl NodeRegistry {
         Self {
             nodes: HashMap::new(),
             pending_capability_syncs: HashMap::new(),
+            remote_hotel_states: HashMap::new(),
         }
     }
 
@@ -71,6 +86,15 @@ impl NodeRegistry {
 
     pub fn freshness_ttl_secs() -> u64 {
         DEFAULT_NODE_TTL.as_secs()
+    }
+
+    /// Returns `true` if the node was not seen recently (stale or first-ever), which means
+    /// the caller should treat the incoming heartbeat as a reconnect event.
+    pub fn is_node_stale(&self, node_id: &str) -> bool {
+        self.nodes
+            .get(node_id)
+            .map(|s| !Self::is_fresh(s))
+            .unwrap_or(true)
     }
 
     pub fn observe_heartbeat(
@@ -211,6 +235,31 @@ impl NodeRegistry {
         self.nodes.values().filter(|status| Self::is_fresh(status))
     }
 
+    /// Store or update the guest/agent roster received from a remote hotel.
+    pub fn observe_hotel_state(
+        &mut self,
+        node_id: String,
+        hotel_name: String,
+        guests: Vec<HotelStateSyncGuest>,
+        agents: Vec<HotelStateSyncAgent>,
+    ) {
+        self.remote_hotel_states.insert(
+            node_id.clone(),
+            RemoteHotelState {
+                hotel_name,
+                node_id,
+                guests,
+                agents,
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    /// Iterate over all known remote hotel states.
+    pub fn remote_hotel_states(&self) -> impl Iterator<Item = &RemoteHotelState> {
+        self.remote_hotel_states.values()
+    }
+
     pub fn find_nodes_with_tool<'a>(
         &'a self,
         tool: &'a str,
@@ -252,6 +301,25 @@ impl NodeRegistry {
                     .iter()
                     .any(|ad| ad.incarnation_id == guest_id)
         })
+    }
+
+    /// Find the node_id hosting a specific guest, checking both live capability advertisements
+    /// and HotelStateSync remote roster entries. Use this for cross-hotel routing lookups.
+    pub fn find_node_id_for_guest(&self, guest_id: &str) -> Option<String> {
+        if let Some(status) = self.find_node_for_incarnation(guest_id) {
+            return Some(status.capabilities.node_id.clone());
+        }
+        self.remote_hotel_states
+            .values()
+            .filter(|state| state.last_seen.elapsed() <= DEFAULT_NODE_TTL)
+            .find(|state| {
+                state
+                    .guests
+                    .iter()
+                    // Include inactive guests: the remote hotel will materialize them on receipt.
+                    .any(|g| g.guest_id == guest_id)
+            })
+            .map(|state| state.node_id.clone())
     }
 }
 

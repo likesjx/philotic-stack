@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - huggingface-training-loop
+
+rectangle "huggingface-training-loop" as huggingface_training_loop #Orange {
+}
+
+
+@enduml

@@ -75,5 +75,8 @@ async fn main() -> Result<()> {
     }
 
     let mut runtime = AgentRuntime::new(ipc_client, agent_id);
+    if let Some(ref rn) = role_name {
+        runtime.set_role_name(rn.clone());
+    }
     runtime.run().await
 }

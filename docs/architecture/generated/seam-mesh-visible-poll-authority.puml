@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mesh-visible-poll-authority
+
+rectangle "mesh-visible-poll-authority" as mesh_visible_poll_authority #Orange {
+}
+
+
+@enduml

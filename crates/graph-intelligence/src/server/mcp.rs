@@ -19,15 +19,21 @@ struct JsonRpcRequest {
     jsonrpc: String,
     method: String,
     params: Option<serde_json::Value>,
-    id: serde_json::Value,
+    // Optional so notifications (no id) deserialize without error
+    #[serde(default)]
+    id: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
 struct JsonRpcResponse {
     jsonrpc: &'static str,
+    // Omit null fields — MCP schema validator uses strict union, rejects extra keys
+    #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<JsonRpcError>,
-    id: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -483,10 +489,13 @@ async fn handle_mcp(
                 "tools": {}
             },
             "serverInfo": {
-                "name": "graph-intelligence",
+                "name": "intel-graph",
                 "version": "0.1.0"
             }
         })),
+        // Notifications have no id; acknowledge with empty result so we don't send
+        // back a JSON-RPC error that confuses strict MCP validators.
+        method if method.starts_with("notifications/") => Ok(serde_json::json!({})),
         _ => Err(JsonRpcError {
             code: -32601,
             message: format!("Method '{}' not found", req.method),

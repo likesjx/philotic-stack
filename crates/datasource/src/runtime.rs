@@ -1,7 +1,8 @@
 use crate::controller::{DatasourceProvider, DatasourceTask, ProviderOutput, ProviderRegistry};
 use anyhow::Result;
 use philotic_client::{
-    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute, TaskErrorPayload,
+    is_ipc_disconnect,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -18,10 +19,7 @@ pub struct DatasourceGuestConfig {
 
 #[derive(Debug, Clone)]
 struct ReplyRoute {
-    reply_to: String,
-    reply_role: String,
-    session_id: String,
-    turn_id: String,
+    return_route: ReturnRoute,
     chat_id: String,
 }
 
@@ -30,27 +28,10 @@ impl ReplyRoute {
         let local_node_id =
             std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string());
 
+        let return_route = ReturnRoute::from_task(task, local_node_id, "agent");
+
         Self {
-            reply_to: task
-                .get("reply_to")
-                .and_then(Value::as_str)
-                .unwrap_or(&local_node_id)
-                .to_string(),
-            reply_role: task
-                .get("reply_role")
-                .and_then(Value::as_str)
-                .unwrap_or("agent")
-                .to_string(),
-            session_id: task
-                .get("session_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            turn_id: task
-                .get("turn_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            return_route,
             chat_id: task
                 .get("chat_id")
                 .and_then(Value::as_str)
@@ -206,16 +187,18 @@ async fn emit_success_response(
 
     ipc_client
         .send_request(IpcRequest::EmitTask {
-            target_node: reply.reply_to.clone(),
-            target_role: reply.reply_role.clone(),
-            target_guest_id: None,
+            target_node: reply.return_route.node.clone(),
+            target_role: reply.return_route.role.clone(),
+            target_guest_id: reply.return_route.guest_id.clone(),
             task_json: json!({
                 "action": "datasource_response",
                 "capability": task.kind.as_str(),
                 "tool_name": task.kind.as_str(),
                 "provider": provider_id,
-                "session_id": reply.session_id,
-                "turn_id": reply.turn_id,
+                "return_route": reply.return_route.as_json(),
+                "reply_guest_id": reply.return_route.guest_id,
+                "session_id": reply.return_route.session_id,
+                "turn_id": reply.return_route.turn_id,
                 "chat_id": reply.chat_id,
                 "result": result_json,
             })
@@ -238,16 +221,18 @@ async fn emit_failure(
 
     ipc_client
         .send_request(IpcRequest::EmitTask {
-            target_node: reply.reply_to.clone(),
-            target_role: reply.reply_role.clone(),
-            target_guest_id: None,
+            target_node: reply.return_route.node.clone(),
+            target_role: reply.return_route.role.clone(),
+            target_guest_id: reply.return_route.guest_id.clone(),
             task_json: json!({
                 "action": "datasource_response",
                 "capability": capability.unwrap_or("unknown"),
                 "tool_name": capability.unwrap_or("unknown"),
                 "provider": provider.unwrap_or("unknown"),
-                "session_id": reply.session_id,
-                "turn_id": reply.turn_id,
+                "return_route": reply.return_route.as_json(),
+                "reply_guest_id": reply.return_route.guest_id,
+                "session_id": reply.return_route.session_id,
+                "turn_id": reply.return_route.turn_id,
                 "chat_id": reply.chat_id,
                 "error": payload,
             })

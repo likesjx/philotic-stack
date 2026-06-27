@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - life-graph-semantic-retrieval
+
+rectangle "life-graph-semantic-retrieval" as life_graph_semantic_retrieval #Orange {
+}
+
+
+@enduml

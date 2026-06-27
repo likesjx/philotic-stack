@@ -21,6 +21,7 @@ members = [
     "crates/philotic-graph",
     "crates/datasource",
     "crates/graph-datasource",
+    "crates/data-memorygraphrag",
     "crates/agent-datasource",
     "crates/router-listener",
     "crates/parakeet-runner",

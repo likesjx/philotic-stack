@@ -342,6 +342,11 @@ smoke-embed:
 smoke-graph-runner:
     bash scripts/smoke-graph-runner-roundtrip.sh
 
+# Run the LifeGraph runner through live hotel IPC.
+# Set PHILOTIC_HOTEL_SOCKET, PHILOTIC_TARGET_NODE, and PHILOTIC_REPLY_NODE for remote hotels.
+smoke-life-graph-ipc:
+    cargo run -p philotic-client --example life_graph_ipc_smoke_driver
+
 # Run the agent-graph-runner live smoke (write + declare + sync round-trip, Seams 3 & 4)
 smoke-agent-graph:
     bash scripts/smoke-agent-graph-roundtrip.sh
@@ -454,9 +459,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher"
+    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -509,7 +514,7 @@ remote-homebrew-start remote hotel:
     if [[ "{{hotel}}" == "mbp-jane" || "{{hotel}}" == "mac-jane" ]]; then profile="jane"; fi
     if [[ "{{hotel}}" == "local-telegram" || "{{hotel}}" == "bjork" ]]; then profile="bjork"; fi
     ssh "{{remote}}" "uid=\$(id -u); launchctl bootout gui/\${uid}/com.philotic.aiua.{{hotel}} 2>/dev/null || true; pkill -f '[a]iua --hotel {{hotel}}' 2>/dev/null || true"
-    ssh "{{remote}}" "mkdir -p ~/.philotic/${profile}/graphs && ulimit -n 65536; nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid)"
+    ssh "{{remote}}" "mkdir -p ~/.philotic/${profile}/graphs && ulimit -n 65536; nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE=vps-jane-aiua-01 PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE=vps-jane-aiua-01 PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid)"
 
 remote-homebrew-status remote hotel:
     @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
@@ -539,12 +544,12 @@ vps-push:
     #!/usr/bin/env bash
     set -euo pipefail
     ROOT_DIR="{{justfile_directory()}}"
-    VPS="deploy@jane-vps"
+    VPS="${PHILOTIC_VPS_SSH_TARGET:-deploy@jane-vps}"
     VPS_CODE="/home/deploy/code/philotic-stack"
     VPS_BUILD="${VPS_CODE}/target/release"
 
     echo "▶ Syncing source to ${VPS}:${VPS_CODE}..."
-    rsync -az --delete \
+    rsync -az --delete --checksum --no-times \
       --exclude='.git' \
       --exclude='target/' \
       --exclude='dist/' \
@@ -565,7 +570,8 @@ vps-push:
       -p graph-datasource \
       -p table-datasource \
       -p router-listener \
-      -p agent-datasource"
+      -p agent-datasource \
+      -p data-memorygraphrag"
 
     echo "▶ Deploying via ansible (binaries from VPS build at ${VPS_BUILD})..."
     cd "${ROOT_DIR}/ansible" && ansible-playbook \
@@ -761,6 +767,26 @@ intel-graph-search query limit="10":
 # Open Web UI in browser (macOS)
 intel-graph-ui:
     open http://127.0.0.1:8900
+
+# Rebuild the graphify tree-sitter code graph (offline, no LLM)
+graphify-update:
+    graphify update .
+
+# Watch the repo and rebuild the graphify graph on code changes
+graphify-watch:
+    graphify watch .
+
+# Query the graphify graph: shortest path between two nodes
+graphify-path a b:
+    graphify path "{{a}}" "{{b}}"
+
+# Explain a node and its neighbors in the graphify graph
+graphify-explain node:
+    graphify explain "{{node}}"
+
+# Bridge graphify call edges into the intel-graph (run after graphify-update)
+graphify-bridge:
+    python3 scripts/graphify_bridge.py
 
 # Close active workstream with summary and disposition
 close-workstream:

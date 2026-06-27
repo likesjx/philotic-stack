@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-05-16
+last_updated: 2026-06-22
 tags:
 - source-of-truth
 - current-state
@@ -15,6 +15,7 @@ related_docs:
 - GRAPH_AS_SOURCE_OF_TRUTH.md
 - GRAPH_INTELLIGENCE_PROPOSAL.md
 - GRAPH_INTELLIGENCE_STATUS.md
+- LIFE_GRAPH_OS_PROPOSAL.md
 - MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md
 - SESSION_LOOP_PROPOSAL.md
 - TELEGRAM_POLL_LEASE_PROPOSAL.md
@@ -24,6 +25,8 @@ related_docs:
 - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
 - MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md
 - MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
+- RESPONSE_RETURN_ROUTE_PROPOSAL.md
+- MODEL_GRAPH_CATALOG_PROPOSAL.md
 - HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md
 - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
 task_refs:
@@ -127,9 +130,11 @@ Primary references:
 - the hotel advertises local capability availability and can route to remote execution advertisements when local implementations are unavailable
 - inter-hotel execution transport is now distinct from raw UDP beacon payload bodies
 - reply routing remains session-owned through the membrane boundary
+- response-like payloads returning to `target_role = "agent"` must resolve to a concrete guest before delivery; `aiua` now repairs missing guest targets from `return_route.guest_id`, `delivery_target_guest_id`, `reply_guest_id`, `agent_id`, or session state, rejects unrecoverable broad responses with `RESPONSE_ROUTE_UNRESOLVED`, and shared `ReturnRoute` is the canonical DTO while flat reply fields remain as rollout compatibility
 
 Primary references:
 - [INTER_HOTEL_ROUTING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/INTER_HOTEL_ROUTING_PROPOSAL.md)
+- [RESPONSE_RETURN_ROUTE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RESPONSE_RETURN_ROUTE_PROPOSAL.md)
 - [NATIVE_OVERLAY_VPN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/NATIVE_OVERLAY_VPN_PROPOSAL.md)
 - [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md)
 
@@ -194,6 +199,7 @@ These are accepted proposals not yet in implementation:
 | --- | --- | --- |
 | Agent-centric resource model | Agents declare and request resources; hotel acts as broker; demand-derived materialization replaces static guest config; agent graph is a mesh-synced tool-runner resource; router-listener generates RL training traces | [AGENT_RESOURCE_MODEL_PROPOSAL.md](AGENT_RESOURCE_MODEL_PROPOSAL.md) — proposed |
 | Graph layer unification | Introduce `GraphDomain` as the unified middle layer; all domain operations expressed in terms of `GraphAdapter` primitives; one update point for entity types across all graph stores | [GRAPH_LAYER_UNIFICATION_PROPOSAL.md](GRAPH_LAYER_UNIFICATION_PROPOSAL.md) — proposed |
+| Model graph catalog | Re-slice stale model catalog work onto current `develop`; keep static model metadata separate from live node routing and provider execution authority | [MODEL_GRAPH_CATALOG_PROPOSAL.md](MODEL_GRAPH_CATALOG_PROPOSAL.md) — accepted-current-slice |
 | Architectural rules and roadmap | Extract standing constraints from proposals into ARCH_RULES.md; maintain dependency-ordered seam roadmap in ROADMAP.md; check rules at slice close-out | [ARCH_RULES_AND_ROADMAP_PROPOSAL.md](ARCH_RULES_AND_ROADMAP_PROPOSAL.md) — proposed |
 
 ## Active Work Right Now
@@ -222,7 +228,7 @@ These are the most clearly active seams as of 2026-03-13:
 | Runtime and sessions | implemented, still evolving | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) and code in `aiua`, `philote`, `ansible-mesh-core` | session ownership semantics, compaction policy, bounded loop follow-through, and role context-shift semantics |
 | Membrane and transport | implemented, still evolving | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md), [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md), [DESKTOP_MEMBRANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_MEMBRANE_PROPOSAL.md), [MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md), and [MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md) | delegated poll authority, desktop/operator membrane hardening, explicit UDP state-sync boundaries, broader transport surfaces, and external membrane trust/edge-defense contracts |
 | Mesh and placement | partially implemented | [INTER_HOTEL_ROUTING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/INTER_HOTEL_ROUTING_PROPOSAL.md), [MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md) | placement policy, trust boundaries, overlay evolution, and mesh-visible state classification |
-| Memory and context | partially implemented | [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md), [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md), [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md), and [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | typed context projection path is now smoke-green for the current cognitive request path through `philote` and `model-router`; the first typed `role_activation` object now flows into session/context projection; current installed runtime has advisory Muninn entity overlays, `MemorySpacetimeFrame` / `MemoryShapingContext`, shaped `memory.remember` metadata, low-risk `memory.cultivate`, `memory.true_up`, graph true-up finding records, and promotion gates; next pressure is exercising the cultivation loop across real repeated sessions |
+| Memory and context | partially implemented | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md), [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md), [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md), [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md), and [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | typed context projection path is now smoke-green for the current cognitive request path through `philote` and `model-router`; the first typed `role_activation` object now flows into session/context projection; current installed runtime has advisory Muninn entity overlays, `MemorySpacetimeFrame` / `MemoryShapingContext`, shaped `memory.remember` metadata, low-risk `memory.cultivate`, `memory.true_up`, graph true-up finding records, and promotion gates; Life Graph OS is now the proposed umbrella for life-scale graph memory, semantic retrieval, attention stewardship, and agentic growth loops; next pressure is exercising the cultivation loop across real repeated sessions and proving the first Life Graph schema/retrieval slice |
 | Tooling and execution | partially implemented | [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md) and [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | structured model envelope and initial `request_class` routing are now smoke-green for the current cognitive path; next pressure is broader structured failures, embedding support, and role-scoped toolsets |
 | Operator and control plane | proposed to early transitional | [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md), [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md), [HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_USER_IDENTITY_AND_OPERATOR_AUTH_PROPOSAL.md), [OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_AUTH_BOOTSTRAP_STRATEGY_PROPOSAL.md) | elevation, hotel-owned operator identity, desktop auth, auth bootstrap strategy, secure always-on operator desktop posture on `vps-jane`, perimeter trust, and egress |
 | Deployment and distribution | implemented boundary, incomplete rollout | [RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md) | real VPS smoke, secret handling hardening, artifact distribution |

@@ -43,10 +43,11 @@ use philotic_client::{
     DesktopMembraneGuestView, DesktopMembraneStatusView, DesktopMembraneTargetGuestInventoryView,
     DesktopMembraneTargetReachabilityView, DesktopMembraneTargetStatusView,
     DesktopMembraneTargetView, GuestExport, GuestIdentity, HookRoute, HookSubscription, IpcRequest,
-    IpcResponse, LeaseEnvelope, LeaseStatus, OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS,
-    OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
-    OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
-    OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
+    IpcResponse, LeaseEnvelope, LeaseStatus, MemoryConfigPayload, OPERATOR_CHAT_REPLY_ROLE,
+    OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
+    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
+    OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView, OperatorChatTurnReply,
+    OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
     OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
@@ -788,10 +789,115 @@ fn attach_delivery_context(
     obj.entry("delivery_target_role".to_string())
         .or_insert_with(|| serde_json::json!(target_role));
     if let Some(target_guest_id) = target_guest_id {
-        obj.entry("delivery_target_guest_id".to_string())
-            .or_insert_with(|| serde_json::json!(target_guest_id));
+        // The router has already resolved the canonical destination for this
+        // envelope. Replace any stale embedded delivery hint so a role switch
+        // cannot split the user turn and model response across two philotes.
+        obj.insert(
+            "delivery_target_guest_id".to_string(),
+            serde_json::json!(target_guest_id),
+        );
     }
     serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
+}
+
+fn is_response_like_agent_action(action: &str) -> bool {
+    matches!(
+        action,
+        "model_response"
+            | "tool_result"
+            | "datasource_response"
+            | "paracrine_response"
+            | "approval_resolution"
+            | "handoff_bundle"
+    )
+}
+
+fn explicit_response_guest_from_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("return_route")
+        .and_then(|route| route.get("guest_id"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("return_route")
+                .and_then(|route| route.get("guest"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("return_route")
+                .and_then(|route| route.get("reply_guest_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("delivery_target_guest_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("reply_guest_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| payload.get("agent_id").and_then(serde_json::Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn response_like_agent_action_for_task(
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: &str,
+) -> Option<String> {
+    if target_role != "agent" || target_guest_id.is_some() {
+        return None;
+    }
+    let payload = serde_json::from_str::<serde_json::Value>(task_json).ok()?;
+    let action = payload.get("action").and_then(serde_json::Value::as_str)?;
+    is_response_like_agent_action(action).then(|| action.to_string())
+}
+
+fn infer_response_target_guest_id_for_agent_task(
+    graph: &GraphDomain,
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: &str,
+    live_agent_guests: &[String],
+) -> Option<String> {
+    response_like_agent_action_for_task(target_role, target_guest_id, task_json)?;
+    let payload = serde_json::from_str::<serde_json::Value>(task_json).ok()?;
+
+    if let Some(guest_id) = explicit_response_guest_from_payload(&payload) {
+        return Some(guest_id);
+    }
+
+    let session_id = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)?;
+    let session = graph.get_session(session_id).ok().flatten()?;
+
+    let is_registered = |guest_id: &str| live_agent_guests.iter().any(|live| live == guest_id);
+
+    if let Some(active_guest_id) = session.active_incarnation_id.clone() {
+        if is_registered(&active_guest_id) {
+            return Some(active_guest_id);
+        }
+
+        // Active incarnation isn't actually live right now (e.g. a single-process
+        // philote handling all roles under its base agent_id) — mirror the inbound
+        // resolver's fallback so the response isn't silently parked ledger-only.
+        if let Some(orchestrator_guest_id) =
+            IpcServer::resolve_orchestrator_guest_id(graph, &session, live_agent_guests)
+        {
+            warn!(
+                "Active incarnation [{}] is not registered for session [{}]; routing response to orchestrator guest [{}] instead.",
+                active_guest_id, session_id, orchestrator_guest_id
+            );
+            return Some(orchestrator_guest_id);
+        }
+    }
+
+    session.primary_agent_id
 }
 
 fn declared_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
@@ -847,6 +953,22 @@ fn project_effective_rights(bindings: &serde_json::Value) -> Vec<String> {
     let mut rights = Vec::new();
     rights.extend(toolset.iter().map(|tool_name| tool_right(tool_name)));
     rights.extend(skillset.iter().map(|skill_name| skill_right(skill_name)));
+    // Also project rights for tools that come from allowed_classes expansion.
+    // Without this, class-expanded tools (e.g. life_graph → life.*) would have no
+    // projected right and would be filtered out by the rights check in
+    // compose_tool_assembly_from_incarnations even though the class is explicitly allowed.
+    if let Some(classes) = bindings
+        .get("allowed_classes")
+        .and_then(serde_json::Value::as_array)
+    {
+        for class in classes {
+            if let Some(class_str) = class.as_str() {
+                for tool_name in tools_for_allowed_class(class_str) {
+                    rights.push(tool_right(tool_name));
+                }
+            }
+        }
+    }
     rights.extend(
         declared_component_capabilities(bindings)
             .into_iter()
@@ -932,9 +1054,12 @@ pub struct IpcServer {
     training_storage: Option<Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>>,
     heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
     webrtc_signal_tx: Option<mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
-    /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
+    /// Broadcast channel for hotel-wide push events (e.g. NetworkState, MuninnStatus).
     /// The sender is cloned into each `handle_client` task for forwarding.
     network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
+    /// Tracks whether MuninnDB was reachable on the most recent probe. Shared with the
+    /// probe loop and per-connection handlers for inline `RefreshMemoryConfig` probes.
+    muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
     /// In-process channel for operator surface query tasks.
     /// When set, tasks addressed to `OPERATOR_SURFACE_QUERY_ROLE` are sent here
     /// instead of through the UDS inbox registry, eliminating the self-connection.
@@ -943,6 +1068,9 @@ pub struct IpcServer {
     perimeter_svc: Option<Arc<crate::service::perimeter::HotelPerimeterService>>,
     /// Hotel egress gateway — wired in via `with_egress()`.
     egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
+    /// Signal channel: send `()` to trigger a hotel-state broadcast to all backbone peers.
+    /// Fired on guest register/deregister so peers stay in sync.
+    hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
 }
 
 struct LoggingLeaseObserver;
@@ -3184,6 +3312,17 @@ impl IpcServer {
                 tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
                     .await
                     .map_err(|_| anyhow::anyhow!("timed out waiting for operator chat reply"))??;
+            // MuninnStatus and NetworkState are OOB hotel broadcasts that can arrive
+            // on any connection at any time — skip them, keep waiting for InboundTask.
+            if matches!(
+                reply,
+                IpcResponse::MuninnStatus { .. }
+                    | IpcResponse::NetworkState { .. }
+                    | IpcResponse::ApartmentUpdate { .. }
+                    | IpcResponse::GracefulShutdown { .. }
+            ) {
+                continue;
+            }
             let IpcResponse::InboundTask { task_json, .. } = reply else {
                 anyhow::bail!("unexpected operator chat reply envelope: {reply:?}");
             };
@@ -3202,6 +3341,11 @@ impl IpcServer {
                 if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
                     observed_partial_replies.push(content.to_string());
                 }
+                continue;
+            }
+            // turn_status is a progress update (e.g. "waiting_tool"), never the terminal reply.
+            // Skip it and keep waiting for send_reply.
+            if action == "turn_status" {
                 continue;
             }
             break payload;
@@ -3881,10 +4025,17 @@ impl IpcServer {
             heal_queue: None,
             webrtc_signal_tx: None,
             network_broadcast,
+            muninn_reachable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             operator_surface_tx: None,
             perimeter_svc: None,
             egress_gw: None,
+            hotel_state_dirty_tx: None,
         }
+    }
+
+    pub fn with_hotel_state_dirty_tx(mut self, tx: mpsc::Sender<()>) -> Self {
+        self.hotel_state_dirty_tx = Some(tx);
+        self
     }
 
     pub fn with_operator_surface_channel(mut self, tx: mpsc::Sender<String>) -> Self {
@@ -3996,6 +4147,17 @@ impl IpcServer {
             });
         }
 
+        // MuninnDB reachability probe — checks every 60s and broadcasts MuninnStatus on flip.
+        // Pushes to heal queue when the endpoint goes down so the heal-dispatcher can act.
+        if let Some(cfg) = self.muninn_config.clone() {
+            let reachable = self.muninn_reachable.clone();
+            let broadcast_tx = self.network_broadcast.clone();
+            let heal_queue = self.heal_queue.clone();
+            tokio::spawn(async move {
+                Self::run_muninn_probe_loop(cfg, reachable, broadcast_tx, heal_queue).await;
+            });
+        }
+
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -4016,14 +4178,17 @@ impl IpcServer {
                     let registry = self.registry.clone();
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
+                    let muninn_reachable = self.muninn_reachable.clone();
                     let training_storage = self.training_storage.clone();
                     let heal_queue = self.heal_queue.clone();
                     let webrtc_signal_tx = self.webrtc_signal_tx.clone();
+                    let network_broadcast_tx = self.network_broadcast.clone();
                     let network_broadcast_rx = self.network_broadcast.subscribe();
                     let operator_surface_tx = self.operator_surface_tx.clone();
                     let socket_path = self.socket_path.clone();
                     let perimeter_svc = self.perimeter_svc.clone();
                     let egress_gw = self.egress_gw.clone();
+                    let hotel_state_dirty_tx = self.hotel_state_dirty_tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -4044,14 +4209,17 @@ impl IpcServer {
                             registry,
                             peer_sockets,
                             muninn_config,
+                            muninn_reachable,
                             training_storage,
                             heal_queue,
                             webrtc_signal_tx,
                             network_broadcast_rx,
+                            network_broadcast_tx,
                             operator_surface_tx,
                             socket_path,
                             perimeter_svc,
                             egress_gw,
+                            hotel_state_dirty_tx,
                         )
                         .await
                         {
@@ -4090,16 +4258,19 @@ impl IpcServer {
         registry: Arc<RwLock<NodeRegistry>>,
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+        muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
         training_storage: Option<
             Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
         >,
         heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
         webrtc_signal_tx: Option<mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
+        network_broadcast_tx: tokio::sync::broadcast::Sender<IpcResponse>,
         operator_surface_tx: Option<mpsc::Sender<String>>,
         socket_path: String,
         perimeter_svc: Option<Arc<crate::service::perimeter::HotelPerimeterService>>,
         egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
+        hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -4141,6 +4312,16 @@ impl IpcServer {
             });
         }
 
+        // Push current MuninnDB state to the new guest so guests that connect while
+        // MuninnDB is down don't falsely assume available=true until the next probe flip.
+        if let Some(cfg) = muninn_config.as_deref() {
+            let available = muninn_reachable.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = outbound_tx.send(IpcResponse::MuninnStatus {
+                available,
+                endpoint: cfg.base_url.clone(),
+            });
+        }
+
         let mut subscribed_roles = Vec::new();
         let mut current_identity: Option<GuestIdentity> = None;
         loop {
@@ -4151,6 +4332,12 @@ impl IpcServer {
                     Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
                     Self::remove_mcp_membrane_leases(&mcp_membrane_leases, conn_id).await;
                     Self::remove_discord_gateway_leases(&discord_gateway_leases, conn_id).await;
+                    // A registered guest disconnected — peers need updated roster.
+                    if current_identity.is_some() {
+                        if let Some(ref tx) = hotel_state_dirty_tx {
+                            let _ = tx.try_send(());
+                        }
+                    }
                     let _ = write_task.await;
                     return Ok(());
                 }
@@ -4163,7 +4350,45 @@ impl IpcServer {
                             has_config = config_json.is_some(),
                             "FetchMemoryConfig handled"
                         );
-                        let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
+                        let _ = outbound_tx.send(IpcResponse::MemoryConfig(MemoryConfigPayload {
+                            config_json,
+                        }));
+                    }
+                    Ok(IpcRequest::RefreshMemoryConfig) => {
+                        let endpoint = muninn_config
+                            .as_deref()
+                            .map(|c| c.base_url.clone())
+                            .unwrap_or_default();
+                        let available = if endpoint.is_empty() {
+                            false
+                        } else {
+                            let http = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5))
+                                .build()
+                                .unwrap_or_default();
+                            Self::probe_muninn_endpoint(&http, &endpoint).await
+                        };
+                        let was =
+                            muninn_reachable.swap(available, std::sync::atomic::Ordering::Relaxed);
+                        if available != was {
+                            let _ = network_broadcast_tx.send(IpcResponse::MuninnStatus {
+                                available,
+                                endpoint: endpoint.clone(),
+                            });
+                            if !available {
+                                if let Some(hq) = heal_queue.as_deref() {
+                                    let msg = format!(
+                                        "MuninnDB unreachable: connection refused at {endpoint}"
+                                    );
+                                    let _ = hq.push_error("hotel", &msg);
+                                }
+                            }
+                        }
+                        info!(available, "RefreshMemoryConfig probe complete");
+                        let _ = outbound_tx.send(IpcResponse::MuninnStatus {
+                            available,
+                            endpoint,
+                        });
                     }
                     Ok(IpcRequest::GetPerimeterStatus) => {
                         use perimeter_core::service::PerimeterService as _;
@@ -4396,6 +4621,12 @@ impl IpcServer {
                             operator_surface_tx.as_ref(),
                         )
                         .await;
+                        // New guest registered — broadcast updated roster to peers.
+                        if matches!(response, IpcResponse::ComponentRegistered { .. }) {
+                            if let Some(ref tx) = hotel_state_dirty_tx {
+                                let _ = tx.try_send(());
+                            }
+                        }
                         let _ = outbound_tx.send(response);
                         for follow_up in follow_up_responses {
                             let _ = outbound_tx.send(follow_up);
@@ -5415,6 +5646,57 @@ impl IpcServer {
 
     // ── end Golgi routing pipeline ────────────────────────────────────────────
 
+    // ── MuninnDB reachability probe ───────────────────────────────────────────
+
+    /// Returns `true` if the MuninnDB REST endpoint answers any HTTP request.
+    /// A connection error (refused, timeout) returns `false`; any HTTP response returns `true`.
+    async fn probe_muninn_endpoint(http: &reqwest::Client, endpoint: &str) -> bool {
+        match http.get(endpoint).send().await {
+            Ok(_) => true,
+            Err(e) if e.is_connect() || e.is_timeout() => false,
+            Err(_) => true, // redirect, TLS, etc. — server exists
+        }
+    }
+
+    /// Periodic MuninnDB probe loop. Spawned at hotel boot when MuninnDB is configured.
+    /// Checks every 60 seconds; on state flip broadcasts `MuninnStatus` to all guests and
+    /// pushes a heal-queue entry when the endpoint goes down.
+    async fn run_muninn_probe_loop(
+        config: Arc<memory_core::MuninnConfig>,
+        reachable: Arc<std::sync::atomic::AtomicBool>,
+        broadcast_tx: tokio::sync::broadcast::Sender<IpcResponse>,
+        heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+    ) {
+        let endpoint = config.base_url.clone();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let available = Self::probe_muninn_endpoint(&http, &endpoint).await;
+            let was = reachable.swap(available, std::sync::atomic::Ordering::Relaxed);
+            if available != was {
+                info!(available, endpoint = %endpoint, "MuninnDB reachability changed");
+                let _ = broadcast_tx.send(IpcResponse::MuninnStatus {
+                    available,
+                    endpoint: endpoint.clone(),
+                });
+                if !available {
+                    if let Some(hq) = heal_queue.as_deref() {
+                        let msg = format!("MuninnDB unreachable: connection refused at {endpoint}");
+                        if let Err(e) = hq.push_error("hotel", &msg) {
+                            warn!(error = %e, "Failed to push MuninnDB outage to heal queue");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── end MuninnDB reachability probe ───────────────────────────────────────
+
     fn configured_local_guest_exists(
         graph: &GraphDomain,
         local_node_id: &str,
@@ -5427,6 +5709,200 @@ impl IpcServer {
             .list_guests(&local_hotel_name, false)
             .map(|guests| guests.into_iter().any(|guest| guest.guest_id == guest_id))
             .unwrap_or(false)
+    }
+
+    /// Park a cross-hotel task and trigger role-philote materialization on this hotel.
+    ///
+    /// Called when a `TaskInvoke` arrives from the mesh with `delivery_target_guest_id` set
+    /// but the target guest has no live inbox subscriber (idle or not yet spawned).
+    pub(crate) async fn park_and_materialize_role_philote(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        mat_req: Option<&dyn GuestMaterializationRequester>,
+        source_node: &str,
+        task_id: Uuid,
+        task_json: String,
+        agent_guest_id: &str,
+    ) {
+        // Park the task — flushed when the role philote connects and registers.
+        {
+            let mut guard = parked_inbound.lock().await;
+            guard
+                .entry(agent_guest_id.to_string())
+                .or_default()
+                .push(ParkedInboundTask {
+                    source_node: source_node.to_string(),
+                    task_id,
+                    task_json,
+                    activate_session_id: None,
+                });
+        }
+        info!(
+            agent_guest_id,
+            task_id = %task_id,
+            "Cross-hotel TaskInvoke parked; triggering role-philote materialization."
+        );
+
+        // Resolve the hotel guest record ID from the agent-centric guest_id.
+        let incarnations = graph
+            .list_role_incarnations_by_guest_id(agent_guest_id)
+            .unwrap_or_default();
+        let Some(inc) = incarnations.into_iter().next() else {
+            warn!(
+                agent_guest_id,
+                "No role incarnation found for cross-hotel guest; cannot materialize."
+            );
+            return;
+        };
+        let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            warn!(
+                agent_guest_id,
+                "Cannot determine local hotel name; cannot materialize role philote."
+            );
+            return;
+        };
+        let hotel_guest_id = format!("{}:philote-{}", hotel_name, inc.role_name);
+        let socket_path = graph
+            .list_hotels()
+            .ok()
+            .and_then(|hs| {
+                hs.into_iter()
+                    .find(|h| h.capabilities.node_id == local_node_id)
+                    .map(|h| h.ipc_socket_path)
+            })
+            .unwrap_or_default();
+
+        // Create the hotel guest record if it doesn't already exist.
+        if graph
+            .get_guest(&hotel_name, &hotel_guest_id)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let config_json = serde_json::json!({
+                "command": "philote",
+                "args": [],
+                "env": {
+                    "PHILOTIC_AGENT_ID": inc.agent_id,
+                    "PHILOTIC_ROLE_NAME": inc.role_name,
+                    "PHILOTIC_HOTEL_SOCKET": socket_path,
+                    "PHILOTIC_NODE_ID": local_node_id,
+                }
+            });
+            let rec = ansible_mesh_core::storage::GuestRecord {
+                hotel_name: hotel_name.clone(),
+                guest_id: hotel_guest_id.clone(),
+                role: inc.role_name.clone(),
+                config_json: config_json.to_string(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            };
+            if let Err(e) = graph.seed_guests(&hotel_name, &[rec]) {
+                warn!(
+                    "Failed to seed role-philote guest record [{}]: {e}",
+                    hotel_guest_id
+                );
+            } else {
+                info!("Created role-philote guest record: {}", hotel_guest_id);
+            }
+        }
+
+        if let Some(req) = mat_req {
+            match req.ensure_guest_active(&hotel_guest_id).await {
+                Ok(true) => info!(
+                    "Role-philote [{}] materialization triggered for cross-hotel task.",
+                    hotel_guest_id
+                ),
+                Ok(false) => warn!(
+                    "Role-philote [{}] could not be materialized.",
+                    hotel_guest_id
+                ),
+                Err(e) => warn!(
+                    "Role-philote [{}] materialization error: {e}",
+                    hotel_guest_id
+                ),
+            }
+        }
+    }
+
+    /// Park a task for a *local* role incarnation and trigger its materialization, flushed
+    /// when the role philote registers under `role_record.guest_id` (single-process role
+    /// incarnations live inside the base philote, spawned/woken via `ensure_role_materialized`
+    /// — unlike [`Self::park_and_materialize_role_philote`], which targets the cross-hotel
+    /// dedicated-process naming scheme and does not wake an already-configured local guest).
+    pub(crate) async fn park_and_materialize_local_role(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        mat_req: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        source_node: &str,
+        task_id: Uuid,
+        task_json: String,
+        role_record: &RoleIncarnationRecord,
+    ) {
+        {
+            let mut guard = parked_inbound.lock().await;
+            guard
+                .entry(role_record.guest_id.clone())
+                .or_default()
+                .push(ParkedInboundTask {
+                    source_node: source_node.to_string(),
+                    task_id,
+                    task_json,
+                    activate_session_id: None,
+                });
+        }
+        info!(
+            guest_id = %role_record.guest_id,
+            task_id = %task_id,
+            "Local role-incarnation task parked; triggering on-demand materialization."
+        );
+
+        match Self::ensure_role_materialized(
+            graph,
+            inboxes,
+            mat_req,
+            local_node_id,
+            &role_record.agent_id,
+            &role_record.role_name,
+        )
+        .await
+        {
+            Ok(readiness) => info!(
+                guest_id = %role_record.guest_id,
+                ?readiness,
+                "Local role-incarnation materialization requested."
+            ),
+            Err(e) => warn!(
+                guest_id = %role_record.guest_id,
+                "Local role-incarnation materialization failed: {e}"
+            ),
+        }
+    }
+
+    /// Resolve the node_id hosting a guest, with a fallback to `home_node` from the role
+    /// incarnation record. Necessary for the first cross-hotel task before the guest appears
+    /// in HotelStateSync (its hotel guest record may not exist yet on the remote hotel).
+    fn resolve_guest_home_node(
+        graph: &GraphDomain,
+        registry: &NodeRegistry,
+        guest_id: &str,
+    ) -> Option<String> {
+        // 1. Live registry: advertisements (running philote) + HotelStateSync roster.
+        if let Some(node_id) = registry.find_node_id_for_guest(guest_id) {
+            return Some(node_id);
+        }
+        // 2. Fallback: home_node from role incarnation record. home_node stores a node_id
+        // directly (e.g. "mac-jane-aiua-01"), not a hotel name — return it as-is.
+        graph
+            .list_role_incarnations_by_guest_id(guest_id)
+            .unwrap_or_default()
+            .into_iter()
+            .next()?
+            .home_node
     }
 
     fn local_delivery_provenance_hint(
@@ -5472,22 +5948,32 @@ impl IpcServer {
         target_guest_id: Option<String>,
         task_json: &str,
     ) -> AgentRouteResolution {
-        if target_role != "agent" || target_guest_id.is_some() {
+        if target_role != "agent" {
             return AgentRouteResolution::Deliver(target_guest_id);
         }
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
-            return AgentRouteResolution::Deliver(None);
+            return AgentRouteResolution::Deliver(target_guest_id);
         };
         let session_id = payload
             .get("session_id")
             .and_then(serde_json::Value::as_str);
         let Some(session_id) = session_id else {
-            return AgentRouteResolution::Deliver(None);
+            return AgentRouteResolution::Deliver(target_guest_id);
         };
         let session = graph.get_session(session_id).ok().flatten();
         let Some(session) = session else {
-            return AgentRouteResolution::Deliver(None);
+            return AgentRouteResolution::Deliver(target_guest_id);
         };
+        if let Some(explicit_guest_id) = target_guest_id.as_deref() {
+            let targets_base_agent = session
+                .primary_agent_id
+                .as_deref()
+                .map(|agent_id| explicit_guest_id == agent_id)
+                .unwrap_or(false);
+            if !targets_base_agent {
+                return AgentRouteResolution::Deliver(target_guest_id);
+            }
+        }
         let local_hotel_name = Self::local_hotel_name(graph, local_node_id);
 
         let live_agent_guests: Vec<String> = {
@@ -5559,6 +6045,16 @@ impl IpcServer {
                 }
             }
 
+            if !Self::configured_local_guest_exists(graph, local_node_id, &active_guest_id) {
+                // Active incarnation is not configured on this hotel — it may live on a
+                // remote hotel. Return Deliver directly so EmitTask can reroute via the
+                // mesh registry (HotelStateSync). Do NOT fall back to the local orchestrator,
+                // which would silently drop the intent to use the remote role.
+                return AgentRouteResolution::Deliver(Some(active_guest_id));
+            }
+
+            // Active incarnation is configured locally but not running; try orchestrator
+            // fallback so the user isn't stuck waiting for a respawn.
             if let Some(orchestrator_guest_id) =
                 Self::resolve_orchestrator_guest_id(graph, &session, &live_agent_guests)
             {
@@ -5569,21 +6065,13 @@ impl IpcServer {
                 return AgentRouteResolution::Deliver(Some(orchestrator_guest_id));
             }
 
-            if Self::configured_local_guest_exists(graph, local_node_id, &active_guest_id) {
-                info!(
-                    "Active incarnation [{}] is not registered for session [{}]; parking inbound and requesting materialization.",
-                    active_guest_id, session_id
-                );
-                return AgentRouteResolution::Park {
-                    guest_id: active_guest_id,
-                };
-            }
-
-            warn!(
-                "Active incarnation [{}] is not registered for session [{}], and no live orchestrator fallback was found.",
+            info!(
+                "Active incarnation [{}] is not registered for session [{}]; parking inbound and requesting materialization.",
                 active_guest_id, session_id
             );
-            return AgentRouteResolution::Deliver(Some(active_guest_id));
+            return AgentRouteResolution::Park {
+                guest_id: active_guest_id,
+            };
         }
 
         if let Some(provenance_guest_id) =
@@ -5698,6 +6186,21 @@ impl IpcServer {
         Ok(())
     }
 
+    fn is_agent_handoff_caller(graph: &GraphDomain, identity: &GuestIdentity) -> bool {
+        if identity.role == "agent" {
+            return true;
+        }
+
+        graph
+            .list_role_incarnations_by_guest_id(&identity.guest_id)
+            .map(|records| {
+                records
+                    .iter()
+                    .any(|record| record.routing_role() == identity.role)
+            })
+            .unwrap_or(false)
+    }
+
     fn resolve_role_incarnation(
         graph: &GraphDomain,
         session_id: &str,
@@ -5759,6 +6262,29 @@ impl IpcServer {
         })
     }
 
+    /// Normalize a freshly-registered cron job's `target_role` to the inbox routing key
+    /// (`role:{agent_id}:{role_name}`, matching `RoleIncarnationRecord::routing_role`) that
+    /// `deliver_inbound_task`/`SubscribeInbox` actually key on. Agents calling `cron.register`
+    /// almost always mean "my own role of that name" when they pass a bare role name like
+    /// `"orchestrator"` — resolve it against the registering guest's own role incarnations so
+    /// the job is deliverable, instead of silently persisting a key that can never match.
+    fn normalize_cron_target_role(graph: &GraphDomain, job: &mut ansible_mesh_core::cron::CronJob) {
+        if job.target_role.starts_with("role:") {
+            return;
+        }
+        let ansible_mesh_core::cron::CronJobSource::Guest(agent_id) = &job.created_by else {
+            return;
+        };
+        if graph
+            .get_role_incarnation(agent_id, &job.target_role)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            job.target_role = format!("role:{agent_id}:{}", job.target_role);
+        }
+    }
+
     async fn role_route_is_live(
         inboxes: &InboxRegistry,
         routing_role: &str,
@@ -5801,7 +6327,14 @@ impl IpcServer {
             return Ok(false);
         }
         if let Some(session_id) = activate_session_id.as_deref() {
-            Self::update_session_active_incarnation(graph, session_id, guest_id)?;
+            if let Err(err) = Self::update_session_active_incarnation(graph, session_id, guest_id) {
+                // Session may live on a remote hotel; skip the local update rather than
+                // blocking delivery.
+                warn!(
+                    "deliver_live_guest_task: skipping session activation for [{}]: {}",
+                    session_id, err
+                );
+            }
         }
         Self::deliver_inbound_task(
             inboxes,
@@ -5833,7 +6366,7 @@ impl IpcServer {
             .is_some_and(Self::pid_exists))
     }
 
-    async fn ensure_role_materialized(
+    pub(crate) async fn ensure_role_materialized(
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
@@ -6322,6 +6855,118 @@ impl IpcServer {
                     data.clone(),
                 )
                 .await;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Like `deliver_event_envelope`, but parks + materializes the role philote when
+    /// `delivery_target_guest_id` is set and no subscriber is currently connected.
+    /// Called from the mesh inbox loop where the full hotel context is available.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn deliver_event_envelope_or_park(
+        inboxes: &InboxRegistry,
+        event: &EventEnvelope,
+        operator_surface_tx: Option<&mpsc::Sender<String>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+        mat_req: Option<&dyn GuestMaterializationRequester>,
+    ) -> bool {
+        // An event explicitly addressed to a different node arrived in this hotel's mesh
+        // inbox (gossiped/relayed batch). It is not ours to deliver or park here — doing so
+        // previously caused a hotel to try materializing a remote hotel's infrastructure
+        // guest (e.g. another hotel's life-graph-runner) as a dormant role incarnation. That
+        // can never succeed since such guest_ids have no role_incarnation record, leaving the
+        // task permanently parked until the turn watchdog timed it out ~90s later.
+        if let Some(target_node) = event.target_node_id.as_deref() {
+            if target_node != local_node_id {
+                return false;
+            }
+        }
+        match (&event.kind, &event.target_agent_id, &event.payload) {
+            (
+                EventKind::TaskInvoke | EventKind::TaskResult,
+                Some(target_role),
+                EventPayload::Inline { data },
+            ) => {
+                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                    if let Some(tx) = operator_surface_tx {
+                        let _ = tx.try_send(data.clone()).ok();
+                        return true;
+                    }
+                }
+                let target_guest_id: Option<String> =
+                    serde_json::from_str::<serde_json::Value>(data)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("delivery_target_guest_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+
+                let is_subscribed = {
+                    let guard = inboxes.lock().await;
+                    let role_subs = guard.get(target_role.as_str()).cloned().unwrap_or_default();
+                    match &target_guest_id {
+                        Some(g) => role_subs.iter().any(|s| s.guest_id == g.as_str()),
+                        None => !role_subs.is_empty(),
+                    }
+                };
+
+                if is_subscribed {
+                    // Register the active incarnation so that model_responses for this
+                    // session route back to the correct specialist philote rather than
+                    // falling through to the orchestrator. Without this, a cross-hotel
+                    // paracrine turn's model_response is rerouted to bjork/orchestrator
+                    // because the session's active_incarnation_id was never set via mesh.
+                    if let (Some(guest_id), Some(session_id)) = (
+                        &target_guest_id,
+                        serde_json::from_str::<serde_json::Value>(data)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("session_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                            }),
+                    ) {
+                        if let Err(err) =
+                            Self::update_session_active_incarnation(graph, &session_id, guest_id)
+                        {
+                            warn!(
+                                "deliver_event_envelope_or_park: session activation skipped [{}]: {}",
+                                session_id, err
+                            );
+                        }
+                    }
+                    Self::deliver_inbound_task(
+                        inboxes,
+                        &event.source_node_id,
+                        target_role,
+                        target_guest_id.as_deref(),
+                        event.event_id,
+                        data.clone(),
+                    )
+                    .await;
+                } else if let Some(ref agent_guest_id) = target_guest_id {
+                    Self::park_and_materialize_role_philote(
+                        graph,
+                        local_node_id,
+                        parked_inbound,
+                        mat_req,
+                        &event.source_node_id,
+                        event.event_id,
+                        data.clone(),
+                        agent_guest_id,
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        "Cross-hotel task {}: no subscriber for role '{}', no specific guest; task dropped.",
+                        event.event_id, target_role
+                    );
+                }
                 true
             }
             _ => false,
@@ -8045,6 +8690,67 @@ impl IpcServer {
                 target_guest_id,
                 task_json,
             } => {
+                let response_like_agent_action = response_like_agent_action_for_task(
+                    &target_role,
+                    target_guest_id.as_deref(),
+                    &task_json,
+                );
+                let target_guest_id = if target_guest_id.is_none() {
+                    let live_agent_guests: Vec<String> = {
+                        let guard = inboxes.lock().await;
+                        guard
+                            .get(target_role.as_str())
+                            .into_iter()
+                            .flatten()
+                            .map(|subscriber| subscriber.guest_id.clone())
+                            .collect()
+                    };
+                    let inferred = infer_response_target_guest_id_for_agent_task(
+                        graph,
+                        &target_role,
+                        None,
+                        &task_json,
+                        &live_agent_guests,
+                    );
+                    if let Some(ref guest_id) = inferred {
+                        info!(
+                            target_role = target_role.as_str(),
+                            guest_id = guest_id.as_str(),
+                            "EmitTask: inferred explicit guest target for response-like agent payload"
+                        );
+                    }
+                    inferred
+                } else {
+                    target_guest_id
+                };
+                if target_guest_id.is_none() {
+                    if let Some(action) = response_like_agent_action {
+                        let message = format!(
+                            "response-like action [{action}] targeted role [agent] without a concrete return guest"
+                        );
+                        warn!(
+                            action = action.as_str(),
+                            target_role = target_role.as_str(),
+                            target_node = target_node.as_str(),
+                            "EmitTask rejected unresolved response return route"
+                        );
+                        if let Some(hq) = heal_queue {
+                            if let Err(err) = hq.push_error("aiua.response_return_route", &message)
+                            {
+                                warn!(
+                                    error = %err,
+                                    "Failed to push unresolved response route to heal queue"
+                                );
+                            }
+                        }
+                        return IpcResponse::error(
+                            "emit_task",
+                            "RESPONSE_ROUTE_UNRESOLVED",
+                            message,
+                        );
+                    }
+                }
+
                 // Short-circuit operator surface queries to the in-process channel,
                 // eliminating the UDS self-connection and its socket leak.
                 // Only short-circuit for local-node targets; cross-hotel queries must
@@ -8124,26 +8830,76 @@ impl IpcServer {
                     }
                     _ => task_json,
                 };
-                let route_resolution = Self::resolve_agent_route(
-                    graph,
-                    inboxes,
-                    local_node_id,
-                    &target_role,
-                    target_guest_id.clone(),
-                    &task_json,
-                )
-                .await;
-                // If the caller targeted this node but the guest isn't configured here,
-                // look up the live node via the registry so the mesh dispatcher forwards
-                // the task to the correct hotel automatically.
+                // Response-like payloads already went through
+                // infer_response_target_guest_id_for_agent_task above, which is the
+                // authoritative resolver for outbound responses. Don't also run them
+                // through resolve_agent_route: that resolver re-derives from
+                // session.active_incarnation_id whenever the resolved guest_id equals
+                // primary_agent_id (its "targets_base_agent" case, meant for fresh
+                // inbound task delivery) and would clobber the inferred fallback right
+                // back to the unregistered active incarnation it was meant to avoid.
+                let route_resolution = if response_like_agent_action.is_some() {
+                    AgentRouteResolution::Deliver(target_guest_id.clone())
+                } else {
+                    Self::resolve_agent_route(
+                        graph,
+                        inboxes,
+                        local_node_id,
+                        &target_role,
+                        target_guest_id.clone(),
+                        &task_json,
+                    )
+                    .await
+                };
+                // Compute resolved_target_guest_id BEFORE the auto-reroute block so we can
+                // gate on it — target_guest_id may be None (e.g. membrane sends target_role="agent"
+                // with no explicit guest_id), but resolve_agent_route fills in the active brain/
+                // orchestrator guest from the session's active_incarnation_id.
+                let resolved_target_guest_id = match &route_resolution {
+                    AgentRouteResolution::Deliver(guest_id) => guest_id.clone(),
+                    AgentRouteResolution::Park { guest_id } => Some(guest_id.clone()),
+                };
+                // If the caller targeted this node but the resolved guest isn't configured here,
+                // look up the live node via registry (advertisements + HotelStateSync roster)
+                // so the mesh dispatcher forwards the task to the correct hotel automatically.
                 let target_node = if target_node == local_node_id {
-                    if let Some(ref guest_id) = target_guest_id {
+                    if let Some(ref guest_id) = resolved_target_guest_id {
                         if !Self::configured_local_guest_exists(graph, local_node_id, guest_id) {
                             let reg = registry.read().await;
-                            if let Some(status) = reg.find_node_for_incarnation(guest_id) {
-                                let remote = status.capabilities.node_id.clone();
+                            if let Some(remote) =
+                                Self::resolve_guest_home_node(graph, &reg, guest_id)
+                            {
                                 info!(guest_id, remote, "EmitTask: auto-routing to mesh peer");
                                 remote
+                            } else {
+                                target_node
+                            }
+                        } else {
+                            target_node
+                        }
+                    } else if target_role != "agent" {
+                        // No specific guest_id. For non-agent roles, discover the nearest
+                        // mesh peer advertising this role when no local subscriber is active.
+                        let has_local_sub = {
+                            let guard = inboxes.lock().await;
+                            guard
+                                .get(target_role.as_str())
+                                .map(|v| !v.is_empty())
+                                .unwrap_or(false)
+                        };
+                        if !has_local_sub {
+                            let reg = registry.read().await;
+                            if let Some(ad) = reg
+                                .advertisements_for_role(target_role.as_str())
+                                .filter(|ad| ad.node_id != local_node_id)
+                                .min_by_key(|ad| ad.latency_hint_ms.unwrap_or(u32::MAX))
+                            {
+                                info!(
+                                    target_role = target_role.as_str(),
+                                    remote_node = ad.node_id.as_str(),
+                                    "EmitTask: role-based mesh discovery"
+                                );
+                                ad.node_id.clone()
                             } else {
                                 target_node
                             }
@@ -8155,10 +8911,6 @@ impl IpcServer {
                     }
                 } else {
                     target_node
-                };
-                let resolved_target_guest_id = match &route_resolution {
-                    AgentRouteResolution::Deliver(guest_id) => guest_id.clone(),
-                    AgentRouteResolution::Park { guest_id } => Some(guest_id.clone()),
                 };
                 let task_json = if target_node == local_node_id {
                     attach_delivery_context(
@@ -8343,7 +9095,7 @@ impl IpcServer {
                         "guest must register before requesting a handoff",
                     );
                 };
-                if identity.role != "agent" {
+                if !Self::is_agent_handoff_caller(graph, identity) {
                     return IpcResponse::error(
                         "handoff_to_role",
                         "HANDOFF_FORBIDDEN",
@@ -8405,9 +9157,16 @@ impl IpcServer {
                             "Dispatched remote handoff for role '{}' to home_node '{}'",
                             role_name, home_node
                         );
+                        // Update local session active_incarnation_id so subsequent messages
+                        // on this hotel route cross-hotel to the remote role guest.
+                        if let Ok(Some(mut session_rec)) = graph.get_session(&session_id) {
+                            session_rec.active_incarnation_id = Some(target_role.guest_id.clone());
+                            session_rec.updated_at = unix_ts();
+                            let _ = graph.upsert_session(&session_rec);
+                        }
                         return IpcResponse::HandoffAck {
                             handoff_guest_id: target_role.guest_id,
-                            became_active: false,
+                            became_active: true,
                         };
                     }
                 }
@@ -8561,7 +9320,7 @@ impl IpcServer {
                         "guest must register before handing back",
                     );
                 };
-                if identity.role != "agent" {
+                if !Self::is_agent_handoff_caller(graph, identity) {
                     return IpcResponse::error(
                         "handoff_back",
                         "HANDOFF_FORBIDDEN",
@@ -8580,6 +9339,37 @@ impl IpcServer {
                             );
                         }
                     };
+                let readiness = match Self::ensure_role_materialized(
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    local_node_id,
+                    &target_role_record.agent_id,
+                    &target_role_record.role_name,
+                )
+                .await
+                {
+                    Ok(readiness) => readiness,
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "handoff_back",
+                            "HANDOFF_BACK_MATERIALIZATION_FAILED",
+                            err.to_string(),
+                        );
+                    }
+                };
+                if matches!(
+                    readiness,
+                    RoleReadinessState::Configured
+                        | RoleReadinessState::Materializing
+                        | RoleReadinessState::Materialized
+                ) {
+                    return IpcResponse::HandoffPending {
+                        role_name: target_role,
+                        readiness: readiness.as_str().into(),
+                        retry_after_ms: Some(250),
+                    };
+                }
                 let target_guest_id = target_role_record.guest_id.clone();
                 let task_id = Uuid::new_v4();
 
@@ -8638,13 +9428,11 @@ impl IpcServer {
                 .to_string();
                 let task_json =
                     attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
-                match Self::queue_or_deliver_guest_task(
+                match Self::deliver_live_guest_task(
                     graph,
                     inboxes,
-                    parked_inbound,
-                    materialization_requester,
                     local_node_id,
-                    "agent",
+                    &target_role_record.routing_role(),
                     &target_guest_id,
                     task_id,
                     task_json,
@@ -8652,10 +9440,34 @@ impl IpcServer {
                 )
                 .await
                 {
-                    Ok(active) => IpcResponse::HandoffBackAck {
-                        return_guest_id: target_guest_id,
-                        became_active: active,
-                    },
+                    Ok(true) => {
+                        if let Err(err) = graph.set_role_incarnation_readiness(
+                            &target_role_record.agent_id,
+                            &target_role_record.role_name,
+                            RoleReadinessState::ActiveInSession,
+                        ) {
+                            warn!(
+                                "Failed to mark return role [{}] active in session: {}",
+                                target_role_record.role_name, err
+                            );
+                        }
+                        IpcResponse::HandoffBackAck {
+                            return_guest_id: target_guest_id,
+                            became_active: true,
+                        }
+                    }
+                    Ok(false) => {
+                        let _ = graph.set_role_incarnation_readiness(
+                            &target_role_record.agent_id,
+                            &target_role_record.role_name,
+                            RoleReadinessState::Materializing,
+                        );
+                        IpcResponse::HandoffPending {
+                            role_name: target_role_record.role_name,
+                            readiness: RoleReadinessState::Materializing.as_str().into(),
+                            retry_after_ms: Some(250),
+                        }
+                    }
                     Err(err) => IpcResponse::error(
                         "handoff_back",
                         "HANDOFF_DELIVERY_FAILED",
@@ -9854,10 +10666,10 @@ impl IpcServer {
                 )
             }
             // Handled before process_request is called (in handle_client).
-            IpcRequest::FetchMemoryConfig => IpcResponse::error(
+            IpcRequest::FetchMemoryConfig | IpcRequest::RefreshMemoryConfig => IpcResponse::error(
                 "memory",
                 "UNREACHABLE",
-                "FetchMemoryConfig dispatched early",
+                "FetchMemoryConfig/RefreshMemoryConfig dispatched early",
             ),
             IpcRequest::ListTrainingSamples { .. }
             | IpcRequest::CorrectTrainingSample { .. }
@@ -10622,7 +11434,8 @@ impl IpcServer {
                 IpcResponse::success("seed_remote_incarnation", None)
             }
             // ── Cron scheduler ──────────────────────────────────────────────
-            IpcRequest::RegisterCronJob { job } => {
+            IpcRequest::RegisterCronJob { mut job } => {
+                Self::normalize_cron_target_role(graph, &mut job);
                 info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
                 match graph.upsert_cron_job(&job) {
                     Ok(_) => {
@@ -10759,6 +11572,68 @@ impl IpcServer {
                             // The philote that handles this role incarnation registers
                             // with guest_id = "{agent_id}:{role_name}".
                             let role_guest_id = inc.guest_id.clone();
+
+                            // Cross-hotel: if the role's guest is not configured on this hotel,
+                            // look it up in the mesh registry (HotelStateSync) and dispatch
+                            // cross-hotel rather than trying to materialize it locally.
+                            if !Self::configured_local_guest_exists(
+                                graph,
+                                local_node_id,
+                                &role_guest_id,
+                            ) {
+                                let remote_node = {
+                                    let reg = registry.read().await;
+                                    Self::resolve_guest_home_node(graph, &reg, &role_guest_id)
+                                };
+                                if let Some(remote_node) = remote_node {
+                                    // Inject delivery_target_guest_id so the remote hotel
+                                    // routes to the correct brain/specialist philote.
+                                    let remote_task_json = if let Ok(mut v) =
+                                        serde_json::from_str::<serde_json::Value>(&task_json)
+                                    {
+                                        if let Some(obj) = v.as_object_mut() {
+                                            obj.entry("delivery_target_guest_id").or_insert_with(
+                                                || serde_json::json!(role_guest_id),
+                                            );
+                                        }
+                                        serde_json::to_string(&v).unwrap_or(task_json)
+                                    } else {
+                                        task_json
+                                    };
+                                    let env = EventEnvelope {
+                                        event_id: task_id,
+                                        seq: 0,
+                                        source_node_id: local_node_id.to_string(),
+                                        target_node_id: Some(remote_node.clone()),
+                                        source_agent_id: "unknown".into(),
+                                        target_agent_id: Some(role.clone()),
+                                        kind: EventKind::TaskInvoke,
+                                        corr_id: "paracrine".into(),
+                                        attempt: 0,
+                                        created_at: 0,
+                                        expires_at: None,
+                                        payload: EventPayload::Inline {
+                                            data: remote_task_json,
+                                        },
+                                        trace: vec![],
+                                    };
+                                    info!(
+                                        role = %role,
+                                        remote_node = %remote_node,
+                                        role_guest_id = %role_guest_id,
+                                        "ParacrineEmit: cross-hotel dispatch to mesh peer"
+                                    );
+                                    let _ =
+                                        dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
+                                    return IpcResponse::success("paracrine_emit", None);
+                                } else {
+                                    warn!(
+                                        role = %role,
+                                        role_guest_id = %role_guest_id,
+                                        "ParacrineEmit: role guest not found in mesh registry; attempting local materialization"
+                                    );
+                                }
+                            }
 
                             // Park the task — flushed when the role philote connects.
                             {
@@ -10963,6 +11838,41 @@ impl IpcServer {
                     })
                     .collect();
 
+                let reg = registry.read().await;
+                let mesh_peers: Vec<serde_json::Value> = reg
+                    .remote_hotel_states()
+                    .map(|state| {
+                        let peer_guests: Vec<serde_json::Value> = state
+                            .guests
+                            .iter()
+                            .map(|g| {
+                                serde_json::json!({
+                                    "guest_id": g.guest_id,
+                                    "role": g.role,
+                                    "active": g.active,
+                                })
+                            })
+                            .collect();
+                        let peer_agents: Vec<serde_json::Value> = state
+                            .agents
+                            .iter()
+                            .map(|a| {
+                                serde_json::json!({
+                                    "agent_id": a.agent_id,
+                                    "persona_name": a.persona_name,
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "hotel_name": state.hotel_name,
+                            "node_id": state.node_id,
+                            "guests": peer_guests,
+                            "agents": peer_agents,
+                        })
+                    })
+                    .collect();
+                drop(reg);
+
                 IpcResponse::success(
                     "hotel_status",
                     Some(serde_json::json!({
@@ -10970,6 +11880,7 @@ impl IpcServer {
                         "node_id": local_node_id,
                         "guests": guests,
                         "agents": agents,
+                        "mesh_peers": mesh_peers,
                     })),
                 )
             }
@@ -11584,7 +12495,6 @@ impl IpcServer {
             }
 
             // ── User Task Engine ──────────────────────────────────────────────
-
             IpcRequest::CreateUserTask {
                 task_id,
                 session_id,
@@ -13666,7 +14576,12 @@ impl IpcServer {
                 .or_else(|| {
                     let source = payload.get("source").and_then(serde_json::Value::as_str)?;
                     let chat_id = payload.get("chat_id")?.as_str()?;
-                    Some(format!("{source}:{chat_id}:agent-jane-01"))
+                    let agent_id = payload
+                        .get("primary_agent_id")
+                        .or_else(|| payload.get("agent_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("agent-jane-01");
+                    Some(format!("{source}:{chat_id}:{agent_id}"))
                 }),
             turn_id: payload
                 .get("turn_id")
@@ -13676,7 +14591,14 @@ impl IpcServer {
                 .get("primary_agent_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
-                .or_else(|| Some("agent-jane-01".to_string())),
+                .or_else(|| {
+                    // agent_id is the canonical field in EmitTask payloads (e.g. operator_chat
+                    // tasks dispatched with agent_id but no primary_agent_id).
+                    payload
+                        .get("agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                }),
             source: payload
                 .get("source")
                 .and_then(serde_json::Value::as_str)
@@ -13815,6 +14737,9 @@ impl IpcServer {
                     }
                 }
 
+                // Carry allowed_classes so philote can expand class-tagged catalog tools.
+                let allowed_classes = profile.allowed_classes.clone();
+
                 if let Some(obj) = bindings.as_object_mut() {
                     obj.insert("effective_toolset".to_string(), serde_json::json!(toolset));
                     obj.insert(
@@ -13824,12 +14749,53 @@ impl IpcServer {
                     if !on_demand.is_empty() {
                         obj.insert("on_demand_skills".to_string(), serde_json::json!(on_demand));
                     }
+                    if !allowed_classes.is_empty() {
+                        obj.insert(
+                            "allowed_classes".to_string(),
+                            serde_json::json!(allowed_classes),
+                        );
+                    }
                 } else {
                     bindings = serde_json::json!({
                         "effective_toolset": toolset,
                         "effective_skillset": skillset,
                         "on_demand_skills": on_demand,
+                        "allowed_classes": allowed_classes,
                     });
+                }
+
+                // Merge profile-level remote_tool_runners into
+                // allowed_tool_runner_incarnations.  Per-session overrides in
+                // summary_json.bindings are preserved; profile entries are
+                // appended only if not already present by incarnation_id.
+                if !profile.remote_tool_runners.is_empty() {
+                    let mut incarnations: Vec<serde_json::Value> = bindings
+                        .get("allowed_tool_runner_incarnations")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for runner in &profile.remote_tool_runners {
+                        let runner_id = runner
+                            .get("incarnation_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if !runner_id.is_empty()
+                            && !incarnations.iter().any(|existing| {
+                                existing
+                                    .get("incarnation_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(runner_id)
+                            })
+                        {
+                            incarnations.push(runner.clone());
+                        }
+                    }
+                    if let Some(obj) = bindings.as_object_mut() {
+                        obj.insert(
+                            "allowed_tool_runner_incarnations".to_string(),
+                            serde_json::Value::Array(incarnations),
+                        );
+                    }
                 }
             }
         }
@@ -15407,6 +16373,18 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
     if toolset.is_empty() {
         toolset.push("echo".into());
     }
+    if let Some(classes) = bindings
+        .get("allowed_classes")
+        .and_then(serde_json::Value::as_array)
+    {
+        for class in classes.iter().filter_map(serde_json::Value::as_str) {
+            for tool in tools_for_allowed_class(class) {
+                if !toolset.iter().any(|existing| existing == tool) {
+                    toolset.push(tool.to_string());
+                }
+            }
+        }
+    }
     let rights = bindings
         .get("effective_rights")
         .and_then(serde_json::Value::as_array)
@@ -15426,6 +16404,20 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
         .into_iter()
         .filter(|tool_name| has_right(&rights, &tool_right(tool_name)))
         .collect()
+}
+
+fn tools_for_allowed_class(class: &str) -> &'static [&'static str] {
+    match class {
+        "life_graph" => &[
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.conflict",
+            "life.patch.propose",
+        ],
+        _ => &[],
+    }
 }
 
 fn shared_tool_receptor_record<'a>(
@@ -15964,6 +16956,7 @@ mod tests {
     use ansible_mesh_core::agent_graph_storage::{
         AgentGraphStorage, AgentReflexPreference, AgentRoutingPreference, SqliteAgentGraphStorage,
     };
+    use ansible_mesh_core::cron::{CronJob, CronJobSource};
     use ansible_mesh_core::graph::{
         MembraneTransportHomeRecord, RoleIncarnationRecord, TurnLoopConfig,
     };
@@ -16181,6 +17174,72 @@ mod tests {
         assert_eq!(components[0]["component_config"]["guild_id"], "1234");
     }
 
+    fn test_cron_job(target_role: &str, agent_id: &str) -> CronJob {
+        CronJob {
+            id: "job-1".into(),
+            schedule: "0 0 7 * * * *".into(),
+            target_role: target_role.into(),
+            target_node_id: None,
+            payload: "{}".into(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at: 0,
+            created_at: 0,
+            created_by: CronJobSource::Guest(agent_id.into()),
+        }
+    }
+
+    #[test]
+    fn normalize_cron_target_role_resolves_bare_role_name_to_routing_key() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: true,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let mut job = test_cron_job("orchestrator", "agent-beacon");
+        IpcServer::normalize_cron_target_role(&graph, &mut job);
+
+        assert_eq!(job.target_role, "role:agent-beacon:orchestrator");
+    }
+
+    #[test]
+    fn normalize_cron_target_role_leaves_unresolvable_role_untouched() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        // No role incarnation seeded for "agent-beacon"/"orchestrator" — normalization
+        // should leave the bare string alone rather than guess.
+        let mut job = test_cron_job("orchestrator", "agent-beacon");
+        IpcServer::normalize_cron_target_role(&graph, &mut job);
+
+        assert_eq!(job.target_role, "orchestrator");
+    }
+
+    #[test]
+    fn normalize_cron_target_role_is_idempotent_for_already_qualified_roles() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        let mut job = test_cron_job("role:agent-beacon:orchestrator", "agent-beacon");
+        IpcServer::normalize_cron_target_role(&graph, &mut job);
+
+        assert_eq!(job.target_role, "role:agent-beacon:orchestrator");
+    }
+
     #[test]
     fn remove_component_deletes_guest_and_component_config() {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -16334,6 +17393,190 @@ mod tests {
         IPC_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn response_task_json(session_id: &str) -> String {
+        serde_json::json!({
+            "session_id": session_id,
+            "action": "model_response",
+            "content": "hi"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn infer_response_target_reroutes_to_base_agent_when_active_incarnation_not_live() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-beacon-stuck".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        // Only the base agent guest is actually live — the role-incarnation guest
+        // (agent-beacon:orchestrator) recorded on the session is not registered,
+        // reproducing the 2026-06-22 "beacon got stuck" incident.
+        let live_agent_guests = vec!["agent-beacon".to_string()];
+
+        let resolved = infer_response_target_guest_id_for_agent_task(
+            &graph,
+            "agent",
+            None,
+            &response_task_json("sess-beacon-stuck"),
+            &live_agent_guests,
+        );
+
+        assert_eq!(resolved, Some("agent-beacon".to_string()));
+    }
+
+    #[test]
+    fn infer_response_target_keeps_active_incarnation_when_live() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-active-live".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let live_agent_guests = vec!["agent-beacon:orchestrator".to_string()];
+
+        let resolved = infer_response_target_guest_id_for_agent_task(
+            &graph,
+            "agent",
+            None,
+            &response_task_json("sess-active-live"),
+            &live_agent_guests,
+        );
+
+        assert_eq!(resolved, Some("agent-beacon:orchestrator".to_string()));
+    }
+
+    #[test]
+    fn infer_response_target_honors_explicit_return_route_even_when_not_live() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-explicit-route".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        // No guest is live at all, but the payload carries an explicit ReturnRoute —
+        // that deliberate routing decision must be honored as-is (park, don't reroute).
+        let live_agent_guests: Vec<String> = vec![];
+        let task_json = serde_json::json!({
+            "session_id": "sess-explicit-route",
+            "action": "model_response",
+            "content": "hi",
+            "return_route": { "guest_id": "agent-beacon:developer" }
+        })
+        .to_string();
+
+        let resolved = infer_response_target_guest_id_for_agent_task(
+            &graph,
+            "agent",
+            None,
+            &task_json,
+            &live_agent_guests,
+        );
+
+        assert_eq!(resolved, Some("agent-beacon:developer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn deliver_event_envelope_or_park_ignores_events_addressed_to_another_node() {
+        // Regression: a mesh inbox batch can carry events explicitly addressed to a
+        // different node (e.g. gossiped/relayed). Previously this hotel would try to
+        // park-and-materialize the guest locally, which can never succeed for a remote
+        // hotel's infrastructure guest (e.g. life-graph-runner) since it has no
+        // role_incarnation record — the task parked forever until the turn watchdog
+        // evicted it ~90s later. The function must skip entirely for foreign-targeted events.
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: "vps-jane-aiua-01".into(),
+            target_node_id: Some("vps-jane-aiua-01".into()),
+            source_agent_id: "unknown".into(),
+            target_agent_id: Some("life-graph-runner".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: "test".into(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({
+                    "delivery_target_guest_id": "vps-jane:life-graph-runner",
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+
+        let delivered = IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &event,
+            None,
+            &graph,
+            "mbp-jane-aiua-01",
+            &parked_inbound,
+            Some(&mat_req),
+        )
+        .await;
+
+        assert!(
+            !delivered,
+            "event addressed to a different node must not be handled here"
+        );
+        assert_eq!(
+            mat_req.calls.load(Ordering::SeqCst),
+            0,
+            "must not attempt materialization for a foreign-targeted event"
+        );
+        assert!(
+            parked_inbound.lock().await.is_empty(),
+            "must not park a task that belongs to a different node"
+        );
     }
 
     #[tokio::test]
@@ -16615,6 +17858,7 @@ mod tests {
                 allowed_classes: vec!["session".into(), "workspace".into()],
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: Some("Codex specialist role profile — workspace read access.".into()),
             })
             .expect("seed toolset profile");
@@ -17187,6 +18431,570 @@ mod tests {
             .await
             .is_err(),
             "orchestrator should not receive task when developer is active incarnation"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_overwrites_stale_embedded_guest_with_active_incarnation() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-stale-guest".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:developer".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let task_payload = serde_json::json!({
+            "session_id": "sess-role-stale-guest",
+            "source": "telegram",
+            "chat_id": "123",
+            "content": "route to active developer",
+            "delivery_target_guest_id": "agent-jane:orchestrator"
+        })
+        .to_string();
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: task_payload,
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
+                .await
+                .expect("developer should receive task before timeout")
+                .expect("developer recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route to active developer");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
+            }
+            other => panic!("unexpected developer inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                orchestrator.recv_task()
+            )
+            .await
+            .is_err(),
+            "stale embedded delivery_target_guest_id must not receive the task"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_targets_response_like_agent_payload_to_originating_guest() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut jane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("jane connect");
+        let mut aria = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-aria".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("aria connect");
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "life-graph-runner-smoke".into(),
+            role: "life-graph-runner".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "datasource_response",
+                    "agent_id": "agent-jane",
+                    "session_id": "telegram:7898847424:agent-jane",
+                    "turn_id": "turn-lifegraph",
+                    "chat_id": "7898847424",
+                    "tool_name": "life.recall",
+                    "result": {
+                        "status": "success"
+                    }
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit response-like task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(tokio::time::Duration::from_secs(1), jane.recv_task())
+            .await
+            .expect("jane should receive response before timeout")
+            .expect("jane recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["action"], "datasource_response");
+                assert_eq!(payload["tool_name"], "life.recall");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane");
+            }
+            other => panic!("unexpected jane inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(200), aria.recv_task())
+                .await
+                .is_err(),
+            "broad agent routing must not deliver response-like payloads to unrelated agents"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_targets_response_like_agent_payload_from_return_route() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut jane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("jane connect");
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "model-router-smoke".into(),
+            role: "model-router".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "model_response",
+                    "return_route": {
+                        "node": "local-aiua-01",
+                        "role": "agent",
+                        "guest_id": "agent-jane",
+                        "session_id": "telegram:7898847424:agent-jane",
+                        "turn_id": "turn-model"
+                    },
+                    "agent_action": {
+                        "kind": "respond",
+                        "content": "ok"
+                    }
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit response-like task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+        let delivered = tokio::time::timeout(tokio::time::Duration::from_secs(1), jane.recv_task())
+            .await
+            .expect("jane should receive response before timeout")
+            .expect("jane recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["action"], "model_response");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane");
+            }
+            other => panic!("unexpected jane inbound response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_response_like_payload_falls_back_to_live_base_agent() {
+        // Regression test for the "beacon got stuck" incident (2026-06-22): a
+        // response-like EmitTask whose session.active_incarnation_id points at a
+        // non-live role guest must be delivered to the live base agent guest, not
+        // re-derived back to the unregistered incarnation by resolve_agent_route's
+        // "targets_base_agent" special case (which is meant for fresh inbound task
+        // delivery, not for payloads that already went through response inference).
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-beacon-stuck-e2e".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("7898847424".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        // Only the base agent guest is live — agent-beacon:orchestrator never
+        // connected, matching the live incident exactly.
+        let mut base_agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("base agent connect");
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "model-router-smoke".into(),
+            role: "model-router".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "model_response",
+                    "session_id": "sess-beacon-stuck-e2e",
+                    "content": "fix verification reply"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit response-like task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            base_agent.recv_task(),
+        )
+        .await
+        .expect("base agent should receive response before timeout — must not park ledger-only")
+        .expect("base agent recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["action"], "model_response");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-beacon");
+            }
+            other => panic!("unexpected base agent inbound response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_rejects_unresolved_response_like_agent_payload() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "model-router-smoke".into(),
+            role: "model-router".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "model_response",
+                    "session_id": "missing-session",
+                    "agent_action": {
+                        "kind": "respond",
+                        "content": "ok"
+                    }
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit response-like task");
+
+        match response {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => {
+                assert_eq!(code, "RESPONSE_ROUTE_UNRESOLVED");
+            }
+            other => panic!("expected unresolved route error, got {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_routes_base_agent_target_to_active_incarnation() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-base-target".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:developer".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut base_agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("base agent connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let task_payload = serde_json::json!({
+            "session_id": "sess-role-base-target",
+            "source": "telegram",
+            "chat_id": "123",
+            "content": "route base target to active developer"
+        })
+        .to_string();
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-jane-01".into()),
+                task_json: task_payload,
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
+                .await
+                .expect("developer should receive task before timeout")
+                .expect("developer recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route base target to active developer");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
+            }
+            other => panic!("unexpected developer inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                base_agent.recv_task()
+            )
+            .await
+            .is_err(),
+            "base-agent target must follow the active incarnation instead"
         );
 
         unsafe {
@@ -18783,6 +20591,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_incarnation_can_initiate_manual_handoff_to_role() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-incarnation-handoff".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::ActiveInSession,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("orchestrator role should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane:developer".into(),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("developer role should seed");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "role:agent-jane-01:orchestrator".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "role:agent-jane-01:developer".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        developer
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "agent".into(),
+            })
+            .await
+            .expect("developer agent inbox subscribe");
+
+        let response = orchestrator
+            .send_request(IpcRequest::HandoffToRole {
+                session_id: "sess-role-incarnation-handoff".into(),
+                role_name: "developer".into(),
+                handoff_bundle: HandoffBundle {
+                    goal: "switch role".into(),
+                    context_excerpt: "manual slash command".into(),
+                    session_id: "sess-role-incarnation-handoff".into(),
+                    initiating_turn_id: "turn-1".into(),
+                    return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: None,
+                    active_constraints: vec!["same_identity_role_handoff".into()],
+                    relevant_session_facts: Vec::new(),
+                    working_summary: None,
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("developer".into()),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("required".into()),
+                    cleanup_actions: vec!["switch_active_role".into()],
+                },
+            })
+            .await
+            .expect("handoff request");
+
+        match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id,
+                became_active,
+            } => {
+                assert_eq!(handoff_guest_id, "agent-jane:developer");
+                assert!(became_active);
+            }
+            other => panic!("unexpected handoff response: {other:?}"),
+        }
+
+        let session = graph
+            .get_session("sess-role-incarnation-handoff")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.active_incarnation_id.as_deref(),
+            Some("agent-jane:developer")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn handoff_to_missing_role_returns_pending_until_role_inbox_is_routable() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -20240,6 +22193,7 @@ mod tests {
                 allowed_classes: vec!["session".into()],
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("toolset profile should seed");
@@ -20589,6 +22543,20 @@ mod tests {
                 .get("agent.configure")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn default_visible_toolset_expands_life_graph_class() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo"],
+            "allowed_classes": ["life_graph"],
+        });
+
+        let toolset = default_visible_toolset(&bindings);
+
+        assert!(toolset.iter().any(|tool| tool == "echo"));
+        assert!(toolset.iter().any(|tool| tool == "life.observe"));
+        assert!(toolset.iter().any(|tool| tool == "life.recall"));
     }
 
     #[test]
@@ -23262,6 +25230,7 @@ mod tests {
                 allowed_classes: vec!["workflow".into()],
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: Some("Implementation-focused role lens.".into()),
             })
             .expect("toolset profile should seed");
@@ -27659,6 +29628,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed toolset profile");
@@ -27756,6 +29726,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec!["research".into(), "handoff.back".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed toolset profile with skills");
@@ -27857,6 +29828,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed empty toolset profile");
@@ -27945,6 +29917,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec!["research".into()],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed profile with research already present");
@@ -28047,6 +30020,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed toolset profile");
@@ -28132,6 +30106,7 @@ mod tests {
                 allowed_classes: vec![],
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
+                remote_tool_runners: vec![],
                 description: None,
             })
             .expect("seed toolset profile");
@@ -28306,6 +30281,15 @@ mod tests {
             other => panic!("unexpected handoff back response: {other:?}"),
         }
 
+        let session = graph
+            .get_session("sess-handoff-back")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.active_incarnation_id.as_deref(),
+            Some("agent-beacon-01:orchestrator")
+        );
+
         // Orchestrator inbox must receive the "handoff_return" task.
         let delivered = tokio::time::timeout(
             tokio::time::Duration::from_secs(1),
@@ -28430,6 +30414,14 @@ mod tests {
             matches!(response, IpcResponse::HandoffBackAck { ref return_guest_id, .. } if return_guest_id == "agent-beacon-01:orchestrator"),
             "default return_to must route to orchestrator, got: {response:?}"
         );
+        let session = graph
+            .get_session("sess-handoff-back-default")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.active_incarnation_id.as_deref(),
+            Some("agent-beacon-01:orchestrator")
+        );
 
         // Orchestrator should still receive the task.
         let delivered = tokio::time::timeout(
@@ -28442,6 +30434,123 @@ mod tests {
         assert!(
             matches!(delivered, IpcResponse::InboundTask { ref task_json, .. } if task_json.contains("handoff_return")),
             "delivered task must contain handoff_return action"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_back_materializes_configured_orchestrator_before_return() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-handoff-back-materialize".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon-01".into()),
+                active_incarnation_id: Some("agent-beacon-01:developer".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("888".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("orchestrator role should seed");
+
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester.clone());
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon-01:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+
+        let response = developer
+            .send_request(IpcRequest::HandoffBack {
+                session_id: "sess-handoff-back-materialize".into(),
+                summary: "task complete, returning to orchestrator".into(),
+                return_to: None,
+            })
+            .await
+            .expect("handoff back request");
+
+        match response {
+            IpcResponse::HandoffPending { role_name, .. } => {
+                assert_eq!(role_name, "orchestrator");
+            }
+            other => panic!("expected pending handoff back, got: {other:?}"),
+        }
+        assert_eq!(requester.calls.load(Ordering::SeqCst), 1);
+        let session = graph
+            .get_session("sess-handoff-back-materialize")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.active_incarnation_id.as_deref(),
+            Some("agent-beacon-01:developer")
         );
 
         unsafe {

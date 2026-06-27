@@ -1,4 +1,7 @@
-use crate::controller::{ControllerTask, ModelProvider, ProviderOutput, TaskKind};
+use crate::controller::{
+    AttemptPolicy, BackoffStrategy, ControllerTask, ModelProvider, ProviderOutput, RetryPolicy,
+    RetryableErrorClass, TaskKind,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -15,6 +18,7 @@ pub struct OllamaProvider {
     http_client: reqwest::Client,
     base_url: String,
     default_model: String,
+    max_tokens: u64,
 }
 
 impl OllamaProvider {
@@ -30,6 +34,10 @@ impl OllamaProvider {
                 .trim_end_matches('/')
                 .to_string(),
             default_model: model.unwrap_or_else(|| "gemma4:e4b".into()),
+            max_tokens: std::env::var("PHILOTIC_OLLAMA_MAX_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(256),
         }
     }
 
@@ -84,6 +92,10 @@ impl ModelProvider for OllamaProvider {
             "model": model,
             "messages": messages,
             "stream": false,
+            "max_tokens": self.max_tokens,
+            "options": {
+                "num_predict": self.max_tokens
+            },
         });
 
         info!(
@@ -130,6 +142,22 @@ impl ModelProvider for OllamaProvider {
             active_plan: None,
             model_gen: None,
         })
+    }
+
+    fn attempt_policy(&self) -> AttemptPolicy {
+        AttemptPolicy {
+            connect_secs: 10,
+            idle_secs: 10,
+            total_secs: 45,
+        }
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffStrategy::None,
+            retryable: RetryableErrorClass::default(),
+        }
     }
 }
 

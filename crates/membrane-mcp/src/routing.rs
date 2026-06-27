@@ -117,17 +117,19 @@ impl RoutingTable {
         self.routes.get(tool_name)
     }
 
-    /// All routes as MCP tool descriptors (for tools/list).
-    pub fn all_descriptors(&self) -> Vec<McpToolDescriptor> {
-        self.routes.values().map(|r| r.as_descriptor()).collect()
-    }
-
     /// All routes that a caller is authorized to see.
     ///
-    /// For now this returns all routes — the auth layer enforces
-    /// per-call authorization. Future slice: filter by caller scopes here.
-    pub fn visible_descriptors(&self, _caller_id: Option<&str>) -> Vec<McpToolDescriptor> {
-        self.all_descriptors()
+    /// This filters descriptor visibility before `tools/list` so public MCP
+    /// surfaces do not disclose tool names to callers without a valid grant.
+    pub fn visible_descriptors_by(
+        &self,
+        mut is_visible: impl FnMut(&ResolvedRoute) -> bool,
+    ) -> Vec<McpToolDescriptor> {
+        self.routes
+            .values()
+            .filter(|route| is_visible(route))
+            .map(|route| route.as_descriptor())
+            .collect()
     }
 }
 
@@ -173,6 +175,24 @@ impl McpEndpointTable {
         self.config.as_ref().map_or(vec![], |c| {
             c.tools
                 .iter()
+                .map(|t| McpToolDescriptor {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.input_schema.clone(),
+                })
+                .collect()
+        })
+    }
+
+    /// Tool descriptors visible to a caller after endpoint-level auth filtering.
+    pub fn visible_tool_descriptors(
+        &self,
+        mut is_visible: impl FnMut(&McpToolSpec) -> bool,
+    ) -> Vec<McpToolDescriptor> {
+        self.config.as_ref().map_or(vec![], |c| {
+            c.tools
+                .iter()
+                .filter(|tool| is_visible(tool))
                 .map(|t| McpToolDescriptor {
                     name: t.name.clone(),
                     description: t.description.clone(),

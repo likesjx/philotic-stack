@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-shaping-context
+
+rectangle "memory-shaping-context" as memory_shaping_context #Orange {
+}
+
+
+@enduml

@@ -67,6 +67,8 @@ pub enum MsgType {
     MeshCatalogSync,
     /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
     WebRtcSignal,
+    /// Full hotel roster (guests + agents) broadcast so every peer can route correctly
+    HotelStateSync,
 }
 
 #[cfg(test)]

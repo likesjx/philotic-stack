@@ -270,6 +270,8 @@ pub enum EdgeRelation {
     Imports,
     TraitImpl,
     Overlaps,
+    /// Function-level call edge, imported from the graphify tree-sitter bridge
+    Calls,
     // Verification tracking
     TestedBy,
     SmokedBy,
@@ -302,6 +304,7 @@ impl EdgeRelation {
             Self::Imports => "imports",
             Self::TraitImpl => "trait_impl",
             Self::Overlaps => "overlaps",
+            Self::Calls => "calls",
             // Verification tracking
             Self::TestedBy => "tested_by",
             Self::SmokedBy => "smoked_by",
@@ -333,6 +336,7 @@ impl EdgeRelation {
             "imports" => Some(Self::Imports),
             "trait_impl" => Some(Self::TraitImpl),
             "overlaps" => Some(Self::Overlaps),
+            "calls" => Some(Self::Calls),
             // Verification tracking
             "tested_by" => Some(Self::TestedBy),
             "smoked_by" => Some(Self::SmokedBy),

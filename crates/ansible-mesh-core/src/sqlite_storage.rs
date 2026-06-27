@@ -14,6 +14,7 @@ use crate::storage::{
     SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
 };
 use anyhow::{Context, Result};
+use rusqlite::types::{Type, ValueRef};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use std::path::Path;
@@ -212,6 +213,15 @@ impl EventStorage for SqliteEventStorage {
 
         Ok(events)
     }
+
+    fn delete_delivered_events(&self, target_node_id: &str, max_seq: u64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM mesh_events WHERE target_node_id = ?1 AND seq <= ?2",
+            params![target_node_id, max_seq],
+        )?;
+        Ok(n)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -359,7 +369,7 @@ impl GraphAdapter for SqliteGraphAdapter {
         let mut rows = stmt.query(params![node_key])?;
 
         if let Some(row) = rows.next()? {
-            let data_json: String = row.get(3)?;
+            let data_json = json_column_as_string(row, 3)?;
             Ok(Some(GraphNode {
                 node_key: row.get(0)?,
                 kind: row.get(1)?,
@@ -393,7 +403,7 @@ impl GraphAdapter for SqliteGraphAdapter {
              ORDER BY node_key ASC",
         )?;
         let rows = stmt.query_map(params![kind], |row| {
-            let data_json: String = row.get(3)?;
+            let data_json = json_column_as_string(row, 3)?;
             Ok(GraphNode {
                 node_key: row.get(0)?,
                 kind: row.get(1)?,
@@ -453,7 +463,7 @@ impl GraphAdapter for SqliteGraphAdapter {
     ) -> Result<Vec<GraphEdge>> {
         let conn = self.conn.lock().unwrap();
         let decode_row = |row: &rusqlite::Row<'_>| {
-            let data_json: String = row.get(4)?;
+            let data_json = json_column_as_string(row, 4)?;
             Ok(GraphEdge {
                 edge_key: row.get(0)?,
                 src_node_key: row.get(1)?,
@@ -502,6 +512,22 @@ impl GraphAdapter for SqliteGraphAdapter {
 pub struct SqliteGraphStorage {
     conn: Arc<Mutex<Connection>>,
     adapter: SqliteGraphAdapter,
+}
+
+fn json_column_as_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+    match row.get_ref(index)? {
+        ValueRef::Text(bytes) => String::from_utf8(bytes.to_vec()).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(err))
+        }),
+        ValueRef::Blob(bytes) => String::from_utf8(bytes.to_vec()).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Blob, Box::new(err))
+        }),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            String::new(),
+            other.data_type(),
+        )),
+    }
 }
 
 impl SqliteGraphStorage {

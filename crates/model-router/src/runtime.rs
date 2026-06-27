@@ -9,7 +9,8 @@ use ansible_mesh_core::router_trace::{
 use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
 use anyhow::Result;
 use philotic_client::{
-    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute, TaskErrorPayload,
+    is_ipc_disconnect,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -38,8 +39,7 @@ pub struct ControllerGuestConfig {
 
 #[derive(Debug, Clone)]
 struct ReplyRoute {
-    reply_to: String,
-    reply_role: String,
+    return_route: ReturnRoute,
     final_reply_to: String,
     final_reply_role: String,
     final_reply_guest_id: Option<String>,
@@ -445,8 +445,17 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     role: config.guest_id.to_string(),
                                     supported_tools: Vec::new(),
                                 };
-                                let stream_ipc_opt =
-                                    PhiloticClient::connect(stream_identity).await.ok();
+                                // 5s timeout on the stream IPC connect: if aiua is busy
+                                // during a retry attempt (e.g. second attempt after first
+                                // timed out), connect could hang indefinitely because it
+                                // precedes the attempt_secs outer timeout on invoke_streaming.
+                                let stream_ipc_opt = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    PhiloticClient::connect(stream_identity),
+                                )
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok());
                                 let reply_clone = reply.clone();
                                 tokio::spawn(async move {
                                     let Some(mut stream_ipc) = stream_ipc_opt else {
@@ -458,20 +467,39 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         }
                                         let task_json = serde_json::to_string(&json!({
                                             "action": "streaming_token",
+                                            "return_route": reply_clone.return_route.as_json(),
+                                            "reply_guest_id": reply_clone.return_route.guest_id,
                                             "session_id": reply_clone.session_id,
                                             "turn_id": reply_clone.turn_id,
                                             "chat_id": reply_clone.chat_id,
                                             "content": token,
                                         }))
                                         .unwrap_or_default();
-                                        let _ = stream_ipc
-                                            .send_request(IpcRequest::EmitTask {
-                                                target_node: reply_clone.reply_to.clone(),
-                                                target_role: reply_clone.reply_role.clone(),
-                                                target_guest_id: None,
+                                        // 10s timeout on the ACK from aiua: if the hotel is
+                                        // slow to respond, drop the connection rather than
+                                        // filling the channel and stalling invoke_streaming.
+                                        let send_result = tokio::time::timeout(
+                                            Duration::from_secs(10),
+                                            stream_ipc.send_request(IpcRequest::EmitTask {
+                                                target_node: reply_clone.return_route.node.clone(),
+                                                target_role: reply_clone.return_route.role.clone(),
+                                                target_guest_id: reply_clone
+                                                    .return_route
+                                                    .guest_id
+                                                    .clone(),
                                                 task_json,
-                                            })
-                                            .await;
+                                            }),
+                                        )
+                                        .await;
+                                        if send_result.is_err() {
+                                            // Timeout or IPC error — stop forwarding tokens.
+                                            // Dropping token_rx makes future send() calls in
+                                            // invoke_streaming return Err immediately (no block).
+                                            warn!(
+                                                "streaming forwarder: send_request timeout, dropping stream"
+                                            );
+                                            break;
+                                        }
                                     }
                                 });
                                 tokio::time::timeout(
@@ -622,17 +650,22 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                             supported_tools: Vec::new(),
                                         };
                                         tokio::spawn(async move {
-                                            if let Ok(mut fanout_ipc) =
-                                                PhiloticClient::connect(fanout_identity).await
-                                            {
-                                                let _ = fanout_ipc
-                                                    .send_request(IpcRequest::EmitTask {
+                                            let connect = tokio::time::timeout(
+                                                Duration::from_secs(5),
+                                                PhiloticClient::connect(fanout_identity),
+                                            )
+                                            .await;
+                                            if let Ok(Ok(mut fanout_ipc)) = connect {
+                                                let _ = tokio::time::timeout(
+                                                    Duration::from_secs(10),
+                                                    fanout_ipc.send_request(IpcRequest::EmitTask {
                                                         target_node: local_node_id(),
                                                         target_role: "router-listener".to_string(),
                                                         target_guest_id: None,
                                                         task_json: capture_json,
-                                                    })
-                                                    .await;
+                                                    }),
+                                                )
+                                                .await;
                                             }
                                         });
                                     }
@@ -893,9 +926,9 @@ async fn emit_text_response(
     response: ControllerResponseEnvelope,
 ) -> Result<()> {
     let reply_req = IpcRequest::EmitTask {
-        target_node: reply.reply_to.clone(),
-        target_role: reply.reply_role.clone(),
-        target_guest_id: None,
+        target_node: reply.return_route.node.clone(),
+        target_role: reply.return_route.role.clone(),
+        target_guest_id: reply.return_route.guest_id.clone(),
         task_json: json!({
             "action": "model_response",
             "agent_action": {
@@ -920,6 +953,8 @@ async fn emit_text_response(
                     "provider_output": response.provider_output,
                 }
             },
+            "return_route": reply.return_route.as_json(),
+            "reply_guest_id": reply.return_route.guest_id,
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
@@ -931,7 +966,9 @@ async fn emit_text_response(
         .to_string(),
     };
 
-    ipc_client.send_request(reply_req).await?;
+    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("emit_text_response: ipc ack timeout after 30s"))??;
     Ok(())
 }
 
@@ -943,9 +980,9 @@ async fn emit_tool_call_response(
     model_result: Option<Value>,
 ) -> Result<()> {
     let reply_req = IpcRequest::EmitTask {
-        target_node: reply.reply_to.clone(),
-        target_role: reply.reply_role.clone(),
-        target_guest_id: None,
+        target_node: reply.return_route.node.clone(),
+        target_role: reply.return_route.role.clone(),
+        target_guest_id: reply.return_route.guest_id.clone(),
         task_json: json!({
             "action": "model_response",
             "agent_action": {
@@ -954,6 +991,8 @@ async fn emit_tool_call_response(
                 "arguments": arguments,
                 "model_result": model_result,
             },
+            "return_route": reply.return_route.as_json(),
+            "reply_guest_id": reply.return_route.guest_id,
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
@@ -964,7 +1003,9 @@ async fn emit_tool_call_response(
         .to_string(),
     };
 
-    ipc_client.send_request(reply_req).await?;
+    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("emit_tool_call_response: ipc ack timeout after 30s"))??;
     Ok(())
 }
 
@@ -1009,16 +1050,18 @@ async fn emit_failure(
         provider.unwrap_or("unknown"),
         message
     );
-    let _ = ipc_client
-        .send_request(IpcRequest::PushHealEntry {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        ipc_client.send_request(IpcRequest::PushHealEntry {
             guest_id: guest_id.to_string(),
             raw_text,
-        })
-        .await;
+        }),
+    )
+    .await;
     let reply_req = IpcRequest::EmitTask {
-        target_node: reply.reply_to.clone(),
-        target_role: reply.reply_role.clone(),
-        target_guest_id: None,
+        target_node: reply.return_route.node.clone(),
+        target_role: reply.return_route.role.clone(),
+        target_guest_id: reply.return_route.guest_id.clone(),
         task_json: json!({
             "action": "model_response",
             "agent_action": {
@@ -1030,6 +1073,8 @@ async fn emit_failure(
                 }
             },
             "error": serde_json::to_value(&error_payload)?,
+            "return_route": reply.return_route.as_json(),
+            "reply_guest_id": reply.return_route.guest_id,
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
@@ -1041,7 +1086,9 @@ async fn emit_failure(
         .to_string(),
     };
 
-    ipc_client.send_request(reply_req).await?;
+    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+        .await
+        .map_err(|_| anyhow::anyhow!("emit_failure: ipc ack timeout after 30s"))??;
     Ok(())
 }
 
@@ -1057,19 +1104,23 @@ async fn emit_falling_back(
     let task_json = json!({
         "action": "model_dispatch_status",
         "content": label,
+        "return_route": reply.return_route.as_json(),
+        "reply_guest_id": reply.return_route.guest_id,
         "session_id": reply.session_id,
         "turn_id": reply.turn_id,
         "chat_id": reply.chat_id,
     })
     .to_string();
-    let _ = ipc_client
-        .send_request(IpcRequest::EmitTask {
-            target_node: reply.reply_to.clone(),
-            target_role: reply.reply_role.clone(),
-            target_guest_id: None,
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        ipc_client.send_request(IpcRequest::EmitTask {
+            target_node: reply.return_route.node.clone(),
+            target_role: reply.return_route.role.clone(),
+            target_guest_id: reply.return_route.guest_id.clone(),
             task_json,
-        })
-        .await;
+        }),
+    )
+    .await;
 }
 
 /// Emit a dispatch status event to philote so it can surface transient state
@@ -1089,19 +1140,23 @@ async fn emit_dispatch_status(
     let task_json = json!({
         "action": "model_dispatch_status",
         "content": label,
+        "return_route": reply.return_route.as_json(),
+        "reply_guest_id": reply.return_route.guest_id,
         "session_id": reply.session_id,
         "turn_id": reply.turn_id,
         "chat_id": reply.chat_id,
     })
     .to_string();
-    let _ = ipc_client
-        .send_request(IpcRequest::EmitTask {
-            target_node: reply.reply_to.clone(),
-            target_role: reply.reply_role.clone(),
-            target_guest_id: None,
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        ipc_client.send_request(IpcRequest::EmitTask {
+            target_node: reply.return_route.node.clone(),
+            target_role: reply.return_route.role.clone(),
+            target_guest_id: reply.return_route.guest_id.clone(),
             task_json,
-        })
-        .await;
+        }),
+    )
+    .await;
 }
 
 fn classify_provider_failure(
@@ -1156,16 +1211,21 @@ fn classify_provider_failure(
         return payload;
     }
 
-    // Auth/key errors (4xx) — the provider is broken for this tier; escalate.
+    let lower_message = message.to_lowercase();
+
+    // Auth/key errors (4xx) — the provider tier is misconfigured, not flaky.
+    // Retrying an expired or invalid key only burns the caller's turn watchdog.
     if message.contains("401")
         || message.contains("403")
-        || message.contains("API key not valid")
-        || message.contains("API key")
-        || message.contains("Unauthorized")
-        || message.contains("Unauthenticated")
+        || lower_message.contains("api key expired")
+        || lower_message.contains("api key not valid")
+        || lower_message.contains("invalid api key")
+        || lower_message.contains("api_key_invalid")
+        || lower_message.contains("unauthorized")
+        || lower_message.contains("unauthenticated")
     {
-        payload.sub_kind = Some("provider_error".into());
-        payload.retryable = Some(true);
+        payload.sub_kind = Some("provider_auth".into());
+        payload.retryable = Some(false);
         return payload;
     }
 
@@ -1238,17 +1298,9 @@ fn record_routing_trace(
 impl ReplyRoute {
     fn from_task(task: &Value) -> Self {
         let local_node_id = local_node_id();
+        let return_route = ReturnRoute::from_task(task, &local_node_id, "agent");
         Self {
-            reply_to: task
-                .get("reply_to")
-                .and_then(Value::as_str)
-                .unwrap_or(&local_node_id)
-                .to_string(),
-            reply_role: task
-                .get("reply_role")
-                .and_then(Value::as_str)
-                .unwrap_or("agent")
-                .to_string(),
+            return_route,
             final_reply_to: task
                 .get("final_reply_to")
                 .and_then(Value::as_str)
@@ -1312,6 +1364,21 @@ mod failure_tests {
         assert_eq!(payload.kind, "provider_failure");
         assert_eq!(payload.code, None);
         assert_eq!(payload.retryable, None);
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_expired_api_key_non_retryable() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Gemini API error (400): API key expired. Please renew the API key.",
+        );
+
+        assert_eq!(payload.kind, "provider_failure");
+        assert_eq!(payload.provider.as_deref(), Some("gemini"));
+        assert_eq!(payload.capability.as_deref(), Some("text.generate"));
+        assert_eq!(payload.sub_kind.as_deref(), Some("provider_auth"));
+        assert_eq!(payload.retryable, Some(false));
     }
 }
 

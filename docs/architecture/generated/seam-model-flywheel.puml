@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-flywheel
+
+rectangle "model-flywheel" as model_flywheel #Orange {
+}
+
+
+@enduml

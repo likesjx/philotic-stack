@@ -42,9 +42,84 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
   - [ ] keep WebRTC as optional peer session transport after signaling, not the graph or membership sync plane
   - [ ] classify the canonical mesh-shared graph projection in code instead of relying on operator intuition
 - [ ] Recover a single known-good live mesh runtime path across `bjork`, `mbp-jane`, and `jane-vps`.
+- [x] Make response return routing core according to [RESPONSE_RETURN_ROUTE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RESPONSE_RETURN_ROUTE_PROPOSAL.md):
+  - [x] patch `philote` to emit `reply_guest_id` for model-driven and direct LifeGraph tool calls
+  - [x] patch `datasource` to target `reply_guest_id` for success and failure responses
+  - [x] patch `aiua` to infer explicit guest targets for response-like `agent` payloads before normal role routing
+  - [x] add a focused regression for `datasource_response` returning to the originating agent guest
+  - [x] migrate remaining runners to a shared typed `ReturnRoute`
+  - [x] reject unrecoverable broad `agent` responses with structured routing errors
+  - [x] expose response-route failures as structured IPC errors and heal queue entries
+  - [ ] deploy `ReturnRoute` compatibility slice across live hotels and remove flat reply fields after rollout
+  - [ ] expose response-route heal entries in first-class operator diagnostics
 - [ ] Redeploy `jane-vps` through Ansible with a real Linux build and re-smoke mesh visibility from Bjork.
 - [ ] Prove roaming peer auto-reconnect live by validating observed-endpoint reconciliation against stale peer graph records.
 - [ ] Feed hotel-owned router traces and mesh events into the desktop event log through `philotic-web` so mesh/routing failures are visible without live journal spelunking.
+
+## New Project: Model Graph Catalog Refresh
+
+Proposal: [MODEL_GRAPH_CATALOG_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_CATALOG_PROPOSAL.md)
+
+Seam IDs: `model-catalog-schema`, `model-catalog-seed`, `model-catalog-projection`, `turn-routing-catalog-input`
+
+- [ ] Treat `origin/codex/model-graph-catalog` as stale source material, not a merge target.
+- [ ] Audit the stale branch and classify changed files as catalog schema, catalog projection, unrelated runtime drift, test-only update, or obsolete conflict.
+- [ ] Re-slice the provider-neutral model catalog schema onto current `develop`.
+- [ ] Seed the minimal supported provider families: Gemini, OpenAI, Ollama-compatible, ElevenLabs, ONNX, and MLX.
+- [ ] Add focused schema/seed tests and run touched-crate checks before merging.
+- [ ] Add one read-only projection surface before any routing integration.
+- [ ] Delete `origin/codex/model-graph-catalog` after valid catalog work lands or is explicitly abandoned.
+
+## New Project: Cypher-First Graph Datasource
+
+Proposal: [GRAPH_DATASOURCE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DATASOURCE_PROPOSAL.md)
+
+Seam IDs: `embedded-cypher-provider`, `central-graph-provider`, `graph-runner-migration`
+
+- [ ] Keep the current SQLite `graph.query` transpiler as an explicit compatibility bridge, not the target Cypher implementation.
+- [ ] Deploy Memgraph on `vps-jane` in Docker/Compose with persistent volume, backup procedure, and mesh-visible endpoint/config.
+- [ ] Add a Memgraph/Bolt-backed `graph-datasource` provider behind the provider boundary.
+- [ ] Prove Beacon-style graph writes against Memgraph: `MATCH`, `MERGE`, relationship creation from matched variables, and bounded `RETURN`.
+- [ ] Decide auth, network exposure, and whether the Memgraph MCP sidecar is useful for operator-facing tools.
+- [ ] Keep Kuzu as a deferred embedded-provider experiment for local hotel graphs.
+  - [ ] Resolve Kuzu Rust binding/linker issue on macOS Tahoe/Rust 1.94, or switch the spike to a maintained fork/alternate binding.
+- [ ] Define the `GraphStore`/provider contract around `query`, `schema`, `validate`, and graph-shaped results.
+- [ ] Decide whether centralized graph authority is Memgraph, Kuzu-per-hotel with mesh sync, or a tiered model with both.
+
+## New Project: Life Graph OS
+
+Proposal: [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md)
+
+Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-attention-steward`, `life-graph-agentic-growth-loop`, `life-graph-semantic-retrieval`, `life-graph-evidence-conflict`, `life-graph-paracrine-heartbeat`
+
+- [ ] Keep `graph-datasource` generic and define `data-memorygraphrag` as the Life Graph / MemoryGraphRAG runner/toolset layer.
+  - [x] Add the first `data-memorygraphrag` runner planning surface for `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+- [ ] Define the first Life Graph schema for `Role`, `Goal`, `System`, `Habit`, `Commitment`, `OpenLoop`, `NextAction`, and `GrowthExperiment`.
+- [ ] Decide whether Life Graph records live as a dedicated datasource partition, central graph labels, or a tiered model.
+- [ ] Add the first Life Graph tool surface: `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+  - [x] Define the tool catalog and typed runner requests/plans in `data-memorygraphrag`; runtime/hotel projection remains next.
+  - [x] Implement provider handlers for `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`, mirroring `handle_observe` with runner gates and Memgraph MERGE/SET writes.
+  - [x] Add a clean external MCP surface: keep Perplexity `context.capture` routed to Muninn continuity memory, add `mcp-surface-hygiene`, enforce auth on config-driven `membrane-mcp` tools, and provide a separate LifeGraph endpoint provisioner for governed `life.recall` / opt-in `life.observe`.
+  - [x] Deploy and smoke the LifeGraph MCP endpoint against the live `life-graph-runner` before claiming `watched-live-green`.
+- [ ] Add semantic indexing for Life Graph nodes with a `768`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
+- [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
+- [ ] Implement one MemGraphRAG-inspired retrieval strategy: semantic pivot, bounded graph expansion, memory-aware ranking, policy filtering, and context packet projection.
+  - [x] Land the first `data-memorygraphrag` semantic retrieval contracts for semantic pivots, bounded expansion, policy filters, ranking weights, and evidence-backed context packets.
+  - [x] Add provider dispatch for the five named retrieval strategies from `SEMANTIC_RETRIEVAL.md`: `open_loops_by_context`, `goals_and_next_actions`, `commitments_approaching`, `re_entry_context`, and `cross_domain_entanglement`.
+- [ ] Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.
+  - [x] Land the initial `data-memorygraphrag` contract crate with validated `EvidencePacket` and `ConflictHandoff` wire types.
+  - [x] Add provider `handle_conflict` and `handle_resolve` execution paths for ConflictHandoff persistence and resolution status updates.
+- [x] Define the cron-backed heartbeat job shape for Life Graph maintenance, using the existing distributed cron subsystem as the first durable clock source.
+- [x] Define the paracrine heartbeat signal shape for Life Graph maintenance, including scope, target role-type, priority, expiry, and policy tags.
+- [ ] Build the Attention Steward paracrine subscriber in observe-only mode before broad notifications or autonomous follow-up.
+  - [x] Land the first runtime boundary: cron payloads with top-level `paracrine_signal` emit `action = "paracrine_signal"` envelopes, and philotes observe them without entering the conversational model path.
+  - [x] Add the canonical `ParacrineHeartbeatTemplate` registration payload for cron-backed Life Graph signals, including `source_hotel`, ISO `observed_at`, target role-type, subject refs, policy tags, and observe-only heartbeat metadata.
+  - [x] Add the observe-only Attention Steward policy decision path: valid signals record observations, new-pattern signals propose SIL entries, expired/non-target/anti-policy signals defer, and philote logs the decision without model re-entry.
+- [ ] Define the Attention Steward SIL as reinforced, situation-aware stewardship instructions with evidence, exceptions, friction, and reinforcement counters.
+- [ ] Define the agentic growth loop for skills, tools, schema, and policy patches with risk-tiered confirmation gates and negative-drift checks.
+  - [x] Add `data-memorygraphrag` growth-loop policy contracts for observed needs, drift findings, capability gaps, growth experiments, patch gates, and drift checks.
+- [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.
+- [ ] Let specialized roles such as Coach consume and contribute to Life Graph OS through governed tools without owning the canonical cross-domain graph posture.
 
 ## New Project: Memory Cultivation and True-Up
 

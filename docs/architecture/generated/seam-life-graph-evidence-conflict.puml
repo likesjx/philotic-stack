@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - life-graph-evidence-conflict
+
+rectangle "life-graph-evidence-conflict" as life_graph_evidence_conflict #Orange {
+}
+
+
+@enduml

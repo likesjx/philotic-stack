@@ -592,7 +592,9 @@ The repository contains specialized skills in `skills/` to standardize common wo
 | `runtime-rollout-watch` | Proving installed/runtime rollout truth before claiming live validation |
 | `retrospective-workflow` | Running seam-based retrospectives and turning lessons into code/process/SVE changes |
 | `muninn-memory-protocol` | Client adapter contract for memory integration |
+| `mcp-surface-hygiene` | Reviewing MCP membrane tool surfaces so Muninn capture, LifeGraph tools, and raw graph/runtime authority stay distinct |
 | `role-authoring` | Creating or updating agent roles through `role.configure` |
+| `lifegraph-truth-summarizer` | Provenance-aware LifeGraph summaries that separate confirmed graph facts, seeded placeholders, inferred intent, and recommended next structure |
 
 ## 12. Repository-Specific Notes
 

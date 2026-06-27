@@ -22,6 +22,7 @@ catalog:
     optional_fields:
       - job_id
       - guaranteed
+      - paracrine_heartbeat_template
     repo_skill_path: skills/cron-manage/SKILL.md
     workflow: "cron.list → compose job → cron.register → verify"
 ---
@@ -76,6 +77,35 @@ The payload is what the target role receives as its task. Write it as if you are
 ```
 
 The role should be able to act on the payload without additional context injection.
+
+## Paracrine heartbeat payloads
+
+For Life Graph heartbeat jobs, prefer the canonical template in `ansible_mesh_core::cron::ParacrineHeartbeatTemplate` instead of hand-writing the JSON. The template emits a top-level `paracrine_signal` object, so the hotel ticker dispatches `action = "paracrine_signal"` and the subscriber role observes the signal without entering the conversational model path.
+
+Minimum shape after template interpolation:
+
+```json
+{
+  "paracrine_signal": {
+    "signal_id": "cron:{job_id}:{timestamp}",
+    "signal_type": "open_loop_staleness",
+    "scope": "personal",
+    "source_hotel": "{node_id}",
+    "source_node": "{node_id}",
+    "target_role_type": "attention-steward",
+    "subject_refs": ["lifegraph:open_loop"],
+    "cadence": "daily",
+    "priority": "medium",
+    "observed_at": "{iso_timestamp}",
+    "expires_at": null,
+    "payload_summary": "Scan stale open loops and defer unless policy says to record.",
+    "policy_tags": ["adhd-support", "re-entry"]
+  },
+  "payload_summary": "Scan stale open loops and defer unless policy says to record."
+}
+```
+
+Use `target_role = "attention-steward"` for the first observe-only Life Graph subscriber.
 
 ## Guardrails
 

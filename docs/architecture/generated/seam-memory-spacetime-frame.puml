@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-spacetime-frame
+
+rectangle "memory-spacetime-frame" as memory_spacetime_frame #Orange {
+}
+
+
+@enduml

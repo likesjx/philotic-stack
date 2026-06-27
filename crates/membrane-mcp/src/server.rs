@@ -17,7 +17,10 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::auth::{AllotmentTracker, VaultHashCache, VaultResolver, authorize_call};
+use crate::auth::{
+    AllotmentTracker, VaultHashCache, VaultResolver, authorize_call, extract_bearer,
+    verify_bearer_token,
+};
 use crate::protocol::{
     InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse, McpToolDescriptor,
     ServerCapabilities, ServerInfo, ToolCallParams, ToolCallResult, ToolsCapability,
@@ -26,6 +29,7 @@ use crate::protocol::{
 use crate::routing::{SharedEndpointTable, SharedRoutingTable};
 use crate::transform;
 use ansible_mesh_core::ExposureTier;
+use ansible_mesh_core::mcp_route::McpAuthScheme;
 
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Approval-required routes park the HTTP connection for up to 5 minutes.
@@ -45,6 +49,9 @@ pub struct MembraneState {
     /// Hotel node ID — used as `final_reply_to` so replies route back
     /// through the local hotel to the mcp-membrane role.
     pub node_id: String,
+    /// Concrete membrane guest ID for this listener. Reply routing must target
+    /// the specific endpoint guest, not the broad mcp-membrane role.
+    pub guest_id: String,
     /// Channel into the runtime's IPC dispatch loop.
     pub inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// Pending tool-call responses keyed by turn_id.
@@ -146,7 +153,7 @@ async fn handle_mcp(
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id, req.params),
         "ping" => JsonRpcResponse::ok(id, json!({})),
-        "tools/list" => handle_tools_list(&state, id, auth_header).await,
+        "tools/list" => handle_tools_list(&state, id, auth_header, is_loopback).await,
         "tools/call" => handle_tools_call(&state, id, req.params, auth_header, is_loopback).await,
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
@@ -182,16 +189,51 @@ async fn handle_tools_list(
     state: &SharedState,
     id: Value,
     auth_header: Option<&str>,
+    is_loopback: bool,
 ) -> JsonRpcResponse {
     // Prefer config-driven endpoint table; fall back to legacy route table.
     let endpoint = state.endpoint_table.read().await;
     let tools: Vec<McpToolDescriptor> = if endpoint.is_active() {
-        endpoint.tool_descriptors()
+        let bearer = extract_bearer(auth_header);
+        endpoint.visible_tool_descriptors(|tool| {
+            let auth_scheme = tool.auth.as_ref().unwrap_or(&McpAuthScheme::None);
+            match auth_scheme {
+                McpAuthScheme::BearerToken { grants } => bearer
+                    .and_then(|token| {
+                        verify_bearer_token(
+                            &tool.name,
+                            token,
+                            grants,
+                            &state.vault_cache,
+                            state.vault.as_ref(),
+                        )
+                        .ok()
+                    })
+                    .is_some(),
+                McpAuthScheme::None => is_loopback,
+                McpAuthScheme::HmacSha256 { .. } => false,
+            }
+        })
     } else {
         drop(endpoint);
-        let caller_id = crate::auth::extract_bearer(auth_header);
+        let bearer = extract_bearer(auth_header);
         let table = state.routing_table.read().await;
-        table.visible_descriptors(caller_id)
+        table.visible_descriptors_by(|route| match &route.record.security.auth {
+            McpAuthScheme::BearerToken { grants } => bearer
+                .and_then(|token| {
+                    verify_bearer_token(
+                        &route.record.tool_name,
+                        token,
+                        grants,
+                        &state.vault_cache,
+                        state.vault.as_ref(),
+                    )
+                    .ok()
+                })
+                .is_some(),
+            McpAuthScheme::None => is_loopback,
+            McpAuthScheme::HmacSha256 { .. } => false,
+        })
     };
 
     JsonRpcResponse::ok(id, serde_json::to_value(ToolsListResult { tools }).unwrap())
@@ -232,6 +274,23 @@ async fn handle_tools_call(
             }
         };
 
+        let auth_scheme = tool_spec.auth.clone().unwrap_or(McpAuthScheme::None);
+        let caller = match authorize_call(
+            tool_name,
+            &auth_scheme,
+            auth_header,
+            is_loopback,
+            &state.vault_cache,
+            state.vault.as_ref(),
+            &state.allotment,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(tool = tool_name, err = %e, "config-driven auth rejected");
+                return JsonRpcResponse::err(id, error_code::PERMISSION_DENIED, e.to_string());
+            }
+        };
+
         // Pre-approval check: apply_inbound tells us the action; check rules.
         let inbound = match transform::apply_inbound(&tool_spec, &args) {
             Ok(r) => r,
@@ -251,10 +310,11 @@ async fn handle_tools_call(
         };
 
         let turn_id = Uuid::new_v4().to_string();
-        let session_id = format!("mcp-{}-{}", tool_spec.name, &turn_id[..8]);
+        let session_id = format!("mcp-{}-{}", caller.token_id, &turn_id[..8]);
 
         info!(
             tool = tool_name,
+            caller_id = %caller.token_id,
             action = %inbound.action,
             target_kind = %inbound.target_kind,
             target_id = %inbound.target_id,
@@ -267,7 +327,7 @@ async fn handle_tools_call(
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             sender: SenderInfo {
-                id: Some("mcp-caller".into()),
+                id: Some(caller.token_id.clone()),
                 display_name: None,
                 username: None,
                 is_operator: false,
@@ -291,7 +351,7 @@ async fn handle_tools_call(
             requires_approval,
             final_reply_to: Some(state.node_id.clone()),
             final_reply_role: Some("mcp-membrane".into()),
-            final_reply_guest_id: None,
+            final_reply_guest_id: Some(state.guest_id.clone()),
         };
 
         let (tx, rx) = oneshot::channel::<String>();
@@ -414,7 +474,7 @@ async fn handle_tools_call(
         requires_approval,
         final_reply_to: Some(state.node_id.clone()),
         final_reply_role: Some("mcp-membrane".into()),
-        final_reply_guest_id: None,
+        final_reply_guest_id: Some(state.guest_id.clone()),
     };
 
     let (tx, rx) = oneshot::channel::<String>();

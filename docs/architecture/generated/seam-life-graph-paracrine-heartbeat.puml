@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - life-graph-paracrine-heartbeat
+
+rectangle "life-graph-paracrine-heartbeat" as life_graph_paracrine_heartbeat #Orange {
+}
+
+
+@enduml

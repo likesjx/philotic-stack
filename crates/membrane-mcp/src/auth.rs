@@ -173,6 +173,39 @@ pub fn check_bearer_token(
     vault: &dyn VaultResolver,
     allotment: &AllotmentTracker,
 ) -> Result<CallerIdentity> {
+    let grant = matching_bearer_grant(tool_name, presented_token, grants, vault_cache, vault)?;
+
+    // Token matched — check allotment.
+    if let Some(a) = &grant.allotment {
+        allotment.check_and_increment(tool_name, &grant.token_id, a)?;
+    }
+
+    Ok(caller_identity(grant))
+}
+
+/// Verify a bearer token without consuming call allotment.
+///
+/// This is used for discovery surfaces such as `tools/list`, where the caller
+/// must prove possession of a valid key but listing metadata should not spend
+/// the budget reserved for actual tool calls.
+pub fn verify_bearer_token(
+    tool_name: &str,
+    presented_token: &str,
+    grants: &[McpTokenGrant],
+    vault_cache: &VaultHashCache,
+    vault: &dyn VaultResolver,
+) -> Result<CallerIdentity> {
+    matching_bearer_grant(tool_name, presented_token, grants, vault_cache, vault)
+        .map(caller_identity)
+}
+
+fn matching_bearer_grant<'a>(
+    tool_name: &str,
+    presented_token: &str,
+    grants: &'a [McpTokenGrant],
+    vault_cache: &VaultHashCache,
+    vault: &dyn VaultResolver,
+) -> Result<&'a McpTokenGrant> {
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -213,21 +246,20 @@ pub fn check_bearer_token(
             continue;
         }
 
-        // Token matched — check allotment.
-        if let Some(a) = &grant.allotment {
-            allotment.check_and_increment(tool_name, &grant.token_id, a)?;
-        }
-
-        return Ok(CallerIdentity {
-            token_id: grant.token_id.clone(),
-            scopes: grant.scopes.clone(),
-        });
+        return Ok(grant);
     }
 
     bail!(
         "no matching token grant for presented credential on tool '{}'",
         tool_name
     )
+}
+
+fn caller_identity(grant: &McpTokenGrant) -> CallerIdentity {
+    CallerIdentity {
+        token_id: grant.token_id.clone(),
+        scopes: grant.scopes.clone(),
+    }
 }
 
 /// Extract the raw bearer token from an `Authorization: Bearer <token>` header.

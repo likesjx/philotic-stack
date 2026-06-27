@@ -1,5 +1,5 @@
 use crate::session::{TaskRunnerBaseConfig, ToolDefinition};
-use philotic_client::{HandoffBundle, TaskErrorPayload};
+use philotic_client::{HandoffBundle, ReturnRoute, TaskErrorPayload};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -102,6 +102,11 @@ pub struct InboundTaskPayload {
     /// `paracrine_response` tasks. Carries the paracrine_id and routing hint.
     #[serde(default)]
     pub exosome: Option<serde_json::Value>,
+    /// Typed low-agency signal delivered by the paracrine loop, often from a
+    /// cron-backed heartbeat. These are observed by role-type subscribers and
+    /// should not automatically enter the normal conversational model path.
+    #[serde(default)]
+    pub paracrine_signal: Option<serde_json::Value>,
     /// When true (set by membrane variants with per-route approval gates,
     /// e.g. membrane-mcp), the philote must park this turn as WaitingApproval
     /// before model invocation and emit `approval_required` back to the sender.
@@ -268,8 +273,12 @@ pub struct ToolExecutionPayload {
     pub workspace_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_runner_overlay: Option<TaskRunnerOverlay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_route: Option<ReturnRoute>,
     pub reply_to: String,
     pub reply_role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_guest_id: Option<String>,
     pub final_reply_to: String,
     pub final_reply_role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -308,6 +317,7 @@ impl InboundTaskPayload {
 mod tests {
     use super::{InboundTaskPayload, TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment};
     use crate::session::TaskRunnerBaseConfig;
+    use philotic_client::ReturnRoute;
 
     #[test]
     fn session_id_defaults_from_source_and_chat() {
@@ -463,6 +473,31 @@ mod tests {
     }
 
     #[test]
+    fn paracrine_signal_field_deserializes() {
+        let payload: InboundTaskPayload = serde_json::from_value(serde_json::json!({
+            "action": "paracrine_signal",
+            "transport": "cron",
+            "paracrine_signal": {
+                "signal_id": "cron:job-1:1234",
+                "signal_type": "life_graph.attention_scan",
+                "scope": "life_graph",
+                "target_role_type": "attention-steward"
+            }
+        }))
+        .expect("payload should deserialize");
+
+        assert_eq!(payload.action.as_deref(), Some("paracrine_signal"));
+        assert_eq!(
+            payload.paracrine_signal.as_ref().and_then(|signal| {
+                signal
+                    .get("target_role_type")
+                    .and_then(serde_json::Value::as_str)
+            }),
+            Some("attention-steward")
+        );
+    }
+
+    #[test]
     fn session_id_defaults_include_thread_when_present() {
         let payload = InboundTaskPayload {
             action: None,
@@ -528,8 +563,17 @@ mod tests {
             }),
             agent_id: "agent-jane-01".into(),
             user_id: None,
+            return_route: Some(ReturnRoute {
+                node: "local-aiua-01".into(),
+                role: "agent".into(),
+                guest_id: Some("agent-jane-01".into()),
+                session_id: Some("sess-1".into()),
+                turn_id: Some("turn-1".into()),
+                correlation_id: None,
+            }),
             reply_to: "local-aiua-01".into(),
             reply_role: "agent".into(),
+            reply_guest_id: Some("agent-jane-01".into()),
             final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
@@ -548,5 +592,7 @@ mod tests {
         );
         assert_eq!(json["task_runner_overlay"]["max_read_bytes"], 4096);
         assert_eq!(json["task_runner_overlay"]["max_search_results"], 25);
+        assert_eq!(json["return_route"]["guest_id"], "agent-jane-01");
+        assert_eq!(json["reply_guest_id"], "agent-jane-01");
     }
 }

@@ -390,6 +390,87 @@ pub struct TaskErrorPayload {
     pub sub_kind: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReturnRoute {
+    pub node: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+impl ReturnRoute {
+    pub fn from_task(
+        task: &serde_json::Value,
+        default_node: impl Into<String>,
+        default_role: impl Into<String>,
+    ) -> Self {
+        let default_node = default_node.into();
+        let default_role = default_role.into();
+        let object = task
+            .get("return_route")
+            .and_then(serde_json::Value::as_object);
+
+        let read = |field: &str| -> Option<String> {
+            object
+                .and_then(|route| route.get(field))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| match field {
+                    "node" => task.get("reply_to").and_then(serde_json::Value::as_str),
+                    "role" => task.get("reply_role").and_then(serde_json::Value::as_str),
+                    "session_id" => task.get("session_id").and_then(serde_json::Value::as_str),
+                    "turn_id" => task.get("turn_id").and_then(serde_json::Value::as_str),
+                    "correlation_id" => task
+                        .get("correlation_id")
+                        .and_then(serde_json::Value::as_str),
+                    _ => None,
+                })
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        };
+
+        let node = read("node").unwrap_or(default_node);
+        let role = read("role").unwrap_or(default_role);
+        let guest_id = object
+            .and_then(|route| route.get("guest_id"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                object
+                    .and_then(|route| route.get("guest"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                task.get("reply_guest_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                (role == "agent")
+                    .then(|| task.get("agent_id").and_then(serde_json::Value::as_str))
+                    .flatten()
+            })
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+
+        Self {
+            node,
+            role,
+            guest_id,
+            session_id: read("session_id"),
+            turn_id: read("turn_id"),
+            correlation_id: read("correlation_id"),
+        }
+    }
+
+    pub fn as_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+}
+
 impl TaskErrorPayload {
     pub fn provider_failure(
         component: impl Into<String>,
@@ -701,9 +782,17 @@ impl LeaseEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ParacrineRouting {
+    /// Feed brain's response back into the orchestrator's own paracrine layer as a
+    /// new turn. The orchestrator (e.g. Astrid) reasons about the reply and explicitly
+    /// calls `delegate.merge` to surface it to the user, or completes silently to
+    /// absorb internally. This is the default — it keeps the human out of specialist
+    /// sub-conversations until the orchestrator decides to include them.
+    #[default]
+    ReflectiveReEntry,
     /// Feed the response into a model cognitive re-entry. If an active turn
     /// exists, inject as enriched context; otherwise start a synthesis turn.
-    #[default]
+    /// Always surfaces a reply to Telegram — prefer ReflectiveReEntry unless you
+    /// explicitly want the raw specialist response to go straight to the user.
     CognitiveReEntry,
     /// Replace the "paracrine dispatched" placeholder tool result with the real
     /// response and re-enter the model as if the tool call completed normally.
@@ -747,7 +836,7 @@ pub struct Exosome {
     pub paracrine_id: Option<String>,
     /// How the receiving philote's response should be handled when it arrives
     /// back at the emitter. Declared at dispatch time by the caller.
-    /// Defaults to [`ParacrineRouting::CognitiveReEntry`] if absent.
+    /// Defaults to [`ParacrineRouting::ReflectiveReEntry`] if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_routing: Option<ParacrineRouting>,
     /// The session_id of the conversation that triggered this paracrine.
@@ -1220,6 +1309,9 @@ pub enum IpcRequest {
     },
     /// Request the hotel's loaded MuninnDB configuration (vault tokens included).
     FetchMemoryConfig,
+    /// Force the hotel to re-probe MuninnDB reachability immediately and broadcast the result.
+    /// Responds with [`IpcResponse::MuninnStatus`].
+    RefreshMemoryConfig,
     /// Register a graph instance with the hotel's ODS so it can route graph_id → instance_id.
     /// Sent by the graph-runner on startup (for all existing graphs) and after each graph.create.
     RegisterGraphInstance {
@@ -1794,6 +1886,17 @@ pub struct UserProfileDataPayload {
     pub linked_providers: Vec<String>,
 }
 
+/// Payload for [`IpcResponse::MemoryConfig`].
+///
+/// `MemoryConfig` has an optional value by design, but this wrapper must remain
+/// strict so untagged deserialization does not accidentally classify unrelated
+/// response objects as memory config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfigPayload {
+    pub config_json: Option<String>,
+}
+
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -2084,6 +2187,14 @@ pub enum IpcResponse {
     NetworkState {
         online: bool,
     },
+    /// Hotel → guest broadcast: MuninnDB reachability state changed.
+    /// Also the direct response to [`IpcRequest::RefreshMemoryConfig`].
+    /// When `available=false`, guests should fall back to `NullMemoryEngine`.
+    /// When `available=true`, guests should resume using the configured engine.
+    MuninnStatus {
+        available: bool,
+        endpoint: String,
+    },
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.
     ///
@@ -2093,6 +2204,18 @@ pub enum IpcResponse {
     /// serde to reject JSON objects with fields not in the struct (e.g. `config_json`).
     /// This prevents this variant from swallowing `MemoryConfig` responses.
     UserProfileData(UserProfileDataPayload),
+    /// Response to [`IpcRequest::PushHealEntry`].
+    HealEntryPushed {
+        id: String,
+    },
+    /// Response to [`IpcRequest::GetHealQueuePending`].
+    ///
+    /// Keep this before generic `rows: Vec<Value>` response shapes in this
+    /// untagged enum, otherwise typed heal queue rows deserialize as generic
+    /// rows and callers never see `HealQueuePending`.
+    HealQueuePending {
+        rows: Vec<ansible_mesh_core::heal_queue::HealQueueRow>,
+    },
     /// Response to [`IpcRequest::GetAgentReflexPreferences`].
     AgentReflexPreferences {
         rows: Vec<serde_json::Value>,
@@ -2147,26 +2270,12 @@ pub enum IpcResponse {
         #[serde(default)]
         inject_headers: std::collections::HashMap<String, String>,
     },
-    /// Response to [`IpcRequest::PushHealEntry`].
-    HealEntryPushed {
-        id: String,
-    },
-    /// Response to [`IpcRequest::GetHealQueuePending`].
-    HealQueuePending {
-        rows: Vec<ansible_mesh_core::heal_queue::HealQueueRow>,
-    },
-    /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
-    /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
-    /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
-    /// Placing it last ensures it only wins when no other variant can match.
     RouterStats {
         stats: Vec<ansible_mesh_core::router_trace::ProviderStats>,
         /// Unix epoch seconds of the query.
         generated_at: u64,
     },
-    MemoryConfig {
-        config_json: Option<String>,
-    },
+    MemoryConfig(MemoryConfigPayload),
 }
 
 /// One agent's persisted route set, as returned by [`IpcResponse::McpRouteState`].
@@ -2350,8 +2459,17 @@ impl PhiloticClient {
 
         loop {
             let resp = self.read_response().await?;
+            if Self::is_expected_response(&req, &resp) {
+                return Ok(resp);
+            }
             if Self::is_push_message(&resp) {
                 self.pending_push.push_back(resp);
+                continue;
+            }
+            // Ignorable hotel-wide broadcasts (MuninnStatus, NetworkState, lease events) can
+            // arrive on any connection at any time, including between a request write and its
+            // response read. Skip them here so they don't masquerade as request responses.
+            if Self::is_ignorable_push(&resp) {
                 continue;
             }
             return Ok(resp);
@@ -2366,20 +2484,51 @@ impl PhiloticClient {
         Ok(resp)
     }
 
+    fn is_expected_response(req: &IpcRequest, response: &IpcResponse) -> bool {
+        matches!(
+            (req, response),
+            (
+                IpcRequest::AcquireTelegramPollLease { .. }
+                    | IpcRequest::GetTelegramPollLeaseOwner { .. },
+                IpcResponse::TelegramPollLeaseStatus { .. }
+            ) | (
+                IpcRequest::AcquireDesktopMembraneLease { .. }
+                    | IpcRequest::GetDesktopMembraneLeaseOwner { .. },
+                IpcResponse::DesktopMembraneLeaseStatus { .. }
+            ) | (
+                IpcRequest::AcquireDiscordGatewayLease { .. }
+                    | IpcRequest::GetDiscordGatewayLeaseOwner { .. },
+                IpcResponse::DiscordGatewayLeaseStatus { .. }
+            ) | (
+                IpcRequest::AcquireMcpMembraneLease { .. }
+                    | IpcRequest::RenewMcpMembraneLease { .. },
+                IpcResponse::McpMembraneLease { .. }
+            ) | (
+                IpcRequest::GetUserProfile { .. } | IpcRequest::PatchUserProfile { .. },
+                IpcResponse::UserProfileData(_)
+            )
+        )
+    }
+
     fn is_push_message(response: &IpcResponse) -> bool {
         matches!(
             response,
             IpcResponse::InboundTask { .. }
                 | IpcResponse::ApartmentUpdate { .. }
                 | IpcResponse::GracefulShutdown { .. }
+                // Hotel-wide OOB broadcasts: never the expected response to a pending request.
+                // Buffering them here prevents send_request from returning them as a real
+                // response and contaminating subsequent request/response pairs.
+                | IpcResponse::MuninnStatus { .. }
+                | IpcResponse::NetworkState { .. }
         )
     }
 
     fn is_ignorable_push(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::UserProfileData(_)
-                | IpcResponse::NetworkState { .. }
+            IpcResponse::NetworkState { .. }
+                | IpcResponse::MuninnStatus { .. }
                 // Lease notifications may be broadcast or arrive out-of-band on any connection.
                 // They are never the expected response to an unrelated request, so skip them.
                 | IpcResponse::McpMembraneLease { .. }
@@ -2401,6 +2550,13 @@ impl PhiloticClient {
             let resp = self.read_response().await?;
             if Self::is_push_message(&resp) {
                 return Ok(resp);
+            }
+            // Some live EmitTask paths can leave a successful ACK on the stream before
+            // the routed push arrives. While explicitly waiting for a pushed task, this
+            // ACK is only framing noise. Do not add Standard OK to send_request's
+            // ignorable set: that would swallow real request replies such as Register.
+            if matches!(resp, IpcResponse::Standard { ok: true, .. }) {
+                continue;
             }
             if Self::is_ignorable_push(&resp) {
                 continue;
@@ -2517,6 +2673,163 @@ mod tests {
                 assert_eq!(lease.metadata["agent_id"], "agent-jane-01");
             }
             other => panic!("unexpected decoded response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn standard_response_does_not_decode_as_memory_config() {
+        let bytes = serde_json::to_vec(&IpcResponse::success("reg", None))
+            .expect("serialize standard response");
+        let decoded: IpcResponse =
+            serde_json::from_slice(&bytes).expect("deserialize standard response");
+
+        match decoded {
+            IpcResponse::Standard { ok: true, code, .. } => assert_eq!(code, "OK"),
+            other => panic!("standard response decoded as wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_config_response_roundtrips_strictly() {
+        let response = IpcResponse::MemoryConfig(MemoryConfigPayload {
+            config_json: Some("{\"base_url\":\"http://127.0.0.1:8475\"}".into()),
+        });
+        let bytes = serde_json::to_vec(&response).expect("serialize memory config");
+        let decoded: IpcResponse =
+            serde_json::from_slice(&bytes).expect("deserialize memory config");
+
+        match decoded {
+            IpcResponse::MemoryConfig(config) => {
+                assert!(
+                    config
+                        .config_json
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("base_url")
+                );
+            }
+            other => panic!("memory config decoded as wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn requested_lease_status_responses_are_not_ignored_as_push_noise() {
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::GetTelegramPollLeaseOwner {
+                lease_key: "telegram:bot".into(),
+            },
+            &IpcResponse::TelegramPollLeaseStatus {
+                active: true,
+                lease: None,
+            }
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::AcquireDesktopMembraneLease {
+                lease_key: "desktop:local".into(),
+                port: 49152,
+            },
+            &IpcResponse::DesktopMembraneLeaseStatus {
+                desktop_active: true,
+                desktop_lease: None,
+            }
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::GetDiscordGatewayLeaseOwner {
+                lease_key: "discord:bot".into(),
+            },
+            &IpcResponse::DiscordGatewayLeaseStatus {
+                active: true,
+                lease: None,
+            }
+        ));
+
+        assert!(!PhiloticClient::is_expected_response(
+            &IpcRequest::GetConfig { key: "x".into() },
+            &IpcResponse::TelegramPollLeaseStatus {
+                active: true,
+                lease: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn requested_user_profile_response_is_not_ignored_as_push_noise() {
+        let profile = UserProfileDataPayload {
+            timezone: Some("America/New_York".into()),
+            display_name: Some("Jared".into()),
+            principal_id: Some("user:jared".into()),
+            preferred_name: Some("Jared".into()),
+            primary_email: None,
+            home_hotel: Some("vps-jane".into()),
+            linked_providers: vec![],
+        };
+
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::GetUserProfile {
+                hotel_name: "vps-jane".into(),
+            },
+            &IpcResponse::UserProfileData(profile.clone())
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::PatchUserProfile {
+                hotel_name: "vps-jane".into(),
+                timezone: Some("America/New_York".into()),
+                display_name: None,
+            },
+            &IpcResponse::UserProfileData(profile.clone())
+        ));
+        assert!(!PhiloticClient::is_expected_response(
+            &IpcRequest::GetConfig { key: "x".into() },
+            &IpcResponse::UserProfileData(profile)
+        ));
+    }
+
+    #[test]
+    fn user_profile_data_is_never_treated_as_an_ignorable_push() {
+        // UserProfileData is always a direct, synchronous reply to GetUserProfile/
+        // PatchUserProfile on the same connection — the hotel never broadcasts it
+        // unprompted. Treating it as ignorable here previously made send_request
+        // skip its own response and loop forever waiting for one that would never
+        // come (regression: a prior commit hung every GetUserProfile call).
+        let profile = UserProfileDataPayload {
+            timezone: None,
+            display_name: None,
+            principal_id: None,
+            preferred_name: None,
+            primary_email: None,
+            home_hotel: None,
+            linked_providers: vec![],
+        };
+
+        assert!(!PhiloticClient::is_ignorable_push(
+            &IpcResponse::UserProfileData(profile)
+        ));
+    }
+
+    #[test]
+    fn heal_queue_rows_deserialize_as_heal_queue_response() {
+        let json = r#"{
+            "rows": [{
+                "id": "01KVDDMB1YZRG327NJG2HNFXH6",
+                "guest_id": "vps-jane:agent-graph-agent-beacon",
+                "timestamp": 1781788191,
+                "raw_text": "Error: Failed to open agent graph SQLite database",
+                "severity": "unknown",
+                "status": "pending",
+                "pattern_tag": null,
+                "heal_action": null,
+                "outcome": null
+            }]
+        }"#;
+
+        let response: IpcResponse = serde_json::from_str(json).expect("decode heal queue response");
+        match response {
+            IpcResponse::HealQueuePending { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "01KVDDMB1YZRG327NJG2HNFXH6");
+                assert_eq!(rows[0].guest_id, "vps-jane:agent-graph-agent-beacon");
+            }
+            other => panic!("expected HealQueuePending, got {other:?}"),
         }
     }
 
@@ -2813,5 +3126,64 @@ mod tests {
     fn disconnect_detection_matches_unexpected_eof() {
         let err = anyhow::Error::new(std::io::Error::from(ErrorKind::UnexpectedEof));
         assert!(is_ipc_disconnect(&err));
+    }
+
+    #[test]
+    fn return_route_reads_typed_route_before_compat_fields() {
+        let task = serde_json::json!({
+            "reply_to": "compat-node",
+            "reply_role": "agent",
+            "reply_guest_id": "compat-guest",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "return_route": {
+                "node": "typed-node",
+                "role": "agent",
+                "guest_id": "typed-guest",
+                "session_id": "typed-session",
+                "turn_id": "typed-turn",
+                "correlation_id": "corr-1"
+            }
+        });
+
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.node, "typed-node");
+        assert_eq!(route.role, "agent");
+        assert_eq!(route.guest_id.as_deref(), Some("typed-guest"));
+        assert_eq!(route.session_id.as_deref(), Some("typed-session"));
+        assert_eq!(route.turn_id.as_deref(), Some("typed-turn"));
+        assert_eq!(route.correlation_id.as_deref(), Some("corr-1"));
+    }
+
+    #[test]
+    fn return_route_reads_compat_fields_and_agent_fallback() {
+        let task = serde_json::json!({
+            "reply_to": "compat-node",
+            "reply_role": "agent",
+            "agent_id": "agent-jane",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        });
+
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.node, "compat-node");
+        assert_eq!(route.role, "agent");
+        assert_eq!(route.guest_id.as_deref(), Some("agent-jane"));
+        assert_eq!(route.session_id.as_deref(), Some("session-1"));
+        assert_eq!(route.turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn return_route_agent_id_fallback_is_agent_role_only() {
+        let task = serde_json::json!({
+            "reply_to": "compat-node",
+            "reply_role": "membrane",
+            "agent_id": "agent-jane"
+        });
+
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.node, "compat-node");
+        assert_eq!(route.role, "membrane");
+        assert_eq!(route.guest_id, None);
     }
 }

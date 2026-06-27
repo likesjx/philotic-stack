@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-observation-contract
+
+rectangle "desktop-observation-contract" as desktop_observation_contract #Orange {
+}
+
+
+@enduml

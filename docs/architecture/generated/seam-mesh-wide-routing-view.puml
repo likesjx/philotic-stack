@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mesh-wide-routing-view
+
+rectangle "mesh-wide-routing-view" as mesh_wide_routing_view #Orange {
+}
+
+
+@enduml

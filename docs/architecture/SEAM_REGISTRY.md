@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-05-29
+last_updated: 2026-06-04
 tags:
 - seams
 - ids
@@ -118,6 +118,13 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `memory-promotion-gates` | `memory-context` | [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md) | implemented-runtime | `docs/task.md` → `New Project: Memory Cultivation and True-Up` |
 | `memory-engine-contract` | `memory-context` | [MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
 | `graph-muninn-memory-dual-path` | `memory-context` | [MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
+| `life-graph-schema` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | schema-applied-live | V001+V002+V003 live on Memgraph 3.10.1 vps-jane (25 constraints, 18 indexes, 25 vector indexes at 768d, StewardshipInstruction). No open backlog for this seam. |
+| `life-graph-memorygraphrag-runner` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | provider-handlers-green | life.observe live+verified, life.recall projection + named strategy dispatch done, life.commit/resolve/conflict/patch.propose provider handlers done. Open: hotel runtime → life.recall IPC invocation and IPC smoke. |
+| `life-graph-attention-steward` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | test-green-observe-policy | Paracrine subscriber observe-only policy + SIL spec + Beacon contract done. Open: active SIL entries and operator confirmation gate in philote. |
+| `life-graph-agentic-growth-loop` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | test-green-contracts | Patch gates, growth signals, drift categories, risk-tiered evaluation done. Open: growth-loop philote role; background drift detector job. |
+| `life-graph-semantic-retrieval` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | named-dispatch-green | 5 named strategies spec + contracts done; provider dispatches open_loops_by_context, goals_and_next_actions, commitments_approaching, re_entry_context, and cross_domain_entanglement. Open: retrieval quality logging + feedback path. |
+| `life-graph-evidence-conflict` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | provider-handlers-green | EvidencePacket + ConflictHandoff contracts done; provider handle_conflict/handle_resolve done. Open: runtime conflict detection + Muninn true-up/contradiction-review tool handoff. |
+| `life-graph-paracrine-heartbeat` | `memory-context` | [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LIFE_GRAPH_OS_PROPOSAL.md) | test-green-runtime-boundary | Cron heartbeat → paracrine signal → philote observe path done. No open backlog for this seam. |
 | `legacy-agent-import` | `migration-parity` | [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md) | `docs/task.md` → `Next Project: Personality and Context` and migration follow-ons |
 | `recognizable-identity-continuity` | `migration-parity` | [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md) | `docs/task.md` → `Next Project: Personality and Context` and migration follow-ons |
 | `parity-matrix` | `migration-parity` | [OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md) | `docs/task.md` → `New Project: OpenClaw Parity And Migration` |

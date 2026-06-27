@@ -48,6 +48,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "memory.cultivate",
             "memory.true_up",
             "memory.promote_candidate",
+            "memory.status",
+            "memory.fix",
         ],
         "routing.refinement" => &[
             "session.status",
@@ -64,9 +66,19 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "graph.create",
             "graph.query",
             "graph.list",
+            "graph.schema",
             "graph.drop",
             "graph.grant_access",
         ],
+        "life.steward" => &[
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.conflict",
+            "life.patch.propose",
+        ],
+        "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
         "imessage-monitor" => &["bash.exec"],
         _ => &[],
     }
@@ -80,6 +92,15 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
 /// if ANY of its owning skills is active.
 pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
+        "life.steward" => &[
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.conflict",
+            "life.patch.propose",
+        ],
+        "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
         "cron.manage" => &[
             "cron.register",
             "cron.list",
@@ -100,6 +121,7 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "graph.create",
             "graph.query",
             "graph.list",
+            "graph.schema",
             "graph.drop",
             "graph.grant_access",
         ],
@@ -137,6 +159,33 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
 pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
     let t = turn_text;
     match skill_name {
+        "life.steward" => {
+            t.contains("life.")
+                || t.contains("lifegraph")
+                || t.contains("life graph")
+                || t.contains("openloop")
+                || t.contains("open loop")
+                || t.contains("signal node")
+                || t.contains("life.observe")
+                || t.contains("life.recall")
+                || t.contains("life.commit")
+                || t.contains("record this")
+                || t.contains("observe this")
+                || t.contains("note this")
+                || t.contains("remember this")
+                || t.contains("log this")
+        }
+        "lifegraph.truth_summarizer" => {
+            t.contains("lifegraph")
+                || t.contains("life graph")
+                || t.contains("what is in my graph")
+                || t.contains("what's in my graph")
+                || t.contains("summarize my graph")
+                || t.contains("roles")
+                || t.contains("habits")
+                || t.contains("systems")
+                || t.contains("goals")
+        }
         "cron.manage" => {
             t.contains("cron")
                 || t.contains("schedule")
@@ -187,6 +236,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
         "role.governance" => {
             t.contains("create role")
                 || t.contains("update role")
+                || (t.contains("provision") && t.contains("role"))
+                || (t.contains("equip") && t.contains("role"))
                 || t.contains("configure agent")
                 || t.contains("best place to run")
                 || t.contains("place role")
@@ -199,6 +250,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
             t.contains("create role")
                 || t.contains("update role")
                 || t.contains("author role")
+                || (t.contains("provision") && t.contains("role"))
+                || (t.contains("equip") && t.contains("role"))
                 || t.contains("role.create")
                 || t.contains("role manifest")
                 || t.contains("new role")
@@ -211,6 +264,9 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("create skill")
                 || t.contains("add skill")
                 || t.contains("assign skill")
+                || (t.contains("equip") && t.contains("skill"))
+                || t.contains("with skill")
+                || t.contains("cron.manage")
                 || t.contains("revoke skill")
         }
         "context.synthesize" => {
@@ -274,8 +330,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "session.status".into(),
         ToolDefinition {
             tool_name: "session.status".into(),
-            description: "Returns a summary of the current session state, including the active \
-                          session ID, turn count, approval policy, and active tool runners."
+            description: "Diagnostic only. Returns a summary of this conversation session: active \
+                          session ID, turn state, approval policy, and active tool runners. Use \
+                          only when the operator asks about session/tool availability or when \
+                          debugging routing. Do not use as a default first step for domain work."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -289,12 +347,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "hotel.status".into(),
         ToolDefinition {
             tool_name: "hotel.status".into(),
-            description: "Returns a safe view of the hotel's current state: hotel name, node ID, \
-                          active and inactive guests (with roles), and registered agent identities. \
-                          No credentials, API keys, or secret values are included. Use this to \
-                          understand what guests are running, which agents are registered, and \
-                          whether the hotel is healthy. Always prefer this over bash.exec for \
-                          hotel introspection."
+            description: "Diagnostic only. Returns a safe view of the hotel's current state: \
+                          hotel name, node ID, active/inactive guests, and registered agent \
+                          identities. Use when the operator asks about hotel health, guest \
+                          placement, or runtime debugging. Do not use for ordinary memory, \
+                          LifeGraph, or planning questions."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -376,16 +433,17 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "agent.graph.read".into(),
         ToolDefinition {
             tool_name: "agent.graph.read".into(),
-            description: "Read structured state from the agent's own graph substrate. Use this \
-                          to inspect agent-local preferences, declarations, and other cognitive \
-                          policy records without reaching into hotel-owned authority."
+            description: "Read agent-local operating preferences and declarations from the \
+                          agent graph. This is not the operator LifeGraph and not the repo intel \
+                          graph. Use only for agent policy such as tool_preferences, routing, \
+                          resource grants, or reflex preferences."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "entity": {
                         "type": "string",
-                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "resource_declarations"],
+                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "reflex_preferences", "resource_declarations"],
                         "description": "The agent-graph entity collection to read."
                     }
                 },
@@ -409,7 +467,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "properties": {
                     "entity": {
                         "type": "string",
-                        "enum": ["tool_preference", "routing_preference"]
+                        "enum": ["tool_preference", "routing_preference", "reflex_preference"]
                     },
                     "tool_name": { "type": "string" },
                     "preference_key": { "type": "string" },
@@ -418,10 +476,90 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "provider_hint": { "type": "string" },
                     "model_ref": { "type": "string" },
                     "preference_level": { "type": "integer" },
+                    "precedence": { "type": "integer" },
+                    "reflexes": { "type": "object" },
                     "weight": { "type": "integer" },
                     "config": {}
                 },
                 "required": ["entity"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.declare".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.declare".into(),
+            description: "Declare an agent-local resource shape in the agent graph. Use this for \
+                          durable cognitive posture about resources the agent expects to use; it \
+                          does not grant hotel authority by itself."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource_type": {
+                        "type": "string",
+                        "description": "Resource type to declare, matching the shared resource enum."
+                    },
+                    "config_hint": {
+                        "type": ["string", "null"],
+                        "description": "Optional configuration hint to store with the declaration."
+                    }
+                },
+                "required": ["resource_type"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.recall".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.recall".into(),
+            description: "Recall recent agent-graph experience traces. Use this to inspect prior \
+                          tool calls, resource requests, model invocations, or approval outcomes \
+                          recorded for this agent."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum number of traces to return."
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "description": "Optional event type filter, such as tool_call."
+                    }
+                }
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.sync".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.sync".into(),
+            description: "Apply an inbound agent-graph snapshot using last-writer-wins merge \
+                          semantics. This is normally used by mesh synchronization rather than \
+                          casual model turns."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "source_node_id": { "type": "string" },
+                    "exported_at": { "type": "integer" },
+                    "preferences": { "type": "array", "items": { "type": "object" } },
+                    "routing_preferences": { "type": "array", "items": { "type": "object" } },
+                    "reflex_preferences": { "type": "array", "items": { "type": "object" } },
+                    "declarations": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["agent_id", "source_node_id", "exported_at", "preferences", "declarations"]
             }),
             class: Some("capability".into()),
         },
@@ -498,6 +636,26 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {}
+            }),
+            class: Some("graph".into()),
+        },
+    );
+
+    m.insert(
+        "graph.schema".into(),
+        ToolDefinition {
+            tool_name: "graph.schema".into(),
+            description: "Inspect the labels and relationship types visible in the active graph \
+                          datasource provider."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "graph_id": {
+                        "type": "string",
+                        "description": "Optional graph partition identifier."
+                    }
+                }
             }),
             class: Some("graph".into()),
         },
@@ -861,6 +1019,80 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "cron.register".into(),
+        ToolDefinition {
+            tool_name: "cron.register".into(),
+            description: "Register a cron job on the hotel. Use cron.list first to avoid \
+                          duplicates. The schedule is a 7-field cron expression and the payload \
+                          is a JSON string delivered to the target role."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schedule": {
+                        "type": "string",
+                        "description": "7-field cron expression: <sec> <min> <hour> <dom> <month> <dow> <year>. Example: \"0 0 7 * * * *\" for 7:00 AM daily."
+                    },
+                    "target_role": {
+                        "type": "string",
+                        "description": "Role name whose inbox receives the trigger payload, such as orchestrator."
+                    },
+                    "payload": {
+                        "type": "string",
+                        "description": "JSON payload string delivered to the role. Include enough context for the recipient to act without extra lookup."
+                    },
+                    "guaranteed": {
+                        "type": "boolean",
+                        "description": "Mesh-coordinated delivery flag. Optional; defaults to false."
+                    }
+                },
+                "required": ["schedule", "target_role", "payload"]
+            }),
+            class: Some("cron".into()),
+        },
+    );
+
+    m.insert(
+        "cron.list".into(),
+        ToolDefinition {
+            tool_name: "cron.list".into(),
+            description: "List cron jobs registered on this hotel, including schedule, target \
+                          role, enabled state, and next fire time."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("cron".into()),
+        },
+    );
+
+    for (tool_name, verb) in [
+        ("cron.enable", "Re-enable"),
+        ("cron.disable", "Disable"),
+        ("cron.remove", "Remove"),
+    ] {
+        m.insert(
+            tool_name.into(),
+            ToolDefinition {
+                tool_name: tool_name.into(),
+                description: format!("{verb} a cron job by id."),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "The cron job UUID."
+                        }
+                    },
+                    "required": ["job_id"]
+                }),
+                class: Some("cron".into()),
+            },
+        );
+    }
+
+    m.insert(
         "skill.register".into(),
         ToolDefinition {
             tool_name: "skill.register".into(),
@@ -915,9 +1147,27 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "skill.list".into(),
         ToolDefinition {
             tool_name: "skill.list".into(),
-            description: "Lists all registered skills in the hotel's skill catalog, including their \
-                          validation states and implied tools. Use to browse available skills before \
-                          assigning them to a role."
+            description: "Configuration inspection only. Lists registered skills in the hotel's \
+                          skill catalog, including validation states and implied tools. Use when \
+                          the operator asks to inspect or assign skills. Do not call just to decide \
+                          how to answer a normal user request."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "role.list".into(),
+        ToolDefinition {
+            tool_name: "role.list".into(),
+            description: "Configuration inspection only. Lists configured roles and active role \
+                          incarnations for this agent/hotel. Use when the operator asks which \
+                          roles exist, which role is active, or when debugging role routing. Do \
+                          not use as a generic discovery step before answering domain questions."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1699,7 +1949,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "description": "Ordered list of transform stages. Each stage has: capability (string), \
                                         mode ('blob'|'stream'), collect ('full'|'incremental'), \
                                         output_as ('replace_content'|'append_content'), \
-                                        on_failure ('passthrough'|'drop'|'error')."
+                                        on_failure ('passthrough'|'drop'|'error').",
+                        "items": { "type": "object" }
                     },
                     "deliver_as": {
                         "type": "string",
@@ -1764,8 +2015,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             tool_name: "memory.recall".into(),
             description: "Retrieve memories relevant to a query from the agent's long-term \
                           autobiographical store (MuninnDB). Returns the most salient engrams \
-                          based on semantic + graph activation. Use when the current context \
-                          is insufficient and prior knowledge may apply."
+                          based on semantic + graph activation. Use for prior conversation, \
+                          operator preferences, and agent continuity. For roles, goals, habits, \
+                          systems, open loops, or commitments in the operator's LifeGraph, prefer \
+                          life.recall."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -2031,6 +2284,36 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "memory.status".into(),
+        ToolDefinition {
+            tool_name: "memory.status".into(),
+            description: "Report the current MuninnDB connection status: whether the hotel has \
+                          the endpoint configured, whether it was reachable on the last probe, \
+                          and how many vaults are registered. Use before memory.recall/remember \
+                          if you suspect a connection issue."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.fix".into(),
+        ToolDefinition {
+            tool_name: "memory.fix".into(),
+            description: "Diagnose and recover MuninnDB memory connectivity. Triggers an \
+                          immediate hotel-side reachability probe and returns the result. \
+                          If the probe succeeds, memory tools are re-enabled. If it fails, \
+                          the outage is recorded in the heal queue for dispatcher action. \
+                          Use when memory.recall or memory.remember report errors or when \
+                          memory.status shows unreachable."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
         "approval.request_standing".into(),
         ToolDefinition {
             tool_name: "approval.request_standing".into(),
@@ -2245,5 +2528,351 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         },
     );
 
+    // ── Life Graph OS tools ────────────────────────────────────────────────────
+
+    m.insert(
+        "life.observe".into(),
+        ToolDefinition {
+            tool_name: "life.observe".into(),
+            description: "Propose a grounded observation as a new Life Graph evidence node. \
+                          Use this to record commitments, open loops, goals, habits, events, \
+                          and other lived-reality facts with provenance. \
+                          The node is written to the Life Graph with validation_state=proposed \
+                          and must be confirmed before becoming durable truth."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["observation_id", "evidence"],
+                "properties": {
+                    "observation_id": {
+                        "type": "string",
+                        "description": "Unique ID for this observation (e.g. 'obs:rowing-2026-06-05')."
+                    },
+                    "evidence": {
+                        "type": "object",
+                        "required": ["packet_id", "claim_ref", "claim_summary", "source_refs",
+                                     "confidence", "validation_state", "source_reliability",
+                                     "adjudication_status"],
+                        "properties": {
+                            "packet_id": {
+                                "type": "string",
+                                "description": "Unique ID for this evidence packet."
+                            },
+                            "claim_ref": {
+                                "type": "object",
+                                "required": ["id", "label"],
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": "Life Graph node ID (e.g. 'life:open_loop:rowing')."
+                                    },
+                                    "label": {
+                                        "type": "string",
+                                        "description": "Life Graph node type. Must be one of: \
+                                            Person, Role, Goal, System, Habit, Project, Commitment, \
+                                            OpenLoop, NextAction, Routine, Decision, Preference, Value, \
+                                            Concern, Event, Signal, GrowthHypothesis, GrowthExperiment, \
+                                            DriftFinding, CapabilityPatch, SkillPatch, ToolPatch, \
+                                            SchemaPatch, AttentionPatch, SystemPatch, StewardshipInstruction."
+                                    },
+                                    "datasource": {
+                                        "type": "string",
+                                        "description": "Always 'life-graph'.",
+                                        "default": "life-graph"
+                                    }
+                                }
+                            },
+                            "claim_summary": {
+                                "type": "string",
+                                "description": "One or two sentence summary of what was observed."
+                            },
+                            "source_refs": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["source_id", "source_kind", "reliability"],
+                                    "properties": {
+                                        "source_id": {
+                                            "type": "string",
+                                            "description": "Source membrane or agent ID (e.g. 'membrane:telegram')."
+                                        },
+                                        "source_kind": {
+                                            "type": "string",
+                                            "enum": [
+                                                "operator_confirmation", "membrane_event",
+                                                "muninn_engram", "graph_passage",
+                                                "imported_record", "agent_inference",
+                                                "runtime_observation"
+                                            ]
+                                        },
+                                        "reliability": {
+                                            "type": "object",
+                                            "required": ["score", "basis"],
+                                            "properties": {
+                                                "score": {
+                                                    "type": "number",
+                                                    "minimum": 0, "maximum": 1
+                                                },
+                                                "basis": {
+                                                    "type": "string",
+                                                    "enum": [
+                                                        "operator_confirmed", "direct_observation",
+                                                        "muninn_trust", "imported_authority",
+                                                        "agent_inferred", "unknown"
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0, "maximum": 1,
+                                "description": "Confidence in this claim (0.0–1.0)."
+                            },
+                            "validation_state": {
+                                "type": "string",
+                                "enum": ["inferred", "proposed", "confirmed", "retired", "conflicted"],
+                                "default": "proposed"
+                            },
+                            "source_reliability": {
+                                "type": "number",
+                                "minimum": 0, "maximum": 1
+                            },
+                            "adjudication_status": {
+                                "type": "string",
+                                "enum": [
+                                    "not_needed", "pending", "muninn_first",
+                                    "graph_review", "operator_required", "resolved", "rejected"
+                                ],
+                                "default": "not_needed"
+                            },
+                            "observed_at": {
+                                "type": "string",
+                                "description": "ISO 8601 timestamp when this was observed."
+                            },
+                            "conflict_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "default": []
+                            },
+                            "passage_refs": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                                "default": []
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "default": {}
+                            }
+                        }
+                    },
+                    "proposed_graph_refs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "default": []
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.recall".into(),
+        ToolDefinition {
+            tool_name: "life.recall".into(),
+            description: "Retrieve context from the operator's LifeGraph: roles, goals, habits, \
+                          systems, open loops, commitments, and next actions. Use this whenever \
+                          the operator asks what is in the LifeGraph or asks about life structure. \
+                          Provide query_text and, when useful, operator_intent; the runner can use \
+                          text/fallback recall when an embedding is not available. Named intents: \
+                          open_loops_by_context, goals_and_next_actions, commitments_approaching, \
+                          re_entry_context."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["query_id", "query_text", "strategy", "semantic_pivots",
+                             "expansion_policy", "ranking_weights", "max_context_packets"],
+                "properties": {
+                    "query_id": {"type": "string"},
+                    "query_text": {"type": "string", "description": "Human-language query."},
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["semantic_pivot", "vector_then_expand", "memory_aware_graph_rank"],
+                        "default": "memory_aware_graph_rank"
+                    },
+                    "operator_intent": {
+                        "type": "string",
+                        "description": "Named strategy hint: open_loops_by_context, goals_and_next_actions, commitments_approaching, re_entry_context."
+                    },
+                    "semantic_pivots": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["space", "embedding_model", "embedding_dims", "query_text_hash"],
+                            "properties": {
+                                "space": {
+                                    "type": "string",
+                                    "enum": ["life_event_semantic", "goal_system_semantic",
+                                             "skill_tool_semantic", "role_person_semantic",
+                                             "memory_bridge_semantic"]
+                                },
+                                "embedding_model": {"type": "string", "default": "Xenova/all-mpnet-base-v2"},
+                                "embedding_dims": {"type": "integer", "default": 768},
+                                "query_text_hash": {"type": "string"}
+                            }
+                        }
+                    },
+                    "expansion_policy": {
+                        "type": "object",
+                        "properties": {
+                            "max_hops": {"type": "integer", "default": 2},
+                            "max_nodes": {"type": "integer", "default": 24},
+                            "allowed_edge_types": {"type": "array", "items": {"type": "string"}, "default": []}
+                        }
+                    },
+                    "policy_filters": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["exclude_retired", "exclude_conflicted_unless_requested",
+                                     "require_evidence", "role_appropriate", "low_agency_only"]
+                        },
+                        "default": ["exclude_retired", "require_evidence"]
+                    },
+                    "ranking_weights": {
+                        "type": "object",
+                        "properties": {
+                            "semantic_similarity": {"type": "number", "default": 0.45},
+                            "graph_specificity": {"type": "number", "default": 0.2},
+                            "recency": {"type": "number", "default": 0.1},
+                            "confirmation": {"type": "number", "default": 0.15},
+                            "active_commitment": {"type": "number", "default": 0.1}
+                        }
+                    },
+                    "active_role": {"type": "string"},
+                    "max_context_packets": {"type": "integer", "default": 6}
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.commit".into(),
+        ToolDefinition {
+            tool_name: "life.commit".into(),
+            description: "Promote a validated Life Graph evidence node to confirmed truth. \
+                          Requires either confirmed evidence or explicit operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["evidence", "operator_approved"],
+                "properties": {
+                    "evidence": {
+                        "type": "object",
+                        "description": "The EvidencePacket to commit (same shape as life.observe)."
+                    },
+                    "operator_approved": {
+                        "type": "boolean",
+                        "description": "True if operator has explicitly approved this commit."
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.patch.propose".into(),
+        ToolDefinition {
+            tool_name: "life.patch.propose".into(),
+            description: "Propose a governed Life Graph improvement: schema change, skill update, \
+                          tool addition, attention policy change, or system-level change. \
+                          High-risk patches require operator approval before applying."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["patch_id", "patch_kind", "summary", "rationale", "evidence_packets", "risk"],
+                "properties": {
+                    "patch_id": {"type": "string"},
+                    "patch_kind": {
+                        "type": "string",
+                        "enum": ["schema_patch", "skill_patch", "tool_patch",
+                                 "attention_patch", "system_patch"]
+                    },
+                    "summary": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "evidence_packets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "object"}
+                    },
+                    "risk": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"]
+                    },
+                    "operator_approved": {
+                        "type": "boolean",
+                        "default": false
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_catalog;
+
+    #[test]
+    fn role_list_has_specific_model_facing_description() {
+        let catalog = tool_catalog();
+        let role_list = catalog.get("role.list").expect("role.list catalog entry");
+
+        assert!(
+            role_list
+                .description
+                .contains("Configuration inspection only")
+        );
+        assert!(!role_list.description.contains("Execute the role.list tool"));
+        assert_eq!(role_list.input_schema["type"], "object");
+    }
+
+    #[test]
+    fn life_recall_description_does_not_require_model_generated_embedding() {
+        let catalog = tool_catalog();
+        let life_recall = catalog
+            .get("life.recall")
+            .expect("life.recall catalog entry");
+
+        assert!(life_recall.description.contains("operator's LifeGraph"));
+        assert!(life_recall.description.contains("text/fallback recall"));
+        assert!(
+            !life_recall
+                .description
+                .contains("Requires an embedding vector")
+        );
+    }
+
+    #[test]
+    fn diagnostic_tool_descriptions_are_explicitly_diagnostic() {
+        let catalog = tool_catalog();
+        for name in ["session.status", "hotel.status", "skill.list"] {
+            let tool = catalog.get(name).expect("cataloged diagnostic tool");
+            assert!(
+                tool.description.contains("Diagnostic only")
+                    || tool.description.contains("Configuration inspection only"),
+                "{name} should tell the model it is an inspection tool"
+            );
+        }
+    }
 }

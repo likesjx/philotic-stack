@@ -131,6 +131,25 @@ impl SqliteCypherProvider {
             }
         }
     }
+
+    fn schema(&self, conn: &Connection) -> Result<Value> {
+        let mut labels = Vec::new();
+        let mut stmt = conn.prepare("SELECT DISTINCT label FROM ag_node ORDER BY label")?;
+        for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            labels.push(row?);
+        }
+
+        let mut relationship_types = Vec::new();
+        let mut stmt = conn.prepare("SELECT DISTINCT label FROM ag_edge ORDER BY label")?;
+        for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            relationship_types.push(row?);
+        }
+
+        Ok(json!({
+            "labels": labels,
+            "relationship_types": relationship_types,
+        }))
+    }
 }
 
 #[async_trait]
@@ -146,7 +165,7 @@ impl DatasourceProvider for SqliteCypherProvider {
                 | TaskKind::CreatePartition
                 | TaskKind::DropPartition
                 | TaskKind::GrantAccess
-        ) || matches!(&task.kind, TaskKind::Custom(s) if s == "graph.list")
+        ) || matches!(&task.kind, TaskKind::Custom(s) if s == "graph.list" || s == "graph.schema")
     }
 
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
@@ -189,6 +208,17 @@ impl DatasourceProvider for SqliteCypherProvider {
                     }
                 }
                 Ok(ProviderOutput::ResultSet(json!(graphs)))
+            }
+            TaskKind::Custom(s) if s == "graph.schema" => {
+                if !db_path.exists() {
+                    if let Some(parent) = db_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    self.init_partition(&db_path)?;
+                }
+
+                let conn = Connection::open(&db_path)?;
+                Ok(ProviderOutput::ResultSet(self.schema(&conn)?))
             }
             TaskKind::GrantAccess => {
                 warn!("GrantAccess is a stub — no persistent permissions store yet");

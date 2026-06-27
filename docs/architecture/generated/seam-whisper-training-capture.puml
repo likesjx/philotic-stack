@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - whisper-training-capture
+
+rectangle "whisper-training-capture" as whisper_training_capture #Orange {
+}
+
+
+@enduml

@@ -1563,7 +1563,15 @@ impl ModelProvider for GeminiProvider {
             }
         };
 
+        let payload_bytes = serde_json::to_vec(&payload).map(|v| v.len()).unwrap_or(0);
         let url = self.streaming_endpoint_url(Some(self.request_model(task)))?;
+        tracing::debug!(
+            "invoke_streaming: payload={}B model={} tools={} structured={}",
+            payload_bytes,
+            self.request_model(task),
+            task.tools.len(),
+            use_structured,
+        );
         let req = self.http_client.post(url).json(&payload);
         // Wrap send() in a timeout — for large contexts Gemini can take 20–30s
         // before returning the first response byte, leaving send().await hung forever.
@@ -1607,6 +1615,12 @@ impl ModelProvider for GeminiProvider {
         };
         let mut _display_text_out = String::new();
 
+        tracing::debug!(
+            "invoke_streaming: HTTP {} — entering SSE loop (idle={}s total={}s)",
+            status.as_u16(),
+            STREAMING_IDLE_SECS,
+            STREAMING_TOTAL_SECS,
+        );
         let idle_dur = Duration::from_secs(STREAMING_IDLE_SECS);
         let sse_start = Instant::now();
         // Stash a function-call response found in SSE chunks. Gemini delivers tool

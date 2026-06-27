@@ -15,6 +15,36 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+fn graph_datasource_node_id() -> String {
+    std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_NODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|hotel| format!("{hotel}-aiua-01"))
+        })
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+}
+
+fn life_graph_runner_node_id() -> String {
+    std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_HOME_HOTEL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(|hotel| format!("{hotel}-aiua-01"))
+        })
+        .unwrap_or_else(|| "vps-jane-aiua-01".to_string())
+}
+
 fn local_agent_id() -> String {
     std::env::var("PHILOTIC_AGENT_ID").unwrap_or_else(|_| "agent-jane-01".to_string())
 }
@@ -31,6 +61,45 @@ fn sanitize_turn_content_for_history(content: &str) -> String {
         }
     }
     content.to_string()
+}
+
+fn dropped_active_turn_record(checkpoint: &serde_json::Value) -> Option<TurnRecord> {
+    let turn = checkpoint.get("active_turn")?;
+    if turn.is_null() {
+        return None;
+    }
+
+    let phase = turn
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("queued");
+    if matches!(phase, "waiting_approval" | "waiting_tool") {
+        return None;
+    }
+
+    let user_content = turn
+        .get("user_content")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_turn_content_for_history)
+        .filter(|content| !content.trim().is_empty())?;
+    let turn_id = turn
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dropped-active-turn")
+        .to_string();
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    Some(TurnRecord {
+        turn_id,
+        user_content,
+        assistant_content: Some(format!(
+            "[Previous turn ended in phase '{phase}' before a final usable answer. If the user asks to retry, resume this request instead of treating the retry as a new topic.]"
+        )),
+        created_at,
+    })
 }
 
 fn sanitize_timezone_for_prompt(raw: &str) -> Option<String> {
@@ -1199,10 +1268,20 @@ impl SessionState {
         target_role: impl Into<String>,
         target_guest_id: Option<String>,
     ) {
+        // Preserve a specific guest_id already locked in by a transport (e.g. membrane-telegram).
+        // Internal re-entry messages (paracrine_response, tool_result) carry no guest_id, so
+        // they would wipe the membrane target and cause fan-out to all subscribers. Only
+        // overwrite guest_id when the caller provides a specific one.
+        let effective_guest_id = target_guest_id.or_else(|| {
+            self.bindings
+                .transport_reply_target
+                .as_ref()
+                .and_then(|t| t.target_guest_id.clone())
+        });
         self.bindings.transport_reply_target = Some(TransportReplyTargetBinding {
             target_node: target_node.into(),
             target_role: target_role.into(),
-            target_guest_id,
+            target_guest_id: effective_guest_id,
         });
     }
 
@@ -1627,7 +1706,8 @@ impl SessionState {
             return all_tools;
         }
 
-        let normalized = normalized_turn_text(user_content);
+        let normalized_current = normalized_turn_text(user_content);
+        let normalized = self.projection_relevance_text(&normalized_current);
         if normalized.is_empty() {
             return all_tools;
         }
@@ -1654,10 +1734,50 @@ impl SessionState {
             .cloned()
             .collect::<Vec<_>>();
         if !explicitly_named.is_empty() {
-            return explicitly_named;
+            if !looks_like_multi_tool_workflow(&normalized) {
+                return explicitly_named;
+            }
+
+            let mut projected = explicitly_named;
+            let mut add_tool = |tool_name: &str| {
+                if projected.iter().any(|tool| tool.tool_name == tool_name) {
+                    return;
+                }
+                if let Some(tool) = all_tools.iter().find(|tool| tool.tool_name == tool_name) {
+                    projected.push(tool.clone());
+                }
+            };
+
+            for skill in self
+                .bindings
+                .effective_skillset
+                .iter()
+                .chain(self.bindings.on_demand_skills.iter())
+            {
+                if crate::catalog::skill_is_relevant_for_turn(skill, &normalized) {
+                    for &tool_name in crate::catalog::skill_implied_tools(skill) {
+                        add_tool(tool_name);
+                    }
+                    for &tool_name in crate::catalog::tools_for_skill(skill) {
+                        add_tool(tool_name);
+                    }
+                }
+            }
+
+            if normalized.contains("handoff")
+                || normalized.contains("hand off")
+                || normalized.contains("hand-off")
+            {
+                add_tool("handoff.to_role");
+                add_tool("handoff.back");
+            }
+
+            return projected;
         }
 
-        if looks_like_conversational_goal(&normalized) {
+        if looks_like_conversational_goal(&normalized)
+            && !looks_like_retry_goal(&normalized_current)
+        {
             return Vec::new();
         }
 
@@ -1708,6 +1828,25 @@ impl SessionState {
         }
 
         all_tools
+    }
+
+    fn projection_relevance_text(&self, normalized_current: &str) -> String {
+        if !looks_like_retry_goal(normalized_current) {
+            return normalized_current.to_string();
+        }
+
+        let mut parts = vec![normalized_current.to_string()];
+        if let Some(previous) = self.recent_turns.last() {
+            parts.push(normalized_turn_text(&previous.user_content));
+            if let Some(assistant_content) = previous.assistant_content.as_deref() {
+                parts.push(normalized_turn_text(assistant_content));
+            }
+        }
+        parts
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     pub fn build_prompt(&self, user_content: &str) -> String {
@@ -2164,7 +2303,8 @@ impl SessionState {
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> Vec<String> {
-        if self.bindings.effective_skillset.is_empty() {
+        if self.bindings.effective_skillset.is_empty() && self.bindings.on_demand_skills.is_empty()
+        {
             return Vec::new();
         }
 
@@ -2173,7 +2313,8 @@ impl SessionState {
             .iter()
             .map(|tool| tool.tool_name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        self.bindings
+        let mut projected_skills = self
+            .bindings
             .effective_skillset
             .iter()
             .filter(|skill| {
@@ -2194,7 +2335,24 @@ impl SessionState {
                     .any(|tool| projected_tool_names.contains(tool))
             })
             .cloned()
-            .collect()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for skill in &self.bindings.on_demand_skills {
+            if !crate::catalog::skill_is_relevant_for_turn(skill, &normalized) {
+                continue;
+            }
+            let implied_tools = crate::catalog::skill_implied_tools(skill);
+            let owned_tools = crate::catalog::tools_for_skill(skill);
+            if implied_tools
+                .iter()
+                .chain(owned_tools.iter())
+                .any(|tool| projected_tool_names.contains(tool))
+            {
+                projected_skills.insert(skill.clone());
+            }
+        }
+
+        projected_skills.into_iter().collect()
     }
 
     fn projected_role_activation_for_turn(
@@ -3263,7 +3421,7 @@ impl SessionState {
             .and_then(|value| serde_json::from_value::<ComponentRouteAssembly>(value).ok())
             .unwrap_or_default();
 
-        let recent_turns = checkpoint
+        let mut recent_turns = checkpoint
             .get("recent_turns")
             .and_then(serde_json::Value::as_array)
             .map(|turns| {
@@ -3286,6 +3444,20 @@ impl SessionState {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+
+        if let Some(dropped) = dropped_active_turn_record(checkpoint) {
+            let already_recorded = recent_turns
+                .iter()
+                .any(|turn| turn.turn_id == dropped.turn_id);
+            if !already_recorded {
+                recent_turns.push(dropped);
+                let window_size = AgentSettings::default().memory.memory_window_size.max(1);
+                if recent_turns.len() > window_size {
+                    let drain = recent_turns.len() - window_size;
+                    recent_turns.drain(0..drain);
+                }
+            }
+        }
 
         let active_turn = checkpoint.get("active_turn").and_then(|turn| {
             if turn.is_null() {
@@ -3528,6 +3700,34 @@ impl SessionState {
     }
 }
 
+/// Returns true if `phrase` appears in `text` as a standalone word/phrase, not as a
+/// substring of a larger word — e.g. "ok" must not match inside "look" or "took".
+fn contains_word_boundary(text: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(idx) = text[start..].find(phrase) {
+        let abs_start = start + idx;
+        let abs_end = abs_start + phrase.len();
+        let before_ok = text[..abs_start]
+            .chars()
+            .next_back()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        let after_ok = text[abs_end..]
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_start + 1;
+        if start >= text.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn looks_like_conversational_goal(normalized: &str) -> bool {
     normalized.contains('?')
         || [
@@ -3551,7 +3751,7 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
             "sounds good",
         ]
         .iter()
-        .any(|phrase| normalized.contains(phrase))
+        .any(|phrase| contains_word_boundary(normalized, phrase))
         || [
             "what",
             "why",
@@ -3567,7 +3767,31 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
             "can we talk",
         ]
         .iter()
-        .any(|prefix| normalized.starts_with(prefix))
+        .any(|prefix| {
+            normalized.starts_with(prefix)
+                && normalized[prefix.len()..]
+                    .chars()
+                    .next()
+                    .map(|c| !c.is_alphanumeric())
+                    .unwrap_or(true)
+        })
+}
+
+fn looks_like_retry_goal(normalized: &str) -> bool {
+    [
+        "try again",
+        "retry",
+        "again?",
+        "again",
+        "one more time",
+        "rerun",
+        "run it again",
+        "do it again",
+        "let's try that again",
+        "lets try that again",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
 }
 
 fn looks_like_execution_goal(normalized: &str) -> bool {
@@ -3652,6 +3876,27 @@ fn looks_like_memory_promotion_goal(normalized: &str) -> bool {
         "make durable",
         "operator approved",
         "verified memory",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_multi_tool_workflow(normalized: &str) -> bool {
+    [
+        " and ",
+        " then ",
+        " also ",
+        "handoff",
+        "hand off",
+        "hand-off",
+        "delegate",
+        "equip",
+        "assign",
+        "schedule",
+        "recurring",
+        "daily",
+        "weekly",
+        "provision",
     ]
     .iter()
     .any(|phrase| normalized.contains(phrase))
@@ -3746,77 +3991,12 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         })
         .collect::<Vec<_>>();
 
-    let local_node_id = local_node_id();
     let execution_routes = toolset
         .iter()
         .map(|tool_name| {
-            let execution_mode = if is_local_agent_tool(tool_name) {
-                "local_agent"
-            } else if is_agent_graph_tool(tool_name) {
-                "agent_graph"
-            } else if is_graph_datasource_tool(tool_name) {
-                "datasource"
-            } else if is_table_datasource_tool(tool_name) {
-                "table_datasource"
-            } else if is_capability_primitive(tool_name) {
-                "capability_invoke"
-            } else if is_pinned_tool(tool_name) {
-                "pinned"
-            } else {
-                "capability"
-            };
             (
                 tool_name.clone(),
-                ToolExecutionRoute {
-                    target_node: local_node_id.clone(),
-                    target_role: if execution_mode == "local_agent" {
-                        "agent".into()
-                    } else if execution_mode == "agent_graph" {
-                        "agent-graph".into()
-                    } else if execution_mode == "datasource" {
-                        "graph-datasource".into()
-                    } else if execution_mode == "table_datasource" {
-                        "table-datasource".into()
-                    } else if execution_mode == "capability_invoke" {
-                        // Hotel routes CapabilityInvoke to the best provider — target_role is unused.
-                        String::new()
-                    } else {
-                        format!("tool.{tool_name}")
-                    },
-                    runner_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
-                    {
-                        None
-                    } else {
-                        Some("tool-runner-01".into())
-                    },
-                    incarnation_id: None,
-                    hotel_id: if execution_mode == "local_agent" || execution_mode == "agent_graph"
-                    {
-                        None
-                    } else {
-                        Some(local_node_id.clone())
-                    },
-                    environment_id: None,
-                    task_runner_kind: task_runner_kind_for_tool(tool_name),
-                    task_runner_config: task_runner_base_config_for_tool(bindings, tool_name),
-                    execution_mode: execution_mode.into(),
-                    availability_state: "live".into(),
-                    selection_reason: Some(if execution_mode == "local_agent" {
-                        "agent_local_tool".into()
-                    } else if execution_mode == "agent_graph" {
-                        "agent_graph_route".into()
-                    } else if execution_mode == "datasource" {
-                        "graph_datasource_route".into()
-                    } else if execution_mode == "table_datasource" {
-                        "table_datasource_route".into()
-                    } else if execution_mode == "capability_invoke" {
-                        "capability_invoke_route".into()
-                    } else if execution_mode == "pinned" {
-                        "default_pinned_route".into()
-                    } else {
-                        "default_capability_route".into()
-                    }),
-                },
+                default_execution_route_for_tool(bindings, tool_name),
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -3859,6 +4039,17 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         }
     }
 
+    // Expand class grants: include every catalog tool whose class is listed.
+    if !bindings.allowed_classes.is_empty() {
+        for (tool_name, def) in crate::catalog::tool_catalog() {
+            if let Some(class) = &def.class {
+                if bindings.allowed_classes.contains(class) && !toolset.contains(tool_name) {
+                    toolset.push(tool_name.clone());
+                }
+            }
+        }
+    }
+
     // Always include observer and meta-approval tools — every philote can inspect its own
     // session/hotel and request standing approval for tools it uses regularly.
     for always in [
@@ -3891,6 +4082,8 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "memory.cultivate"
             | "memory.true_up"
             | "memory.promote_candidate"
+            | "memory.fix"
+            | "memory.status"
             | "rule.propose"
             | "routing.policy.propose"
             | "routing.reflex.set"
@@ -3923,6 +4116,11 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "router.stats"
             | "vision.setup"
             | "vision.status"
+            | "cron.register"
+            | "cron.list"
+            | "cron.enable"
+            | "cron.disable"
+            | "cron.remove"
     )
 }
 
@@ -3940,7 +4138,24 @@ fn is_agent_graph_tool(tool_name: &str) -> bool {
 fn is_graph_datasource_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "graph.query" | "graph.create" | "graph.drop" | "graph.list" | "graph.grant_access"
+        "graph.query"
+            | "graph.create"
+            | "graph.drop"
+            | "graph.list"
+            | "graph.schema"
+            | "graph.grant_access"
+    )
+}
+
+fn is_life_graph_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "life.observe"
+            | "life.recall"
+            | "life.commit"
+            | "life.resolve"
+            | "life.conflict"
+            | "life.patch.propose"
     )
 }
 
@@ -4033,7 +4248,11 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
             .into_iter()
             .collect::<Vec<_>>()
     } else {
-        bindings.effective_toolset.clone()
+        // Use default_visible_toolset so allowed_classes and skill grants expand
+        // alongside the explicit effective_toolset.  Without this, class-tagged tools
+        // (e.g. life.observe from the life_graph class) would be invisible even when
+        // the profile has allowed_classes: ["life_graph"] and a matching incarnation.
+        default_visible_toolset(bindings)
     };
 
     let catalog = tool_catalog();
@@ -4055,7 +4274,9 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
     let execution_routes = visible_tools
         .iter()
         .filter_map(|tool_name| {
-            select_incarnation_route(bindings, tool_name).map(|route| (tool_name.clone(), route))
+            let route = select_incarnation_route(bindings, tool_name)
+                .unwrap_or_else(|| default_execution_route_for_tool(bindings, tool_name));
+            Some((tool_name.clone(), route))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
 
@@ -4076,6 +4297,91 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
         tools_for_model,
         execution_routes,
         policy_annotations,
+    }
+}
+
+fn default_execution_route_for_tool(
+    bindings: &SessionBindings,
+    tool_name: &str,
+) -> ToolExecutionRoute {
+    let local_node_id = local_node_id();
+    let graph_datasource_node_id = graph_datasource_node_id();
+    let life_graph_runner_node_id = life_graph_runner_node_id();
+    let execution_mode = if is_local_agent_tool(tool_name) {
+        "local_agent"
+    } else if is_agent_graph_tool(tool_name) {
+        "agent_graph"
+    } else if is_graph_datasource_tool(tool_name) {
+        "datasource"
+    } else if is_life_graph_tool(tool_name) {
+        "life_graph"
+    } else if is_table_datasource_tool(tool_name) {
+        "table_datasource"
+    } else if is_capability_primitive(tool_name) {
+        "capability_invoke"
+    } else if is_pinned_tool(tool_name) {
+        "pinned"
+    } else {
+        "capability"
+    };
+
+    ToolExecutionRoute {
+        target_node: if execution_mode == "datasource" {
+            graph_datasource_node_id
+        } else if execution_mode == "life_graph" {
+            life_graph_runner_node_id
+        } else {
+            local_node_id.clone()
+        },
+        target_role: if execution_mode == "local_agent" {
+            "agent".into()
+        } else if execution_mode == "agent_graph" {
+            "agent-graph".into()
+        } else if execution_mode == "datasource" {
+            "graph-datasource".into()
+        } else if execution_mode == "life_graph" {
+            "life-graph-runner".into()
+        } else if execution_mode == "table_datasource" {
+            "table-datasource".into()
+        } else if execution_mode == "capability_invoke" {
+            // Hotel routes CapabilityInvoke to the best provider; target_role is unused.
+            String::new()
+        } else {
+            format!("tool.{tool_name}")
+        },
+        runner_id: if execution_mode == "local_agent" || execution_mode == "agent_graph" {
+            None
+        } else {
+            Some("tool-runner-01".into())
+        },
+        incarnation_id: None,
+        hotel_id: if execution_mode == "local_agent" || execution_mode == "agent_graph" {
+            None
+        } else {
+            Some(local_node_id)
+        },
+        environment_id: None,
+        task_runner_kind: task_runner_kind_for_tool(tool_name),
+        task_runner_config: task_runner_base_config_for_tool(bindings, tool_name),
+        execution_mode: execution_mode.into(),
+        availability_state: "live".into(),
+        selection_reason: Some(if execution_mode == "local_agent" {
+            "agent_local_tool".into()
+        } else if execution_mode == "agent_graph" {
+            "agent_graph_route".into()
+        } else if execution_mode == "datasource" {
+            "graph_datasource_route".into()
+        } else if execution_mode == "life_graph" {
+            "life_graph_runner_route".into()
+        } else if execution_mode == "table_datasource" {
+            "table_datasource_route".into()
+        } else if execution_mode == "capability_invoke" {
+            "capability_invoke_route".into()
+        } else if execution_mode == "pinned" {
+            "default_pinned_route".into()
+        } else {
+            "default_capability_route".into()
+        }),
     }
 }
 
@@ -4406,9 +4712,9 @@ mod tests {
         MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel,
         ParacrineThreadStatus, PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest,
         ResponseRouteMode, RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
-        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, VoiceDeliveryMode,
-        VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
-        session_checkpoint_memory_type,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, TurnRecord,
+        VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings,
+        merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
@@ -4538,6 +4844,39 @@ mod tests {
         assert_eq!(
             restored_turn.paracrine_response_routing,
             Some(philotic_client::ParacrineRouting::EnrichedToolResult)
+        );
+    }
+
+    #[test]
+    fn failed_active_turn_is_preserved_as_retry_context_on_restore() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut turn = test_working_turn(None);
+        turn.phase = TurnPhase::Failed;
+        turn.user_content = "Use life.recall to inspect my LifeGraph roles".into();
+        state.start_turn(turn);
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+
+        assert!(
+            restored.active_turn.is_none(),
+            "failed turn should not stay active after restore"
+        );
+        let retry_context = restored
+            .recent_turns
+            .last()
+            .expect("failed turn should become retry context");
+        assert_eq!(
+            retry_context.user_content,
+            "Use life.recall to inspect my LifeGraph roles"
+        );
+        assert!(
+            retry_context
+                .assistant_content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("resume this request")
         );
     }
 
@@ -4910,10 +5249,15 @@ mod tests {
                 preferred_hotel_id: None,
                 preferred_environment_id: None,
                 allowed_tool_runner_incarnations: Vec::new(),
+                allowed_classes: Vec::new(),
                 on_demand_skills: Vec::new(),
             }
         );
-        assert_eq!(state.recent_turns.len(), 1);
+        // The dropped "waiting_model" active turn (not resumable across restart) is
+        // appended as a continuity record alongside the original recent_turns entry.
+        assert_eq!(state.recent_turns.len(), 2);
+        assert_eq!(state.recent_turns[1].turn_id, "turn-2");
+        assert_eq!(state.recent_turns[1].user_content, "status?");
         assert!(state.active_turn.is_none());
         assert_eq!(state.tool_assembly.tools_for_model[0].tool_name, "echo");
         assert_eq!(
@@ -5082,6 +5426,77 @@ mod tests {
         assert!(props.contains_key("command"));
         assert!(props.contains_key("working_dir"));
         assert!(props.contains_key("timeout_secs"));
+    }
+
+    #[test]
+    fn cron_register_catalog_entry_exposes_required_contract() {
+        use crate::catalog::tool_catalog;
+        let catalog = tool_catalog();
+        let entry = catalog
+            .get("cron.register")
+            .expect("cron.register in catalog");
+        let required = entry
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required array");
+        for name in ["schedule", "target_role", "payload"] {
+            assert!(
+                required.iter().any(|v| v.as_str() == Some(name)),
+                "{name} must be required for cron.register"
+            );
+        }
+        let props = entry
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties object");
+        assert!(props.contains_key("schedule"));
+        assert!(props.contains_key("target_role"));
+        assert!(props.contains_key("payload"));
+        assert_eq!(entry.class.as_deref(), Some("cron"));
+    }
+
+    #[test]
+    fn catalog_exposes_agent_graph_and_graph_schema_surface() {
+        use crate::catalog::tool_catalog;
+        let catalog = tool_catalog();
+
+        for tool_name in [
+            "agent.graph.read",
+            "agent.graph.write",
+            "agent.graph.declare",
+            "agent.graph.recall",
+            "agent.graph.sync",
+            "graph.schema",
+        ] {
+            assert!(
+                catalog.contains_key(tool_name),
+                "{tool_name} must be in catalog"
+            );
+        }
+
+        let read_entity_enum =
+            catalog["agent.graph.read"].input_schema["properties"]["entity"]["enum"]
+                .as_array()
+                .expect("agent.graph.read entity enum");
+        assert!(
+            read_entity_enum
+                .iter()
+                .any(|value| value.as_str() == Some("reflex_preferences")),
+            "agent.graph.read must expose reflex_preferences"
+        );
+
+        let write_entity_enum =
+            catalog["agent.graph.write"].input_schema["properties"]["entity"]["enum"]
+                .as_array()
+                .expect("agent.graph.write entity enum");
+        assert!(
+            write_entity_enum
+                .iter()
+                .any(|value| value.as_str() == Some("reflex_preference")),
+            "agent.graph.write must expose reflex_preference"
+        );
     }
 
     #[test]
@@ -5454,6 +5869,7 @@ mod tests {
             preferred_hotel_id: None,
             preferred_environment_id: None,
             allowed_tool_runner_incarnations: Vec::new(),
+            allowed_classes: Vec::new(),
             on_demand_skills: Vec::new(),
         };
 
@@ -5719,6 +6135,75 @@ mod tests {
                 .iter()
                 .any(|skill| skill["id"] == "context.synthesize")
         );
+    }
+
+    #[test]
+    fn orchestrator_role_provisioning_projects_authoring_and_skill_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        state.clear_tool_bindings();
+        for tool in [
+            "role.list",
+            "role.create_or_update",
+            "skill.list",
+            "skill.register",
+            "skill.assign",
+            "handoff.to_role",
+            "handoff.back",
+            "cron.register",
+            "cron.list",
+        ] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.effective_skillset = vec!["handoff.to_role".into(), "handoff.back".into()];
+        state.bindings.on_demand_skills = vec![
+            "role.authoring".into(),
+            "skill.authoring".into(),
+            "cron.manage".into(),
+        ];
+
+        let user_content = concat!(
+            "Beacon, please provision a new role named Chronos for scheduling and recurring rituals. ",
+            "Use role.create_or_update to create or update the role with the cron-capable profile ",
+            "or the narrowest available profile that can use cron tools. ",
+            "Equip Chronos with the cron.manage skill if needed. ",
+            "Then hand off to Chronos and have her schedule my Daily Check-In for 7:00 AM America/New_York."
+        );
+        let projected = state.project_tools_for_turn(user_content);
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(projected_names.contains("role.create_or_update"));
+        assert!(projected_names.contains("skill.assign"));
+        assert!(projected_names.contains("handoff.to_role"));
+        assert!(projected_names.contains("cron.register"));
+        assert_eq!(
+            state
+                .resolve_tool_route("cron.list")
+                .expect("cron.list should have an execution route")
+                .execution_mode,
+            "local_agent"
+        );
+        assert_eq!(
+            state
+                .resolve_tool_route("cron.register")
+                .expect("cron.register should have an execution route")
+                .execution_mode,
+            "local_agent"
+        );
+
+        let affordances = state.model_affordances_for_turn(user_content, &projected);
+        let projected_skills = affordances["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|skill| skill["id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(projected_skills.contains("role.authoring"));
+        assert!(projected_skills.contains("skill.authoring"));
+        assert!(projected_skills.contains("cron.manage"));
     }
 
     #[test]
@@ -6123,6 +6608,116 @@ mod tests {
     }
 
     #[test]
+    fn life_graph_class_routes_to_vps_runner() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.rebuild_default_tool_assembly();
+
+        assert!(state.tool_is_enabled("life.observe"));
+        let route = state
+            .resolve_tool_route("life.observe")
+            .expect("life.observe route should be assembled from life_graph class");
+        assert_eq!(route.target_node, "vps-jane-aiua-01");
+        assert_eq!(route.target_role, "life-graph-runner");
+        assert_eq!(route.execution_mode, "life_graph");
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("life_graph_runner_route")
+        );
+    }
+
+    #[test]
+    fn life_graph_class_routes_via_incarnation_when_effective_toolset_set() {
+        // Regression: when effective_toolset is non-empty and allowed_tool_runner_incarnations
+        // is also set (e.g. orchestrator profile), allowed_classes must still expand so that
+        // class-tagged tools like life.observe are visible and routed to the incarnation.
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-bjork-01".into(),
+            "operator-chat".into(),
+        );
+        state.bindings.effective_toolset = vec!["echo".into(), "bash.exec".into()];
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.bindings.allowed_tool_runner_incarnations = vec![ToolRunnerIncarnationBinding {
+            incarnation_id: "vps-jane:life-graph-runner".into(),
+            runner_id: Some("vps-jane:life-graph-runner".into()),
+            hotel_id: Some("vps-jane".into()),
+            environment_id: None,
+            target_node: Some("vps-jane-aiua-01".into()),
+            target_role: Some("life-graph-runner".into()),
+            supported_tools: vec![
+                "life.observe".into(),
+                "life.recall".into(),
+                "life.commit".into(),
+            ],
+            execution_mode: "capability".into(),
+            availability_state: "live".into(),
+            selection_hint: None,
+        }];
+        state.rebuild_default_tool_assembly();
+
+        assert!(
+            state.tool_is_enabled("echo"),
+            "echo should still be enabled"
+        );
+        assert!(
+            state.tool_is_enabled("life.observe"),
+            "life.observe should be enabled via allowed_classes life_graph"
+        );
+        let route = state
+            .resolve_tool_route("life.observe")
+            .expect("life.observe route should be assembled from incarnation");
+        assert_eq!(
+            route.incarnation_id.as_deref(),
+            Some("vps-jane:life-graph-runner")
+        );
+        assert_eq!(route.hotel_id.as_deref(), Some("vps-jane"));
+    }
+
+    #[test]
+    fn incarnation_assembly_preserves_local_agent_routes() {
+        // Regression: binding a remote LifeGraph runner must not make local-agent tools
+        // visible without routes. Beacon hit this as: "Tool role.list has no assembled
+        // execution route" after life_graph runner bindings were seeded.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon-01".into(), "telegram".into());
+        state.bindings.effective_toolset = vec!["role.list".into()];
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.bindings.allowed_tool_runner_incarnations = vec![ToolRunnerIncarnationBinding {
+            incarnation_id: "vps-jane:life-graph-runner".into(),
+            runner_id: Some("vps-jane:life-graph-runner".into()),
+            hotel_id: Some("vps-jane".into()),
+            environment_id: None,
+            target_node: Some("vps-jane-aiua-01".into()),
+            target_role: Some("life-graph-runner".into()),
+            supported_tools: vec![
+                "life.observe".into(),
+                "life.recall".into(),
+                "life.commit".into(),
+            ],
+            execution_mode: "capability".into(),
+            availability_state: "live".into(),
+            selection_hint: None,
+        }];
+        state.rebuild_default_tool_assembly();
+
+        let role_route = state
+            .resolve_tool_route("role.list")
+            .expect("role.list should keep its local-agent route");
+        assert_eq!(role_route.execution_mode, "local_agent");
+        assert_eq!(role_route.target_role, "agent");
+
+        let life_route = state
+            .resolve_tool_route("life.observe")
+            .expect("life.observe should still route to the runner incarnation");
+        assert_eq!(
+            life_route.incarnation_id.as_deref(),
+            Some("vps-jane:life-graph-runner")
+        );
+    }
+
+    #[test]
     fn preferred_environment_overrides_live_local_fallback() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -6268,6 +6863,36 @@ mod tests {
     }
 
     #[test]
+    fn graph_datasource_tools_route_to_home_node() {
+        unsafe {
+            std::env::set_var("PHILOTIC_NODE_ID", "mac-jane-aiua-01");
+            std::env::remove_var("PHILOTIC_GRAPH_DATASOURCE_HOME_NODE");
+            std::env::remove_var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL");
+        }
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("graph.query");
+        state.rebuild_default_tool_assembly();
+
+        let route = state
+            .resolve_tool_route("graph.query")
+            .expect("graph.query route should exist");
+
+        assert_eq!(route.execution_mode, "datasource");
+        assert_eq!(route.target_node, "vps-jane-aiua-01");
+        assert_eq!(route.target_role, "graph-datasource");
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("graph_datasource_route")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_NODE_ID");
+        }
+    }
+
+    #[test]
     fn conversational_turns_project_no_tools_by_default() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -6300,6 +6925,58 @@ mod tests {
             "\"Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.\"",
         );
         assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn natural_lifegraph_request_is_not_treated_as_conversational() {
+        // Regression: Jane's real-world phrase "please take a look at the lifegraph
+        // now and see whtat we have there." was projecting zero tools because
+        // looks_like_conversational_goal's plain substring match for "ok" matched
+        // inside "look" — the word "look" contains "ok" as a substring, so the
+        // filler-phrase heuristic falsely treated the whole request as conversational
+        // chit-chat and the model never even saw life.recall as an available tool.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.rebuild_default_tool_assembly();
+
+        let projected = state.project_tools_for_turn(
+            "please take a look at the lifegraph now and see whtat we have there.",
+        );
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            projected_names.contains("life.recall"),
+            "expected life.recall to survive tool projection, got {projected_names:?}"
+        );
+    }
+
+    #[test]
+    fn retry_turn_projects_tools_from_failed_lifegraph_context() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.allowed_classes = vec!["life_graph".into()];
+        state.rebuild_default_tool_assembly();
+        state.recent_turns.push(TurnRecord {
+            turn_id: "failed-turn".into(),
+            user_content: "Use life.recall to inspect my LifeGraph roles and goals".into(),
+            assistant_content: Some(
+                "[Previous turn ended in phase 'failed' before a final usable answer. If the user asks to retry, resume this request instead of treating the retry as a new topic.]"
+                    .into(),
+            ),
+            created_at: 1,
+        });
+
+        let projected = state.project_tools_for_turn("try again?");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(projected_names.contains(&"life.recall"));
     }
 
     #[test]

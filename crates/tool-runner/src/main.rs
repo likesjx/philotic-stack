@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use memory_core::{MemoryEngine as _, MemoryScope, MuninnConfig, MuninnRestEngine, VaultResolver};
-use philotic_client::{is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{
+    is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute,
+};
 use philotic_sandbox::{
     DirectShellExecutor, ExecuteCommandRequest, ExecuteCommandResponse, ExecutionStatus,
     SandboxedShellExecutor, ShellExecutionMode, ShellExecutor,
@@ -739,19 +741,20 @@ async fn main() -> Result<()> {
         .send_request(IpcRequest::FetchMemoryConfig)
         .await
     {
-        Ok(IpcResponse::MemoryConfig {
-            config_json: Some(json),
-        }) => match serde_json::from_str::<MuninnConfig>(&json) {
-            Ok(cfg) => {
-                info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "Memory tools enabled");
-                Some(cfg)
+        Ok(IpcResponse::MemoryConfig(config)) if config.config_json.is_some() => {
+            let json = config.config_json.expect("checked is_some");
+            match serde_json::from_str::<MuninnConfig>(&json) {
+                Ok(cfg) => {
+                    info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "Memory tools enabled");
+                    Some(cfg)
+                }
+                Err(e) => {
+                    warn!("Failed to parse MuninnConfig: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                warn!("Failed to parse MuninnConfig: {e}");
-                None
-            }
-        },
-        Ok(IpcResponse::MemoryConfig { config_json: None }) => {
+        }
+        Ok(IpcResponse::MemoryConfig(config)) if config.config_json.is_none() => {
             info!("Memory tools disabled — hotel has no MuninnDB config");
             None
         }
@@ -797,16 +800,7 @@ async fn main() -> Result<()> {
                     .unwrap_or_default()
                     .to_string();
                 let local_node_id = local_node_id();
-                let reply_to = task
-                    .get("reply_to")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&local_node_id)
-                    .to_string();
-                let reply_role = task
-                    .get("reply_role")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("agent")
-                    .to_string();
+                let return_route = ReturnRoute::from_task(&task, &local_node_id, "agent");
                 let final_reply_to = task
                     .get("final_reply_to")
                     .and_then(serde_json::Value::as_str)
@@ -854,11 +848,13 @@ async fn main() -> Result<()> {
 
                 ipc_client
                     .send_request(IpcRequest::EmitTask {
-                        target_node: reply_to,
-                        target_role: reply_role,
-                        target_guest_id: None,
+                        target_node: return_route.node.clone(),
+                        target_role: return_route.role.clone(),
+                        target_guest_id: return_route.guest_id.clone(),
                         task_json: json!({
                             "action": "tool_result",
+                            "return_route": return_route.as_json(),
+                            "reply_guest_id": return_route.guest_id,
                             "session_id": session_id,
                             "turn_id": turn_id,
                             "chat_id": chat_id,

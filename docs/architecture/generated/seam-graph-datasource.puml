@@ -6,5 +6,7 @@ title Seam Detail - graph-datasource
 rectangle "graph-datasource" as graph_datasource #Orange {
 }
 
+rectangle "Life Graph OS Proposal [proposal]" as Life_Graph_OS_Proposal #LightBlue
+Life_Graph_OS_Proposal --> graph_datasource : governs
 
 @enduml

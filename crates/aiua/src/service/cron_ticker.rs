@@ -25,12 +25,14 @@
 //! [`ansible_mesh_core::cron::interpolate_payload`].
 
 use crate::LedgerCommand;
-use crate::service::ipc::InboxRegistry;
+use crate::service::guest_manager::GuestMaterializationRequester;
+use crate::service::ipc::{InboxRegistry, ParkedInboundRegistry};
 use ansible_mesh_core::cron::{
     CronInterpolationVars, CronJob, interpolate_payload, next_fire_after,
 };
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+use ansible_mesh_core::graph::RoleIncarnationRecord;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -46,6 +48,8 @@ pub struct CronTicker {
     /// Per-hotel stagger offset for guaranteed jobs (ms).
     /// Derived from `PHILOTIC_CRON_OFFSET_SECS * 1000`. Default 0.
     offset_ms: u64,
+    parked_inbound: ParkedInboundRegistry,
+    materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
 }
 
 impl CronTicker {
@@ -55,6 +59,8 @@ impl CronTicker {
         inboxes: InboxRegistry,
         local_node_id: impl Into<String>,
         offset_ms: u64,
+        parked_inbound: ParkedInboundRegistry,
+        materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     ) -> Self {
         Self {
             graph,
@@ -62,7 +68,20 @@ impl CronTicker {
             inboxes,
             local_node_id: local_node_id.into(),
             offset_ms,
+            parked_inbound,
+            materialization_requester,
         }
+    }
+
+    /// Resolve a cron job's `target_role` (expected shape: `role:{agent_id}:{role_name}`,
+    /// matching `RoleIncarnationRecord::routing_role`) to the role incarnation it names,
+    /// if one is configured.
+    fn resolve_target_role_record(
+        graph: &GraphDomain,
+        target_role: &str,
+    ) -> Option<RoleIncarnationRecord> {
+        let (agent_id, role_name) = target_role.strip_prefix("role:")?.split_once(':')?;
+        graph.get_role_incarnation(agent_id, role_name).ok().flatten()
     }
 
     pub async fn run(self) {
@@ -186,13 +205,7 @@ impl CronTicker {
         let payload_data = interpolate_payload(&job.payload, &vars);
 
         let task_id = Uuid::new_v4();
-        let task_json = serde_json::json!({
-            "cron_job_id": job.id,
-            "target_role": job.target_role,
-            "fire_epoch": fire_epoch,
-            "payload": payload_data,
-        })
-        .to_string();
+        let task_json = build_cron_task_json(job, fire_epoch, &self.local_node_id, payload_data);
 
         // Durably append TaskInvoke to the event ledger.
         let task_env = EventEnvelope {
@@ -225,16 +238,47 @@ impl CronTicker {
             return;
         }
 
-        // Deliver to the role inbox (local delivery).
-        crate::service::ipc::IpcServer::deliver_inbound_task(
-            &self.inboxes,
-            &self.local_node_id,
-            &job.target_role,
-            None,
-            task_id,
-            task_json,
-        )
-        .await;
+        // Deliver to the role inbox (local delivery). If the target role resolves to a
+        // configured role incarnation that isn't currently subscribed (e.g. an on-demand
+        // role guest that hasn't been spawned yet), park the task and trigger its
+        // materialization instead of dropping it ledger-only.
+        let target_role_record = Self::resolve_target_role_record(&self.graph, &job.target_role);
+        let is_subscribed = {
+            let guard = self.inboxes.lock().await;
+            let role_subs = guard.get(job.target_role.as_str()).cloned().unwrap_or_default();
+            match &target_role_record {
+                Some(record) => role_subs.iter().any(|s| s.guest_id == record.guest_id),
+                None => !role_subs.is_empty(),
+            }
+        };
+
+        match (&target_role_record, is_subscribed) {
+            (Some(record), false) => {
+                crate::service::ipc::IpcServer::park_and_materialize_local_role(
+                    &self.graph,
+                    &self.inboxes,
+                    &self.parked_inbound,
+                    self.materialization_requester.as_deref(),
+                    &self.local_node_id,
+                    &self.local_node_id,
+                    task_id,
+                    task_json,
+                    record,
+                )
+                .await;
+            }
+            _ => {
+                crate::service::ipc::IpcServer::deliver_inbound_task(
+                    &self.inboxes,
+                    &self.local_node_id,
+                    &job.target_role,
+                    target_role_record.as_ref().map(|r| r.guest_id.as_str()),
+                    task_id,
+                    task_json,
+                )
+                .await;
+            }
+        }
 
         info!(
             "CronTicker: fired job {} → role={} epoch={}",
@@ -389,4 +433,330 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn build_cron_task_json(
+    job: &CronJob,
+    fire_epoch: u64,
+    local_node_id: &str,
+    payload_data: String,
+) -> String {
+    let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(&payload_data) else {
+        return serde_json::json!({
+            "cron_job_id": job.id,
+            "target_role": job.target_role,
+            "fire_epoch": fire_epoch,
+            "payload": payload_data,
+        })
+        .to_string();
+    };
+
+    let Some(signal_seed) = payload_json.get("paracrine_signal") else {
+        // Promote message → content so the philote runtime's handle_user_message can dispatch
+        // the turn. Also propagate routing fields (session_id, chat_id, source, transport)
+        // from the inner payload so that the reply routes back to the right channel/chat.
+        let content = payload_json
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut outer = serde_json::json!({
+            "cron_job_id": job.id,
+            "target_role": job.target_role,
+            "fire_epoch": fire_epoch,
+            "payload": payload_data,
+            "content": content,
+            "source": "cron",
+        });
+        for key in ["chat_id", "session_id", "source", "transport", "thread_id"] {
+            if let Some(val) = payload_json.get(key) {
+                outer[key] = val.clone();
+            }
+        }
+        return outer.to_string();
+    };
+
+    let mut signal = signal_seed
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    signal
+        .entry("signal_id")
+        .or_insert_with(|| serde_json::Value::String(format!("cron:{}:{fire_epoch}", job.id)));
+    signal
+        .entry("signal_type")
+        .or_insert_with(|| serde_json::Value::String("heartbeat".into()));
+    signal
+        .entry("scope")
+        .or_insert_with(|| serde_json::Value::String("hotel".into()));
+    signal
+        .entry("source_node")
+        .or_insert_with(|| serde_json::Value::String(local_node_id.to_string()));
+    signal
+        .entry("source_hotel")
+        .or_insert_with(|| serde_json::Value::String(local_node_id.to_string()));
+    signal
+        .entry("target_role_type")
+        .or_insert_with(|| serde_json::Value::String(job.target_role.clone()));
+    signal
+        .entry("cadence")
+        .or_insert_with(|| serde_json::Value::String(job.schedule.clone()));
+    signal
+        .entry("priority")
+        .or_insert_with(|| serde_json::Value::String("normal".into()));
+    signal
+        .entry("observed_at")
+        .or_insert_with(|| serde_json::Value::Number(fire_epoch.into()));
+    signal
+        .entry("policy_tags")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    signal
+        .entry("subject_refs")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+
+    serde_json::json!({
+        "action": "paracrine_signal",
+        "source": "cron-ticker",
+        "transport": "cron",
+        "cron_job_id": job.id,
+        "target_role": job.target_role,
+        "fire_epoch": fire_epoch,
+        "payload": payload_json,
+        "paracrine_signal": serde_json::Value::Object(signal),
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ansible_mesh_core::cron::CronJobSource;
+
+    fn test_job() -> CronJob {
+        CronJob {
+            id: "job-1".into(),
+            schedule: "0 */15 * * * * *".into(),
+            target_role: "attention-steward".into(),
+            target_node_id: None,
+            payload: "{}".into(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at: 1_000,
+            created_at: 900,
+            created_by: CronJobSource::Operator,
+        }
+    }
+
+    #[test]
+    fn cron_payload_without_paracrine_signal_keeps_legacy_task_shape() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{"hello":"world"}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(value["cron_job_id"], "job-1");
+        assert_eq!(value["target_role"], "attention-steward");
+        assert_eq!(value["fire_epoch"], 1_234);
+        assert_eq!(value["payload"], r#"{"hello":"world"}"#);
+        assert!(value.get("action").is_none());
+    }
+
+    #[test]
+    fn cron_payload_with_message_promotes_content_and_routing_fields() {
+        let payload = r#"{
+            "event": "daily_check_in",
+            "message": "Good morning! Please run the morning check-in.",
+            "chat_id": "7898847424",
+            "source": "telegram",
+            "session_id": "telegram:7898847424:agent-beacon"
+        }"#;
+        let task = build_cron_task_json(&test_job(), 9_999, "vps-jane-aiua-01", payload.into());
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(
+            value["content"],
+            "Good morning! Please run the morning check-in."
+        );
+        assert_eq!(value["chat_id"], "7898847424");
+        assert_eq!(value["source"], "telegram");
+        assert_eq!(value["session_id"], "telegram:7898847424:agent-beacon");
+        assert_eq!(value["cron_job_id"], "job-1");
+        assert_eq!(value["fire_epoch"], 9_999);
+        assert!(value.get("action").is_none());
+    }
+
+    #[test]
+    fn cron_payload_without_message_uses_empty_content() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{"event": "ping"}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(value["content"], "");
+        assert_eq!(value["source"], "cron");
+    }
+
+    #[test]
+    fn cron_payload_with_paracrine_signal_builds_normalized_signal_task() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{
+                "paracrine_signal": {
+                    "signal_type": "life_graph.attention_scan",
+                    "scope": "life_graph",
+                    "policy_tags": ["observe_only"]
+                },
+                "payload_summary": "scan open loops"
+            }"#
+            .into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(value["action"], "paracrine_signal");
+        assert_eq!(value["transport"], "cron");
+        assert_eq!(value["cron_job_id"], "job-1");
+        assert_eq!(value["paracrine_signal"]["signal_id"], "cron:job-1:1234");
+        assert_eq!(
+            value["paracrine_signal"]["signal_type"],
+            "life_graph.attention_scan"
+        );
+        assert_eq!(value["paracrine_signal"]["source_node"], "mac-jane-aiua-01");
+        assert_eq!(
+            value["paracrine_signal"]["source_hotel"],
+            "mac-jane-aiua-01"
+        );
+        assert_eq!(
+            value["paracrine_signal"]["target_role_type"],
+            "attention-steward"
+        );
+        assert_eq!(value["paracrine_signal"]["cadence"], "0 */15 * * * * *");
+        assert_eq!(value["paracrine_signal"]["observed_at"], 1_234);
+        assert_eq!(value["paracrine_signal"]["policy_tags"][0], "observe_only");
+    }
+
+    #[tokio::test]
+    async fn fire_parks_and_materializes_dormant_role_incarnation_instead_of_dropping_task() {
+        use ansible_mesh_core::NodeCapabilities;
+        use ansible_mesh_core::graph::{RoleReadinessState, TurnLoopConfig};
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+        use ansible_mesh_core::storage::HotelRecord;
+        use async_trait::async_trait;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Mutex;
+
+        struct MockRequester {
+            calls: AtomicUsize,
+            last_guest_id: Mutex<Option<String>>,
+        }
+
+        #[async_trait]
+        impl GuestMaterializationRequester for MockRequester {
+            async fn ensure_guest_active(&self, guest_id: &str) -> anyhow::Result<bool> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                *self.last_guest_id.lock().await = Some(guest_id.to_string());
+                Ok(true)
+            }
+        }
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/cron-ticker-test.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-test".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-test:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: true,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let mut job = test_job();
+        job.target_role = "role:agent-test:orchestrator".into();
+
+        // Buffered and never read — `fire()` only ever pushes one ledger entry per call,
+        // so the receiver just needs to stay alive to keep the send from failing.
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let requester = Arc::new(MockRequester {
+            calls: AtomicUsize::new(0),
+            last_guest_id: Mutex::new(None),
+        });
+        let parked_inbound: crate::service::ipc::ParkedInboundRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let ticker = CronTicker::new(
+            graph.clone(),
+            dispatcher_tx,
+            inboxes,
+            "local-aiua-01",
+            0,
+            parked_inbound.clone(),
+            Some(requester.clone() as Arc<dyn GuestMaterializationRequester>),
+        );
+
+        ticker.fire(&job, 1_000).await;
+
+        assert_eq!(
+            requester.calls.load(Ordering::SeqCst),
+            1,
+            "fire() should trigger on-demand materialization for the dormant role guest"
+        );
+        assert_eq!(
+            requester.last_guest_id.lock().await.as_deref(),
+            Some("agent-test:orchestrator"),
+            "materialization must target the role incarnation's own guest_id, not a \
+             cross-hotel philote-{{role}} placeholder"
+        );
+
+        let parked = parked_inbound.lock().await;
+        assert_eq!(
+            parked.get("agent-test:orchestrator").map(Vec::len),
+            Some(1),
+            "task should be parked under the role incarnation's own guest_id, not dropped"
+        );
+
+        let guest = graph
+            .get_guest("local-hotel", "agent-test:orchestrator")
+            .expect("get_guest should not error")
+            .expect(
+                "on-demand materialization should have upserted the local role guest record",
+            );
+        assert!(
+            guest.is_active,
+            "materialization must flip the dormant role guest active, not leave it dead"
+        );
+    }
 }

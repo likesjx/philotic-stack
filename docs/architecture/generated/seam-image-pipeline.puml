@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - image-pipeline
+
+rectangle "image-pipeline" as image_pipeline #Orange {
+}
+
+
+@enduml

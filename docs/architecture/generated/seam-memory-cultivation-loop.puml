@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-cultivation-loop
+
+rectangle "memory-cultivation-loop" as memory_cultivation_loop #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - life-graph-schema
+
+rectangle "life-graph-schema" as life_graph_schema #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - dangerous-action-ceremonies
+
+rectangle "dangerous-action-ceremonies" as dangerous_action_ceremonies #Orange {
+}
+
+
+@enduml

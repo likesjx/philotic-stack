@@ -932,7 +932,7 @@ pub struct ContextWindowPolicy {
 }
 
 fn default_max_tool_result_chars() -> usize {
-    32_768
+    8_192
 }
 
 fn default_max_tool_history_entries() -> usize {
@@ -945,7 +945,7 @@ impl Default for ContextWindowPolicy {
             dialogue_window_minutes: 10,
             dialogue_window_chars: 10_000,
             include_tool_calls: true,
-            max_tool_result_chars: 32_768,
+            max_tool_result_chars: 8_192,
             max_tool_history_entries: 15,
         }
     }
@@ -996,7 +996,7 @@ pub struct ExecutionPolicy {
 impl Default for ExecutionPolicy {
     fn default() -> Self {
         Self {
-            iteration_cap: 20,
+            iteration_cap: 10,
             plan_required_on_skill: true,
             stream_tool_events: true,
             stall_detection_threshold: 3,
@@ -1120,6 +1120,11 @@ pub struct SessionBindings {
     pub preferred_environment_id: Option<String>,
     #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
+    /// Tool classes whose catalog members are eligible for this session.
+    /// Populated from the active toolset profile; expanded into concrete tool names
+    /// by `default_visible_toolset` using the local catalog's class annotations.
+    #[serde(default)]
+    pub allowed_classes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

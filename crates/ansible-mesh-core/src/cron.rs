@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::str::FromStr;
 
 /// Unique identifier for a cron job.
@@ -77,6 +78,130 @@ pub struct CronInterpolationVars<'a> {
     pub target_role: &'a str,
 }
 
+/// Reusable template for a cron-backed paracrine heartbeat payload.
+///
+/// The hotel cron ticker interpolates `{job_id}`, `{timestamp}`,
+/// `{iso_timestamp}`, `{node_id}`, and `{target_role}` before dispatch. Keeping
+/// the template here gives role authors one canonical registration shape instead
+/// of hand-rolled JSON per heartbeat.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParacrineHeartbeatTemplate {
+    /// Typed signal category, for example `open_loop_staleness`.
+    pub signal_type: String,
+    /// Life Graph scope, for example `personal`, `project`, or `work`.
+    pub scope: String,
+    /// Subscriber role-type that should receive the signal.
+    pub target_role_type: String,
+    /// Life Graph node ids or external refs the signal concerns.
+    #[serde(default)]
+    pub subject_refs: Vec<String>,
+    /// Human cadence label used by stewardship policy.
+    pub cadence: String,
+    /// Signal priority: `low`, `medium`, or `high`.
+    pub priority: String,
+    /// Optional ISO 8601 expiry template or timestamp.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Human-readable summary of what caused the heartbeat.
+    pub payload_summary: String,
+    /// Tags used by SIL/policy matching.
+    #[serde(default)]
+    pub policy_tags: Vec<String>,
+}
+
+impl ParacrineHeartbeatTemplate {
+    pub fn attention_steward(
+        signal_type: impl Into<String>,
+        scope: impl Into<String>,
+        cadence: impl Into<String>,
+        payload_summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            signal_type: signal_type.into(),
+            scope: scope.into(),
+            target_role_type: "attention-steward".into(),
+            subject_refs: Vec::new(),
+            cadence: cadence.into(),
+            priority: "medium".into(),
+            expires_at: None,
+            payload_summary: payload_summary.into(),
+            policy_tags: vec!["observe_only".into(), "life_graph".into()],
+        }
+    }
+
+    pub fn with_subject_refs(
+        mut self,
+        subject_refs: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.subject_refs = subject_refs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_policy_tags(
+        mut self,
+        policy_tags: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.policy_tags = policy_tags.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_priority(mut self, priority: impl Into<String>) -> Self {
+        self.priority = priority.into();
+        self
+    }
+
+    pub fn with_expires_at(mut self, expires_at: impl Into<String>) -> Self {
+        self.expires_at = Some(expires_at.into());
+        self
+    }
+
+    /// Serialize a cron `payload` string that the ticker will normalize into an
+    /// `action = "paracrine_signal"` task at fire time.
+    pub fn to_cron_payload(&self) -> Result<String> {
+        anyhow::ensure!(
+            !self.signal_type.trim().is_empty(),
+            "signal_type is required"
+        );
+        anyhow::ensure!(!self.scope.trim().is_empty(), "scope is required");
+        anyhow::ensure!(
+            !self.target_role_type.trim().is_empty(),
+            "target_role_type is required"
+        );
+        anyhow::ensure!(!self.cadence.trim().is_empty(), "cadence is required");
+        anyhow::ensure!(
+            !self.payload_summary.trim().is_empty(),
+            "payload_summary is required"
+        );
+
+        Ok(json!({
+            "paracrine_signal": {
+                "signal_id": "cron:{job_id}:{timestamp}",
+                "signal_type": self.signal_type,
+                "scope": self.scope,
+                "source_hotel": "{node_id}",
+                "source_node": "{node_id}",
+                "target_role_type": self.target_role_type,
+                "subject_refs": self.subject_refs,
+                "cadence": self.cadence,
+                "priority": self.priority,
+                "observed_at": "{iso_timestamp}",
+                "expires_at": self.expires_at,
+                "payload_summary": self.payload_summary,
+                "policy_tags": self.policy_tags,
+            },
+            "payload_summary": self.payload_summary,
+            "heartbeat": {
+                "kind": "cron-backed-paracrine-heartbeat",
+                "job_id": "{job_id}",
+                "fired_at": "{iso_timestamp}",
+                "source_hotel": "{node_id}",
+                "target_role": "{target_role}",
+            }
+        })
+        .to_string())
+    }
+}
+
 impl<'a> CronInterpolationVars<'a> {
     /// Construct vars for a given fire time and job context.
     pub fn new(timestamp_ms: u64, job_id: &'a str, node_id: &'a str, target_role: &'a str) -> Self {
@@ -127,4 +252,55 @@ pub fn next_fire_after(schedule_str: &str, after_ms: u64) -> Result<u64> {
         .next()
         .with_context(|| format!("cron expression '{schedule_str}' has no future occurrences"))?;
     Ok(next.timestamp_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paracrine_heartbeat_template_emits_attention_steward_contract() {
+        let payload = ParacrineHeartbeatTemplate::attention_steward(
+            "open_loop_staleness",
+            "personal",
+            "daily",
+            "Scan stale open loops and defer unless policy says to record.",
+        )
+        .with_subject_refs(["lifegraph:open_loop"])
+        .with_policy_tags(["adhd-support", "re-entry"])
+        .to_cron_payload()
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let signal = &value["paracrine_signal"];
+
+        assert_eq!(signal["signal_id"], "cron:{job_id}:{timestamp}");
+        assert_eq!(signal["signal_type"], "open_loop_staleness");
+        assert_eq!(signal["scope"], "personal");
+        assert_eq!(signal["source_hotel"], "{node_id}");
+        assert_eq!(signal["source_node"], "{node_id}");
+        assert_eq!(signal["target_role_type"], "attention-steward");
+        assert_eq!(signal["subject_refs"][0], "lifegraph:open_loop");
+        assert_eq!(signal["cadence"], "daily");
+        assert_eq!(signal["observed_at"], "{iso_timestamp}");
+        assert_eq!(signal["policy_tags"][0], "adhd-support");
+        assert_eq!(
+            value["heartbeat"]["kind"],
+            "cron-backed-paracrine-heartbeat"
+        );
+    }
+
+    #[test]
+    fn paracrine_heartbeat_template_rejects_empty_required_fields() {
+        let err = ParacrineHeartbeatTemplate::attention_steward(
+            "",
+            "personal",
+            "daily",
+            "Scan stale open loops.",
+        )
+        .to_cron_payload()
+        .unwrap_err();
+
+        assert!(err.to_string().contains("signal_type is required"));
+    }
 }

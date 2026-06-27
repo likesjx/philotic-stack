@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - membrane-transport-home
+
+rectangle "membrane-transport-home" as membrane_transport_home #Orange {
+}
+
+
+@enduml

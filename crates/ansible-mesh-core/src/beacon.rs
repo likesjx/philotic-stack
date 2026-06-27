@@ -1,6 +1,9 @@
 use crate::authz::{MeshAuth, NonceTracker};
 use crate::domain::GraphDomain;
-use crate::heartbeat::{CapabilitySyncPayload, HeartbeatPayload};
+use crate::heartbeat::{
+    emit_catalog_sync, emit_heartbeat, emit_hotel_state_sync, CapabilitySyncPayload,
+    HeartbeatPayload, HotelStateSyncPayload, MeshCatalogSyncPayload, MeshPeerEntry,
+};
 use crate::registry::NodeRegistry;
 use crate::{BeaconMessage, MsgType, NodeCapabilities};
 use anyhow::{Context, Result};
@@ -22,6 +25,9 @@ pub struct BeaconDaemon {
     // and WAL contention on the main context.db under concurrent UDP load.
     nonce_tracker: Option<Mutex<NonceTracker>>,
     enable_rust_auth: bool,
+    /// Shared snapshot of this hotel's current guest+agent roster. Written by aiua
+    /// whenever the roster changes; read by the beacon to include in anchor handshakes.
+    pub local_hotel_state: Arc<RwLock<Option<HotelStateSyncPayload>>>,
 }
 
 impl BeaconDaemon {
@@ -86,6 +92,7 @@ impl BeaconDaemon {
             inbox_tx,
             nonce_tracker,
             enable_rust_auth,
+            local_hotel_state: Arc::new(RwLock::new(None)),
         })
     }
     pub fn socket(&self) -> Arc<UdpSocket> {
@@ -185,7 +192,7 @@ impl BeaconDaemon {
                     return;
                 }
 
-                self.dispatch_message(msg).await;
+                self.dispatch_message(msg, src).await;
             }
             Err(e) => {
                 error!("Failed to decode BeaconMessage from {}: {}", src, e);
@@ -193,7 +200,7 @@ impl BeaconDaemon {
         }
     }
 
-    async fn dispatch_message(&self, msg: BeaconMessage) {
+    async fn dispatch_message(&self, msg: BeaconMessage, src: SocketAddr) {
         match msg.msg_type {
             MsgType::Heartbeat => {
                 if let Ok(payload) = serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
@@ -201,13 +208,127 @@ impl BeaconDaemon {
                         "Received heartbeat from node: {} (roles: {:?})",
                         payload.capabilities.node_id, payload.capabilities.roles
                     );
+                    let peer_node_id = payload.capabilities.node_id.clone();
+
+                    // Check before updating so we can detect reconnects (stale → fresh).
+                    let was_stale = {
+                        let registry = self.registry.read().await;
+                        registry.is_node_stale(&peer_node_id)
+                    };
+
                     let mut registry = self.registry.write().await;
                     registry.observe_heartbeat(
-                        payload.capabilities,
+                        payload.capabilities.clone(),
                         payload.execution_reachability,
                         payload.node_health,
                     );
+                    drop(registry);
+
+                    // Reconcile stored mesh_port if the heartbeat arrived from a different port.
+                    // This self-heals boot-time port conflicts without manual DB edits.
+                    // We do NOT update mesh_host from src.ip() — Tailscale routing makes
+                    // the observed source IP unreliable vs. the stored Tailscale address.
+                    let mut port_changed = false;
+                    if let Ok(hotels) = self.graph.list_hotels() {
+                        if let Some(mut hotel) = hotels
+                            .into_iter()
+                            .find(|h| h.capabilities.node_id == peer_node_id)
+                        {
+                            if hotel.mesh_port != src.port() {
+                                info!(
+                                    "Reconciling mesh_port for {}: {} → {}",
+                                    hotel.hotel_name,
+                                    hotel.mesh_port,
+                                    src.port()
+                                );
+                                hotel.mesh_port = src.port();
+                                let _ = self.graph.upsert_hotel(&hotel);
+                                port_changed = true;
+                            }
+                        }
+                    }
+
+                    // Reply with a heartbeat + peer catalog when a peer reconnects (was stale or
+                    // changed port). The heartbeat gives the reconnecting node our current address;
+                    // the catalog lets it fix stale entries for ALL other peers in one shot.
+                    // This is the anchor handshake: even if mac-jane doesn't know mbp-jane's new
+                    // port, it can learn it from vps-jane's catalog the moment it re-announces.
+                    if port_changed || was_stale {
+                        if let Ok(Some(auth_key)) = self.auth_key_for_node(&peer_node_id) {
+                            if let Err(e) = emit_heartbeat(
+                                &self.socket,
+                                src,
+                                &self.local_capabilities,
+                                None,
+                                &auth_key,
+                                None,
+                            )
+                            .await
+                            {
+                                warn!("Failed to send reconnect reply heartbeat to {}: {}", src, e);
+                            } else {
+                                info!(
+                                    "Sent reconnect reply heartbeat to {} at {}",
+                                    peer_node_id, src
+                                );
+                            }
+
+                            // Send our peer directory so the reconnecting node can update any
+                            // stale peer records in a single round-trip (anchor handshake).
+                            if let Ok(hotels) = self.graph.list_hotels() {
+                                let peers: Vec<MeshPeerEntry> = hotels
+                                    .into_iter()
+                                    .filter(|h| {
+                                        h.capabilities.node_id != self.local_capabilities.node_id
+                                            && h.capabilities.node_id != peer_node_id
+                                    })
+                                    .map(|h| MeshPeerEntry {
+                                        node_id: h.capabilities.node_id.clone(),
+                                        hotel_name: h.hotel_name.clone(),
+                                        mesh_host: h.mesh_host.clone(),
+                                        mesh_port: h.mesh_port,
+                                    })
+                                    .collect();
+                                if !peers.is_empty() {
+                                    if let Err(e) = emit_catalog_sync(
+                                        &self.socket,
+                                        src,
+                                        &self.local_capabilities,
+                                        peers,
+                                        &auth_key,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            "Failed to send reconnect catalog sync to {}: {}",
+                                            src, e
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Send our hotel roster so the reconnecting peer can immediately
+                            // route to our agents without waiting for the next HotelStateSync.
+                            if let Some(state) = self.local_hotel_state.read().await.clone() {
+                                if let Err(e) = emit_hotel_state_sync(
+                                    &self.socket,
+                                    src,
+                                    &self.local_capabilities,
+                                    state,
+                                    &auth_key,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "Failed to send hotel state sync to {} at {}: {}",
+                                        peer_node_id, src, e
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
+                let _ = self.inbox_tx.send(msg).await;
             }
             MsgType::CapabilitySync => {
                 if let Ok(payload) = serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload) {
@@ -222,12 +343,89 @@ impl BeaconDaemon {
                         payload.advertisements,
                     );
                 }
+                let _ = self.inbox_tx.send(msg).await;
+            }
+            MsgType::MeshCatalogSync => {
+                // Anchor handshake reply: update stale peer records from the sender's directory.
+                // Only updates mesh_port (port changes are the main drift vector). mesh_host is
+                // only filled in if empty — we trust stored Tailscale IPs over relayed values.
+                if let Ok(payload) = serde_json::from_slice::<MeshCatalogSyncPayload>(&msg.payload)
+                {
+                    if let Ok(hotels) = self.graph.list_hotels() {
+                        for peer in &payload.peers {
+                            if peer.node_id == self.local_capabilities.node_id {
+                                continue;
+                            }
+                            if let Some(mut hotel) = hotels
+                                .iter()
+                                .find(|h| h.capabilities.node_id == peer.node_id)
+                                .cloned()
+                            {
+                                let mut changed = false;
+                                if hotel.mesh_port != peer.mesh_port {
+                                    info!(
+                                        "Catalog sync from {}: updating mesh_port for {} {} → {}",
+                                        msg.src_node,
+                                        hotel.hotel_name,
+                                        hotel.mesh_port,
+                                        peer.mesh_port
+                                    );
+                                    hotel.mesh_port = peer.mesh_port;
+                                    changed = true;
+                                }
+                                if hotel.mesh_host.as_deref().unwrap_or("").is_empty() {
+                                    if let Some(ref host) = peer.mesh_host {
+                                        if !host.is_empty() {
+                                            info!(
+                                                "Catalog sync from {}: setting mesh_host for {} to {}",
+                                                msg.src_node, hotel.hotel_name, host
+                                            );
+                                            hotel.mesh_host = Some(host.clone());
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                                if changed {
+                                    let _ = self.graph.upsert_hotel(&hotel);
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = self.inbox_tx.send(msg).await;
+            }
+            MsgType::HotelStateSync => {
+                if let Ok(payload) = serde_json::from_slice::<HotelStateSyncPayload>(&msg.payload) {
+                    if payload.node_id != self.local_capabilities.node_id {
+                        let mut registry = self.registry.write().await;
+                        registry.observe_hotel_state(
+                            payload.node_id.clone(),
+                            payload.hotel_name.clone(),
+                            payload.guests,
+                            payload.agents,
+                        );
+                        info!(
+                            "Hotel state sync from {} ({}): {} guests, {} agents",
+                            payload.hotel_name,
+                            payload.node_id,
+                            registry
+                                .remote_hotel_states()
+                                .find(|s| s.node_id == payload.node_id)
+                                .map(|s| s.guests.len())
+                                .unwrap_or(0),
+                            registry
+                                .remote_hotel_states()
+                                .find(|s| s.node_id == payload.node_id)
+                                .map(|s| s.agents.len())
+                                .unwrap_or(0),
+                        );
+                    }
+                }
             }
             MsgType::MeshEventBatch
             | MsgType::MeshEventAck
             | MsgType::MeshMembershipAccept
             | MsgType::MeshMembershipSync
-            | MsgType::MeshCatalogSync
             | MsgType::WebRtcSignal => {
                 let _ = self.inbox_tx.send(msg).await;
             }
@@ -246,5 +444,168 @@ impl BeaconDaemon {
             .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::GraphDomain;
+    use crate::heartbeat::HeartbeatPayload;
+    use crate::registry::NodeRegistry;
+    use crate::sqlite_storage::SqliteGraphStorage;
+    use crate::storage::HotelRecord;
+    use crate::{BeaconMessage, MsgType, NodeCapabilities, NodeConstraints};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
+
+    fn test_caps(node_id: &str) -> NodeCapabilities {
+        NodeCapabilities {
+            node_id: node_id.to_string(),
+            roles: vec![],
+            models: vec![],
+            tools: vec![],
+            constraints: NodeConstraints::default(),
+        }
+    }
+
+    fn test_hotel(hotel_name: &str, node_id: &str, mesh_port: u16) -> HotelRecord {
+        HotelRecord {
+            hotel_name: hotel_name.to_string(),
+            capabilities: test_caps(node_id),
+            mesh_host: Some("100.79.239.64".to_string()),
+            mesh_port,
+            blob_port: mesh_port + 1,
+            execution_port: mesh_port + 2,
+            ipc_socket_path: "/tmp/philotic-aiua.sock".to_string(),
+            active_pid: None,
+        }
+    }
+
+    fn heartbeat_msg(node_id: &str) -> BeaconMessage {
+        let payload = HeartbeatPayload {
+            capabilities: test_caps(node_id),
+            execution_reachability: None,
+            node_health: None,
+        };
+        BeaconMessage {
+            version: 1,
+            msg_id: Uuid::new_v4(),
+            src_node: node_id.to_string(),
+            dest_node: "broadcast".to_string(),
+            msg_type: MsgType::Heartbeat,
+            seq: 0,
+            total: 1,
+            payload: serde_json::to_vec(&payload).unwrap(),
+            timestamp: 0,
+            hmac: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reconciles_mesh_port() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+
+        // Peer stored at port 9100 (stale, pre-conflict-resolution value)
+        graph
+            .upsert_hotel(&test_hotel("mbp-jane", "mbp-jane-aiua-01", 9100))
+            .unwrap();
+
+        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::channel(8);
+        let daemon = BeaconDaemon::bind_with_registry(
+            "127.0.0.1:0",
+            test_caps("mac-jane-aiua-01"),
+            inbox_tx,
+            graph.clone(),
+            "",
+            false,
+            Arc::new(RwLock::new(NodeRegistry::new())),
+        )
+        .await
+        .unwrap();
+
+        // Heartbeat arrives from source port 9106 (the actual resolved port)
+        let src: SocketAddr = "100.79.239.64:9106".parse().unwrap();
+        daemon
+            .dispatch_message(heartbeat_msg("mbp-jane-aiua-01"), src)
+            .await;
+
+        let hotel = graph.get_hotel("mbp-jane").unwrap().unwrap();
+        assert_eq!(
+            hotel.mesh_port, 9106,
+            "mesh_port should be reconciled to the observed source port"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_no_write_on_port_match() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+
+        graph
+            .upsert_hotel(&test_hotel("mbp-jane", "mbp-jane-aiua-01", 9106))
+            .unwrap();
+
+        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::channel(8);
+        let daemon = BeaconDaemon::bind_with_registry(
+            "127.0.0.1:0",
+            test_caps("mac-jane-aiua-01"),
+            inbox_tx,
+            graph.clone(),
+            "",
+            false,
+            Arc::new(RwLock::new(NodeRegistry::new())),
+        )
+        .await
+        .unwrap();
+
+        // Heartbeat arrives from the already-correct port
+        let src: SocketAddr = "100.79.239.64:9106".parse().unwrap();
+        daemon
+            .dispatch_message(heartbeat_msg("mbp-jane-aiua-01"), src)
+            .await;
+
+        let hotel = graph.get_hotel("mbp-jane").unwrap().unwrap();
+        assert_eq!(hotel.mesh_port, 9106, "mesh_port should remain unchanged");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stale_detection_returns_true_for_new_node() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+
+        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::channel(8);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        let daemon = BeaconDaemon::bind_with_registry(
+            "127.0.0.1:0",
+            test_caps("mac-jane-aiua-01"),
+            inbox_tx,
+            graph.clone(),
+            "",
+            false,
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Before any heartbeat, the node is stale (unknown).
+        assert!(
+            registry.read().await.is_node_stale("mbp-jane-aiua-01"),
+            "unknown node should be stale"
+        );
+
+        let src: SocketAddr = "100.79.239.64:9106".parse().unwrap();
+        daemon
+            .dispatch_message(heartbeat_msg("mbp-jane-aiua-01"), src)
+            .await;
+
+        // After observing a fresh heartbeat, the node is no longer stale.
+        assert!(
+            !registry.read().await.is_node_stale("mbp-jane-aiua-01"),
+            "node should be fresh after heartbeat"
+        );
     }
 }

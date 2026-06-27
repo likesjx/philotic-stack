@@ -7,6 +7,12 @@ philotic_hotel_previous_names:
 philotic_oidc_public_base_url: "https://brain.jaredlikes.com"
 philotic_default_model: "gemini-flash-latest"
 philotic_repo_branch: "codex/hegemon-membrane-slice"
+philotic_memgraph_enabled: true
+philotic_memgraph_image: "memgraph/memgraph:latest"
+# Bind Bolt to the Tailscale interface so central graph access is mesh-only.
+philotic_memgraph_host: "100.64.212.8"
+philotic_memgraph_port: 7687
+philotic_graph_provider: "memgraph"
 
 # Agents
 philotic_agents:
@@ -20,6 +26,10 @@ philotic_agents:
         - "likesjx"
     model:
       default_model: "{{ philotic_default_model }}"
+    turn_loop_config:
+      fallback_tiers:
+        - "model"
+        - "model.ollama"
     voice_response_policy:
       mode: "off"                          # off | auto | on  (/tts to toggle)
       provider: "elevenlabs"

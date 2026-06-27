@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-component-map
+
+rectangle "desktop-component-map" as desktop_component_map #Orange {
+}
+
+
+@enduml

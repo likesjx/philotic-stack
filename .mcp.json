@@ -3,6 +3,11 @@
     "intel-graph": {
       "type": "http",
       "url": "http://127.0.0.1:8901/mcp"
+    },
+    "graphify": {
+      "type": "stdio",
+      "command": "graphify-mcp",
+      "args": ["graphify-out/graph.json"]
     }
   }
 }

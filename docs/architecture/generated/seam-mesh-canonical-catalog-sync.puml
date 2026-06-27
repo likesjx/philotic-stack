@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mesh-canonical-catalog-sync
+
+rectangle "mesh-canonical-catalog-sync" as mesh_canonical_catalog_sync #Orange {
+}
+
+
+@enduml
