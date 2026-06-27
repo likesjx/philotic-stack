@@ -458,13 +458,29 @@ fn build_cron_task_json(
     };
 
     let Some(signal_seed) = payload_json.get("paracrine_signal") else {
-        return serde_json::json!({
+        // Promote routing fields so the receiving agent has content and can
+        // route its reply — without `content`, normalized_user_content returns
+        // None and handle_user_message silently drops the task.
+        let content = payload_json
+            .get("message")
+            .or_else(|| payload_json.get("content"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let mut obj = serde_json::json!({
             "cron_job_id": job.id,
             "target_role": job.target_role,
             "fire_epoch": fire_epoch,
             "payload": payload_data,
-        })
-        .to_string();
+        });
+        if let Some(c) = content {
+            obj["content"] = serde_json::Value::String(c.to_string());
+        }
+        for key in ["source", "chat_id", "session_id"] {
+            if let Some(v) = payload_json.get(key) {
+                obj[key] = v.clone();
+            }
+        }
+        return obj.to_string();
     };
 
     let mut signal = signal_seed
@@ -537,6 +553,28 @@ mod tests {
             created_at: 900,
             created_by: CronJobSource::Operator,
         }
+    }
+
+    #[test]
+    fn cron_legacy_payload_with_message_promotes_content_and_routing_fields() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "vps-jane-aiua-01",
+            r#"{"message":"Good evening — time for your check-in","source":"telegram","chat_id":7898847424,"session_id":"telegram:7898847424:agent-beacon"}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(
+            value["content"],
+            "Good evening — time for your check-in",
+            "message must be promoted to top-level content"
+        );
+        assert_eq!(value["source"], "telegram");
+        assert_eq!(value["chat_id"], 7898847424i64);
+        assert_eq!(value["session_id"], "telegram:7898847424:agent-beacon");
+        assert_eq!(value["cron_job_id"], "job-1");
+        assert!(value.get("action").is_none(), "action must be absent for non-paracrine tasks");
     }
 
     #[test]
