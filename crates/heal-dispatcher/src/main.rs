@@ -72,6 +72,24 @@ async fn dispatch_cycle(
     ollama_url: &str,
     ollama_model: &str,
 ) -> Result<()> {
+    // Proactively repair session turns stuck in "running" for more than 5 minutes.
+    match ipc
+        .send_request(IpcRequest::RepairStaleSessionTurns { min_age_secs: 300 })
+        .await
+    {
+        Ok(IpcResponse::Standard {
+            data: Some(data), ..
+        }) => {
+            if let Some(n) = data.get("repaired").and_then(|v| v.as_u64()) {
+                if n > 0 {
+                    info!(repaired = n, "heal-dispatcher: zombie turn scan repaired stale turns");
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!("heal-dispatcher: RepairStaleSessionTurns failed: {e}"),
+    }
+
     let resp = ipc
         .send_request(IpcRequest::GetHealQueuePending { limit: BATCH_LIMIT })
         .await?;
