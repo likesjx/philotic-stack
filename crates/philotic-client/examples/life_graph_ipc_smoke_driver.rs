@@ -68,11 +68,40 @@ async fn main() -> Result<()> {
     if packet["context_id"].as_str().is_none() || !packet["ranked_packets"].is_array() {
         bail!("life.recall returned malformed context packet: {recall_payload}");
     }
+    let cross_agent_packet = &recall_data["cross_agent_context_packet"];
+    if cross_agent_packet["packet_id"].as_str().is_none()
+        || !cross_agent_packet["refs"].is_array()
+        || !cross_agent_packet["sections"].is_array()
+    {
+        bail!("life.recall returned malformed cross-agent context packet: {recall_payload}");
+    }
+    let refs = cross_agent_packet["refs"]
+        .as_array()
+        .context("cross-agent context packet refs must be an array")?;
+    if !refs.iter().any(|r| {
+        r["kind"].as_str() == Some("life_graph_retrieval_packet")
+            && r["authority"].as_str() == Some("life_graph_evidence")
+    }) {
+        bail!(
+            "cross-agent context packet missing LifeGraph retrieval evidence ref: {recall_payload}"
+        );
+    }
+    let policy_notes = cross_agent_packet["policy_notes"]
+        .as_array()
+        .context("cross-agent context packet policy_notes must be an array")?;
+    if !policy_notes.iter().any(|note| {
+        note.as_str()
+            .map(|text| text.contains("Muninn refs are continuity handles"))
+            .unwrap_or(false)
+    }) {
+        bail!("cross-agent context packet missing Muninn continuity policy note: {recall_payload}");
+    }
     let result_count = packet["ranked_packets"]
         .as_array()
         .map(Vec::len)
         .unwrap_or_default();
-    println!("life.recall IPC ok   result_count={result_count}");
+    let cross_ref_count = refs.len();
+    println!("life.recall IPC ok   result_count={result_count} cross_ref_count={cross_ref_count}");
 
     let context_id = packet["context_id"]
         .as_str()
