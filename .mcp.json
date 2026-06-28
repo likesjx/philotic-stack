@@ -4,6 +4,14 @@
       "type": "http",
       "url": "http://127.0.0.1:8901/mcp"
     },
+    "muninn-local": {
+      "type": "stdio",
+      "command": "muninn",
+      "args": ["mcp"],
+      "env": {
+        "MUNINN_MCP_URL": "http://127.0.0.1:8750/mcp"
+      }
+    },
     "graphify": {
       "type": "stdio",
       "command": "graphify-mcp",

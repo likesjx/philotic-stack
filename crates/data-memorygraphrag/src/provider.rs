@@ -4,9 +4,9 @@ use data_memorygraphrag::LIFE_GRAPH_EMBEDDING_DIMS;
 use data_memorygraphrag::cypher;
 use data_memorygraphrag::projection;
 use data_memorygraphrag::{
-    AdjudicationStatus, ConflictHandoff, EvidencePacket, GraphRecordRef, LifeCommitInput,
-    LifeGraphToolRequest, LifeObserveInput, LifePatchProposalInput, LifeResolveInput,
-    MemoryGraphRagRunner, PatchKind, PatchRisk, PolicyFilter, ReliabilityBasis,
+    AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, GraphRecordRef,
+    LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchProposalInput,
+    LifeResolveInput, MemoryGraphRagRunner, PatchKind, PatchRisk, PolicyFilter, ReliabilityBasis,
     RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery, RunnerConfig,
     RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef, SourceReliability, ValidationState,
 };
@@ -474,12 +474,20 @@ impl LifeGraphProvider {
 
         let packet_json =
             serde_json::to_value(&packet).context("failed to serialize RetrievalContextPacket")?;
+        let cross_agent_packet = ContextPacket::from_lifegraph_retrieval(
+            &packet,
+            format!("LifeGraph recall for {}", query_val.query_text),
+            query_val.active_role.clone(),
+        );
+        let cross_agent_packet_json = serde_json::to_value(&cross_agent_packet)
+            .context("failed to serialize cross-agent ContextPacket")?;
 
         Ok(ProviderOutput::ResultSet(json!({
             "status": "ok",
             "named_strategy": named_strategy.as_str(),
             "fallback_used": fallback_used,
             "context_packet": packet_json,
+            "cross_agent_context_packet": cross_agent_packet_json,
         })))
     }
 

@@ -141,6 +141,46 @@ Seam IDs: `memory-spacetime-frame`, `memory-shaping-context`, `memory-cultivatio
 - [x] Gate promotion from Muninn into AgentGraph/docs/code behind validation evidence or explicit operator approval.
 - [x] Deploy and watched-live verify on `mbp-jane` and `vps-jane` before claiming runtime truth.
 
+## Muninn v0.7 Capability Adoption
+
+Proposal: [MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md)
+
+Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-concept-evolution-hygiene`, `muninn-hotel-cluster-authority`
+
+- [ ] Adopt scoped Muninn API keys for external clients.
+  - [x] Create one short-lived `observe` key for retrieval testing.
+  - [x] Verify observe-mode keys can recall but cannot write.
+  - [x] Document key labels, modes, expiries, and revocation path without storing raw tokens.
+- [ ] Add tag-filtered recall lanes.
+  - [x] Add `tags_all`, `tags_any`, and `tag_filter` support to the shared Muninn helper.
+  - [x] Smoke filtered recall against known Perplexity and Muninn-upgrade memories.
+  - [x] Update repo-local Muninn guidance with the lane vocabulary if the smoke improves retrieval.
+- [ ] Trial `muninn_evolve` concept cleanup.
+  - [x] Pick a small candidate list of low-risk vague memory labels.
+  - [x] Evolve labels while preserving lineage.
+  - [x] Compare recall before/after and record whether the cleanup helped.
+- [ ] Evaluate Muninn cluster mode as a lab slice, not production continuity authority.
+  - [x] Draft the isolated test-vault/data-dir checklist.
+  - [ ] Validate failover, returning-primary deference, and no accidental secret replication.
+  - [ ] Record a decision before enabling cluster mode for real continuity vaults.
+
+## Cross-Agent Knowledge Architecture
+
+Proposal: [KNOWLEDGE_ARCHITECTURE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KNOWLEDGE_ARCHITECTURE_PROPOSAL.md)
+
+Seam IDs: `muninn-native-client-access`, `lifegraph-muninn-promotion`, `cross-agent-context-packet`
+
+- [x] Define the authority split between Muninn continuity memory, LifeGraph structured life truth, Intel Graph project truth, and the Philotic MCP frontdoor.
+- [x] Add a private direct-client runbook for native Muninn MCP over loopback or SSH/private-overlay tunnel.
+- [x] Add Codex local `muninn-local` MCP config using Muninn's stdio proxy.
+- [x] Add a typed `ContextPacket` contract that carries Muninn memory IDs, LifeGraph node IDs, and Intel Graph references with explicit authority labels.
+  - [x] Return a `cross_agent_context_packet` from `life.recall` alongside the LifeGraph retrieval packet.
+  - [x] Validate that Muninn engram refs cannot claim LifeGraph truth authority.
+- [x] Decide whether remote trusted native Muninn access should standardize on SSH tunnels, Tailscale-only routing, or private HTTPS ingress with scoped keys.
+  - [x] Standardize current remote trusted native path on SSH tunnel to loopback.
+  - [x] Add `just muninn-private-smoke` to prove local health, remote private binding, and tunneled MCP health.
+  - [ ] Revisit Tailscale-only/private HTTPS only after credential lifecycle and client config are explicit.
+
 ### WI 1: Session Management
 
 Seam IDs: `session-leases`

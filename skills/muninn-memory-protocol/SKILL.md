@@ -37,6 +37,14 @@ Preferred transport helper:
 
 Do not reimplement the MCP handshake ad hoc unless you are intentionally porting the helper into another runtime.
 
+For clients that need a native MCP server entry, prefer Muninn's stdio proxy:
+
+```bash
+MUNINN_MCP_URL=http://127.0.0.1:8750/mcp muninn mcp
+```
+
+Remote native Muninn access must stay private: use loopback, a private overlay, or an SSH tunnel. Do not expose the native Muninn MCP listener publicly.
+
 ## Default Habit
 
 Before meaningful work:

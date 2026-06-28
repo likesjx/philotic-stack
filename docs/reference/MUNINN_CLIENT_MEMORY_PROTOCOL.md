@@ -218,6 +218,16 @@ Use a helper or wrapper that:
 - initializes the session
 - invokes tools consistently
 
+For direct client wiring, prefer the native stdio proxy:
+
+```bash
+MUNINN_MCP_URL=http://127.0.0.1:8750/mcp muninn mcp
+```
+
+Remote native Muninn access should use a private overlay or SSH tunnel to the
+remote loopback listener. Do not expose native Muninn MCP on a public interface.
+See [MUNINN_DIRECT_CLIENT_ACCESS.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MUNINN_DIRECT_CLIENT_ACCESS.md).
+
 Recommended shared helper:
 
 - [muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py)

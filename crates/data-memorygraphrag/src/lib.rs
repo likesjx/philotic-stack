@@ -9,7 +9,7 @@ pub mod cypher;
 pub mod projection;
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 pub type PacketId = String;
 pub type ConflictId = String;
@@ -545,6 +545,280 @@ impl RetrievalContextPacket {
         }
 
         finish_validation(violations)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAuthority {
+    MuninnContinuity,
+    LifeGraphTruth,
+    LifeGraphEvidence,
+    IntelGraphProjectTruth,
+    RuntimeObservation,
+    AgentInference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRefKind {
+    MuninnEngram,
+    LifeGraphNode,
+    LifeGraphEvidencePacket,
+    LifeGraphRetrievalPacket,
+    IntelGraphNode,
+    RepoDoc,
+    RuntimeObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextRef {
+    pub ref_id: String,
+    pub kind: ContextRefKind,
+    pub authority: ContextAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_state: Option<ValidationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl ContextRef {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "ref_id", &self.ref_id);
+
+        match (&self.kind, &self.authority) {
+            (ContextRefKind::MuninnEngram, ContextAuthority::MuninnContinuity)
+            | (ContextRefKind::LifeGraphNode, ContextAuthority::LifeGraphTruth)
+            | (ContextRefKind::LifeGraphNode, ContextAuthority::LifeGraphEvidence)
+            | (ContextRefKind::LifeGraphEvidencePacket, ContextAuthority::LifeGraphEvidence)
+            | (ContextRefKind::LifeGraphRetrievalPacket, ContextAuthority::LifeGraphEvidence)
+            | (ContextRefKind::IntelGraphNode, ContextAuthority::IntelGraphProjectTruth)
+            | (ContextRefKind::RepoDoc, ContextAuthority::IntelGraphProjectTruth)
+            | (ContextRefKind::RuntimeObservation, ContextAuthority::RuntimeObservation)
+            | (_, ContextAuthority::AgentInference) => {}
+            _ => violations.push(format!(
+                "{:?} cannot claim {:?} authority",
+                self.kind, self.authority
+            )),
+        }
+
+        if matches!(self.authority, ContextAuthority::LifeGraphTruth)
+            && matches!(
+                self.validation_state,
+                Some(ValidationState::Inferred | ValidationState::Proposed)
+            )
+        {
+            violations.push("LifeGraphTruth refs cannot be inferred or proposed".into());
+        }
+
+        finish_validation(violations)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextPacketSection {
+    pub title: String,
+    pub authority: ContextAuthority,
+    #[serde(default)]
+    pub ref_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl ContextPacketSection {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "title", &self.title);
+        if self.ref_ids.is_empty() && self.text.as_deref().unwrap_or("").trim().is_empty() {
+            violations.push("section requires ref_ids or text".into());
+        }
+        finish_validation(violations)
+    }
+}
+
+/// Cross-agent context envelope that can carry Muninn, LifeGraph, Intel Graph,
+/// repo, and runtime references without erasing their authority boundaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextPacket {
+    pub packet_id: String,
+    pub generated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience_role: Option<String>,
+    pub summary: String,
+    #[serde(default)]
+    pub refs: Vec<ContextRef>,
+    #[serde(default)]
+    pub sections: Vec<ContextPacketSection>,
+    #[serde(default)]
+    pub policy_notes: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl ContextPacket {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "packet_id", &self.packet_id);
+        require_non_empty(&mut violations, "generated_at", &self.generated_at);
+        require_non_empty(&mut violations, "summary", &self.summary);
+
+        if self.refs.is_empty() && self.sections.is_empty() {
+            violations.push("context packet requires at least one ref or section".into());
+        }
+
+        let known_ref_ids: BTreeSet<_> = self.refs.iter().map(|r| r.ref_id.as_str()).collect();
+
+        for (idx, context_ref) in self.refs.iter().enumerate() {
+            if let Err(err) = context_ref.validate() {
+                for violation in err.violations {
+                    violations.push(format!("refs[{idx}].{violation}"));
+                }
+            }
+        }
+
+        for (idx, section) in self.sections.iter().enumerate() {
+            if let Err(err) = section.validate() {
+                for violation in err.violations {
+                    violations.push(format!("sections[{idx}].{violation}"));
+                }
+            }
+            for ref_id in &section.ref_ids {
+                if !known_ref_ids.contains(ref_id.as_str()) {
+                    violations.push(format!(
+                        "sections[{idx}].ref_ids contains unknown ref {ref_id}"
+                    ));
+                }
+            }
+        }
+
+        finish_validation(violations)
+    }
+
+    pub fn from_lifegraph_retrieval(
+        packet: &RetrievalContextPacket,
+        summary: impl Into<String>,
+        audience_role: Option<String>,
+    ) -> Self {
+        let mut refs = vec![ContextRef {
+            ref_id: packet.context_id.clone(),
+            kind: ContextRefKind::LifeGraphRetrievalPacket,
+            authority: ContextAuthority::LifeGraphEvidence,
+            summary: Some("LifeGraph retrieval context packet".into()),
+            validation_state: None,
+            uri: None,
+            metadata: serde_json::json!({
+                "query_id": packet.query_id,
+                "strategy": packet.strategy,
+            }),
+        }];
+
+        let mut seen_muninn = BTreeSet::new();
+        let mut seen_lifegraph = BTreeSet::new();
+
+        for ranked in &packet.ranked_packets {
+            let evidence = &ranked.packet;
+            if seen_lifegraph.insert(evidence.claim_ref.id.clone()) {
+                refs.push(ContextRef {
+                    ref_id: evidence.claim_ref.id.clone(),
+                    kind: ContextRefKind::LifeGraphNode,
+                    authority: match evidence.validation_state {
+                        ValidationState::Confirmed => ContextAuthority::LifeGraphTruth,
+                        _ => ContextAuthority::LifeGraphEvidence,
+                    },
+                    summary: Some(evidence.claim_summary.clone()),
+                    validation_state: Some(evidence.validation_state.clone()),
+                    uri: None,
+                    metadata: serde_json::json!({
+                        "label": evidence.claim_ref.label,
+                        "datasource": evidence.claim_ref.datasource,
+                        "score": ranked.score,
+                    }),
+                });
+            }
+
+            refs.push(ContextRef {
+                ref_id: evidence.packet_id.clone(),
+                kind: ContextRefKind::LifeGraphEvidencePacket,
+                authority: ContextAuthority::LifeGraphEvidence,
+                summary: Some(evidence.claim_summary.clone()),
+                validation_state: Some(evidence.validation_state.clone()),
+                uri: None,
+                metadata: serde_json::json!({
+                    "claim_ref": evidence.claim_ref.id,
+                    "confidence": evidence.confidence,
+                    "source_reliability": evidence.source_reliability,
+                }),
+            });
+
+            for source in &evidence.source_refs {
+                if matches!(source.source_kind, SourceKind::MuninnEngram)
+                    && seen_muninn.insert(source.source_id.clone())
+                {
+                    refs.push(ContextRef {
+                        ref_id: source.source_id.clone(),
+                        kind: ContextRefKind::MuninnEngram,
+                        authority: ContextAuthority::MuninnContinuity,
+                        summary: Some("Muninn continuity source for LifeGraph evidence".into()),
+                        validation_state: None,
+                        uri: source.uri.clone(),
+                        metadata: serde_json::json!({
+                            "captured_at": source.captured_at,
+                            "reliability": source.reliability,
+                        }),
+                    });
+                }
+            }
+
+            for passage in &evidence.passage_refs {
+                if let Some(muninn_id) = &passage.muninn_engram_id {
+                    if seen_muninn.insert(muninn_id.clone()) {
+                        refs.push(ContextRef {
+                            ref_id: muninn_id.clone(),
+                            kind: ContextRefKind::MuninnEngram,
+                            authority: ContextAuthority::MuninnContinuity,
+                            summary: Some("Muninn passage source for LifeGraph evidence".into()),
+                            validation_state: None,
+                            uri: None,
+                            metadata: serde_json::json!({
+                                "passage_id": passage.passage_id,
+                                "excerpt_hash": passage.excerpt_hash,
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+
+        let ref_ids = refs.iter().map(|r| r.ref_id.clone()).collect();
+        Self {
+            packet_id: format!("context:{}", packet.context_id),
+            generated_at: packet.generated_at.clone(),
+            query_id: Some(packet.query_id.clone()),
+            audience_role,
+            summary: summary.into(),
+            refs,
+            sections: vec![ContextPacketSection {
+                title: "LifeGraph recall".into(),
+                authority: ContextAuthority::LifeGraphEvidence,
+                ref_ids,
+                text: None,
+            }],
+            policy_notes: vec![
+                "Muninn refs are continuity handles, not confirmed LifeGraph truth.".into(),
+                "LifeGraph proposed evidence requires governance before promotion.".into(),
+            ],
+            metadata: serde_json::json!({
+                "source_context_packet": packet.context_id,
+                "omitted_conflict_ids": packet.omitted_conflict_ids,
+            }),
+        }
     }
 }
 
@@ -1616,6 +1890,80 @@ mod tests {
             json["ranked_packets"][0]["matched_policy_filters"][0],
             "require_evidence"
         );
+    }
+
+    #[test]
+    fn cross_agent_context_packet_preserves_authority_boundaries() {
+        let mut evidence = evidence_packet();
+        evidence.validation_state = ValidationState::Confirmed;
+        evidence.adjudication_status = AdjudicationStatus::NotNeeded;
+
+        let retrieval_packet = RetrievalContextPacket {
+            context_id: "context:beacon:open-loops".into(),
+            query_id: "retrieval:open-loops:20260604".into(),
+            strategy: RetrievalStrategy::MemoryAwareGraphRank,
+            ranked_packets: vec![RankedEvidencePacket {
+                packet: evidence,
+                score: 0.91,
+                matched_policy_filters: vec![PolicyFilter::RequireEvidence],
+                evidence_path: vec![graph_ref("life:open_loop:rowing-follow-up")],
+            }],
+            omitted_conflict_ids: vec![],
+            token_budget: 2_000,
+            generated_at: "2026-06-04T19:36:00Z".into(),
+        };
+
+        let packet = ContextPacket::from_lifegraph_retrieval(
+            &retrieval_packet,
+            "Beacon open-loop context",
+            Some("beacon".into()),
+        );
+
+        packet.validate().expect("context packet should be valid");
+
+        let muninn_ref = packet
+            .refs
+            .iter()
+            .find(|r| matches!(r.kind, ContextRefKind::MuninnEngram))
+            .expect("Muninn engram ref should be projected");
+        assert_eq!(muninn_ref.authority, ContextAuthority::MuninnContinuity);
+
+        let life_ref = packet
+            .refs
+            .iter()
+            .find(|r| {
+                matches!(r.kind, ContextRefKind::LifeGraphNode)
+                    && r.ref_id == "life:open_loop:rowing-follow-up"
+            })
+            .expect("LifeGraph node ref should be projected");
+        assert_eq!(life_ref.authority, ContextAuthority::LifeGraphTruth);
+
+        let json = serde_json::to_value(packet).expect("serialize context packet");
+        assert_eq!(json["refs"][0]["kind"], "life_graph_retrieval_packet");
+        assert!(
+            json["policy_notes"][0]
+                .as_str()
+                .unwrap()
+                .contains("continuity handles")
+        );
+    }
+
+    #[test]
+    fn context_ref_rejects_muninn_as_lifegraph_truth() {
+        let context_ref = ContextRef {
+            ref_id: "01KTA0Z5K942VAP9NPAAABH20T".into(),
+            kind: ContextRefKind::MuninnEngram,
+            authority: ContextAuthority::LifeGraphTruth,
+            summary: Some("This should remain a continuity handle.".into()),
+            validation_state: Some(ValidationState::Confirmed),
+            uri: None,
+            metadata: serde_json::json!({}),
+        };
+
+        let err = context_ref
+            .validate()
+            .expect_err("Muninn refs must not claim LifeGraph truth authority");
+        assert!(err.violations.iter().any(|v| v.contains("cannot claim")));
     }
 
     #[test]
