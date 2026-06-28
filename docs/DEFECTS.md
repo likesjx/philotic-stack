@@ -56,6 +56,18 @@ Agent re-entry loop completes multiple tool iterations, but the final synthesize
 
 ---
 
+## DEF-006: Turn watchdog evicts WaitingModel turns instead of escalating to next fallback tier
+
+**Status**: in-progress
+**Severity**: high
+**Size**: S
+**Seam**: cognitive-loop-reentry
+**Found**: 2026-06-27
+
+When a model call hangs and the philote watchdog fires (`WAITING_MODEL_SECS = 300`), it evicts the turn and tells the user "I seem to have gotten stuck" instead of escalating to the next fallback tier. The root cause is a silent IPC drop between model-router and philote: model-router has a 70s budget (35s × 2 attempts) but if its IPC connection to aiua drops, no error signal reaches philote — so the 300s watchdog is the only backstop, and it was wired to give up rather than retry. The prior "fix" (`951e113`, bump 120s→300s) only delayed the give-up; it did not escalate. Fix: branch on `WaitingModel` phase in `evict_timed_out_turns` Step 3 and call `advance_turn_to_next_fallback_tier` instead of evicting. The 600s `CatchAll` ceiling remains a hard evict.
+
+---
+
 ## DEF-005: `aiua` test suite — 10 hung tests, 2 unrelated failures on develop HEAD
 
 **Status**: open
