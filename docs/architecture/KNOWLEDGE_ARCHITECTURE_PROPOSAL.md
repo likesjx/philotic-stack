@@ -125,6 +125,7 @@ Implemented slice:
 - `ContextRef.authority` labels every reference as `muninn_continuity`, `life_graph_truth`, `life_graph_evidence`, `intel_graph_project_truth`, `runtime_observation`, or `agent_inference`.
 - `life.recall` now returns both the existing LifeGraph `context_packet` and a `cross_agent_context_packet` projection.
 - contract validation rejects a Muninn engram ref that claims `life_graph_truth` authority.
+- `vps-jane` was deployed with the updated `life-graph-runner`; the live IPC smoke returned `cross_agent_context_packet` through `/run/philotic/vps-jane.sock`.
 
 ## Agent Defaults
 
@@ -172,6 +173,7 @@ Minimum evidence before calling this slice live-green:
 - Perplexity `context.capture` remains on the Philotic MCP frontdoor
 - `cargo test -p data-memorygraphrag` passes with ContextPacket authority-boundary tests
 - `just muninn-private-smoke` proves the SSH tunnel path and remote private binding
+- live `vps-jane` LifeGraph IPC smoke proves installed `life-graph-runner` returns `cross_agent_context_packet`
 
 ## Open Seams
 

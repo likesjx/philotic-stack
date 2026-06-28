@@ -176,6 +176,7 @@ Seam IDs: `muninn-native-client-access`, `lifegraph-muninn-promotion`, `cross-ag
 - [x] Add a typed `ContextPacket` contract that carries Muninn memory IDs, LifeGraph node IDs, and Intel Graph references with explicit authority labels.
   - [x] Return a `cross_agent_context_packet` from `life.recall` alongside the LifeGraph retrieval packet.
   - [x] Validate that Muninn engram refs cannot claim LifeGraph truth authority.
+  - [x] Deploy to `vps-jane` and live-smoke `life.recall` through `/run/philotic/vps-jane.sock`, confirming `cross_agent_context_packet` is returned by the installed runner.
 - [x] Decide whether remote trusted native Muninn access should standardize on SSH tunnels, Tailscale-only routing, or private HTTPS ingress with scoped keys.
   - [x] Standardize current remote trusted native path on SSH tunnel to loopback.
   - [x] Add `just muninn-private-smoke` to prove local health, remote private binding, and tunneled MCP health.
