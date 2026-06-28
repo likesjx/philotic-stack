@@ -8,6 +8,7 @@ Every session MUST begin with these steps in order:
 1.  **Read [AGENTS.md](file:///Users/jaredlikes/code/philotic-stack/AGENTS.md)**: Adopt the standing protocol.
 2.  **Query the Project Graph**: If the graph server is running (`just intel-graph-ensure`), use MCP tools (`graph_status`, `graph_digest`) for a complete picture of what's in flight. The graph is faster and more complete than reading raw files but is NOT required — agents can work effectively without it. See `$graph-intelligence` skill.
 3.  **Orient and Recall**: Run `just session-start` to bootstrap Muninn. Use `$muninn-memory-habit` for cognitive context and the Muninn triad: self, user, topic. The graph gives you structural facts; Muninn gives you learned context.
+    - Trusted local Claude clients may use Muninn's native stdio proxy (`muninn mcp`) against the loopback listener; do not expose native Muninn MCP publicly.
 4.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to confirm the baseline is stable before editing.
 5.  **Record Decisions**: After completing work, use `graph_decide` (MCP) or `phil graph decide` to record what you did and why. Use `muninn_decide` / `muninn_remember` for the durable memory delta: decisions, reality gaps, validation outcomes, next seams, and operator preferences.
 
@@ -139,3 +140,4 @@ All consumers hold `Arc<dyn XxxStorage>`:
 - `AGENTS.md` — standing protocol for coding agents
 - `skills/graph-intelligence/SKILL.md` — full MCP tool reference and agent workflow
 - `docs/process/WORKFLOW.md` — SVE operating loop
+- `docs/reference/MUNINN_DIRECT_CLIENT_ACCESS.md` — private native Muninn MCP access for trusted clients

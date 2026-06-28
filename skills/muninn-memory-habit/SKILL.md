@@ -136,6 +136,20 @@ Recommended lightweight tags when helpful:
 
 Use tags sparingly. If a tag does not improve retrieval later, it is decorative bureaucracy.
 
+Muninn v0.7 recall can filter server-side with `tags_all`, `tags_any`, and
+`tag_filter`. Prefer these lane tags when the memory clearly belongs to a lane:
+
+| Lane | Tags | Use |
+| --- | --- | --- |
+| Continuity | `continuity`, `operator-preference`, `decision` | cross-client orientation and durable preferences |
+| Philotic runtime | `philotic-stack`, `runtime`, `validation`, `reality-gap` | repo/runtime work and live ops |
+| MCP boundary | `mcp`, `perplexity`, `lifegraph`, `muninn-only` | external MCP surface hygiene |
+| LifeGraph adjacent | `lifegraph`, `evidence`, `recall-feedback` | LifeGraph context without treating Muninn as LifeGraph truth |
+| Client session | `codex`, `claude`, `perplexity` | client-specific working continuity |
+
+Do not over-tag. Lane tags are retrieval hints, not an ontology or a proof of
+truth. In particular, never use Muninn tags to imply confirmed LifeGraph truth.
+
 Good atomic candidates:
 - "active_incarnation_id is the load-bearing primitive for session ownership switching in Philotic."
 - "Jared prefers soft toolset restrictions on the conversational incarnation, not hard-coded."

@@ -24,9 +24,10 @@ DEFAULT_MUNINN_DIR = pathlib.Path.home() / "code" / "muninndb"
 
 
 class MuninnMcpClient:
-    def __init__(self, base_url: str, token: Optional[str] = None):
+    def __init__(self, base_url: str, token: Optional[str] = None, request_timeout: float = 60.0):
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self.request_timeout = request_timeout
         self.message_url = None
         self._sse_response = None
 
@@ -87,7 +88,7 @@ class MuninnMcpClient:
             headers=self._headers({"content-type": "application/json"}),
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=20) as response:
+        with urllib.request.urlopen(req, timeout=self.request_timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
         if not raw.strip():
             return {}
@@ -118,6 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Muninn MCP base URL")
     parser.add_argument("--token", help="MCP bearer token; defaults to MUNINN_MCP_TOKEN or token file")
     parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="HTTP request timeout in seconds for MCP message calls.",
+    )
+    parser.add_argument(
         "--token-file",
         default=os.environ.get("MUNINN_MCP_TOKEN_FILE", str(pathlib.Path.home() / ".muninn" / "mcp.token")),
         help="Path to MCP bearer token file when token auth is enabled",
@@ -142,6 +149,22 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("--context", action="append", required=True, help="Context phrase (repeatable)")
     recall.add_argument("--limit", type=int, default=5)
     recall.add_argument("--mode", default="semantic")
+    recall.add_argument(
+        "--tags-all",
+        action="append",
+        default=[],
+        help="Require every listed tag. Repeat for multiple tags.",
+    )
+    recall.add_argument(
+        "--tags-any",
+        action="append",
+        default=[],
+        help="Require at least one listed tag. Repeat for multiple tags.",
+    )
+    recall.add_argument(
+        "--tag-filter-json",
+        help="Advanced Muninn tag_filter object as JSON, for key-prefix or lexical-bound filters.",
+    )
 
     remember = sub.add_parser("remember", help="Store an atomic memory")
     remember.add_argument("--content", required=True)
@@ -373,7 +396,7 @@ def main() -> int:
         sys.stdout.write("\n")
         return 0
 
-    client = MuninnMcpClient(args.base_url, token)
+    client = MuninnMcpClient(args.base_url, token, request_timeout=args.timeout)
     client.connect()
 
     if args.command == "tools":
@@ -381,9 +404,16 @@ def main() -> int:
     elif args.command == "where-left-off":
         result = client.call_tool("muninn_where_left_off", {"limit": args.limit})
     elif args.command == "recall":
+        payload = {"context": args.context, "limit": args.limit, "mode": args.mode}
+        if args.tags_all:
+            payload["tags_all"] = args.tags_all
+        if args.tags_any:
+            payload["tags_any"] = args.tags_any
+        if args.tag_filter_json:
+            payload["tag_filter"] = json.loads(args.tag_filter_json)
         result = client.call_tool(
             "muninn_recall",
-            {"context": args.context, "limit": args.limit, "mode": args.mode},
+            payload,
         )
     elif args.command == "remember":
         payload = {

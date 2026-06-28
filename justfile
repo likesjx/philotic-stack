@@ -26,6 +26,10 @@ session-start:
     just harness-drift 2>/dev/null || true
     bash scripts/session-start.sh
 
+# Verify private native Muninn access, including the vps-jane SSH tunnel path.
+muninn-private-smoke:
+    ./scripts/muninn-private-access.sh smoke
+
 # Show drift status for all managed harnesses.
 harness-drift:
     @phil graph harness drift
