@@ -8968,6 +8968,12 @@ impl AgentRuntime {
             self.agent_id, bundle.from_role, to_role, session_id
         );
 
+        // Extract fields needed after the session-state borrow block.
+        // Gate auto-execution on active_goal (distinguishes task delegation from a bare role switch).
+        let auto_execute_goal = bundle.active_goal.clone();
+        let bundle_goal = bundle.goal.clone();
+        let bundle_context = bundle.context_excerpt.clone();
+
         self.ensure_session_loaded(&session_id, "handoff").await?;
 
         let role_config = self.configured_roles.get(&to_role).cloned();
@@ -9009,12 +9015,42 @@ impl AgentRuntime {
                 state.settings.execution.iteration_cap = cap.clamp(1, 50);
             }
             state.role_activation = Some(activation);
-            // Carry over the handoff context as the working summary for the new role.
-            if let Some(summary) = bundle.working_summary {
+            // Synthesise the handoff context: prefer working_summary if the sender provided one
+            // (e.g. build_same_identity_handoff_bundle); otherwise fall back to goal + context_excerpt,
+            // which is what handoff.to_role always populates.
+            let handoff_context = bundle.working_summary.or_else(|| {
+                let mut parts = Vec::new();
+                if !bundle_goal.is_empty() {
+                    parts.push(format!("Goal: {}", bundle_goal));
+                }
+                if !bundle_context.is_empty() {
+                    parts.push(format!("Context: {}", bundle_context));
+                }
+                if !parts.is_empty() {
+                    Some(parts.join("\n\n"))
+                } else {
+                    None
+                }
+            });
+            if let Some(summary) = handoff_context {
                 if state.active_turn.is_none() {
                     state.last_handoff_summary = Some(summary);
                 }
             }
+        }
+
+        // When active_goal is present the handoff is a task delegation, not a bare role switch.
+        // Push a synthetic task so the receiving role executes the goal immediately without
+        // waiting for the operator to send another message.
+        if let Some(goal) = auto_execute_goal {
+            let synthetic = crate::protocol::InboundTaskPayload {
+                action: Some("role_directed_task".into()),
+                session_id: Some(session_id.clone()),
+                turn_id: Some(Uuid::new_v4().to_string()),
+                content: Some(goal),
+                ..Default::default()
+            };
+            self.pending_drains.push_back((Uuid::new_v4(), synthetic));
         }
 
         let reply = format!("Switched to role {}.", to_role);
