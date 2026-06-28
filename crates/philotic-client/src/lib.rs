@@ -898,6 +898,13 @@ pub enum IpcRequest {
         task_id: Uuid,
         error_code: String,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+    },
+    RepairStaleSessionTurns {
+        min_age_secs: u64,
     },
     SubscribeInbox {
         role: String,

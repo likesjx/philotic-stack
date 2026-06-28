@@ -616,6 +616,26 @@ impl GraphDomain {
         Ok(out)
     }
 
+    /// Returns all session_turn records with status="running" and started_at <= max_started_at.
+    /// Used by the hotel's zombie-turn repair sweep.
+    pub fn list_zombie_session_turns(&self, max_started_at: u64) -> Result<Vec<SessionTurnRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_TURN)? {
+            let record = match serde_json::from_value::<SessionTurnRecord>(node.data) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if record.status == "running" {
+                if let Some(started_at) = record.started_at {
+                    if started_at <= max_started_at {
+                        out.push(record);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     // ── Session event methods ─────────────────────────────────────────────────
 
     fn session_event_key(event_id: &str) -> String {

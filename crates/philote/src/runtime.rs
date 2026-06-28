@@ -2528,13 +2528,16 @@ impl AgentRuntime {
                 continue;
             }
 
-            let Some(state) = SessionState::from_checkpoint(&checkpoint) else {
+            let Some(mut state) = SessionState::from_checkpoint(&checkpoint) else {
                 continue;
             };
 
             if state.active_turn.is_some() {
-                // Phase is resumable — leave it alone.
-                continue;
+                // from_checkpoint keeps WaitingTool turns as "resumable", but after a
+                // process restart the tool runner connection is gone — the response will
+                // never arrive. Evict the turn now so the checkpoint gets cleaned below
+                // instead of leaving this session outside eviction coverage forever.
+                state.active_turn = None;
             }
 
             let stale_phase = checkpoint
@@ -2849,6 +2852,8 @@ impl AgentRuntime {
                     task_id,
                     error_code: "TURN_WATCHDOG_TIMEOUT".into(),
                     reason: reason.clone(),
+                    session_id: Some(session_id.clone()),
+                    turn_id: Some(turn_id.clone()),
                 })
                 .await
             {
@@ -7756,6 +7761,8 @@ impl AgentRuntime {
                 task_id,
                 error_code: "MODEL_EMPTY_RESPONSE".into(),
                 reason: message.clone(),
+                session_id: None,
+                turn_id: None,
             })
             .await?;
 
@@ -8462,6 +8469,8 @@ impl AgentRuntime {
                         task_id: original_task_id,
                         error_code: "APPROVAL_DENIED".into(),
                         reason: approval.reason.clone(),
+                        session_id: None,
+                        turn_id: None,
                     })
                     .await?;
 
@@ -8868,6 +8877,8 @@ impl AgentRuntime {
                 task_id: original_task_id,
                 error_code: "APPROVAL_CANCELLED".into(),
                 reason: cancel_reason.to_string(),
+                session_id: None,
+                turn_id: None,
             })
             .await?;
 

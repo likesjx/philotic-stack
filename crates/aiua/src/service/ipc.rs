@@ -7451,8 +7451,28 @@ impl IpcServer {
                 task_id,
                 error_code,
                 reason,
+                session_id: fail_session_id,
+                turn_id: fail_turn_id,
             } => {
                 info!("FailTask for: {} ({}): {}", task_id, error_code, reason);
+                // When the caller provides session_id + turn_id (e.g. evict_timed_out_turns),
+                // directly mark the session_turn record failed. record_session_activity_from_value
+                // can't do this because it requires session_id inside the payload JSON.
+                if let (Some(sid), Some(tid)) = (&fail_session_id, &fail_turn_id) {
+                    match graph.get_session_turn(sid, tid) {
+                        Ok(Some(mut existing)) => {
+                            existing.status = "failed".into();
+                            existing.error_json =
+                                Some(serde_json::json!({"error": &error_code, "reason": &reason}));
+                            existing.completed_at = Some(unix_ts());
+                            if let Err(e) = graph.upsert_session_turn(&existing) {
+                                warn!("FailTask: upsert_session_turn {sid}:{tid} failed: {e}");
+                            }
+                        }
+                        Ok(None) => {} // turn not yet written to DB
+                        Err(e) => warn!("FailTask: get_session_turn {sid}:{tid} error: {e}"),
+                    }
+                }
                 Self::record_session_activity_from_value(
                     graph,
                     &serde_json::json!({
@@ -7487,6 +7507,59 @@ impl IpcServer {
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
                 IpcResponse::success("fail", None)
+            }
+            IpcRequest::RepairStaleSessionTurns { min_age_secs } => {
+                let now_secs = unix_ts();
+                let max_started_at = now_secs.saturating_sub(min_age_secs);
+                let zombie_turns = match graph.list_zombie_session_turns(max_started_at) {
+                    Ok(turns) => turns,
+                    Err(e) => {
+                        error!("RepairStaleSessionTurns: query failed: {e}");
+                        return IpcResponse::error("repair", "QUERY_ERROR", e.to_string());
+                    }
+                };
+                let mut repaired: u32 = 0;
+                for mut turn in zombie_turns {
+                    let sid = turn.session_id.clone();
+                    let tid = turn.turn_id.clone();
+                    turn.status = "failed".into();
+                    turn.error_json =
+                        Some(serde_json::json!({"error": "ZOMBIE_TURN_REPAIR", "reason": "hotel watchdog: stale running turn"}));
+                    turn.completed_at = Some(now_secs);
+                    if let Err(e) = graph.upsert_session_turn(&turn) {
+                        warn!("RepairStaleSessionTurns: mark failed {sid}:{tid}: {e}");
+                        continue;
+                    }
+                    // Null the owning session's checkpoint active_turn.
+                    if let Ok(Some(mut session)) = graph.get_session(&sid) {
+                        let has_active = session
+                            .summary_json
+                            .pointer("/memory_checkpoint/checkpoint/active_turn")
+                            .map(|v| !v.is_null())
+                            .unwrap_or(false);
+                        if has_active {
+                            if let Some(cp) = session
+                                .summary_json
+                                .pointer_mut("/memory_checkpoint/checkpoint")
+                                .and_then(|v| v.as_object_mut())
+                            {
+                                cp.insert("active_turn".into(), serde_json::Value::Null);
+                            }
+                            let _ = graph.upsert_session(&session);
+                        }
+                    }
+                    if let Some(hq) = heal_queue {
+                        let _ = hq.push_error(
+                            &sid,
+                            &format!("zombie turn {sid}:{tid} repaired by hotel watchdog (age >{min_age_secs}s)"),
+                        );
+                    }
+                    repaired += 1;
+                }
+                if repaired > 0 {
+                    info!(repaired, min_age_secs, "RepairStaleSessionTurns: repaired zombie turns");
+                }
+                IpcResponse::success("repair", Some(serde_json::json!({"repaired": repaired})))
             }
             IpcRequest::SubscribeInbox { role } => {
                 info!("SubscribeInbox for role: {}", role);
