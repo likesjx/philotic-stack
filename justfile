@@ -571,6 +571,7 @@ vps-push:
       -p table-datasource \
       -p router-listener \
       -p agent-datasource \
+      -p heal-dispatcher \
       -p data-memorygraphrag"
 
     echo "▶ Deploying via ansible (binaries from VPS build at ${VPS_BUILD})..."
