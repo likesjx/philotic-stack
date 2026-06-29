@@ -2564,9 +2564,9 @@ impl AgentRuntime {
         }
     }
 
-    /// Scan all active sessions and evict any turn stuck in a waiting phase past its
-    /// deadline. Deadlines:
-    ///   WaitingModel  — 120 s  (accounts for slow/retriable model calls)
+    /// Scan all active sessions and evict (or escalate) any turn stuck in a waiting
+    /// phase past its deadline. Deadlines:
+    ///   WaitingModel  — 300 s  (escalates to next fallback tier; evicts when all tiers exhausted)
     ///   WaitingTool   — 90 s   (tool runners should be fast)
     ///   WaitingVoice  — 60 s   (ElevenLabs is normally < 10 s)
     ///
@@ -2575,8 +2575,10 @@ impl AgentRuntime {
     /// observation and cleared when the session leaves the waiting phase or has no
     /// active turn. This approach works regardless of which code path set the phase.
     ///
-    /// On eviction: clear the active turn, persist a clean checkpoint, and send the
-    /// user a brief notice so they know the session is unblocked.
+    /// On WaitingModel timeout: call `advance_turn_to_next_fallback_tier`, which either
+    /// dispatches to the next provider or calls `fail_active_turn` when all tiers are
+    /// exhausted. Other phases: evict directly (clear the active turn, persist a clean
+    /// checkpoint, and send the user a brief notice so they know the session is unblocked).
     async fn evict_timed_out_turns(&mut self) {
         const WAITING_MODEL_SECS: u64 = 300;
         const THINKING_SECS: u64 = 90; // post-model, dispatching actions or building reply
@@ -2795,7 +2797,7 @@ impl AgentRuntime {
             .collect();
         let timed_out: Vec<_> = timed_out.into_iter().chain(catch_all).collect();
 
-        // Step 3: evict.
+        // Step 3: escalate or evict.
         for (
             session_id,
             task_id,
@@ -2814,6 +2816,29 @@ impl AgentRuntime {
                 .and_then(|s| s.active_turn.as_ref())
                 .map(|t| t.pending_tool_call.is_some())
                 .unwrap_or(false);
+
+            // WaitingModel: escalate to the next fallback tier instead of evicting.
+            // The model-router's IPC connection may have dropped silently (no error
+            // signal arrives, only the watchdog fires). Tier escalation gives another
+            // provider a chance. total_active_since is preserved so the 600s CatchAll
+            // hard ceiling still applies.
+            if phase == "WaitingModel" {
+                warn!(
+                    session_id = %session_id,
+                    phase = %phase,
+                    elapsed_secs = %elapsed_secs,
+                    has_pending_tool = %has_pending_tool,
+                    "Turn watchdog: WaitingModel timeout — escalating to next fallback tier"
+                );
+                self.stuck_turn_first_seen.remove(&session_id);
+                self.stuck_turn_signature.remove(&session_id);
+                // Do NOT remove total_active_since — the 600s CatchAll budget still applies.
+                let _ = self
+                    .advance_turn_to_next_fallback_tier(session_id, turn_id)
+                    .await;
+                continue;
+            }
+
             warn!(
                 session_id = %session_id,
                 phase = %phase,

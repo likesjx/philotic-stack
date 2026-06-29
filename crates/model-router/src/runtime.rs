@@ -407,9 +407,10 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     // outer timeout and drives the retry loop so providers don't need to
                     // implement this themselves.
                     //
-                    // Invariant: attempt_policy.total_secs × retry_policy.max_attempts < 120s
-                    // (philote WaitingModel watchdog), ensuring the controller always
-                    // resolves before the watchdog evicts the turn.
+                    // Invariant: attempt_policy.total_secs × retry_policy.max_attempts < 300s
+                    // (philote WaitingModel watchdog). If the controller resolves within budget,
+                    // philote escalates via its own retry path; if the IPC connection drops
+                    // silently, the watchdog fires and escalates to the next fallback tier.
                     let provider_result = {
                         let retry = provider.retry_policy();
                         let attempt_secs = provider.attempt_policy().total_secs;
