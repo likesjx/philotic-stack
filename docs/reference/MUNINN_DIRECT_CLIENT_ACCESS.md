@@ -112,6 +112,8 @@ Rules:
 - document key IDs, labels, mode, and expiry without committing tokens
 - revoke keys as part of client offboarding
 
+For the full credential lifecycle, including external MCP bearer rotation and UAT gates, use [MCP_CREDENTIAL_LIFECYCLE.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MCP_CREDENTIAL_LIFECYCLE.md).
+
 ## Client Memory Habit
 
 Trusted clients should follow [MUNINN_CLIENT_MEMORY_PROTOCOL.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md):

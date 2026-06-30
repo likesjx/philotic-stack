@@ -16,6 +16,7 @@ related_docs:
   - MUNINN_CLUSTER_EVALUATION_CHECKLIST.md
   - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
   - ../reference/MUNINN_DIRECT_CLIENT_ACCESS.md
+  - ../reference/MCP_CREDENTIAL_LIFECYCLE.md
 task_refs:
   - docs/task.md#cross-agent-knowledge-architecture
 proposal_id: cross-agent-knowledge-architecture
@@ -150,6 +151,8 @@ Use `scripts/muninn-private-access.sh` or `just muninn-private-smoke` to prove t
 
 Do not add a private HTTPS native Muninn ingress until API key/bearer scope, rotation, and revocation are documented. Do not treat Tailscale reachability as public exposure, but also do not make it the only required mechanism until the client configuration story is explicit.
 
+Current credential lifecycle rules and client UAT gates are defined in [MCP_CREDENTIAL_LIFECYCLE.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MCP_CREDENTIAL_LIFECYCLE.md). Use `just mcp-client-uat` for safe local checks, and provide live bearer tokens through environment variables only when testing Perplexity or LifeGraph external endpoints.
+
 ## Cluster Decision
 
 Muninn cluster mode should not become production continuity authority until the decision answers:
@@ -174,6 +177,11 @@ Minimum evidence before calling this slice live-green:
 - `cargo test -p data-memorygraphrag` passes with ContextPacket authority-boundary tests
 - `just muninn-private-smoke` proves the SSH tunnel path and remote private binding
 - live `vps-jane` LifeGraph IPC smoke proves installed `life-graph-runner` returns `cross_agent_context_packet`
+
+Additional UAT evidence:
+
+- 2026-06-30: `just mcp-client-uat all` passed local Codex/Muninn checks and skipped token-backed external checks because no live bearer tokens were supplied.
+- 2026-06-30: `just mcp-client-uat remote-native` passed against `vps-jane`, confirming native Muninn MCP remained bound to `127.0.0.1:8750` and SSH-tunneled MCP health succeeded.
 
 ## Open Seams
 

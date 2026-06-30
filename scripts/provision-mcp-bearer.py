@@ -65,7 +65,7 @@ def ipc_call(sock, operation: str, payload: dict) -> dict:
 
 def main():
     token_hash_hex = blake3_hex(BEARER_TOKEN.encode())
-    print(f"Bearer token BLAKE3 hex: {token_hash_hex}")
+    print(f"Bearer token SHA-256 preview: {hashlib.sha256(BEARER_TOKEN.encode()).hexdigest()[:12]}")
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(SOCKET_PATH)
@@ -161,8 +161,9 @@ def main():
     print(f"UpdateMcpRoutes: {update_resp}")
 
     sock.close()
-    print(f"\n✅ Provisioned! Bearer token: {BEARER_TOKEN}")
-    print(f"   vault_ref: {secret_ref}")
+    print("\nProvisioned Perplexity/context.capture MCP bearer route")
+    print(f"  token_id:  perplexity")
+    print(f"  vault_ref: {secret_ref}")
 
 
 if __name__ == "__main__":

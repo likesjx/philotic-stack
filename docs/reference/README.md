@@ -17,6 +17,7 @@ Structured reference index for commands, providers, channels, config, and integr
 - LangGraph-based integration patterns: [../langgraph-integration.md](../langgraph-integration.md)
 - Proxy scope operation playbook: [../proxy-agent-playbook.md](../proxy-agent-playbook.md)
 - Muninn direct client access: [MUNINN_DIRECT_CLIENT_ACCESS.md](MUNINN_DIRECT_CLIENT_ACCESS.md)
+- MCP credential lifecycle: [MCP_CREDENTIAL_LIFECYCLE.md](MCP_CREDENTIAL_LIFECYCLE.md)
 
 ## Usage
 

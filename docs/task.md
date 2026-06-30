@@ -151,6 +151,8 @@ Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-con
   - [x] Create one short-lived `observe` key for retrieval testing.
   - [x] Verify observe-mode keys can recall but cannot write.
   - [x] Document key labels, modes, expiries, and revocation path without storing raw tokens.
+  - [x] Add MCP credential lifecycle rules for external bearer grants, rotation, revocation, and UAT evidence.
+  - [x] Remove raw bearer-token terminal echoing from the Perplexity `context.capture` provisioner.
 - [ ] Add tag-filtered recall lanes.
   - [x] Add `tags_all`, `tags_any`, and `tag_filter` support to the shared Muninn helper.
   - [x] Smoke filtered recall against known Perplexity and Muninn-upgrade memories.
@@ -180,6 +182,8 @@ Seam IDs: `muninn-native-client-access`, `lifegraph-muninn-promotion`, `cross-ag
 - [x] Decide whether remote trusted native Muninn access should standardize on SSH tunnels, Tailscale-only routing, or private HTTPS ingress with scoped keys.
   - [x] Standardize current remote trusted native path on SSH tunnel to loopback.
   - [x] Add `just muninn-private-smoke` to prove local health, remote private binding, and tunneled MCP health.
+  - [x] Add `just mcp-client-uat` to prove local Codex/Muninn posture and token-scoped external MCP tool projection when live bearers are supplied.
+  - [x] Run `just mcp-client-uat remote-native` against `vps-jane`, confirming loopback-only native binding and SSH-tunneled MCP health.
   - [ ] Revisit Tailscale-only/private HTTPS only after credential lifecycle and client config are explicit.
 
 ### WI 1: Session Management
