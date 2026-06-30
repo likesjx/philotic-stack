@@ -43,6 +43,16 @@ require_cluster_cli() {
   pass "local Muninn CLI exposes cluster management commands"
 }
 
+local_isolation_check() {
+  local start_help
+  start_help="$(muninn start --help)"
+  if grep -Eq -- "--data|--rest-addr|--admin-addr|--ui-addr|--mbp-addr" <<<"${start_help}"; then
+    pass "local Muninn start help exposes at least one isolation-related daemon flag"
+  else
+    skip "same-host multi-node lab isolation not proven; muninn start help exposes no alternate data/admin/UI/MBP port flags"
+  fi
+}
+
 local_health() {
   python3 "${ROOT_DIR}/scripts/muninn_mcp.py" --timeout 10 health >/dev/null
   pass "local Muninn MCP health"
@@ -82,6 +92,7 @@ mode="${1:-local}"
 case "${mode}" in
   local)
     require_cluster_cli
+    local_isolation_check
     local_health
     ;;
   remote)
@@ -89,6 +100,7 @@ case "${mode}" in
     ;;
   all)
     require_cluster_cli
+    local_isolation_check
     local_health
     if [[ "${RUN_REMOTE}" == "1" ]]; then
       remote_health

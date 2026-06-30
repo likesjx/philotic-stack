@@ -286,6 +286,7 @@ Progress in this slice:
 - [x] verified `just mcp-client-uat remote-native` against `vps-jane`: native Muninn stayed loopback-only and SSH-tunneled MCP health passed
 - [x] added `just muninn-cluster-preflight` as a non-mutating cluster lab readiness gate before any cluster enablement
 - [x] verified `RUN_REMOTE=1 just muninn-cluster-preflight all`: local, `mbp-jane`, and `vps-jane` have cluster CLI support, healthy standalone daemons, and no public remote MCP binding
+- [x] recorded the isolation caveat: same-host multi-node cluster lab is not safe until alternate daemon data/admin/UI/MBP bindings are proven
 
 Observed during the cleanup trial:
 

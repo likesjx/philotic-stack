@@ -88,6 +88,11 @@ Preflight evidence recorded 2026-06-30: local, `mbp-jane`, and `vps-jane`
 reported Muninn cluster CLI support and healthy standalone daemons. Listener
 checks confirmed MCP was not public-bound on the remote hosts.
 
+Isolation caveat recorded 2026-06-30: `muninn cluster enable` accepts an admin
+address, but `muninn start --help` does not expose alternate data/admin/UI/MBP
+port flags. Do not run a same-host multi-node lab until alternate daemon binding
+is proven through environment overrides or Muninn adds explicit start flags.
+
 - [ ] Enable cluster mode on the isolated data set.
 - [ ] Add nodes one at a time.
 - [ ] Record initial role for each node.
