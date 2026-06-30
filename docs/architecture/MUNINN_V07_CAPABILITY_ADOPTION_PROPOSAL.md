@@ -284,6 +284,7 @@ Progress in this slice:
 - [x] extended `just mcp-client-uat` with token-backed `context.capture` and `life.recall` positive-path calls
 - [x] tightened `just mcp-client-uat live` so live mode now fails loudly when required bearer tokens are absent; `all` remains the safe/opportunistic mode
 - [x] added token-file inputs for `just mcp-client-uat live` so large bearer values can stay out of shell history
+- [x] added `phil mcp uat` as the operator-facing wrapper for the same MCP client UAT gate
 - [x] removed raw bearer echoing from the Perplexity `context.capture` provisioner
 - [x] verified `just mcp-client-uat remote-native` against `vps-jane`: native Muninn stayed loopback-only and SSH-tunneled MCP health passed
 - [x] added `just muninn-cluster-preflight` as a non-mutating cluster lab readiness gate before any cluster enablement

@@ -130,6 +130,12 @@ Run [mcp-client-uat.sh](/Users/jaredlikes/code/philotic-stack/scripts/mcp-client
 Useful commands:
 
 ```bash
+phil mcp uat all
+phil mcp uat live \
+  --perplexity-token-file /path/to/perplexity.token \
+  --lifegraph-token-file /path/to/lifegraph.token
+
+# Lower-level script/just wrappers are still available.
 just mcp-client-uat
 just mcp-client-uat all
 just mcp-client-uat remote-native

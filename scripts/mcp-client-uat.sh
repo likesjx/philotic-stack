@@ -111,7 +111,12 @@ PY
 }
 
 muninn_local() {
-  python3 "${ROOT_DIR}/scripts/muninn_mcp.py" --base-url "${MUNINN_BASE_URL}" health >/dev/null
+  local output
+  if ! output="$(python3 "${ROOT_DIR}/scripts/muninn_mcp.py" --base-url "${MUNINN_BASE_URL}" --timeout 10 health 2>&1)"; then
+    printf 'FAIL local Muninn MCP health at %s\n' "${MUNINN_BASE_URL}" >&2
+    printf '%s\n' "${output}" >&2
+    exit 1
+  fi
   pass "local Muninn MCP health at ${MUNINN_BASE_URL}"
 }
 
