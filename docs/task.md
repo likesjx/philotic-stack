@@ -156,6 +156,7 @@ Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-con
   - [x] Remove raw bearer-token terminal echoing from the Perplexity `context.capture` provisioner.
   - [x] Add token-backed `just mcp-client-uat live` modes for positive-path `context.capture` and `life.recall` calls without printing bearer material.
   - [x] Make `just mcp-client-uat live` fail loudly when required bearer tokens are not exported, while `all` remains safe/opportunistic.
+  - [x] Add explicit token-file inputs for live UAT so large bearers can be supplied without shell history exposure.
 - [ ] Add tag-filtered recall lanes.
   - [x] Add `tags_all`, `tags_any`, and `tag_filter` support to the shared Muninn helper.
   - [x] Smoke filtered recall against known Perplexity and Muninn-upgrade memories.

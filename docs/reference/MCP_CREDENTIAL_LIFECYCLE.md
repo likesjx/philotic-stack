@@ -117,7 +117,7 @@ Minimum revocation evidence:
 
 ## UAT Matrix
 
-Run [mcp-client-uat.sh](/Users/jaredlikes/code/philotic-stack/scripts/mcp-client-uat.sh) for the safe local checks and any live checks for which you provide tokens through environment variables. The `all` mode skips token-backed checks when tokens are absent; the `live` mode is strict and fails unless both live bearer tokens are exported.
+Run [mcp-client-uat.sh](/Users/jaredlikes/code/philotic-stack/scripts/mcp-client-uat.sh) for the safe local checks and any live checks for which you provide tokens through environment variables or readable token files. The `all` mode skips token-backed checks when tokens are absent; the `live` mode is strict and fails unless both live bearer tokens are supplied.
 
 | Client | Required UAT | Live Secret Needed |
 | --- | --- | --- |
@@ -136,9 +136,14 @@ just mcp-client-uat remote-native
 PERPLEXITY_MCP_TOKEN=... just mcp-client-uat perplexity-capture
 LIFEGRAPH_MCP_TOKEN=... just mcp-client-uat lifegraph-recall
 PERPLEXITY_MCP_TOKEN=... LIFEGRAPH_MCP_TOKEN=... just mcp-client-uat live
+
+# Prefer token files for large bearers or shell history hygiene.
+PERPLEXITY_MCP_TOKEN_FILE=/path/to/perplexity.token \
+LIFEGRAPH_MCP_TOKEN_FILE=/path/to/lifegraph.token \
+  just mcp-client-uat live
 ```
 
-The live modes read bearer tokens only from environment variables and do not print token values.
+The live modes read bearer tokens only from environment variables or explicit token files and do not print token values.
 
 ## Completion Gate
 

@@ -17,9 +17,12 @@ Environment:
   MUNINN_BASE_URL          Local Muninn MCP URL (default: http://127.0.0.1:8750/mcp)
   PERPLEXITY_MCP_URL       Perplexity/frontdoor MCP URL (default: https://mcp.jaredlikes.com/mcp)
   PERPLEXITY_MCP_TOKEN     Bearer token for frontdoor tools/list UAT
+  PERPLEXITY_MCP_TOKEN_FILE
+                           File containing bearer token when env token is absent
   PERPLEXITY_CAPTURE_TEXT  Optional context.capture text; generated when absent
   LIFEGRAPH_MCP_URL        LifeGraph MCP URL (default: https://mcp.jaredlikes.com/lifegraph/mcp)
   LIFEGRAPH_MCP_TOKEN      Bearer token for LifeGraph tools/list UAT
+  LIFEGRAPH_MCP_TOKEN_FILE File containing bearer token when env token is absent
   LIFEGRAPH_RECALL_QUERY   Optional life.recall query text
   RUN_REMOTE=1             Include remote native Muninn private smoke in all/safe mode
 
@@ -50,14 +53,40 @@ fail() {
   exit 1
 }
 
+read_token_file() {
+  local token_name="$1"
+  local token_file="$2"
+  if [[ ! -r "${token_file}" ]]; then
+    fail "${token_name}_FILE is set but is not readable"
+  fi
+  local token
+  token="$(<"${token_file}")"
+  token="${token//$'\r'/}"
+  token="${token//$'\n'/}"
+  if [[ -z "${token}" ]]; then
+    fail "${token_name}_FILE is empty"
+  fi
+  printf '%s' "${token}"
+}
+
+load_live_tokens() {
+  if [[ -z "${PERPLEXITY_MCP_TOKEN:-}" && -n "${PERPLEXITY_MCP_TOKEN_FILE:-}" ]]; then
+    PERPLEXITY_MCP_TOKEN="$(read_token_file PERPLEXITY_MCP_TOKEN "${PERPLEXITY_MCP_TOKEN_FILE}")"
+  fi
+  if [[ -z "${LIFEGRAPH_MCP_TOKEN:-}" && -n "${LIFEGRAPH_MCP_TOKEN_FILE:-}" ]]; then
+    LIFEGRAPH_MCP_TOKEN="$(read_token_file LIFEGRAPH_MCP_TOKEN "${LIFEGRAPH_MCP_TOKEN_FILE}")"
+  fi
+}
+
 require_live_tokens() {
+  load_live_tokens
   local missing=0
   if [[ -z "${PERPLEXITY_MCP_TOKEN:-}" ]]; then
-    printf 'FAIL live UAT requires PERPLEXITY_MCP_TOKEN\n' >&2
+    printf 'FAIL live UAT requires PERPLEXITY_MCP_TOKEN or PERPLEXITY_MCP_TOKEN_FILE\n' >&2
     missing=1
   fi
   if [[ -z "${LIFEGRAPH_MCP_TOKEN:-}" ]]; then
-    printf 'FAIL live UAT requires LIFEGRAPH_MCP_TOKEN\n' >&2
+    printf 'FAIL live UAT requires LIFEGRAPH_MCP_TOKEN or LIFEGRAPH_MCP_TOKEN_FILE\n' >&2
     missing=1
   fi
   if [[ "${missing}" == "1" ]]; then
@@ -151,6 +180,7 @@ PY
 }
 
 perplexity_tools() {
+  load_live_tokens
   if [[ -z "${PERPLEXITY_MCP_TOKEN:-}" ]]; then
     skip "perplexity tools/list; set PERPLEXITY_MCP_TOKEN for live UAT"
     return 0
@@ -170,6 +200,7 @@ PY
 }
 
 perplexity_capture() {
+  load_live_tokens
   if [[ -z "${PERPLEXITY_MCP_TOKEN:-}" ]]; then
     skip "perplexity context.capture call; set PERPLEXITY_MCP_TOKEN for live UAT"
     return 0
@@ -210,6 +241,7 @@ PY
 }
 
 lifegraph_tools() {
+  load_live_tokens
   if [[ -z "${LIFEGRAPH_MCP_TOKEN:-}" ]]; then
     skip "lifegraph tools/list; set LIFEGRAPH_MCP_TOKEN for live UAT"
     return 0
@@ -229,6 +261,7 @@ PY
 }
 
 lifegraph_recall() {
+  load_live_tokens
   if [[ -z "${LIFEGRAPH_MCP_TOKEN:-}" ]]; then
     skip "lifegraph life.recall call; set LIFEGRAPH_MCP_TOKEN for live UAT"
     return 0
