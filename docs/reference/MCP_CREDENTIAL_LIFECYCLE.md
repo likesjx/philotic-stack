@@ -117,7 +117,7 @@ Minimum revocation evidence:
 
 ## UAT Matrix
 
-Run [mcp-client-uat.sh](/Users/jaredlikes/code/philotic-stack/scripts/mcp-client-uat.sh) for the safe local checks and any live checks for which you provide tokens through environment variables.
+Run [mcp-client-uat.sh](/Users/jaredlikes/code/philotic-stack/scripts/mcp-client-uat.sh) for the safe local checks and any live checks for which you provide tokens through environment variables. The `all` mode skips token-backed checks when tokens are absent; the `live` mode is strict and fails unless both live bearer tokens are exported.
 
 | Client | Required UAT | Live Secret Needed |
 | --- | --- | --- |

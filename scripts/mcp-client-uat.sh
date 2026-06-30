@@ -33,7 +33,7 @@ Modes:
   lifegraph-recall         Call life.recall when LIFEGRAPH_MCP_TOKEN is set
   remote-native            Run just muninn-private-smoke
   all                      Run safe checks plus token-backed checks when tokens are present
-  live                     Run token-backed tools/list and positive-path calls when tokens are present
+  live                     Require both live tokens, then run tools/list and positive-path calls
 EOF
 }
 
@@ -48,6 +48,21 @@ skip() {
 fail() {
   printf 'FAIL %s\n' "$1" >&2
   exit 1
+}
+
+require_live_tokens() {
+  local missing=0
+  if [[ -z "${PERPLEXITY_MCP_TOKEN:-}" ]]; then
+    printf 'FAIL live UAT requires PERPLEXITY_MCP_TOKEN\n' >&2
+    missing=1
+  fi
+  if [[ -z "${LIFEGRAPH_MCP_TOKEN:-}" ]]; then
+    printf 'FAIL live UAT requires LIFEGRAPH_MCP_TOKEN\n' >&2
+    missing=1
+  fi
+  if [[ "${missing}" == "1" ]]; then
+    exit 1
+  fi
 }
 
 codex_config() {
@@ -293,6 +308,7 @@ case "${mode}" in
     lifegraph_tools
     ;;
   live)
+    require_live_tokens
     perplexity_tools
     perplexity_capture
     lifegraph_tools
