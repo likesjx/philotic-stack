@@ -167,7 +167,8 @@ Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-con
   - [x] Draft the isolated test-vault/data-dir checklist.
   - [x] Add `just muninn-cluster-preflight` for non-mutating cluster CLI/health/binding readiness checks before cluster enablement.
   - [x] Run `RUN_REMOTE=1 just muninn-cluster-preflight all` across local, `mbp-jane`, and `vps-jane`.
-  - [x] Record that same-host multi-node cluster lab isolation is not yet proven because `muninn start --help` lacks alternate daemon binding flags.
+  - [x] Prove disposable same-host Muninn daemon isolation with alternate REST/UI/MCP/MBP/gRPC bindings and `/tmp` data.
+  - [x] Record the current cluster enablement blocker: the CLI reaches the admin endpoint but does not attach an admin session cookie, so unauthenticated enablement fails with HTTP 401.
   - [ ] Validate failover, returning-primary deference, and no accidental secret replication.
   - [ ] Record a decision before enabling cluster mode for real continuity vaults.
 
