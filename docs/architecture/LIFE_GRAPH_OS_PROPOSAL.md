@@ -98,14 +98,14 @@ Per-seam open items for the next implementation round:
 |---|---|
 | `life-graph-memorygraphrag-runner` | `life.recall.feedback` is provider/test-green and now emits governed patch proposals; next is live smoke through hotel IPC and patch review UX |
 | `life-graph-semantic-retrieval` | Named strategy dispatch is provider-green; next is retrieval quality aggregation, ranking/bridge tuning, and live feedback smoke |
-| `life-graph-evidence-conflict` | Runtime conflict detection and Muninn `true_up` / `contradiction_review` tool handoff still need wiring; provider `handle_conflict` / `handle_resolve` are test-green |
+| `life-graph-evidence-conflict` | Runtime conflict detection still needs first-class triggering; provider `handle_conflict` / `handle_resolve` are test-green, and Muninn-facing resolve plans now route implemented `true_up` / `contradiction_review` / `trust_update` intents through Philote's `memory.true_up` surface |
 | `life-graph-attention-steward` | Active SIL entries and operator confirmation gate in philote (first slice is observe-only; active interruptions unlock after 5 confirmed SIL entries) |
 | `life-graph-agentic-growth-loop` | Growth-loop philote role; background drift detector job |
 
 Cross-cutting next pressure:
 
 - embed `life.recall` in Beacon's turn context pipeline (claude-local)
-- connect conflict handoff packets to Muninn `true_up` / `contradiction_review` tools
+- connect runtime conflict detection to LifeGraph conflict handoff packets; resolved handoffs use Philote `memory.true_up` for `true_up`, `contradiction_review`, and `trust_update` intents until a narrower reviewed tool exists
 - live-smoke `life.recall.feedback` through hotel IPC and expose the resulting patch proposals for Beacon/operator review
 
 ## Codex Handoff — Group B Provider Completions

@@ -114,6 +114,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.
   - [x] Land the initial `data-memorygraphrag` contract crate with validated `EvidencePacket` and `ConflictHandoff` wire types.
   - [x] Add provider `handle_conflict` and `handle_resolve` execution paths for ConflictHandoff persistence and resolution status updates.
+  - [x] Route LifeGraph resolve plans for `contradiction_review` and `trust_update` through the implemented `memory.true_up` surface instead of phantom Muninn tools, preserving the requested action in payload metadata.
 - [x] Define the cron-backed heartbeat job shape for Life Graph maintenance, using the existing distributed cron subsystem as the first durable clock source.
 - [x] Define the paracrine heartbeat signal shape for Life Graph maintenance, including scope, target role-type, priority, expiry, and policy tags.
 - [ ] Build the Attention Steward paracrine subscriber in observe-only mode before broad notifications or autonomous follow-up.

@@ -1597,8 +1597,11 @@ impl MemoryGraphRagRunner {
         ) {
             let muninn_action = match input.handoff.requested_muninn_action {
                 MuninnRequestedAction::TrueUp => "memory.true_up",
-                MuninnRequestedAction::ContradictionReview => "memory.contradiction_review",
-                MuninnRequestedAction::TrustUpdate => "memory.trust_update",
+                // Philote currently exposes true-up as the implemented review
+                // surface. Keep the requested action in payload metadata instead
+                // of routing to phantom tools.
+                MuninnRequestedAction::ContradictionReview => "memory.true_up",
+                MuninnRequestedAction::TrustUpdate => "memory.true_up",
                 MuninnRequestedAction::Cultivate => "memory.cultivate",
                 MuninnRequestedAction::None => "memory.none",
             };
@@ -1608,6 +1611,7 @@ impl MemoryGraphRagRunner {
                 payload: serde_json::json!({
                     "conflict_id": input.handoff.conflict_id,
                     "muninn_engram_ids": input.handoff.muninn_engram_ids,
+                    "requested_muninn_action": input.handoff.requested_muninn_action,
                     "resolution_summary": input.resolution_summary,
                 }),
             });
@@ -2269,6 +2273,42 @@ mod tests {
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(plan.steps[1].target, RunnerPlanTarget::Muninn);
         assert_eq!(plan.steps[1].action, "memory.true_up");
+    }
+
+    #[test]
+    fn runner_resolve_routes_contradiction_review_to_true_up_surface() {
+        let runner = MemoryGraphRagRunner::default();
+        let handoff = ConflictHandoff {
+            handoff_id: "handoff:conflict:4".into(),
+            conflict_id: "conflict:preference:stale".into(),
+            finding_type: ConflictFindingType::DirectContradiction,
+            summary: "Muninn and LifeGraph disagree about the active preference.".into(),
+            graph_fact_refs: vec![graph_ref("life:preference:focus-mode")],
+            evidence_packets: vec![evidence_packet()],
+            muninn_engram_ids: vec!["01KW5TZQ0PBBHRFS23JQDZEDFV".into()],
+            recommended_owner: HandoffOwner::SharedGate,
+            requested_muninn_action: MuninnRequestedAction::ContradictionReview,
+            risk: ConflictRisk::Medium,
+            requires_operator: false,
+            status: ConflictHandoffStatus::Open,
+            metadata: serde_json::json!({}),
+        };
+
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeResolve(LifeResolveInput {
+                handoff,
+                resolution_summary: "Run true-up before any promotion.".into(),
+                operator_approved: false,
+            }))
+            .expect("resolve should plan");
+
+        assert!(plan.allowed());
+        assert_eq!(plan.steps[1].target, RunnerPlanTarget::Muninn);
+        assert_eq!(plan.steps[1].action, "memory.true_up");
+        assert_eq!(
+            plan.steps[1].payload["requested_muninn_action"],
+            "contradiction_review"
+        );
     }
 
     #[test]

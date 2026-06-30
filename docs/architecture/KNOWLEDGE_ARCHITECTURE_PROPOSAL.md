@@ -186,8 +186,18 @@ Additional UAT evidence:
 - 2026-06-30: `just mcp-client-uat remote-native` passed against `vps-jane`, confirming native Muninn MCP remained bound to `127.0.0.1:8750` and SSH-tunneled MCP health succeeded.
 - 2026-06-30: `python3 scripts/muninn_mcp.py --timeout 10 recall --context "cross-agent context packet credential UAT" --limit 2 --context-packet` returned a helper-level `cross_agent_context_packet` with Muninn refs labeled `muninn_continuity`.
 
+## True-Up Decision
+
+LifeGraph conflict handoffs should route through the implemented Philote memory surfaces:
+
+- `true_up`, `contradiction_review`, and `trust_update` requests use `memory.true_up`
+- `cultivate` requests use `memory.cultivate`
+- the original requested Muninn action stays in the payload for audit and future specialization
+- direct `muninn_evolve` remains a concept-label hygiene tool, not the default conflict-resolution path
+
+This keeps LifeGraph/Muninn reconciliation behind the same promotion gates as other memory true-up work instead of bypassing governance through raw Muninn mutation.
+
 ## Open Seams
 
-- Decide whether LifeGraph conflict handoff should call Muninn `muninn_evolve`, `muninn_decide`, or a dedicated true-up tool.
 - Teach Intel Graph recall/projection output to project into `ContextPacket` when it is used together with Muninn or LifeGraph in a model turn.
 - Revisit Tailscale-only or private HTTPS native Muninn access only after credential lifecycle and client config are explicit.
