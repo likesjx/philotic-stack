@@ -127,12 +127,24 @@ Run [mcp-client-uat.sh](/Users/jaredlikes/code/philotic-stack/scripts/mcp-client
 | LifeGraph readonly | `tools/list` shows `life.recall` and not write tools | yes |
 | Remote native Muninn | loopback-only binding and SSH tunnel health pass | SSH access |
 
+Useful commands:
+
+```bash
+just mcp-client-uat
+just mcp-client-uat all
+just mcp-client-uat remote-native
+PERPLEXITY_MCP_TOKEN=... just mcp-client-uat perplexity-capture
+LIFEGRAPH_MCP_TOKEN=... just mcp-client-uat lifegraph-recall
+PERPLEXITY_MCP_TOKEN=... LIFEGRAPH_MCP_TOKEN=... just mcp-client-uat live
+```
+
+The live modes read bearer tokens only from environment variables and do not print token values.
+
 ## Completion Gate
 
 Do not call a credential slice complete unless:
 
 - safe local UAT passes
-- any newly provisioned live credential has positive-path and deny-path evidence
+- any newly provisioned live credential has positive-path and deny-path evidence, including `context.capture` or `life.recall` calls where applicable
 - no raw secrets appear in `git diff`
 - `docs/task.md` and the relevant proposal record which gates are proven and which remain operator-gated
-

@@ -154,6 +154,7 @@ Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-con
   - [x] Document key labels, modes, expiries, and revocation path without storing raw tokens.
   - [x] Add MCP credential lifecycle rules for external bearer grants, rotation, revocation, and UAT evidence.
   - [x] Remove raw bearer-token terminal echoing from the Perplexity `context.capture` provisioner.
+  - [x] Add token-backed `just mcp-client-uat live` modes for positive-path `context.capture` and `life.recall` calls without printing bearer material.
 - [ ] Add tag-filtered recall lanes.
   - [x] Add `tags_all`, `tags_any`, and `tag_filter` support to the shared Muninn helper.
   - [x] Smoke filtered recall against known Perplexity and Muninn-upgrade memories.
