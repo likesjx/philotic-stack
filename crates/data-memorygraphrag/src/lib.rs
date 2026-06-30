@@ -641,6 +641,23 @@ impl ContextPacketSection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MuninnRecallMemory {
+    pub id: MuninnEngramId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
 /// Cross-agent context envelope that can carry Muninn, LifeGraph, Intel Graph,
 /// repo, and runtime references without erasing their authority boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -817,6 +834,60 @@ impl ContextPacket {
             metadata: serde_json::json!({
                 "source_context_packet": packet.context_id,
                 "omitted_conflict_ids": packet.omitted_conflict_ids,
+            }),
+        }
+    }
+
+    pub fn from_muninn_recall(
+        packet_id: impl Into<String>,
+        generated_at: impl Into<String>,
+        query_id: Option<String>,
+        summary: impl Into<String>,
+        memories: &[MuninnRecallMemory],
+    ) -> Self {
+        let refs: Vec<_> = memories
+            .iter()
+            .map(|memory| ContextRef {
+                ref_id: memory.id.clone(),
+                kind: ContextRefKind::MuninnEngram,
+                authority: ContextAuthority::MuninnContinuity,
+                summary: memory
+                    .summary
+                    .clone()
+                    .or_else(|| memory.concept.clone())
+                    .or_else(|| memory.content.clone()),
+                validation_state: None,
+                uri: None,
+                metadata: serde_json::json!({
+                    "concept": memory.concept,
+                    "score": memory.score,
+                    "trust": memory.trust,
+                    "source": "muninn_recall",
+                    "extra": memory.metadata,
+                }),
+            })
+            .collect();
+        let ref_ids = refs.iter().map(|r| r.ref_id.clone()).collect();
+
+        Self {
+            packet_id: packet_id.into(),
+            generated_at: generated_at.into(),
+            query_id,
+            audience_role: None,
+            summary: summary.into(),
+            refs,
+            sections: vec![ContextPacketSection {
+                title: "Muninn recall".into(),
+                authority: ContextAuthority::MuninnContinuity,
+                ref_ids,
+                text: None,
+            }],
+            policy_notes: vec![
+                "Muninn refs are continuity memory, not confirmed LifeGraph truth.".into(),
+                "Promote life-relevant claims through LifeGraph evidence/governance before treating them as structured life truth.".into(),
+            ],
+            metadata: serde_json::json!({
+                "source": "muninn_recall",
             }),
         }
     }
@@ -1964,6 +2035,46 @@ mod tests {
             .validate()
             .expect_err("Muninn refs must not claim LifeGraph truth authority");
         assert!(err.violations.iter().any(|v| v.contains("cannot claim")));
+    }
+
+    #[test]
+    fn muninn_recall_context_packet_uses_continuity_authority() {
+        let memories = vec![MuninnRecallMemory {
+            id: "01KW5TQST4EMBXCMAA0XNDWHDZ".into(),
+            concept: Some("cross-agent-knowledge-architecture".into()),
+            summary: Some("Keep native Muninn MCP private.".into()),
+            content: Some("Decision: native Muninn MCP stays loopback/private.".into()),
+            score: Some(0.91),
+            trust: Some("inferred".into()),
+            metadata: serde_json::json!({"state": "active"}),
+        }];
+
+        let packet = ContextPacket::from_muninn_recall(
+            "context:muninn:test",
+            "2026-06-30T12:00:00Z",
+            Some("muninn:recall:test".into()),
+            "Muninn recall for credential UAT",
+            &memories,
+        );
+
+        packet
+            .validate()
+            .expect("Muninn context packet should validate");
+        assert_eq!(packet.refs[0].kind, ContextRefKind::MuninnEngram);
+        assert_eq!(packet.refs[0].authority, ContextAuthority::MuninnContinuity);
+        assert_eq!(
+            packet.sections[0].authority,
+            ContextAuthority::MuninnContinuity
+        );
+
+        let json = serde_json::to_value(packet).expect("serialize context packet");
+        assert_eq!(json["refs"][0]["authority"], "muninn_continuity");
+        assert!(
+            json["policy_notes"][0]
+                .as_str()
+                .unwrap()
+                .contains("continuity memory")
+        );
     }
 
     #[test]

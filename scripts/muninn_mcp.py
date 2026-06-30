@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -164,6 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument(
         "--tag-filter-json",
         help="Advanced Muninn tag_filter object as JSON, for key-prefix or lexical-bound filters.",
+    )
+    recall.add_argument(
+        "--context-packet",
+        action="store_true",
+        help="Project recall results into a cross-agent ContextPacket with Muninn continuity authority.",
     )
 
     remember = sub.add_parser("remember", help="Store an atomic memory")
@@ -353,6 +360,101 @@ def try_start_local_server() -> dict:
     }
 
 
+def _result_text_json(result: dict) -> Optional[dict]:
+    content = result.get("result", {}).get("content", [])
+    if not content:
+        return None
+    text = content[0].get("text") if isinstance(content[0], dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _memory_summary(memory: dict) -> Optional[str]:
+    for key in ("summary", "concept", "content"):
+        value = memory.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def muninn_context_packet(recall_payload: dict, contexts: list[str]) -> dict:
+    memories = recall_payload.get("memories", [])
+    if not isinstance(memories, list):
+        memories = []
+    query_text = " | ".join(contexts)
+    query_hash = hashlib.sha256(query_text.encode("utf-8")).hexdigest()[:16]
+    generated_at = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    refs = []
+
+    for memory in memories:
+        if not isinstance(memory, dict):
+            continue
+        memory_id = memory.get("id")
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            continue
+        refs.append(
+            {
+                "ref_id": memory_id,
+                "kind": "muninn_engram",
+                "authority": "muninn_continuity",
+                "summary": _memory_summary(memory),
+                "metadata": {
+                    "concept": memory.get("concept"),
+                    "score": memory.get("score"),
+                    "trust": memory.get("trust"),
+                    "state": memory.get("state"),
+                    "source": "muninn_recall",
+                },
+            }
+        )
+
+    ref_ids = [ref["ref_id"] for ref in refs]
+    return {
+        "packet_id": f"context:muninn:{query_hash}",
+        "generated_at": generated_at,
+        "query_id": f"muninn:recall:{query_hash}",
+        "summary": f"Muninn recall for {query_text}" if query_text else "Muninn recall",
+        "refs": refs,
+        "sections": [
+            {
+                "title": "Muninn recall",
+                "authority": "muninn_continuity",
+                "ref_ids": ref_ids,
+            }
+        ],
+        "policy_notes": [
+            "Muninn refs are continuity memory, not confirmed LifeGraph truth.",
+            "Promote life-relevant claims through LifeGraph evidence/governance before treating them as structured life truth.",
+        ],
+        "metadata": {
+            "source": "muninn_recall",
+            "total": recall_payload.get("total"),
+        },
+    }
+
+
+def attach_muninn_context_packet(result: dict, contexts: list[str]) -> dict:
+    parsed = _result_text_json(result)
+    if parsed is None:
+        return result
+    parsed["cross_agent_context_packet"] = muninn_context_packet(parsed, contexts)
+    result = dict(result)
+    result_payload = dict(result.get("result", {}))
+    content = list(result_payload.get("content", []))
+    if content and isinstance(content[0], dict):
+        first = dict(content[0])
+        first["text"] = json.dumps(parsed, separators=(",", ":"))
+        content[0] = first
+        result_payload["content"] = content
+        result["result"] = result_payload
+    return result
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -415,6 +517,8 @@ def main() -> int:
             "muninn_recall",
             payload,
         )
+        if args.context_packet:
+            result = attach_muninn_context_packet(result, args.context)
     elif args.command == "remember":
         payload = {
             "content": args.content,

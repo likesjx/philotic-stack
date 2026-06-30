@@ -125,6 +125,8 @@ Implemented slice:
 - `data-memorygraphrag::ContextPacket` is the cross-agent envelope for Muninn, LifeGraph, Intel Graph, repo, and runtime references.
 - `ContextRef.authority` labels every reference as `muninn_continuity`, `life_graph_truth`, `life_graph_evidence`, `intel_graph_project_truth`, `runtime_observation`, or `agent_inference`.
 - `life.recall` now returns both the existing LifeGraph `context_packet` and a `cross_agent_context_packet` projection.
+- `data-memorygraphrag::ContextPacket::from_muninn_recall` projects Muninn recall memories as `muninn_continuity` refs.
+- `scripts/muninn_mcp.py recall --context-packet` attaches a `cross_agent_context_packet` to helper recall output for Codex, Claude, and other local harnesses.
 - contract validation rejects a Muninn engram ref that claims `life_graph_truth` authority.
 - `vps-jane` was deployed with the updated `life-graph-runner`; the live IPC smoke returned `cross_agent_context_packet` through `/run/philotic/vps-jane.sock`.
 
@@ -182,9 +184,10 @@ Additional UAT evidence:
 
 - 2026-06-30: `just mcp-client-uat all` passed local Codex/Muninn checks and skipped token-backed external checks because no live bearer tokens were supplied.
 - 2026-06-30: `just mcp-client-uat remote-native` passed against `vps-jane`, confirming native Muninn MCP remained bound to `127.0.0.1:8750` and SSH-tunneled MCP health succeeded.
+- 2026-06-30: `python3 scripts/muninn_mcp.py --timeout 10 recall --context "cross-agent context packet credential UAT" --limit 2 --context-packet` returned a helper-level `cross_agent_context_packet` with Muninn refs labeled `muninn_continuity`.
 
 ## Open Seams
 
 - Decide whether LifeGraph conflict handoff should call Muninn `muninn_evolve`, `muninn_decide`, or a dedicated true-up tool.
-- Teach other recall producers, including Intel Graph and Muninn helper output, to project into `ContextPacket` when they are used together in a model turn.
+- Teach Intel Graph recall/projection output to project into `ContextPacket` when it is used together with Muninn or LifeGraph in a model turn.
 - Revisit Tailscale-only or private HTTPS native Muninn access only after credential lifecycle and client config are explicit.
