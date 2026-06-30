@@ -48,6 +48,9 @@ This checklist is intentionally conservative. Muninn v0.7 makes clustering plaus
   - [ ] `local-bjork`
   - [ ] `mbp-jane`
   - [ ] `vps-jane`
+- [ ] Run non-mutating lab preflight:
+  - [x] `just muninn-cluster-preflight`
+  - [x] `RUN_REMOTE=1 just muninn-cluster-preflight all`
 - [ ] Confirm current standalone services are healthy before cluster changes.
 - [ ] Back up `auth_secret`, `mcp.token` if present, and any cluster config.
 - [ ] Record listener bindings and firewall state.
@@ -76,6 +79,14 @@ Validation requires reading the same IDs from the expected nodes after replicati
 - [ ] Confirm `vps-jane` firewall continues to block unintended public access.
 
 ## Cluster Bring-Up
+
+Do not run this section until the isolated-data/vault plan is explicit. The
+current CLI exposes `muninn cluster enable`, but the first lab still needs a
+verified isolation mechanism before any cluster enablement touches real data.
+
+Preflight evidence recorded 2026-06-30: local, `mbp-jane`, and `vps-jane`
+reported Muninn cluster CLI support and healthy standalone daemons. Listener
+checks confirmed MCP was not public-bound on the remote hosts.
 
 - [ ] Enable cluster mode on the isolated data set.
 - [ ] Add nodes one at a time.

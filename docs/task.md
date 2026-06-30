@@ -164,6 +164,8 @@ Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-con
   - [x] Compare recall before/after and record whether the cleanup helped.
 - [ ] Evaluate Muninn cluster mode as a lab slice, not production continuity authority.
   - [x] Draft the isolated test-vault/data-dir checklist.
+  - [x] Add `just muninn-cluster-preflight` for non-mutating cluster CLI/health/binding readiness checks before cluster enablement.
+  - [x] Run `RUN_REMOTE=1 just muninn-cluster-preflight all` across local, `mbp-jane`, and `vps-jane`.
   - [ ] Validate failover, returning-primary deference, and no accidental secret replication.
   - [ ] Record a decision before enabling cluster mode for real continuity vaults.
 

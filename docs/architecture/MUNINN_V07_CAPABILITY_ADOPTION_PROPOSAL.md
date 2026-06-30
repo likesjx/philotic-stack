@@ -283,6 +283,8 @@ Progress in this slice:
 - [x] added the MCP credential lifecycle runbook and `just mcp-client-uat` safe/local UAT gate
 - [x] removed raw bearer echoing from the Perplexity `context.capture` provisioner
 - [x] verified `just mcp-client-uat remote-native` against `vps-jane`: native Muninn stayed loopback-only and SSH-tunneled MCP health passed
+- [x] added `just muninn-cluster-preflight` as a non-mutating cluster lab readiness gate before any cluster enablement
+- [x] verified `RUN_REMOTE=1 just muninn-cluster-preflight all`: local, `mbp-jane`, and `vps-jane` have cluster CLI support, healthy standalone daemons, and no public remote MCP binding
 
 Observed during the cleanup trial:
 
