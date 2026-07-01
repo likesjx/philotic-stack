@@ -10,6 +10,7 @@ use crate::{
 const KNOWN_LABELS: &[&str] = &[
     "Person",
     "Role",
+    "Aspiration",
     "Goal",
     "System",
     "Habit",
