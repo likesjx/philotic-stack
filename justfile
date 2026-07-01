@@ -30,6 +30,14 @@ session-start:
 muninn-private-smoke:
     ./scripts/muninn-private-access.sh smoke
 
+# Verify local/private MCP client credential posture without printing secrets.
+mcp-client-uat mode="safe":
+    ./scripts/mcp-client-uat.sh {{mode}}
+
+# Non-mutating Muninn cluster lab preflight. Does not enable cluster mode.
+muninn-cluster-preflight mode="local":
+    ./scripts/muninn-cluster-lab-preflight.sh {{mode}}
+
 # Show drift status for all managed harnesses.
 harness-drift:
     @phil graph harness drift

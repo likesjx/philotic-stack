@@ -3,7 +3,7 @@ title: Muninn Cluster Evaluation Checklist
 doc_type: seam
 domain: memory-context
 status: proposed
-last_updated: 2026-06-27
+last_updated: 2026-06-30
 tags:
   - muninn
   - cluster
@@ -48,6 +48,11 @@ This checklist is intentionally conservative. Muninn v0.7 makes clustering plaus
   - [ ] `local-bjork`
   - [ ] `mbp-jane`
   - [ ] `vps-jane`
+- [ ] Run non-mutating lab preflight:
+  - [x] `just muninn-cluster-preflight`
+  - [x] `RUN_REMOTE=1 just muninn-cluster-preflight all`
+  - [x] disposable local alternate-port daemon probe
+  - [x] disposable cluster enablement probe reached the admin-auth gate without touching real data
 - [ ] Confirm current standalone services are healthy before cluster changes.
 - [ ] Back up `auth_secret`, `mcp.token` if present, and any cluster config.
 - [ ] Record listener bindings and firewall state.
@@ -76,6 +81,29 @@ Validation requires reading the same IDs from the expected nodes after replicati
 - [ ] Confirm `vps-jane` firewall continues to block unintended public access.
 
 ## Cluster Bring-Up
+
+Do not run this section against real continuity data until the isolated-data or
+test-vault plan is explicit. The local lab can start disposable Muninn daemons
+on alternate ports with isolated `/tmp` data, but production cluster enablement
+still needs an authenticated admin ceremony.
+
+Preflight evidence recorded 2026-06-30: local, `mbp-jane`, and `vps-jane`
+reported Muninn cluster CLI support and healthy standalone daemons. Listener
+checks confirmed MCP was not public-bound on the remote hosts.
+
+Isolation evidence recorded 2026-06-30: `muninn start` forwards hidden
+`--rest-addr`, `--ui-addr`, `--mcp-addr`, `--mbp-addr`, and `--grpc-addr`
+daemon flags. The Philotic preflight starts a disposable local daemon with
+isolated `/tmp` data and verifies MCP health on the alternate MCP port before
+cleanup.
+
+Auth blocker recorded 2026-06-30: `muninn cluster enable` reaches
+`/api/admin/cluster/enable`, but the current CLI path does not attach an admin
+session cookie to that request. The disposable probe therefore treats HTTP 401
+`admin session required` as the expected gate. The next lab slice needs either
+an upstream Muninn CLI fix that authenticates cluster admin requests or an
+explicit direct REST ceremony that obtains `muninn_session` from the UI login
+endpoint without storing secrets.
 
 - [ ] Enable cluster mode on the isolated data set.
 - [ ] Add nodes one at a time.

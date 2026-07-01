@@ -7,7 +7,9 @@ mod flush;
 mod footprint;
 mod harness;
 mod init;
+mod keys;
 mod load;
+mod mcp;
 mod mesh;
 mod muninn;
 mod onboard;
@@ -142,6 +144,18 @@ enum Command {
     Mesh {
         #[command(subcommand)]
         action: MeshAction,
+    },
+
+    /// MCP credential and client UAT helpers
+    Mcp {
+        #[command(subcommand)]
+        action: mcp::McpAction,
+    },
+
+    /// Manage provider keys and model configuration in the hotel vault/config plane
+    Keys {
+        #[command(subcommand)]
+        action: keys::KeysAction,
     },
 
     /// Project intelligence graph — scan, query, and serve the codebase graph
@@ -432,6 +446,8 @@ async fn main() -> Result<()> {
                 host,
             } => mesh::accept(invite, hotel, host).await,
         },
+        Command::Mcp { action } => mcp::run(action).await,
+        Command::Keys { action } => keys::run(action).await,
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};
             use philotic_graph::PhiloticGraphConfig;

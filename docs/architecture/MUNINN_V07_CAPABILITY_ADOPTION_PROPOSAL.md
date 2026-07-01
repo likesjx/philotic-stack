@@ -15,6 +15,7 @@ related_docs:
   - ARCHITECTURE_STATUS.md
   - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
   - MUNINN_CLUSTER_EVALUATION_CHECKLIST.md
+  - ../reference/MCP_CREDENTIAL_LIFECYCLE.md
   - MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md
   - LIFE_GRAPH_OS_PROPOSAL.md
 task_refs:
@@ -229,6 +230,9 @@ Until that is answered, clustering is promising infrastructure, not current arch
 - key creation outputs are captured only into local operator secret stores
 - docs may record key IDs, labels, modes, and expiry
 - revocation is part of the lifecycle, not an emergency-only operation
+- external bearer provisioning scripts must never echo the raw bearer token back to the terminal
+
+Credential lifecycle and UAT rules live in [MCP_CREDENTIAL_LIFECYCLE.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MCP_CREDENTIAL_LIFECYCLE.md).
 
 ## Verification Ladder
 
@@ -276,6 +280,17 @@ Progress in this slice:
 - [x] verified observe-mode read/list succeeds and write is denied
 - [x] drafted the cluster evaluation checklist
 - [x] ran the low-risk `muninn_evolve` cleanup trial
+- [x] added the MCP credential lifecycle runbook and `just mcp-client-uat` safe/local UAT gate
+- [x] extended `just mcp-client-uat` with token-backed `context.capture` and `life.recall` positive-path calls
+- [x] tightened `just mcp-client-uat live` so live mode now fails loudly when required bearer tokens are absent; `all` remains the safe/opportunistic mode
+- [x] added token-file inputs for `just mcp-client-uat live` so large bearer values can stay out of shell history
+- [x] added `phil mcp uat` as the operator-facing wrapper for the same MCP client UAT gate
+- [x] removed raw bearer echoing from the Perplexity `context.capture` provisioner
+- [x] verified `just mcp-client-uat remote-native` against `vps-jane`: native Muninn stayed loopback-only and SSH-tunneled MCP health passed
+- [x] added `just muninn-cluster-preflight` as a non-mutating cluster lab readiness gate before any cluster enablement
+- [x] verified `RUN_REMOTE=1 just muninn-cluster-preflight all`: local, `mbp-jane`, and `vps-jane` have cluster CLI support, healthy standalone daemons, and no public remote MCP binding
+- [x] proved disposable same-host Muninn daemon isolation with alternate REST/UI/MCP/MBP/gRPC bindings and `/tmp` data
+- [x] recorded the current cluster enablement blocker: the CLI reaches the admin endpoint but does not attach an admin session cookie, so unauthenticated enablement fails with HTTP 401
 
 Observed during the cleanup trial:
 

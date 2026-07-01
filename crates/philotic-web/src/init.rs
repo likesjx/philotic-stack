@@ -99,7 +99,7 @@ pub async fn run_inner(config: Option<PathBuf>, force: bool, skip_config: bool) 
         fs::write(&config_path, CONFIG_TEMPLATE)
             .with_context(|| format!("write {}", config_path.display()))?;
         println!("\n  config    {} written", config_path.display());
-        println!("\n  Edit mesh-config.json and fill in your API keys and Telegram bot tokens.");
+        println!("\n  Edit mesh-config.json for agent settings, then use `phil keys configure <provider>` for provider API keys.");
         println!("  Then run:  phil start");
     }
 
@@ -128,8 +128,6 @@ fn key_fingerprint(key: &VerifyingKey) -> String {
 
 static CONFIG_TEMPLATE: &str = r#"{
   "context_graph": {
-    "gemini_api_key": "REPLACE_WITH_GEMINI_API_KEY",
-    "elevenlabs_api_key": "",
     "default_model": "gemini-2.0-flash-exp"
   },
   "hotels": {

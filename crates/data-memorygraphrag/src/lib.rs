@@ -641,6 +641,23 @@ impl ContextPacketSection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MuninnRecallMemory {
+    pub id: MuninnEngramId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
 /// Cross-agent context envelope that can carry Muninn, LifeGraph, Intel Graph,
 /// repo, and runtime references without erasing their authority boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -817,6 +834,60 @@ impl ContextPacket {
             metadata: serde_json::json!({
                 "source_context_packet": packet.context_id,
                 "omitted_conflict_ids": packet.omitted_conflict_ids,
+            }),
+        }
+    }
+
+    pub fn from_muninn_recall(
+        packet_id: impl Into<String>,
+        generated_at: impl Into<String>,
+        query_id: Option<String>,
+        summary: impl Into<String>,
+        memories: &[MuninnRecallMemory],
+    ) -> Self {
+        let refs: Vec<_> = memories
+            .iter()
+            .map(|memory| ContextRef {
+                ref_id: memory.id.clone(),
+                kind: ContextRefKind::MuninnEngram,
+                authority: ContextAuthority::MuninnContinuity,
+                summary: memory
+                    .summary
+                    .clone()
+                    .or_else(|| memory.concept.clone())
+                    .or_else(|| memory.content.clone()),
+                validation_state: None,
+                uri: None,
+                metadata: serde_json::json!({
+                    "concept": memory.concept,
+                    "score": memory.score,
+                    "trust": memory.trust,
+                    "source": "muninn_recall",
+                    "extra": memory.metadata,
+                }),
+            })
+            .collect();
+        let ref_ids = refs.iter().map(|r| r.ref_id.clone()).collect();
+
+        Self {
+            packet_id: packet_id.into(),
+            generated_at: generated_at.into(),
+            query_id,
+            audience_role: None,
+            summary: summary.into(),
+            refs,
+            sections: vec![ContextPacketSection {
+                title: "Muninn recall".into(),
+                authority: ContextAuthority::MuninnContinuity,
+                ref_ids,
+                text: None,
+            }],
+            policy_notes: vec![
+                "Muninn refs are continuity memory, not confirmed LifeGraph truth.".into(),
+                "Promote life-relevant claims through LifeGraph evidence/governance before treating them as structured life truth.".into(),
+            ],
+            metadata: serde_json::json!({
+                "source": "muninn_recall",
             }),
         }
     }
@@ -1526,8 +1597,11 @@ impl MemoryGraphRagRunner {
         ) {
             let muninn_action = match input.handoff.requested_muninn_action {
                 MuninnRequestedAction::TrueUp => "memory.true_up",
-                MuninnRequestedAction::ContradictionReview => "memory.contradiction_review",
-                MuninnRequestedAction::TrustUpdate => "memory.trust_update",
+                // Philote currently exposes true-up as the implemented review
+                // surface. Keep the requested action in payload metadata instead
+                // of routing to phantom tools.
+                MuninnRequestedAction::ContradictionReview => "memory.true_up",
+                MuninnRequestedAction::TrustUpdate => "memory.true_up",
                 MuninnRequestedAction::Cultivate => "memory.cultivate",
                 MuninnRequestedAction::None => "memory.none",
             };
@@ -1537,6 +1611,7 @@ impl MemoryGraphRagRunner {
                 payload: serde_json::json!({
                     "conflict_id": input.handoff.conflict_id,
                     "muninn_engram_ids": input.handoff.muninn_engram_ids,
+                    "requested_muninn_action": input.handoff.requested_muninn_action,
                     "resolution_summary": input.resolution_summary,
                 }),
             });
@@ -1967,6 +2042,46 @@ mod tests {
     }
 
     #[test]
+    fn muninn_recall_context_packet_uses_continuity_authority() {
+        let memories = vec![MuninnRecallMemory {
+            id: "01KW5TQST4EMBXCMAA0XNDWHDZ".into(),
+            concept: Some("cross-agent-knowledge-architecture".into()),
+            summary: Some("Keep native Muninn MCP private.".into()),
+            content: Some("Decision: native Muninn MCP stays loopback/private.".into()),
+            score: Some(0.91),
+            trust: Some("inferred".into()),
+            metadata: serde_json::json!({"state": "active"}),
+        }];
+
+        let packet = ContextPacket::from_muninn_recall(
+            "context:muninn:test",
+            "2026-06-30T12:00:00Z",
+            Some("muninn:recall:test".into()),
+            "Muninn recall for credential UAT",
+            &memories,
+        );
+
+        packet
+            .validate()
+            .expect("Muninn context packet should validate");
+        assert_eq!(packet.refs[0].kind, ContextRefKind::MuninnEngram);
+        assert_eq!(packet.refs[0].authority, ContextAuthority::MuninnContinuity);
+        assert_eq!(
+            packet.sections[0].authority,
+            ContextAuthority::MuninnContinuity
+        );
+
+        let json = serde_json::to_value(packet).expect("serialize context packet");
+        assert_eq!(json["refs"][0]["authority"], "muninn_continuity");
+        assert!(
+            json["policy_notes"][0]
+                .as_str()
+                .unwrap()
+                .contains("continuity memory")
+        );
+    }
+
+    #[test]
     fn runner_catalog_exposes_first_life_graph_tool_surface() {
         let runner = MemoryGraphRagRunner::default();
         let catalog = runner.tool_catalog();
@@ -2158,6 +2273,42 @@ mod tests {
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(plan.steps[1].target, RunnerPlanTarget::Muninn);
         assert_eq!(plan.steps[1].action, "memory.true_up");
+    }
+
+    #[test]
+    fn runner_resolve_routes_contradiction_review_to_true_up_surface() {
+        let runner = MemoryGraphRagRunner::default();
+        let handoff = ConflictHandoff {
+            handoff_id: "handoff:conflict:4".into(),
+            conflict_id: "conflict:preference:stale".into(),
+            finding_type: ConflictFindingType::DirectContradiction,
+            summary: "Muninn and LifeGraph disagree about the active preference.".into(),
+            graph_fact_refs: vec![graph_ref("life:preference:focus-mode")],
+            evidence_packets: vec![evidence_packet()],
+            muninn_engram_ids: vec!["01KW5TZQ0PBBHRFS23JQDZEDFV".into()],
+            recommended_owner: HandoffOwner::SharedGate,
+            requested_muninn_action: MuninnRequestedAction::ContradictionReview,
+            risk: ConflictRisk::Medium,
+            requires_operator: false,
+            status: ConflictHandoffStatus::Open,
+            metadata: serde_json::json!({}),
+        };
+
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeResolve(LifeResolveInput {
+                handoff,
+                resolution_summary: "Run true-up before any promotion.".into(),
+                operator_approved: false,
+            }))
+            .expect("resolve should plan");
+
+        assert!(plan.allowed());
+        assert_eq!(plan.steps[1].target, RunnerPlanTarget::Muninn);
+        assert_eq!(plan.steps[1].action, "memory.true_up");
+        assert_eq!(
+            plan.steps[1].payload["requested_muninn_action"],
+            "contradiction_review"
+        );
     }
 
     #[test]

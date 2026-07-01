@@ -232,6 +232,16 @@ Recommended shared helper:
 
 - [muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py)
 
+When a client needs a cross-agent context envelope from helper recall output, add `--context-packet`:
+
+```bash
+python3 scripts/muninn_mcp.py recall \
+  --context "who am I talking to and what matters about this topic" \
+  --context-packet
+```
+
+The helper attaches `cross_agent_context_packet` with all Muninn engrams labeled as `muninn_continuity`. Treat those refs as continuity handles, not confirmed LifeGraph truth.
+
 ## Minimum Implementation Contract
 
 If you are wiring this into another cognitive client, implement these hooks:

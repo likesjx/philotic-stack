@@ -25,6 +25,7 @@ pub mod mcp_route;
 pub mod membership;
 pub mod meshops;
 pub mod model_manager;
+pub mod provider_keys;
 pub mod registry;
 pub mod resources;
 pub mod router_trace;

@@ -114,6 +114,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.
   - [x] Land the initial `data-memorygraphrag` contract crate with validated `EvidencePacket` and `ConflictHandoff` wire types.
   - [x] Add provider `handle_conflict` and `handle_resolve` execution paths for ConflictHandoff persistence and resolution status updates.
+  - [x] Route LifeGraph resolve plans for `contradiction_review` and `trust_update` through the implemented `memory.true_up` surface instead of phantom Muninn tools, preserving the requested action in payload metadata.
 - [x] Define the cron-backed heartbeat job shape for Life Graph maintenance, using the existing distributed cron subsystem as the first durable clock source.
 - [x] Define the paracrine heartbeat signal shape for Life Graph maintenance, including scope, target role-type, priority, expiry, and policy tags.
 - [ ] Build the Attention Steward paracrine subscriber in observe-only mode before broad notifications or autonomous follow-up.
@@ -151,6 +152,12 @@ Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-con
   - [x] Create one short-lived `observe` key for retrieval testing.
   - [x] Verify observe-mode keys can recall but cannot write.
   - [x] Document key labels, modes, expiries, and revocation path without storing raw tokens.
+  - [x] Add MCP credential lifecycle rules for external bearer grants, rotation, revocation, and UAT evidence.
+  - [x] Remove raw bearer-token terminal echoing from the Perplexity `context.capture` provisioner.
+  - [x] Add token-backed `just mcp-client-uat live` modes for positive-path `context.capture` and `life.recall` calls without printing bearer material.
+  - [x] Make `just mcp-client-uat live` fail loudly when required bearer tokens are not exported, while `all` remains safe/opportunistic.
+  - [x] Add explicit token-file inputs for live UAT so large bearers can be supplied without shell history exposure.
+  - [x] Add `phil mcp uat` as the operator-facing wrapper around the MCP client UAT gate.
 - [ ] Add tag-filtered recall lanes.
   - [x] Add `tags_all`, `tags_any`, and `tag_filter` support to the shared Muninn helper.
   - [x] Smoke filtered recall against known Perplexity and Muninn-upgrade memories.
@@ -161,6 +168,10 @@ Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-con
   - [x] Compare recall before/after and record whether the cleanup helped.
 - [ ] Evaluate Muninn cluster mode as a lab slice, not production continuity authority.
   - [x] Draft the isolated test-vault/data-dir checklist.
+  - [x] Add `just muninn-cluster-preflight` for non-mutating cluster CLI/health/binding readiness checks before cluster enablement.
+  - [x] Run `RUN_REMOTE=1 just muninn-cluster-preflight all` across local, `mbp-jane`, and `vps-jane`.
+  - [x] Prove disposable same-host Muninn daemon isolation with alternate REST/UI/MCP/MBP/gRPC bindings and `/tmp` data.
+  - [x] Record the current cluster enablement blocker: the CLI reaches the admin endpoint but does not attach an admin session cookie, so unauthenticated enablement fails with HTTP 401.
   - [ ] Validate failover, returning-primary deference, and no accidental secret replication.
   - [ ] Record a decision before enabling cluster mode for real continuity vaults.
 
@@ -177,9 +188,12 @@ Seam IDs: `muninn-native-client-access`, `lifegraph-muninn-promotion`, `cross-ag
   - [x] Return a `cross_agent_context_packet` from `life.recall` alongside the LifeGraph retrieval packet.
   - [x] Validate that Muninn engram refs cannot claim LifeGraph truth authority.
   - [x] Deploy to `vps-jane` and live-smoke `life.recall` through `/run/philotic/vps-jane.sock`, confirming `cross_agent_context_packet` is returned by the installed runner.
+  - [x] Add `ContextPacket::from_muninn_recall` and `scripts/muninn_mcp.py recall --context-packet` so Muninn helper recall can emit `muninn_continuity` context refs for cross-agent use.
 - [x] Decide whether remote trusted native Muninn access should standardize on SSH tunnels, Tailscale-only routing, or private HTTPS ingress with scoped keys.
   - [x] Standardize current remote trusted native path on SSH tunnel to loopback.
   - [x] Add `just muninn-private-smoke` to prove local health, remote private binding, and tunneled MCP health.
+  - [x] Add `just mcp-client-uat` to prove local Codex/Muninn posture and token-scoped external MCP tool projection when live bearers are supplied.
+  - [x] Run `just mcp-client-uat remote-native` against `vps-jane`, confirming loopback-only native binding and SSH-tunneled MCP health.
   - [ ] Revisit Tailscale-only/private HTTPS only after credential lifecycle and client config are explicit.
 
 ### WI 1: Session Management

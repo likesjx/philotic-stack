@@ -7,9 +7,10 @@ use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
     now_epoch_secs, verify_join_request,
 };
+use ansible_mesh_core::provider_keys::{ProviderKeySpec, provider_key_specs};
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
 use ansible_mesh_core::storage::{
-    AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord,
+    AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord, VaultRegistryEntry,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeHealthSnapshot, NodeRole};
 use anyhow::{Context, Result};
@@ -917,6 +918,68 @@ fn resolve_internal_secret(graph: &GraphDomain, secret_ref: &str) -> Result<Stri
         },
     )?
     .ok_or_else(|| anyhow::anyhow!("vault secret not found: {secret_ref}"))
+}
+
+fn migrate_plaintext_provider_api_keys(graph: &GraphDomain) -> Result<usize> {
+    let mut migrated = 0usize;
+    for spec in provider_key_specs() {
+        if migrate_plaintext_provider_api_key(graph, spec)? {
+            migrated += 1;
+        }
+    }
+    if migrated > 0 {
+        info!(
+            count = migrated,
+            "Migrated plaintext provider API-key config entries into vault refs"
+        );
+    }
+    Ok(migrated)
+}
+
+fn migrate_plaintext_provider_api_key(graph: &GraphDomain, spec: &ProviderKeySpec) -> Result<bool> {
+    let Some(plaintext) = read_string_config(graph, spec.legacy_api_key_key)? else {
+        return Ok(false);
+    };
+
+    if read_string_config(graph, spec.api_key_ref_key)?.is_some() {
+        graph.remove_config_value(spec.legacy_api_key_key)?;
+        info!(
+            provider = spec.provider,
+            legacy_key = spec.legacy_api_key_key,
+            ref_key = spec.api_key_ref_key,
+            "Removed legacy plaintext provider API-key config; existing vault ref is authoritative"
+        );
+        return Ok(true);
+    }
+
+    let secret_ref = store_secret(
+        graph,
+        SecretInput {
+            secret_kind: spec.vault_name.to_string(),
+            scope: "hotel".into(),
+            allowed_roles: spec
+                .allowed_roles
+                .iter()
+                .map(|role| role.to_string())
+                .collect(),
+            allowed_guests: Vec::new(),
+            plaintext,
+        },
+    )
+    .with_context(|| format!("store provider API key secret for {}", spec.provider))?;
+    graph.upsert_vault_registry_entry(&VaultRegistryEntry {
+        vault_name: spec.vault_name.to_string(),
+        secret_ref: secret_ref.clone(),
+    })?;
+    graph.set_config_value(spec.api_key_ref_key, &serde_json::to_string(&secret_ref)?)?;
+    graph.remove_config_value(spec.legacy_api_key_key)?;
+    info!(
+        provider = spec.provider,
+        legacy_key = spec.legacy_api_key_key,
+        ref_key = spec.api_key_ref_key,
+        "Migrated legacy plaintext provider API-key config into the hotel vault"
+    );
+    Ok(true)
 }
 
 fn mesh_auth_key_for_node(graph: &GraphDomain, node_id: &str) -> Result<Option<String>> {
@@ -2642,6 +2705,23 @@ fn hotel_shared_guests(
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-openrouter"),
+            role: "model.openrouter".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-openrouter",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:model-controller-onnx"),
             role: "model.local".into(),
             config_json: serde_json::json!({
@@ -2796,7 +2876,9 @@ fn hotel_shared_guests(
     // Otherwise it's spawned on-demand by ProvisionMcpEndpoint. This prevents unnecessary
     // process spawning and orphan accumulation when MCP endpoints are not in use.
     if std::env::var("MCP_MEMBRANE_REQUIRED").is_err() {
-        guests.retain(|guest| !(guest.role == "mcp-membrane" && guest.guest_id.ends_with(":membrane-mcp")));
+        guests.retain(|guest| {
+            !(guest.role == "mcp-membrane" && guest.guest_id.ends_with(":membrane-mcp"))
+        });
     }
 
     // life-graph-runner: paracrine → Memgraph observation pipeline.
@@ -5210,11 +5292,6 @@ fn enable_guest_test_overrides(
             }
         }
         StartupTest::CognitiveRoundTrip => {
-            graph.set_config_value(
-                "gemini_api_key",
-                &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
-            )?;
-
             // Clear vault registry so the startup test uses NullMemoryEngine.
             // This prevents philote from trying to activate against a real Muninn
             // instance when the hotel was seeded from a production mesh-config.json.
@@ -5236,6 +5313,10 @@ fn enable_guest_test_overrides(
                 env.insert(
                     "PHILOTIC_GEMINI_BASE_URL".into(),
                     serde_json::Value::String(startup_test_gemini_base_url(hotel_name)),
+                );
+                env.insert(
+                    "PHILOTIC_GEMINI_API_KEY".into(),
+                    serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()),
                 );
                 guest.config_json = config.to_string();
             }
@@ -5304,12 +5385,6 @@ fn enable_guest_test_overrides(
                 "telegram_bot_token",
                 &serde_json::Value::String(STARTUP_TEST_TELEGRAM_TOKEN.into()).to_string(),
             )?;
-            if matches!(test, StartupTest::TelegramRoundTrip) {
-                graph.set_config_value(
-                    "gemini_api_key",
-                    &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
-                )?;
-            }
 
             let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
             let gemini_api_base_url = startup_test_gemini_api_base_url(hotel_name);
@@ -5330,6 +5405,12 @@ fn enable_guest_test_overrides(
                         "PHILOTIC_GEMINI_BASE_URL".into(),
                         serde_json::Value::String(gemini_api_base_url.clone()),
                     );
+                    if matches!(test, StartupTest::TelegramRoundTrip) {
+                        env.insert(
+                            "PHILOTIC_GEMINI_API_KEY".into(),
+                            serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()),
+                        );
+                    }
                 }
 
                 if guest.role == "membrane" {
@@ -5903,6 +5984,7 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
         "target/debug/graph-runner",
         "target/debug/model-controller-gemini",
         "target/debug/model-controller-elevenlabs",
+        "target/debug/model-controller-openrouter",
     ];
     if existing_bins
         .iter()
@@ -7251,6 +7333,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     } else {
         warn!("Config file has no context_graph entries.");
     }
+    migrate_plaintext_provider_api_keys(&graph_domain)?;
 
     let seeded_peer_hotels = seed_peer_hotels_from_config(&graph_domain, &config_json, hotel_name)?;
     if seeded_peer_hotels > 0 {
@@ -7498,6 +7581,7 @@ async fn main() -> Result<()> {
         .context("--hotel is required unless using a subcommand such as `aiua load`")?;
 
     enforce_graph_datasource_home(&graph_domain_arc, &hotel_name)?;
+    migrate_plaintext_provider_api_keys(&graph_domain_arc)?;
     let seeded_guests = graph_domain_arc.list_guests(&hotel_name, true)?;
     if seeded_guests.is_empty() {
         warn!(
@@ -8351,20 +8435,23 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentProfile, StartupTest, agent_identity_record_for_profile, agent_profile_from_config,
+        AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest,
+        agent_identity_record_for_profile, agent_profile_from_config,
         all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, enforce_graph_datasource_home,
         execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
         guest_supervision_enabled, hotel_base_port, hotel_ipc_socket_path,
-        local_capability_advertisements, mesh_target_addr_for_node, nearest_available_base_port,
-        reconcile_peer_execution_reachability, resolve_runtime_ports, seed_toolset_profiles,
-        startup_test_gemini_base_url,
+        local_capability_advertisements, mesh_target_addr_for_node,
+        migrate_plaintext_provider_api_keys, nearest_available_base_port, read_string_config,
+        reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
+        seed_toolset_profiles, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::registry::ExecutionReachability;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{GuestRecord, HotelRecord};
+    use base64::Engine;
     use std::sync::Arc;
 
     #[test]
@@ -8799,7 +8886,7 @@ mod tests {
             &serde_json::json!({
                 "context_graph": {
                     "telegram_bot_token": "token",
-                    "elevenlabs_api_key": "key"
+                    "elevenlabs_api_key_ref": "secret://hotel/default/elevenlabs_api_key/test"
                 },
                 "ignored": {
                     "not": "imported"
@@ -8810,7 +8897,11 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(key, _)| key == "telegram_bot_token"));
-        assert!(entries.iter().any(|(key, _)| key == "elevenlabs_api_key"));
+        assert!(
+            entries
+                .iter()
+                .any(|(key, _)| key == "elevenlabs_api_key_ref")
+        );
     }
 
     #[test]
@@ -8818,7 +8909,7 @@ mod tests {
         let entries = extract_context_graph_entries(
             &serde_json::json!({
                 "context_graph": {
-                    "gemini_api_key": "shared"
+                    "gemini_api_key_ref": "secret://hotel/default/gemini_api_key/shared"
                 },
                 "hotels": {
                     "default": {
@@ -8852,11 +8943,10 @@ mod tests {
             Some("aria-architect-hotel"),
         );
 
-        assert!(
-            entries.iter().any(|(key, value)| {
-                key == "gemini_api_key" && value.as_str() == Some("shared")
-            })
-        );
+        assert!(entries.iter().any(|(key, value)| {
+            key == "gemini_api_key_ref"
+                && value.as_str() == Some("secret://hotel/default/gemini_api_key/shared")
+        }));
         assert!(entries.iter().any(|(key, value)| {
             key == "telegram_bot_token" && value.as_str() == Some("aria-token")
         }));
@@ -9355,6 +9445,83 @@ mod tests {
             .expect("graph datasource");
         assert!(!graph_datasource.is_active);
         assert_eq!(graph_datasource.active_pid, None);
+    }
+
+    #[test]
+    fn provider_api_key_migration_moves_plaintext_to_vault_ref() {
+        unsafe {
+            std::env::set_var(
+                "PHILOTIC_VAULT_MASTER_KEY",
+                BASE64_STANDARD.encode([7u8; 32]),
+            );
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        graph
+            .set_config_value(
+                "openrouter_api_key",
+                &serde_json::json!("sk-test").to_string(),
+            )
+            .expect("seed legacy plaintext key");
+
+        let migrated = migrate_plaintext_provider_api_keys(&graph).expect("migrate provider keys");
+        assert_eq!(migrated, 1);
+        assert!(
+            graph
+                .get_config_value("openrouter_api_key")
+                .unwrap()
+                .is_none()
+        );
+
+        let secret_ref = read_string_config(&graph, "openrouter_api_key_ref")
+            .expect("read ref config")
+            .expect("secret ref configured");
+        let plaintext = resolve_secret(
+            &graph,
+            &secret_ref,
+            &SecretAccess {
+                role: "model.openrouter".into(),
+                guest_id: "test".into(),
+            },
+        )
+        .expect("resolve secret")
+        .expect("secret exists");
+        assert_eq!(plaintext, "sk-test");
+        assert!(
+            graph
+                .get_vault_registry()
+                .expect("vault registry")
+                .iter()
+                .any(|entry| entry.vault_name == "openrouter_api_key"
+                    && entry.secret_ref == secret_ref)
+        );
+    }
+
+    #[test]
+    fn provider_api_key_migration_deletes_plaintext_when_ref_exists() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        graph
+            .set_config_value("openai_api_key", &serde_json::json!("stale").to_string())
+            .expect("seed legacy plaintext key");
+        graph
+            .set_config_value(
+                "openai_api_key_ref",
+                &serde_json::json!("secret://hotel/default/openai_api_key/existing").to_string(),
+            )
+            .expect("seed existing ref");
+
+        let migrated = migrate_plaintext_provider_api_keys(&graph).expect("migrate provider keys");
+        assert_eq!(migrated, 1);
+        assert!(graph.get_config_value("openai_api_key").unwrap().is_none());
+        assert_eq!(
+            read_string_config(&graph, "openai_api_key_ref")
+                .unwrap()
+                .as_deref(),
+            Some("secret://hotel/default/openai_api_key/existing")
+        );
     }
 
     #[test]

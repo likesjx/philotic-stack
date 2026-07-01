@@ -43,15 +43,6 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
         .with_help_message("Name for this node — used in mesh identity")
         .prompt()?;
 
-    let gemini_key = Password::new("Gemini API key:")
-        .with_help_message("Required — get one at https://aistudio.google.com/apikey")
-        .without_confirmation()
-        .prompt()?;
-
-    if gemini_key.trim().is_empty() {
-        anyhow::bail!("Gemini API key is required. Cannot continue without an LLM provider.");
-    }
-
     let default_model = Text::new("Default model:")
         .with_default("gemini-2.0-flash-exp")
         .with_help_message("Model ID for the primary LLM provider")
@@ -195,18 +186,9 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
         .with_help_message("ElevenLabs voice, Muninn password, etc.")
         .prompt()?;
 
-    let mut elevenlabs_key = String::new();
     let mut muninn_password = generate_password();
 
     if configure_advanced {
-        let el_key = Password::new("  ElevenLabs API key (Enter to skip):")
-            .without_confirmation()
-            .prompt()
-            .unwrap_or_default();
-        if !el_key.is_empty() {
-            elevenlabs_key = el_key;
-        }
-
         let custom_muninn = Confirm::new("  Set custom Muninn password?")
             .with_default(false)
             .with_help_message("Auto-generated if skipped")
@@ -257,8 +239,6 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
                 "admin_username": "root",
                 "admin_password": muninn_password,
             },
-            "gemini_api_key": gemini_key,
-            "elevenlabs_api_key": elevenlabs_key,
             "default_model": default_model,
         },
         "hotels": {
@@ -339,11 +319,9 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
             if telegram_count > 1 { "s" } else { "" }
         );
     }
-    if !elevenlabs_key.is_empty() {
-        println!("  ✓ ElevenLabs voice enabled");
-    }
     println!();
     println!("  Next steps:");
+    println!("    phil keys configure gemini  store your Gemini API key in the hotel vault");
     println!(
         "    phil status --hotel {}  inspect the daemon and agent config",
         hotel_name
