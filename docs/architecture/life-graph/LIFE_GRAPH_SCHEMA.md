@@ -102,6 +102,27 @@ Embedding space: `role_person_semantic`
 
 ---
 
+### Aspiration
+
+An identity the operator is growing *into* — a becoming, not a target. The pivot of the civic
+core: shaped from above by `Role` (who they are now) and from below by `Goal` (what they pursue),
+and reshaped as goals are met. No finish line.
+
+| Property | Notes |
+|---|---|
+| `claim_summary` | The aspiration in the operator's words |
+| `description` | What becoming this means |
+| `domain` | Life area it concerns |
+| `status` | `emerging` \| `developing` \| `integrated` \| `retired` |
+
+Embedding space: `role_person_semantic`
+
+Civic cycle (edges are a follow-up; edge-write path not yet in `life.observe`):
+`Role -[:SHAPES]-> Aspiration`, `Aspiration -[:SETS]-> Goal`, `Goal -[:SHAPES]-> Aspiration`.
+Agent-ownership of a civic node is expressed via `source_membrane` (e.g. `agent:beacon`), not an edge.
+
+---
+
 ### Goal
 
 Something the operator is working toward.

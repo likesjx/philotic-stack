@@ -59,7 +59,9 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
             "AttentionPatch",
             "SystemPatch",
         ],
-        SemanticSpace::RolePersonSemantic => &["Role", "Person", "Value", "Preference", "Concern"],
+        SemanticSpace::RolePersonSemantic => {
+            &["Role", "Aspiration", "Person", "Value", "Preference", "Concern"]
+        }
         SemanticSpace::MemoryBridgeSemantic => &["Commitment", "Decision"],
     }
 }
@@ -78,7 +80,9 @@ pub fn embedding_space_for_label(label: &str) -> Option<&'static str> {
         | "SkillPatch" | "ToolPatch" | "SchemaPatch" | "AttentionPatch" | "SystemPatch" => {
             Some("skill_tool_semantic")
         }
-        "Role" | "Person" | "Value" | "Preference" | "Concern" => Some("role_person_semantic"),
+        "Role" | "Aspiration" | "Person" | "Value" | "Preference" | "Concern" => {
+            Some("role_person_semantic")
+        }
         "Commitment" | "Decision" => Some("memory_bridge_semantic"),
         _ => None,
     }
@@ -460,6 +464,22 @@ mod tests {
             "observed_at": "2026-06-04T10:00:00Z",
             "status": "open"
         })
+    }
+
+    #[test]
+    fn aspiration_is_a_known_civic_label_in_role_person_space() {
+        // Beacon's civic core writes Aspiration via life.observe; it must be whitelisted
+        // and mapped to the identity (role_person) space, matching the V004 vector index.
+        assert!(crate::cypher::is_known_label("Aspiration"));
+        assert_eq!(
+            embedding_space_for_label("Aspiration"),
+            Some("role_person_semantic")
+        );
+        assert!(labels_for_space(&SemanticSpace::RolePersonSemantic).contains(&"Aspiration"));
+        assert_eq!(
+            index_name(&SemanticSpace::RolePersonSemantic, "Aspiration"),
+            "role_person_semantic__Aspiration"
+        );
     }
 
     #[test]
