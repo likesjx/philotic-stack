@@ -25,9 +25,12 @@ pub struct OpenAIProvider {
     http_client: reqwest::Client,
     auth: Option<OpenAIAuth>,
     base_url: String,
+    provider_id: &'static str,
     project_id: Option<String>,
     default_model: String,
     default_embedding_model: String,
+    fallback_models: Vec<String>,
+    fallback_route: Option<String>,
 }
 
 impl OpenAIProvider {
@@ -39,6 +42,31 @@ impl OpenAIProvider {
         default_model: Option<String>,
         default_embedding_model: Option<String>,
     ) -> Self {
+        Self::new_compatible(
+            "openai",
+            http_client,
+            auth,
+            base_url,
+            project_id,
+            default_model,
+            default_embedding_model,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_compatible(
+        provider_id: &'static str,
+        http_client: reqwest::Client,
+        auth: Option<OpenAIAuth>,
+        base_url: Option<String>,
+        project_id: Option<String>,
+        default_model: Option<String>,
+        default_embedding_model: Option<String>,
+        fallback_models: Vec<String>,
+        fallback_route: Option<String>,
+    ) -> Self {
         Self {
             http_client,
             auth,
@@ -48,10 +76,15 @@ impl OpenAIProvider {
                 let b = b.trim_end_matches("/v1");
                 b.trim_end_matches('/').to_string()
             },
+            provider_id,
             project_id,
             default_model: default_model.unwrap_or_else(|| "gpt-4.1-mini".into()),
             default_embedding_model: default_embedding_model
                 .unwrap_or_else(|| "text-embedding-3-small".into()),
+            fallback_models,
+            fallback_route: fallback_route
+                .map(|route| route.trim().to_string())
+                .filter(|route| !route.is_empty()),
         }
     }
 
@@ -347,6 +380,37 @@ impl OpenAIProvider {
 
         if let Some(stop) = task.provider_options.get("stop") {
             body["stop"] = stop.clone();
+        }
+
+        if self.provider_id == "openrouter" {
+            let fallback_models = task.provider_options.get("models").cloned().or_else(|| {
+                if self.fallback_models.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(
+                        self.fallback_models
+                            .iter()
+                            .map(|model| Value::String(model.clone()))
+                            .collect(),
+                    ))
+                }
+            });
+            if let Some(models) = fallback_models {
+                body["models"] = models;
+            }
+
+            let route = task.provider_options.get("route").cloned().or_else(|| {
+                self.fallback_route
+                    .as_ref()
+                    .map(|route| Value::String(route.clone()))
+            });
+            if let Some(route) = route {
+                body["route"] = route;
+            }
+
+            if let Some(provider) = task.provider_options.get("provider") {
+                body["provider"] = provider.clone();
+            }
         }
 
         if let Some(stream) = task.provider_options.get("stream") {
@@ -873,7 +937,7 @@ impl OpenAIProvider {
 #[async_trait]
 impl ModelProvider for OpenAIProvider {
     fn id(&self) -> &'static str {
-        "openai"
+        self.provider_id
     }
 
     fn supports(&self, task: &ControllerTask) -> bool {
@@ -1139,6 +1203,70 @@ mod tests {
         assert_eq!(body["verbosity"], "low");
         assert_eq!(body["background"], true);
         assert_eq!(body["tools"][0]["type"], "web_search_preview");
+    }
+
+    #[tokio::test]
+    async fn openrouter_request_includes_fallback_routing_fields() {
+        let captured = Arc::new(Mutex::new(None::<Value>));
+        let captured_for_handler = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured_for_handler = Arc::clone(&captured_for_handler);
+                async move {
+                    *captured_for_handler.lock().await = Some(body);
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": "done"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = spawn_test_server(app).await;
+
+        let provider = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some(base_url),
+            None,
+            Some("anthropic/claude-sonnet-4.5".into()),
+            None,
+            vec![
+                "anthropic/claude-sonnet-4.5".into(),
+                "openai/gpt-4.1-mini".into(),
+            ],
+            Some("fallback".into()),
+        );
+        assert_eq!(provider.id(), "openrouter");
+
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "Summarize this",
+            "provider_options": {
+                "provider": {
+                    "allow_fallbacks": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let output = provider.invoke(&task).await.unwrap();
+        assert!(matches!(output, ProviderOutput::Text { .. }));
+
+        let body = captured
+            .lock()
+            .await
+            .clone()
+            .expect("request body captured");
+        assert_eq!(body["model"], "anthropic/claude-sonnet-4.5");
+        assert_eq!(body["models"][0], "anthropic/claude-sonnet-4.5");
+        assert_eq!(body["models"][1], "openai/gpt-4.1-mini");
+        assert_eq!(body["route"], "fallback");
+        assert_eq!(body["provider"]["allow_fallbacks"], true);
     }
 
     #[tokio::test]

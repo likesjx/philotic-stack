@@ -1,4 +1,5 @@
 use ansible_mesh_core::catalog_rights::{has_right, tool_right};
+use ansible_mesh_core::provider_keys::{ProviderKeySpec, provider_key_spec};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use media_prep::serialize_audio_artifact_envelope;
@@ -1407,15 +1408,18 @@ pub struct ProviderConfigs {
     pub openai_project_id: Option<String>,
     pub openai_default_model: Option<String>,
     pub openai_default_embedding_model: Option<String>,
+    pub openrouter_api_key: Option<String>,
+    pub openrouter_base_url: Option<String>,
+    pub openrouter_default_model: Option<String>,
+    pub openrouter_default_embedding_model: Option<String>,
+    pub openrouter_fallback_models: Vec<String>,
+    pub openrouter_route: Option<String>,
 }
 
 impl ProviderConfigs {
     pub async fn load(ipc_client: &mut PhiloticClient) -> Result<Self> {
         Ok(Self {
-            gemini_api_key: env_override("PHILOTIC_GEMINI_API_KEY").or(
-                fetch_config_or_secret_string(ipc_client, "gemini_api_key", "gemini_api_key_ref")
-                    .await?,
-            ),
+            gemini_api_key: load_provider_api_key(ipc_client, "gemini").await?,
             gemini_oauth_access_token: load_env_or_config_secret_string(
                 ipc_client,
                 "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN",
@@ -1431,12 +1435,7 @@ impl ProviderConfigs {
                 "gemini_base_url",
             )
             .await?),
-            elevenlabs_api_key: fetch_config_or_secret_string(
-                ipc_client,
-                "elevenlabs_api_key",
-                "elevenlabs_api_key_ref",
-            )
-            .await?,
+            elevenlabs_api_key: load_provider_api_key(ipc_client, "elevenlabs").await?,
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
             ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL").or(fetch_config_string(
@@ -1457,12 +1456,7 @@ impl ProviderConfigs {
                 "openai_oauth_access_token_ref",
             )
             .await?,
-            openai_api_key: fetch_config_or_secret_string(
-                ipc_client,
-                "openai_api_key",
-                "openai_api_key_ref",
-            )
-            .await?,
+            openai_api_key: load_provider_api_key(ipc_client, "openai").await?,
             openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL").or(fetch_config_string(
                 ipc_client,
                 "openai_base_url",
@@ -1477,8 +1471,50 @@ impl ProviderConfigs {
                 .or(fetch_config_string(ipc_client, "openai_default_model").await?),
             openai_default_embedding_model: env_override("PHILOTIC_OPENAI_DEFAULT_EMBEDDING_MODEL")
                 .or(fetch_config_string(ipc_client, "openai_default_embedding_model").await?),
+            openrouter_api_key: load_provider_api_key(ipc_client, "openrouter").await?,
+            openrouter_base_url: env_override("PHILOTIC_OPENROUTER_BASE_URL")
+                .or(fetch_config_string(ipc_client, "openrouter_base_url").await?),
+            openrouter_default_model: env_override("PHILOTIC_OPENROUTER_DEFAULT_MODEL")
+                .or(fetch_config_string(ipc_client, "openrouter_default_model").await?),
+            openrouter_default_embedding_model: env_override(
+                "PHILOTIC_OPENROUTER_DEFAULT_EMBEDDING_MODEL",
+            )
+            .or(fetch_config_string(ipc_client, "openrouter_default_embedding_model").await?),
+            openrouter_fallback_models: env_override("PHILOTIC_OPENROUTER_FALLBACK_MODELS")
+                .or(fetch_config_string(ipc_client, "openrouter_fallback_models").await?)
+                .map(|raw| parse_model_list(&raw))
+                .unwrap_or_default(),
+            openrouter_route: env_override("PHILOTIC_OPENROUTER_ROUTE").or(fetch_config_string(
+                ipc_client,
+                "openrouter_route",
+            )
+            .await?),
         })
     }
+}
+
+fn parse_model_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(trimmed) {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Per-attempt timing budget declared by each provider.
@@ -1748,6 +1784,34 @@ async fn load_env_or_config_secret_string(
     }
 
     fetch_config_or_secret_string(ipc_client, value_key, ref_key).await
+}
+
+async fn load_provider_api_key(
+    ipc_client: &mut PhiloticClient,
+    provider: &str,
+) -> Result<Option<String>> {
+    let spec = provider_key_spec(provider)
+        .with_context(|| format!("unknown provider key spec: {provider}"))?;
+    load_provider_api_key_by_spec(ipc_client, spec).await
+}
+
+async fn load_provider_api_key_by_spec(
+    ipc_client: &mut PhiloticClient,
+    spec: &ProviderKeySpec,
+) -> Result<Option<String>> {
+    if let Some(value) = env_override(spec.env_api_key) {
+        return Ok(Some(value));
+    }
+
+    if let Some(secret_ref) = env_override(spec.env_api_key_ref) {
+        return fetch_secret_string(ipc_client, &secret_ref).await;
+    }
+
+    let Some(secret_ref) = fetch_config_string(ipc_client, spec.api_key_ref_key).await? else {
+        return Ok(None);
+    };
+
+    fetch_secret_string(ipc_client, &secret_ref).await
 }
 
 async fn fetch_config_or_secret_string(

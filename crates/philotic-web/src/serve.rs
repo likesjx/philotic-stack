@@ -69,6 +69,7 @@
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+use ansible_mesh_core::provider_keys::{provider_key_spec, provider_key_specs, ProviderKeySpec};
 use ansible_mesh_core::sqlite_storage::{SqliteEventStorage, SqliteGraphStorage};
 use ansible_mesh_core::storage::{
     EventStorage, ProjectedExternalIdentityRecord, ProjectedUserIdentityRecord,
@@ -623,6 +624,11 @@ pub async fn run(
         .route("/api/config/telegram", get(handle_config_telegram))
         .route("/api/config/gemini", get(handle_config_gemini))
         .route("/api/config/oidc", get(handle_config_oidc))
+        .route("/api/provider-configs", get(handle_provider_configs))
+        .route(
+            "/api/provider-configs/:provider",
+            get(handle_provider_config_get).post(handle_provider_configure),
+        )
         .route(
             "/api/components",
             get(handle_components).post(handle_component_create),
@@ -1195,9 +1201,12 @@ async fn handle_setup_guide() -> Response {
 
       <article class="panel">
         <h2>2. Configure your model path</h2>
-        <p>The management UI is where model setup should become legible instead of hidden in config folklore.</p>
+        <p>The management UI and <code>phil keys</code> keep model setup legible instead of hidden in config folklore.</p>
         <ul>
+          <li>Provider keys: use <code>phil keys configure openrouter</code>, or the provider config API at <code>/api/provider-configs/openrouter</code>.</li>
+          <li>Provider status: use <code>phil keys status</code> or <code>/api/provider-configs</code>; secret values stay hidden.</li>
           <li>Remote Gemini path: confirm the configured default model and the Gemini secret/config entries.</li>
+          <li>OpenRouter path: configure <code>openrouter_api_key_ref</code>, default model, fallback models, and route through the vault/config surface.</li>
           <li>MLX path: add or edit the <code>model-controller-mlx</code> component and define its model fleet.</li>
           <li>Local controller path: use the local model controller surfaces when you want a local-first or offline-ish route.</li>
         </ul>
@@ -3621,7 +3630,7 @@ async fn handle_graph_detail(
 // ── GET /api/secrets ──────────────────────────────────────────────────────────
 //
 // Returns a read-only inventory of known secret refs: vault registry entries
-// (vault name → secret_ref) plus known config-key secret refs (telegram, gemini).
+// (vault name → secret_ref) plus known config-key secret refs.
 // Values are never returned — only metadata about what refs are configured.
 
 async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -3651,7 +3660,7 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
         .collect();
 
     // Named config-key secret refs
-    let named_refs = [
+    let mut named_refs = vec![
         ("gemini_oauth_access_token", "gemini_oauth_access_token_ref"),
         (
             "gemini_oauth_refresh_token",
@@ -3661,6 +3670,11 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
         ("oidc_github_client_secret", "oidc_github_client_secret_ref"),
         ("telegram_bot_token", "telegram_bot_token"),
     ];
+    named_refs.extend(
+        provider_key_specs()
+            .iter()
+            .map(|spec| (spec.vault_name, spec.api_key_ref_key)),
+    );
     let mut named_entries: Vec<Value> = Vec::new();
     for (label, key) in &named_refs {
         let configured = match ipc_get_config(&state.socket, key).await {
@@ -3691,11 +3705,43 @@ const MUTABLE_CONFIG_KEYS: &[&str] = &[
     "oidc_google_client_secret_ref",
     "oidc_github_client_id",
     "oidc_github_client_secret_ref",
+    "gemini_api_key_ref",
+    "gemini_base_url",
+    "gemini_default_model",
+    "openai_api_key_ref",
+    "openai_base_url",
+    "openai_default_model",
+    "openai_default_embedding_model",
+    "openrouter_api_key_ref",
+    "openrouter_base_url",
+    "openrouter_default_model",
+    "openrouter_default_embedding_model",
+    "openrouter_fallback_models",
+    "openrouter_route",
+    "elevenlabs_api_key_ref",
+    "elevenlabs_default_model",
+    "elevenlabs_base_url",
 ];
 
 #[derive(serde::Deserialize)]
 struct SetConfigBody {
     value: Value,
+}
+
+#[derive(serde::Deserialize)]
+struct ProviderConfigureBody {
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    embedding_model: Option<String>,
+    #[serde(default)]
+    fallback_models: Vec<String>,
+    #[serde(default)]
+    route: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -3782,6 +3828,258 @@ async fn handle_config_put(
         )
             .into_response(),
     }
+}
+
+async fn handle_provider_configs(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let mut providers = Vec::new();
+    for spec in provider_key_specs() {
+        match provider_config_view(&state, spec).await {
+            Ok(view) => providers.push(view),
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response()
+            }
+        }
+    }
+    Json(json!({ "providers": providers })).into_response()
+}
+
+async fn handle_provider_config_get(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let Some(spec) = provider_key_spec(&provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown provider '{provider}'")})),
+        )
+            .into_response();
+    };
+    match provider_config_view(&state, spec).await {
+        Ok(view) => Json(view).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_provider_configure(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProviderConfigureBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let Some(spec) = provider_key_spec(&provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown provider '{provider}'")})),
+        )
+            .into_response();
+    };
+
+    let mut changed_keys = Vec::new();
+    let mut secret_ref = match ipc_get_config(&state.socket, spec.api_key_ref_key).await {
+        Ok(Some(Value::String(value))) => Some(value),
+        _ => None,
+    };
+
+    if let Some(api_key) = body
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match ipc_add_vault_entry(
+            &state.socket,
+            spec.vault_name,
+            api_key,
+            spec.allowed_roles
+                .iter()
+                .map(|role| role.to_string())
+                .collect(),
+        )
+        .await
+        {
+            Ok(new_secret_ref) => {
+                secret_ref = Some(new_secret_ref.clone());
+                if let Err(err) = ipc_set_config(
+                    &state.socket,
+                    spec.api_key_ref_key,
+                    &serde_json::to_string(&new_secret_ref).unwrap_or_else(|_| "null".into()),
+                )
+                .await
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": err.to_string()})),
+                    )
+                        .into_response();
+                }
+                changed_keys.push(spec.api_key_ref_key);
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    let config_updates = [
+        (
+            spec.default_model_key,
+            body.default_model.as_deref().map(str::trim),
+        ),
+        (spec.base_url_key, body.base_url.as_deref().map(str::trim)),
+        (
+            spec.embedding_model_key,
+            body.embedding_model.as_deref().map(str::trim),
+        ),
+        (spec.route_key, body.route.as_deref().map(str::trim)),
+    ];
+    for (key, value) in config_updates {
+        let Some(key) = key else { continue };
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let value_json = match serde_json::to_string(value) {
+            Ok(value_json) => value_json,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response()
+            }
+        };
+        if let Err(err) = ipc_set_config(&state.socket, key, &value_json).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+        changed_keys.push(key);
+    }
+
+    if let Some(key) = spec.fallback_models_key {
+        let fallback_models: Vec<String> = body
+            .fallback_models
+            .iter()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .collect();
+        if !fallback_models.is_empty() {
+            let value_json = match serde_json::to_string(&fallback_models) {
+                Ok(value_json) => value_json,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": err.to_string()})),
+                    )
+                        .into_response()
+                }
+            };
+            if let Err(err) = ipc_set_config(&state.socket, key, &value_json).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response();
+            }
+            changed_keys.push(key);
+        }
+    }
+
+    let event = json!({
+        "type": "provider-config:updated",
+        "payload": { "provider": spec.provider, "changed_keys": changed_keys }
+    });
+    let _ = state.tx.send(event.to_string());
+    Json(json!({
+        "ok": true,
+        "provider": spec.provider,
+        "secret_configured": secret_ref.is_some(),
+        "secret_ref": secret_ref,
+        "changed_keys": changed_keys,
+    }))
+    .into_response()
+}
+
+async fn provider_config_view(state: &AppState, spec: &ProviderKeySpec) -> anyhow::Result<Value> {
+    let secret_ref = ipc_config_string(&state.socket, spec.api_key_ref_key).await?;
+    let default_model = optional_config_string(&state.socket, spec.default_model_key).await?;
+    let base_url = optional_config_string(&state.socket, spec.base_url_key).await?;
+    let embedding_model = optional_config_string(&state.socket, spec.embedding_model_key).await?;
+    let route = optional_config_string(&state.socket, spec.route_key).await?;
+    let fallback_models = if let Some(key) = spec.fallback_models_key {
+        ipc_get_config(&state.socket, key)
+            .await?
+            .and_then(|raw| {
+                raw.as_array().map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    Ok(json!({
+        "provider": spec.provider,
+        "display_name": spec.display_name,
+        "secret_configured": secret_ref.is_some(),
+        "secret_ref": secret_ref,
+        "api_key_ref_key": spec.api_key_ref_key,
+        "default_model": default_model,
+        "default_model_key": spec.default_model_key,
+        "base_url": base_url,
+        "base_url_key": spec.base_url_key,
+        "embedding_model": embedding_model,
+        "embedding_model_key": spec.embedding_model_key,
+        "fallback_models": fallback_models,
+        "fallback_models_key": spec.fallback_models_key,
+        "route": route,
+        "route_key": spec.route_key,
+        "defaults": {
+            "default_model": spec.default_model,
+            "base_url": spec.default_base_url,
+        },
+        "allowed_roles": spec.allowed_roles,
+    }))
+}
+
+async fn optional_config_string(socket: &str, key: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    ipc_config_string(socket, key).await
+}
+
+async fn ipc_config_string(socket: &str, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(ipc_get_config(socket, key)
+        .await?
+        .and_then(|raw| raw.as_str().map(str::to_string)))
 }
 
 // ── POST /api/secrets/rotate ──────────────────────────────────────────────────
@@ -5731,6 +6029,53 @@ fn component_templates() -> Vec<ComponentTemplateView> {
                     secret: false,
                     vault_only: false,
                     help: "Companion config when OAuth auth is used.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "model-controller-openrouter".into(),
+            label: "OpenRouter Model Controller".into(),
+            description: "OpenRouter-backed model controller for hosted fallback routing. API keys and model routing belong in hotel provider config, not component manifests.".into(),
+            command: "model-controller-openrouter".into(),
+            role: "model.openrouter".into(),
+            env_fields: vec![],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "openrouter_api_key_ref".into(),
+                    label: "OpenRouter API Key Ref".into(),
+                    location: "hotel-config".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    help: "Configure through phil keys configure openrouter or the desktop provider config API. The raw key is stored in the hotel vault.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "openrouter_default_model".into(),
+                    label: "Default Model".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "Primary OpenRouter model id used when a task does not override provider options.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "openrouter_fallback_models".into(),
+                    label: "Fallback Models".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "Ordered model list passed to OpenRouter as the fallback chain.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "openrouter_route".into(),
+                    label: "Routing Mode".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "OpenRouter route value, usually fallback when a fallback model list is configured.".into(),
                 },
             ],
         },

@@ -1,5 +1,6 @@
 use crate::vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
 use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::provider_keys::provider_key_spec;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -716,14 +717,26 @@ fn resolve_openai_project_id(project_id: &Option<String>) -> Option<String> {
 }
 
 fn load_openai_api_key(graph: &GraphDomain) -> Result<String> {
-    if let Some(value_json) = graph.get_config_value("openai_api_key")? {
-        return serde_json::from_str::<String>(&value_json)
-            .context("failed to decode legacy openai_api_key");
+    if let Some(value) = std::env::var("PHILOTIC_OPENAI_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value);
     }
 
-    let secret_ref = graph
-        .get_config_value("openai_api_key_ref")?
-        .and_then(|value_json| serde_json::from_str::<String>(&value_json).ok())
+    let spec = provider_key_spec("openai").context("OpenAI provider key spec missing")?;
+    let secret_ref = std::env::var(spec.env_api_key_ref)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            graph
+                .get_config_value(spec.api_key_ref_key)
+                .ok()
+                .flatten()
+                .and_then(|value_json| serde_json::from_str::<String>(&value_json).ok())
+        })
         .context("openai_api_key_ref is not configured")?;
 
     resolve_secret(
