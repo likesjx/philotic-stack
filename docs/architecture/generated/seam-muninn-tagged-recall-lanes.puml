@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - muninn-tagged-recall-lanes
+
+rectangle "muninn-tagged-recall-lanes" as muninn_tagged_recall_lanes #Orange {
+}
+
+
+@enduml

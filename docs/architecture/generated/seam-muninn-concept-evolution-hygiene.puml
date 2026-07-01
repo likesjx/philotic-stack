@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - muninn-concept-evolution-hygiene
+
+rectangle "muninn-concept-evolution-hygiene" as muninn_concept_evolution_hygiene #Orange {
+}
+
+
+@enduml

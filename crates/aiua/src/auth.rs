@@ -1,6 +1,6 @@
 use crate::vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
 use ansible_mesh_core::domain::GraphDomain;
-use ansible_mesh_core::provider_keys::provider_key_spec;
+use ansible_mesh_core::provider_keys::{ProviderKeySpec, provider_key_spec};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -172,35 +172,51 @@ async fn run_openai_auth_start(args: OpenAIStartArgs) -> Result<()> {
     let model = resolve_openai_model(&args.model);
     let embedding_model = resolve_openai_embedding_model(&args.embedding_model);
     let project_id = resolve_openai_project_id(&args.project_id);
-    let api_key = resolve_openai_api_key(&args)
-        .context("OpenAI API key is required; set --api-key or PHILOTIC_OPENAI_API_KEY")?;
+    let spec = provider_key_spec(&args.provider).with_context(|| {
+        format!(
+            "provider key spec is not configured for '{}'",
+            args.provider
+        )
+    })?;
+    let api_key = resolve_provider_api_key(&args, spec).with_context(|| {
+        format!(
+            "{} API key is required; set --api-key or {}",
+            spec.display_name, spec.env_api_key
+        )
+    })?;
     let graph = openai_graph()?;
     let domain = GraphDomain::new(Arc::new(graph.adapter()));
-    let secret_kind = openai_secret_kind(&base_url, &args.provider);
     let secret_ref = store_secret(
         &domain,
         SecretInput {
-            secret_kind,
+            secret_kind: spec.vault_name.to_string(),
             scope: "hotel".into(),
-            allowed_roles: vec!["model".into(), "model.openai".into()],
+            allowed_roles: spec
+                .allowed_roles
+                .iter()
+                .map(|role| role.to_string())
+                .collect(),
             allowed_guests: Vec::new(),
             plaintext: api_key,
         },
     )?;
 
-    domain.set_config_value("openai_api_key_ref", &serde_json::to_string(&secret_ref)?)?;
-    domain.set_config_value("openai_base_url", &serde_json::to_string(&base_url)?)?;
-    domain.set_config_value("openai_model", &serde_json::to_string(&model)?)?;
-    domain.set_config_value(
-        "openai_embedding_model",
-        &serde_json::to_string(&embedding_model)?,
-    )?;
+    domain.set_config_value(spec.api_key_ref_key, &serde_json::to_string(&secret_ref)?)?;
+    if let Some(key) = spec.base_url_key {
+        domain.set_config_value(key, &serde_json::to_string(&base_url)?)?;
+    }
+    if let Some(key) = spec.default_model_key {
+        domain.set_config_value(key, &serde_json::to_string(&model)?)?;
+    }
+    if let Some(key) = spec.embedding_model_key {
+        domain.set_config_value(key, &serde_json::to_string(&embedding_model)?)?;
+    }
     if let Some(project_id) = project_id.as_deref() {
         domain.set_config_value("openai_project_id", &serde_json::to_string(project_id)?)?;
     }
 
-    println!("OpenAI API key stored in the hotel vault.");
-    println!("Provider: {}", args.provider);
+    println!("{} API key stored in the hotel vault.", spec.display_name);
+    println!("Provider: {}", spec.provider);
     println!("Base URL: {}", base_url);
     println!("Secret ref: {}", secret_ref);
     Ok(())
@@ -647,31 +663,14 @@ fn openai_graph() -> Result<ansible_mesh_core::sqlite_storage::SqliteGraphStorag
     ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("aiua_context.db")
 }
 
-fn openai_secret_kind(base_url: &str, provider: &str) -> String {
-    let host = reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_else(|| "unknown-endpoint".into())
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    format!(
-        "{}-api-key-{}",
-        provider.trim(),
-        if host.is_empty() { "endpoint" } else { &host }
-    )
-}
-
-fn resolve_openai_api_key(args: &OpenAIStartArgs) -> Option<String> {
+fn resolve_provider_api_key(args: &OpenAIStartArgs, spec: &ProviderKeySpec) -> Option<String> {
     args.api_key
         .as_deref()
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(str::to_string)
         .or_else(|| {
-            std::env::var("PHILOTIC_OPENAI_API_KEY")
+            std::env::var(spec.env_api_key)
                 .ok()
                 .map(|key| key.trim().to_string())
                 .filter(|key| !key.is_empty())

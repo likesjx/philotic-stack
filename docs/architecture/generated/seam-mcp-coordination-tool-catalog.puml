@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-coordination-tool-catalog
+
+rectangle "mcp-coordination-tool-catalog" as mcp_coordination_tool_catalog #Orange {
+}
+
+
+@enduml

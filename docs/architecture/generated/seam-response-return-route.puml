@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - response-return-route
+
+rectangle "response-return-route" as response_return_route #Orange {
+}
+
+
+@enduml

@@ -7523,8 +7523,9 @@ impl IpcServer {
                     let sid = turn.session_id.clone();
                     let tid = turn.turn_id.clone();
                     turn.status = "failed".into();
-                    turn.error_json =
-                        Some(serde_json::json!({"error": "ZOMBIE_TURN_REPAIR", "reason": "hotel watchdog: stale running turn"}));
+                    turn.error_json = Some(
+                        serde_json::json!({"error": "ZOMBIE_TURN_REPAIR", "reason": "hotel watchdog: stale running turn"}),
+                    );
                     turn.completed_at = Some(now_secs);
                     if let Err(e) = graph.upsert_session_turn(&turn) {
                         warn!("RepairStaleSessionTurns: mark failed {sid}:{tid}: {e}");
@@ -7557,7 +7558,10 @@ impl IpcServer {
                     repaired += 1;
                 }
                 if repaired > 0 {
-                    info!(repaired, min_age_secs, "RepairStaleSessionTurns: repaired zombie turns");
+                    info!(
+                        repaired,
+                        min_age_secs, "RepairStaleSessionTurns: repaired zombie turns"
+                    );
                 }
                 IpcResponse::success("repair", Some(serde_json::json!({"repaired": repaired})))
             }

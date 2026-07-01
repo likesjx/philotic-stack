@@ -42,6 +42,7 @@ philotic_binaries:
   - model-controller-gemini
   - model-controller-elevenlabs
   - model-controller-openai
+  - model-controller-openrouter
   - model-controller-mlx
   - model-controller-ollama
   - heal-dispatcher

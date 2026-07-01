@@ -64,10 +64,17 @@ Seam IDs: `model-catalog-schema`, `model-catalog-seed`, `model-catalog-projectio
 
 - [ ] Treat `origin/codex/model-graph-catalog` as stale source material, not a merge target.
 - [ ] Audit the stale branch and classify changed files as catalog schema, catalog projection, unrelated runtime drift, test-only update, or obsolete conflict.
-- [ ] Re-slice the provider-neutral model catalog schema onto current `develop`.
-- [ ] Seed the minimal supported provider families: Gemini, OpenAI, Ollama-compatible, ElevenLabs, ONNX, and MLX.
-- [ ] Add focused schema/seed tests and run touched-crate checks before merging.
-- [ ] Add one read-only projection surface before any routing integration.
+- [x] Re-slice the provider-neutral model catalog schema onto current `develop`.
+- [x] Reuse existing provider/model metadata instead of adding another provider table:
+  - `ProviderKeySpec` for provider ids, env/config/ref names, and allowed roles
+  - `ModelProfileRecord` for live per-node operational health
+  - model-router provider ids for execution identity
+- [x] Seed the minimal supported provider families: Gemini, OpenAI, OpenRouter, Ollama-compatible, ElevenLabs, ONNX, and MLX.
+- [x] Add focused schema/seed tests and run touched-crate checks before merging.
+- [x] Add one read-only projection surface before any routing integration:
+  - show static catalog facts
+  - join live `ModelProfileRecord` status/latency/error-rate when present
+  - do not alter provider selection or fallback behavior in this slice
 - [ ] Delete `origin/codex/model-graph-catalog` after valid catalog work lands or is explicitly abandoned.
 
 ## New Project: Cypher-First Graph Datasource
@@ -1121,6 +1128,21 @@ This workstream includes a quick look at the OpenAI websocket/realtime API becau
   - background mode
   - built-in tools gated behind explicit provider options
   - realtime/audio kept as a follow-on slice, not part of the first parity path
+- [x] Add a first-class OpenRouter model-controller path:
+  - separate `openrouter` provider id for routing traces and health
+  - `model-controller-openrouter` guest on role `model.openrouter`
+  - OpenRouter-specific config keys for API key, base URL, default model, fallback model list, and route
+  - pass-through request fields for OpenRouter fallback routing (`models`, `route`, `provider`)
+- [x] Add operator key/config management for provider credentials:
+  - `phil keys configure <provider>` stores API keys through hotel vault IPC and writes provider config refs
+  - `phil keys status [provider]` reports configured/missing state without exposing secret values
+  - desktop backend exposes `GET/POST /api/provider-configs/:provider` plus provider status inventory
+  - OpenRouter appears as a first-class component template with vault-only key guidance
+- [x] Close provider API-key at-rest plaintext gap:
+  - shared `ProviderKeySpec` owns provider vault names, ref keys, env overrides, config keys, and allowed roles
+  - model controllers resolve API keys from env or `*_api_key_ref` only; plaintext `*_api_key` config is migration input
+  - aiua load/startup migrates legacy plaintext provider keys into vault refs and removes the plaintext config entry
+  - desktop mutable provider-config keys derive from the shared provider spec instead of a second hand-written table
 - [x] Define the provider-family strategy for OpenAI-compatible endpoints:
   - OpenAI remains the canonical first-class provider path
   - OpenRouter and similar hosted endpoints should usually ride the same adapter family with different endpoint/auth settings
@@ -1135,6 +1157,14 @@ Seam IDs: `vault-secret-refs`, `remote-vault-delegation`
 - [x] Define the first vault record schema and context-graph secret references.
 - [x] Begin removing new OAuth access-token storage from plain `node_config` by storing secret refs instead.
 - [x] Define and implement the first hotel-local secret fetch API for guests.
+- [x] Add first operator UX for API-key secrets:
+  - CLI provider setup writes raw keys only via `AddVaultEntry`, then persists secret refs in config
+  - desktop provider config endpoints reuse the same vault/config boundary
+  - secret inventory includes provider API-key refs without returning values
+- [x] Add one-time legacy provider-key migration:
+  - plaintext `gemini/openai/openrouter/elevenlabs_api_key` config values are stored through `store_secret`
+  - migrated secrets are registered in `vault_registry`, ref config is written, and plaintext config is deleted
+  - when a ref already exists, stale plaintext is deleted and the existing ref remains authoritative
 - [x] Define and implement the first envelope-encryption and root-key strategy:
   - OS keychain / TPM / Secure Enclave preferred
   - cloud KMS/HSM for hosted hotels

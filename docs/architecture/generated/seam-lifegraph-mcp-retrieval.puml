@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - lifegraph-mcp-retrieval
+
+rectangle "lifegraph-mcp-retrieval" as lifegraph_mcp_retrieval #Orange {
+}
+
+
+@enduml
