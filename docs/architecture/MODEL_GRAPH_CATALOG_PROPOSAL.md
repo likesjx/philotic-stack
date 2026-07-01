@@ -3,7 +3,7 @@ title: Model Graph Catalog Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-06-22
+last_updated: 2026-07-01
 tags:
 - model-controller
 - model-catalog
@@ -86,9 +86,38 @@ Do not merge `origin/codex/model-graph-catalog` wholesale.
 Instead, extract the intended model-catalog work into small current seams and
 delete the stale branch after those seams are landed or intentionally abandoned.
 
+As of 2026-07-01, the live runtime already has a partial model graph in the form
+of `ModelProfileRecord` plus health-aware routing:
+
+- `ModelProfileRecord` stores per-node provider/task operational facts such as
+  `model_ref`, `provider`, `task_kinds`, `trust_tier`, latency, error rate, and
+  health status.
+- `GraphDomain::observe_model_outcome` updates latency/error health after model
+  dispatch.
+- `GraphDomain::best_model_for` ranks node-local profiles for a task kind.
+- `model-router` can substitute a healthier provider when the selected provider
+  is degraded and no explicit provider hint was supplied.
+
+That live profile layer is operational truth, not the static catalog itself. The
+catalog refresh should join with it, not replace it.
+
 ## Current Slice
 
-Make the old model graph catalog work current enough to merge safely.
+Make the old model graph catalog work current enough to merge safely, while
+anchoring it to the live `ModelProfileRecord` and provider-key metadata already
+present in the repo.
+
+Implemented as of 2026-07-01:
+
+- `ansible_mesh_core::model_manager` owns the first static
+  `ModelCatalogRecord` seed and read-only `ModelCatalogProjection`.
+- The seed reuses `ProviderKeySpec` display metadata and covers Gemini, OpenAI,
+  OpenRouter, ElevenLabs, Ollama, ONNX, and MLX provider families.
+- `philotic-web` exposes authenticated `GET /api/model-catalog`, which joins
+  static catalog facts with live `ModelProfileRecord` entries and reports
+  `routing_effect: none-read-only-projection`.
+- This slice does not change `model-router`, `model.manager.list`, provider
+  selection, or fallback behavior.
 
 This slice should:
 
@@ -96,13 +125,18 @@ This slice should:
   catalog schema, catalog projection, unrelated runtime drift, test-only update,
   or obsolete conflict
 - recover only still-valid model catalog concepts onto current `develop`
-- add the first provider-neutral catalog schema in the smallest shared crate
-  that current code can consume without reviving old branch drift
+- add the first provider-neutral catalog schema in the smallest shared crate that
+  current code can consume without reviving old branch drift
+- reuse existing shared metadata where it exists, especially
+  `ansible_mesh_core::provider_keys::ProviderKeySpec`, instead of creating a
+  third provider table
 - seed a minimal catalog snapshot for currently supported provider families:
-  Gemini, OpenAI, Ollama-compatible, ElevenLabs, ONNX, and MLX
+  Gemini, OpenAI, OpenRouter, Ollama-compatible, ElevenLabs, ONNX, and MLX
 - keep endpoint families explicit, including planned/future endpoint families,
   without advertising unsupported runtime capability
 - add focused tests for catalog shape and projection
+- add one read-only projection that joins static catalog facts with live
+  `ModelProfileRecord` health without changing routing
 - update `MODEL_CONTROLLER_PROPOSAL.md`, `ARCHITECTURE_STATUS.md`, and
   `docs/task.md` only with current, proven truth
 
@@ -115,14 +149,18 @@ This slice should not:
 - make model scores look more precise than they are
 - make `model.manager.list` catalog-backed until the projection is actually
   implemented and tested
+- let static catalog scores override provider health, explicit provider hints,
+  hotel reachability, or operator routing policy
 
 ## Refresh Plan
 
 1. Create a clean branch from current `develop`.
 2. Compare `origin/codex/model-graph-catalog` by intent, not by file diff.
-3. Recreate the catalog schema as a small current patch.
-4. Add seed data and tests.
-5. Wire one read-only projection surface.
+3. Recreate the catalog schema as a small current patch, reusing
+   `ProviderKeySpec` and existing `ModelProfileRecord` fields where possible.
+4. Add seed data and tests for the currently materialized provider families.
+5. Wire one read-only projection surface that reports catalog metadata plus live
+   profile status.
 6. Run targeted crate tests and a model-router check.
 7. Delete `origin/codex/model-graph-catalog` after the current seams land.
 
@@ -135,6 +173,8 @@ This slice should not:
   or another bounded model catalog query surface.
 - `turn-routing-catalog-input`: deferred integration where turn routing can use
   catalog facts as hints without surrendering routing authority.
+- `catalog-live-profile-join`: joins static catalog records with
+  `ModelProfileRecord` health and route traces for inspection only.
 
 ## Validation
 

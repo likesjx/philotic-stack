@@ -3,6 +3,7 @@ title: Philotic Persistence Tiers
 doc_type: proposal
 domain: memory-context
 status: proposed
+disposition: accepted-current-slice
 last_updated: 2026-03-31
 tags:
 - ods

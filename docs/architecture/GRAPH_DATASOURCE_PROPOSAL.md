@@ -16,7 +16,7 @@ related_docs:
 - GRAPH_DATASOURCE_PHILOTE_PROPOSAL.md
 task_refs:
 - docs/task.md
-disposition: accepted for current slice
+disposition: accepted-current-slice
 ---
 
 # Graph Datasource Proposal

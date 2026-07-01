@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cross-agent-context-packet
+
+rectangle "cross-agent-context-packet" as cross_agent_context_packet #Orange {
+}
+
+
+@enduml

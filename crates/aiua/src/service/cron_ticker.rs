@@ -566,15 +566,17 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&task).unwrap();
 
         assert_eq!(
-            value["content"],
-            "Good evening — time for your check-in",
+            value["content"], "Good evening — time for your check-in",
             "message must be promoted to top-level content"
         );
         assert_eq!(value["source"], "telegram");
         assert_eq!(value["chat_id"], 7898847424i64);
         assert_eq!(value["session_id"], "telegram:7898847424:agent-beacon");
         assert_eq!(value["cron_job_id"], "job-1");
-        assert!(value.get("action").is_none(), "action must be absent for non-paracrine tasks");
+        assert!(
+            value.get("action").is_none(),
+            "action must be absent for non-paracrine tasks"
+        );
     }
 
     #[test]

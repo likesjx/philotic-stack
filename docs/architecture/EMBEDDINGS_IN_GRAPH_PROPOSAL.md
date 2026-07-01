@@ -1,7 +1,7 @@
 ---
 domain: memory-context
 status: in-progress
-disposition: accepted for current slice
+disposition: accepted-current-slice
 last_updated: 2026-03-31
 active_seams:
 - onnx-runner-embed-surface

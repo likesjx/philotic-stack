@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cross-hotel-tool-results
+
+rectangle "cross-hotel-tool-results" as cross_hotel_tool_results #Orange {
+}
+
+
+@enduml

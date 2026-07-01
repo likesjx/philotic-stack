@@ -3,6 +3,7 @@ title: Discord Membrane Proposal
 doc_type: proposal
 domain: membrane-transport
 status: proposed
+disposition: accepted-current-slice
 last_updated: 2026-03-31
 tags:
 - discord

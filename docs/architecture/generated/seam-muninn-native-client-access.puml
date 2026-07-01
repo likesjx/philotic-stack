@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - muninn-native-client-access
+
+rectangle "muninn-native-client-access" as muninn_native_client_access #Orange {
+}
+
+
+@enduml

@@ -3,6 +3,7 @@ title: Graph Layer Unification
 doc_type: proposal
 domain: runtime-sessions
 status: proposed
+disposition: implemented
 last_updated: 2026-03-31
 tags:
 - graph

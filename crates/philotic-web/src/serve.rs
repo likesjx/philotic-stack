@@ -44,6 +44,7 @@
 //!   GET  /api/config
 //!   GET  /api/config/telegram
 //!   GET  /api/config/gemini
+//!   GET  /api/model-catalog
 //!   GET  /api/components
 //!   GET  /api/component-templates
 //!   POST /api/components
@@ -69,6 +70,7 @@
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+use ansible_mesh_core::model_manager::{project_model_catalog, ModelCatalogProjection};
 use ansible_mesh_core::provider_keys::{provider_key_spec, provider_key_specs, ProviderKeySpec};
 use ansible_mesh_core::sqlite_storage::{SqliteEventStorage, SqliteGraphStorage};
 use ansible_mesh_core::storage::{
@@ -624,6 +626,7 @@ pub async fn run(
         .route("/api/config/telegram", get(handle_config_telegram))
         .route("/api/config/gemini", get(handle_config_gemini))
         .route("/api/config/oidc", get(handle_config_oidc))
+        .route("/api/model-catalog", get(handle_model_catalog))
         .route("/api/provider-configs", get(handle_provider_configs))
         .route(
             "/api/provider-configs/:provider",
@@ -3696,7 +3699,7 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
 // ── PUT /api/config/:key ──────────────────────────────────────────────────────
 //
 // Allowed keys for operator mutation (prevents arbitrary config overwrites).
-const MUTABLE_CONFIG_KEYS: &[&str] = &[
+const BASE_MUTABLE_CONFIG_KEYS: &[&str] = &[
     "telegram_bot_token",
     "execution_host",
     "vault_registry",
@@ -3705,22 +3708,6 @@ const MUTABLE_CONFIG_KEYS: &[&str] = &[
     "oidc_google_client_secret_ref",
     "oidc_github_client_id",
     "oidc_github_client_secret_ref",
-    "gemini_api_key_ref",
-    "gemini_base_url",
-    "gemini_default_model",
-    "openai_api_key_ref",
-    "openai_base_url",
-    "openai_default_model",
-    "openai_default_embedding_model",
-    "openrouter_api_key_ref",
-    "openrouter_base_url",
-    "openrouter_default_model",
-    "openrouter_default_embedding_model",
-    "openrouter_fallback_models",
-    "openrouter_route",
-    "elevenlabs_api_key_ref",
-    "elevenlabs_default_model",
-    "elevenlabs_base_url",
 ];
 
 #[derive(serde::Deserialize)]
@@ -3799,7 +3786,7 @@ async fn handle_config_put(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    if !MUTABLE_CONFIG_KEYS.contains(&key.as_str()) {
+    if !is_mutable_config_key(&key) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("config key '{}' is not operator-mutable", key)})),
@@ -3830,6 +3817,26 @@ async fn handle_config_put(
     }
 }
 
+fn is_mutable_config_key(key: &str) -> bool {
+    BASE_MUTABLE_CONFIG_KEYS.contains(&key) || provider_key_matches_mutable_config(key)
+}
+
+fn provider_key_matches_mutable_config(key: &str) -> bool {
+    provider_key_specs().iter().any(|spec| {
+        [
+            Some(spec.api_key_ref_key),
+            spec.default_model_key,
+            spec.base_url_key,
+            spec.embedding_model_key,
+            spec.fallback_models_key,
+            spec.route_key,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|provider_key| provider_key == key)
+    })
+}
+
 async fn handle_provider_configs(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if !check_auth(&headers, &state) {
         return unauthorized();
@@ -3848,6 +3855,31 @@ async fn handle_provider_configs(headers: HeaderMap, State(state): State<AppStat
         }
     }
     Json(json!({ "providers": providers })).into_response()
+}
+
+async fn handle_model_catalog(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match model_catalog_view(&state.db_path) {
+        Ok(catalog) => Json(json!({
+            "catalog": catalog,
+            "routing_effect": "none-read-only-projection",
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+fn model_catalog_view(db_path: &PathBuf) -> Result<Vec<ModelCatalogProjection>> {
+    let storage = SqliteGraphStorage::open(db_path)?;
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    let profiles = graph.list_model_profiles()?;
+    Ok(project_model_catalog(&profiles))
 }
 
 async fn handle_provider_config_get(

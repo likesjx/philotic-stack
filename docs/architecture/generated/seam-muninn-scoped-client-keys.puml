@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - muninn-scoped-client-keys
+
+rectangle "muninn-scoped-client-keys" as muninn_scoped_client_keys #Orange {
+}
+
+
+@enduml

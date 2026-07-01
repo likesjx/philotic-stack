@@ -3,6 +3,7 @@ title: Distributed Cron Scheduler Proposal
 doc_type: proposal
 domain: runtime-and-sessions
 status: accepted-current-slice
+disposition: implemented
 last_updated: 2026-03-31
 tags:
 - cron
