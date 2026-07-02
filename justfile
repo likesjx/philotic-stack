@@ -598,6 +598,40 @@ vps-push:
 vps-config:
     cd ansible && ansible-playbook -i inventory/hosts.ini deploy_hotel.yml --limit jane-vps --skip-tags binary
 
+# CI deploy to vps-jane: fetch the latest develop build-linux artifact and ship
+# it. No compilation anywhere — this replaces `vps-push` and avoids the VPS
+# OOM-killing release links (it has no swap and ~2 GB free). Requires the gh CLI
+# authed and a successful build-linux run on develop (.github/workflows/build-linux.yml).
+vps-deploy-ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT_DIR="{{justfile_directory()}}"
+    VPS="${PHILOTIC_VPS_SSH_TARGET:-deploy@jane-vps}"
+    REMOTE_DIR="/home/deploy/ci-artifacts"
+    STAGE="${ROOT_DIR}/dist-ci"
+
+    echo "▶ Finding latest successful build-linux run on develop..."
+    RUN_ID=$(gh run list --workflow=build-linux.yml --branch develop --status success --limit 1 --json databaseId -q '.[0].databaseId')
+    if [ -z "${RUN_ID}" ]; then echo "✗ no successful build-linux run on develop — push to develop or run the workflow first"; exit 1; fi
+    echo "  run ${RUN_ID}"
+
+    echo "▶ Downloading linux-x86_64 artifact..."
+    rm -rf "${STAGE}" && mkdir -p "${STAGE}"
+    gh run download "${RUN_ID}" --name linux-x86_64 --dir "${STAGE}"
+    chmod +x "${STAGE}"/* 2>/dev/null || true   # upload-artifact drops the +x bit
+    echo "  $(ls -1 "${STAGE}" | grep -vc SHA256SUMS) binaries staged"
+
+    echo "▶ Syncing binaries to ${VPS}:${REMOTE_DIR}..."
+    ssh -n "${VPS}" "mkdir -p '${REMOTE_DIR}'"
+    rsync -az --delete "${STAGE}/" "${VPS}:${REMOTE_DIR}/"
+
+    echo "▶ Deploying via ansible (remote artifacts; stats-and-skips any missing)..."
+    cd "${ROOT_DIR}/ansible" && ansible-playbook \
+      -i inventory/hosts.ini \
+      deploy_hotel.yml \
+      --limit jane-vps \
+      --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${REMOTE_DIR}"
+
 # Check that vps-jane host_vars peer ports match the live context graph.
 vps-port-drift-check:
     ./scripts/check-hotel-port-drift.py --host-vars ansible/host_vars/jane-vps.yml --ssh-target vps-jane
