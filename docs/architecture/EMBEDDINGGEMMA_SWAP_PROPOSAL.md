@@ -1,7 +1,7 @@
 ---
 domain: memory-context
 status: proposed
-disposition: accepted for current slice
+disposition: deferred
 last_updated: 2026-03-31
 active_seams:
 - embeddinggemma-swap-validation

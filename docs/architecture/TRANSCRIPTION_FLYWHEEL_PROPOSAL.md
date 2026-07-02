@@ -3,6 +3,7 @@ title: Transcription Flywheel — Router-Listener, Training Capture, and Whisper
 doc_type: proposal
 domain: voice-ai
 status: proposed
+disposition: accepted-current-slice
 last_updated: 2026-04-22
 tags:
 - whisper

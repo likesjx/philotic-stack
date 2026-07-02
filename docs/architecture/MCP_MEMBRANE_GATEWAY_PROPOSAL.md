@@ -3,6 +3,7 @@ title: MCP Membrane Gateway — Philote-Configured, Transform-Driven
 doc_type: proposal
 domain: membrane-transport
 status: proposed
+disposition: implemented
 last_updated: 2026-06-22
 tags:
   - mcp

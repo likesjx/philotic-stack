@@ -3,6 +3,7 @@ title: Memory Engine Abstraction Proposal
 doc_type: proposal
 domain: memory-context
 status: proposed
+disposition: obsolete
 last_updated: 2026-03-31
 tags:
 - memory

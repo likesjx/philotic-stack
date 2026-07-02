@@ -3,6 +3,7 @@ title: 'Philotic Web: The Mesh, Management Plane, and Distribution'
 doc_type: proposal
 domain: product-management-plane
 status: proposed
+disposition: accepted-current-slice
 last_updated: 2026-03-31
 tags:
 - philotic-web

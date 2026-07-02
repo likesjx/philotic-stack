@@ -3,6 +3,7 @@ title: Role Context Shift And Subagent Whitepaper
 doc_type: proposal
 domain: runtime-sessions
 status: proposed
+disposition: obsolete
 last_updated: 2026-03-31
 tags:
 - roles

@@ -3,6 +3,7 @@ title: Memory Cultivation and True-Up Proposal
 doc_type: proposal
 domain: memory-context
 status: implemented
+disposition: accepted-current-slice
 last_updated: 2026-05-20
 tags:
 - muninn

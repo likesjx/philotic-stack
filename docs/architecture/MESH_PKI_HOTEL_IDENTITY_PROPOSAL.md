@@ -2,7 +2,7 @@
 title: Philotic Mesh PKI and Hotel Identity Proposal
 doc_type: proposal
 domain: mesh-placement
-status: accepted for current slice
+status: accepted-current-slice
 last_updated: 2026-04-12
 tags:
 - pki

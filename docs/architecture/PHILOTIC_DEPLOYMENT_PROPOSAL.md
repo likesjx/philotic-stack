@@ -3,6 +3,7 @@ title: Philotic Deployment and Environment Model
 doc_type: proposal
 domain: deployment-distribution
 status: proposed
+disposition: accepted-current-slice
 last_updated: 2026-04-11
 tags:
 - deployment
