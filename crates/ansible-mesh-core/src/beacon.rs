@@ -404,8 +404,23 @@ impl BeaconDaemon {
                             payload.guests,
                             payload.agents,
                         );
+                        let mut replicated_profiles = 0usize;
+                        for profile in payload
+                            .model_profiles
+                            .into_iter()
+                            .filter(|profile| profile.node_id == payload.node_id)
+                        {
+                            if let Err(err) = self.graph.upsert_model_profile(&profile) {
+                                warn!(
+                                    "Hotel state sync from {}: failed to upsert model profile {}@{}: {}",
+                                    payload.node_id, profile.model_ref, profile.node_id, err
+                                );
+                            } else {
+                                replicated_profiles += 1;
+                            }
+                        }
                         info!(
-                            "Hotel state sync from {} ({}): {} guests, {} agents",
+                            "Hotel state sync from {} ({}): {} guests, {} agents, {} model profiles",
                             payload.hotel_name,
                             payload.node_id,
                             registry
@@ -418,6 +433,7 @@ impl BeaconDaemon {
                                 .find(|s| s.node_id == payload.node_id)
                                 .map(|s| s.agents.len())
                                 .unwrap_or(0),
+                            replicated_profiles,
                         );
                     }
                 }

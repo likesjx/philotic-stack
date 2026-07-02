@@ -8067,11 +8067,18 @@ async fn main() -> Result<()> {
                                 persona_name: a.persona_name,
                             })
                             .collect();
+                        let model_profiles = sync_graph
+                            .list_model_profiles()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|profile| profile.node_id == sync_caps.node_id)
+                            .collect();
                         let payload = HotelStateSyncPayload {
                             node_id: sync_caps.node_id.clone(),
                             hotel_name: sync_hotel.hotel_name.clone(),
                             guests,
                             agents,
+                            model_profiles,
                         };
                         *sync_state.write().await = Some(payload.clone());
                     }

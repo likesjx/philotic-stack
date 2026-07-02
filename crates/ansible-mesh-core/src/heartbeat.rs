@@ -1,4 +1,5 @@
 use crate::authz::MeshAuth;
+use crate::graph::ModelProfileRecord;
 use crate::registry::{CapabilityAdvertisement, ExecutionReachability};
 use crate::{BeaconMessage, MsgType, NodeCapabilities, NodeHealthSnapshot};
 use anyhow::Result;
@@ -64,17 +65,19 @@ pub struct HotelStateSyncAgent {
 }
 
 /// Payload for `MsgType::HotelStateSync`.
-/// Broadcast whenever a hotel's guest or agent roster changes so every peer
-/// on the mesh can route to any agent without querying the authority hotel.
+/// Broadcast whenever a hotel's routable state changes so every peer on the mesh
+/// can route to any agent/model without querying the authority hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotelStateSyncPayload {
     pub node_id: String,
     pub hotel_name: String,
     pub guests: Vec<HotelStateSyncGuest>,
     pub agents: Vec<HotelStateSyncAgent>,
+    #[serde(default)]
+    pub model_profiles: Vec<ModelProfileRecord>,
 }
 
-/// Emits a `HotelStateSync` to a target carrying the sender's current guest and agent roster.
+/// Emits a `HotelStateSync` to a target carrying the sender's current routable state.
 pub async fn emit_hotel_state_sync(
     socket: &UdpSocket,
     target: SocketAddr,
@@ -322,6 +325,45 @@ mod tests {
                 .map(|value| value.host.as_str()),
             Some("aria-vps")
         );
+    }
+
+    #[test]
+    fn hotel_state_sync_round_trips_model_profiles_and_defaults_old_payloads() {
+        let payload = HotelStateSyncPayload {
+            node_id: "aria-node".into(),
+            hotel_name: "aria".into(),
+            guests: Vec::new(),
+            agents: Vec::new(),
+            model_profiles: vec![ModelProfileRecord {
+                model_ref: "openrouter".into(),
+                node_id: "aria-node".into(),
+                provider: "openrouter".into(),
+                task_kinds: vec!["text.generate".into()],
+                trust_tier: "remote_cloud".into(),
+                max_context_tokens: 0,
+                latency_p50_ms: 123,
+                error_rate: 0.0,
+                status: "healthy".into(),
+                last_healthy_secs: 1,
+                updated_secs: 2,
+            }],
+        };
+
+        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
+        let decoded: HotelStateSyncPayload =
+            serde_json::from_slice(&encoded).expect("payload should decode");
+        assert_eq!(decoded.model_profiles.len(), 1);
+        assert_eq!(decoded.model_profiles[0].provider, "openrouter");
+
+        let legacy = serde_json::json!({
+            "node_id": "legacy-node",
+            "hotel_name": "legacy",
+            "guests": [],
+            "agents": []
+        });
+        let decoded_legacy: HotelStateSyncPayload =
+            serde_json::from_value(legacy).expect("legacy payload should decode");
+        assert!(decoded_legacy.model_profiles.is_empty());
     }
 
     #[test]
