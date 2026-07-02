@@ -1969,6 +1969,31 @@ pub struct AgentRuntime {
     /// paracrine whispers so the specialist's response routes back to this role instance
     /// rather than to the membrane seat that initiated the user turn.
     role_name: Option<String>,
+    /// Per-session recent role-switch timestamps (epoch millis). Used to throttle a
+    /// burst of `/role`/`/back` commands (e.g. a membrane redelivery storm) so a
+    /// rapid switch storm cannot drive an endless role-handoff ping-pong.
+    role_switch_history: HashMap<String, std::collections::VecDeque<i64>>,
+}
+
+/// Sliding window for the role-switch rate limiter (see `handle_role_command`).
+const ROLE_SWITCH_WINDOW_MS: i64 = 10_000;
+/// Max role switches permitted within `ROLE_SWITCH_WINDOW_MS` before throttling.
+const ROLE_SWITCH_MAX: usize = 6;
+
+/// Returns true if `history` already holds `>= max_in_window` timestamps inside
+/// `[now_ms - window_ms, now_ms]` — i.e. role switches are arriving too fast and
+/// the next one should be throttled to prevent a handoff ping-pong loop.
+fn should_throttle_role_switch(
+    history: &std::collections::VecDeque<i64>,
+    now_ms: i64,
+    window_ms: i64,
+    max_in_window: usize,
+) -> bool {
+    let in_window = history
+        .iter()
+        .filter(|&&ts| now_ms - ts <= window_ms && ts <= now_ms)
+        .count();
+    in_window >= max_in_window
 }
 
 impl AgentRuntime {
@@ -1985,6 +2010,7 @@ impl AgentRuntime {
             stuck_turn_first_seen: HashMap::new(),
             stuck_turn_signature: HashMap::new(),
             total_active_since: HashMap::new(),
+            role_switch_history: HashMap::new(),
             network_offline: false,
             role_name: None,
         }
@@ -9135,6 +9161,49 @@ impl AgentRuntime {
         const HANDOFF_MAX_RETRIES: u32 = 12;
         const HANDOFF_DEFAULT_WAIT_MS: u64 = 250;
 
+        // Rate-limit actual role SWITCHES (`/role`, `/back`) — not `/roles` listing —
+        // so a burst of redelivered switch commands cannot drive an endless
+        // orchestrator↔specialist handoff ping-pong. `/roles` is read-only and exempt.
+        let is_role_switch =
+            matches!(command, SlashCommand::Role { .. } | SlashCommand::Back);
+        let role_switch_throttled = if is_role_switch {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let history = self.role_switch_history.entry(session_id.clone()).or_default();
+            while let Some(&front) = history.front() {
+                if now_ms - front > ROLE_SWITCH_WINDOW_MS {
+                    history.pop_front();
+                } else {
+                    break;
+                }
+            }
+            history.push_back(now_ms);
+            should_throttle_role_switch(history, now_ms, ROLE_SWITCH_WINDOW_MS, ROLE_SWITCH_MAX)
+        } else {
+            false
+        };
+
+        let (reply_content, update_state, payload, next_active_incarnation) = if role_switch_throttled
+        {
+            warn!(
+                "Throttling rapid role switch for session [{}] ({} switches in {}ms) to avoid a handoff loop",
+                session_id, ROLE_SWITCH_MAX, ROLE_SWITCH_WINDOW_MS
+            );
+            (
+                "⚠️ Ignoring rapid role switch to avoid a handoff loop (too many switches in a short window)."
+                    .to_string(),
+                "role_switch_throttled",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "role_command": "role_switch_throttled",
+                }),
+                None,
+            )
+        } else {
         let response = match &command {
             SlashCommand::Role { role_name } => {
                 let handoff_bundle = self
@@ -9220,7 +9289,7 @@ impl AgentRuntime {
             _ => unreachable!("handle_role_command only accepts role handoff commands"),
         };
 
-        let (reply_content, update_state, payload, next_active_incarnation) = match response {
+        match response {
             IpcResponse::HandoffAck {
                 handoff_guest_id,
                 became_active,
@@ -9367,6 +9436,7 @@ impl AgentRuntime {
                 }),
                 None,
             ),
+        }
         };
 
         if let Some(active_incarnation_id) = next_active_incarnation {
@@ -16538,7 +16608,7 @@ mod tests {
         loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments,
         merge_toolset_profile_into_session_bindings, normalized_user_content,
         parse_memory_candidate, resolve_media_routing, resolve_model_execution_target,
-        should_attempt_provider_repair,
+        should_attempt_provider_repair, should_throttle_role_switch,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
@@ -16551,6 +16621,37 @@ mod tests {
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
+
+    #[test]
+    fn role_switch_throttle_trips_after_max_in_window() {
+        use std::collections::VecDeque;
+        const WINDOW: i64 = 10_000;
+        const MAX: usize = 6;
+        let mut hist: VecDeque<i64> = VecDeque::new();
+        // 5 switches spaced 500ms apart: under the limit, never throttled.
+        for i in 0..5 {
+            let now = 1_000 + i * 500;
+            hist.push_back(now);
+            assert!(
+                !should_throttle_role_switch(&hist, now, WINDOW, MAX),
+                "should not throttle at {} entries",
+                hist.len()
+            );
+        }
+        // 6th switch inside the window trips the throttle.
+        let now = 1_000 + 5 * 500;
+        hist.push_back(now);
+        assert!(should_throttle_role_switch(&hist, now, WINDOW, MAX));
+
+        // Timestamps older than the window do not count toward the limit.
+        let mut old: VecDeque<i64> = (0..6).map(|i| i * 100).collect();
+        let much_later = 1_000_000;
+        old.push_back(much_later);
+        assert!(
+            !should_throttle_role_switch(&old, much_later, WINDOW, MAX),
+            "stale timestamps outside the window must not throttle"
+        );
+    }
 
     fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
         WorkingTurn {

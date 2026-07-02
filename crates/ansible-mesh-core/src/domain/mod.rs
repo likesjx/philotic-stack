@@ -761,6 +761,35 @@ impl GraphDomain {
         Ok(out)
     }
 
+    /// List every role incarnation record across all agents. Used by the
+    /// role-handoff-loop self-heal detector to find agents with more than one
+    /// `ActiveInSession` incarnation.
+    pub fn list_all_role_incarnations(&self) -> Result<Vec<RoleIncarnationRecord>> {
+        let mut out = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)?
+        {
+            out.push(serde_json::from_value(node.data).context(
+                "GraphDomain::list_all_role_incarnations: deserialize RoleIncarnationRecord",
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// List every session record. Used by the role-handoff-loop self-heal
+    /// detector to clear pins that point at a demoted incarnation.
+    pub fn list_all_sessions(&self) -> Result<Vec<SessionRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION)? {
+            out.push(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::list_all_sessions: deserialize SessionRecord")?,
+            );
+        }
+        Ok(out)
+    }
+
     pub fn set_role_incarnation_readiness(
         &self,
         agent_id: &str,
@@ -772,6 +801,36 @@ impl GraphDomain {
             self.upsert_role_incarnation(&rec)?;
         }
         Ok(())
+    }
+
+    /// Promote a single role incarnation to `ActiveInSession`, enforcing the
+    /// single-active invariant: at most ONE incarnation per agent may be
+    /// `ActiveInSession` at a time. Any sibling incarnation of the same agent
+    /// currently `ActiveInSession` is demoted to `Routable`.
+    ///
+    /// Without this invariant, distinct role handoffs (e.g. orchestrator then
+    /// Chronos) each set their own target active without clearing the previous
+    /// one, leaving two incarnations active simultaneously — the corrupt state
+    /// that seeds the role-handoff ping-pong loop.
+    pub fn promote_role_incarnation_active(
+        &self,
+        agent_id: &str,
+        role_name: &str,
+    ) -> Result<()> {
+        // Demote any OTHER incarnation of this agent that is currently active.
+        for sibling in self.list_role_incarnations(agent_id)? {
+            if sibling.role_name != role_name
+                && matches!(sibling.readiness_state, RoleReadinessState::ActiveInSession)
+            {
+                self.set_role_incarnation_readiness(
+                    agent_id,
+                    &sibling.role_name,
+                    RoleReadinessState::Routable,
+                )?;
+            }
+        }
+        // Promote the target.
+        self.set_role_incarnation_readiness(agent_id, role_name, RoleReadinessState::ActiveInSession)
     }
 
     /// Find the first role incarnation record with the given role_name, across all agents.
@@ -1908,6 +1967,68 @@ mod tests {
 
         let by_guest = d.list_role_incarnations_by_guest_id("guest-1").unwrap();
         assert_eq!(by_guest.len(), 1);
+    }
+
+    #[test]
+    fn promote_role_incarnation_active_enforces_single_active() {
+        use crate::graph::TurnLoopConfig;
+        let d = make_domain();
+        let mk = |role: &str| RoleIncarnationRecord {
+            agent_id: "agent-beacon".to_string(),
+            role_name: role.to_string(),
+            guest_id: format!("agent-beacon:{role}"),
+            toolset_profile: "default".to_string(),
+            role_identity_addendum: None,
+            role_manifest: None,
+            is_admin: false,
+            readiness_state: RoleReadinessState::Configured,
+            inactive_ttl_seconds: None,
+            turn_loop_config: TurnLoopConfig::default(),
+            home_node: None,
+        };
+        d.upsert_role_incarnation(&mk("orchestrator")).unwrap();
+        d.upsert_role_incarnation(&mk("Chronos")).unwrap();
+
+        // Promote orchestrator → it is active, Chronos untouched.
+        d.promote_role_incarnation_active("agent-beacon", "orchestrator")
+            .unwrap();
+        assert!(matches!(
+            d.get_role_incarnation("agent-beacon", "orchestrator")
+                .unwrap()
+                .unwrap()
+                .readiness_state,
+            RoleReadinessState::ActiveInSession
+        ));
+
+        // Promote Chronos → orchestrator MUST be demoted (single-active invariant).
+        d.promote_role_incarnation_active("agent-beacon", "Chronos")
+            .unwrap();
+        assert!(matches!(
+            d.get_role_incarnation("agent-beacon", "Chronos")
+                .unwrap()
+                .unwrap()
+                .readiness_state,
+            RoleReadinessState::ActiveInSession
+        ));
+        assert!(
+            matches!(
+                d.get_role_incarnation("agent-beacon", "orchestrator")
+                    .unwrap()
+                    .unwrap()
+                    .readiness_state,
+                RoleReadinessState::Routable
+            ),
+            "previous active incarnation must be demoted, never two active at once"
+        );
+
+        // Exactly one incarnation is ActiveInSession.
+        let active = d
+            .list_role_incarnations("agent-beacon")
+            .unwrap()
+            .into_iter()
+            .filter(|r| matches!(r.readiness_state, RoleReadinessState::ActiveInSession))
+            .count();
+        assert_eq!(active, 1);
     }
 
     #[test]
