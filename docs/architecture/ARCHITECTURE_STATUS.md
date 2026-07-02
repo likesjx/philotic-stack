@@ -199,7 +199,7 @@ These are accepted proposals not yet in implementation:
 | --- | --- | --- |
 | Agent-centric resource model | Agents declare and request resources; hotel acts as broker; demand-derived materialization replaces static guest config; agent graph is a mesh-synced tool-runner resource; router-listener generates RL training traces | [AGENT_RESOURCE_MODEL_PROPOSAL.md](AGENT_RESOURCE_MODEL_PROPOSAL.md) — proposed |
 | Graph layer unification | Introduce `GraphDomain` as the unified middle layer; all domain operations expressed in terms of `GraphAdapter` primitives; one update point for entity types across all graph stores | [GRAPH_LAYER_UNIFICATION_PROPOSAL.md](GRAPH_LAYER_UNIFICATION_PROPOSAL.md) — proposed |
-| Model graph catalog | Re-slice stale model catalog work onto current `develop`; keep static model metadata separate from live node routing and provider execution authority | [MODEL_GRAPH_CATALOG_PROPOSAL.md](MODEL_GRAPH_CATALOG_PROPOSAL.md) — accepted-current-slice |
+| Model graph catalog | Implemented catalog/trust foundation: static provider-neutral model metadata, live profile projection, hotel-state model-profile sharing, and seeded trust guidance. External ingestion moves to the follow-on `model-graph-controller` seam. | [MODEL_GRAPH_CATALOG_PROPOSAL.md](MODEL_GRAPH_CATALOG_PROPOSAL.md) — implemented |
 | Architectural rules and roadmap | Extract standing constraints from proposals into ARCH_RULES.md; maintain dependency-ordered seam roadmap in ROADMAP.md; check rules at slice close-out | [ARCH_RULES_AND_ROADMAP_PROPOSAL.md](ARCH_RULES_AND_ROADMAP_PROPOSAL.md) — proposed |
 
 ## Active Work Right Now

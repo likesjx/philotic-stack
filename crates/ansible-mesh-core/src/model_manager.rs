@@ -44,11 +44,17 @@ pub struct ModelCatalogRecord {
     pub endpoint_family: String,
     pub model_family: String,
     #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
     pub model_refs: Vec<String>,
     #[serde(default)]
     pub modalities: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<ModelCatalogCapability>,
+    #[serde(default)]
+    pub external_sources: Vec<ModelExternalSourceRecord>,
+    #[serde(default)]
+    pub provider_availability: Vec<ModelProviderAvailabilityRecord>,
     pub lifecycle: String,
     pub source: String,
 }
@@ -60,11 +66,57 @@ pub struct ModelCatalogCapability {
     pub source: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelExternalSourceRecord {
+    pub source_id: String,
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at_secs: Option<u64>,
+    pub trust_weight: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelProviderAvailabilityRecord {
+    pub provider: String,
+    pub endpoint_family: String,
+    pub model_ref: String,
+    pub provider_model_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cost_per_million: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cost_per_million: Option<f64>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelTrustPolicy {
+    pub data_sensitivity: String,
+    pub require_local_provider: bool,
+    pub allow_proxy_provider: bool,
+    pub allow_external_provider: bool,
+    pub allow_experimental: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelTrustDecision {
+    pub data_sensitivity: String,
+    pub allowed: bool,
+    pub reason: String,
+    pub source: String,
+    pub confidence: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCatalogProjection {
     pub catalog: ModelCatalogRecord,
     #[serde(default)]
     pub live_profiles: Vec<ModelProfileRecord>,
+    #[serde(default)]
+    pub trust_guidance: Vec<ModelTrustDecision>,
 }
 
 pub fn seeded_model_catalog() -> Vec<ModelCatalogRecord> {
@@ -156,6 +208,7 @@ pub fn project_model_catalog(live_profiles: &[ModelProfileRecord]) -> Vec<ModelC
                 .cloned()
                 .collect();
             ModelCatalogProjection {
+                trust_guidance: default_trust_guidance(&catalog),
                 catalog,
                 live_profiles,
             }
@@ -177,12 +230,33 @@ fn catalog_record(
         .find(|spec| spec.provider == provider)
         .map(|spec| spec.display_name)
         .unwrap_or(provider);
+    let external_sources = vec![ModelExternalSourceRecord {
+        source_id: "philotic.seed".to_string(),
+        source_kind: "operator_seed".to_string(),
+        source_url: None,
+        fetched_at_secs: None,
+        trust_weight: 0.7,
+    }];
+    let provider_availability = model_refs
+        .iter()
+        .map(|model_ref| ModelProviderAvailabilityRecord {
+            provider: provider.to_string(),
+            endpoint_family: endpoint_family.to_string(),
+            model_ref: model_ref.to_string(),
+            provider_model_ref: model_ref.to_string(),
+            context_window_tokens: None,
+            input_cost_per_million: None,
+            output_cost_per_million: None,
+            source: "philotic.seed".to_string(),
+        })
+        .collect();
     ModelCatalogRecord {
         catalog_ref: format!("{provider}:{model_family}"),
         provider: provider.to_string(),
         provider_display_name: provider_display_name.to_string(),
         endpoint_family: endpoint_family.to_string(),
         model_family: model_family.to_string(),
+        aliases: model_refs.iter().map(|value| value.to_string()).collect(),
         model_refs: model_refs.iter().map(|value| value.to_string()).collect(),
         modalities: modalities.iter().map(|value| value.to_string()).collect(),
         capabilities: capabilities
@@ -193,9 +267,90 @@ fn catalog_record(
                 source: "seed".to_string(),
             })
             .collect(),
+        external_sources,
+        provider_availability,
         lifecycle: lifecycle.to_string(),
         source: "seed".to_string(),
     }
+}
+
+pub fn trust_policy_for_sensitivity(data_sensitivity: &str) -> ModelTrustPolicy {
+    match data_sensitivity {
+        "secret" | "lifegraph" => ModelTrustPolicy {
+            data_sensitivity: data_sensitivity.to_string(),
+            require_local_provider: true,
+            allow_proxy_provider: false,
+            allow_external_provider: false,
+            allow_experimental: false,
+        },
+        "personal" => ModelTrustPolicy {
+            data_sensitivity: data_sensitivity.to_string(),
+            require_local_provider: false,
+            allow_proxy_provider: false,
+            allow_external_provider: true,
+            allow_experimental: false,
+        },
+        "internal" => ModelTrustPolicy {
+            data_sensitivity: data_sensitivity.to_string(),
+            require_local_provider: false,
+            allow_proxy_provider: false,
+            allow_external_provider: true,
+            allow_experimental: true,
+        },
+        _ => ModelTrustPolicy {
+            data_sensitivity: "public".to_string(),
+            require_local_provider: false,
+            allow_proxy_provider: true,
+            allow_external_provider: true,
+            allow_experimental: true,
+        },
+    }
+}
+
+pub fn evaluate_model_trust(
+    catalog: &ModelCatalogRecord,
+    policy: &ModelTrustPolicy,
+) -> ModelTrustDecision {
+    let local_provider = is_local_endpoint(catalog);
+    let proxy_provider = is_proxy_endpoint(catalog);
+    let experimental = catalog.lifecycle == "experimental";
+    let (allowed, reason) = if policy.require_local_provider && !local_provider {
+        (false, "data_requires_local_provider")
+    } else if proxy_provider && !policy.allow_proxy_provider {
+        (false, "proxy_provider_disallowed")
+    } else if !local_provider && !policy.allow_external_provider {
+        (false, "external_provider_disallowed")
+    } else if experimental && !policy.allow_experimental {
+        (false, "experimental_lifecycle_disallowed")
+    } else {
+        (true, "allowed")
+    };
+
+    ModelTrustDecision {
+        data_sensitivity: policy.data_sensitivity.clone(),
+        allowed,
+        reason: reason.to_string(),
+        source: "philotic.trust_policy.seed".to_string(),
+        confidence: 1.0,
+    }
+}
+
+fn default_trust_guidance(catalog: &ModelCatalogRecord) -> Vec<ModelTrustDecision> {
+    ["public", "personal", "lifegraph", "secret"]
+        .iter()
+        .map(|sensitivity| {
+            evaluate_model_trust(catalog, &trust_policy_for_sensitivity(sensitivity))
+        })
+        .collect()
+}
+
+fn is_local_endpoint(catalog: &ModelCatalogRecord) -> bool {
+    catalog.endpoint_family.contains("local")
+        || matches!(catalog.provider.as_str(), "mlx" | "ollama" | "onnx")
+}
+
+fn is_proxy_endpoint(catalog: &ModelCatalogRecord) -> bool {
+    catalog.provider == "openrouter" || catalog.endpoint_family.contains("openrouter")
 }
 
 /// A ToolInvoker that exposes `model.manager.*` capabilities.
@@ -248,6 +403,34 @@ mod tests {
             .expect("openrouter projection");
         assert_eq!(openrouter.live_profiles.len(), 1);
         assert_eq!(openrouter.live_profiles[0].latency_p50_ms, 1234);
+    }
+
+    #[test]
+    fn trust_guidance_blocks_lifegraph_for_proxy_providers() {
+        let openrouter = seeded_model_catalog()
+            .into_iter()
+            .find(|record| record.provider == "openrouter")
+            .expect("openrouter catalog record");
+        let decision =
+            evaluate_model_trust(&openrouter, &trust_policy_for_sensitivity("lifegraph"));
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, "data_requires_local_provider");
+    }
+
+    #[test]
+    fn trust_guidance_allows_public_proxy_and_lifegraph_local() {
+        let catalog = seeded_model_catalog();
+        let openrouter = catalog
+            .iter()
+            .find(|record| record.provider == "openrouter")
+            .expect("openrouter catalog record");
+        assert!(evaluate_model_trust(openrouter, &trust_policy_for_sensitivity("public"),).allowed);
+
+        let ollama = catalog
+            .iter()
+            .find(|record| record.provider == "ollama")
+            .expect("ollama catalog record");
+        assert!(evaluate_model_trust(ollama, &trust_policy_for_sensitivity("lifegraph")).allowed);
     }
 }
 

@@ -75,6 +75,29 @@ Seam IDs: `model-catalog-schema`, `model-catalog-seed`, `model-catalog-projectio
   - show static catalog facts
   - join live `ModelProfileRecord` status/latency/error-rate when present
   - do not alter provider selection or fallback behavior in this slice
+- [x] Share live model profile facts across hotels through hotel-state sync:
+  - advertise only the sender hotel's own `ModelProfileRecord` entries
+  - replicate remote profiles into each receiving hotel graph
+  - keep the static catalog code-owned and provider-neutral
+- [x] Add seeded trust guidance to the model catalog projection:
+  - public data may use proxy providers
+  - personal data blocks proxy providers by default
+  - LifeGraph and secret data require local providers by default
+  - trust decisions are explainable records, not hidden router behavior
+- [ ] Route through the shared model graph only via an explicit routing-policy slice:
+  - local healthy providers remain preferred for ordinary turns
+  - explicit provider hints stay authoritative
+  - cross-hotel model selection must verify peer reachability and return-route support
+  - model-router fallback should stay provider-local until hotel capability routing owns remote dispatch
+- [ ] Build the follow-on centralized `model-graph-controller`:
+  - ingest OpenRouter model/pricing/context metadata
+  - ingest Hugging Face model/task/license metadata
+  - ingest llm-stats-style benchmark/ranking feeds when a stable source is chosen
+  - normalize external facts into model catalog provenance and trust inputs
+- [ ] Move active development posture toward `mbp-jane`:
+  - treat `mbp-jane` as the preferred development seat for new implementation work
+  - keep Bjork/mac-jane available for local runtime verification and operator desktop work
+  - keep Beacon/vps-jane as the hosted durability and remote-service target
 - [ ] Delete `origin/codex/model-graph-catalog` after valid catalog work lands or is explicitly abandoned.
 
 ## New Project: Cypher-First Graph Datasource
