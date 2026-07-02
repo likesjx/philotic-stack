@@ -3,6 +3,7 @@ title: Scripted Turn Loop Variants Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: draft
+disposition: accepted-current-slice
 last_updated: 2026-03-31
 tags:
 - agent-loop

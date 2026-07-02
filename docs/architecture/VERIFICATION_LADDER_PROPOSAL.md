@@ -1,7 +1,7 @@
 ---
 domain: runtime-sessions
 doc_type: proposal
-disposition: proposed
+disposition: accepted-current-slice
 status: process-documentation
 last_updated: 2026-03-31
 ---

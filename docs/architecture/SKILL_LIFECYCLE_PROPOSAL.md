@@ -3,6 +3,7 @@ title: Skill Lifecycle and Delegation Contract Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: accepted
+disposition: accepted-current-slice
 last_updated: 2026-03-31
 tags:
 - skills

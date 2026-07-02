@@ -3,6 +3,7 @@ title: Routed Operator Chat Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: proposed
+disposition: accepted-current-slice
 last_updated: 2026-03-31
 tags:
 - operator-chat

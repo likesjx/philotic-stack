@@ -3,6 +3,7 @@ title: Dream Engine — Lifecycle Coordination in Aiua Guest Shutdown/Restart
 doc_type: proposal
 domain: cognitive-plane
 status: proposed
+disposition: accepted-current-slice
 last_updated: 2026-04-09
 proposal_id: dream-engine-coordination
 tags:

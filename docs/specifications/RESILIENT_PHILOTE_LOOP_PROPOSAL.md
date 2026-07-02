@@ -1,3 +1,10 @@
+---
+domain: runtime-sessions
+status: accepted-current-slice
+disposition: accepted-current-slice
+last_updated: 2026-06-30
+---
+
 # Resilient Philote Cognitive Loop Proposal
 
 **Status**: Proposed

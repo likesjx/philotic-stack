@@ -3,6 +3,7 @@ title: Whisper Protocol — Silent Reactive Role Dispatch via Lookaside Turn
 doc_type: proposal
 domain: cognitive-plane
 status: proposed
+disposition: implemented
 last_updated: 2026-04-01
 tags:
 - role-handoff

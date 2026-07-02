@@ -2,7 +2,7 @@
 title: Mesh Sync And Transport Boundaries Proposal
 doc_type: proposal
 domain: membrane-transport
-status: accepted for current slice
+status: accepted-current-slice
 last_updated: 2026-05-10
 tags:
 - mesh
