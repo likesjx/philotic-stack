@@ -1072,12 +1072,37 @@ fn telegram_callback_envelope(
         sender_id,
         sender_username,
         message_kind: "callback",
-        content: format!("Telegram callback action: {callback_data}"),
+        content: approval_callback_content(&callback_data),
         attachments: Vec::new(),
         command: None,
         callback_data: Some(callback_data),
         raw_transport_event: update.clone(),
     })
+}
+
+/// Translate approval inline-button callbacks into the slash commands the philote's
+/// approval resolver recognizes.
+///
+/// The Approve/Deny/Trust buttons a parked turn renders emit bare `callback_data`
+/// (`"approve"` / `"deny"` / `"trust"`, occasionally turn-suffixed like `"approve:turn-1"`).
+/// Without this mapping the tap arrives as literal `"Telegram callback action: …"` text,
+/// which `parse_slash_command` does not recognize, so it is dispatched as an ordinary chat
+/// turn to the model and the parked approval turn is never resolved — it simply times out
+/// under the turn watchdog. `trust` maps to `/approve`; callers preserve the original
+/// `callback_data` so the runtime pre-approves the session before resolving the turn.
+/// Non-approval callbacks pass through unchanged.
+fn approval_callback_content(callback_data: &str) -> String {
+    if callback_data == "approve"
+        || callback_data.starts_with("approve:")
+        || callback_data == "trust"
+        || callback_data.starts_with("trust:")
+    {
+        "/approve".to_string()
+    } else if callback_data == "deny" || callback_data.starts_with("deny:") {
+        "/deny".to_string()
+    } else {
+        format!("Telegram callback action: {callback_data}")
+    }
 }
 
 fn telegram_session_id(chat_id: &str, thread_id: Option<&str>, agent_id: &str) -> String {
@@ -2419,8 +2444,8 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::{
         TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand, TelegramFileRef,
-        build_combined_telegram_commands, build_telegram_menu_commands, default_attachment_name,
-        enrich_attachment_with_transport, next_error_backoff_secs,
+        approval_callback_content, build_combined_telegram_commands, build_telegram_menu_commands,
+        default_attachment_name, enrich_attachment_with_transport, next_error_backoff_secs,
         normalize_telegram_menu_command_name, telegram_command, telegram_format_text,
         telegram_help_text, telegram_inbound_envelope,
     };
@@ -2534,9 +2559,32 @@ mod tests {
 
         assert_eq!(envelope.session_id, "telegram:12345:9:agent-jane-01");
         assert_eq!(envelope.message_kind, "callback");
-        assert_eq!(envelope.content, "Telegram callback action: approve:turn-1");
+        // Approval callbacks must arrive as the slash command the philote resolver parses,
+        // not as opaque "Telegram callback action: …" text (which would be treated as chat).
+        assert_eq!(envelope.content, "/approve");
+        // The original callback_data is preserved so the runtime can distinguish trust, etc.
         assert_eq!(envelope.callback_data.as_deref(), Some("approve:turn-1"));
         assert!(envelope.attachments.is_empty());
+    }
+
+    #[test]
+    fn approval_callbacks_map_to_slash_commands() {
+        assert_eq!(approval_callback_content("approve"), "/approve");
+        assert_eq!(approval_callback_content("approve:turn-1"), "/approve");
+        assert_eq!(approval_callback_content("deny"), "/deny");
+        assert_eq!(approval_callback_content("deny:turn-1"), "/deny");
+        // "Trust for session" resolves the turn via /approve; callback_data (preserved by
+        // the envelope) is what the runtime keys on to also pre-approve the session.
+        assert_eq!(approval_callback_content("trust"), "/approve");
+        // Non-approval callbacks (e.g. role switches) are untouched.
+        assert_eq!(
+            approval_callback_content("/role architect"),
+            "Telegram callback action: /role architect"
+        );
+        assert_eq!(
+            approval_callback_content("something-else"),
+            "Telegram callback action: something-else"
+        );
     }
 
     #[test]
