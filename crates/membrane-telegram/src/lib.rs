@@ -559,6 +559,49 @@ async fn download_telegram_file(http_client: &reqwest::Client, file_url: &str) -
     Ok(bytes.to_vec())
 }
 
+/// Transcode audio bytes (e.g. ElevenLabs MP3) into OGG/OPUS so Telegram accepts
+/// them as a proper voice note via `sendVoice` (the round bubble that plays
+/// inline) instead of an `sendAudio` music-file card. Returns `None` if ffmpeg
+/// is missing or the transcode fails, so the caller can fall back to `sendAudio`.
+/// Uses temp files rather than stdio pipes to avoid a pipe-buffer deadlock on
+/// multi-MB inputs.
+async fn transcode_to_voice_ogg(input: &[u8]) -> Option<Vec<u8>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir();
+    let stem = format!("phil-tts-{}-{}", std::process::id(), nanos);
+    let in_path = dir.join(format!("{stem}.in"));
+    let out_path = dir.join(format!("{stem}.ogg"));
+
+    if tokio::fs::write(&in_path, input).await.is_err() {
+        return None;
+    }
+    let status = tokio::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-i"])
+        .arg(&in_path)
+        .args(["-ac", "1", "-c:a", "libopus", "-b:a", "48k", "-f", "ogg"])
+        .arg(&out_path)
+        .status()
+        .await;
+    let ogg = match status {
+        Ok(s) if s.success() => tokio::fs::read(&out_path).await.ok(),
+        Ok(s) => {
+            warn!("ffmpeg voice transcode exited non-zero: {:?}", s.code());
+            None
+        }
+        Err(e) => {
+            warn!("ffmpeg unavailable for voice transcode: {}", e);
+            None
+        }
+    };
+    let _ = tokio::fs::remove_file(&in_path).await;
+    let _ = tokio::fs::remove_file(&out_path).await;
+    ogg.filter(|b| !b.is_empty())
+}
+
 async fn upload_blob(
     http_client: &reqwest::Client,
     blob_base: &str,
@@ -2123,16 +2166,26 @@ async fn run_seat_impl(
                                                 use base64::Engine;
                                                 match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
                                                     Ok(audio_bytes) => {
-                                                        // Use sendVoice for OGG (voice notes), sendAudio for everything else.
-                                                        let (endpoint, field_name, file_name) = if mime_type.contains("ogg") {
-                                                            ("sendVoice", "voice", "voice.ogg")
-                                                        } else {
-                                                            ("sendAudio", "audio", "audio.mp3")
-                                                        };
+                                                        // Deliver as a real Telegram voice note (sendVoice: round bubble,
+                                                        // plays inline) whenever possible. That needs OGG/OPUS; ElevenLabs
+                                                        // returns MP3, so transcode when needed and only fall back to
+                                                        // sendAudio (a music-file card) if transcoding is unavailable.
+                                                        let (send_bytes, send_mime, endpoint, field_name, file_name) =
+                                                            if mime_type.contains("ogg") {
+                                                                (audio_bytes, "audio/ogg".to_string(), "sendVoice", "voice", "voice.ogg")
+                                                            } else {
+                                                                match transcode_to_voice_ogg(&audio_bytes).await {
+                                                                    Some(ogg) => (ogg, "audio/ogg".to_string(), "sendVoice", "voice", "voice.ogg"),
+                                                                    None => {
+                                                                        warn!("Voice-note transcode unavailable; falling back to sendAudio (music-file card).");
+                                                                        (audio_bytes, mime_type.to_string(), "sendAudio", "audio", "audio.mp3")
+                                                                    }
+                                                                }
+                                                            };
                                                         let send_url = format!("{}{}", tg_base_clone, endpoint);
-                                                        let part = reqwest::multipart::Part::bytes(audio_bytes)
+                                                        let part = reqwest::multipart::Part::bytes(send_bytes)
                                                             .file_name(file_name)
-                                                            .mime_str(mime_type)
+                                                            .mime_str(&send_mime)
                                                             .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new()));
                                                         let form = reqwest::multipart::Form::new()
                                                             .text("chat_id", chat_id.clone())

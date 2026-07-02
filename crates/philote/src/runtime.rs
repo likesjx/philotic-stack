@@ -9129,6 +9129,28 @@ impl AgentRuntime {
         command_chat_id: String,
         command: SlashCommand,
     ) -> Result<()> {
+        // Guard against a self-handoff. Issuing `/role X` while already incarnated
+        // as X sends a same-role HandoffToRole whose completion re-emits another
+        // handoff_bundle ("no active turn" warning), spinning an infinite loop that
+        // hammers the session. A role switch to the role you're already in is a
+        // no-op — acknowledge and stop before any handoff is dispatched.
+        if let SlashCommand::Role { role_name } = &command {
+            let target_incarnation = format!("{}:{}", self.agent_id, role_name);
+            let already_active = self
+                .sessions
+                .get(&session_id)
+                .and_then(|state| state.active_incarnation_id.clone());
+            if already_active.as_deref() == Some(target_incarnation.as_str()) {
+                return self
+                    .complete_local_command(
+                        session_id,
+                        command_turn_id,
+                        format!("You're already in the {role_name} role — nothing to switch."),
+                    )
+                    .await;
+            }
+        }
+
         // Set by the Roles arm of the match below to carry the inline keyboard to the reply.
         let mut roles_keyboard_holder: Option<serde_json::Value> = None;
 
