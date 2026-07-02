@@ -43,15 +43,29 @@ pub fn load_muninn_config(graph: &GraphDomain) -> Result<Option<MuninnConfig>> {
     };
 
     for entry in &registry {
-        match resolve_secret(graph, &entry.secret_ref, &access)? {
-            Some(token) => {
+        match resolve_secret(graph, &entry.secret_ref, &access) {
+            Ok(Some(token)) => {
                 config = config.with_vault_token(&entry.vault_name, token);
             }
-            None => {
+            Ok(None) => {
                 tracing::warn!(
                     vault = %entry.vault_name,
                     secret_ref = %entry.secret_ref,
                     "vault registry entry has no resolvable secret — skipping"
+                );
+            }
+            Err(err) => {
+                // The vault registry also holds provider API keys (gemini/openai/
+                // elevenlabs), which are ACL-scoped to their model roles and are
+                // intentionally NOT readable by the "hotel" identity. Those are not
+                // Muninn vault tokens, so a denial here is expected — skip the entry
+                // instead of aborting the whole load (which would leave every agent
+                // without memory).
+                tracing::debug!(
+                    vault = %entry.vault_name,
+                    secret_ref = %entry.secret_ref,
+                    error = %err,
+                    "vault registry entry not accessible to hotel — skipping (expected for model-scoped provider keys)"
                 );
             }
         }
@@ -156,6 +170,64 @@ mod tests {
                 .map(String::as_str),
             Some("mk_test-token-abc123")
         );
+    }
+
+    #[test]
+    fn model_scoped_provider_key_in_registry_is_skipped_not_fatal() {
+        // Regression: the vault registry also holds provider API keys scoped to
+        // model roles (gemini/openai/elevenlabs). The hotel identity cannot read
+        // those; a denial must skip the entry, not abort the whole load and leave
+        // every agent without memory.
+        let (_storage, domain) = open_domain();
+
+        // A real Muninn vault token the hotel CAN read.
+        let muninn_ref = store_secret(
+            &domain,
+            SecretInput {
+                plaintext: "mk_test-token-abc123".to_string(),
+                secret_kind: "muninn_vault_token".to_string(),
+                scope: "hotel".to_string(),
+                allowed_roles: vec!["hotel".to_string()],
+                allowed_guests: vec![],
+            },
+        )
+        .unwrap();
+        domain
+            .upsert_vault_registry_entry(&VaultRegistryEntry {
+                vault_name: "self_philote-1".into(),
+                secret_ref: muninn_ref,
+            })
+            .unwrap();
+
+        // A provider key scoped to model roles — NOT accessible to "hotel".
+        let gemini_ref = store_secret(
+            &domain,
+            SecretInput {
+                plaintext: "gemini-secret".to_string(),
+                secret_kind: "gemini_api_key".to_string(),
+                scope: "hotel".to_string(),
+                allowed_roles: vec!["model".to_string(), "model.gemini".to_string()],
+                allowed_guests: vec![],
+            },
+        )
+        .unwrap();
+        domain
+            .upsert_vault_registry_entry(&VaultRegistryEntry {
+                vault_name: "gemini_api_key".into(),
+                secret_ref: gemini_ref,
+            })
+            .unwrap();
+        domain.set_muninn_endpoint("http://127.0.0.1:8475").unwrap();
+
+        let config = load_muninn_config(&domain)
+            .unwrap()
+            .expect("Some config despite an inaccessible provider key in the registry");
+        // The Muninn token loaded; the model-scoped provider key was skipped.
+        assert_eq!(
+            config.vault_tokens.get("self_philote-1").map(String::as_str),
+            Some("mk_test-token-abc123")
+        );
+        assert!(!config.vault_tokens.contains_key("gemini_api_key"));
     }
 
     #[test]

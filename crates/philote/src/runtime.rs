@@ -4167,6 +4167,7 @@ impl AgentRuntime {
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
                 streaming_retry_attempts: 0,
+                streamed_content: String::new(),
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -8564,28 +8565,26 @@ impl AgentRuntime {
             _ => return Ok(()),
         };
 
-        // Resolve routing from the active turn of the session.
-        let routing = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| {
-                (
-                    t.final_reply_to.clone(),
-                    t.final_reply_role.clone(),
-                    t.final_reply_guest_id.clone(),
-                    t.turn_id.clone(),
-                    t.chat_id.clone(),
-                    t.paracrine_origin.is_some(),
-                )
-            });
-
-        let Some((reply_to, reply_role, reply_guest_id, turn_id, chat_id, is_paracrine_turn)) =
-            routing
-        else {
+        // Accumulate the delta into the active turn and resolve routing. The
+        // model-router emits one `streaming_token` per SSE delta, but membrane's
+        // draft edit replaces the message with `content` — so we must emit the
+        // *cumulative* text built up so far, not the isolated token, or the
+        // Telegram message flickers between fragments instead of growing.
+        let Some(state) = self.sessions.get_mut(&session_id) else {
             // No active turn — token arrived after turn completed; drop silently.
             return Ok(());
         };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return Ok(());
+        };
+        turn.streamed_content.push_str(&token);
+        let accumulated = turn.streamed_content.clone();
+        let reply_to = turn.final_reply_to.clone();
+        let reply_role = turn.final_reply_role.clone();
+        let reply_guest_id = turn.final_reply_guest_id.clone();
+        let turn_id = turn.turn_id.clone();
+        let chat_id = turn.chat_id.clone();
+        let is_paracrine_turn = turn.paracrine_origin.is_some();
 
         if is_paracrine_turn {
             // Paracrine specialist output is private until it is wrapped as a
@@ -8600,7 +8599,7 @@ impl AgentRuntime {
             "session_id": session_id,
             "turn_id": turn_id,
             "chat_id": chat_id,
-            "content": token,
+            "content": accumulated,
         }))?;
 
         self.ipc_client
@@ -10289,6 +10288,7 @@ impl AgentRuntime {
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
                 streaming_retry_attempts: 0,
+                streamed_content: String::new(),
             });
             Some((
                 state.checkpoint_memory_type(),
@@ -16561,6 +16561,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         }
     }
 
@@ -17092,6 +17093,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));

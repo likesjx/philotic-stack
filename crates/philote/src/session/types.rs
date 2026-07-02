@@ -634,6 +634,13 @@ pub struct WorkingTurn {
     /// Allows one automatic retry before escalating to the next fallback tier.
     #[serde(default)]
     pub streaming_retry_attempts: u8,
+    /// Running accumulation of streaming tokens for this turn. The model-router
+    /// emits `streaming_token` tasks carrying individual SSE deltas; membrane's
+    /// draft edit expects the *cumulative* text (it replaces the draft message),
+    /// so tokens are appended here and the running total is what gets emitted as
+    /// `partial_reply`. Reset implicitly per turn (new `WorkingTurn` starts empty).
+    #[serde(default)]
+    pub streamed_content: String,
 }
 
 #[derive(Debug, Clone)]

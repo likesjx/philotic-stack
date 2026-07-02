@@ -1804,14 +1804,44 @@ async fn load_provider_api_key_by_spec(
     }
 
     if let Some(secret_ref) = env_override(spec.env_api_key_ref) {
-        return fetch_secret_string(ipc_client, &secret_ref).await;
+        return fetch_provider_secret_soft_on_denial(ipc_client, &secret_ref, spec.provider).await;
     }
 
     let Some(secret_ref) = fetch_config_string(ipc_client, spec.api_key_ref_key).await? else {
         return Ok(None);
     };
 
-    fetch_secret_string(ipc_client, &secret_ref).await
+    fetch_provider_secret_soft_on_denial(ipc_client, &secret_ref, spec.provider).await
+}
+
+/// Fetch a provider API key, degrading an ACL *denial* to `None` instead of a fatal error.
+///
+/// A model controller reloads *every* provider's config on each task
+/// (`ProviderConfigs::load`), yet each provider key is ACL-scoped to its own
+/// role via `ProviderKeySpec::allowed_roles` (e.g. `openai_api_key` →
+/// `["model","model.openai"]`). A specialized controller such as
+/// `model.elevenlabs` therefore hits a legitimate cross-provider denial when it
+/// reaches for `openai_api_key` — that denial must NOT sink the whole config
+/// load (which would silently break voice synthesis). Only the "is not
+/// accessible" ACL case is softened; every other failure (decrypt, transport,
+/// malformed response, or a denial of the controller's *own* key) stays fatal.
+async fn fetch_provider_secret_soft_on_denial(
+    ipc_client: &mut PhiloticClient,
+    secret_ref: &str,
+    provider: &str,
+) -> Result<Option<String>> {
+    match fetch_secret_string(ipc_client, secret_ref).await {
+        Ok(value) => Ok(value),
+        Err(err) if err.to_string().contains("is not accessible") => {
+            tracing::debug!(
+                provider,
+                secret_ref,
+                "Provider key not accessible to this controller role; skipping (expected for cross-provider keys)."
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn fetch_config_or_secret_string(

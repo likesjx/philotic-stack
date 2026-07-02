@@ -3674,6 +3674,11 @@ impl SessionState {
                     .get("streaming_retry_attempts")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u8,
+                streamed_content: turn
+                    .get("streamed_content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             })
         });
 
@@ -4798,6 +4803,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         }
     }
 
@@ -4838,6 +4844,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         let checkpoint = state.checkpoint_json();
@@ -5096,6 +5103,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         state.complete_active_turn("hi".into());
@@ -5145,6 +5153,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -6012,6 +6021,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         let projection = state.build_context_projection("status");
@@ -6104,6 +6114,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         let prompt = state.build_prompt("status");
@@ -6303,6 +6314,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -6386,6 +6398,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         let delegation = state.build_subagent_delegation(
@@ -7380,6 +7393,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -7436,6 +7450,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         state.push_tool_history(
@@ -7507,6 +7522,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         state.push_tool_history(
@@ -7579,6 +7595,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         let reentry = state
@@ -7866,6 +7883,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -8138,6 +8156,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         }
     }
 
@@ -8262,6 +8281,7 @@ mod tests {
             plan_confirm_note: None,
             fallback_tier: 0,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
         };
         state.start_turn(turn);
         state.push_tool_history(
