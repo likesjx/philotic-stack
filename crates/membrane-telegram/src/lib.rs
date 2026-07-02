@@ -2225,19 +2225,49 @@ async fn run_seat_impl(
                         + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
                 }
                 Err(err) => {
+                    // A renew can fail because the hotel let our lease lapse while the seat was
+                    // quiet: a network-offline window (or machine sleep) suppresses polling, so
+                    // renewals are missed and the wall-clock TTL expires hotel-side. In that case
+                    // nobody else holds the lease, so re-acquire in place instead of tearing the
+                    // seat down — a full restart escalates the error backoff (up to 600s) and turns
+                    // a brief connectivity blip into a multi-minute Telegram outage.
                     warn!(
-                        "Failed to renew Telegram poll lease [{}]: {}. Seat will restart with backoff.",
+                        "Telegram poll lease [{}] renew failed: {}. Attempting immediate re-acquire.",
                         poll_lease_key, err
                     );
-                    // Release best-effort (lease may already be dropped by hotel after TTL expiry).
-                    let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
-                    // Return Err so run_seat_with_backoff retries and re-acquires the lease.
-                    // This handles machine sleep: wall-clock TTL expires on hotel side while
-                    // tokio's monotonic timer is paused, causing renewal to be missed.
-                    return Err(anyhow::anyhow!(
-                        "Telegram poll lease lost ({}); triggering seat restart to re-acquire.",
-                        err
-                    ));
+                    match acquire_telegram_poll_lease(
+                        &mut ipc_client,
+                        &poll_lease_key,
+                        &target_agent_id,
+                        &telegram_token_key,
+                    )
+                    .await
+                    {
+                        Ok(epoch) => {
+                            info!(
+                                "Re-acquired Telegram poll lease [{}] at epoch {} after renew lapse.",
+                                poll_lease_key, epoch
+                            );
+                            poll_lease_epoch = epoch;
+                            next_lease_renewal = tokio::time::Instant::now()
+                                + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+                        }
+                        Err(acquire_err) => {
+                            // Re-acquire only fails when a genuinely live seat holds the lease
+                            // (real contention / failover) — the hotel denies the grab. Now it is
+                            // correct to stand down and let run_seat_with_backoff retry later.
+                            warn!(
+                                "Failed to re-acquire Telegram poll lease [{}] after renew lapse: {}. Seat will restart with backoff.",
+                                poll_lease_key, acquire_err
+                            );
+                            // Release best-effort (lease may already be dropped by hotel after TTL expiry).
+                            let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
+                            return Err(anyhow::anyhow!(
+                                "Telegram poll lease lost ({}); triggering seat restart to re-acquire.",
+                                acquire_err
+                            ));
+                        }
+                    }
                 }
             }
         }
