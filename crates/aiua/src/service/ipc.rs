@@ -1030,6 +1030,24 @@ enum AgentRouteResolution {
     Park { guest_id: String },
 }
 
+/// Terminal outcome of a single [`IpcServer::deliver_inbound_task`] attempt.
+///
+/// The chokepoint reports whether an envelope reached a live subscriber so callers can
+/// distinguish "handed off" from "no route". Undeliverable envelopes that expect a
+/// reply are turned into an actionable failure via
+/// [`IpcServer::emit_undeliverable_error_back`] instead of being silently dropped.
+///
+/// Intentionally NOT `#[must_use]`: the many existing call sites that fire-and-forget a
+/// delivery keep compiling unchanged; only the sites that need to react inspect it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    /// Handed to `subscriber_count` live subscriber(s).
+    Delivered { subscriber_count: usize },
+    /// No live subscriber for (role, guest). The task stays ledger-only; the caller
+    /// decides whether to park, materialize, or error back to the originator.
+    NoSubscriber,
+}
+
 pub struct IpcServer {
     socket_path: String,
     local_node_id: String,
@@ -5012,7 +5030,7 @@ impl IpcServer {
         target_guest_id: Option<&str>,
         task_id: Uuid,
         task_json: String,
-    ) {
+    ) -> DeliveryOutcome {
         if let Err(err) = Self::hydrate_agent_graph_snapshot(&task_json) {
             warn!(
                 "Failed to hydrate agent graph snapshot before delivering task {} to role='{}' guest={:?}: {}",
@@ -5043,13 +5061,14 @@ impl IpcServer {
                     target_role, task_id
                 ),
             }
-            return;
+            return DeliveryOutcome::NoSubscriber;
         }
 
+        let subscriber_count = subscribers.len();
         info!(
             "Delivering inbound task {} to {} local subscriber(s) for role='{}' guest={:?} (payload {} bytes).",
             task_id,
-            subscribers.len(),
+            subscriber_count,
             target_role,
             target_guest_id,
             task_json.len()
@@ -5078,6 +5097,130 @@ impl IpcServer {
                 entries.retain(|subscriber| !stale.contains(&subscriber.conn_id));
             }
         }
+
+        // A subscriber whose channel had already closed was counted above but never
+        // actually received the task. If every subscriber was stale, report NoSubscriber
+        // so the caller can still recover the undeliverable envelope.
+        let delivered = subscriber_count.saturating_sub(stale.len());
+        if delivered == 0 {
+            DeliveryOutcome::NoSubscriber
+        } else {
+            DeliveryOutcome::Delivered {
+                subscriber_count: delivered,
+            }
+        }
+    }
+
+    /// Terminal reply actions that must never trigger an error-back. Erroring back on
+    /// one of these would either recurse (an error-back producing another error-back) or
+    /// clobber a legitimate response. Any envelope carrying a top-level `error` is also
+    /// treated as terminal by [`Self::emit_undeliverable_error_back`].
+    fn is_terminal_reply_action(action: &str) -> bool {
+        matches!(
+            action,
+            "tool_result"
+                | "model_response"
+                | "send_reply"
+                | "datasource_response"
+                | "capability_response"
+                | "approval_required"
+                | "undeliverable"
+        ) || action.ends_with("_response")
+    }
+
+    /// When an envelope cannot be delivered to any live subscriber, synthesize an
+    /// actionable `tool_result` failure and deliver it to the envelope's reply
+    /// coordinates so the calling component unsticks immediately instead of waiting for
+    /// the turn watchdog (90–600 s later).
+    ///
+    /// Returns `true` when an error-back was delivered locally. Only fires for
+    /// request-shaped envelopes that (a) are not themselves a terminal reply and (b)
+    /// carry a `reply_role`. Cross-hotel reply targets (reply_to != local node) are left
+    /// to the caller-side envelope deadline (Slice 3/4) — a local error-back cannot reach
+    /// them and the mesh may be exactly what is broken.
+    async fn emit_undeliverable_error_back(
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+        undeliverable_role: &str,
+        original_task_json: &str,
+        reason: &str,
+    ) -> bool {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(original_task_json) else {
+            return false;
+        };
+        let get = |k: &str| {
+            payload
+                .get(k)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+
+        // Loop guard: never error-back a terminal reply or an envelope that already
+        // carries an error — that is what would recurse into a storm.
+        let action = get("action").unwrap_or_default();
+        if Self::is_terminal_reply_action(&action) || payload.get("error").is_some() {
+            return false;
+        }
+
+        // Need somewhere to reply to.
+        let Some(reply_role) = get("reply_role").filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let reply_to = get("reply_to").unwrap_or_default();
+        // Only handle local reply targets here. A blank reply_to is assumed local
+        // (in-process emitters omit it); an explicit remote node is out of scope for
+        // Slice 1 and handled by the caller-side deadline.
+        if !reply_to.is_empty() && reply_to != local_node_id {
+            return false;
+        }
+
+        let session_id = get("session_id").unwrap_or_default();
+        let turn_id = get("turn_id").unwrap_or_default();
+        // Without a session+turn the reply cannot be correlated to a pending tool call.
+        if session_id.is_empty() || turn_id.is_empty() {
+            return false;
+        }
+        let reply_guest_id = get("reply_guest_id").filter(|s| !s.is_empty());
+        let tool_name = get("tool_name")
+            .or_else(|| get("capability"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".into());
+
+        let error_back = serde_json::json!({
+            "action": "tool_result",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "tool_name": tool_name,
+            "content": reason,
+            "error": {
+                "kind": "routing_error",
+                "code": "UNDELIVERABLE",
+                "message": reason,
+                "component": "aiua.router",
+                "retryable": true,
+            },
+        })
+        .to_string();
+
+        warn!(
+            undeliverable_role = %undeliverable_role,
+            reply_role = %reply_role,
+            reply_guest_id = ?reply_guest_id,
+            session_id = %session_id,
+            turn_id = %turn_id,
+            "Router: envelope undeliverable — erroring back to caller so it unsticks."
+        );
+
+        let outcome = Box::pin(Self::deliver_inbound_task(
+            inboxes,
+            local_node_id,
+            &reply_role,
+            reply_guest_id.as_deref(),
+            Uuid::new_v4(),
+            error_back,
+        ))
+        .await;
+        matches!(outcome, DeliveryOutcome::Delivered { .. })
     }
 
     // ── Golgi routing pipeline ───────────────────────────────────────────────
