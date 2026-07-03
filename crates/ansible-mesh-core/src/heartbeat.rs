@@ -10,6 +10,17 @@ use uuid::Uuid;
 
 const MAX_SYNC_PAYLOAD_BYTES: usize = 900;
 
+/// Inner-payload budget for a single `HotelStateSync` datagram.
+///
+/// `BeaconMessage.payload` is a `Vec<u8>` that serde_json encodes as a JSON
+/// integer array (`[123,34,...]`), roughly a 3.5–4× size blowup, so the inner
+/// payload must stay well under the ~65507-byte UDP datagram ceiling. 12 KB of
+/// inner JSON wraps to ~48 KB on the wire, leaving comfortable headroom while
+/// still packing many model profiles per datagram (unlike the 900-byte
+/// advertisement budget, which would degrade to one profile per datagram once
+/// the always-present guests/agents base is included on every chunk).
+const MAX_HOTEL_STATE_PAYLOAD_BYTES: usize = 12_000;
+
 /// A single peer record included in a [`MeshCatalogSyncPayload`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshPeerEntry {
@@ -78,6 +89,12 @@ pub struct HotelStateSyncPayload {
 }
 
 /// Emits a `HotelStateSync` to a target carrying the sender's current routable state.
+///
+/// The small guests/agents roster rides every datagram while `model_profiles`
+/// is split across as many datagrams as needed to keep each under the UDP
+/// ceiling (see [`chunk_hotel_state_payloads`]). The receiver upserts each
+/// profile idempotently and replaces the roster per datagram, so no reassembly
+/// is required and dropped chunks self-heal on the next 30s broadcast.
 pub async fn emit_hotel_state_sync(
     socket: &UdpSocket,
     target: SocketAddr,
@@ -85,15 +102,67 @@ pub async fn emit_hotel_state_sync(
     payload: HotelStateSyncPayload,
     auth_key: &str,
 ) -> Result<()> {
-    emit_signed_message(
-        socket,
-        target,
-        capabilities,
-        MsgType::HotelStateSync,
-        serde_json::to_vec(&payload)?,
-        auth_key,
-    )
-    .await
+    for chunk in chunk_hotel_state_payloads(&payload)? {
+        emit_signed_message(
+            socket,
+            target,
+            capabilities,
+            MsgType::HotelStateSync,
+            serde_json::to_vec(&chunk)?,
+            auth_key,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Splits a [`HotelStateSyncPayload`] into datagram-sized payloads.
+///
+/// Guests and agents are bounded and small, so they are cloned onto every
+/// chunk; `model_profiles` is packed greedily so each chunk's serialized inner
+/// payload stays within [`MAX_HOTEL_STATE_PAYLOAD_BYTES`]. The union of profiles
+/// across the returned chunks equals the input, order preserved. Returns at
+/// least one chunk (with an empty profile list when there are no profiles).
+fn chunk_hotel_state_payloads(
+    payload: &HotelStateSyncPayload,
+) -> Result<Vec<HotelStateSyncPayload>> {
+    // Fast path: the whole payload already fits in one datagram.
+    if serde_json::to_vec(payload)?.len() <= MAX_HOTEL_STATE_PAYLOAD_BYTES {
+        return Ok(vec![payload.clone()]);
+    }
+
+    let with_profiles = |model_profiles: Vec<ModelProfileRecord>| HotelStateSyncPayload {
+        node_id: payload.node_id.clone(),
+        hotel_name: payload.hotel_name.clone(),
+        guests: payload.guests.clone(),
+        agents: payload.agents.clone(),
+        model_profiles,
+    };
+
+    let mut chunks: Vec<HotelStateSyncPayload> = Vec::new();
+    let mut current: Vec<ModelProfileRecord> = Vec::new();
+
+    for profile in &payload.model_profiles {
+        let mut candidate = current.clone();
+        candidate.push(profile.clone());
+        let over_budget = serde_json::to_vec(&with_profiles(candidate.clone()))?.len()
+            > MAX_HOTEL_STATE_PAYLOAD_BYTES;
+        // Only flush when `current` holds at least one profile, so a single
+        // oversized record (or an oversized guests/agents base) still ships
+        // rather than looping forever on an empty batch.
+        if over_budget && !current.is_empty() {
+            chunks.push(with_profiles(std::mem::take(&mut current)));
+            current.push(profile.clone());
+        } else {
+            current = candidate;
+        }
+    }
+
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(with_profiles(current));
+    }
+
+    Ok(chunks)
 }
 
 /// Emits compact heartbeat messages over the given UDP socket to a target address.
@@ -383,5 +452,118 @@ mod tests {
         assert!(chunks.len() > 1);
         let flattened = chunks.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(flattened.len(), advertisements.len());
+    }
+
+    fn model_profile(ix: usize) -> ModelProfileRecord {
+        ModelProfileRecord {
+            model_ref: format!("openrouter/vendor-{ix}/model-name-{ix}-instruct-v3"),
+            node_id: "mbp-jane-aiua-01".into(),
+            provider: "openrouter".into(),
+            task_kinds: vec!["text.generate".into(), "media.analyze".into()],
+            trust_tier: "remote_cloud".into(),
+            max_context_tokens: 131_072,
+            latency_p50_ms: 850,
+            error_rate: 0.01,
+            status: "healthy".into(),
+            last_healthy_secs: 1_720_000_000,
+            updated_secs: 1_720_000_100,
+        }
+    }
+
+    fn hotel_state_payload(profile_count: usize) -> HotelStateSyncPayload {
+        HotelStateSyncPayload {
+            node_id: "mbp-jane-aiua-01".into(),
+            hotel_name: "mbp-jane".into(),
+            guests: (0..20)
+                .map(|ix| HotelStateSyncGuest {
+                    guest_id: format!("mbp-jane:model-controller-openrouter-{ix}"),
+                    role: "model".into(),
+                    active: true,
+                })
+                .collect(),
+            agents: (0..6)
+                .map(|ix| HotelStateSyncAgent {
+                    agent_id: format!("agent-persona-{ix}"),
+                    persona_name: format!("Persona {ix}"),
+                })
+                .collect(),
+            model_profiles: (0..profile_count).map(model_profile).collect(),
+        }
+    }
+
+    /// Serialized size of the on-the-wire datagram for a single chunk, matching
+    /// how `emit_signed_message` frames the payload inside a `BeaconMessage`.
+    fn datagram_len(chunk: &HotelStateSyncPayload) -> usize {
+        let payload = serde_json::to_vec(chunk).expect("chunk should encode");
+        let msg = BeaconMessage {
+            version: 1,
+            msg_id: Uuid::nil(),
+            src_node: "mbp-jane-aiua-01".into(),
+            dest_node: "broadcast".into(),
+            msg_type: MsgType::HotelStateSync,
+            seq: 0,
+            total: 1,
+            timestamp: 1_720_000_000,
+            payload,
+            // Conservative HMAC width; also a `Vec<u8>` encoded as an integer array.
+            hmac: vec![0u8; 64],
+        };
+        serde_json::to_vec(&msg)
+            .expect("message should encode")
+            .len()
+    }
+
+    const UDP_DATAGRAM_MAX: usize = 65_507;
+
+    #[test]
+    fn hotel_state_single_datagram_when_small() {
+        let payload = hotel_state_payload(3);
+        let chunks = chunk_hotel_state_payloads(&payload).expect("chunking should succeed");
+        assert_eq!(chunks.len(), 1);
+        assert!(datagram_len(&chunks[0]) < UDP_DATAGRAM_MAX);
+    }
+
+    #[test]
+    fn hotel_state_chunks_stay_under_udp_ceiling_and_preserve_profiles() {
+        // A large OpenRouter-style catalog that far exceeds one datagram.
+        let payload = hotel_state_payload(600);
+        assert!(
+            serde_json::to_vec(&payload).expect("encode").len() > MAX_HOTEL_STATE_PAYLOAD_BYTES,
+            "test fixture must actually require chunking"
+        );
+
+        let chunks = chunk_hotel_state_payloads(&payload).expect("chunking should succeed");
+        assert!(
+            chunks.len() > 1,
+            "large catalog must split into multiple chunks"
+        );
+
+        // (a) Every emitted datagram fits under the UDP ceiling, with headroom.
+        for chunk in &chunks {
+            let len = datagram_len(chunk);
+            assert!(
+                len < UDP_DATAGRAM_MAX,
+                "datagram {len} bytes exceeds UDP ceiling {UDP_DATAGRAM_MAX}"
+            );
+        }
+
+        // (b) Guests and agents ride every chunk so each is independently useful.
+        for chunk in &chunks {
+            assert_eq!(chunk.guests.len(), payload.guests.len());
+            assert_eq!(chunk.agents.len(), payload.agents.len());
+        }
+
+        // (c) The union of profiles across chunks equals the input, in order —
+        //     no profile is lost or duplicated by chunking.
+        let flattened: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| c.model_profiles.iter().map(|p| p.model_ref.clone()))
+            .collect();
+        let expected: Vec<_> = payload
+            .model_profiles
+            .iter()
+            .map(|p| p.model_ref.clone())
+            .collect();
+        assert_eq!(flattened, expected);
     }
 }
