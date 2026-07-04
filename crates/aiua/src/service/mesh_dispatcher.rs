@@ -129,9 +129,9 @@ async fn dispatch_for_target(
             msg_type: MsgType::ExecutionEventBatch,
             seq: event.seq as u32,
             total: 1,
-            payload,
+            payload: payload.into(),
             timestamp: ts,
-            hmac,
+            hmac: hmac.into(),
         };
 
         match send_execution_message(target_addr, &msg).await {

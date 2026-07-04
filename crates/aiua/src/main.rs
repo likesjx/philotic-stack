@@ -1853,9 +1853,9 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                         msg_type: ansible_mesh_core::MsgType::ExecutionEventAck,
                                         seq,
                                         total: 1,
-                                        payload,
+                                        payload: payload.into(),
                                         timestamp,
-                                        hmac,
+                                        hmac: hmac.into(),
                                     };
                                     if let Err(err) =
                                         crate::service::execution_transport::send_execution_message(
@@ -1897,7 +1897,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         }
                     }
                     ansible_mesh_core::MsgType::MeshMembershipAccept => {
-                        if let Ok(payload_json) = String::from_utf8(msg.payload.clone()) {
+                        if let Ok(payload_json) = String::from_utf8(msg.payload.to_vec()) {
                             handle_mesh_membership_accept(inbound_graph.as_ref(), &payload_json);
                         } else {
                             warn!(
@@ -2034,8 +2034,8 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         seq,
                         total: 1,
                         timestamp,
-                        payload: payload_bytes,
-                        hmac,
+                        payload: payload_bytes.into(),
+                        hmac: hmac.into(),
                     };
 
                     if let Ok(packet) = serde_json::to_vec(&msg) {
