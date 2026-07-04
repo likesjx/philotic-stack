@@ -17822,4 +17822,308 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    // ── DEF-004 regression: multi-tool re-entry must surface the final reply ──
+    //
+    // Drives a turn through two tool_result re-entries and a final model Respond,
+    // over a recording stub hotel, and asserts exactly one `send_reply` task is
+    // emitted to the turn's final_reply_* transport target with the synthesized text.
+
+    /// Minimal hotel harness that records every EmitTask envelope it receives
+    /// (target fields + parsed task_json) and acks everything else generically.
+    async fn run_recording_hotel(
+        listener: tokio::net::UnixListener,
+        emitted: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        loop {
+            let buf = match async {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await?;
+                Ok::<_, std::io::Error>(buf)
+            }
+            .await
+            {
+                Ok(b) => b,
+                Err(_) => return, // client disconnected
+            };
+
+            let req: philotic_client::IpcRequest =
+                serde_json::from_slice(&buf).expect("decode request");
+            let reply = match &req {
+                philotic_client::IpcRequest::GetConfig { key } => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::ConfigData {
+                        key: key.clone(),
+                        value_json: None,
+                    })
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::EmitTask {
+                    target_node,
+                    target_role,
+                    target_guest_id,
+                    task_json,
+                } => {
+                    let task: serde_json::Value =
+                        serde_json::from_str(task_json).unwrap_or(serde_json::Value::Null);
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "target_node": target_node,
+                        "target_role": target_role,
+                        "target_guest_id": target_guest_id,
+                        "task": task,
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+                _ => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+            };
+
+            let len = u32::try_from(reply.len()).expect("frame length fits u32");
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .expect("write header");
+            stream.write_all(&reply).await.expect("write payload");
+        }
+    }
+
+    fn def004_working_turn(turn_id: &str, first_tool: &str) -> WorkingTurn {
+        let mut turn = test_working_turn(TurnPhase::WaitingTool);
+        turn.turn_id = turn_id.into();
+        turn.chat_id = "555".into();
+        turn.user_content = "compare hotel and session status".into();
+        turn.final_reply_to = "membrane-node-01".into();
+        turn.final_reply_role = "membrane".into();
+        turn.final_reply_guest_id = Some("membrane-seat-1".into());
+        turn.pending_tool_call = Some(ToolCall {
+            tool_name: first_tool.into(),
+            arguments: serde_json::json!({}),
+        });
+        turn
+    }
+
+    #[tokio::test]
+    async fn multi_tool_reentry_surfaces_final_send_reply() {
+        let socket_path = format!("/tmp/philote-def004-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-def004".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-def004");
+
+        let session_id = "sess-def004";
+        let turn_id = "turn-def004";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Seed an active turn waiting on its first tool result, bound to a
+        // membrane transport target (the real final_reply_* shape).
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(def004_working_turn(turn_id, "hotel.status"));
+
+        // Tool result #1 → first model re-entry (iteration 1).
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("hotel.status".into()),
+                content: Some("hotel green".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result 1");
+
+        // Simulate the model dispatching a second tool call.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.set_pending_tool_call(ToolCall {
+                tool_name: "session.status".into(),
+                arguments: serde_json::json!({}),
+            });
+            state.set_active_turn_phase(TurnPhase::WaitingTool);
+        }
+
+        // Tool result #2 → second model re-entry (iteration 2).
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("session.status".into()),
+                content: Some("session green".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result 2");
+
+        // Sanity: both results are in the working tool history and iteration advanced.
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn still active");
+            assert_eq!(turn.iteration, 2, "two re-entries must advance iteration");
+            assert_eq!(turn.working_tool_history.len(), 2);
+        }
+
+        // Final model Respond with the synthesized summary.
+        let final_text = "Final synthesized summary: hotel green, session green.";
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                agent_action: Some(serde_json::json!({
+                    "kind": "respond",
+                    "content": final_text,
+                })),
+                content: Some(final_text.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("final model respond");
+
+        // The turn must be completed and out of the active slot.
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            assert!(
+                state.active_turn.is_none(),
+                "turn must complete after final respond"
+            );
+            let last = state.recent_turns.last().expect("turn recorded");
+            assert_eq!(last.assistant_content.as_deref(), Some(final_text));
+        }
+
+        drop(runtime); // closes socket → server exits
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+
+        let reentries: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert!(
+            reentries.len() >= 2,
+            "expected >=2 model re-entries, got {}: {:#?}",
+            reentries.len(),
+            *emitted
+        );
+
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "exactly one send_reply must surface: {:#?}",
+            *emitted
+        );
+        let reply = send_replies[0];
+        assert_eq!(reply["task"]["session_id"], session_id);
+        assert_eq!(reply["task"]["turn_id"], turn_id);
+        assert!(
+            reply["task"]["content"]
+                .as_str()
+                .expect("send_reply content")
+                .contains("Final synthesized summary"),
+            "send_reply must carry the synthesized text: {reply:#?}"
+        );
+        // The reply must go to the turn's bound transport target, not fan out.
+        assert_eq!(reply["target_node"], "membrane-node-01");
+        assert_eq!(reply["target_role"], "membrane");
+        assert_eq!(reply["target_guest_id"], "membrane-seat-1");
+    }
+
+    /// Suppression-path guard: `paracrine_merge_completed` must only suppress the
+    /// final reply for turns that actually have a paracrine origin. A plain
+    /// transport turn with the flag set (e.g. stale checkpoint bits) must still
+    /// surface its send_reply.
+    #[tokio::test]
+    async fn merge_completed_flag_does_not_suppress_plain_transport_reply() {
+        let socket_path = format!("/tmp/philote-def004b-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-def004b".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-def004b");
+
+        let session_id = "sess-def004b";
+        let turn_id = "turn-def004b";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.pending_tool_call = None;
+        turn.phase = TurnPhase::WaitingModel;
+        // No paracrine_origin, but the merge flag is (incorrectly) set.
+        turn.paracrine_merge_completed = true;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        let final_text = "Plain transport reply.";
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                agent_action: Some(serde_json::json!({
+                    "kind": "respond",
+                    "content": final_text,
+                })),
+                content: Some(final_text.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("model respond");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "plain transport turn must always surface its reply: {:#?}",
+            *emitted
+        );
+        assert_eq!(send_replies[0]["task"]["content"], final_text);
+    }
 }
