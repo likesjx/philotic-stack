@@ -7561,6 +7561,88 @@ impl IpcServer {
                 }
                 IpcResponse::success("repair", Some(serde_json::json!({"repaired": repaired})))
             }
+            // TODO(role-loop): schedule alongside the RepairStaleSessionTurns cron so
+            // this runs periodically; for now it is on-demand like RepairStaleSessionTurns.
+            IpcRequest::HealRoleHandoffLoops {} => {
+                let incarnations = match graph.list_all_role_incarnations() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("HealRoleHandoffLoops: query failed: {e}");
+                        return IpcResponse::error("heal", "QUERY_ERROR", e.to_string());
+                    }
+                };
+                // Group active incarnations by agent_id.
+                let mut active_by_agent: std::collections::HashMap<String, Vec<RoleIncarnationRecord>> =
+                    std::collections::HashMap::new();
+                for rec in incarnations {
+                    if matches!(rec.readiness_state, RoleReadinessState::ActiveInSession) {
+                        active_by_agent
+                            .entry(rec.agent_id.clone())
+                            .or_default()
+                            .push(rec);
+                    }
+                }
+
+                let mut healed_agents: u32 = 0;
+                let mut demoted_guest_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for (agent_id, actives) in active_by_agent {
+                    if actives.len() <= 1 {
+                        continue; // healthy: at most one active incarnation.
+                    }
+                    // Corrupt state: demote ALL of this agent's incarnations to Routable
+                    // so the base agent resumes as orchestrator (matches the manual fix).
+                    let all = graph.list_role_incarnations(&agent_id).unwrap_or_default();
+                    for rec in &all {
+                        demoted_guest_ids.insert(rec.guest_id.clone());
+                        if let Err(e) = graph.set_role_incarnation_readiness(
+                            &agent_id,
+                            &rec.role_name,
+                            RoleReadinessState::Routable,
+                        ) {
+                            warn!("HealRoleHandoffLoops: demote {agent_id}:{}: {e}", rec.role_name);
+                        }
+                    }
+                    if let Some(hq) = heal_queue {
+                        let _ = hq.push_error(
+                            &agent_id,
+                            &format!(
+                                "role_handoff_loop: {} incarnations were ActiveInSession simultaneously; demoted to routable + cleared session pin",
+                                actives.len()
+                            ),
+                        );
+                    }
+                    warn!(
+                        agent_id,
+                        active = actives.len(),
+                        "HealRoleHandoffLoops: demoted duplicate active incarnations"
+                    );
+                    healed_agents += 1;
+                }
+
+                // Clear any session pin that points at a demoted incarnation.
+                if !demoted_guest_ids.is_empty() {
+                    if let Ok(sessions) = graph.list_all_sessions() {
+                        for mut session in sessions {
+                            let pinned = session
+                                .active_incarnation_id
+                                .as_deref()
+                                .map(|g| demoted_guest_ids.contains(g))
+                                .unwrap_or(false);
+                            if pinned {
+                                session.active_incarnation_id = None;
+                                session.updated_at = unix_ts();
+                                let _ = graph.upsert_session(&session);
+                            }
+                        }
+                    }
+                }
+
+                if healed_agents > 0 {
+                    info!(healed_agents, "HealRoleHandoffLoops: healed role-handoff loops");
+                }
+                IpcResponse::success("heal", Some(serde_json::json!({"healed_agents": healed_agents})))
+            }
             IpcRequest::SubscribeInbox { role } => {
                 info!("SubscribeInbox for role: {}", role);
                 let guest = {
@@ -9347,10 +9429,12 @@ impl IpcServer {
                 .await
                 {
                     Ok(true) => {
-                        if let Err(err) = graph.set_role_incarnation_readiness(
+                        // Single-active invariant: promoting this role demotes any
+                        // sibling incarnation of the same agent that is still active,
+                        // so two roles can never both be ActiveInSession at once.
+                        if let Err(err) = graph.promote_role_incarnation_active(
                             &target_role.agent_id,
                             &target_role.role_name,
-                            RoleReadinessState::ActiveInSession,
                         ) {
                             warn!(
                                 "Failed to mark role [{}] active in session: {}",
@@ -9514,10 +9598,11 @@ impl IpcServer {
                 .await
                 {
                     Ok(true) => {
-                        if let Err(err) = graph.set_role_incarnation_readiness(
+                        // Single-active invariant (see promote_role_incarnation_active):
+                        // returning to a role demotes any other active incarnation.
+                        if let Err(err) = graph.promote_role_incarnation_active(
                             &target_role_record.agent_id,
                             &target_role_record.role_name,
-                            RoleReadinessState::ActiveInSession,
                         ) {
                             warn!(
                                 "Failed to mark return role [{}] active in session: {}",

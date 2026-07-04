@@ -906,6 +906,10 @@ pub enum IpcRequest {
     RepairStaleSessionTurns {
         min_age_secs: u64,
     },
+    /// Self-heal detector for the role-handoff ping-pong loop: finds any agent
+    /// with more than one incarnation at `ActiveInSession`, demotes them, and
+    /// clears any session pin pointing at a demoted incarnation.
+    HealRoleHandoffLoops {},
     SubscribeInbox {
         role: String,
     },
