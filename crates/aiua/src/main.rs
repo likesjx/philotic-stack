@@ -8067,11 +8067,18 @@ async fn main() -> Result<()> {
                                 persona_name: a.persona_name,
                             })
                             .collect();
+                        let model_profiles = sync_graph
+                            .list_model_profiles()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|profile| profile.node_id == sync_caps.node_id)
+                            .collect();
                         let payload = HotelStateSyncPayload {
                             node_id: sync_caps.node_id.clone(),
                             hotel_name: sync_hotel.hotel_name.clone(),
                             guests,
                             agents,
+                            model_profiles,
                         };
                         *sync_state.write().await = Some(payload.clone());
                     }
@@ -8171,6 +8178,14 @@ async fn main() -> Result<()> {
             cron_ticker.run().await;
         });
     }
+
+    // Model-catalog discovery: periodically pull provider model lists, diff
+    // against the last snapshot, and route retirements / thinking-flips into the
+    // self-heal queue for operator visibility.
+    crate::service::model_catalog_sync::spawn_loop(
+        graph_domain_arc.clone(),
+        db_path.to_string_lossy().to_string(),
+    );
 
     tokio::spawn(run_operator_surface_query_worker(
         operator_surface_rx,

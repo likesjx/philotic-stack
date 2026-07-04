@@ -2,9 +2,9 @@
 
 A distributed AI agent operating system built in Rust — designed around a clear, intuitive **Hotel & Guest** metaphor.
 
-At the core of the stack is **The Hotel** (an autonomous, Rust-powered node). The Hotel acts as a secure supervisor and message switchboard. It brings **Guests** (specialized AI agent processes like your personal assistant or system architect) to life, manages their memory within a local **Context Graph**, and connects them to the outside world through secure **Membranes**. 
+At the core of the stack is **The Hotel** (an autonomous, Rust-powered node) protected by an **Ingress Fence** security perimeter. The Hotel acts as a secure supervisor and message switchboard. It brings **Guests** (specialized AI agent processes like your personal assistant or system architect) to life, manages their memory within a local **Context Graph**, and connects them to the outside world through secure **Membranes**. 
 
-Multiple Hotels can link together to form a resilient, cryptographically secure mesh network—the **Philotic Web**.
+Multiple Hotels can link together to form a resilient, cryptographically secure mesh network—the **Philotic Web**—using hybrid UDP/TCP gossiping, WebRTC signaling for direct execution channels, and the **Whisper Protocol** for paracrine agent communication.
 
 [![Philotic Web Teaser](https://img.youtube.com/vi/SF2C9rbz330/maxresdefault.jpg)](https://youtu.be/SF2C9rbz330)
 
@@ -80,7 +80,7 @@ aiua --load-config mesh-config.json
 
 | Crate | Role |
 |---|---|
-| [`aiua`](crates/aiua/) | Hotel daemon — guest materialization, IPC server, mesh routing |
+| [`aiua`](crates/aiua/) | Hotel daemon — guest materialization, IPC server, mesh routing, perimeter security |
 | [`philote`](crates/philote/) | Agent core — cognitive loop, session management, role incarnation |
 | [`membrane`](crates/membrane/) | Transitional wrapper over membrane runtime |
 | [`membrane-telegram`](crates/membrane-telegram/) | Telegram / external protocol gateway |
@@ -90,9 +90,11 @@ aiua --load-config mesh-config.json
 | [`model-router`](crates/model-router/) | Shared LLM inference routing SDK |
 | [`tool-runner`](crates/tool-runner/) | Sandboxed tool execution (Landlock + seccomp via philotic-sandbox) |
 | [`graph-runner`](crates/graph-runner/) | Shared project graph store |
-| [`agent-graph-runner`](crates/agent-graph-runner/) | Per-agent cognitive graph (`agent.graph.*` tool surface) |
+| [`agent-datasource`](crates/agent-datasource/) | Per-agent cognitive graph partition datasource (`agent.graph.*` tool surface) |
 | [`graph-datasource`](crates/graph-datasource/) | Autonomous graph partition management tool surface |
 | [`graph-intelligence`](crates/graph-intelligence/) | Project intelligence graph + MCP server |
+| [`heal-dispatcher`](crates/heal-dispatcher/) | FunctionGemma self-healing dispatcher |
+| [`parakeet-runner`](crates/parakeet-runner/) | NVIDIA Parakeet ASR model controller |
 
 ### Libraries
 
@@ -109,6 +111,11 @@ aiua --load-config mesh-config.json
 | [`memory-core`](crates/memory-core/) | MemoryEngine trait, CognitiveEngine, Muninn integration |
 | [`philotic-graph`](crates/philotic-graph/) | Core graph intelligence and SVE tooling |
 | [`datasource`](crates/datasource/) | SQLite partition and datasource management |
+| [`data-memorygraphrag`](crates/data-memorygraphrag/) | MemGraphRAG / LifeGraph runner toolset layer |
+| [`router-listener`](crates/router-listener/) | Router training tap |
+| [`table-datasource`](crates/table-datasource/) | Multi-DB datasource support + full CRUD task kinds |
+| [`media-codec`](crates/media-codec/) | Audio normalization and voice transcoding |
+| [`perimeter-core`](crates/perimeter-core/) | Security perimeter boundary, IngressFence |
 | [`onnx-runner`](crates/onnx-runner/) | Local ONNX inference (embeddings, transcription) |
 | [`mlx-runner`](crates/mlx-runner/) | Local MLX inference (Apple Silicon) |
 | [`philotic-sandbox`](crates/philotic-sandbox/) | Secure execution sandbox (Landlock + seccomp policies) |

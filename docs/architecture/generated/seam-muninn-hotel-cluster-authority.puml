@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - muninn-hotel-cluster-authority
+
+rectangle "muninn-hotel-cluster-authority" as muninn_hotel_cluster_authority #Orange {
+}
+
+
+@enduml

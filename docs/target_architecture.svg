@@ -48,44 +48,54 @@
 <text x="66" y="184" font-size="9" font-weight="700" letter-spacing="1.6" fill="#ffc107" style="text-transform:uppercase">CORE SERVICES</text>
 
 <!-- IpcServer -->
-<rect x="46" y="194" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-<text x="56" y="211" font-size="11" font-weight="600" fill="#e8eaf0">IpcServer</text>
-<text x="56" y="224" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/ipc.rs  (13K LOC)</text>
+<rect x="46" y="194" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="208" font-size="10.5" font-weight="600" fill="#e8eaf0">IpcServer</text>
+<text x="56" y="220" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/ipc.rs  (13K LOC)</text>
 
 <!-- GuestManager -->
-<rect x="46" y="242" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-<text x="56" y="259" font-size="11" font-weight="600" fill="#e8eaf0">GuestManager</text>
-<text x="56" y="272" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/guest_manager.rs</text>
+<rect x="46" y="230" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="244" font-size="10.5" font-weight="600" fill="#e8eaf0">GuestManager</text>
+<text x="56" y="256" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/guest_manager.rs</text>
 
 <!-- BlobService -->
-<rect x="46" y="290" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-<text x="56" y="307" font-size="11" font-weight="600" fill="#e8eaf0">BlobService</text>
-<text x="56" y="320" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/blob.rs  :9001</text>
+<rect x="46" y="266" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="280" font-size="10.5" font-weight="600" fill="#e8eaf0">BlobService</text>
+<text x="56" y="292" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/blob.rs  :9001</text>
 
 <!-- MeshDispatcher -->
-<rect x="46" y="338" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-<text x="56" y="355" font-size="11" font-weight="600" fill="#e8eaf0">MeshDispatcher</text>
-<text x="56" y="368" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/mesh_dispatcher.rs</text>
+<rect x="46" y="302" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="316" font-size="10.5" font-weight="600" fill="#e8eaf0">MeshDispatcher</text>
+<text x="56" y="328" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/mesh_dispatcher.rs</text>
 
 <!-- ResourceRegistry -->
-<rect x="46" y="386" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-<text x="56" y="403" font-size="11" font-weight="600" fill="#e8eaf0">ResourceRegistry</text>
-<text x="56" y="416" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/resource_registry.rs</text>
+<rect x="46" y="338" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="352" font-size="10.5" font-weight="600" fill="#e8eaf0">ResourceRegistry</text>
+<text x="56" y="364" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/resource_registry.rs</text>
 
 <!-- CronTicker -->
-<rect x="46" y="434" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-<text x="56" y="451" font-size="11" font-weight="600" fill="#e8eaf0">CronTicker</text>
-<text x="56" y="464" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/cron_ticker.rs</text>
+<rect x="46" y="374" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="388" font-size="10.5" font-weight="600" fill="#e8eaf0">CronTicker</text>
+<text x="56" y="400" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/cron_ticker.rs</text>
 
 <!-- VaultService -->
-<rect x="46" y="482" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-<text x="56" y="499" font-size="11" font-weight="600" fill="#e8eaf0">VaultService</text>
-<text x="56" y="512" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/vault.rs</text>
+<rect x="46" y="410" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="424" font-size="10.5" font-weight="600" fill="#e8eaf0">VaultService</text>
+<text x="56" y="436" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/vault.rs</text>
+
+<!-- HotelPerimeterService -->
+<rect x="46" y="446" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="460" font-size="10.5" font-weight="600" fill="#e8eaf0">HotelPerimeterService</text>
+<text x="56" y="472" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/perimeter.rs (IngressFence)</text>
+
+<!-- HealDispatcher -->
+<rect x="46" y="482" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="496" font-size="10.5" font-weight="600" fill="#e8eaf0">HealDispatcher</text>
+<text x="56" y="508" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">service/heal.rs (Heal Queue)</text>
 
 <!-- Auth Exchange -->
-<rect x="46" y="530" width="230" height="34" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="0.5" stroke-opacity="0.5"/>
-<text x="56" y="547" font-size="10" font-weight="500" fill="#8892b0">Mesh PKI &amp; Auth</text>
-<text x="56" y="558" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">Ed25519 identity + X25519 session keys</text>
+<rect x="46" y="518" width="230" height="32" rx="6" fill="#161b2e" stroke="#ffc107" stroke-width="0.5" stroke-opacity="0.5"/>
+<text x="56" y="530" font-size="10" font-weight="500" fill="#8892b0">Mesh PKI &amp; Auth</text>
+<text x="56" y="542" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">Ed25519 identity + X25519 session keys</text>
 
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <!-- STORAGE LAYER                                                       -->
@@ -95,34 +105,39 @@
 <text x="328" y="184" font-size="9" font-weight="700" letter-spacing="1.6" fill="#ff6d00" style="text-transform:uppercase">STORAGE LAYER</text>
 
 <!-- GraphDomain -->
-<rect x="308" y="194" width="232" height="44" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
-<text x="318" y="212" font-size="11" font-weight="600" fill="#e8eaf0">GraphDomain</text>
-<text x="318" y="227" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">ansible-mesh-core  (SQLite)</text>
+<rect x="308" y="194" width="232" height="32" rx="6" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="208" font-size="10.5" font-weight="600" fill="#e8eaf0">GraphDomain</text>
+<text x="318" y="220" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">ansible-mesh-core  (SQLite)</text>
 
 <!-- EventStorage -->
-<rect x="308" y="248" width="232" height="44" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
-<text x="318" y="266" font-size="11" font-weight="600" fill="#e8eaf0">EventStorage</text>
-<text x="318" y="281" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">mesh_events table  (SQLite)</text>
+<rect x="308" y="230" width="232" height="32" rx="6" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="244" font-size="10.5" font-weight="600" fill="#e8eaf0">EventStorage</text>
+<text x="318" y="256" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">mesh_events table  (SQLite)</text>
 
-<!-- AgentGraphStorage -->
-<rect x="308" y="302" width="232" height="44" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
-<text x="318" y="320" font-size="11" font-weight="600" fill="#e8eaf0">AgentGraphStorage</text>
-<text x="318" y="335" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">per-agent cognitive graph</text>
+<!-- AgentDatasource -->
+<rect x="308" y="266" width="232" height="32" rx="6" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="280" font-size="10.5" font-weight="600" fill="#e8eaf0">AgentDatasource</text>
+<text x="318" y="292" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">per-agent SQLite partitions</text>
 
 <!-- RouterTraceStorage -->
-<rect x="308" y="356" width="232" height="44" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
-<text x="318" y="374" font-size="11" font-weight="600" fill="#e8eaf0">RouterTraceStorage</text>
-<text x="318" y="389" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">model routing RL traces</text>
+<rect x="308" y="302" width="232" height="32" rx="6" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="316" font-size="10.5" font-weight="600" fill="#e8eaf0">RouterTraceStorage</text>
+<text x="318" y="328" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">model routing RL traces</text>
 
 <!-- Vault (encrypted) -->
-<rect x="308" y="410" width="232" height="44" rx="7" fill="#1a1000" stroke="#ff6d00" stroke-width="1"/>
-<text x="318" y="428" font-size="11" font-weight="600" fill="#e8eaf0">Vault <tspan font-size="8" fill="#ffc107">(encrypted)</tspan></text>
-<text x="318" y="443" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">secrets, tokens, keys</text>
+<rect x="308" y="338" width="232" height="32" rx="6" fill="#1a1000" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="352" font-size="10.5" font-weight="600" fill="#e8eaf0">Vault <tspan font-size="8" fill="#ffc107">(encrypted)</tspan></text>
+<text x="318" y="364" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">secrets, tokens, keys</text>
+
+<!-- Memgraph Central Store -->
+<rect x="308" y="374" width="232" height="32" rx="6" fill="#1a1000" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="388" font-size="10.5" font-weight="600" fill="#e8eaf0">Memgraph (Optional)</text>
+<text x="318" y="400" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">Bolt-connection Cypher graph</text>
 
 <!-- SQLite Backing Store label -->
-<rect x="308" y="466" width="232" height="36" rx="7" fill="#1a1000" stroke="#ff6d00" stroke-width="0.5" stroke-opacity="0.5"/>
-<text x="318" y="483" font-size="10" font-weight="500" fill="#8892b0">Backing Store</text>
-<text x="318" y="494" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">ansible_context.db  (SQLite)</text>
+<rect x="308" y="410" width="232" height="32" rx="6" fill="#1a1000" stroke="#ff6d00" stroke-width="0.5" stroke-opacity="0.5"/>
+<text x="318" y="424" font-size="10" font-weight="500" fill="#8892b0">Backing Store</text>
+<text x="318" y="436" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">ansible_context.db  (SQLite)</text>
 
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <!-- GUEST PROCESSES                                                     -->
@@ -148,26 +163,38 @@
 <text x="1100" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">philote-worker binary</text>
 
 <!-- Row 2: Model Controllers -->
-<rect x="574" y="266" width="122" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-<text x="584" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Model: Gemini</text>
-<text x="584" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">model-controller</text>
+<rect x="574" y="266" width="90" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="584" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Gemini</text>
+<text x="584" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">model-router</text>
 
-<rect x="706" y="266" width="138" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-<text x="716" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Model: ElevenLabs</text>
-<text x="716" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">TTS + STT</text>
+<rect x="670" y="266" width="90" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="680" y="285" font-size="10" font-weight="600" fill="#e8eaf0">OpenAI</text>
+<text x="680" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">model-router</text>
 
-<rect x="854" y="266" width="112" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-<text x="864" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Model: ONNX</text>
-<text x="864" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">onnx-runner</text>
+<rect x="766" y="266" width="100" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="776" y="285" font-size="10" font-weight="600" fill="#e8eaf0">OpenRouter</text>
+<text x="776" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">model-router</text>
 
-<rect x="976" y="266" width="112" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-<text x="986" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Model: MLX</text>
-<text x="986" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">mlx-runner</text>
+<rect x="872" y="266" width="100" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="882" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Parakeet ASR</text>
+<text x="882" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">parakeet-runner</text>
+
+<rect x="978" y="266" width="110" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="988" y="285" font-size="10" font-weight="600" fill="#e8eaf0">ElevenLabs</text>
+<text x="988" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">TTS + STT</text>
+
+<rect x="1094" y="266" width="80" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="1104" y="285" font-size="10" font-weight="600" fill="#e8eaf0">ONNX</text>
+<text x="1104" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">onnx-runner</text>
+
+<rect x="1180" y="266" width="80" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="1190" y="285" font-size="10" font-weight="600" fill="#e8eaf0">MLX</text>
+<text x="1190" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">mlx-runner</text>
 
 <!-- model-router (routing layer) -->
-<rect x="1098" y="266" width="258" height="50" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1" stroke-opacity="0.7"/>
-<text x="1108" y="285" font-size="10" font-weight="600" fill="#d500f9">model-router</text>
-<text x="1108" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">LLM inference routing layer</text>
+<rect x="1266" y="266" width="90" height="50" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1" stroke-opacity="0.7"/>
+<text x="1276" y="285" font-size="10" font-weight="600" fill="#d500f9">router-SDK</text>
+<text x="1276" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">model-router</text>
 
 <!-- Row 3: Runners + Sandbox -->
 <rect x="574" y="328" width="192" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
@@ -179,25 +206,37 @@
 <text x="786" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">shared project graph store</text>
 
 <rect x="978" y="328" width="192" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-<text x="988" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Agent Graph Runner</text>
-<text x="988" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">per-agent cognitive graph</text>
+<text x="988" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Agent Datasource</text>
+<text x="988" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">per-agent cognitive CRUD</text>
 
 <rect x="1180" y="328" width="176" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
 <text x="1190" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Philotic Sandbox</text>
 <text x="1190" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Landlock + seccomp</text>
 
 <!-- Row 4: Library crates -->
-<rect x="574" y="394" width="355" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<rect x="574" y="394" width="150" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
 <text x="584" y="411" font-size="10" font-weight="600" fill="#1de9b6">philotic-primitives-*</text>
-<text x="584" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">extracted: mesh · hotel · agent · data · model · tool</text>
+<text x="584" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">mesh, hotel, agent, data...</text>
 
-<rect x="939" y="394" width="190" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
-<text x="949" y="411" font-size="10" font-weight="600" fill="#1de9b6">philotic-client</text>
-<text x="949" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">IPC client SDK for guests</text>
+<rect x="730" y="394" width="110" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<text x="740" y="411" font-size="10" font-weight="600" fill="#1de9b6">philotic-client</text>
+<text x="740" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">UDS client SDK</text>
 
-<rect x="1139" y="394" width="217" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
-<text x="1149" y="411" font-size="10" font-weight="600" fill="#1de9b6">memory-core</text>
-<text x="1149" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">MemoryEngine trait · Muninn client</text>
+<rect x="846" y="394" width="110" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<text x="856" y="411" font-size="10" font-weight="600" fill="#1de9b6">memory-core</text>
+<text x="856" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">MemoryEngine/Muninn</text>
+
+<rect x="962" y="394" width="110" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<text x="972" y="411" font-size="10" font-weight="600" fill="#1de9b6">media-codec</text>
+<text x="972" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">audio normalizer</text>
+
+<rect x="1078" y="394" width="120" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<text x="1088" y="411" font-size="10" font-weight="600" fill="#1de9b6">perimeter-core</text>
+<text x="1088" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">IngressFence security</text>
+
+<rect x="1204" y="394" width="152" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<text x="1214" y="411" font-size="10" font-weight="600" fill="#1de9b6">data-memorygraphrag</text>
+<text x="1214" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">LifeGraph runner layer</text>
 
 <!-- Annotation: "All guests connect via philotic-client IPC" -->
 <text x="574" y="458" font-size="8.5" fill="#4a5370" font-style="italic">All guest processes connect to the hotel via philotic-client over Unix Domain Socket IPC</text>

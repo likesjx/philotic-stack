@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - catalog-vs-routing-authority
+
+rectangle "catalog-vs-routing-authority" as catalog_vs_routing_authority #Orange {
+}
+
+
+@enduml

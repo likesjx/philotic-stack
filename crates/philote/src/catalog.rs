@@ -9,11 +9,230 @@
 //! forward-compatible with dynamically registered tools from tool-runner guests.
 
 use crate::session::ToolDefinition;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 static TOOL_CATALOG: OnceLock<HashMap<String, ToolDefinition>> = OnceLock::new();
+
+fn graph_record_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["id", "label"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Life Graph node ID (e.g. 'life:open_loop:rowing')."
+            },
+            "label": {
+                "type": "string",
+                "description": "Life Graph node type. Examples: Person, Role, Goal, System, Habit, Project, Commitment, OpenLoop, NextAction, Routine, Decision, Preference, Value, Concern, Event, Signal, GrowthHypothesis, GrowthExperiment, DriftFinding, CapabilityPatch, SkillPatch, ToolPatch, SchemaPatch, AttentionPatch, SystemPatch, StewardshipInstruction."
+            },
+            "datasource": {
+                "type": "string",
+                "description": "Usually 'life-graph'.",
+                "default": "life-graph"
+            }
+        }
+    })
+}
+
+fn source_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["source_id", "source_kind", "reliability"],
+        "properties": {
+            "source_id": {
+                "type": "string",
+                "description": "Source membrane, agent, or memory ID (e.g. 'membrane:telegram')."
+            },
+            "source_kind": {
+                "type": "string",
+                "enum": [
+                    "operator_confirmation", "membrane_event",
+                    "muninn_engram", "graph_passage",
+                    "imported_record", "agent_inference",
+                    "runtime_observation"
+                ]
+            },
+            "reliability": {
+                "type": "object",
+                "required": ["score", "basis"],
+                "properties": {
+                    "score": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                    },
+                    "basis": {
+                        "type": "string",
+                        "enum": [
+                            "operator_confirmed", "direct_observation",
+                            "muninn_trust", "imported_authority",
+                            "agent_inferred", "unknown"
+                        ]
+                    }
+                }
+            },
+            "uri": { "type": "string" },
+            "captured_at": {
+                "type": "string",
+                "description": "ISO 8601 timestamp when this source was captured."
+            }
+        }
+    })
+}
+
+fn passage_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["passage_id"],
+        "properties": {
+            "passage_id": { "type": "string" },
+            "source_ref_id": { "type": "string" },
+            "excerpt_hash": { "type": "string" },
+            "muninn_engram_id": { "type": "string" },
+            "graph_node_id": { "type": "string" }
+        }
+    })
+}
+
+fn evidence_packet_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "packet_id", "claim_ref", "claim_summary",
+            "confidence", "validation_state", "source_reliability",
+            "adjudication_status"
+        ],
+        "properties": {
+            "packet_id": {
+                "type": "string",
+                "description": "Unique ID for this evidence packet."
+            },
+            "claim_ref": graph_record_ref_schema(),
+            "claim_summary": {
+                "type": "string",
+                "description": "One or two sentence summary of what was observed."
+            },
+            "source_refs": {
+                "type": "array",
+                "items": source_ref_schema(),
+                "default": []
+            },
+            "passage_refs": {
+                "type": "array",
+                "items": passage_ref_schema(),
+                "default": []
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+            },
+            "validation_state": {
+                "type": "string",
+                "enum": ["inferred", "proposed", "confirmed", "retired", "conflicted"],
+                "default": "proposed"
+            },
+            "source_reliability": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+            },
+            "adjudication_status": {
+                "type": "string",
+                "enum": [
+                    "not_needed", "pending", "muninn_first",
+                    "graph_review", "operator_required", "resolved", "rejected"
+                ],
+                "default": "not_needed"
+            },
+            "observed_at": {
+                "type": "string",
+                "description": "ISO 8601 timestamp when this was observed."
+            },
+            "valid_time_range": {
+                "type": "object",
+                "properties": {
+                    "starts_at": { "type": "string" },
+                    "ends_at": { "type": "string" }
+                }
+            },
+            "conflict_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": []
+            },
+            "metadata": {
+                "type": "object",
+                "default": {}
+            }
+        },
+        "description": "EvidencePacket. Provide at least one source_ref or passage_ref; ungrounded evidence is rejected by the runner."
+    })
+}
+
+fn conflict_handoff_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "handoff_id", "conflict_id", "finding_type", "summary",
+            "recommended_owner", "requested_muninn_action", "risk",
+            "requires_operator", "status"
+        ],
+        "properties": {
+            "handoff_id": { "type": "string" },
+            "conflict_id": { "type": "string" },
+            "finding_type": {
+                "type": "string",
+                "enum": [
+                    "direct_contradiction", "temporal_conflict",
+                    "granularity_conflict", "identity_ambiguity",
+                    "staleness", "policy_risk"
+                ]
+            },
+            "summary": { "type": "string" },
+            "graph_fact_refs": {
+                "type": "array",
+                "items": graph_record_ref_schema(),
+                "default": []
+            },
+            "evidence_packets": {
+                "type": "array",
+                "items": evidence_packet_schema(),
+                "default": []
+            },
+            "muninn_engram_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": []
+            },
+            "recommended_owner": {
+                "type": "string",
+                "enum": ["muninn", "data_memory_graph_rag", "shared_gate", "operator"]
+            },
+            "requested_muninn_action": {
+                "type": "string",
+                "enum": ["none", "true_up", "contradiction_review", "trust_update", "cultivate"]
+            },
+            "risk": {
+                "type": "string",
+                "enum": ["low", "medium", "high"]
+            },
+            "requires_operator": { "type": "boolean" },
+            "status": {
+                "type": "string",
+                "enum": ["open", "sent_to_muninn", "awaiting_operator", "resolved", "closed_no_action"]
+            },
+            "metadata": {
+                "type": "object",
+                "default": {}
+            }
+        },
+        "description": "ConflictHandoff. Include graph_fact_refs, evidence_packets, or muninn_engram_ids so the conflict is grounded."
+    })
+}
 
 /// Returns the static built-in tool catalog.
 ///
@@ -2710,15 +2929,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["query_id", "query_text", "strategy", "semantic_pivots",
-                             "expansion_policy", "ranking_weights", "max_context_packets"],
+                "required": ["query_id", "query_text"],
                 "properties": {
                     "query_id": {"type": "string"},
                     "query_text": {"type": "string", "description": "Human-language query."},
                     "strategy": {
                         "type": "string",
                         "enum": ["semantic_pivot", "vector_then_expand", "memory_aware_graph_rank"],
-                        "default": "memory_aware_graph_rank"
+                        "default": "memory_aware_graph_rank",
+                        "description": "Defaults to memory_aware_graph_rank when omitted."
                     },
                     "operator_intent": {
                         "type": "string",
@@ -2726,7 +2945,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "semantic_pivots": {
                         "type": "array",
-                        "minItems": 1,
+                        "description": "Optional. The runner can auto-embed query_text when this is omitted.",
                         "items": {
                             "type": "object",
                             "required": ["space", "embedding_model", "embedding_dims", "query_text_hash"],
@@ -2859,13 +3078,57 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "type": "object",
                 "required": ["evidence", "operator_approved"],
                 "properties": {
-                    "evidence": {
-                        "type": "object",
-                        "description": "The EvidencePacket to commit (same shape as life.observe)."
-                    },
+                    "evidence": evidence_packet_schema(),
                     "operator_approved": {
                         "type": "boolean",
                         "description": "True if operator has explicitly approved this commit."
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.conflict".into(),
+        ToolDefinition {
+            tool_name: "life.conflict".into(),
+            description: "Open a governed Life Graph conflict handoff when graph evidence, \
+                          Muninn memory, or operator context disagrees. Use this to record \
+                          the conflict and route it toward Muninn, graph review, shared gate, \
+                          or operator resolution; do not use it for ordinary observations."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["handoff"],
+                "properties": {
+                    "handoff": conflict_handoff_schema()
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.resolve".into(),
+        ToolDefinition {
+            tool_name: "life.resolve".into(),
+            description: "Resolve a Life Graph conflict handoff after review. This is a \
+                          governance tool: high-risk or operator-required handoffs need \
+                          explicit operator approval before resolution."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["handoff", "resolution_summary", "operator_approved"],
+                "properties": {
+                    "handoff": conflict_handoff_schema(),
+                    "resolution_summary": {
+                        "type": "string",
+                        "description": "Concise explanation of how the conflict should be resolved."
+                    },
+                    "operator_approved": {
+                        "type": "boolean",
+                        "description": "True only when the operator explicitly approved this resolution."
                     }
                 }
             }),
@@ -2896,7 +3159,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "evidence_packets": {
                         "type": "array",
                         "minItems": 1,
-                        "items": {"type": "object"}
+                        "items": evidence_packet_schema()
                     },
                     "risk": {
                         "type": "string",
@@ -2918,6 +3181,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::{skill_implied_tools, skill_is_relevant_for_turn, tool_catalog};
+    use serde_json::json;
 
     #[test]
     fn role_list_has_specific_model_facing_description() {
@@ -2942,10 +3206,80 @@ mod tests {
 
         assert!(life_recall.description.contains("operator's LifeGraph"));
         assert!(life_recall.description.contains("text/fallback recall"));
+        assert_eq!(
+            life_recall.input_schema["required"],
+            json!(["query_id", "query_text"])
+        );
+        assert_eq!(
+            life_recall.input_schema["properties"]["semantic_pivots"]["description"],
+            "Optional. The runner can auto-embed query_text when this is omitted."
+        );
         assert!(
             !life_recall
                 .description
                 .contains("Requires an embedding vector")
+        );
+    }
+
+    #[test]
+    fn life_steward_implied_tools_have_catalog_entries() {
+        let catalog = tool_catalog();
+        for tool in skill_implied_tools("life.steward") {
+            assert!(
+                catalog.contains_key(*tool),
+                "life.steward implied tool {tool} should have a real catalog schema"
+            );
+        }
+    }
+
+    #[test]
+    fn life_write_tools_expose_governance_payloads() {
+        let catalog = tool_catalog();
+        let commit = catalog
+            .get("life.commit")
+            .expect("life.commit catalog entry");
+        assert_eq!(
+            commit.input_schema["required"],
+            json!(["evidence", "operator_approved"])
+        );
+        assert_eq!(
+            commit.input_schema["properties"]["evidence"]["required"],
+            json!([
+                "packet_id",
+                "claim_ref",
+                "claim_summary",
+                "confidence",
+                "validation_state",
+                "source_reliability",
+                "adjudication_status"
+            ])
+        );
+
+        let conflict = catalog
+            .get("life.conflict")
+            .expect("life.conflict catalog entry");
+        assert_eq!(conflict.input_schema["required"], json!(["handoff"]));
+        assert_eq!(
+            conflict.input_schema["properties"]["handoff"]["required"],
+            json!([
+                "handoff_id",
+                "conflict_id",
+                "finding_type",
+                "summary",
+                "recommended_owner",
+                "requested_muninn_action",
+                "risk",
+                "requires_operator",
+                "status"
+            ])
+        );
+
+        let resolve = catalog
+            .get("life.resolve")
+            .expect("life.resolve catalog entry");
+        assert_eq!(
+            resolve.input_schema["required"],
+            json!(["handoff", "resolution_summary", "operator_approved"])
         );
     }
 

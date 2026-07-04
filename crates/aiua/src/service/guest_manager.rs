@@ -365,22 +365,28 @@ impl GuestManager {
         tokio::spawn(async move {
             let _ = shutdown_rx.recv().await;
             info!("Universal Dematerialization Shutdown Triggered. Reaping active Guests...");
-            
+
             if let Ok(all_guests) = graph_clone.list_guests(&hotel_clone, false) {
                 for rec in all_guests {
                     if rec.is_active {
                         info!("Shutdown: Reclaiming guest [{}]...", rec.guest_id);
                         let mut mat = materializer_clone.lock().await;
                         if let Err(e) = mat.reclaim_guest(&rec.guest_id).await {
-                            warn!("Shutdown: Failed to reclaim guest [{}]: {}", rec.guest_id, e);
+                            warn!(
+                                "Shutdown: Failed to reclaim guest [{}]: {}",
+                                rec.guest_id, e
+                            );
                         }
                         drop(mat);
-                        
+
                         // Belt-and-suspenders: kill directly if PID still exists
                         if let Some(active_pid) = rec.active_pid.as_deref() {
                             if let Ok(pid) = active_pid.parse::<u32>() {
                                 if LocalProcessMaterializer::pid_exists(pid) {
-                                    info!("Shutdown: Killing guest [{}] PID {} directly.", rec.guest_id, pid);
+                                    info!(
+                                        "Shutdown: Killing guest [{}] PID {} directly.",
+                                        rec.guest_id, pid
+                                    );
                                     LocalProcessMaterializer::terminate_pid(pid);
                                 }
                             }

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - lifegraph-muninn-promotion
+
+rectangle "lifegraph-muninn-promotion" as lifegraph_muninn_promotion #Orange {
+}
+
+
+@enduml

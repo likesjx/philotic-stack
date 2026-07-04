@@ -24,6 +24,7 @@ pub mod mcp_endpoint;
 pub mod mcp_route;
 pub mod membership;
 pub mod meshops;
+pub mod model_catalog_discovery;
 pub mod model_manager;
 pub mod provider_keys;
 pub mod registry;

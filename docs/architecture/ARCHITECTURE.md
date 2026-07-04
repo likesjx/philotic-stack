@@ -64,25 +64,30 @@ Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 ## 1. Mental Model
 
 ```
-           ┌──────────────────────────────────────────────┐
-           │               HOTEL  (aiua daemon)            │
-           │                                               │
-           │  ┌──────────┐   IPC    ┌────────────────────┐ │
-           │  │ membrane  │◄────────►│  aiua (hotel)      │ │
-           │  └──────────┘   UDS    │                    │ │
-           │                        │  • ContextGraph DB  │ │
-           │  ┌──────────┐          │  • GuestManager     │ │
-           │  │ philote  │◄────────►│  • IpcServer        │ │
-           │  └──────────┘   UDS    │  • BeaconDaemon     │ │
-           │                        │  • BlobService      │ │
-           │  ┌─────────────┐       │  • Outbound Disp.   │ │
-           │  │model-router │◄──────►└────────────────────┘ │
-           │  └─────────────┘                               │
-           └──────────────────────────────────────────────┘
-                 │ UDP control plane / TCP execution plane
-           ┌─────▼────────────────────────────────────────┐
-           │              REMOTE HOTEL                    │
-           └──────────────────────────────────────────────┘
+         ┌────────────────────────────────────────────────────────┐
+         │                 HOTEL  (aiua daemon)                   │
+         │  ┌──────────────────────────────────────────────────┐  │
+         │  │               [ INGRESS FENCE ]                  │  │
+         │  │                                                  │  │
+         │  │  ┌──────────┐   IPC    ┌──────────────────────┐  │  │
+         │  │  │ membrane  │◄────────►│  aiua (hotel)        │  │  │
+         │  │  └──────────┘   UDS    │                      │  │  │
+         │  │                        │  • ContextGraph DB   │  │  │
+         │  │  ┌──────────┐          │  • GuestManager      │  │  │
+         │  │  │ philote  │◄────────►│  • IpcServer         │  │  │
+         │  │  └──────────┘   UDS    │  • BeaconDaemon      │  │  │
+         │  │   ▲                    │  • BlobService       │  │  │
+         │  │   │ Whisper            │  • PerimeterService  │  │  │
+         │  │   ▼ Loop (Paracrine)   │  • HealDispatcher    │  │  │
+         │  │  ┌─────────────┐       │  • Outbound Disp.    │  │  │
+         │  │  │model-router │◄──────►└──────────────────────┘  │  │
+         │  │  └─────────────┘                                 │  │
+         │  └──────────────────────────────────────────────────┘  │
+         └────────────────────────────────────────────────────────┘
+               │ UDP Gossip / WebRTC Signaling / TCP execution plane
+         ┌─────▼──────────────────────────────────────────────────┐
+         │                  REMOTE HOTEL                          │
+         └────────────────────────────────────────────────────────┘
 ```
 
 **Key design constraints:**
@@ -106,12 +111,19 @@ Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 | `philotic-client`   | Guest SDK — IPC client for guests to talk to the hotel       |
 | `membrane-*`        | Protocol gateway guests (Telegram, Discord, MCP)             |
 | `philote`           | Persona/agent cognitive loop guest binary                    |
-| `model-router`      | Shared LLM inference routing SDK                             |
+| `model-router`      | Shared LLM inference routing SDK and provider controllers     |
 | `philotic-web`      | Desktop operator surface (Next.js)                           |
 | `tool-runner`       | Workspace tool executor guest                                |
-| `graph-datasource`  | Autonomous graph partition management                        |
+| `agent-datasource`  | Per-agent cognitive graph partition datasource               |
+| `graph-datasource`  | Autonomous graph partition management tool surface            |
 | `graph-intelligence`| Project intelligence graph + MCP server                      |
-| `robot-kit`         | Embedded robotics HAL (separate concern, not hotel/guest)    |
+| `data-memorygraphrag`| MemGraphRAG / LifeGraph runner toolset layer                |
+| `router-listener`   | Router training tap                                          |
+| `table-datasource`  | Multi-DB datasource support + full CRUD task kinds            |
+| `media-codec`       | Audio normalization and voice transcoding                    |
+| `perimeter-core`     | Security perimeter boundary, IngressFence                    |
+| `heal-dispatcher`   | FunctionGemma self-healing dispatcher                        |
+| `parakeet-runner`   | NVIDIA Parakeet ASR model controller guest                   |
 
 ### 2.1 The Legacy Reference
 
@@ -148,13 +160,15 @@ main()
 
 ### 3.2 In-Process Services
 
-| Service           | File                         | Description                                                                                        |
-| ----------------- | ---------------------------- | -------------------------------------------------------------------------------------------------- |
-| `IpcServer`       | `service/ipc.rs`             | Unix Domain Socket server. Routes IPC requests from guests to hotel logic.                         |
-| `GuestManager`    | `service/guest_manager.rs`   | Materializes and supervises guest OS processes. Consumes `Arc<dyn GraphStorage>`.                  |
-| `BlobService`     | `service/blob.rs`            | HTTP server for large payload upload/download via content-addressed SHA-256 IDs.                   |
-| `mesh_dispatcher` | `service/mesh_dispatcher.rs` | Outbound routed-task dispatcher. Polls the EventLedger and sends framed `BeaconMessage` batches to peer hotels over the execution plane. |
-| `webrtc_guest`    | `service/webrtc_guest.rs`    | WebRTC transceiver for ephemeral P2P data channels, bypassing the mesh ledger.                     |
+| Service                 | File                         | Description                                                                                        |
+| ----------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------- |
+| `IpcServer`             | `service/ipc.rs`             | Unix Domain Socket server. Routes IPC requests from guests to hotel logic.                         |
+| `GuestManager`          | `service/guest_manager.rs`   | Materializes and supervises guest OS processes. Consumes `Arc<dyn GraphStorage>`.                  |
+| `BlobService`           | `service/blob.rs`            | HTTP server for large payload upload/download via content-addressed SHA-256 IDs.                   |
+| `mesh_dispatcher`       | `service/mesh_dispatcher.rs` | Outbound routed-task dispatcher. Polls the EventLedger and sends framed `BeaconMessage` batches to peer hotels over the execution plane. |
+| `webrtc_guest`          | `service/webrtc_guest.rs`    | WebRTC transceiver for ephemeral P2P data channels, bypassing the mesh ledger.                     |
+| `HotelPerimeterService` | `service/perimeter.rs`       | Governs the security perimeter IngressFence rules and authorization gates for incoming requests.   |
+| `HealDispatcher`        | `service/heal.rs`            | Subscribes to the `heal_queue` in the Context Graph and drives recovery tasks.                     |
 
 ### 3.3 `graph.rs` — Legacy ContextGraph
 
@@ -241,18 +255,21 @@ BeaconMessage {
 Guests are OS child processes spawned by `GuestManager`. They communicate with
 the hotel exclusively over the IPC UDS socket using `PhiloticClient`.
 
-| Binary                      | Crate                 | Role identity                    | Purpose                                                    |
-| --------------------------- | --------------------- | -------------------------------- | ---------------------------------------------------------- |
-| `membrane-telegram`         | `crates/membrane-telegram` | `membrane-telegram-01`       | Telegram gateway, ingress/egress for external messages     |
-| `membrane-discord`          | `crates/membrane-discord`  | `membrane-discord-01`        | Discord gateway                                            |
-| `membrane-mcp`              | `crates/membrane-mcp`      | `membrane-mcp-01`            | MCP gateway                                                |
-| `membrane`                 | `crates/membrane`      | compatibility wrapper             | Transitional wrapper over shared membrane runtime during provider extraction |
-| `philote`                | `crates/philote`      | `agent-{persona}-01`             | Persona runtime, long-running reasoning loop               |
-| `model-controller-*`        | `crates/model-router` | `model-router-01`                | Multi-provider LLM/TTS routing guest (Gemini, ElevenLabs)  |
-| `tool-runner`               | `crates/tool-runner`  | `{hotel}:tool-runner`            | Workspace tool executor                                    |
-| `philotic-web`              | `crates/philotic-web` | `desktop-operator-01`            | Desktop/web operator surface                               |
+| Binary                      | Crate                      | Role identity                    | Purpose                                                    |
+| --------------------------- | -------------------------- | -------------------------------- | ---------------------------------------------------------- |
+| `membrane-telegram`         | `crates/membrane-telegram` | `membrane-telegram-01`           | Telegram gateway, ingress/egress for external messages     |
+| `membrane-discord`          | `crates/membrane-discord`  | `membrane-discord-01`            | Discord gateway                                            |
+| `membrane-mcp`              | `crates/membrane-mcp`      | `membrane-mcp-01`                | MCP gateway                                                |
+| `membrane`                  | `crates/membrane`          | compatibility wrapper            | Transitional wrapper over shared membrane runtime          |
+| `philote`                   | `crates/philote`           | `agent-{persona}-01`             | Persona runtime, long-running reasoning loop               |
+| `model-controller-*`        | `crates/model-router`      | `model-router-01`                | Multi-provider LLM/TTS routing guest (Gemini, ElevenLabs, OpenAI, OpenRouter) |
+| `parakeet-runner`           | `crates/parakeet-runner`   | `{hotel}:parakeet-runner`        | NVIDIA Parakeet ASR model controller guest                 |
+| `tool-runner`               | `crates/tool-runner`       | `{hotel}:tool-runner`            | Workspace tool executor                                    |
+| `philote-worker`            | `crates/philote`           | `agent-worker-{id}`              | Bounded subagent/delegated cognitive task runner           |
+| `agent-datasource`          | `crates/agent-datasource`  | `{hotel}:agent-datasource`       | Multi-DB partition and CRUD datasource interface           |
+| `philotic-web`              | `crates/philotic-web`      | `desktop-operator-01`            | Desktop operator dashboard and OIDC membrane gateway       |
 
-The `model-router` crate now acts as shared SDK/runtime infrastructure. The two `model-controller-*` binaries are separate materialized guests for their respective providers.
+The `model-router` crate now acts as shared SDK/runtime infrastructure. The various `model-controller-*` binaries are separate materialized guests for their respective providers.
 
 ### Guest Boot Sequence
 
@@ -413,9 +430,19 @@ goes offline, events accumulate in the ledger. When the peer comes back
 online, the outbound dispatcher resumes from the last acknowledged cursor
 position — guaranteeing **at-least-once delivery** with **idempotent processing**.
 
-Current implementation note:
-- inbound `MESH_EVENT_BATCH` payloads are now delivered into the local role inbox and trigger a real `MESH_EVENT_ACK` reply
-- the ACK is emitted from the async inbox loop after enqueueing the inbound batch to the writer thread; that is a transitional approximation of durable receipt, not yet a strictly post-commit acknowledgment boundary
+### 8.6 WebRTC P2P Execution Channels
+
+For low-latency peer-to-peer data plane transport, the Hotel supports WebRTC signaling:
+- Signaling messages (`WEBRTC_SIGNAL`) are routed using the node's cryptographic identity over the standard TCP execution plane or UDP control plane.
+- Once signaling completes (offer/answer handshake), hotels establish direct WebRTC data channels, bypassing the need to write every transient execution frame to the durable `EventLedger`.
+
+### 8.7 Whisper Protocol (Paracrine Loop)
+
+The **Whisper Protocol** provides local paracrine dispatch for cooperative, concurrent task resolution:
+- **Paracrine Whispers**: Guests can broadcast non-blocking or blocking whispers locally to peers within the same hotel using `ParacrineEmit` commands.
+- **Lookaside Reflex**: Solves immediate query routing by checking local capability indexes before falling back to external mesh dispatch.
+- **Membrane Attribution**: Ensures incoming events carry proper trace metadata detailing which gateway membrane or peer ingress received the request.
+- **ReturnRoute**: Keeps track of final response routing paths (`final_reply_guest_id`) so results can flow cleanly back through the exact same UDS connection and model router instance.
 
 ---
 
@@ -448,13 +475,19 @@ trait GraphStorage: Send + Sync {
 }
 ```
 
-### 9.2 SQLite Implementations (`sqlite_storage.rs`)
+### 9.2 SQLite and Cypher-First Graph Implementations
 
-| Trait           | Implementation        | DB / Table                                                                    |
+The stack supports a hybrid storage model:
+- **Local SQLite Storage** (`sqlite_storage.rs`): Used for local context graph, event logs, and metadata.
+- **Agent Datasource Partitioning** (`agent-datasource`): Manages per-agent SQLite cognitive graph partitions, supporting structured CRUD operations across multiple databases.
+- **Memgraph Central Store** (Optional): A central Cypher/Bolt-backed graph-datasource provider configured on remote environments (e.g. VPS Jane) to allow shared, queryable property graph structures across hotels.
+
+| Trait           | Implementation        | DB / Table / Store                                                            |
 | --------------- | --------------------- | ----------------------------------------------------------------------------- |
-| `EventStorage`  | `SqliteEventStorage`  | `mesh_events`                                                                 |
-| `CursorStorage` | `SqliteCursorStorage` | `mesh_cursors`                                                                |
-| `GraphStorage`  | `SqliteGraphStorage`  | `node_config`, `materialized_guests`, `agent_identities`, `memory_apartments`, session graph entities, route/identity records |
+| `EventStorage`  | `SqliteEventStorage`  | `mesh_events` (local SQLite)                                                  |
+| `CursorStorage` | `SqliteCursorStorage` | `mesh_cursors` (local SQLite)                                                 |
+| `GraphStorage`  | `SqliteGraphStorage`  | `node_config`, `materialized_guests`, `agent_identities` (local SQLite)       |
+| `GraphQuery`    | `Memgraph / Bolt`     | Cypher property graph for central indexing and multi-agent relationship querying |
 
 ### 9.3 Adding a New Storage Backend
 
@@ -462,17 +495,14 @@ To plug in PebbleDB, RocksDB, or Postgres:
 
 1. Create a new crate (e.g. `ansible-db-pebble`)
 2. Implement `GraphStorage + EventStorage + CursorStorage` for your engine
-3. In `ansible/main.rs`, swap the one line:
+3. In `crates/aiua/src/main.rs`, register the provider:
 
    ```rust
-   // Before (SQLite)
-   let graph_storage = SqliteGraphStorage::open(db_path)?;
-
-   // After (PebbleDB)
+   // Registration is managed via runtime config matching:
    let graph_storage = PebbleGraphStorage::open(db_path)?;
    ```
 
-`GuestManager`, `IpcServer`, and the outbound dispatcher are unchanged.
+`GuestManager`, `IpcServer`, and the outbound dispatcher remain decoupled via these interfaces.
 
 ---
 
@@ -596,13 +626,13 @@ To move a guest process from Hotel A → Hotel B:
 
 ## 12. Security Model
 
-| Layer        | Mechanism                                                       |
-| ------------ | --------------------------------------------------------------- |
-| Mesh PKI     | WireGuard-inspired Ed25519 node identities and ephemeral X25519 ECDH session keys |
-| Legacy Mesh PSK | HMAC-SHA256 over `(payload \|\| timestamp)` with pre-shared key (migrating out) |
-| Replay guard | ±5 minute timestamp window on all BeaconMessages                |
-| IPC          | Unix file-system permissions on the UDS socket                  |
-| Future       | Automated certificate rotation                                  |
+| Layer          | Mechanism                                                       |
+| -------------- | --------------------------------------------------------------- |
+| Mesh PKI & Auth| WireGuard-inspired Ed25519 node identities and ephemeral X25519 ECDH session keys |
+| Ingress Fence  | Role-based and path-based ingress restrictions configured in the HotelPerimeterService |
+| Replay guard   | ±5 minute timestamp window on all BeaconMessages                |
+| IPC            | Unix file-system permissions on the UDS socket                  |
+| Sandbox        | Landlock + seccomp constraints for guest processes in tool execution |
 
 Set `PHILOTIC_MESH_PSK=<secret>` on all hotels in the same mesh cluster for fallback.
 Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
@@ -634,14 +664,14 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 | Session Graph Model           | ✅ Complete | Graph-owned sessions, participants, turns, and events  |
 | Derived Apartment Sync        | ✅ Complete | `SyncApartment` IPC, LWW apartment upsert              |
 | Database Agnosticism          | ✅ Complete | `EventStorage`, `CursorStorage`, `GraphStorage` traits |
-| Task Lifecycle Engine         | 🔲 Planned  | State machine with invariants (PORT-BP-004)            |
-| Auth Exchange                 | 🔲 Planned  | Invite/ticket validation (PORT-BP-006)                 |
-| Scaling / Performance Monitor | 🔲 Planned  | Process scale-out/in based on machine metrics          |
-| WebRTC P2P Data Channels      | 🔶 In Progress | Signal/SDP types exist; `WebRtcGuest` started but ICE/lifecycle incomplete |
+| Task Lifecycle Engine         | ✅ Complete | State machine with invariants, UserTask planning/creation |
+| Auth Exchange                 | ✅ Complete | ECDH-signed invite acceptance and keys pairing         |
+| WebRTC P2P Data Channels      | ✅ Complete | Signaling messages routed P2P for direct data loops    |
 | Multi-Hotel Parity Tests      | ✅ Complete | Mesh-visible capability routing and remote model proof |
+| Scaling / Performance Monitor | 🔲 Planned  | Process scale-out/in based on machine metrics          |
 
 ### Current Transitional Notes
 
-- control-plane peer discovery and execution-plane addressing are still carrying transitional local-development assumptions in some paths
-- apartment sync remains a derived checkpoint path and should not be confused with canonical session truth
-- role incarnation routing direction is established, but the full graph-backed role/toolset/handoff system is still a live implementation seam
+- Role activation, toolset profiling, and local handoff mechanics are fully implemented, while large-scale mesh placement of cognitive work is still a live seam.
+- Apartment sync remains a derived checkpoint path and should not be confused with canonical session truth.
+- Local loopback-only peer resolution remains fallback, while signed mesh ceremonies support multi-host deployment.
