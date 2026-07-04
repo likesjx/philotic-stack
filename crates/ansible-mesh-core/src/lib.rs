@@ -38,7 +38,7 @@ pub mod validation;
 pub mod webrtc;
 pub mod whisper_training;
 
-pub use philotic_primitives_mesh::beacon::{BeaconMessage, MsgType};
+pub use philotic_primitives_mesh::beacon::{BeaconMessage, BeaconPayload, MsgType, WireEncoding};
 
 /// Represents a unique identifier for a node in the mesh network.
 pub type NodeId = String;

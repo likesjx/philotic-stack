@@ -13958,9 +13958,9 @@ impl IpcServer {
             msg_type: ansible_mesh_core::MsgType::MeshMembershipAccept,
             seq: 0,
             total: 1,
-            payload,
+            payload: payload.into(),
             timestamp,
-            hmac: Vec::new(),
+            hmac: ansible_mesh_core::BeaconPayload::default(),
         };
 
         let target_addr = format!("{}:{}", invite.payload.mesh_host, invite.payload.mesh_port);

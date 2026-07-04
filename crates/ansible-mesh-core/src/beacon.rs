@@ -514,9 +514,9 @@ mod tests {
             msg_type: MsgType::Heartbeat,
             seq: 0,
             total: 1,
-            payload: serde_json::to_vec(&payload).unwrap(),
+            payload: serde_json::to_vec(&payload).unwrap().into(),
             timestamp: 0,
-            hmac: vec![],
+            hmac: crate::BeaconPayload::default(),
         }
     }
 
