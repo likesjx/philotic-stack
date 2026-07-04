@@ -117,6 +117,28 @@ const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 90;
 #[cfg(test)]
 const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 1;
 
+/// Test-only ledger dispatcher channel. In production the durable-writer
+/// thread in `main.rs` drains `dispatcher_rx`; unit tests do not spawn that
+/// thread, so a bare bounded channel deadlocks once its buffer fills (the
+/// server's `dispatcher_tx.send().await` parks forever and the test hangs).
+/// This helper forwards the bounded channel into an unbounded one via a
+/// background drain task, so ledger sends never block while tests can still
+/// observe every `LedgerCommand` (or simply drop the receiver to sink them).
+#[cfg(test)]
+pub(crate) fn test_dispatcher_channel() -> (
+    mpsc::Sender<LedgerCommand>,
+    mpsc::UnboundedReceiver<LedgerCommand>,
+) {
+    let (tx, mut rx) = mpsc::channel::<LedgerCommand>(64);
+    let (fwd_tx, fwd_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            let _ = fwd_tx.send(cmd);
+        }
+    });
+    (tx, fwd_rx)
+}
+
 fn normalize_marker_text(text: &str) -> String {
     text.chars()
         .map(|ch| {
@@ -7576,8 +7598,10 @@ impl IpcServer {
                     }
                 };
                 // Group active incarnations by agent_id.
-                let mut active_by_agent: std::collections::HashMap<String, Vec<RoleIncarnationRecord>> =
-                    std::collections::HashMap::new();
+                let mut active_by_agent: std::collections::HashMap<
+                    String,
+                    Vec<RoleIncarnationRecord>,
+                > = std::collections::HashMap::new();
                 for rec in incarnations {
                     if matches!(rec.readiness_state, RoleReadinessState::ActiveInSession) {
                         active_by_agent
@@ -7604,7 +7628,10 @@ impl IpcServer {
                             &rec.role_name,
                             RoleReadinessState::Routable,
                         ) {
-                            warn!("HealRoleHandoffLoops: demote {agent_id}:{}: {e}", rec.role_name);
+                            warn!(
+                                "HealRoleHandoffLoops: demote {agent_id}:{}: {e}",
+                                rec.role_name
+                            );
                         }
                     }
                     if let Some(hq) = heal_queue {
@@ -7643,9 +7670,15 @@ impl IpcServer {
                 }
 
                 if healed_agents > 0 {
-                    info!(healed_agents, "HealRoleHandoffLoops: healed role-handoff loops");
+                    info!(
+                        healed_agents,
+                        "HealRoleHandoffLoops: healed role-handoff loops"
+                    );
                 }
-                IpcResponse::success("heal", Some(serde_json::json!({"healed_agents": healed_agents})))
+                IpcResponse::success(
+                    "heal",
+                    Some(serde_json::json!({"healed_agents": healed_agents})),
+                )
             }
             IpcRequest::SubscribeInbox { role } => {
                 info!("SubscribeInbox for role: {}", role);
@@ -8997,7 +9030,7 @@ impl IpcServer {
                 // primary_agent_id (its "targets_base_agent" case, meant for fresh
                 // inbound task delivery) and would clobber the inferred fallback right
                 // back to the unregistered active incarnation it was meant to avoid.
-                let route_resolution = if response_like_agent_action.is_some() {
+                let mut route_resolution = if response_like_agent_action.is_some() {
                     AgentRouteResolution::Deliver(target_guest_id.clone())
                 } else {
                     Self::resolve_agent_route(
@@ -9010,6 +9043,81 @@ impl IpcServer {
                     )
                     .await
                 };
+                // Last-resort orchestrator fallback for fresh inbound agent tasks:
+                // resolve_agent_route returns Deliver(active_incarnation) for guests
+                // that are not configured locally so the auto-reroute below can forward
+                // them to their home hotel. But if the guest is ALSO unknown to the mesh
+                // (no advertisement, no HotelStateSync roster entry, no home_node), the
+                // task would be "delivered" to a guest that exists nowhere and silently
+                // black-holed. Route it to the session's live orchestrator instead.
+                if response_like_agent_action.is_none()
+                    && target_role == "agent"
+                    && target_node == local_node_id
+                {
+                    if let AgentRouteResolution::Deliver(Some(ref resolved_guest_id)) =
+                        route_resolution
+                    {
+                        let is_live_local = {
+                            let guard = inboxes.lock().await;
+                            guard
+                                .get(target_role.as_str())
+                                .into_iter()
+                                .flatten()
+                                .any(|subscriber| &subscriber.guest_id == resolved_guest_id)
+                        };
+                        if !is_live_local
+                            && !Self::configured_local_guest_exists(
+                                graph,
+                                local_node_id,
+                                resolved_guest_id,
+                            )
+                        {
+                            let remote_home = {
+                                let reg = registry.read().await;
+                                Self::resolve_guest_home_node(graph, &reg, resolved_guest_id)
+                            };
+                            if remote_home.is_none() {
+                                let session = serde_json::from_str::<serde_json::Value>(&task_json)
+                                    .ok()
+                                    .and_then(|payload| {
+                                        payload
+                                            .get("session_id")
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(str::to_string)
+                                    })
+                                    .and_then(|session_id| {
+                                        graph.get_session(&session_id).ok().flatten()
+                                    });
+                                if let Some(session) = session {
+                                    let live_agent_guests: Vec<String> = {
+                                        let guard = inboxes.lock().await;
+                                        guard
+                                            .get(target_role.as_str())
+                                            .into_iter()
+                                            .flatten()
+                                            .map(|subscriber| subscriber.guest_id.clone())
+                                            .collect()
+                                    };
+                                    if let Some(orchestrator_guest_id) =
+                                        Self::resolve_orchestrator_guest_id(
+                                            graph,
+                                            &session,
+                                            &live_agent_guests,
+                                        )
+                                    {
+                                        warn!(
+                                            "Resolved agent guest [{}] is not configured locally and unknown to the mesh; falling back to orchestrator guest [{}].",
+                                            resolved_guest_id, orchestrator_guest_id
+                                        );
+                                        route_resolution = AgentRouteResolution::Deliver(Some(
+                                            orchestrator_guest_id,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Compute resolved_target_guest_id BEFORE the auto-reroute block so we can
                 // gate on it — target_guest_id may be None (e.g. membrane sends target_role="agent"
                 // with no explicit guest_id), but resolve_agent_route fills in the active brain/
@@ -17746,7 +17854,7 @@ mod tests {
     async fn emit_task_is_delivered_to_registered_local_role() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
@@ -17849,7 +17957,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-jane-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -18004,7 +18112,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-jane-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -18154,7 +18262,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-aria-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -18293,7 +18401,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-foreign-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -18406,7 +18514,7 @@ mod tests {
     async fn emit_task_can_target_specific_guest_within_shared_role() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
@@ -18498,7 +18606,7 @@ mod tests {
     async fn emit_task_routes_agent_work_to_active_incarnation_from_session() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -18610,7 +18718,7 @@ mod tests {
     async fn emit_task_overwrites_stale_embedded_guest_with_active_incarnation() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -18722,7 +18830,7 @@ mod tests {
     async fn emit_task_targets_response_like_agent_payload_to_originating_guest() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -18817,7 +18925,7 @@ mod tests {
     async fn emit_task_targets_response_like_agent_payload_from_return_route() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -18905,7 +19013,7 @@ mod tests {
         // delivery, not for payloads that already went through response inference).
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -19000,7 +19108,7 @@ mod tests {
     async fn emit_task_rejects_unresolved_response_like_agent_payload() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -19063,7 +19171,7 @@ mod tests {
     async fn emit_task_routes_base_agent_target_to_active_incarnation() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -19174,7 +19282,7 @@ mod tests {
     async fn emit_task_falls_back_to_orchestrator_when_active_incarnation_is_unregistered() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -19293,7 +19401,7 @@ mod tests {
     async fn emit_task_defaults_to_orchestrator_when_session_has_no_active_incarnation() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -19412,7 +19520,7 @@ mod tests {
     async fn emit_task_prefers_persisted_local_delivery_guest_when_no_active_incarnation() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let now = unix_ts();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
@@ -19564,7 +19672,7 @@ mod tests {
     async fn emit_task_parks_for_missing_active_incarnation_and_flushes_after_register() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -19701,7 +19809,7 @@ mod tests {
     async fn emit_task_parks_for_persisted_local_delivery_guest_and_flushes_after_register() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let now = unix_ts();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
@@ -19843,7 +19951,7 @@ mod tests {
     async fn emit_task_ignores_stale_persisted_local_delivery_guest_and_falls_back() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let now = unix_ts();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
@@ -19994,7 +20102,7 @@ mod tests {
     async fn emit_task_marker_policy_gives_receptor_ingress_a_shorter_half_life() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let now = unix_ts();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
@@ -20147,7 +20255,7 @@ mod tests {
     async fn emit_task_supersedes_older_local_provenance_when_active_incarnation_is_newer() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let now = unix_ts();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
@@ -20601,7 +20709,7 @@ mod tests {
     async fn handoff_to_live_role_switches_active_incarnation_and_delivers_bundle() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -20757,7 +20865,7 @@ mod tests {
     async fn role_incarnation_can_initiate_manual_handoff_to_role() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -20902,7 +21010,7 @@ mod tests {
     async fn handoff_to_missing_role_returns_pending_until_role_inbox_is_routable() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -21143,7 +21251,7 @@ mod tests {
     async fn spawn_subagent_acquires_lease_and_returns_ok() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -21231,7 +21339,7 @@ mod tests {
     async fn emit_task_can_target_specific_guest_with_large_audio_payload() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
@@ -21317,7 +21425,7 @@ mod tests {
     async fn emit_task_for_remote_node_stays_off_local_inbox() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
@@ -21387,7 +21495,7 @@ mod tests {
     async fn get_config_can_return_live_mesh_registry_snapshot() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
@@ -21478,7 +21586,7 @@ mod tests {
     async fn get_secret_returns_vault_secret_for_authorized_guest() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -21552,7 +21660,7 @@ mod tests {
     async fn emit_task_persists_session_and_turn_metadata() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -21629,7 +21737,7 @@ mod tests {
     async fn emit_task_persists_agent_runtime_provenance_with_authority_and_delivery_context() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -21757,7 +21865,7 @@ mod tests {
     async fn get_config_can_return_canonical_session_snapshot() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -21890,7 +21998,7 @@ mod tests {
     async fn canonical_session_snapshot_includes_agent_runtime_provenance() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -22058,7 +22166,7 @@ mod tests {
     async fn canonical_session_snapshot_applies_reflex_overrides_over_inferred_reflexes() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -22182,7 +22290,7 @@ mod tests {
     async fn canonical_session_snapshot_projects_reflex_policy_records_with_precedence() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -22338,7 +22446,7 @@ mod tests {
     async fn session_snapshot_seeds_bindings_from_toolset_profile_on_fresh_role_session() {
         let _guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -22482,7 +22590,7 @@ mod tests {
     async fn session_snapshot_includes_approval_policy_from_session_summary() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -22563,7 +22671,7 @@ mod tests {
     async fn session_snapshot_includes_bindings_and_status_from_session_summary() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -23012,7 +23120,7 @@ mod tests {
      {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -23138,7 +23246,7 @@ mod tests {
     async fn session_snapshot_prefers_live_local_generic_model_over_remote_advertisement() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -23276,7 +23384,7 @@ mod tests {
     async fn session_snapshot_suppresses_remote_model_route_when_placement_risk_elevated() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -23415,7 +23523,7 @@ mod tests {
      {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -23546,7 +23654,7 @@ mod tests {
     async fn session_snapshot_includes_workspace_runner_base_config() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -23668,7 +23776,7 @@ mod tests {
     async fn session_snapshot_derives_visible_tools_from_allowed_incarnations() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -23826,7 +23934,7 @@ mod tests {
     async fn session_snapshot_prefers_requested_environment_even_when_local_is_live() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -23980,7 +24088,7 @@ mod tests {
     async fn session_snapshot_can_route_tool_to_remote_advertisement_when_local_runner_missing() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
@@ -24111,7 +24219,7 @@ mod tests {
     async fn tool_runner_registration_persists_durable_registry() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24161,7 +24269,7 @@ mod tests {
     async fn session_snapshot_marks_registered_but_offline_tools_as_materialization_required() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24263,7 +24371,7 @@ mod tests {
     async fn session_snapshot_uses_per_session_checkpoint_when_agent_has_multiple_sessions() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24415,7 +24523,7 @@ mod tests {
     async fn update_task_with_approval_metadata_writes_explicit_approval_events() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24494,7 +24602,7 @@ mod tests {
     async fn update_task_with_approval_policy_updates_session_summary_and_event_log() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24572,7 +24680,7 @@ mod tests {
     async fn update_task_with_reflex_governance_updates_session_summary_and_event_log() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24662,7 +24770,7 @@ mod tests {
     async fn update_task_with_session_status_and_bindings_updates_session_summary_and_event_log() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24754,7 +24862,7 @@ mod tests {
     async fn update_task_with_reflex_policy_records_updates_session_summary_and_event_log() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24857,7 +24965,7 @@ mod tests {
     async fn canonical_session_snapshot_projects_hotel_default_reflex_policy_from_bindings() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -24973,7 +25081,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-learned-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -25110,7 +25218,7 @@ mod tests {
     async fn canonical_session_snapshot_projects_shared_model_markers_from_graph() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -25207,7 +25315,7 @@ mod tests {
     async fn canonical_session_snapshot_projects_shared_tool_and_skill_markers_from_graph() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -25312,7 +25420,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-reflex-writeback-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
@@ -25384,7 +25492,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-role-reflex-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -25501,7 +25609,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-learned-approved-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -25650,7 +25758,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-learned-rejected-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -25800,7 +25908,7 @@ mod tests {
     async fn record_routing_policy_proposal_persists_specific_record_with_history() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -25878,7 +25986,7 @@ mod tests {
     async fn append_routing_policy_evaluation_updates_durable_history() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -25962,7 +26070,7 @@ mod tests {
     async fn set_routing_policy_disposition_updates_operator_state_and_history() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -26044,7 +26152,7 @@ mod tests {
     async fn list_routing_policies_returns_agent_scoped_records() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -26113,7 +26221,7 @@ mod tests {
     async fn e2e_session_round_trip_persists_and_delivers_reply() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -26255,6 +26363,12 @@ mod tests {
                     "turn_id": turn_id,
                     "chat_id": "123",
                     "content": "hi back",
+                    // Production model-router always echoes the requester's guest id
+                    // back as reply_guest_id (see emit_text_response in
+                    // crates/model-router/src/runtime.rs). Without it, the response
+                    // resolver falls back to session.primary_agent_id, which is not
+                    // a registered guest here, and the reply parks undelivered.
+                    "reply_guest_id": "agent-local",
                     "final_reply_to": "local-aiua-01",
                     "final_reply_role": "membrane"
                 })
@@ -26368,7 +26482,7 @@ mod tests {
     async fn e2e_structured_tool_call_round_trip_persists_and_delivers_reply() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
@@ -26518,6 +26632,11 @@ mod tests {
                     "turn_id": turn_id,
                     "chat_id": "456",
                     "content": "tool_call: echo hello structured tool",
+                    // Mirror production model-router, which always includes the
+                    // requester's guest id so the response resolver has a concrete
+                    // return guest (see emit_tool_call_response in
+                    // crates/model-router/src/runtime.rs).
+                    "reply_guest_id": "agent-local",
                     "final_reply_to": "local-aiua-01",
                     "final_reply_role": "membrane"
                 })
@@ -26641,7 +26760,7 @@ mod tests {
     async fn telegram_poll_lease_is_single_owner_and_released_on_disconnect() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -26761,7 +26880,7 @@ mod tests {
     async fn telegram_poll_lease_denies_foreign_authority_hotel() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -26844,7 +26963,7 @@ mod tests {
     async fn telegram_poll_lease_allows_delegated_foreign_hotel() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -26923,7 +27042,7 @@ mod tests {
     async fn set_transport_home_persists_graph_record() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27041,7 +27160,7 @@ mod tests {
     async fn telegram_poll_lease_denies_non_home_transport_hotel() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27137,7 +27256,7 @@ mod tests {
     async fn telegram_poll_lease_can_be_renewed_by_owner() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27227,7 +27346,7 @@ mod tests {
     async fn telegram_poll_lease_expires_and_allows_takeover() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27324,7 +27443,7 @@ mod tests {
     async fn telegram_poll_lease_release_allows_immediate_takeover() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27427,7 +27546,7 @@ mod tests {
     async fn telegram_poll_lease_owner_status_drops_dead_guest_owner() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27533,7 +27652,7 @@ mod tests {
     async fn desktop_membrane_lease_disconnect_allows_takeover() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27642,7 +27761,7 @@ mod tests {
     async fn desktop_membrane_lease_can_be_renewed_by_owner() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27721,7 +27840,7 @@ mod tests {
     async fn desktop_membrane_lease_release_allows_immediate_takeover() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27828,7 +27947,7 @@ mod tests {
     async fn desktop_membrane_status_view_comes_from_hotel_record() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27890,7 +28009,7 @@ mod tests {
     async fn desktop_membrane_guest_views_come_from_graph_storage() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -27982,7 +28101,7 @@ mod tests {
     async fn desktop_membrane_agent_views_are_redacted_and_local_hotel_scoped() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -28072,7 +28191,7 @@ mod tests {
     async fn desktop_membrane_target_views_include_source_and_freshness_attribution() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -28211,7 +28330,7 @@ mod tests {
     async fn desktop_membrane_target_status_distinguishes_local_from_remote_observation() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -28344,7 +28463,7 @@ mod tests {
     {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -28483,7 +28602,7 @@ mod tests {
     async fn operator_target_surface_requests_reuse_membrane_target_logic() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -28652,7 +28771,7 @@ mod tests {
     async fn operator_chat_turn_reuses_agent_conversation_path() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -29166,7 +29285,7 @@ mod tests {
     async fn configure_role_persists_config_successfully() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _) = mpsc::channel(8);
+        let (dispatcher_tx, _) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -29244,7 +29363,7 @@ mod tests {
     async fn execute_role_create_workflow_persists_config_successfully() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _) = mpsc::channel(8);
+        let (dispatcher_tx, _) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -29340,7 +29459,7 @@ mod tests {
     async fn configure_role_eagerly_materializes_new_role_worker() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _) = mpsc::channel(8);
+        let (dispatcher_tx, _) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -29438,7 +29557,7 @@ mod tests {
     async fn configure_role_forbids_configuring_other_identities() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _) = mpsc::channel(8);
+        let (dispatcher_tx, _) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
@@ -29568,7 +29687,7 @@ mod tests {
     async fn telegram_lease_injects_membrane_binding() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _rx) = mpsc::channel(16);
+        let (dispatcher_tx, _rx) = test_dispatcher_channel();
         let graph = make_hotel_graph(&socket_path, "agent-jane-01");
         let server = IpcServer::new(
             socket_path.clone(),
@@ -29673,7 +29792,7 @@ mod tests {
     async fn discord_lease_injects_membrane_binding() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _rx) = mpsc::channel(16);
+        let (dispatcher_tx, _rx) = test_dispatcher_channel();
         let graph = make_hotel_graph(&socket_path, "agent-jane-01");
         let server = IpcServer::new(
             socket_path.clone(),
@@ -29774,7 +29893,7 @@ mod tests {
     async fn assign_skill_adds_skill_to_toolset_profile() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -29879,7 +29998,7 @@ mod tests {
     async fn revoke_skill_removes_skill_from_toolset_profile() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -29981,7 +30100,7 @@ mod tests {
     async fn revoke_skill_is_idempotent_when_skill_not_present() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -30063,7 +30182,7 @@ mod tests {
     async fn assign_skill_is_idempotent_when_skill_already_present() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -30166,7 +30285,7 @@ mod tests {
     async fn assign_skill_forbidden_for_non_orchestrator_guest() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -30259,7 +30378,7 @@ mod tests {
     async fn assign_skill_fails_for_unknown_skill_name() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -30347,7 +30466,7 @@ mod tests {
         // inbox, returns HandoffBackAck.
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -30492,7 +30611,7 @@ mod tests {
     async fn handoff_back_defaults_return_to_orchestrator_when_return_to_is_none() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -30614,7 +30733,7 @@ mod tests {
     async fn handoff_back_materializes_configured_orchestrator_before_return() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
 
@@ -30771,7 +30890,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-pipeline-rule-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
@@ -30889,7 +31008,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-golgi-slice2-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = make_hotel_graph(&socket_path, agent_id);
 
         let server = IpcServer::new(
@@ -31139,7 +31258,7 @@ mod tests {
         let agent_id = "agent-golgi-slice3-watchdog";
         let graph = make_hotel_graph(&socket_path, agent_id);
 
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let server = IpcServer::new(
             socket_path.clone(),
             "local-aiua-watchdog",
@@ -31286,7 +31405,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-golgi-slice4-multi";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = make_hotel_graph(&socket_path, agent_id);
 
         let server = IpcServer::new(
@@ -31583,7 +31702,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-golgi-slice5-err";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = make_hotel_graph(&socket_path, agent_id);
 
         let server = IpcServer::new(
@@ -31758,7 +31877,7 @@ mod tests {
         let graph_db_template = test_agent_graph_db_template();
         let agent_id = "agent-golgi-slice6-coll";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph = make_hotel_graph(&socket_path, agent_id);
 
         let server = IpcServer::new(

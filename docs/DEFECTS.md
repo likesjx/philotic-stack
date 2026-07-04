@@ -19,7 +19,7 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 | DEF-002 | Abstract tool storage methods unwired in sqlite storage (legacy `ansible` crate Gap 3) | medium | fixed | 2 | 2026-03-10 | port to `ansible-mesh-core` (methods live in `domain/mod.rs`) |
 | DEF-003 | `aiua` binary test target could not compile/run | medium | fixed | 2 | 2026-03 | mock stubs + fallback fix (pre-04) |
 | DEF-004 | Multi-tool synthesized response not surfacing | high | fixed | 2 | 2026-03-30 | superseded by cognitive loop v2 + resilient loop (PR #58, #59); no recurrence since |
-| DEF-005 | `aiua` test suite hangs on 10 desktop-membrane/e2e tests | medium | open | 3 | 2026-06-22 | — |
+| DEF-005 | `aiua` test suite hangs on 10 desktop-membrane/e2e tests | medium | fixed | 3 | 2026-06-22 | codex/aiua-test-unhang |
 | DEF-006 | Watchdog evicts WaitingModel turns instead of escalating fallback tier | high | fixed | 1 | 2026-06-27 | PR #93 (2e33928) |
 | DEF-007 | Voice routing lost on checkpoint restore (`agent_profile` not serialized) | medium | fixed | 1 | 2026-04-29 | PR #60 |
 | DEF-008 | `IpcResponse` untagged-enum ordering: `UserProfileData` swallowed `MemoryConfig` | medium | fixed | 1 | 2026-04-29 | wrapper struct + `deny_unknown_fields` (2026-04-29) |
@@ -65,6 +65,14 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 **Found**: 2026-06-22 · **Seam**: aiua-test-infra
 
 `cargo test -p aiua` on unmodified develop (`d2478e8`) hangs indefinitely (0% CPU) on 10 tests: the `desktop_membrane_*` lease/status/target tests, `discord_lease_injects_membrane_binding`, and both `e2e_*_round_trip` tests. Reproduced in a clean detached worktree and single-threaded with one test alone — not parallel contention, not cache corruption. With those skipped, `emit_task_falls_back_to_orchestrator_when_active_incarnation_is_unregistered` and `default_guest_seed_injects_hotel_socket_env` fail order-dependently. Prime suspect for the hangs: tests bind `(dispatcher_tx, _dispatcher_rx)` and never drain the receiver, so any path sending more than channel capacity of `LedgerCommand`s blocks forever on `dispatcher_tx.send(...).await`. Blocks using `cargo test -p aiua` as an automated gate; sweeps work around it via `--skip` filters and live-fire verification.
+
+**Fixed** (`codex/aiua-test-unhang`, 2026-07-03). The dispatcher-channel suspect was real but secondary; four distinct causes stacked:
+1. **Client swallowed lease acquire/renew replies (the true hang)** — `PhiloticClient::is_expected_response` expected `DesktopMembraneLeaseStatus` for `AcquireDesktopMembraneLease`, but the server replies `DesktopMembraneLease`, which is also listed in `is_ignorable_push` — so the real reply was skipped as an OOB broadcast and `send_request` read forever. Only the 3 desktop-lease tests truly hung; the other 7 "hung" tests were queued behind them on the shared `ipc_env_guard()` mutex. Fixed by mapping Acquire/Renew requests to their actual reply variants (including the untagged-enum collapse of `DiscordGatewayLease` → `TelegramPollLease`).
+2. **Undrained test dispatcher channels** — production's durable-writer thread drains `dispatcher_rx`; test fixtures never did, so chatty tests could block on `dispatcher_tx.send().await` at channel capacity. Fixed with a shared `ipc::test_dispatcher_channel()` helper that drains into an unbounded channel; all fixture sites in `ipc.rs`/`cron_ticker.rs` converted.
+3. **e2e tests predated the response-route resolver** — their `model_response` emissions carried no `reply_guest_id`/`return_route` (production model-router always includes both), so the resolver fell back to the session's unregistered `primary_agent_id` and parked the reply. Tests updated to mirror production payloads.
+4. **Real routing black hole + stale seed count** — `emit_task_falls_back_to_orchestrator_when_active_incarnation_is_unregistered` exposed that an active incarnation unknown both locally and to the mesh was silently dropped; EmitTask now falls back to the session's live orchestrator when the mesh reroute finds no home (production fix in `ipc.rs`). `default_guest_seed_injects_hotel_socket_env` was stale since PR #94 added the `model.openrouter` guest (11 → 12).
+
+Full suite: 219/219 green in ~21s.
 
 ### DEF-024: `brain` role incarnation loops infinitely on mac-jane
 

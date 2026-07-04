@@ -8569,7 +8569,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 11); // shared guests omit graph-datasource off the configured home hotel; profile: agent, agent-datasource
+        assert_eq!(guests.len(), 12); // shared guests omit graph-datasource off the configured home hotel; profile: agent, agent-datasource
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
@@ -8583,6 +8583,7 @@ mod tests {
         assert!(guests.iter().all(|guest| guest.hotel_name == "beta-hotel"));
         assert!(guests.iter().any(|guest| guest.role == "model"));
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
+        assert!(guests.iter().any(|guest| guest.role == "model.openrouter"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
         assert!(!guests.iter().any(|guest| guest.role == "graph-datasource"));
         // Single membrane uses PHILOTIC_AGENT_ROSTER (not per-agent token key)
