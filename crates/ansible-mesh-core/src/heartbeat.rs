@@ -13,13 +13,18 @@ const MAX_SYNC_PAYLOAD_BYTES: usize = 900;
 /// Inner-payload budget for a single `HotelStateSync` datagram.
 ///
 /// `BeaconMessage.payload` is a `Vec<u8>` that serde_json encodes as a JSON
-/// integer array (`[123,34,...]`), roughly a 3.5–4× size blowup, so the inner
-/// payload must stay well under the ~65507-byte UDP datagram ceiling. 12 KB of
-/// inner JSON wraps to ~48 KB on the wire, leaving comfortable headroom while
-/// still packing many model profiles per datagram (unlike the 900-byte
-/// advertisement budget, which would degrade to one profile per datagram once
-/// the always-present guests/agents base is included on every chunk).
-const MAX_HOTEL_STATE_PAYLOAD_BYTES: usize = 12_000;
+/// integer array (`[123,34,...]`), a worst-case 4× size blowup (each byte can
+/// render as up to three digits plus a comma), plus ~500 bytes of signed
+/// envelope. The binding ceiling is NOT the ~65507-byte UDP maximum: macOS
+/// caps datagrams at `net.inet.udp.maxdgram` = **9216 bytes by default**, and
+/// Mac hotels are first-class mesh senders — the previous 12 KB budget wrapped
+/// to ~48 KB on the wire and every send from a Mac failed with EMSGSIZE
+/// ("Message too long", os error 40), silently dropping hotel-state sync
+/// (DEF-032 recurrence). 2 KB of inner JSON wraps to ≤ ~8.7 KB signed wire
+/// bytes, which clears the macOS ceiling with headroom. Do not raise this
+/// without measuring the full signed wire size on macOS (see
+/// `hotel_state_chunks_stay_under_udp_ceiling_and_preserve_profiles`).
+const MAX_HOTEL_STATE_PAYLOAD_BYTES: usize = 2_048;
 
 /// A single peer record included in a [`MeshCatalogSyncPayload`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,11 +518,13 @@ mod tests {
             .len()
     }
 
-    const UDP_DATAGRAM_MAX: usize = 65_507;
+    /// The binding ceiling is macOS's default `net.inet.udp.maxdgram`, not the
+    /// theoretical 65507-byte UDP maximum — Mac hotels send with EMSGSIZE above it.
+    const UDP_DATAGRAM_MAX: usize = 9_216;
 
     #[test]
     fn hotel_state_single_datagram_when_small() {
-        let payload = hotel_state_payload(3);
+        let payload = hotel_state_payload(1);
         let chunks = chunk_hotel_state_payloads(&payload).expect("chunking should succeed");
         assert_eq!(chunks.len(), 1);
         assert!(datagram_len(&chunks[0]) < UDP_DATAGRAM_MAX);
