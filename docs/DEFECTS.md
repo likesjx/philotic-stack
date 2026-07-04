@@ -1,79 +1,221 @@
 ---
 doc_type: defect-tracker
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-07-03
 ---
 
 # Defects and Technical Debt
 
-Tracked defects and known technical debt. Each entry carries status, severity, size estimate, and commit/seam cross-references.
+Tracked defects and known technical debt. Each entry carries status, severity, points estimate, and PR/commit cross-references. Rebuilt 2026-07-03 from session history (2026-04 → 2026-07): the ledger had not been updated since 2026-03-31 while ~30 real defects were found and fixed in the field.
 
-**Status values**: `open` | `in-progress` | `fixed` | `deferred` | `wont-fix`
-**Severity values**: `critical` | `high` | `medium` | `low`
-**Size values**: `XS` | `S` | `M` | `L` | `XL`
+**Status values**: `open` | `fixed`
+**Severity values**: `high` | `medium` | `low`
 
----
+## Ledger
 
-## DEF-001: `local_capability_advertisements_include_hotel_scoped_incarnations` off-by-one
-
-**Status**: open
-**Severity**: low
-**Size**: S
-**Seam**: active-membrane-routing
-**Found**: 2026-03-10
-
-`tool-runner` is counted in hotel-scoped incarnation advertisements but is seeded as inactive. The test expects the active set only, producing an off-by-one failure. Pre-existing; does not affect runtime behavior since `tool-runner` is unused.
-
----
-
-## DEF-002: `ansible` crate Gap 3 sqlite_storage incomplete
-
-**Status**: open
-**Severity**: medium
-**Size**: M
-**Seam**: tooling-execution
-**Found**: 2026-03-10
-
-`GraphStorage` trait methods for `AbstractToolRecord` (`upsert_abstract_tool`, `get_abstract_tool`, `list_abstract_tools`) are defined in the trait but not fully wired in `SqliteGraphStorage`. Causes compile error in the `ansible` crate. Does not affect `aiua`, `philote`, or `model-router` builds. In-progress slice (Gap 3).
-
-## DEF-003: `aiua` has no library target — unit tests in binary modules cannot be run
-
-**Status**: fixed
-**Severity**: medium | **Effort**: 2pts
-
-`aiua` is configured as a binary-only crate. Test mocks in the binary test target had pre-existing compilation failures (missing `OperatorTargetView` import, incomplete `WorkflowSkillRecord` mock impls on two `TestGraphStorage` structs), which prevented `cargo test -p aiua` from running any tests. Additionally, `context_graph_entries_support_hotel_level_telegram_overlay` was failing because `extract_context_graph_entries` didn't fall back to `hotels["default"]` when the named hotel was absent. All three issues fixed: import added to ipc.rs test module, stub methods added to both mock impls, fallback added to `extract_context_graph_entries`. `cargo test -p aiua` now passes 110 tests.
----
-
-## DEF-004: Multi-tool synthesized response not surfacing
-
-**Status**: open
-**Severity**: high
-**Size**: M
-**Seam**: cognitive-loop-reentry
-**Found**: 2026-03-30 (identified in MEMORY.md)
-
-Agent re-entry loop completes multiple tool iterations, but the final synthesized summary response does not reach the user or surface in the final turn result. Re-entry loop works, but the final text generation step may be failing or its output is being dropped.
+| ID | Title | Severity | Status | Pts | Found | Fixed by |
+|---|---|---|---|---|---|---|
+| DEF-001 | Hotel-scoped capability advertisement off-by-one (inactive tool-runner counted) | low | open | 1 | 2026-03-10 | — |
+| DEF-002 | Abstract tool storage methods unwired in sqlite storage (legacy `ansible` crate Gap 3) | medium | fixed | 2 | 2026-03-10 | port to `ansible-mesh-core` (methods live in `domain/mod.rs`) |
+| DEF-003 | `aiua` binary test target could not compile/run | medium | fixed | 2 | 2026-03 | mock stubs + fallback fix (pre-04) |
+| DEF-004 | Multi-tool synthesized response not surfacing | high | fixed | 2 | 2026-03-30 | superseded by cognitive loop v2 + resilient loop (PR #58, #59); no recurrence since |
+| DEF-005 | `aiua` test suite hangs on 10 desktop-membrane/e2e tests | medium | open | 3 | 2026-06-22 | — |
+| DEF-006 | Watchdog evicts WaitingModel turns instead of escalating fallback tier | high | fixed | 1 | 2026-06-27 | PR #93 (2e33928) |
+| DEF-007 | Voice routing lost on checkpoint restore (`agent_profile` not serialized) | medium | fixed | 1 | 2026-04-29 | PR #60 |
+| DEF-008 | `IpcResponse` untagged-enum ordering: `UserProfileData` swallowed `MemoryConfig` | medium | fixed | 1 | 2026-04-29 | wrapper struct + `deny_unknown_fields` (2026-04-29) |
+| DEF-009 | Gemini no-content SSE fell back to un-timed batch call — 27-minute hang | high | fixed | 2 | 2026-05-04 | PR #59 (batch fallback removed, 8s idle timeout) |
+| DEF-010 | Gemini keep-alive "thinking-drip" resets SSE idle timer — unbounded stream | high | fixed | 1 | 2026-05-20 | f7f8715 (wall-clock cap); 816dadd (forwarder deadlock) |
+| DEF-011 | membrane-mcp orphan storm — ghost processes fight one lease | medium | fixed | 2 | 2026-05-29 | 8abef40, 18cbf14 |
+| DEF-012 | `hotel.status`/`hotel.logs`/`role.set_home` had no execution route | low | fixed | 1 | 2026-06-01 | `is_local_agent_tool` additions |
+| DEF-013 | String `completed_at` killed whole session snapshot via `?` propagation | medium | fixed | 1 | 2026-06-01 | warn+skip in `list_session_turns` + data surgery |
+| DEF-014 | Unbuffered OOB hotel broadcasts broke `send_request` (Telegram seats dark) | medium | fixed | 1 | 2026-06-04 | 63f7072 |
+| DEF-015 | Paracrine replies silently dropped (`reply_to_guest_id` = membrane seat); delegate.merge unrouted | high | fixed | 2 | 2026-06-08 | d0b969e, 542d967 |
+| DEF-016 | `mesh_events` table grew unboundedly (84k stale events found) | medium | fixed | 1 | 2026-06-12 | a2ed50d |
+| DEF-017 | Cron jobs to dormant role incarnations silently dropped (bare `target_role`, no materialization) | high | fixed | 3 | 2026-06-19 | PR #80 |
+| DEF-018 | `UserProfileData` classified as ignorable push — guest request hang | medium | fixed | 1 | 2026-06-19 | PR #81 (4687ae4) |
+| DEF-019 | Agent responses parked ledger-only when `active_incarnation_id` guest not live | high | fixed | 2 | 2026-06-22 | PR #84 + #85 |
+| DEF-020 | LifeGraph cross-hotel TaskInvoke parked forever (90s watchdog on every call) | high | fixed | 2 | 2026-06-19 | PR #86 |
+| DEF-021 | Conversational-goal gate: `"ok"` substring-matched inside `"look"` — zero tools for turn | medium | fixed | 1 | 2026-06-24 | PR #87 (ab1ce23) |
+| DEF-022 | Zombie `running` turns accumulate after restart storms (64 found on bjork) | medium | fixed | 2 | 2026-06-27 | PR #91 |
+| DEF-023 | Role handoff delivered zero context and never auto-executed | high | fixed | 2 | 2026-06-27 | PR #92 |
+| DEF-024 | `brain` role incarnation loops infinitely on mac-jane, never returns reply | medium | open | 3 | 2026-06-27 | — |
+| DEF-025 | Boot-time fallback mesh port persisted as advertised port — hotel silently diverges from peers | medium | open | 2 | 2026-07-01 | peer-side mitigation only (94edd08) |
+| DEF-026 | Provider secrets leaked into Muninn config payload | high | fixed | 1 | 2026-07-01 | PR #95 (bf5bee6) |
+| DEF-027 | ElevenLabs voice synthesis and Telegram streaming broken | high | fixed | 2 | 2026-07-02 | PR #98 (c5e6263) |
+| DEF-028 | Telegram poll lease lost on network flap — seats dark up to 600s | high | fixed | 2 | 2026-07-02 | PR #99 (648acf9) |
+| DEF-029 | Approval inline buttons never resolved parked turns (300s timeout, 7 occurrences) | high | fixed | 1 | 2026-07-02 | PR #99 (1b86a45) |
+| DEF-030 | `/role` to current role triggered infinite self-handoff loop | high | fixed | 2 | 2026-07-02 | PR #101 + #102 |
+| DEF-031 | TTS replies delivered as music cards instead of Telegram voice notes | low | fixed | 1 | 2026-07-02 | PR #102 (36e73c2) |
+| DEF-032 | `HotelStateSync` UDP broadcast exceeds 65507 bytes — EMSGSIZE every 30s | medium | open | 1 | 2026-07-03 | fix committed (a5b6f55, `codex/model-catalog-sync`) — unmerged |
+| DEF-033 | `FailTask` never updates persisted `session_turn` status (record-keeping gap) | low | open | 1 | 2026-06-22 | — |
+| DEF-034 | router-listener crashes on startup — missing `router_listener.config` DB key | medium | open | 1 | 2026-06-04 | — |
 
 ---
 
-## DEF-006: Turn watchdog evicts WaitingModel turns instead of escalating to next fallback tier
+## Open defects — detail
 
-**Status**: in-progress
-**Severity**: high
-**Size**: S
-**Seam**: cognitive-loop-reentry
-**Found**: 2026-06-27
+### DEF-001: `local_capability_advertisements_include_hotel_scoped_incarnations` off-by-one
 
-When a model call hangs and the philote watchdog fires (`WAITING_MODEL_SECS = 300`), it evicts the turn and tells the user "I seem to have gotten stuck" instead of escalating to the next fallback tier. The root cause is a silent IPC drop between model-router and philote: model-router has a 70s budget (35s × 2 attempts) but if its IPC connection to aiua drops, no error signal reaches philote — so the 300s watchdog is the only backstop, and it was wired to give up rather than retry. The prior "fix" (`951e113`, bump 120s→300s) only delayed the give-up; it did not escalate. Fix: branch on `WaitingModel` phase in `evict_timed_out_turns` Step 3 and call `advance_turn_to_next_fallback_tier` instead of evicting. The 600s `CatchAll` ceiling remains a hard evict.
+**Found**: 2026-03-10 · **Seam**: active-membrane-routing
+
+`tool-runner` is counted in hotel-scoped incarnation advertisements but is seeded as inactive. The test expects the active set only, producing an off-by-one failure. Pre-existing; does not affect runtime behavior since `tool-runner` is unused. Test still present at `crates/aiua/src/main.rs`.
+
+### DEF-005: `aiua` test suite — 10 hung tests, 2 unrelated failures on develop HEAD
+
+**Found**: 2026-06-22 · **Seam**: aiua-test-infra
+
+`cargo test -p aiua` on unmodified develop (`d2478e8`) hangs indefinitely (0% CPU) on 10 tests: the `desktop_membrane_*` lease/status/target tests, `discord_lease_injects_membrane_binding`, and both `e2e_*_round_trip` tests. Reproduced in a clean detached worktree and single-threaded with one test alone — not parallel contention, not cache corruption. With those skipped, `emit_task_falls_back_to_orchestrator_when_active_incarnation_is_unregistered` and `default_guest_seed_injects_hotel_socket_env` fail order-dependently. Prime suspect for the hangs: tests bind `(dispatcher_tx, _dispatcher_rx)` and never drain the receiver, so any path sending more than channel capacity of `LedgerCommand`s blocks forever on `dispatcher_tx.send(...).await`. Blocks using `cargo test -p aiua` as an automated gate; sweeps work around it via `--skip` filters and live-fire verification.
+
+### DEF-024: `brain` role incarnation loops infinitely on mac-jane
+
+**Found**: 2026-06-27 · **Seam**: role-incarnation
+
+After the mesh-auth-key mismatch between mbp-jane and mac-jane was fixed, `agent-astrid:brain` materializes cross-hotel on mac-jane but loops infinitely against Gemini and never replies back to Telegram — likely missing vault/mempalace skills plus an unwired cross-hotel return path. Mitigated by deactivating the guest and reverting Astrid to orchestrator posture; `/role brain` remains unsafe until the loop and return path are fixed. Related but distinct from DEF-030 (the `/role` self-handoff loop, which is fixed).
+
+### DEF-025: Boot-time fallback mesh port persisted as advertised port
+
+**Found**: 2026-07-01 · **Seam**: mesh-transport
+
+`resolve_runtime_ports` (`crates/aiua/src/main.rs:627`) falls back to an alternate port cluster on a boot-time collision and writes the fallback back into the hotel's `graph_nodes` record — while peers keep sending to the originally advertised port. One transient collision permanently diverged mac-jane from its peers (days-long silent mesh-receive blackout; brain TaskInvokes never arrived). Manual fix: reset `hotel:mac-jane` ports + full `launchctl bootout`/`bootstrap`. Peer-side heartbeat reconcile (94edd08) mitigates but the fallback port should not be persisted as the advertised port, or aiua should retry the canonical cluster on later boots.
+
+### DEF-032: `HotelStateSync` broadcast exceeds UDP datagram ceiling (EMSGSIZE)
+
+**Found**: 2026-07-03 · **Seam**: mesh-transport
+
+Adding the `model_profiles` catalog to the `HotelStateSync` payload (on `codex/model-catalog-sync`) pushed the UDP broadcast over the 65507-byte ceiling — `Message too long (os error 40)` every 30s, dropping guests/agents routing state propagation to peers. Benign for local serving, degrades cross-hotel state sync. Fix `a5b6f55` (chunk oversized broadcasts under the ceiling) is committed on `codex/model-catalog-sync` but not yet PR'd/merged — was queued behind a WAN outage on the dev machine.
+
+### DEF-033: `FailTask` never updates the persisted `session_turn` record
+
+**Found**: 2026-06-22 · **Seam**: session-ledger
+
+`IpcRequest::FailTask` (`crates/aiua/src/service/ipc.rs`) carries only `{error, reason}` with no session/turn envelope, so `extract_session_envelope` bails and the persisted turn stays `running` forever. Record-keeping gap only — in-memory watchdog recovery works and nothing gates new dispatch on the stale status — but it pollutes the DB with false zombie turns (see DEF-022) and misleads diagnostics.
+
+### DEF-034: router-listener startup crash — missing `router_listener.config`
+
+**Found**: 2026-06-04 · **Seam**: guest-lifecycle
+
+The router-listener guest crashes on startup when the `router_listener.config` key is absent from the context graph. Pre-existing regression, observed repeatedly in mbp-jane's heal queue. Guest should seed a default config or degrade gracefully instead of crash-looping.
 
 ---
 
-## DEF-005: `aiua` test suite — 10 hung tests, 2 unrelated failures on develop HEAD
+## Fixed defects — detail
 
-**Status**: open
-**Severity**: medium
-**Size**: M
-**Seam**: aiua-test-infra
-**Found**: 2026-06-22
+### DEF-002: Abstract tool storage methods unwired (legacy `ansible` crate Gap 3)
 
-`cargo test -p aiua --release` on unmodified `develop` HEAD (`d2478e8`) hangs indefinitely on 10 tests: `desktop_membrane_lease_can_be_renewed_by_owner`, `desktop_membrane_lease_disconnect_allows_takeover`, `desktop_membrane_lease_release_allows_immediate_takeover`, `desktop_membrane_status_view_comes_from_hotel_record`, `desktop_membrane_target_guest_inventory_reports_failed_remote_query_when_unreachable`, `desktop_membrane_target_status_distinguishes_local_from_remote_observation`, `desktop_membrane_target_views_include_source_and_freshness_attribution`, `discord_lease_injects_membrane_binding`, `e2e_session_round_trip_persists_and_delivers_reply`, `e2e_structured_tool_call_round_trip_persists_and_delivers_reply`. Confirmed via isolated single-threaded run of one test alone (still hangs, so it is not parallel resource contention) and via `git stash` on the same commit (still hangs with the working tree clean). With those 10 skipped via `--skip`, two more fail: `service::ipc::tests::emit_task_falls_back_to_orchestrator_when_active_incarnation_is_unregistered` (timeout waiting for fallback delivery) and `tests::default_guest_seed_injects_hotel_socket_env` (`assertion left == right failed: left: 12, right: 11`) — both reproduce identically with or without unrelated changes, so likely order/state-dependent on which tests ran before them in the filtered set rather than newly broken. Not investigated further; out of scope for `codex/lifegraph-cross-hotel-park`. Suspect for the hangs: several of these tests bind `(dispatcher_tx, _dispatcher_rx)` and never drain `_dispatcher_rx`, so any code path that sends more than the channel capacity (8 or 16) worth of `LedgerCommand`s blocks forever on `dispatcher_tx.send(...).await` — worth checking first.
+`upsert_abstract_tool` / `get_abstract_tool` / `list_abstract_tools` were defined but not wired in the old `ansible` crate's sqlite storage, breaking its build. Resolved by the port: the methods are implemented in `crates/ansible-mesh-core/src/domain/mod.rs` and the workspace compiles.
+
+### DEF-003: `aiua` binary test target could not compile/run
+
+Missing `OperatorTargetView` import, incomplete `WorkflowSkillRecord` mock impls, and a missing `hotels["default"]` fallback in `extract_context_graph_entries` prevented `cargo test -p aiua` from running at all. All three fixed; 110 tests passed at close. (The later, separate hang is DEF-005.)
+
+### DEF-004: Multi-tool synthesized response not surfacing
+
+Re-entry loops completed tool iterations but the final synthesized summary never reached the user. No isolated fix commit; the cognitive loop was rebuilt in PR #58 (cognitive loop v2) and PR #59 (resilient loop, all 6 slices) and the failure has not reproduced since 2026-04. Closed as superseded.
+
+### DEF-006: Watchdog evicted WaitingModel turns instead of escalating
+
+When a model call hung past `WAITING_MODEL_SECS = 300`, the philote watchdog evicted the turn ("I seem to have gotten stuck") instead of escalating to the next fallback tier. Underlying trigger: silent IPC drop between model-router and philote leaves no error signal, so the watchdog is the only backstop. An earlier "fix" (951e113, 120s→300s bump) only delayed the give-up. PR #93 (2e33928) branches on `WaitingModel` in `evict_timed_out_turns` and calls `advance_turn_to_next_fallback_tier`; the 600s CatchAll ceiling remains a hard evict. Deployed to mac-jane 2026-06-29.
+
+### DEF-007: Voice routing lost on checkpoint restore
+
+Checkpoint snapshots didn't serialize `agent_profile`, so restored sessions got a default `VoiceResponsePolicy` (provider=None) and always fell back to ElevenLabs, ignoring the agent bundle's `"onnx"` setting. Fixed in `ensure_session_loaded` by applying `default_agent_profile` after `from_checkpoint`, mirroring the new-session path (shipped with PR #60).
+
+### DEF-008: `IpcResponse` untagged-enum ordering swallowed `MemoryConfig`
+
+`UserProfileData { Option, Option }` sat before `MemoryConfig { Option }` in the `#[serde(untagged)]` enum; an all-optional variant matches any JSON object, so `{ "config_json": ... }` deserialized as an empty `UserProfileData` and philote ran without memory. Fixed by extracting a `UserProfileDataPayload` wrapper with `#[serde(deny_unknown_fields)]`. Standing rule: every new all-optional variant needs a `deny_unknown_fields` wrapper; `MemoryConfig` stays last.
+
+### DEF-009 / DEF-010: Gemini streaming hangs (batch fallback; keep-alive drip)
+
+Two related hangs. (1) Gemini streaming sometimes returns SSE with no text (safety block, quota); the no-content path fell back to the batch endpoint which had no timeout — observed 27-minute hang. PR #59 removed the batch fallback (bail with `streaming_timeout`, routed to tier escalation) and added an 8s per-chunk idle timeout. (2) Gemini can drip keep-alive SSE bytes every ~7s, resetting the idle timer forever without progress; f7f8715 added a hard wall-clock cap on the whole SSE session (`STREAMING_TOTAL_SECS`). 816dadd later added connect/send timeouts in the streaming forwarder to close a related deadlock. Do not re-add the batch fallback; the correct escape is tier escalation.
+
+### DEF-011: membrane-mcp orphan storm
+
+Stale membrane-mcp processes accumulated and fought over a single lease (~5 lease attempts/sec observed with 7 orphans). 8abef40 made ghost reclamation kill stale PIDs directly; 18cbf14 eliminated the remaining accumulation path in guest-manager.
+
+### DEF-012: Local-agent tools with no execution route
+
+`hotel.status`, `hotel.logs`, `role.set_home` were in the abstract tool catalog and toolset profiles but missing from `is_local_agent_tool()` in `crates/aiua/src/service/ipc.rs`, so they silently had no route. Rule: any tool handled in philote's `execute_local_agent_tool` match MUST be added to `is_local_agent_tool`.
+
+### DEF-013: Malformed `session_turn` record killed snapshot composition
+
+An old binary wrote `completed_at` as a JSON string; `list_session_turns` used `?` per record, so one bad row failed the entire `compose_session_snapshot`, silently blocking toolset injection for the whole session. Hardened to warn+skip in `ansible-mesh-core/src/domain/mod.rs`; bad rows repaired via SQL.
+
+### DEF-014: OOB broadcasts broke request/response on the guest socket
+
+Hotel-initiated OOB broadcasts (`MuninnStatus`, `NetworkState`) arriving mid-`send_request` were consumed as the response, wedging membrane-telegram seats. 63f7072 buffers OOB push messages in `philotic-client::send_request` instead of misinterpreting them.
+
+### DEF-015: Paracrine reply drops and unrouted delegate.merge
+
+`reply_to_guest_id` for "self" whispers was set to the membrane seat, so specialist (brain) replies went brain → membrane → silently dropped instead of returning to the orchestrator (d0b969e). Separately, `delegate.merge` had no execution route in paracrine specialist turns (542d967). Confirmed e2e: Astrid → delegate.whisper → brain → synthesized Telegram reply.
+
+### DEF-016: `mesh_events` unbounded growth
+
+The append-only event ledger never pruned; 84,904 stale events from a renamed hotel had to be deleted by hand before a2ed50d added retention.
+
+### DEF-017: Cron-fired tasks silently dropped for dormant role incarnations
+
+Beacon's daily Chronos heartbeat failed silently for days: `target_role` was stored bare (`"orchestrator"`) instead of the routing key (`role:agent-beacon:orchestrator`), and even a correct key found zero subscribers when the role guest was dormant. PR #80 added `normalize_cron_target_role` at registration and park-and-materialize via `ensure_role_materialized` in `CronTicker::fire` (the first attempt wrongly reused the cross-hotel helper — caught in review). Live-verified on vps-jane: park → spawn → register → flush → delivery.
+
+### DEF-018: `UserProfileData` treated as ignorable push
+
+`UserProfileData` in `is_ignorable_push` caused a hang in the client push path. PR #81 removed it and added a guard test against re-adding it.
+
+### DEF-019: Outbound responses parked ledger-only for non-live incarnations
+
+Inbound delivery checked whether `session.active_incarnation_id` was a live registered guest and fell back to the orchestrator; outbound (`infer_response_target_guest_id_for_agent_task`) did not — replies resolved to an unregistered guest, logged "stays ledger-only for now", and were swallowed until the 300s watchdog fired. PR #84 mirrored the liveness fallback; live-firing showed PR #84 alone was insufficient because the fallback guest tripped `targets_base_agent` re-derivation in `resolve_agent_route`, which PR #85 made response-like payloads skip. Bit every hotel independently (vps-jane Beacon, then mac-jane Bjork within minutes); all three patched 2026-06-22.
+
+### DEF-020: LifeGraph cross-hotel calls parked forever
+
+Every `life.*`/`graph.query` call from mac-jane/mbp-jane routes cross-hotel to `vps-jane:life-graph-runner` — a hotel-level utility guest with no `role_incarnation` record. The cross-hotel dispatch path assumed the target was a dormant role guest, logged "No role incarnation found for cross-hotel guest; cannot materialize", and parked the task forever; the 90s WaitingTool watchdog then evicted the turn. 100% reproducible. PR #86 guards `deliver_event_envelope_or_park` to skip events addressed to another node. Live-verified: cross-hotel round trip in ~1.46s, no park.
+
+### DEF-021: Conversational-goal gate zeroed all tools on "look"
+
+`looks_like_conversational_goal` used plain `str::contains` against a filler list including `"ok"` — a substring of "look"/"took"/"book" — so natural requests like "take a look at the lifegraph" tripped the conversational heuristic and `project_tools_for_turn` returned an empty tool list for the whole turn with no fallback. PR #87 added word-boundary matching. Verification lesson: the standard smoke driver names the tool explicitly and bypasses this gate — regression checks must use natural phrasing.
+
+### DEF-022: Zombie running turns after restart storms
+
+Stuck `status=running` turns accumulated across hotel restarts (64 found on bjork, oldest from May), partly downstream of DEF-033. PR #91 added a startup sweep plus a heal-dispatcher scan that proactively repairs them.
+
+### DEF-023: Role handoff arrived with no context and never executed
+
+`handle_handoff_bundle` read only `bundle.working_summary` — always `None` from `handoff.to_role` — so receiving roles had zero context; and nothing triggered execution, so the role sat idle until another operator message. PR #92 synthesizes the summary from `goal + context_excerpt` and pushes a synthetic `role_directed_task` to `pending_drains` when `active_goal` is set.
+
+### DEF-026: Provider secrets in Muninn config
+
+The hotel's Muninn config payload included provider secrets from the vault registry. PR #95 filters them out.
+
+### DEF-027: Voice synthesis and Telegram streaming broken
+
+A keys/streaming regression broke ElevenLabs synthesis and Telegram streamed replies. PR #98 (c5e6263) restored both.
+
+### DEF-028: Telegram poll lease lost on network flap
+
+Marginal WiFi (reachability probe TCP-connects 1.1.1.1:53 with a 3s timeout) flapped the seat offline; missed renewals let the lease TTL lapse, and the client treated "lease lost to None" as contested — entering a never-resetting backoff that left seats dark up to 600s per flap. PR #99 (648acf9) re-acquires the lease in place.
+
+### DEF-029: Approval buttons never resolved parked turns
+
+philote's approval resolver only acted on `/approve`/`/deny` text, but membrane turned inline-button callbacks into plain "Telegram callback action: X" chat — so approval-parked turns always hit the 300s watchdog (7 occurrences since May 29). PR #99 (1b86a45) maps approve→`/approve`, deny→`/deny`, trust→`/approve`.
+
+### DEF-030: `/role` self-handoff infinite loop
+
+Issuing `/role` for the role a session was already in triggered an infinite role-swap loop. PR #101 (1b90cfa) hardened the handoff path with a loop guard + self-heal; PR #102 (6f992f7) makes `/role` to the current role a no-op.
+
+### DEF-031: TTS replies rendered as music cards
+
+Telegram TTS replies were sent as audio files (music cards) instead of voice notes. PR #102 (36e73c2) switches delivery to `sendVoice`.
+
+---
+
+## Technical debt
+
+One line each; severity + pointer. These are structural, not behavioral defects.
+
+- **Two drifting Telegram gateways** — medium — `crates/membrane` (legacy gateway) and `crates/membrane-telegram` implement overlapping Telegram logic and drift apart; fixes like DEF-028/029 land in one and not the other.
+- **Four hand-rolled lease clients** — medium — membrane-telegram, membrane-discord, membrane-mcp, and the desktop membrane each reimplement lease acquire/renew/backoff (`lease.rs` per crate); DEF-028's bug class exists ×4.
+- **park_and_materialize duplication + cron dual-delivery race** — medium — `park_and_materialize_local_role` vs `park_and_materialize_role_philote` in `crates/aiua/src/service/ipc.rs`, and a fired cron event is consumed by BOTH `CronTicker::fire` delivery and `deliver_event_envelope_or_park` reacting to the same `AppendLocal` — which one wins varies per fire (observed live, session 18).
+- **Guest supervisor off by default** — high — respawn loop is gated on `PHILOTIC_ENABLE_GUEST_SUPERVISOR` (`crates/aiua/src/main.rs:489`); hotels missing the env var never respawn dead guests.
+- **Unbounded paracrine chains** — medium — paracrine delegation (whisper → specialist → …) has no depth/hop cap; a misrouted or looping specialist burns model calls until a watchdog fires (see DEF-024).
+- **Primitives crates unused** — low — `philotic-primitives-{agent,data,hotel,model,tool}` have no consumers; only `philotic-primitives-mesh` is depended on (by ansible-mesh-core).
+- **agent-graph-runner vs agent-datasource dual binaries** — low — two overlapping datasource guest crates (`crates/agent-graph-runner`, `crates/agent-datasource`); orphaned agent-graph-runner PIDs from stale binaries have already caused cleanup work.
+- **membrane-discord unshipped island** — low — `crates/membrane-discord` is a full gateway (voice bridge included) that is never seeded or deployed; it still costs build time and carries its own lease client.
+- **membrane-mcp dead dispatch.rs** — low — `crates/membrane-mcp/src/dispatch.rs` is declared (`mod dispatch;`) but nothing references it; dead code to delete or wire in.
