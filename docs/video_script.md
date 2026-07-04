@@ -16,8 +16,8 @@
 **Voiceover:** "The Hotel is an autonomous node. It materializes AI Guest processes, bringing specialized agent personas to life on demand."
 
 ### Segment 3: 0:16 - 0:24
-**Visual:** A brilliant central switchboard lighting up, routing messages instantly between the compartments.
-**Voiceover:** "Every Guest communicates through a secure, lightning-fast Unix Domain Socket. The Hotel acts as the ultimate, reliable switchboard."
+**Visual:** A protective, glowing shield (The Ingress Fence) wrapping around the switchboard of The Hotel, filtering all local connections.
+**Voiceover:** "Protected by the Ingress Fence, every Guest communicates through a secure, lightning-fast UDS interface under absolute boundary isolation."
 
 ### Segment 4: 0:24 - 0:32
 **Visual:** The Context Graph materializes—a highly structured, glowing web of data built on a solid foundation.
@@ -36,8 +36,8 @@
 **Voiceover:** "But a single Hotel is just the beginning. The Philotic Web connects multiple nodes across a durable UDP and TCP mesh."
 
 ### Segment 8: 0:56 - 1:04
-**Visual:** Packets flashing between nodes, locking together with cryptographic symbols.
-**Voiceover:** "Every connection is cryptographically secured by Ed25519 identities and ephemeral session keys. Your mesh is private and trusted."
+**Visual:** Ephemeral WebRTC P2P data channels dynamically establishing between nodes, bypassing intermediate hubs.
+**Voiceover:** "Direct execution routes via peer-to-peer WebRTC channels, protected by cryptographic identities and session keys."
 
 ### Segment 9: 1:04 - 1:12
 **Visual:** A Guest process suddenly turns red (crashes), but is instantly respawned by a scanning beam (The Supervisor).
@@ -48,8 +48,8 @@
 **Voiceover:** "Built on 29 focused Rust crates, our architecture isolates memory, models, and mesh logic for unparalleled stability."
 
 ### Segment 11: 1:20 - 1:28
-**Visual:** The Muninn raven logo glowing, showing digital memories fading in and out based on human-like recall patterns.
-**Voiceover:** "Agents think using the Muninn cognitive memory engine, mimicking human recall and natural memory decay over time."
+**Visual:** A glowing paracrine cloud (The Whisper Protocol) distributing task context to nearby agent processes.
+**Voiceover:** "Agents collaborate via paracrine whispers, utilizing the lookaside reflex and Muninn engine for structured memory recall."
 
 ### Segment 12: 1:28 - 1:36
 **Visual:** A crisp terminal typing out `brew install philotic-web` and `phil start`. The Hotel powers on immediately.

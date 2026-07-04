@@ -134,6 +134,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
   - [x] Implement provider handlers for `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`, mirroring `handle_observe` with runner gates and Memgraph MERGE/SET writes.
   - [x] Add a clean external MCP surface: keep Perplexity `context.capture` routed to Muninn continuity memory, add `mcp-surface-hygiene`, enforce auth on config-driven `membrane-mcp` tools, and provide a separate LifeGraph endpoint provisioner for governed `life.recall` / opt-in `life.observe`.
   - [x] Deploy and smoke the LifeGraph MCP endpoint against the live `life-graph-runner` before claiming `watched-live-green`.
+  - [x] Harden the model-facing LifeGraph tool contracts: `life.recall` now supports the advertised text-only auto-embed path, governed patch approval defaults safely to false, and every `life.steward` implied tool has a concrete catalog schema.
 - [ ] Add semantic indexing for Life Graph nodes with a `768`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
 - [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
   - [x] Add `life.recall.feedback` contracts/provider handler to record retrieval reward/friction as `Signal` nodes and emit governed improvement-candidate steps from usefulness, staleness, missing context, noise, overconfidence, and low connectivity.
