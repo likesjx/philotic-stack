@@ -26,7 +26,12 @@ env:
 jobs:
   build-linux:
     name: Build x86_64-unknown-linux-gnu
-    runs-on: ubuntu-22.04
+    # ubuntu-24.04 = glibc 2.39, matching vps-jane (Ubuntu 24.04, glibc 2.39).
+    # The prebuilt onnxruntime static libs pulled in by the `ort` crate
+    # (download-binaries) are built against glibc >= 2.38 (__isoc23_strto*),
+    # which fails to link on ubuntu-22.04 (glibc 2.35). Do not downgrade the
+    # runner below the glibc of both the ort binaries and vps-jane.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
