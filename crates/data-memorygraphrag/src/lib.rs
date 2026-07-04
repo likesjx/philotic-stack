@@ -410,18 +410,30 @@ impl Default for RankingWeights {
 pub struct RetrievalQuery {
     pub query_id: String,
     pub query_text: String,
+    #[serde(default = "default_retrieval_strategy")]
     pub strategy: RetrievalStrategy,
     #[serde(default)]
     pub semantic_pivots: Vec<SemanticPivot>,
+    #[serde(default)]
     pub expansion_policy: ExpansionPolicy,
     #[serde(default)]
     pub policy_filters: Vec<PolicyFilter>,
+    #[serde(default)]
     pub ranking_weights: RankingWeights,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_intent: Option<String>,
+    #[serde(default = "default_max_context_packets")]
     pub max_context_packets: usize,
+}
+
+fn default_retrieval_strategy() -> RetrievalStrategy {
+    RetrievalStrategy::MemoryAwareGraphRank
+}
+
+fn default_max_context_packets() -> usize {
+    6
 }
 
 impl RetrievalQuery {
@@ -430,10 +442,6 @@ impl RetrievalQuery {
 
         require_non_empty(&mut violations, "query_id", &self.query_id);
         require_non_empty(&mut violations, "query_text", &self.query_text);
-
-        if self.semantic_pivots.is_empty() {
-            violations.push("retrieval query requires at least one semantic_pivot".into());
-        }
 
         for (idx, pivot) in self.semantic_pivots.iter().enumerate() {
             require_non_empty(
@@ -1337,6 +1345,7 @@ pub struct LifePatchProposalInput {
     #[serde(default)]
     pub evidence_packets: Vec<EvidencePacket>,
     pub risk: PatchRisk,
+    #[serde(default)]
     pub operator_approved: bool,
 }
 
@@ -1923,6 +1932,28 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_query_accepts_text_only_auto_embed_shape() {
+        let query: RetrievalQuery = serde_json::from_value(serde_json::json!({
+            "query_id": "retrieval:text-only:20260703",
+            "query_text": "What open loops need attention today?"
+        }))
+        .expect("text-only recall query should deserialize with defaults");
+
+        assert_eq!(query.strategy, RetrievalStrategy::MemoryAwareGraphRank);
+        assert!(query.semantic_pivots.is_empty());
+        assert_eq!(query.expansion_policy, ExpansionPolicy::default());
+        assert_eq!(query.ranking_weights, RankingWeights::default());
+        assert_eq!(query.max_context_packets, 6);
+
+        let plan = MemoryGraphRagRunner::default()
+            .plan(LifeGraphToolRequest::LifeRecall(query))
+            .expect("text-only recall query should plan for provider auto-embedding");
+
+        assert!(plan.allowed());
+        assert_eq!(plan.tool_name, LifeGraphToolName::LifeRecall);
+    }
+
+    #[test]
     fn retrieval_query_bounds_graph_expansion() {
         let mut query = retrieval_query();
         query.expansion_policy.max_hops = 5;
@@ -2339,6 +2370,28 @@ mod tests {
             plan.steps[0].payload["growth_evaluation"]["gate"],
             "proposal_only"
         );
+    }
+
+    #[test]
+    fn patch_proposal_defaults_missing_operator_approval_to_false() {
+        let input: LifePatchProposalInput = serde_json::from_value(serde_json::json!({
+            "patch_id": "patch:ranking-bridge",
+            "patch_kind": "attention_patch",
+            "summary": "Tune ranking bridge policy.",
+            "rationale": "Recent feedback says important commitments are disconnected.",
+            "evidence_packets": [evidence_packet()],
+            "risk": "medium"
+        }))
+        .expect("operator_approved should default to false");
+
+        assert!(!input.operator_approved);
+
+        let plan = MemoryGraphRagRunner::default()
+            .plan(LifeGraphToolRequest::LifePatchPropose(input))
+            .expect("medium-risk patch should plan");
+
+        assert!(!plan.allowed());
+        assert!(plan.requires_operator);
     }
 
     #[test]

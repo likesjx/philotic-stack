@@ -266,7 +266,11 @@ pub fn parse_openrouter_models(
     for m in list.data {
         let mut modalities: Vec<String> = Vec::new();
         if let Some(arch) = &m.architecture {
-            for modality in arch.input_modalities.iter().chain(arch.output_modalities.iter()) {
+            for modality in arch
+                .input_modalities
+                .iter()
+                .chain(arch.output_modalities.iter())
+            {
                 if !modalities.contains(modality) {
                     modalities.push(modality.clone());
                 }
