@@ -37,8 +37,33 @@ const STREAMING_CONNECT_SECS: u64 = 25;
 /// with the philote WaitingModel watchdog (also 120s).
 const STREAMING_TOTAL_SECS: u64 = 32;
 
+/// Thinking-token budget sent as `generationConfig.thinkingConfig.thinkingBudget`.
+/// Set to 0 to DISABLE model "thinking". Thinking models (e.g. gemini-3.5-flash, which
+/// `gemini-flash-latest` currently resolves to) otherwise drip empty thinking keep-alive SSE
+/// chunks that reset STREAMING_IDLE_SECS without emitting output, hanging the turn until the
+/// philote WaitingModel watchdog evicts it at ~300s. Disabling thinking removes the drip at
+/// the source (the hotel has no live fallback provider to escalate to). Tunable via the
+/// PHILOTIC_GEMINI_THINKING_BUDGET env var; -1 lets Gemini choose (dynamic thinking).
+const GEMINI_THINKING_BUDGET: i64 = 0;
+
+/// Resolve the Gemini thinking budget, allowing an operator override without a rebuild.
+fn gemini_thinking_budget() -> i64 {
+    std::env::var("PHILOTIC_GEMINI_THINKING_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(GEMINI_THINKING_BUDGET)
+}
+
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
+/// Default model for text.generate (agent cognition). `gemini-3.5-flash` is the capable
+/// tier — it emits well-formed tool/function calls (which agents like the orchestrator rely
+/// on) and richer prose. It is a thinking model that can drip empty keep-alive SSE bytes for
+/// a long time, but that is now bounded by the provider's per-attempt cap (attempt_policy
+/// total_secs=35) plus the retry loop, so a dripping turn bails and retries fast instead of
+/// hanging. `gemini-3.1-flash-lite` was tried but mangles structured/tool turns (wraps plain
+/// replies as malformed function calls), stalling the orchestrator — do not use it here.
+const GEMINI_TEXT_DEFAULT_MODEL: &str = "gemini-3.5-flash";
 const GEMINI_LIVE_PROTOCOL: &str = "gemini-live-v1beta";
 const GEMINI_LIVE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 type GeminiLiveSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -163,6 +188,7 @@ impl GeminiProvider {
     fn request_model<'a>(&'a self, task: &'a ControllerTask) -> &'a str {
         task.model.as_deref().unwrap_or_else(|| match task.kind {
             TaskKind::AudioTranscribe => GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL,
+            TaskKind::TextGenerate => GEMINI_TEXT_DEFAULT_MODEL,
             _ => &self.default_model,
         })
     }
@@ -235,7 +261,10 @@ impl GeminiProvider {
 
     fn request_payload(prompt: &str) -> Value {
         json!({
-            "contents": [{"parts": [{"text": prompt}]}]
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingBudget": gemini_thinking_budget() }
+            }
         })
     }
 
@@ -484,7 +513,8 @@ impl GeminiProvider {
                     "type": "OBJECT",
                     "properties": properties,
                     "required": required
-                }
+                },
+                "thinkingConfig": { "thinkingBudget": gemini_thinking_budget() }
             },
             "tools": [
                 {
@@ -576,7 +606,8 @@ impl GeminiProvider {
                     "type": "OBJECT",
                     "properties": properties,
                     "required": required
-                }
+                },
+                "thinkingConfig": { "thinkingBudget": gemini_thinking_budget() }
             }
         })
     }
@@ -2793,6 +2824,25 @@ mod tests {
         assert_eq!(
             payload["toolResponse"]["functionResponses"][0]["response"]["ok"],
             serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn request_payload_includes_thinking_budget() {
+        let payload = GeminiProvider::request_payload("hello");
+        assert_eq!(
+            payload["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            serde_json::json!(super::gemini_thinking_budget())
+        );
+    }
+
+    #[test]
+    fn request_model_defaults_text_generate_to_text_default_model() {
+        let provider = GeminiProvider::new(reqwest::Client::new(), None, None);
+        let task = minimal_text_task_with_tools(vec![]);
+        assert_eq!(
+            provider.request_model(&task),
+            super::GEMINI_TEXT_DEFAULT_MODEL
         );
     }
 }
