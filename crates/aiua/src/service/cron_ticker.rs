@@ -700,9 +700,9 @@ mod tests {
         let mut job = test_job();
         job.target_role = "role:agent-test:orchestrator".into();
 
-        // Buffered and never read — `fire()` only ever pushes one ledger entry per call,
-        // so the receiver just needs to stay alive to keep the send from failing.
-        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        // Drained by a background task (see `ipc::test_dispatcher_channel`) so
+        // ledger sends can never block, no matter how many entries fire pushes.
+        let (dispatcher_tx, _dispatcher_rx) = crate::service::ipc::test_dispatcher_channel();
         let requester = Arc::new(MockRequester {
             calls: AtomicUsize::new(0),
             last_guest_id: Mutex::new(None),

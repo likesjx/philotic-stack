@@ -2500,16 +2500,36 @@ impl PhiloticClient {
             (req, response),
             (
                 IpcRequest::AcquireTelegramPollLease { .. }
-                    | IpcRequest::GetTelegramPollLeaseOwner { .. },
+                    | IpcRequest::RenewTelegramPollLease { .. },
+                IpcResponse::TelegramPollLease { .. }
+            ) | (
+                IpcRequest::GetTelegramPollLeaseOwner { .. },
                 IpcResponse::TelegramPollLeaseStatus { .. }
             ) | (
+                // Acquire/Renew reply with the lease envelope itself, not the
+                // owner-status view. Matching the actual reply variant here is
+                // load-bearing: `DesktopMembraneLease` is also in
+                // `is_ignorable_push`, so without this arm the real reply is
+                // swallowed as an OOB broadcast and send_request hangs forever
+                // (DEF-005).
                 IpcRequest::AcquireDesktopMembraneLease { .. }
-                    | IpcRequest::GetDesktopMembraneLeaseOwner { .. },
+                    | IpcRequest::RenewDesktopMembraneLease { .. },
+                IpcResponse::DesktopMembraneLease { .. }
+            ) | (
+                IpcRequest::GetDesktopMembraneLeaseOwner { .. },
                 IpcResponse::DesktopMembraneLeaseStatus { .. }
             ) | (
+                // `IpcResponse` is untagged, and `DiscordGatewayLease { granted, lease }`
+                // has the same shape as `TelegramPollLease` (which is declared first),
+                // so discord lease replies deserialize as `TelegramPollLease` on the
+                // wire. Accept both variants for discord requests.
                 IpcRequest::AcquireDiscordGatewayLease { .. }
-                    | IpcRequest::GetDiscordGatewayLeaseOwner { .. },
+                    | IpcRequest::RenewDiscordGatewayLease { .. },
+                IpcResponse::DiscordGatewayLease { .. } | IpcResponse::TelegramPollLease { .. }
+            ) | (
+                IpcRequest::GetDiscordGatewayLeaseOwner { .. },
                 IpcResponse::DiscordGatewayLeaseStatus { .. }
+                    | IpcResponse::TelegramPollLeaseStatus { .. }
             ) | (
                 IpcRequest::AcquireMcpMembraneLease { .. }
                     | IpcRequest::RenewMcpMembraneLease { .. },
@@ -2734,10 +2754,33 @@ mod tests {
                 lease: None,
             }
         ));
+        // Acquire/Renew reply with the lease envelope itself (`DesktopMembraneLease`),
+        // NOT the owner-status view — see the AcquireDesktopMembraneLease handler in
+        // crates/aiua/src/service/ipc.rs. Matching the actual reply variant is what
+        // keeps it from being swallowed by is_ignorable_push (DEF-005).
         assert!(PhiloticClient::is_expected_response(
             &IpcRequest::AcquireDesktopMembraneLease {
                 lease_key: "desktop:local".into(),
                 port: 49152,
+            },
+            &IpcResponse::DesktopMembraneLease {
+                desktop_granted: true,
+                desktop_lease: None,
+            }
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::RenewDesktopMembraneLease {
+                lease_key: "desktop:local".into(),
+                lease_epoch: 1,
+            },
+            &IpcResponse::DesktopMembraneLease {
+                desktop_granted: true,
+                desktop_lease: None,
+            }
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::GetDesktopMembraneLeaseOwner {
+                lease_key: "desktop:local".into(),
             },
             &IpcResponse::DesktopMembraneLeaseStatus {
                 desktop_active: true,
@@ -2750,6 +2793,19 @@ mod tests {
             },
             &IpcResponse::DiscordGatewayLeaseStatus {
                 active: true,
+                lease: None,
+            }
+        ));
+        // IpcResponse is untagged and DiscordGatewayLease has the same field shape
+        // as TelegramPollLease (declared first), so discord lease replies arrive
+        // deserialized as TelegramPollLease. Both variants must be accepted.
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::AcquireDiscordGatewayLease {
+                lease_key: "discord:bot".into(),
+                agent_id: "agent-test".into(),
+            },
+            &IpcResponse::TelegramPollLease {
+                granted: true,
                 lease: None,
             }
         ));
