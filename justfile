@@ -472,9 +472,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
+    AIUA_BINS="aiua philote membrane membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -576,6 +576,7 @@ vps-push:
       -p philote \
       -p membrane \
       -p membrane-telegram \
+      -p membrane-discord \
       -p membrane-mcp \
       -p model-router \
       -p tool-runner \
