@@ -14,7 +14,9 @@ pub mod lease;
 pub mod runtime;
 
 pub use envelope::{InboundEnvelope, OutboundReply, SenderInfo};
-pub use lease::LeaseRenewResult;
+pub use lease::{
+    LeaseAcquireOutcome, LeaseBackend, LeaseDriver, LeaseDriverConfig, LeaseEvent, LeaseRenewResult,
+};
 pub use runtime::{MembraneContext, MembraneRuntime};
 
 use anyhow::Result;
