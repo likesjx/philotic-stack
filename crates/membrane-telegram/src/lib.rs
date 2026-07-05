@@ -66,6 +66,10 @@ struct TelegramMessageEnvelope {
     thread_id: Option<String>,
     sender_id: Option<String>,
     sender_username: Option<String>,
+    /// The chat type: "private", "group", "supergroup", or "channel".
+    chat_type: Option<String>,
+    /// The sender's first name (display name, always present for real users).
+    sender_first_name: Option<String>,
     message_kind: &'static str,
     content: String,
     attachments: Vec<Value>,
@@ -1066,6 +1070,17 @@ fn telegram_message_envelope(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|name| !name.is_empty());
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sender_first_name = message
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
     let attachments = telegram_message_attachments(message);
     let message_kind = telegram_message_kind(message);
     let explicit_text = message
@@ -1090,6 +1105,8 @@ fn telegram_message_envelope(
         thread_id,
         sender_id,
         sender_username,
+        chat_type,
+        sender_first_name,
         message_kind,
         content: content.clone(),
         attachments,
@@ -1131,6 +1148,17 @@ fn telegram_callback_envelope(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|name| !name.is_empty());
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sender_first_name = callback
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
 
     Some(TelegramMessageEnvelope {
         session_id: telegram_session_id(&chat_id, thread_id.as_deref(), agent_id),
@@ -1139,6 +1167,8 @@ fn telegram_callback_envelope(
         thread_id,
         sender_id,
         sender_username,
+        chat_type,
+        sender_first_name,
         message_kind: "callback",
         content: approval_callback_content(&callback_data),
         attachments: Vec::new(),
@@ -1170,6 +1200,31 @@ fn approval_callback_content(callback_data: &str) -> String {
         "/deny".to_string()
     } else {
         format!("Telegram callback action: {callback_data}")
+    }
+}
+
+/// Group-chat detection for the operator gate: explicit chat type wins,
+/// with the negative-chat-id convention as a fallback.
+fn is_group_chat(chat_type: Option<&str>, chat_id: &str) -> bool {
+    matches!(chat_type, Some("group") | Some("supergroup")) || chat_id.starts_with('-')
+}
+
+/// True when the sender's username is in the operator allowlist
+/// (case-insensitive; the allowlist is stored lowercased).
+fn is_operator_sender(sender_username: Option<&str>, operator_usernames: &HashSet<String>) -> bool {
+    sender_username
+        .map(|u| operator_usernames.contains(&u.to_lowercase()))
+        .unwrap_or(false)
+}
+
+/// Derive the operator allowlist config key from the bot-token config key:
+/// `telegram_bot_token_{agent_key}` → `telegram_allowed_users_{agent_key}`,
+/// with the un-suffixed global fallback for single-seat mode.
+fn telegram_allowed_users_key(telegram_token_key: &str) -> String {
+    if let Some(suffix) = telegram_token_key.strip_prefix("telegram_bot_token_") {
+        format!("telegram_allowed_users_{suffix}")
+    } else {
+        "telegram_allowed_users".to_string()
     }
 }
 
@@ -1820,13 +1875,29 @@ fn seat_inbound_envelope(
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
+    extra.insert(
+        "chat_type".into(),
+        envelope
+            .chat_type
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    extra.insert(
+        "sender_first_name".into(),
+        envelope
+            .sender_first_name
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
 
     InboundEnvelope {
         session_id: envelope.session_id.clone(),
         turn_id: envelope.turn_id.clone(),
         sender: SenderInfo {
             id: envelope.sender_id.clone(),
-            display_name: None,
+            display_name: envelope.sender_first_name.clone(),
             username: envelope.sender_username.clone(),
             is_operator: false,
         },
@@ -1856,6 +1927,9 @@ struct SeatPollContext {
     tg_file_base: String,
     blob_base: String,
     agent_cmds: Vec<CommandManifestEntry>,
+    /// Operator usernames (lowercased) allowed to issue commands and
+    /// approval callbacks in group chats. Empty set disables the gate.
+    operator_usernames: HashSet<String>,
     active_turns: ActiveTurns,
     inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// NetworkState from the hotel: polling is suppressed while `false`.
@@ -2089,6 +2163,32 @@ async fn seat_process_update(
         }
     }
 
+    // Group chat operator gate: only operators may issue commands or
+    // approval callbacks. Non-operators in group chats have their slash
+    // commands stripped so the message is forwarded as context-only text.
+    if is_group_chat(envelope.chat_type.as_deref(), &envelope.chat_id)
+        && !ctx.operator_usernames.is_empty()
+        && !is_operator_sender(envelope.sender_username.as_deref(), &ctx.operator_usernames)
+    {
+        if envelope.message_kind == "callback" {
+            // Silently ignore approval callbacks from non-operators.
+            info!(
+                "Group chat: dropping callback from non-operator {:?}",
+                envelope.sender_username
+            );
+            return true;
+        }
+        // Strip any slash command so the message reaches the agent as
+        // plain context, not a command.
+        if envelope.command.is_some() {
+            info!(
+                "Group chat: stripping command from non-operator {:?}",
+                envelope.sender_username
+            );
+            envelope.command = None;
+        }
+    }
+
     // Elevation: handle deterministic commands in membrane
     // before they reach agent-core.
     if handle_membrane_command(
@@ -2296,6 +2396,33 @@ impl MembraneGuest for TelegramSeatGuest {
             return Ok(());
         };
 
+        // Load the operator allowlist for group-chat command gating.
+        let allowed_users_key = telegram_allowed_users_key(&self.telegram_token_key);
+        let operator_usernames: HashSet<String> = match client
+            .send_request(IpcRequest::GetConfig {
+                key: allowed_users_key.clone(),
+            })
+            .await
+            .ok()
+        {
+            Some(IpcResponse::ConfigData {
+                value_json: Some(json_str),
+                ..
+            }) => serde_json::from_str::<Vec<String>>(&json_str)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
+            _ => HashSet::new(),
+        };
+        if !operator_usernames.is_empty() {
+            info!(
+                "Loaded {} operator username(s) for group chat gating from key [{}]",
+                operator_usernames.len(),
+                allowed_users_key
+            );
+        }
+
         let lease_key = telegram_poll_lease_key(&self.telegram_token_key, &bot_token);
         self.lease_key = Some(lease_key.clone());
 
@@ -2384,6 +2511,7 @@ impl MembraneGuest for TelegramSeatGuest {
             tg_file_base,
             blob_base: self.blob_base.clone(),
             agent_cmds,
+            operator_usernames,
             active_turns: self.active_turns.clone(),
             inbound_tx: self.inbound_tx.clone(),
             online_rx: self.online_rx.clone(),
@@ -3328,6 +3456,86 @@ mod tests {
         assert!(names.contains(&"ping"));
         assert!(names.contains(&"new"));
         assert!(names.contains(&"status"));
+    }
+
+    #[test]
+    fn envelope_captures_chat_type_and_sender_first_name() {
+        let update = json!({
+            "update_id": 400,
+            "message": {
+                "text": "hello",
+                "chat": { "id": -900123, "type": "supergroup" },
+                "from": { "id": 888, "username": "jared", "first_name": "Jared" }
+            }
+        });
+        let envelope = telegram_inbound_envelope(&update, 400, "agent-jane-01")
+            .expect("group message should normalize");
+        assert_eq!(envelope.chat_type.as_deref(), Some("supergroup"));
+        assert_eq!(envelope.sender_first_name.as_deref(), Some("Jared"));
+
+        let callback_update = json!({
+            "update_id": 401,
+            "callback_query": {
+                "data": "approve",
+                "from": { "id": 999, "username": "mallory", "first_name": "Mallory" },
+                "message": {
+                    "chat": { "id": -900123, "type": "group" }
+                }
+            }
+        });
+        let cb = telegram_inbound_envelope(&callback_update, 401, "agent-jane-01")
+            .expect("callback should normalize");
+        assert_eq!(cb.chat_type.as_deref(), Some("group"));
+        assert_eq!(cb.sender_first_name.as_deref(), Some("Mallory"));
+    }
+
+    #[test]
+    fn group_chat_detection_uses_chat_type_then_negative_id() {
+        assert!(super::is_group_chat(Some("group"), "12345"));
+        assert!(super::is_group_chat(Some("supergroup"), "12345"));
+        assert!(super::is_group_chat(None, "-10012345"));
+        assert!(!super::is_group_chat(Some("private"), "12345"));
+        assert!(!super::is_group_chat(None, "12345"));
+    }
+
+    #[test]
+    fn operator_check_is_case_insensitive_and_requires_username() {
+        let operators: std::collections::HashSet<String> =
+            ["jared".to_string()].into_iter().collect();
+        assert!(super::is_operator_sender(Some("jared"), &operators));
+        assert!(super::is_operator_sender(Some("JARED"), &operators));
+        assert!(!super::is_operator_sender(Some("mallory"), &operators));
+        // No username at all can never be an operator.
+        assert!(!super::is_operator_sender(None, &operators));
+    }
+
+    #[test]
+    fn allowed_users_key_derivation_matches_token_key_convention() {
+        assert_eq!(
+            super::telegram_allowed_users_key("telegram_bot_token_jane"),
+            "telegram_allowed_users_jane"
+        );
+        assert_eq!(
+            super::telegram_allowed_users_key("telegram_bot_token"),
+            "telegram_allowed_users"
+        );
+    }
+
+    #[test]
+    fn seat_inbound_envelope_carries_chat_type_and_first_name_extras() {
+        let update = json!({
+            "update_id": 402,
+            "message": {
+                "text": "hi",
+                "chat": { "id": -777, "type": "group" },
+                "from": { "id": 1, "username": "jared", "first_name": "Jared" }
+            }
+        });
+        let envelope = telegram_inbound_envelope(&update, 402, "agent-jane-01").unwrap();
+        let inbound = super::seat_inbound_envelope(&envelope, "node", "agent-jane-01", "seat");
+        assert_eq!(inbound.extra["chat_type"], "group");
+        assert_eq!(inbound.extra["sender_first_name"], "Jared");
+        assert_eq!(inbound.sender.display_name.as_deref(), Some("Jared"));
     }
 
     #[test]
