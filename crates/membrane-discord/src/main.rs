@@ -12,12 +12,13 @@ mod voice_udp;
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
+use membrane::LeaseEvent;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Value, json};
 use session::{ActiveTurn, ActiveTurns, GuildCache};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 use voice_bridge::{VoiceBridge, VoiceUtteranceEvent};
 
@@ -154,10 +155,6 @@ async fn run_once(args: Args) -> Result<()> {
     let mut active_bridges: HashMap<String, VoiceBridge> = HashMap::new();
 
     let http = reqwest::Client::new();
-    let mut lease_renew_tick = interval(Duration::from_secs(
-        lease::DiscordGatewayLease::renew_interval_secs(),
-    ));
-    lease_renew_tick.tick().await; // consume immediate tick
 
     // Ctrl-C shutdown
     let ctrl_c = tokio::signal::ctrl_c();
@@ -170,10 +167,31 @@ async fn run_once(args: Args) -> Result<()> {
 
     loop {
         tokio::select! {
-            // Periodic lease renewal
-            _ = lease_renew_tick.tick() => {
-                if let Err(e) = gateway_lease.renew(&mut ipc).await {
-                    return Err(anyhow!("Discord gateway lease lost: {}", e));
+            // Lease lifecycle — the shared LeaseDriver schedules renewals,
+            // re-acquires in place after lapses/errors, and backs off on IPC
+            // failures. Only losing the lease to ANOTHER holder ends the seat;
+            // everything else is survivable and already scheduled for retry.
+            _ = lease_deadline(&gateway_lease) => {
+                match gateway_lease.tick(&mut ipc).await {
+                    LeaseEvent::Lost { owner } => {
+                        return Err(anyhow!(
+                            "Discord gateway lease lost to [{}] — yielding seat",
+                            owner.as_deref().unwrap_or("unknown")
+                        ));
+                    }
+                    LeaseEvent::Reacquired { epoch } => {
+                        info!("Discord gateway lease re-acquired in place — epoch {}", epoch);
+                    }
+                    LeaseEvent::BackingOff { retry_in, error } => {
+                        warn!(
+                            "Discord gateway lease attempt failed ({}); retrying in {:?}",
+                            error, retry_in
+                        );
+                    }
+                    LeaseEvent::Renewed { epoch } => {
+                        debug!("Discord gateway lease renewed — epoch {}", epoch);
+                    }
+                    _ => {}
                 }
             }
 
@@ -542,6 +560,16 @@ async fn run_once(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Sleep until the lease driver's next scheduled attempt. Pends forever once
+/// the driver reaches a terminal state (lost/released) — the Lost event has
+/// already been surfaced by the tick that entered that state.
+async fn lease_deadline(gateway_lease: &lease::DiscordGatewayLease) {
+    match gateway_lease.next_deadline() {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn run_with_backoff(args: Args) -> Result<()> {
