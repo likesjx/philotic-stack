@@ -2482,9 +2482,15 @@ impl MembraneGuest for TelegramSeatGuest {
         let lease_key = telegram_poll_lease_key(&self.telegram_token_key, &bot_token);
         self.lease_key = Some(lease_key.clone());
 
-        // A fresh IPC connection means the hotel is reachable: clear any
-        // stale offline latch so the acquire below can proceed. The next
-        // NetworkState push re-syncs the real connectivity state.
+        // A fresh (re)connection starts optimistically online, exactly like
+        // the deployed seat loop reset network_online = true on every seat
+        // (re)start. Without this, an offline latch from before an IPC
+        // reconnect would suppress the new poll loop forever if the hotel
+        // does not re-push NetworkState. If the WAN is genuinely still down,
+        // the next NetworkState push flips it back off.
+        self.online_tx.send_replace(true);
+        // Defensive: the lease driver is never fed offline (see handle_push),
+        // but a fresh connection must always start it online.
         self.lease_driver.set_online(true);
         if self.lease_driver.is_lost() {
             // Seat-restart semantics: after losing the lease we get exactly
@@ -2686,10 +2692,14 @@ impl MembraneGuest for TelegramSeatGuest {
                 if *self.online_rx.borrow() != online {
                     info!(online, "Network state changed; adjusting Telegram polling.");
                     self.online_tx.send_replace(online);
-                    // Feed the lease driver: renewals are suppressed while
-                    // offline; on reconnect it renews or re-acquires
-                    // immediately (TTL-drift tolerant).
-                    self.lease_driver.set_online(online);
+                    // Deliberately NOT fed to the lease driver: NetworkState
+                    // reflects WAN reachability, but lease renewals run over
+                    // the local hotel UDS and must continue while offline
+                    // (deployed behaviour). Keeping the lease warm means the
+                    // poll loop can resume the instant connectivity returns,
+                    // with no window where another seat could grab the lease.
+                    // Machine sleep (where renewals really do stop) is covered
+                    // by the driver's TTL-gap re-acquire.
                 }
                 Ok(true)
             }
