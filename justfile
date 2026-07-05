@@ -604,6 +604,12 @@ vps-config:
 # it. No compilation anywhere — this replaces `vps-push` and avoids the VPS
 # OOM-killing release links (it has no swap and ~2 GB free). Requires the gh CLI
 # authed and a successful build-linux run on develop (.github/workflows/build-linux.yml).
+#
+# Default transfer path: the VPS pulls the artifact zip DIRECTLY from GitHub
+# (datacenter bandwidth, seconds) instead of downloading it locally and rsyncing
+# ~1.2GB over a residential uplink (measured ~37 KB/s, 4.5h+ unfinished on
+# 2026-07-03). Set PHILOTIC_VPS_DEPLOY_VIA_RSYNC=1 to fall back to the old
+# local-download + rsync path (for when the VPS cannot reach GitHub).
 vps-deploy-ci:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -611,21 +617,46 @@ vps-deploy-ci:
     VPS="${PHILOTIC_VPS_SSH_TARGET:-deploy@jane-vps}"
     REMOTE_DIR="/home/deploy/ci-artifacts"
     STAGE="${ROOT_DIR}/dist-ci"
+    REPO="${PHILOTIC_GH_REPO:-likesjx/philotic-stack}"
+    SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 
     echo "▶ Finding latest successful build-linux run on develop..."
     RUN_ID=$(gh run list --workflow=build-linux.yml --branch develop --status success --limit 1 --json databaseId -q '.[0].databaseId')
     if [ -z "${RUN_ID}" ]; then echo "✗ no successful build-linux run on develop — push to develop or run the workflow first"; exit 1; fi
     echo "  run ${RUN_ID}"
 
-    echo "▶ Downloading linux-x86_64 artifact..."
-    rm -rf "${STAGE}" && mkdir -p "${STAGE}"
-    gh run download "${RUN_ID}" --name linux-x86_64 --dir "${STAGE}"
-    chmod +x "${STAGE}"/* 2>/dev/null || true   # upload-artifact drops the +x bit
-    echo "  $(ls -1 "${STAGE}" | grep -vc SHA256SUMS) binaries staged"
+    if [ "${PHILOTIC_VPS_DEPLOY_VIA_RSYNC:-0}" = "1" ]; then
+      echo "▶ Fallback path (PHILOTIC_VPS_DEPLOY_VIA_RSYNC=1): downloading linux-x86_64 artifact locally..."
+      rm -rf "${STAGE}" && mkdir -p "${STAGE}"
+      gh run download "${RUN_ID}" --name linux-x86_64 --dir "${STAGE}"
+      chmod +x "${STAGE}"/* 2>/dev/null || true   # upload-artifact drops the +x bit
+      echo "  $(ls -1 "${STAGE}" | grep -vc SHA256SUMS) binaries staged"
 
-    echo "▶ Syncing binaries to ${VPS}:${REMOTE_DIR}..."
-    ssh -n "${VPS}" "mkdir -p '${REMOTE_DIR}'"
-    rsync -az --delete "${STAGE}/" "${VPS}:${REMOTE_DIR}/"
+      echo "▶ Syncing binaries to ${VPS}:${REMOTE_DIR} (rsync over local uplink — slow)..."
+      ssh -n "${SSH_OPTS[@]}" "${VPS}" "mkdir -p '${REMOTE_DIR}'"
+      rsync -az --delete -e "ssh ${SSH_OPTS[*]}" "${STAGE}/" "${VPS}:${REMOTE_DIR}/"
+    else
+      echo "▶ Resolving linux-x86_64 artifact id for run ${RUN_ID}..."
+      ARTIFACT_ID=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" -q '.artifacts[] | select(.name == "linux-x86_64") | .id')
+      if [ -z "${ARTIFACT_ID}" ]; then echo "✗ run ${RUN_ID} has no linux-x86_64 artifact (expired?)"; exit 1; fi
+      echo "  artifact ${ARTIFACT_ID}"
+
+      echo "▶ Capturing short-lived signed download URL..."
+      ZIP_URL=$(curl -sI -H "Authorization: Bearer $(gh auth token)" \
+        "https://api.github.com/repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip" \
+        | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+      if [ -z "${ZIP_URL}" ]; then echo "✗ could not resolve artifact redirect URL (gh auth token valid?) — or set PHILOTIC_VPS_DEPLOY_VIA_RSYNC=1 to fall back"; exit 1; fi
+
+      echo "▶ ${VPS} pulling artifact directly from GitHub..."
+      ssh "${SSH_OPTS[@]}" "${VPS}" "set -e; rm -rf '${REMOTE_DIR}' && mkdir -p '${REMOTE_DIR}' && curl -fsSL --connect-timeout 15 -o /tmp/philotic-ci-artifact.zip '${ZIP_URL}' && unzip -o -q /tmp/philotic-ci-artifact.zip -d '${REMOTE_DIR}' && chmod +x '${REMOTE_DIR}'/* && rm -f /tmp/philotic-ci-artifact.zip"
+
+      echo "▶ Verifying SHA256SUMS on the remote..."
+      if ! ssh -n "${SSH_OPTS[@]}" "${VPS}" "cd '${REMOTE_DIR}' && test -f SHA256SUMS && sha256sum -c --quiet SHA256SUMS"; then
+        echo "✗ SHA256SUMS verification failed on ${VPS}:${REMOTE_DIR} — aborting before ansible"
+        exit 1
+      fi
+      echo "  ✓ $(ssh -n "${SSH_OPTS[@]}" "${VPS}" "ls -1 '${REMOTE_DIR}' | grep -vc SHA256SUMS") binaries pulled and verified"
+    fi
 
     echo "▶ Deploying via ansible (remote artifacts; stats-and-skips any missing)..."
     cd "${ROOT_DIR}/ansible" && ansible-playbook \

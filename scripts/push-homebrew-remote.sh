@@ -10,7 +10,33 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE="$1"
 HOTEL_NAME="$2"
 EXPECTED_HOSTNAME="${3:-}"
-REMOTE_HOME="$(ssh "${REMOTE}" 'echo $HOME')"
+
+# Keepalives + timeouts on every ssh/scp: a mid-session WiFi flap on the target
+# hung this script for 5 hours on a bare `ssh -n ... test -f` (2026-07-03).
+SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+
+# Probe a remote path for existence. Distinguishes "file absent" (test exits 1)
+# from ssh transport failure (exit 255 etc.) — a transport failure retries once,
+# then aborts the whole script loudly instead of silently misclassifying the
+# binary as new or hanging forever.
+remote_file_exists() {
+  local path="$1" attempt rc
+  for attempt in 1 2; do
+    if ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "test -f '${path}'"; then
+      return 0
+    fi
+    rc=$?
+    if [[ ${rc} -eq 1 ]]; then
+      return 1  # connection fine, file genuinely absent
+    fi
+    echo "⚠ ssh probe of '${path}' on ${REMOTE} failed (exit ${rc}), attempt ${attempt}/2" >&2
+    sleep 3
+  done
+  echo "❌ Aborting: ${REMOTE} unreachable while probing '${path}'." >&2
+  exit 1
+}
+
+REMOTE_HOME="$(ssh "${SSH_OPTS[@]}" "${REMOTE}" 'echo $HOME')"
 if [[ -n "${PHILOTIC_REMOTE_PROFILE:-}" ]]; then
   REMOTE_PROFILE="${PHILOTIC_REMOTE_PROFILE}"
 elif [[ "${HOTEL_NAME}" == "mbp-jane" || "${HOTEL_NAME}" == "mac-jane" ]]; then
@@ -28,7 +54,7 @@ REMOTE_LIFE_GRAPH_RUNNER_NODE="${PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE:-${LIFE_
 cd "${ROOT_DIR}"
 
 if [[ -n "${EXPECTED_HOSTNAME}" ]]; then
-  ACTUAL_HOST="$(ssh "${REMOTE}" "scutil --get LocalHostName 2>/dev/null || hostname -s" 2>/dev/null)"
+  ACTUAL_HOST="$(ssh "${SSH_OPTS[@]}" "${REMOTE}" "scutil --get LocalHostName 2>/dev/null || hostname -s" 2>/dev/null)"
   if [[ "${ACTUAL_HOST}" != "${EXPECTED_HOSTNAME}" ]]; then
     echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected '${EXPECTED_HOSTNAME}'."
     exit 1
@@ -51,11 +77,11 @@ cargo build --release --bins \
   -p philotic-web
 
 echo "▶ Preparing remote staging directory on ${REMOTE}..."
-ssh "${REMOTE}" "mkdir -p ${STAGE_DIR}"
-ssh "${REMOTE}" "mkdir -p ${REMOTE_GRAPH_DIR}"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "mkdir -p ${STAGE_DIR}"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "mkdir -p ${REMOTE_GRAPH_DIR}"
 
-AIUA_CELLAR="$(ssh "${REMOTE}" "ls -d /opt/homebrew/Cellar/aiua/*/bin 2>/dev/null | head -1")"
-PHIL_CELLAR="$(ssh "${REMOTE}" "ls -d /opt/homebrew/Cellar/philotic-web/*/bin 2>/dev/null | head -1")"
+AIUA_CELLAR="$(ssh "${SSH_OPTS[@]}" "${REMOTE}" "ls -d /opt/homebrew/Cellar/aiua/*/bin 2>/dev/null | head -1")"
+PHIL_CELLAR="$(ssh "${SSH_OPTS[@]}" "${REMOTE}" "ls -d /opt/homebrew/Cellar/philotic-web/*/bin 2>/dev/null | head -1")"
 
 if [[ -z "${AIUA_CELLAR}" ]]; then
   echo "❌ Could not locate remote aiua Cellar bin directory."
@@ -63,7 +89,7 @@ if [[ -z "${AIUA_CELLAR}" ]]; then
 fi
 
 echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
-ssh "${REMOTE}" "uid=\$(id -u); launchctl bootout gui/\${uid}/com.philotic.aiua.${HOTEL_NAME} 2>/dev/null || true; pkill -f '[a]iua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f '[a]iua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "uid=\$(id -u); launchctl bootout gui/\${uid}/com.philotic.aiua.${HOTEL_NAME} 2>/dev/null || true; pkill -f '[a]iua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f '[a]iua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
 
 echo "▶ Signing and verifying local binaries before push..."
 UNSIGNED=()
@@ -86,6 +112,15 @@ if [[ ${#UNSIGNED[@]} -gt 0 ]]; then
 fi
 echo "  ✓ All local binaries have adhoc signatures"
 
+# Homebrew leaves Cellar bin dirs (and installed binaries) read-only; without
+# this, copying a NEW binary in fails with Permission denied (bit the fleet on
+# 2026-07-02). Per-binary chmods below re-lock existing files after install.
+echo "▶ Unlocking Cellar bin dirs for writes..."
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod -R u+w '${AIUA_CELLAR}' 2>/dev/null || true"
+if [[ -n "${PHIL_CELLAR}" ]]; then
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod -R u+w '${PHIL_CELLAR}' 2>/dev/null || true"
+fi
+
 echo "▶ Staging and installing runtime binaries on ${REMOTE}..."
 # Collect paths into array first — SSH commands inside a while-read loop would otherwise
 # consume stdin from the pipe, causing all but the first binary to be silently skipped.
@@ -98,45 +133,45 @@ for bin_path in "${BIN_PATHS[@]}"; do
     continue
   fi
 
-  scp -q "${bin_path}" "${REMOTE}:${STAGE_DIR}/${bin}"
-  ssh -n "${REMOTE}" "chmod +x '${STAGE_DIR}/${bin}'"
+  scp -q "${SSH_OPTS[@]}" "${bin_path}" "${REMOTE}:${STAGE_DIR}/${bin}"
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${STAGE_DIR}/${bin}'"
 
-  if ! ssh -n "${REMOTE}" "test -f '${AIUA_CELLAR}/${bin}'"; then
+  if ! remote_file_exists "${AIUA_CELLAR}/${bin}"; then
     # New binary not yet in Cellar — install it and create the symlink
-    ssh -n "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
-    ssh -n "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true && codesign -s - --force '${AIUA_CELLAR}/${bin}' >/dev/null 2>&1 || true"
-    ssh -n "${REMOTE}" "chmod 555 '${AIUA_CELLAR}/${bin}'"
-    ssh -n "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
+    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
+    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true && codesign -s - --force '${AIUA_CELLAR}/${bin}' >/dev/null 2>&1 || true"
+    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod 555 '${AIUA_CELLAR}/${bin}'"
+    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
     echo "  + ${bin} (new)"
     continue
   fi
 
-  ssh -n "${REMOTE}" "chmod u+w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
-  ssh -n "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
-  ssh -n "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true && codesign -s - --force '${AIUA_CELLAR}/${bin}' >/dev/null 2>&1 || true"
-  ssh -n "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
-  ssh -n "${REMOTE}" "chmod u-w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod u+w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true && codesign -s - --force '${AIUA_CELLAR}/${bin}' >/dev/null 2>&1 || true"
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod u-w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
   echo "  ✓ ${bin}"
 done
 
 if [[ -n "${PHIL_CELLAR}" && -f "${ROOT_DIR}/target/release/philotic-web" ]]; then
   echo "▶ Installing phil / philotic-web..."
-  scp -q "${ROOT_DIR}/target/release/philotic-web" "${REMOTE}:${STAGE_DIR}/philotic-web"
-  ssh "${REMOTE}" "chmod +x '${STAGE_DIR}/philotic-web'"
-  ssh "${REMOTE}" "chmod u+w '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
-  ssh "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/philotic-web'"
-  ssh "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/phil'"
-  ssh "${REMOTE}" "chmod +x '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil'"
-  ssh "${REMOTE}" "xattr -d com.apple.quarantine '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
-  ssh "${REMOTE}" "codesign -s - --force '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' >/dev/null 2>&1 || true"
-  ssh "${REMOTE}" "chmod u-w '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
+  scp -q "${SSH_OPTS[@]}" "${ROOT_DIR}/target/release/philotic-web" "${REMOTE}:${STAGE_DIR}/philotic-web"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${STAGE_DIR}/philotic-web'"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod u+w '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/philotic-web'"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/phil'"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil'"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "xattr -d com.apple.quarantine '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "codesign -s - --force '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' >/dev/null 2>&1 || true"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod u-w '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
   echo "  ✓ phil / philotic-web"
 fi
 
 echo "▶ Applying mesh-config on ${REMOTE}..."
-ssh "${REMOTE}" "env PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' /opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel ${HOTEL_NAME}"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "env PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' /opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel ${HOTEL_NAME}"
 
 echo "▶ Starting hotel '${HOTEL_NAME}' on ${REMOTE} with Rust cutover flags..."
-ssh "${REMOTE}" "ulimit -n 65536; nohup env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel ${HOTEL_NAME} >> ~/.philotic/${REMOTE_PROFILE}/aiua.log 2>&1 & echo \$! > ~/.philotic/${REMOTE_PROFILE}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${REMOTE_PROFILE}/aiua.pid)"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "ulimit -n 65536; nohup env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel ${HOTEL_NAME} >> ~/.philotic/${REMOTE_PROFILE}/aiua.log 2>&1 & echo \$! > ~/.philotic/${REMOTE_PROFILE}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${REMOTE_PROFILE}/aiua.pid)"
 
 echo "✅ ${REMOTE}:${HOTEL_NAME} updated and restarted."
