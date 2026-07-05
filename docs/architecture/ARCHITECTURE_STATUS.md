@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-06-24
+last_updated: 2026-07-05
 tags:
 - source-of-truth
 - current-state
@@ -44,7 +44,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-06-24
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-07-05
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -74,10 +74,10 @@ Philotic currently operates as a hotel-centered runtime:
 - `membrane-telegram`, `philote`, `model-router`, and `tool-runner` are separate guest-facing binaries with explicit runtime boundaries.
 - local guest-to-hotel IPC currently runs over Unix domain sockets, driven by `PHILOTIC_HOTEL_SOCKET`; default paths include `/tmp/philotic-aiua.sock` for generic local clients and hotel-specific socket paths such as `/tmp/philotic-<hotel>.sock` when `aiua` materializes a named hotel.
 - canonical session state now lives in the context graph, while apartment-style checkpoints remain derived recovery projections rather than a competing source of truth.
-- Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception; Telegram hotels should now materialize `membrane-telegram` directly while the bare `membrane` binary remains a transitional compatibility wrapper.
+- Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception; `membrane-telegram` is a first-class provider binary driven by the shared MembraneRuntime SDK and LeaseDriver (PR #119) — no longer a wrapper-extraction situation — while the bare `membrane` binary lingers only as a transitional compatibility entry point over the same runtime.
 - local and remote execution routing both exist, but several placement, delegation, and admin/control-plane seams are still under active development.
 - `phil` now owns the launchd service lifecycle surface for `aiua` on macOS through `phil service install`, `start`, `stop`, `restart`, `uninstall`, and `status`; interactive onboarding can optionally hand off to service install immediately after config generation and now captures the agent workspace/import path plus initial skillset for runner setup.
-- the primitives split is now implemented in repo truth: `philotic-primitives-mesh` owns envelope and node identity types, `philotic-primitives-hotel` owns hotel/runtime capability records, `philotic-primitives-data` owns generic graph/storage primitives, `philotic-primitives-agent` owns agent/session/memory primitives, `philotic-primitives-tool` owns tool/skill governance and tool runner route/config envelopes, and `philotic-primitives-model` owns model-routing DTOs while `ansible-mesh-core` remains a transitional compatibility shim for reexports and legacy module paths; `model-router` now owns the `model_manager` runtime wiring.
+- the primitives split is NOT implemented in repo truth (corrected 2026-07-05 after verification): the six `philotic-primitives-*` crates exist in-tree, but only `philotic-primitives-mesh` has a consumer (`ansible-mesh-core` depends on it as a path dependency); `philotic-primitives-agent`, `-data`, `-hotel`, `-model`, and `-tool` have zero reverse dependencies in any workspace `Cargo.toml` and are not workspace members, so they are unbuilt scaffolds rather than the extraction landing. `ansible-mesh-core` remains the real shared library, not a compatibility shim. The disposition of the five unwired primitives crates (wire them or delete them) is tracked as a Phase 3 slice of the active consolidation plan. `model-router` does own the `model_manager` runtime wiring.
 - the hotel perimeter now has a first explicit mesh membership ceremony through `phil mesh invite` and `phil mesh accept`, with accepted peers persisted in the graph; this is still transitional trust because revocation, scoped authorization, and non-PSK hotel identity are not finished.
 - intended mesh transport boundaries are now explicit: UDP is the state-sync/control plane only, routed execution belongs on reliable point-to-point transport, WebRTC is an optional peer session plane after signaling, and mesh-shared graph sync is selective projected state rather than blind full-database replication.
 - operator-facing canonical hotel naming should converge on `mac-jane`, `mbp-jane`, and `vps-jane`; legacy runtime names such as local `default` and VPS `beacon-test-hotel` are explicit migration debt, and deploy paths should clean stale previous-name graph records instead of letting old hotel identities linger as undead peers.
@@ -118,7 +118,7 @@ Primary references:
 - slash commands are short-circuited before the normal model path
 - Telegram poll leases are hotel-owned, renewed, fenced, explicitly released on graceful shutdown, and can be delegated to named remote hotels as a transitional contract
 - poll authority is anchored to the agent's home hotel rather than the current routed role
-- `membrane-telegram` is now the intended Telegram provider binary, while `crates/membrane` remains a compatibility wrapper package during extraction
+- `membrane-telegram` is the Telegram provider binary and runs on the shared MembraneRuntime SDK + LeaseDriver (PR #119); `crates/membrane` now serves primarily as that SDK library, with its own binary kept only for transitional compatibility
 
 Primary references:
 - [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md)
