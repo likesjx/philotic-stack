@@ -41,6 +41,7 @@ cargo build --release --bins \
   -p philote \
   -p membrane \
   -p membrane-telegram \
+  -p membrane-discord \
   -p model-router \
   -p tool-runner \
   -p graph-runner \

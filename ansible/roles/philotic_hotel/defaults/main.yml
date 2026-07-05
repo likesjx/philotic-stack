@@ -28,6 +28,7 @@ philotic_binaries:
   - philote-worker
   - membrane
   - membrane-telegram
+  - membrane-discord
   - membrane-mcp
   - graph-runner
   - graph-datasource
