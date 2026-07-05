@@ -1494,6 +1494,10 @@ const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
         command: "new",
         description: "Start a fresh conversation.",
     },
+    TelegramBotCommand {
+        command: "voice",
+        description: "Swap voice provider: /voice [kokoro|elevenlabs|openai] [voice_id]",
+    },
 ];
 
 const TELEGRAM_MAX_COMMANDS: usize = 100;
@@ -3556,6 +3560,19 @@ mod tests {
             .iter()
             .any(|c| c.command == "new");
         assert!(has_new, "TELEGRAM_MENU_COMMANDS should include 'new'");
+    }
+
+    #[test]
+    fn menu_commands_include_voice() {
+        // /voice is parsed by philote's parse_slash_command and handled by
+        // SlashCommand::Voice in the philote runtime — the menu entry only
+        // surfaces the already-working command.
+        let has_voice = super::TELEGRAM_MENU_COMMANDS
+            .iter()
+            .any(|c| c.command == "voice");
+        assert!(has_voice, "TELEGRAM_MENU_COMMANDS should include 'voice'");
+        let help = super::telegram_help_text(&[]);
+        assert!(help.contains("/voice"), "help text should mention /voice");
     }
 
     #[test]
