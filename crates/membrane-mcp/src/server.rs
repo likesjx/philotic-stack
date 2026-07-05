@@ -352,6 +352,9 @@ async fn handle_tools_call(
             final_reply_to: Some(state.node_id.clone()),
             final_reply_role: Some("mcp-membrane".into()),
             final_reply_guest_id: Some(state.guest_id.clone()),
+            target_node: None,
+            target_guest_id: None,
+            extra: serde_json::Map::new(),
         };
 
         let (tx, rx) = oneshot::channel::<String>();
@@ -475,6 +478,9 @@ async fn handle_tools_call(
         final_reply_to: Some(state.node_id.clone()),
         final_reply_role: Some("mcp-membrane".into()),
         final_reply_guest_id: Some(state.guest_id.clone()),
+        target_node: None,
+        target_guest_id: None,
+        extra: serde_json::Map::new(),
     };
 
     let (tx, rx) = oneshot::channel::<String>();

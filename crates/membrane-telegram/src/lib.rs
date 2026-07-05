@@ -1,23 +1,35 @@
 use anyhow::Result;
-// Telegram-specific membrane runtime lives with the Telegram provider crate.
+// Telegram gateway guest built on the `membrane` SDK: `MembraneRuntime` owns
+// the IPC lifecycle (registration, reconnect, renew tick, inbound dispatch)
+// and `TelegramSeatGuest` provides the Telegram-specific behaviour. One
+// runtime instance runs per seat, preserving the one-process/N-seats model.
+use async_trait::async_trait;
 use clap::Parser;
-use philotic_client::{
-    CommandManifestEntry, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect,
+use membrane::{
+    InboundEnvelope, LeaseAcquireOutcome, LeaseBackend, LeaseDriver, LeaseDriverConfig, LeaseEvent,
+    LeaseRenewResult, MembraneGuest, MembraneRuntime, OutboundReply, SenderInfo,
 };
+use philotic_client::{CommandManifestEntry, IpcRequest, IpcResponse, PhiloticClient};
 use pulldown_cmark::{
     CodeBlockKind, Event, LinkType, Options, Parser as MarkdownParser, Tag, TagEnd,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::oneshot;
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, warn};
 
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
-const TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
 const MEMBRANE_ERROR_BACKOFF_INITIAL_SECS: u64 = 1;
 const MEMBRANE_ERROR_BACKOFF_MAX_SECS: u64 = 600;
+
+/// Shared map of in-flight turns, keyed by session_id. Written by the seat's
+/// poll task (turn start) and by `handle_push` (turn lifecycle + final reply).
+/// Guarded by a std mutex — never held across an await.
+type ActiveTurns = Arc<StdMutex<HashMap<String, ActiveTurn>>>;
 
 fn next_error_backoff_secs(current_secs: u64) -> u64 {
     current_secs.saturating_mul(2).clamp(
@@ -32,6 +44,10 @@ fn local_node_id() -> String {
 
 fn local_guest_id() -> String {
     std::env::var("PHILOTIC_GUEST_ID").unwrap_or_else(|_| "membrane-telegram-01".to_string())
+}
+
+fn hotel_socket_path() -> String {
+    std::env::var("PHILOTIC_HOTEL_SOCKET").unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string())
 }
 
 #[derive(Parser, Debug)]
@@ -50,6 +66,10 @@ struct TelegramMessageEnvelope {
     thread_id: Option<String>,
     sender_id: Option<String>,
     sender_username: Option<String>,
+    /// The chat type: "private", "group", "supergroup", or "channel".
+    chat_type: Option<String>,
+    /// The sender's first name (display name, always present for real users).
+    sender_first_name: Option<String>,
     message_kind: &'static str,
     content: String,
     attachments: Vec<Value>,
@@ -710,12 +730,39 @@ struct ActiveTurn {
     status_message_id: Option<i64>,
     /// Telegram thread the turn belongs to, if any.
     thread_id: Option<String>,
+    /// Accumulated text from `streaming_token` fragments (LLM SSE stream).
+    streaming_draft: String,
+    /// When we last sent an `editMessageText` for streaming (throttle guard).
+    streaming_last_edit: Option<tokio::time::Instant>,
 }
 
 impl ActiveTurn {
+    fn new(cancel_typing: oneshot::Sender<()>, thread_id: Option<String>) -> Self {
+        Self {
+            cancel_typing,
+            draft_message_id: None,
+            status_message_id: None,
+            thread_id,
+            streaming_draft: String::new(),
+            streaming_last_edit: None,
+        }
+    }
+
     fn cancel(self) {
         let _ = self.cancel_typing.send(());
     }
+}
+
+/// Minimum interval between streaming `editMessageText` draft edits, to stay
+/// well under Telegram's per-chat edit rate limit.
+const STREAMING_THROTTLE_MS: u64 = 1500;
+
+/// Throttle guard for streaming draft edits: an edit is due when none has
+/// happened yet or the last one is at least [`STREAMING_THROTTLE_MS`] old.
+fn streaming_edit_due(last_edit: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    last_edit
+        .map(|t| now.duration_since(t).as_millis() as u64 >= STREAMING_THROTTLE_MS)
+        .unwrap_or(true)
 }
 
 /// Start a `sendChatAction(typing)` heartbeat that refreshes every 4 seconds until cancelled.
@@ -1041,6 +1088,17 @@ fn telegram_message_envelope(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|name| !name.is_empty());
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sender_first_name = message
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
     let attachments = telegram_message_attachments(message);
     let message_kind = telegram_message_kind(message);
     let explicit_text = message
@@ -1065,6 +1123,8 @@ fn telegram_message_envelope(
         thread_id,
         sender_id,
         sender_username,
+        chat_type,
+        sender_first_name,
         message_kind,
         content: content.clone(),
         attachments,
@@ -1106,6 +1166,17 @@ fn telegram_callback_envelope(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|name| !name.is_empty());
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sender_first_name = callback
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
 
     Some(TelegramMessageEnvelope {
         session_id: telegram_session_id(&chat_id, thread_id.as_deref(), agent_id),
@@ -1114,6 +1185,8 @@ fn telegram_callback_envelope(
         thread_id,
         sender_id,
         sender_username,
+        chat_type,
+        sender_first_name,
         message_kind: "callback",
         content: approval_callback_content(&callback_data),
         attachments: Vec::new(),
@@ -1145,6 +1218,60 @@ fn approval_callback_content(callback_data: &str) -> String {
         "/deny".to_string()
     } else {
         format!("Telegram callback action: {callback_data}")
+    }
+}
+
+/// True when `callback_data` came from an approval inline button
+/// (Approve / Deny / Trust). Used to ack the callback query so Telegram
+/// dismisses the loading spinner — the slash-promotion ack path only fires
+/// for `/`-prefixed callback_data, which approval buttons don't use.
+fn is_approval_callback(callback_data: &str) -> bool {
+    callback_data == "approve"
+        || callback_data.starts_with("approve:")
+        || callback_data == "deny"
+        || callback_data.starts_with("deny:")
+        || callback_data == "trust"
+        || callback_data.starts_with("trust:")
+}
+
+/// Ack a Telegram callback query so the client dismisses the loading spinner.
+async fn answer_callback_query(http_client: &reqwest::Client, tg_base: &str, raw_update: &Value) {
+    if let Some(callback_id) = raw_update
+        .get("callback_query")
+        .and_then(|q| q.get("id"))
+        .and_then(Value::as_str)
+    {
+        let ack_url = format!("{tg_base}answerCallbackQuery");
+        let _ = http_client
+            .post(&ack_url)
+            .json(&json!({ "callback_query_id": callback_id }))
+            .send()
+            .await;
+    }
+}
+
+/// Group-chat detection for the operator gate: explicit chat type wins,
+/// with the negative-chat-id convention as a fallback.
+fn is_group_chat(chat_type: Option<&str>, chat_id: &str) -> bool {
+    matches!(chat_type, Some("group") | Some("supergroup")) || chat_id.starts_with('-')
+}
+
+/// True when the sender's username is in the operator allowlist
+/// (case-insensitive; the allowlist is stored lowercased).
+fn is_operator_sender(sender_username: Option<&str>, operator_usernames: &HashSet<String>) -> bool {
+    sender_username
+        .map(|u| operator_usernames.contains(&u.to_lowercase()))
+        .unwrap_or(false)
+}
+
+/// Derive the operator allowlist config key from the bot-token config key:
+/// `telegram_bot_token_{agent_key}` → `telegram_allowed_users_{agent_key}`,
+/// with the un-suffixed global fallback for single-seat mode.
+fn telegram_allowed_users_key(telegram_token_key: &str) -> String {
+    if let Some(suffix) = telegram_token_key.strip_prefix("telegram_bot_token_") {
+        format!("telegram_allowed_users_{suffix}")
+    } else {
+        "telegram_allowed_users".to_string()
     }
 }
 
@@ -1366,6 +1493,10 @@ const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
     TelegramBotCommand {
         command: "new",
         description: "Start a fresh conversation.",
+    },
+    TelegramBotCommand {
+        command: "voice",
+        description: "Swap voice provider: /voice [kokoro|elevenlabs|openai] [voice_id]",
     },
 ];
 
@@ -1611,206 +1742,270 @@ fn telegram_poll_lease_key(token_key: &str, bot_token: &str) -> String {
     format!("telegram:{token_key}:{}", &fingerprint[..16])
 }
 
-async fn acquire_telegram_poll_lease(
-    ipc_client: &mut PhiloticClient,
-    lease_key: &str,
-    agent_id: &str,
-    resource_ref: &str,
-) -> Result<u64> {
-    match ipc_client
-        .send_request(IpcRequest::AcquireTelegramPollLease {
-            lease_key: lease_key.to_string(),
-            agent_id: agent_id.to_string(),
-            resource_ref: Some(resource_ref.to_string()),
-        })
-        .await?
-    {
-        IpcResponse::TelegramPollLease {
-            granted: true,
-            lease: Some(lease),
-        } => Ok(lease.lease_epoch),
-        IpcResponse::TelegramPollLease {
-            granted: false,
-            lease,
-        } => {
-            let owner = lease.as_ref().map(|entry| entry.owner_guest_id.as_str());
-            let epoch = lease.as_ref().map(|entry| entry.lease_epoch).unwrap_or(0);
-            anyhow::bail!("lease held by {:?} at epoch {}", owner, epoch)
-        }
-        other => anyhow::bail!(
-            "unexpected Telegram poll lease response for [{}]: {:?}",
-            lease_key,
-            other
-        ),
-    }
-}
-
-async fn renew_telegram_poll_lease(
-    ipc_client: &mut PhiloticClient,
-    lease_key: &str,
-    agent_id: &str,
-    resource_ref: &str,
-    lease_epoch: u64,
-) -> Result<u64> {
-    match ipc_client
-        .send_request(IpcRequest::RenewTelegramPollLease {
-            lease_key: lease_key.to_string(),
-            agent_id: agent_id.to_string(),
-            resource_ref: Some(resource_ref.to_string()),
-            lease_epoch,
-        })
-        .await?
-    {
-        IpcResponse::TelegramPollLease {
-            granted: true,
-            lease: Some(lease),
-        } => Ok(lease.lease_epoch),
-        IpcResponse::TelegramPollLease {
-            granted: false,
-            lease,
-        } => {
-            let owner = lease.as_ref().map(|entry| entry.owner_guest_id.as_str());
-            let epoch = lease.as_ref().map(|entry| entry.lease_epoch).unwrap_or(0);
-            anyhow::bail!("lease lost to {:?} at epoch {}", owner, epoch)
-        }
-        other => anyhow::bail!(
-            "unexpected Telegram poll lease renew response for [{}]: {:?}",
-            lease_key,
-            other
-        ),
-    }
-}
-
-async fn release_telegram_poll_lease(
-    ipc_client: &mut PhiloticClient,
-    lease_key: &str,
-) -> Result<()> {
-    match ipc_client
-        .send_request(IpcRequest::ReleaseTelegramPollLease {
-            lease_key: lease_key.to_string(),
-        })
-        .await?
-    {
-        IpcResponse::Standard { ok: true, .. } => Ok(()),
-        IpcResponse::Standard { message, .. } => anyhow::bail!(message),
-        other => anyhow::bail!(
-            "unexpected Telegram poll lease release response for [{}]: {:?}",
-            lease_key,
-            other
-        ),
-    }
-}
-
-/// Core seat loop: one IPC connection + one Telegram bot polling indefinitely.
+/// Short-lived [`LeaseBackend`] adapter driven by the SDK [`LeaseDriver`].
 ///
-/// Called once per seat (once in single-seat mode, N times via tokio::spawn in multi-seat).
-async fn run_seat_impl(
-    seat_guest_id: String,
-    telegram_token_key: String,
-    target_agent_id: String,
-    http_client: reqwest::Client,
-    telegram_api_base: String,
-    telegram_file_api_base: String,
-    blob_base: String,
-) -> Result<()> {
-    let guest_id = seat_guest_id;
+/// Maps the Telegram poll-lease IPC responses onto the driver's typed
+/// outcomes. The mapping preserves the deployed re-acquire-in-place
+/// semantics: a renew denial where nobody (or our own stale binding after an
+/// IPC reconnect — the hotel fences renewals by connection id) holds the
+/// lease is `NeedsReacquire`, not `Lost`; only a denial naming a *different*
+/// live holder is `Lost`.
+struct TelegramLeaseBackend<'a> {
+    client: &'a mut PhiloticClient,
+    lease_key: &'a str,
+    /// Agent this seat polls for (`AcquireTelegramPollLease.agent_id`).
+    agent_id: &'a str,
+    /// Token config key, doubling as the transport resource ref.
+    resource_ref: &'a str,
+    /// This seat's IPC guest_id — used to recognise our own stale lease
+    /// binding in a renew denial (conn-id fencing after IPC reconnect).
+    seat_guest_id: &'a str,
+}
 
-    let identity = GuestIdentity {
-        guest_id: guest_id.clone(),
-        role: "membrane".into(),
-        supported_tools: Vec::new(),
-    };
+#[async_trait]
+impl LeaseBackend for TelegramLeaseBackend<'_> {
+    async fn acquire(&mut self) -> Result<LeaseAcquireOutcome> {
+        match self
+            .client
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: self.lease_key.to_string(),
+                agent_id: self.agent_id.to_string(),
+                resource_ref: Some(self.resource_ref.to_string()),
+            })
+            .await?
+        {
+            IpcResponse::TelegramPollLease {
+                granted: true,
+                lease: Some(lease),
+            } => Ok(LeaseAcquireOutcome::Granted {
+                epoch: lease.lease_epoch,
+            }),
+            IpcResponse::TelegramPollLease {
+                granted: false,
+                lease,
+            } => Ok(LeaseAcquireOutcome::Held {
+                owner: lease.as_ref().map(|entry| entry.owner_guest_id.clone()),
+                epoch: lease.as_ref().map(|entry| entry.lease_epoch).unwrap_or(0),
+            }),
+            // The hotel answered but refused (unknown agent, foreign
+            // authority, transport-home mismatch, …): a deterministic denial,
+            // not a transient IPC failure — report it as held-by-nobody so the
+            // driver goes terminal and the seat stands down instead of
+            // hammering acquire forever.
+            IpcResponse::Standard {
+                ok: false, message, ..
+            } => {
+                warn!(
+                    "Telegram poll lease [{}] acquire refused by hotel: {}",
+                    self.lease_key, message
+                );
+                Ok(LeaseAcquireOutcome::Held {
+                    owner: None,
+                    epoch: 0,
+                })
+            }
+            other => anyhow::bail!(
+                "unexpected Telegram poll lease response for [{}]: {:?}",
+                self.lease_key,
+                other
+            ),
+        }
+    }
 
-    let mut ipc_client = PhiloticClient::connect(identity).await?;
-
-    // Pull configuration from the Hotel Graph dynamically
-    info!("Requesting Telegram Configuration from Ansible Context Graph...");
-    let bot_token = if let Some(env_token) = std::env::var("PHILOTIC_TELEGRAM_BOT_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        env_token
-    } else {
-        let config_req = IpcRequest::GetConfig {
-            key: telegram_token_key.clone(),
-        };
-
-        match ipc_client.send_request(config_req).await? {
-            IpcResponse::ConfigData { key: _, value_json } => {
-                if let Some(json_str) = value_json {
-                    if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
-                        val.as_str().unwrap_or("").to_string()
-                    } else {
-                        json_str
-                    }
+    async fn renew(&mut self, epoch: u64) -> Result<LeaseRenewResult> {
+        match self
+            .client
+            .send_request(IpcRequest::RenewTelegramPollLease {
+                lease_key: self.lease_key.to_string(),
+                agent_id: self.agent_id.to_string(),
+                resource_ref: Some(self.resource_ref.to_string()),
+                lease_epoch: epoch,
+            })
+            .await?
+        {
+            IpcResponse::TelegramPollLease {
+                granted: true,
+                lease: Some(lease),
+            } => Ok(LeaseRenewResult::Ok {
+                epoch: lease.lease_epoch,
+            }),
+            IpcResponse::TelegramPollLease {
+                granted: false,
+                lease: None,
+            } => Ok(LeaseRenewResult::NeedsReacquire),
+            IpcResponse::TelegramPollLease {
+                granted: false,
+                lease: Some(lease),
+            } => {
+                if lease.owner_guest_id == self.seat_guest_id {
+                    // Our own binding with a mismatched epoch/connection —
+                    // typical after an IPC reconnect. Re-acquire in place.
+                    Ok(LeaseRenewResult::NeedsReacquire)
                 } else {
-                    warn!(
-                        "Telegram Bot Token key [{}] found, but value was empty in Context Graph. Using Dummy Token.",
-                        telegram_token_key
-                    );
-                    "dummy_token".to_string()
+                    Ok(LeaseRenewResult::Lost {
+                        owner: Some(lease.owner_guest_id),
+                    })
                 }
             }
-            _ => {
+            // Hotel refused the renew outright (e.g. registration race after
+            // reconnect): treat like a lapse and re-acquire in place — the
+            // acquire decides grant vs. deny. Matches the deployed behaviour
+            // where any renew failure fell through to an immediate re-acquire.
+            IpcResponse::Standard {
+                ok: false, message, ..
+            } => {
                 warn!(
-                    "Failed to retrieve Telegram Bot Token from Context Graph key [{}]. Using Dummy Token.",
-                    telegram_token_key
+                    "Telegram poll lease [{}] renew refused by hotel: {}. Re-acquiring in place.",
+                    self.lease_key, message
                 );
-                "dummy_token".to_string()
+                Ok(LeaseRenewResult::NeedsReacquire)
             }
+            other => anyhow::bail!(
+                "unexpected Telegram poll lease renew response for [{}]: {:?}",
+                self.lease_key,
+                other
+            ),
         }
-    };
-
-    if bot_token.is_empty() || bot_token == "dummy_token" {
-        warn!(
-            "No valid Telegram Bot Token found. Membrane will stop instead of polling without authority."
-        );
-        return Ok(());
     }
 
-    let poll_lease_key = telegram_poll_lease_key(&telegram_token_key, &bot_token);
-    let mut poll_lease_epoch = match acquire_telegram_poll_lease(
-        &mut ipc_client,
-        &poll_lease_key,
-        &target_agent_id,
-        &telegram_token_key,
-    )
-    .await
-    {
-        Ok(lease_epoch) => {
-            info!(
-                "Acquired Telegram poll lease [{}] at epoch {}; membrane may poll.",
-                poll_lease_key, lease_epoch
-            );
-            lease_epoch
+    async fn release(&mut self) -> Result<()> {
+        match self
+            .client
+            .send_request(IpcRequest::ReleaseTelegramPollLease {
+                lease_key: self.lease_key.to_string(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => Ok(()),
+            IpcResponse::Standard { message, .. } => anyhow::bail!(message),
+            other => anyhow::bail!(
+                "unexpected Telegram poll lease release response for [{}]: {:?}",
+                self.lease_key,
+                other
+            ),
         }
-        Err(err) => {
-            warn!(
-                "Failed to acquire Telegram poll lease [{}]: {}. Membrane will stop instead of polling without authority.",
-                poll_lease_key, err
-            );
-            return Ok(());
-        }
-    };
-    let mut next_lease_renewal =
-        tokio::time::Instant::now() + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+    }
+}
 
-    let tg_base = format!("{telegram_api_base}/bot{}/", bot_token);
-    let tg_file_base = format!("{telegram_file_api_base}/file/bot{}/", bot_token);
-    let agent_cmds = fetch_agent_command_manifest(&mut ipc_client, &target_agent_id).await;
-    register_telegram_commands(&http_client, &tg_base, &agent_cmds).await;
+/// Convert a normalized Telegram envelope into the SDK [`InboundEnvelope`]
+/// the runtime dispatches to the hotel.
+///
+/// `extra` carries the Telegram-specific payload fields verbatim so the
+/// dispatched task payload keeps the exact shape philote already consumes
+/// from the deployed seat loop (`source`, `transport`, `chat_id`,
+/// `thread_id`, `message_kind`, `callback_data` at the top level).
+/// `target_node`/`target_guest_id` reproduce the deployed local `EmitTask`
+/// routing, and `final_reply_guest_id` pins replies to this seat's inbox.
+fn seat_inbound_envelope(
+    envelope: &TelegramMessageEnvelope,
+    node_id: &str,
+    target_agent_id: &str,
+    seat_guest_id: &str,
+) -> InboundEnvelope {
+    let mut extra = serde_json::Map::new();
+    extra.insert("source".into(), Value::String("telegram".into()));
+    extra.insert("transport".into(), Value::String("telegram".into()));
+    extra.insert("chat_id".into(), Value::String(envelope.chat_id.clone()));
+    extra.insert(
+        "thread_id".into(),
+        envelope
+            .thread_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    extra.insert(
+        "message_kind".into(),
+        Value::String(envelope.message_kind.to_string()),
+    );
+    extra.insert(
+        "callback_data".into(),
+        envelope
+            .callback_data
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    extra.insert(
+        "chat_type".into(),
+        envelope
+            .chat_type
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    extra.insert(
+        "sender_first_name".into(),
+        envelope
+            .sender_first_name
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+
+    InboundEnvelope {
+        session_id: envelope.session_id.clone(),
+        turn_id: envelope.turn_id.clone(),
+        sender: SenderInfo {
+            id: envelope.sender_id.clone(),
+            display_name: envelope.sender_first_name.clone(),
+            username: envelope.sender_username.clone(),
+            is_operator: false,
+        },
+        content: envelope.content.clone(),
+        attachments: envelope.attachments.clone(),
+        command: envelope.command.clone(),
+        reply_to: None,
+        raw_transport: envelope.raw_transport_event.clone(),
+        requires_approval: false,
+        final_reply_to: Some(node_id.to_string()),
+        final_reply_role: Some("membrane".to_string()),
+        final_reply_guest_id: Some(seat_guest_id.to_string()),
+        target_node: Some(node_id.to_string()),
+        target_guest_id: Some(target_agent_id.to_string()),
+        extra,
+    }
+}
+
+/// Everything the seat's Telegram long-polling task needs. Spawned by
+/// [`TelegramSeatGuest::setup`]; aborted on IPC reconnect and teardown.
+struct SeatPollContext {
+    seat_guest_id: String,
+    target_agent_id: String,
+    node_id: String,
+    http_client: reqwest::Client,
+    tg_base: String,
+    tg_file_base: String,
+    blob_base: String,
+    agent_cmds: Vec<CommandManifestEntry>,
+    /// Operator usernames (lowercased) allowed to issue commands and
+    /// approval callbacks in group chats. Empty set disables the gate.
+    operator_usernames: HashSet<String>,
+    active_turns: ActiveTurns,
+    inbound_tx: mpsc::Sender<InboundEnvelope>,
+    /// NetworkState from the hotel: polling is suppressed while `false`.
+    online_rx: watch::Receiver<bool>,
+}
+
+/// Telegram long-polling loop for one seat.
+///
+/// Owns the getUpdates cycle, envelope normalization, attachment hydration,
+/// membrane-local command handling, and the exponential poll-error backoff
+/// (1s → 600s, reset on success). Normalized messages are handed to the
+/// membrane runtime through `inbound_tx`; the runtime owns the IPC dispatch.
+async fn seat_poll_loop(mut ctx: SeatPollContext) {
     let mut offset: i64 = 0;
-    // session_id → ActiveTurn for in-flight agent turns.
-    let mut active_turns: HashMap<String, ActiveTurn> = HashMap::new();
     // (chat_id:thread_id) → overridden session_id, set by /new.
     let mut session_id_overrides: HashMap<String, String> = HashMap::new();
 
-    info!("Starting Telegram long-polling loop...");
+    info!(
+        "Starting Telegram long-polling loop for seat [{}]...",
+        ctx.seat_guest_id
+    );
 
-    // Poll task: spawned so that arriving IPC messages (agent replies) never cancel
-    // the in-flight getUpdates HTTP request.  A cancelled request leaves a zombie
-    // session on Telegram's server and causes immediate Conflict on the next retry.
+    // Poll task: spawned so that concurrent work never cancels the in-flight
+    // getUpdates HTTP request. A cancelled request leaves a zombie session on
+    // Telegram's server and causes immediate Conflict on the next retry.
     // There is always at most ONE request in flight — one JoinHandle = one connection.
     let mut poll_handle: Option<tokio::task::JoinHandle<Result<Value, reqwest::Error>>> = None;
     // When set, do not start a new poll until this instant.
@@ -1818,20 +2013,18 @@ async fn run_seat_impl(
     // Exponential back-off state for poll errors and 409 Conflicts.
     // Reset to the initial value after any successful update batch.
     let mut poll_error_backoff_secs: u64 = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
-    // Set to false when the hotel broadcasts NetworkState { online: false }.
-    // Polling is suppressed until the hotel confirms connectivity is restored.
-    let mut network_online: bool = true;
 
-    // Main Long-Polling Loop
     loop {
+        let network_online = *ctx.online_rx.borrow();
+
         // Start a new poll if none is in flight, not in back-off, and network is reachable.
         if poll_handle.is_none() && network_online {
-            let ready = poll_resume_at.map_or(true, |t| tokio::time::Instant::now() >= t);
+            let ready = poll_resume_at.is_none_or(|t| tokio::time::Instant::now() >= t);
             if ready {
                 poll_resume_at = None;
-                let url = format!("{}getUpdates", tg_base);
+                let url = format!("{}getUpdates", ctx.tg_base);
                 let off = offset;
-                let client = http_client.clone();
+                let client = ctx.http_client.clone();
                 poll_handle = Some(tokio::spawn(async move {
                     let res = client
                         .get(&url)
@@ -1852,9 +2045,7 @@ async fn run_seat_impl(
         }
 
         tokio::select! {
-            // Branch 1: Wait for Telegram Updates (Long Polling)
-            // The request runs in an independent tokio task so that the IPC branch
-            // (below) never cancels it mid-flight.
+            // Branch 1: Wait for Telegram Updates (Long Polling).
             //
             // NOTE: tokio::select! evaluates the future *expression* before checking
             // the guard, so `poll_handle.as_mut().unwrap()` would panic when None.
@@ -1873,156 +2064,33 @@ async fn run_seat_impl(
                 match http_result {
                     Ok(json) => {
                         if let Some(result) = json.get("result").and_then(|r| r.as_array()) {
-                                // Successful response — reset exponential back-off.
-                                poll_error_backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
-                                for update in result {
-                                    if let Some(update_id) = update.get("update_id").and_then(|id| id.as_i64()) {
-                                        offset = update_id + 1; // Ack the message
-
-                                        if let Some(mut envelope) = telegram_inbound_envelope(update, update_id, &target_agent_id) {
-                                            if !envelope.attachments.is_empty() {
-                                                envelope.attachments = hydrate_telegram_attachments(
-                                                    &http_client,
-                                                    &tg_base,
-                                                    &tg_file_base,
-                                                    &blob_base,
-                                                    envelope.attachments,
-                                                ).await;
-                                            }
-
-                                            // Apply any active /new session override for this chat.
-                                            let session_key = format!(
-                                                "{}:{}",
-                                                envelope.chat_id,
-                                                envelope.thread_id.as_deref().unwrap_or("")
-                                            );
-                                            if let Some(sid) = session_id_overrides.get(&session_key) {
-                                                envelope.session_id = sid.clone();
-                                            }
-
-                                            info!(
-                                                "Received Telegram {} message from chat [{}]{}: {}",
-                                                envelope.message_kind,
-                                                envelope.chat_id,
-                                                envelope
-                                                    .thread_id
-                                                    .as_deref()
-                                                    .map(|thread| format!(" thread [{}]", thread))
-                                                    .unwrap_or_default(),
-                                                envelope.content
-                                            );
-
-                                            // Promote callback_data that looks like a slash command
-                                            // (e.g. "/role bjork" from an inline keyboard button)
-                                            // so it routes through handle_membrane_command and the
-                                            // agent's command dispatch identically to a typed command.
-                                            // Also ack the callback so Telegram removes the spinner.
-                                            if envelope.command.is_none() {
-                                                if let Some(data) = envelope.callback_data.as_deref() {
-                                                    if data.starts_with('/') {
-                                                        // Parse: first token is the command, rest are args.
-                                                        let cmd = data.split_whitespace().next().unwrap_or(data);
-                                                        envelope.command = Some(cmd.to_string());
-                                                        // Re-surface as a text message with the full command string.
-                                                        envelope.content = data.to_string();
-                                                        // Ack the callback query to dismiss Telegram's loading indicator.
-                                                        if let Some(callback_id) = envelope
-                                                            .raw_transport_event
-                                                            .get("callback_query")
-                                                            .and_then(|q| q.get("id"))
-                                                            .and_then(Value::as_str)
-                                                        {
-                                                            let ack_url = format!("{tg_base}answerCallbackQuery");
-                                                            let _ = http_client
-                                                                .post(&ack_url)
-                                                                .json(&json!({"callback_query_id": callback_id}))
-                                                                .send()
-                                                                .await;
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            // Elevation: handle deterministic commands in membrane
-                                            // before they reach agent-core.
-                                            if handle_membrane_command(
-                                                &http_client,
-                                                &tg_base,
-                                                &envelope,
-                                                &mut session_id_overrides,
-                                                &target_agent_id,
-                                                &agent_cmds,
-                                            )
-                                            .await
-                                            {
-                                                continue;
-                                            }
-
-                                            let local_node_id = local_node_id();
-                                            let task_req = IpcRequest::EmitTask {
-                                                target_node: local_node_id.clone(),
-                                                target_role: "agent".into(),
-                                                target_guest_id: Some(target_agent_id.clone()),
-                                                task_json: json!({
-                                                    "source": "telegram",
-                                                    "transport": "telegram",
-                                                    "session_id": envelope.session_id,
-                                                    "turn_id": envelope.turn_id,
-                                                    "chat_id": envelope.chat_id,
-                                                    "thread_id": envelope.thread_id,
-                                                    "sender_id": envelope.sender_id,
-                                                    "sender_username": envelope.sender_username,
-                                                    "message_kind": envelope.message_kind,
-                                                    "content": envelope.content,
-                                                    "attachments": envelope.attachments,
-                                                    "command": envelope.command,
-                                                    "callback_data": envelope.callback_data,
-                                                    "raw_transport_event": envelope.raw_transport_event,
-                                                    "final_reply_to": local_node_id,
-                                                    "final_reply_role": "membrane",
-                                                    "final_reply_guest_id": guest_id.clone()
-                                                }).to_string(),
-                                            };
-
-                                            match ipc_client.send_request(task_req).await {
-                    Ok(_) => {
-                                                    info!("Routed message to Ansible successfully.");
-                                                    let (cancel_tx, _handle) = spawn_typing_heartbeat(
-                                                        http_client.clone(),
-                                                        tg_base.clone(),
-                                                        envelope.chat_id.clone(),
-                                                    );
-                                                    active_turns.insert(
-                                                        envelope.session_id.clone(),
-                                                        ActiveTurn {
-                                                            cancel_typing: cancel_tx,
-                                                            draft_message_id: None,
-                                                            status_message_id: None,
-                                                            thread_id: envelope.thread_id.clone(),
-                                                        },
-                                                    );
-                                                }
-                                                Err(e) => error!("Failed to route message to Ansible: {}", e),
-                                            }
-                                        }
+                            // Successful response — reset exponential back-off.
+                            poll_error_backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
+                            for update in result {
+                                if let Some(update_id) = update.get("update_id").and_then(|id| id.as_i64()) {
+                                    offset = update_id + 1; // Ack the message
+                                    if !seat_process_update(&mut ctx, &mut session_id_overrides, update, update_id).await {
+                                        // Runtime channel closed — seat is shutting down.
+                                        return;
                                     }
                                 }
-                            } else if let Some(desc) = json.get("description").and_then(|d| d.as_str()) {
-                                error!("Telegram API error: {}", desc);
-                                // 409 Conflict: Telegram still has our previous connection open
-                                // (common after sleep/wake). Back off exponentially so we don't
-                                // hammer it. One JoinHandle = one connection; we just need to
-                                // wait for Telegram's server to drop the old session.
-                                poll_resume_at = Some(
-                                    tokio::time::Instant::now()
-                                        + Duration::from_secs(poll_error_backoff_secs),
-                                );
-                                poll_error_backoff_secs = next_error_backoff_secs(poll_error_backoff_secs);
-                                warn!(
-                                    backoff_secs = poll_error_backoff_secs,
-                                    "Telegram API error — will retry after back-off."
-                                );
                             }
+                        } else if let Some(desc) = json.get("description").and_then(|d| d.as_str()) {
+                            error!("Telegram API error: {}", desc);
+                            // 409 Conflict: Telegram still has our previous connection open
+                            // (common after sleep/wake). Back off exponentially so we don't
+                            // hammer it. One JoinHandle = one connection; we just need to
+                            // wait for Telegram's server to drop the old session.
+                            poll_resume_at = Some(
+                                tokio::time::Instant::now()
+                                    + Duration::from_secs(poll_error_backoff_secs),
+                            );
+                            poll_error_backoff_secs = next_error_backoff_secs(poll_error_backoff_secs);
+                            warn!(
+                                backoff_secs = poll_error_backoff_secs,
+                                "Telegram API error — will retry after back-off."
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -2043,346 +2111,964 @@ async fn run_seat_impl(
                 poll_resume_at = None;
             }
 
-            _ = tokio::signal::ctrl_c() => {
-                info!(
-                    "Ctrl-C received; releasing Telegram poll lease [{}] before shutdown.",
-                    poll_lease_key
-                );
-                if let Err(err) = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await {
-                    warn!(
-                        "Failed to release Telegram poll lease [{}] during Ctrl-C shutdown: {}",
-                        poll_lease_key, err
-                    );
+            // NetworkState transition from the hotel (via handle_push).
+            changed = ctx.online_rx.changed() => {
+                if changed.is_err() {
+                    // Guest dropped the sender — seat is gone.
+                    return;
                 }
-                return Ok(());
-            }
-
-            // Branch 2: Wait for outbound IPC tasks (LLM Responses)
-            ipc_result = ipc_client.recv_task() => {
-                match ipc_result {
-                    Ok(IpcResponse::InboundTask { source_node, task_id, task_json }) => {
-                        info!("Membrane received IPC task [{}] from [{}]", task_id, source_node);
-
-                        if let Ok(task) = serde_json::from_str::<Value>(&task_json) {
-                            let action = task.get("action").and_then(Value::as_str).unwrap_or("send_reply");
-                            let session_id = task.get("session_id").and_then(Value::as_str).unwrap_or_default().to_string();
-                            let chat_id = task.get("chat_id").and_then(|id| id.as_str()).unwrap_or_default().to_string();
-
-                            if action == "turn_event" {
-                                // Turn lifecycle signal from agent-core: update delivery UX without
-                                // delivering a final reply.
-                                let event = task.get("event").and_then(Value::as_str).unwrap_or_default();
-                                info!("Turn event [{}] for session [{}]", event, session_id);
-                                // waiting_approval stops the typing; the approval reply arrives as
-                                // a separate send_reply which will also cancel the turn entry.
-                                if event == "waiting_approval" {
-                                    if let Some(active) = active_turns.remove(&session_id) {
-                                        if let Some(sid) = active.status_message_id {
-                                            let c = http_client.clone();
-                                            let b = tg_base.clone();
-                                            let cid = chat_id.clone();
-                                            tokio::spawn(async move {
-                                                delete_telegram_message(&c, &b, &cid, sid).await;
-                                            });
-                                        }
-                                        active.cancel();
-                                    }
-                                }
-                                // waiting_tool and waiting_model: typing continues — no action needed.
-                            } else if action == "partial_reply" {
-                                let content = task.get("content").and_then(Value::as_str).unwrap_or_default().to_string();
-                                info!(
-                                    "Partial reply observed for session [{}] ({} chars); typing continues until final reply.",
-                                    session_id,
-                                    content.len()
-                                );
-                                if !chat_id.is_empty() && !content.is_empty() {
-                                    let (draft_message_id, thread_id) = active_turns
-                                        .get(&session_id)
-                                        .map(|active| (active.draft_message_id, active.thread_id.clone()))
-                                        .unwrap_or((None, None));
-                                    if let Some(message_id) = upsert_formatted_text(
-                                        &http_client,
-                                        &tg_base,
-                                        &chat_id,
-                                        thread_id.as_deref(),
-                                        draft_message_id,
-                                        &content,
-                                        None, // no button on partial/draft messages
-                                    ).await {
-                                        if let Some(active) = active_turns.get_mut(&session_id) {
-                                            active.draft_message_id = Some(message_id);
-                                        }
-                                    }
-                                }
-                            } else if action == "turn_status" {
-                                // Ephemeral status message: shows what the agent is doing right
-                                // now (e.g. "Searching the web..."). Created on first call,
-                                // edited on subsequent calls, deleted on final reply.
-                                let status = task.get("status").and_then(Value::as_str).unwrap_or_default().to_string();
-                                if !chat_id.is_empty() && !status.is_empty() {
-                                    let (existing_id, thread_id) = active_turns
-                                        .get(&session_id)
-                                        .map(|a| (a.status_message_id, a.thread_id.clone()))
-                                        .unwrap_or((None, None));
-                                    let formatted = format!("_{}_", status);
-                                    if let Some(new_id) = upsert_formatted_text(
-                                        &http_client,
-                                        &tg_base,
-                                        &chat_id,
-                                        thread_id.as_deref(),
-                                        existing_id,
-                                        &formatted,
-                                        None,
-                                    ).await {
-                                        if let Some(active) = active_turns.get_mut(&session_id) {
-                                            active.status_message_id = Some(new_id);
-                                        }
-                                    }
-                                }
-                            } else {
-                                // send_reply (or any unrecognised action): deliver to Telegram and
-                                // cancel the typing heartbeat for this session.
-                                let (draft_message_id, status_message_id, active_thread_id) = if let Some(active) = active_turns.remove(&session_id) {
-                                    let draft_message_id = active.draft_message_id;
-                                    let status_message_id = active.status_message_id;
-                                    let active_thread_id = active.thread_id.clone();
-                                    active.cancel();
-                                    (draft_message_id, status_message_id, active_thread_id)
-                                } else {
-                                    (None, None, None)
-                                };
-
-                                let raw_content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
-                                // Interceptor: strip @agent:<role> attribution tag and
-                                // build an inline button so the user can switch to that role.
-                                // reply_markup from the agent (e.g. roles keyboard) takes
-                                // priority over the per-reply role_switch_button.
-                                let (content, role_button) = {
-                                    let explicit_markup = task.get("reply_markup").cloned();
-                                    let (clean, role) = strip_attribution_tag(&raw_content);
-                                    let markup = explicit_markup
-                                        .or_else(|| role.as_deref().map(role_switch_button));
-                                    (clean, markup)
-                                };
-                                let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string).or(active_thread_id);
-                                let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
-                                let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
-
-                                if !chat_id.is_empty() {
-                                    let http_client_clone = http_client.clone();
-                                    let tg_base_clone = tg_base.clone();
-                                    let thread_id_clone = thread_id.clone();
-                                    let draft_message_id = draft_message_id;
-                                    let status_message_id = status_message_id;
-
-                                    tokio::spawn(async move {
-                                        // Delete ephemeral status message (e.g. "Searching...") before reply.
-                                        if let Some(sid) = status_message_id {
-                                            delete_telegram_message(&http_client_clone, &tg_base_clone, &chat_id, sid).await;
-                                        }
-
-                                        // Voice path: send audio first, then optional text caption.
-                                        if let Some(artifact_json) = audio_artifact_json {
-                                            if let Ok(artifact) = serde_json::from_str::<Value>(&artifact_json) {
-                                                let mime_type = artifact.get("mime_type").and_then(Value::as_str).unwrap_or("audio/mpeg");
-                                                let audio_b64 = artifact.get("audio_base64").and_then(Value::as_str).unwrap_or_default();
-
-                                                use base64::Engine;
-                                                match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
-                                                    Ok(audio_bytes) => {
-                                                        // Deliver as a real Telegram voice note (sendVoice: round bubble,
-                                                        // plays inline) whenever possible. That needs OGG/OPUS; ElevenLabs
-                                                        // returns MP3, so transcode when needed and only fall back to
-                                                        // sendAudio (a music-file card) if transcoding is unavailable.
-                                                        let (send_bytes, send_mime, endpoint, field_name, file_name) =
-                                                            if mime_type.contains("ogg") {
-                                                                (audio_bytes, "audio/ogg".to_string(), "sendVoice", "voice", "voice.ogg")
-                                                            } else {
-                                                                match transcode_to_voice_ogg(&audio_bytes).await {
-                                                                    Some(ogg) => (ogg, "audio/ogg".to_string(), "sendVoice", "voice", "voice.ogg"),
-                                                                    None => {
-                                                                        warn!("Voice-note transcode unavailable; falling back to sendAudio (music-file card).");
-                                                                        (audio_bytes, mime_type.to_string(), "sendAudio", "audio", "audio.mp3")
-                                                                    }
-                                                                }
-                                                            };
-                                                        let send_url = format!("{}{}", tg_base_clone, endpoint);
-                                                        let part = reqwest::multipart::Part::bytes(send_bytes)
-                                                            .file_name(file_name)
-                                                            .mime_str(&send_mime)
-                                                            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new()));
-                                                        let form = reqwest::multipart::Form::new()
-                                                            .text("chat_id", chat_id.clone())
-                                                            .part(field_name, part);
-                                                        info!("Sending voice/audio via {} to Telegram Chat [{}]...", endpoint, chat_id);
-                                                        match http_client_clone.post(&send_url).multipart(form).send().await {
-                                                            Ok(_) => info!("Telegram audio sent successfully."),
-                                                            Err(e) => error!("Failed to send Telegram audio: {}", e),
-                                                        }
-                                                    }
-                                                    Err(e) => error!("Failed to decode audio_base64: {}", e),
-                                                }
-                                            } else {
-                                                error!("Failed to parse audio_artifact JSON; skipping audio delivery.");
-                                            }
-
-                                            // Also send text as a follow-up caption if requested.
-                                            if send_text_caption && !content.is_empty() {
-                                                let _ = upsert_formatted_text(
-                                                    &http_client_clone,
-                                                    &tg_base_clone,
-                                                    &chat_id,
-                                                    thread_id_clone.as_deref(),
-                                                    draft_message_id,
-                                                    &content,
-                                                    role_button.clone(),
-                                                ).await;
-                                            }
-                                        } else if !content.is_empty() {
-                                            // Text-only path.
-                                            info!("Sending final response back to Telegram Chat [{}]...", chat_id);
-                                            let _ = upsert_formatted_text(
-                                                &http_client_clone,
-                                                &tg_base_clone,
-                                                &chat_id,
-                                                thread_id_clone.as_deref(),
-                                                draft_message_id,
-                                                &content,
-                                                role_button.clone(),
-                                            ).await;
-                                        }
-                                    });
-                                } else {
-                                    warn!("Received a reply task but 'chat_id' was missing. Cannot route to Telegram.");
-                                }
-                            }
-                        }
-                    }
-                    Ok(IpcResponse::NetworkState { online }) => {
-                        if online != network_online {
-                            info!(online, "Network state changed; adjusting Telegram polling.");
-                            network_online = online;
-                            if online {
-                                // Resume immediately: clear back-off and let the loop start a
-                                // fresh poll on the next iteration.
-                                poll_resume_at = None;
-                                poll_error_backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
-                            }
-                            // When offline: the in-flight poll (if any) is left to complete or
-                            // fail naturally.  network_online=false prevents new polls from
-                            // starting, so the membrane goes quiet without cancelling HTTP requests.
-                        }
-                    }
-                    Ok(other) => info!("Hegemon received non-task IPC message: {:?}", other),
-                    Err(e) => {
-                        if is_ipc_disconnect(&e) {
-                            info!("Hotel IPC disconnected; membrane exiting.");
-                            return Ok(());
-                        }
-                        warn!("IPC Recv error: {}", e);
-                    },
+                let online = *ctx.online_rx.borrow();
+                info!(online, "Network state changed; adjusting Telegram polling.");
+                if online {
+                    // Resume immediately: clear back-off and let the loop start a
+                    // fresh poll on the next iteration.
+                    poll_resume_at = None;
+                    poll_error_backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
                 }
-            }
-        }
-
-        // Renew lease between polls (never mid-poll) to avoid cancelling in-flight HTTP requests.
-        if tokio::time::Instant::now() >= next_lease_renewal {
-            match renew_telegram_poll_lease(
-                &mut ipc_client,
-                &poll_lease_key,
-                &target_agent_id,
-                &telegram_token_key,
-                poll_lease_epoch,
-            )
-            .await
-            {
-                Ok(epoch) => {
-                    poll_lease_epoch = epoch;
-                    next_lease_renewal = tokio::time::Instant::now()
-                        + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
-                }
-                Err(err) => {
-                    // A renew can fail because the hotel let our lease lapse while the seat was
-                    // quiet: a network-offline window (or machine sleep) suppresses polling, so
-                    // renewals are missed and the wall-clock TTL expires hotel-side. In that case
-                    // nobody else holds the lease, so re-acquire in place instead of tearing the
-                    // seat down — a full restart escalates the error backoff (up to 600s) and turns
-                    // a brief connectivity blip into a multi-minute Telegram outage.
-                    warn!(
-                        "Telegram poll lease [{}] renew failed: {}. Attempting immediate re-acquire.",
-                        poll_lease_key, err
-                    );
-                    match acquire_telegram_poll_lease(
-                        &mut ipc_client,
-                        &poll_lease_key,
-                        &target_agent_id,
-                        &telegram_token_key,
-                    )
-                    .await
-                    {
-                        Ok(epoch) => {
-                            info!(
-                                "Re-acquired Telegram poll lease [{}] at epoch {} after renew lapse.",
-                                poll_lease_key, epoch
-                            );
-                            poll_lease_epoch = epoch;
-                            next_lease_renewal = tokio::time::Instant::now()
-                                + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
-                        }
-                        Err(acquire_err) => {
-                            // Re-acquire only fails when a genuinely live seat holds the lease
-                            // (real contention / failover) — the hotel denies the grab. Now it is
-                            // correct to stand down and let run_seat_with_backoff retry later.
-                            warn!(
-                                "Failed to re-acquire Telegram poll lease [{}] after renew lapse: {}. Seat will restart with backoff.",
-                                poll_lease_key, acquire_err
-                            );
-                            // Release best-effort (lease may already be dropped by hotel after TTL expiry).
-                            let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
-                            return Err(anyhow::anyhow!(
-                                "Telegram poll lease lost ({}); triggering seat restart to re-acquire.",
-                                acquire_err
-                            ));
-                        }
-                    }
-                }
+                // When offline: the in-flight poll (if any) is left to complete or
+                // fail naturally. network_online=false prevents new polls from
+                // starting, so the membrane goes quiet without cancelling HTTP requests.
             }
         }
     }
 }
 
-async fn run_seat_with_backoff(
+/// Process one Telegram update inside the poll loop: normalize, hydrate
+/// attachments, apply /new session overrides, handle membrane-local commands,
+/// then queue the envelope for IPC dispatch and start the turn-UX tracking.
+///
+/// Returns `false` when the runtime's inbound channel is closed (shutdown).
+async fn seat_process_update(
+    ctx: &mut SeatPollContext,
+    session_id_overrides: &mut HashMap<String, String>,
+    update: &Value,
+    update_id: i64,
+) -> bool {
+    let Some(mut envelope) = telegram_inbound_envelope(update, update_id, &ctx.target_agent_id)
+    else {
+        return true;
+    };
+
+    if !envelope.attachments.is_empty() {
+        envelope.attachments = hydrate_telegram_attachments(
+            &ctx.http_client,
+            &ctx.tg_base,
+            &ctx.tg_file_base,
+            &ctx.blob_base,
+            envelope.attachments,
+        )
+        .await;
+    }
+
+    // Apply any active /new session override for this chat.
+    let session_key = format!(
+        "{}:{}",
+        envelope.chat_id,
+        envelope.thread_id.as_deref().unwrap_or("")
+    );
+    if let Some(sid) = session_id_overrides.get(&session_key) {
+        envelope.session_id = sid.clone();
+    }
+
+    info!(
+        "Received Telegram {} message from chat [{}]{}: {}",
+        envelope.message_kind,
+        envelope.chat_id,
+        envelope
+            .thread_id
+            .as_deref()
+            .map(|thread| format!(" thread [{}]", thread))
+            .unwrap_or_default(),
+        envelope.content
+    );
+
+    // Promote callback_data that looks like a slash command
+    // (e.g. "/role bjork" from an inline keyboard button)
+    // so it routes through handle_membrane_command and the
+    // agent's command dispatch identically to a typed command.
+    // Also ack the callback so Telegram removes the spinner.
+    if envelope.command.is_none() {
+        if let Some(data) = envelope.callback_data.as_deref() {
+            if data.starts_with('/') {
+                // Parse: first token is the command, rest are args.
+                let cmd = data.split_whitespace().next().unwrap_or(data);
+                envelope.command = Some(cmd.to_string());
+                // Re-surface as a text message with the full command string.
+                envelope.content = data.to_string();
+                // Ack the callback query to dismiss Telegram's loading indicator.
+                answer_callback_query(
+                    &ctx.http_client,
+                    &ctx.tg_base,
+                    &envelope.raw_transport_event,
+                )
+                .await;
+            } else if is_approval_callback(data) {
+                // Approve/Deny/Trust buttons: the envelope already carries the
+                // translated /approve or /deny content for philote, but the
+                // callback query itself was never answered — Telegram keeps
+                // showing the button's loading spinner until it times out.
+                // Ack it here (before the operator gate, so even a dropped
+                // non-operator tap doesn't spin).
+                answer_callback_query(
+                    &ctx.http_client,
+                    &ctx.tg_base,
+                    &envelope.raw_transport_event,
+                )
+                .await;
+            }
+        }
+    }
+
+    // Group chat operator gate: only operators may issue commands or
+    // approval callbacks. Non-operators in group chats have their slash
+    // commands stripped so the message is forwarded as context-only text.
+    if is_group_chat(envelope.chat_type.as_deref(), &envelope.chat_id)
+        && !ctx.operator_usernames.is_empty()
+        && !is_operator_sender(envelope.sender_username.as_deref(), &ctx.operator_usernames)
+    {
+        if envelope.message_kind == "callback" {
+            // Silently ignore approval callbacks from non-operators.
+            info!(
+                "Group chat: dropping callback from non-operator {:?}",
+                envelope.sender_username
+            );
+            return true;
+        }
+        // Strip any slash command so the message reaches the agent as
+        // plain context, not a command.
+        if envelope.command.is_some() {
+            info!(
+                "Group chat: stripping command from non-operator {:?}",
+                envelope.sender_username
+            );
+            envelope.command = None;
+        }
+    }
+
+    // Elevation: handle deterministic commands in membrane
+    // before they reach agent-core.
+    if handle_membrane_command(
+        &ctx.http_client,
+        &ctx.tg_base,
+        &envelope,
+        session_id_overrides,
+        &ctx.target_agent_id,
+        &ctx.agent_cmds,
+    )
+    .await
+    {
+        return true;
+    }
+
+    let inbound = seat_inbound_envelope(
+        &envelope,
+        &ctx.node_id,
+        &ctx.target_agent_id,
+        &ctx.seat_guest_id,
+    );
+
+    // Start the turn UX (typing heartbeat) before queueing so the reply
+    // handlers in handle_push always find the turn entry.
+    let (cancel_tx, _handle) = spawn_typing_heartbeat(
+        ctx.http_client.clone(),
+        ctx.tg_base.clone(),
+        envelope.chat_id.clone(),
+    );
+    {
+        let mut turns = ctx.active_turns.lock().unwrap();
+        if let Some(previous) = turns.insert(
+            envelope.session_id.clone(),
+            ActiveTurn::new(cancel_tx, envelope.thread_id.clone()),
+        ) {
+            previous.cancel();
+        }
+    }
+
+    if ctx.inbound_tx.send(inbound).await.is_err() {
+        warn!("Membrane runtime inbound channel closed; stopping poll loop.");
+        if let Some(turn) = ctx
+            .active_turns
+            .lock()
+            .unwrap()
+            .remove(&envelope.session_id)
+        {
+            turn.cancel();
+        }
+        return false;
+    }
+
+    true
+}
+
+/// One Telegram seat: a bot token + target agent pair, driven by the SDK
+/// [`MembraneRuntime`]. The runtime owns IPC registration, reconnect, the
+/// renew tick, and inbound dispatch; this guest owns the Telegram protocol
+/// behaviour and the lease policy (via the SDK [`LeaseDriver`]).
+struct TelegramSeatGuest {
     seat_guest_id: String,
     telegram_token_key: String,
     target_agent_id: String,
+    node_id: String,
     http_client: reqwest::Client,
     telegram_api_base: String,
     telegram_file_api_base: String,
     blob_base: String,
-) -> Result<()> {
-    let mut backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
+    inbound_tx: mpsc::Sender<InboundEnvelope>,
+    online_tx: watch::Sender<bool>,
+    online_rx: watch::Receiver<bool>,
+    active_turns: ActiveTurns,
+    lease_driver: LeaseDriver,
+    lease_key: Option<String>,
+    tg_base: Option<String>,
+    poll_task: Option<JoinHandle<()>>,
+    /// Permanent stand-down: invalid/missing bot token, or the lease is held
+    /// by another live seat after the single re-acquire attempt. Mirrors the
+    /// deployed behaviour where such a seat stopped polling for good.
+    yielded: bool,
+}
 
-    loop {
-        match run_seat_impl(
-            seat_guest_id.clone(),
-            telegram_token_key.clone(),
-            target_agent_id.clone(),
-            http_client.clone(),
-            telegram_api_base.clone(),
-            telegram_file_api_base.clone(),
-            blob_base.clone(),
-        )
-        .await
+impl TelegramSeatGuest {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        seat_guest_id: String,
+        telegram_token_key: String,
+        target_agent_id: String,
+        http_client: reqwest::Client,
+        telegram_api_base: String,
+        telegram_file_api_base: String,
+        blob_base: String,
+        inbound_tx: mpsc::Sender<InboundEnvelope>,
+    ) -> Self {
+        let (online_tx, online_rx) = watch::channel(true);
+        Self {
+            seat_guest_id,
+            telegram_token_key,
+            target_agent_id,
+            node_id: local_node_id(),
+            http_client,
+            telegram_api_base,
+            telegram_file_api_base,
+            blob_base,
+            inbound_tx,
+            online_tx,
+            online_rx,
+            active_turns: Arc::new(StdMutex::new(HashMap::new())),
+            lease_driver: LeaseDriver::new(LeaseDriverConfig::default()),
+            lease_key: None,
+            tg_base: None,
+            poll_task: None,
+            yielded: false,
+        }
+    }
+
+    /// Abort the poll task (if running) and cancel all in-flight turn UX.
+    /// Called on IPC reconnect (before re-setup) and on teardown.
+    fn stop_poll_task(&mut self) {
+        if let Some(handle) = self.poll_task.take() {
+            handle.abort();
+        }
+        let drained: Vec<ActiveTurn> = {
+            let mut turns = self.active_turns.lock().unwrap();
+            turns.drain().map(|(_, turn)| turn).collect()
+        };
+        for turn in drained {
+            turn.cancel();
+        }
+    }
+
+    /// Resolve the bot token: env override first, then the hotel context graph.
+    async fn fetch_bot_token(&self, client: &mut PhiloticClient) -> Result<Option<String>> {
+        if let Some(env_token) = std::env::var("PHILOTIC_TELEGRAM_BOT_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
         {
-            Ok(()) => return Ok(()),
-            Err(err) => {
+            return Ok(Some(env_token));
+        }
+
+        info!("Requesting Telegram Configuration from Ansible Context Graph...");
+        let config_req = IpcRequest::GetConfig {
+            key: self.telegram_token_key.clone(),
+        };
+        let token = match client.send_request(config_req).await? {
+            IpcResponse::ConfigData { key: _, value_json } => match value_json {
+                Some(json_str) => {
+                    if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
+                        val.as_str().unwrap_or("").to_string()
+                    } else {
+                        json_str
+                    }
+                }
+                None => {
+                    warn!(
+                        "Telegram Bot Token key [{}] found, but value was empty in Context Graph.",
+                        self.telegram_token_key
+                    );
+                    String::new()
+                }
+            },
+            _ => {
                 warn!(
-                    "Telegram membrane seat [{}] failed: {}. Retrying in {}s.",
-                    seat_guest_id, err, backoff_secs
+                    "Failed to retrieve Telegram Bot Token from Context Graph key [{}].",
+                    self.telegram_token_key
                 );
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = next_error_backoff_secs(backoff_secs);
+                String::new()
+            }
+        };
+
+        Ok((!token.is_empty()).then_some(token))
+    }
+}
+
+#[async_trait]
+impl MembraneGuest for TelegramSeatGuest {
+    fn role(&self) -> &'static str {
+        "membrane"
+    }
+
+    fn lease_key(&self) -> String {
+        self.lease_key.clone().unwrap_or_default()
+    }
+
+    async fn setup(&mut self, client: &mut PhiloticClient) -> Result<()> {
+        if self.yielded {
+            info!(
+                "Seat [{}] has stood down; skipping setup.",
+                self.seat_guest_id
+            );
+            return Ok(());
+        }
+
+        // IPC reconnect path: stop the previous poll task and clear turn UX
+        // before rebuilding — exactly one getUpdates loop per seat, always.
+        self.stop_poll_task();
+
+        let Some(bot_token) = self.fetch_bot_token(client).await? else {
+            warn!(
+                "No valid Telegram Bot Token for seat [{}]. Membrane will stop instead of polling without authority.",
+                self.seat_guest_id
+            );
+            self.yielded = true;
+            return Ok(());
+        };
+
+        // Load the operator allowlist for group-chat command gating.
+        let allowed_users_key = telegram_allowed_users_key(&self.telegram_token_key);
+        let operator_usernames: HashSet<String> = match client
+            .send_request(IpcRequest::GetConfig {
+                key: allowed_users_key.clone(),
+            })
+            .await
+            .ok()
+        {
+            Some(IpcResponse::ConfigData {
+                value_json: Some(json_str),
+                ..
+            }) => serde_json::from_str::<Vec<String>>(&json_str)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
+            _ => HashSet::new(),
+        };
+        if !operator_usernames.is_empty() {
+            info!(
+                "Loaded {} operator username(s) for group chat gating from key [{}]",
+                operator_usernames.len(),
+                allowed_users_key
+            );
+        }
+
+        let lease_key = telegram_poll_lease_key(&self.telegram_token_key, &bot_token);
+        self.lease_key = Some(lease_key.clone());
+
+        // A fresh (re)connection starts optimistically online, exactly like
+        // the deployed seat loop reset network_online = true on every seat
+        // (re)start. Without this, an offline latch from before an IPC
+        // reconnect would suppress the new poll loop forever if the hotel
+        // does not re-push NetworkState. If the WAN is genuinely still down,
+        // the next NetworkState push flips it back off.
+        self.online_tx.send_replace(true);
+        // Defensive: the lease driver is never fed offline (see handle_push),
+        // but a fresh connection must always start it online.
+        self.lease_driver.set_online(true);
+        if self.lease_driver.is_lost() {
+            // Seat-restart semantics: after losing the lease we get exactly
+            // one fresh acquire attempt (below). If another live holder still
+            // owns it the seat stands down for good.
+            self.lease_driver = LeaseDriver::new(LeaseDriverConfig::default());
+        }
+
+        // Drive the lease driver until the initial acquire settles.
+        loop {
+            let mut backend = TelegramLeaseBackend {
+                client,
+                lease_key: &lease_key,
+                agent_id: &self.target_agent_id,
+                resource_ref: &self.telegram_token_key,
+                seat_guest_id: &self.seat_guest_id,
+            };
+            match self.lease_driver.tick(&mut backend).await {
+                LeaseEvent::Acquired { epoch }
+                | LeaseEvent::Reacquired { epoch }
+                | LeaseEvent::Renewed { epoch } => {
+                    info!(
+                        "Acquired Telegram poll lease [{}] at epoch {}; membrane may poll.",
+                        lease_key, epoch
+                    );
+                    break;
+                }
+                LeaseEvent::Lost { owner } => {
+                    warn!(
+                        "Telegram poll lease [{}] is held by {:?}. Seat [{}] will stop instead of polling without authority.",
+                        lease_key, owner, self.seat_guest_id
+                    );
+                    self.yielded = true;
+                    return Ok(());
+                }
+                LeaseEvent::BackingOff { retry_in, error } => {
+                    // Transient IPC failure: hand control back to the runtime,
+                    // which redials IPC and calls setup again. The driver keeps
+                    // its backoff state across attempts.
+                    anyhow::bail!(
+                        "Telegram poll lease [{}] acquire failed ({}); retrying in {:?}",
+                        lease_key,
+                        error,
+                        retry_in
+                    );
+                }
+                LeaseEvent::Idle => {
+                    // Not due yet (backoff from a previous attempt). Wait for
+                    // the driver's own schedule.
+                    match self.lease_driver.next_deadline() {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => anyhow::bail!(
+                            "Telegram poll lease [{}] driver idle with no deadline",
+                            lease_key
+                        ),
+                    }
+                }
+                LeaseEvent::Offline => {
+                    anyhow::bail!(
+                        "network reported offline while acquiring Telegram poll lease [{}]",
+                        lease_key
+                    );
+                }
+            }
+        }
+
+        let tg_base = format!("{}/bot{}/", self.telegram_api_base, bot_token);
+        let tg_file_base = format!("{}/file/bot{}/", self.telegram_file_api_base, bot_token);
+        self.tg_base = Some(tg_base.clone());
+
+        let agent_cmds = fetch_agent_command_manifest(client, &self.target_agent_id).await;
+        register_telegram_commands(&self.http_client, &tg_base, &agent_cmds).await;
+
+        let ctx = SeatPollContext {
+            seat_guest_id: self.seat_guest_id.clone(),
+            target_agent_id: self.target_agent_id.clone(),
+            node_id: self.node_id.clone(),
+            http_client: self.http_client.clone(),
+            tg_base,
+            tg_file_base,
+            blob_base: self.blob_base.clone(),
+            agent_cmds,
+            operator_usernames,
+            active_turns: self.active_turns.clone(),
+            inbound_tx: self.inbound_tx.clone(),
+            online_rx: self.online_rx.clone(),
+        };
+        self.poll_task = Some(tokio::spawn(seat_poll_loop(ctx)));
+
+        Ok(())
+    }
+
+    async fn renew(&mut self, client: &mut PhiloticClient) -> Result<LeaseRenewResult> {
+        if self.yielded {
+            return Ok(LeaseRenewResult::Ok { epoch: 0 });
+        }
+        let Some(lease_key) = self.lease_key.clone() else {
+            return Ok(LeaseRenewResult::Ok { epoch: 0 });
+        };
+
+        let mut backend = TelegramLeaseBackend {
+            client,
+            lease_key: &lease_key,
+            agent_id: &self.target_agent_id,
+            resource_ref: &self.telegram_token_key,
+            seat_guest_id: &self.seat_guest_id,
+        };
+        match self.lease_driver.tick(&mut backend).await {
+            LeaseEvent::Renewed { epoch } | LeaseEvent::Acquired { epoch } => {
+                Ok(LeaseRenewResult::Ok { epoch })
+            }
+            LeaseEvent::Reacquired { epoch } => {
+                info!(
+                    "Re-acquired Telegram poll lease [{}] at epoch {} after renew lapse.",
+                    lease_key, epoch
+                );
+                Ok(LeaseRenewResult::Ok { epoch })
+            }
+            LeaseEvent::Idle | LeaseEvent::Offline => Ok(LeaseRenewResult::Ok {
+                epoch: self.lease_driver.epoch().unwrap_or(0),
+            }),
+            LeaseEvent::BackingOff { retry_in, error } => {
+                // Transient IPC failure: the driver retries on its own
+                // schedule at the next runtime tick. Never fatal by itself —
+                // a genuinely dead IPC connection surfaces through the
+                // runtime's recv loop and triggers a reconnect there.
+                warn!(
+                    "Telegram poll lease [{}] renew/acquire error ({}); retrying in {:?}.",
+                    lease_key, error, retry_in
+                );
+                Ok(LeaseRenewResult::Ok {
+                    epoch: self.lease_driver.epoch().unwrap_or(0),
+                })
+            }
+            LeaseEvent::Lost { owner } => {
+                // Another live seat owns the lease. Stop polling and hand the
+                // runtime a Lost so it re-runs setup, which performs the
+                // single seat-restart re-acquire attempt (then stands down).
+                warn!(
+                    "Telegram poll lease [{}] lost to {:?}. Seat will restart to attempt one re-acquire.",
+                    lease_key, owner
+                );
+                self.stop_poll_task();
+                Ok(LeaseRenewResult::Lost { owner })
+            }
+        }
+    }
+
+    async fn teardown(&mut self, client: &mut PhiloticClient) {
+        self.stop_poll_task();
+        if let Some(lease_key) = self.lease_key.clone() {
+            info!(
+                "Releasing Telegram poll lease [{}] before shutdown.",
+                lease_key
+            );
+            let mut backend = TelegramLeaseBackend {
+                client,
+                lease_key: &lease_key,
+                agent_id: &self.target_agent_id,
+                resource_ref: &self.telegram_token_key,
+                seat_guest_id: &self.seat_guest_id,
+            };
+            if let Err(err) = self.lease_driver.release(&mut backend).await {
+                warn!(
+                    "Failed to release Telegram poll lease [{}] during shutdown: {}",
+                    lease_key, err
+                );
+            }
+        }
+    }
+
+    async fn deliver(&mut self, reply: OutboundReply) -> Result<()> {
+        // All hotel pushes are consumed by handle_push (the Telegram reply
+        // payload carries fields like chat_id / audio_artifact / reply_markup
+        // that the generic OutboundReply does not model).
+        debug!(
+            session_id = reply.session_id(),
+            "deliver() reached — push should have been handled by handle_push"
+        );
+        Ok(())
+    }
+
+    async fn handle_push(&mut self, msg: &IpcResponse) -> Result<bool> {
+        match msg {
+            IpcResponse::InboundTask {
+                source_node,
+                task_id,
+                task_json,
+            } => {
+                info!(
+                    "Membrane received IPC task [{}] from [{}]",
+                    task_id, source_node
+                );
+                self.handle_inbound_task(task_json).await;
+                Ok(true)
+            }
+            IpcResponse::NetworkState { online } => {
+                let online = *online;
+                if *self.online_rx.borrow() != online {
+                    info!(online, "Network state changed; adjusting Telegram polling.");
+                    self.online_tx.send_replace(online);
+                    // Deliberately NOT fed to the lease driver: NetworkState
+                    // reflects WAN reachability, but lease renewals run over
+                    // the local hotel UDS and must continue while offline
+                    // (deployed behaviour). Keeping the lease warm means the
+                    // poll loop can resume the instant connectivity returns,
+                    // with no window where another seat could grab the lease.
+                    // Machine sleep (where renewals really do stop) is covered
+                    // by the driver's TTL-gap re-acquire.
+                }
+                Ok(true)
+            }
+            other => {
+                info!("Membrane received non-task IPC message: {:?}", other);
+                Ok(true)
+            }
+        }
+    }
+}
+
+impl TelegramSeatGuest {
+    /// Handle a hotel push task for this seat: turn lifecycle events,
+    /// progressive drafts, ephemeral status, and final reply delivery.
+    async fn handle_inbound_task(&mut self, task_json: &str) {
+        let Ok(task) = serde_json::from_str::<Value>(task_json) else {
+            return;
+        };
+        let Some(tg_base) = self.tg_base.clone() else {
+            warn!("Received a reply task before Telegram setup completed; dropping.");
+            return;
+        };
+
+        let action = task
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("send_reply");
+        let session_id = task
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let chat_id = task
+            .get("chat_id")
+            .and_then(|id| id.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        if action == "turn_event" {
+            // Turn lifecycle signal from agent-core: update delivery UX without
+            // delivering a final reply.
+            let event = task
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            info!("Turn event [{}] for session [{}]", event, session_id);
+            // waiting_approval stops the typing; the approval reply arrives as
+            // a separate send_reply which will also cancel the turn entry.
+            if event == "waiting_approval" {
+                let removed = self.active_turns.lock().unwrap().remove(&session_id);
+                if let Some(active) = removed {
+                    if let Some(sid) = active.status_message_id {
+                        let c = self.http_client.clone();
+                        let b = tg_base.clone();
+                        let cid = chat_id.clone();
+                        tokio::spawn(async move {
+                            delete_telegram_message(&c, &b, &cid, sid).await;
+                        });
+                    }
+                    active.cancel();
+                }
+            }
+            // waiting_tool and waiting_model: typing continues — no action needed.
+        } else if action == "partial_reply" {
+            let content = task
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            info!(
+                "Partial reply observed for session [{}] ({} chars); typing continues until final reply.",
+                session_id,
+                content.len()
+            );
+            if !chat_id.is_empty() && !content.is_empty() {
+                let (draft_message_id, thread_id) = {
+                    let turns = self.active_turns.lock().unwrap();
+                    turns
+                        .get(&session_id)
+                        .map(|active| (active.draft_message_id, active.thread_id.clone()))
+                        .unwrap_or((None, None))
+                };
+                if let Some(message_id) = upsert_formatted_text(
+                    &self.http_client,
+                    &tg_base,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    draft_message_id,
+                    &content,
+                    None, // no button on partial/draft messages
+                )
+                .await
+                {
+                    if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id) {
+                        active.draft_message_id = Some(message_id);
+                    }
+                }
+            }
+        } else if action == "streaming_token" {
+            // LLM SSE token fragment — accumulate and periodically edit the
+            // in-progress Telegram message. Throttled to ≤1 edit/1500ms to
+            // stay well under Telegram's editMessageText rate limit.
+            //
+            // Note: philote currently aggregates model-router streaming_token
+            // deltas into cumulative partial_reply pushes, so this branch is
+            // the direct-emission path (defense in depth, ported from the
+            // gateway binary).
+            let token = task
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !chat_id.is_empty() && !token.is_empty() {
+                let now = tokio::time::Instant::now();
+                // Accumulate under the lock; snapshot only when an edit is due.
+                let due_snapshot = {
+                    let mut turns = self.active_turns.lock().unwrap();
+                    match turns.get_mut(&session_id) {
+                        Some(active) => {
+                            active.streaming_draft.push_str(&token);
+                            streaming_edit_due(active.streaming_last_edit, now).then(|| {
+                                (
+                                    active.streaming_draft.clone(),
+                                    active.thread_id.clone(),
+                                    active.draft_message_id,
+                                )
+                            })
+                        }
+                        // Token arrived after the turn completed — drop silently.
+                        None => None,
+                    }
+                };
+                if let Some((draft_snapshot, thread_id, draft_message_id)) = due_snapshot {
+                    if let Some(message_id) = upsert_formatted_text(
+                        &self.http_client,
+                        &tg_base,
+                        &chat_id,
+                        thread_id.as_deref(),
+                        draft_message_id,
+                        &draft_snapshot,
+                        None, // no button on streaming drafts
+                    )
+                    .await
+                    {
+                        if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
+                        {
+                            active.draft_message_id = Some(message_id);
+                            active.streaming_last_edit = Some(now);
+                        }
+                    }
+                }
+            }
+        } else if action == "turn_status" {
+            // Ephemeral status message: shows what the agent is doing right
+            // now (e.g. "Searching the web..."). Created on first call,
+            // edited on subsequent calls, deleted on final reply.
+            let status = task
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !chat_id.is_empty() && !status.is_empty() {
+                let (existing_id, thread_id) = {
+                    let turns = self.active_turns.lock().unwrap();
+                    turns
+                        .get(&session_id)
+                        .map(|a| (a.status_message_id, a.thread_id.clone()))
+                        .unwrap_or((None, None))
+                };
+                let formatted = format!("_{}_", status);
+                if let Some(new_id) = upsert_formatted_text(
+                    &self.http_client,
+                    &tg_base,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    existing_id,
+                    &formatted,
+                    None,
+                )
+                .await
+                {
+                    if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id) {
+                        active.status_message_id = Some(new_id);
+                    }
+                }
+            }
+        } else {
+            // send_reply (or any unrecognised action): deliver to Telegram and
+            // cancel the typing heartbeat for this session.
+            let (draft_message_id, status_message_id, active_thread_id) = {
+                let removed = self.active_turns.lock().unwrap().remove(&session_id);
+                if let Some(active) = removed {
+                    let draft_message_id = active.draft_message_id;
+                    let status_message_id = active.status_message_id;
+                    let active_thread_id = active.thread_id.clone();
+                    active.cancel();
+                    (draft_message_id, status_message_id, active_thread_id)
+                } else {
+                    (None, None, None)
+                }
+            };
+
+            let raw_content = task
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // Interceptor: strip @agent:<role> attribution tag and
+            // build an inline button so the user can switch to that role.
+            // reply_markup from the agent (e.g. roles keyboard) takes
+            // priority over the per-reply role_switch_button.
+            let (content, role_button) = {
+                let explicit_markup = task.get("reply_markup").cloned();
+                let (clean, role) = strip_attribution_tag(&raw_content);
+                let markup = explicit_markup.or_else(|| role.as_deref().map(role_switch_button));
+                (clean, markup)
+            };
+            let thread_id = task
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or(active_thread_id);
+            let audio_artifact_json = task
+                .get("audio_artifact")
+                .and_then(|a| a.as_str())
+                .map(str::to_string);
+            let send_text_caption = task
+                .get("send_text_caption")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if !chat_id.is_empty() {
+                let http_client_clone = self.http_client.clone();
+                let tg_base_clone = tg_base.clone();
+                let thread_id_clone = thread_id.clone();
+
+                tokio::spawn(async move {
+                    // Delete ephemeral status message (e.g. "Searching...") before reply.
+                    if let Some(sid) = status_message_id {
+                        delete_telegram_message(&http_client_clone, &tg_base_clone, &chat_id, sid)
+                            .await;
+                    }
+
+                    // Voice path: send audio first, then optional text caption.
+                    if let Some(artifact_json) = audio_artifact_json {
+                        if let Ok(artifact) = serde_json::from_str::<Value>(&artifact_json) {
+                            let mime_type = artifact
+                                .get("mime_type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("audio/mpeg");
+                            let audio_b64 = artifact
+                                .get("audio_base64")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+
+                            use base64::Engine;
+                            match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
+                                Ok(audio_bytes) => {
+                                    // Deliver as a real Telegram voice note (sendVoice: round bubble,
+                                    // plays inline) whenever possible. That needs OGG/OPUS; ElevenLabs
+                                    // returns MP3, so transcode when needed and only fall back to
+                                    // sendAudio (a music-file card) if transcoding is unavailable.
+                                    let (send_bytes, send_mime, endpoint, field_name, file_name) =
+                                        if mime_type.contains("ogg") {
+                                            (
+                                                audio_bytes,
+                                                "audio/ogg".to_string(),
+                                                "sendVoice",
+                                                "voice",
+                                                "voice.ogg",
+                                            )
+                                        } else {
+                                            match transcode_to_voice_ogg(&audio_bytes).await {
+                                                Some(ogg) => (
+                                                    ogg,
+                                                    "audio/ogg".to_string(),
+                                                    "sendVoice",
+                                                    "voice",
+                                                    "voice.ogg",
+                                                ),
+                                                None => {
+                                                    warn!(
+                                                        "Voice-note transcode unavailable; falling back to sendAudio (music-file card)."
+                                                    );
+                                                    (
+                                                        audio_bytes,
+                                                        mime_type.to_string(),
+                                                        "sendAudio",
+                                                        "audio",
+                                                        "audio.mp3",
+                                                    )
+                                                }
+                                            }
+                                        };
+                                    let send_url = format!("{}{}", tg_base_clone, endpoint);
+                                    let part = reqwest::multipart::Part::bytes(send_bytes)
+                                        .file_name(file_name)
+                                        .mime_str(&send_mime)
+                                        .unwrap_or_else(|_| {
+                                            reqwest::multipart::Part::bytes(Vec::new())
+                                        });
+                                    let form = reqwest::multipart::Form::new()
+                                        .text("chat_id", chat_id.clone())
+                                        .part(field_name, part);
+                                    info!(
+                                        "Sending voice/audio via {} to Telegram Chat [{}]...",
+                                        endpoint, chat_id
+                                    );
+                                    match http_client_clone
+                                        .post(&send_url)
+                                        .multipart(form)
+                                        .send()
+                                        .await
+                                    {
+                                        Ok(_) => info!("Telegram audio sent successfully."),
+                                        Err(e) => error!("Failed to send Telegram audio: {}", e),
+                                    }
+                                }
+                                Err(e) => error!("Failed to decode audio_base64: {}", e),
+                            }
+                        } else {
+                            error!("Failed to parse audio_artifact JSON; skipping audio delivery.");
+                        }
+
+                        // Also send text as a follow-up caption if requested.
+                        if send_text_caption && !content.is_empty() {
+                            let _ = upsert_formatted_text(
+                                &http_client_clone,
+                                &tg_base_clone,
+                                &chat_id,
+                                thread_id_clone.as_deref(),
+                                draft_message_id,
+                                &content,
+                                role_button.clone(),
+                            )
+                            .await;
+                        } else if let Some(msg_id) = draft_message_id {
+                            // Voice-only response: delete any streaming/partial
+                            // draft that appeared while the model was generating
+                            // so the chat stays clean (audio only, no leftover
+                            // text fragment).
+                            delete_telegram_message(
+                                &http_client_clone,
+                                &tg_base_clone,
+                                &chat_id,
+                                msg_id,
+                            )
+                            .await;
+                        }
+                    } else if !content.is_empty() {
+                        // Text-only path.
+                        info!(
+                            "Sending final response back to Telegram Chat [{}]...",
+                            chat_id
+                        );
+                        let _ = upsert_formatted_text(
+                            &http_client_clone,
+                            &tg_base_clone,
+                            &chat_id,
+                            thread_id_clone.as_deref(),
+                            draft_message_id,
+                            &content,
+                            role_button.clone(),
+                        )
+                        .await;
+                    }
+                });
+            } else {
+                warn!("Received a reply task but 'chat_id' was missing. Cannot route to Telegram.");
             }
         }
     }
@@ -2440,24 +3126,23 @@ pub async fn run() -> Result<()> {
                     "Spawning seat for agent [{}] (guest_id: {})",
                     agent_id, seat_guest_id
                 );
-                let agent_id = agent_id.to_string();
-                let http = http_client.clone();
-                let tg_api = telegram_api_base.clone();
-                let tg_file = telegram_file_api_base.clone();
-                let blob = blob_base.clone();
+                let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEnvelope>(64);
+                let guest = TelegramSeatGuest::new(
+                    seat_guest_id.clone(),
+                    token_key,
+                    agent_id.to_string(),
+                    http_client.clone(),
+                    telegram_api_base.clone(),
+                    telegram_file_api_base.clone(),
+                    blob_base.clone(),
+                    inbound_tx,
+                );
+                let runtime =
+                    MembraneRuntime::new(hotel_socket_path(), &seat_guest_id, local_node_id())
+                        .with_inbound_rx(inbound_rx);
 
                 tasks.push(tokio::spawn(async move {
-                    if let Err(e) = run_seat_with_backoff(
-                        seat_guest_id.clone(),
-                        token_key,
-                        agent_id,
-                        http,
-                        tg_api,
-                        tg_file,
-                        blob,
-                    )
-                    .await
-                    {
+                    if let Err(e) = runtime.run(guest).await {
                         error!("Seat [{}] exited with error: {}", seat_guest_id, e);
                     }
                 }));
@@ -2481,16 +3166,21 @@ pub async fn run() -> Result<()> {
     let target_agent_id = configured_target_agent_id();
     let telegram_token_key = configured_telegram_token_key();
 
-    run_seat_with_backoff(
-        guest_id,
+    let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEnvelope>(64);
+    let guest = TelegramSeatGuest::new(
+        guest_id.clone(),
         telegram_token_key,
         target_agent_id,
         http_client,
         telegram_api_base,
         telegram_file_api_base,
         blob_base,
-    )
-    .await
+        inbound_tx,
+    );
+    MembraneRuntime::new(hotel_socket_path(), guest_id, local_node_id())
+        .with_inbound_rx(inbound_rx)
+        .run(guest)
+        .await
 }
 
 #[cfg(test)]
@@ -2883,6 +3573,19 @@ mod tests {
     }
 
     #[test]
+    fn menu_commands_include_voice() {
+        // /voice is parsed by philote's parse_slash_command and handled by
+        // SlashCommand::Voice in the philote runtime — the menu entry only
+        // surfaces the already-working command.
+        let has_voice = super::TELEGRAM_MENU_COMMANDS
+            .iter()
+            .any(|c| c.command == "voice");
+        assert!(has_voice, "TELEGRAM_MENU_COMMANDS should include 'voice'");
+        let help = super::telegram_help_text(&[]);
+        assert!(help.contains("/voice"), "help text should mention /voice");
+    }
+
+    #[test]
     fn combined_commands_include_native_and_agent_entries() {
         let agent_cmds = vec![CommandManifestEntry {
             command: "status".into(),
@@ -2898,6 +3601,172 @@ mod tests {
         assert!(names.contains(&"ping"));
         assert!(names.contains(&"new"));
         assert!(names.contains(&"status"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_edit_throttle_allows_first_then_gates_at_1500ms() {
+        let start = tokio::time::Instant::now();
+        // First edit is always due.
+        assert!(super::streaming_edit_due(None, start));
+
+        // Within the throttle window: gated.
+        tokio::time::advance(std::time::Duration::from_millis(1499)).await;
+        assert!(!super::streaming_edit_due(
+            Some(start),
+            tokio::time::Instant::now()
+        ));
+
+        // At/after 1500ms: due again.
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert!(super::streaming_edit_due(
+            Some(start),
+            tokio::time::Instant::now()
+        ));
+    }
+
+    #[test]
+    fn approval_callback_predicate_matches_buttons_only() {
+        for data in [
+            "approve",
+            "approve:turn-1",
+            "deny",
+            "deny:turn-1",
+            "trust",
+            "trust:turn-1",
+        ] {
+            assert!(super::is_approval_callback(data), "{data} should ack");
+        }
+        // Slash callbacks are acked by the promotion path; others not at all.
+        assert!(!super::is_approval_callback("/role architect"));
+        assert!(!super::is_approval_callback("something-else"));
+        assert!(!super::is_approval_callback("approved"));
+    }
+
+    #[test]
+    fn envelope_captures_chat_type_and_sender_first_name() {
+        let update = json!({
+            "update_id": 400,
+            "message": {
+                "text": "hello",
+                "chat": { "id": -900123, "type": "supergroup" },
+                "from": { "id": 888, "username": "jared", "first_name": "Jared" }
+            }
+        });
+        let envelope = telegram_inbound_envelope(&update, 400, "agent-jane-01")
+            .expect("group message should normalize");
+        assert_eq!(envelope.chat_type.as_deref(), Some("supergroup"));
+        assert_eq!(envelope.sender_first_name.as_deref(), Some("Jared"));
+
+        let callback_update = json!({
+            "update_id": 401,
+            "callback_query": {
+                "data": "approve",
+                "from": { "id": 999, "username": "mallory", "first_name": "Mallory" },
+                "message": {
+                    "chat": { "id": -900123, "type": "group" }
+                }
+            }
+        });
+        let cb = telegram_inbound_envelope(&callback_update, 401, "agent-jane-01")
+            .expect("callback should normalize");
+        assert_eq!(cb.chat_type.as_deref(), Some("group"));
+        assert_eq!(cb.sender_first_name.as_deref(), Some("Mallory"));
+    }
+
+    #[test]
+    fn group_chat_detection_uses_chat_type_then_negative_id() {
+        assert!(super::is_group_chat(Some("group"), "12345"));
+        assert!(super::is_group_chat(Some("supergroup"), "12345"));
+        assert!(super::is_group_chat(None, "-10012345"));
+        assert!(!super::is_group_chat(Some("private"), "12345"));
+        assert!(!super::is_group_chat(None, "12345"));
+    }
+
+    #[test]
+    fn operator_check_is_case_insensitive_and_requires_username() {
+        let operators: std::collections::HashSet<String> =
+            ["jared".to_string()].into_iter().collect();
+        assert!(super::is_operator_sender(Some("jared"), &operators));
+        assert!(super::is_operator_sender(Some("JARED"), &operators));
+        assert!(!super::is_operator_sender(Some("mallory"), &operators));
+        // No username at all can never be an operator.
+        assert!(!super::is_operator_sender(None, &operators));
+    }
+
+    #[test]
+    fn allowed_users_key_derivation_matches_token_key_convention() {
+        assert_eq!(
+            super::telegram_allowed_users_key("telegram_bot_token_jane"),
+            "telegram_allowed_users_jane"
+        );
+        assert_eq!(
+            super::telegram_allowed_users_key("telegram_bot_token"),
+            "telegram_allowed_users"
+        );
+    }
+
+    #[test]
+    fn seat_inbound_envelope_carries_chat_type_and_first_name_extras() {
+        let update = json!({
+            "update_id": 402,
+            "message": {
+                "text": "hi",
+                "chat": { "id": -777, "type": "group" },
+                "from": { "id": 1, "username": "jared", "first_name": "Jared" }
+            }
+        });
+        let envelope = telegram_inbound_envelope(&update, 402, "agent-jane-01").unwrap();
+        let inbound = super::seat_inbound_envelope(&envelope, "node", "agent-jane-01", "seat");
+        assert_eq!(inbound.extra["chat_type"], "group");
+        assert_eq!(inbound.extra["sender_first_name"], "Jared");
+        assert_eq!(inbound.sender.display_name.as_deref(), Some("Jared"));
+    }
+
+    #[test]
+    fn seat_inbound_envelope_reproduces_deployed_dispatch_shape() {
+        let update = json!({
+            "update_id": 300,
+            "message": {
+                "message_thread_id": 4,
+                "text": "/status please",
+                "chat": { "id": 12345 },
+                "from": { "id": 888, "username": "jared" }
+            }
+        });
+        let envelope = telegram_inbound_envelope(&update, 300, "agent-jane-01")
+            .expect("update should normalize");
+
+        let inbound = super::seat_inbound_envelope(
+            &envelope,
+            "mbp-jane-aiua-01",
+            "agent-jane-01",
+            "default:membrane-gateway-jane",
+        );
+
+        // Explicit local EmitTask routing (deployed behaviour).
+        assert_eq!(inbound.target_node.as_deref(), Some("mbp-jane-aiua-01"));
+        assert_eq!(inbound.target_guest_id.as_deref(), Some("agent-jane-01"));
+        // Reply routing pins this seat's inbox.
+        assert_eq!(inbound.final_reply_to.as_deref(), Some("mbp-jane-aiua-01"));
+        assert_eq!(inbound.final_reply_role.as_deref(), Some("membrane"));
+        assert_eq!(
+            inbound.final_reply_guest_id.as_deref(),
+            Some("default:membrane-gateway-jane")
+        );
+        // Standard fields.
+        assert_eq!(inbound.session_id, "telegram:12345:4:agent-jane-01");
+        assert_eq!(inbound.turn_id, "telegram-update-300");
+        assert_eq!(inbound.content, "/status please");
+        assert_eq!(inbound.command.as_deref(), Some("/status"));
+        assert_eq!(inbound.sender.id.as_deref(), Some("888"));
+        assert_eq!(inbound.sender.username.as_deref(), Some("jared"));
+        // Telegram payload extras merged at top level of the task payload.
+        assert_eq!(inbound.extra["source"], "telegram");
+        assert_eq!(inbound.extra["transport"], "telegram");
+        assert_eq!(inbound.extra["chat_id"], "12345");
+        assert_eq!(inbound.extra["thread_id"], "4");
+        assert_eq!(inbound.extra["message_kind"], "text");
+        assert_eq!(inbound.extra["callback_data"], serde_json::Value::Null);
     }
 
     #[test]
