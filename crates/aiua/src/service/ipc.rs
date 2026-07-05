@@ -1009,6 +1009,29 @@ pub(crate) struct ParkedInboundTask {
 
 pub(crate) type ParkedInboundRegistry = Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
+/// Which flavor of dormant target a parked task is waiting on.
+///
+/// Forces the local-vs-cross-hotel materialization semantics to be an explicit
+/// compile-time choice at every call site. These used to be two near-twin helpers
+/// (`park_and_materialize_local_role` / `park_and_materialize_role_philote`) and
+/// picking the wrong one once shipped a bug (PR #80: a cron fire targeting a local
+/// role incarnation spawned a wrong-named `{hotel}:philote-{role}` guest and
+/// dead-ended, because the cross-hotel helper was reused for a local target).
+pub(crate) enum ParkTarget<'a> {
+    /// A *local* role incarnation (single-process, lives inside the base philote),
+    /// resolved via its `RoleIncarnationRecord`. Parked under `role_record.guest_id`
+    /// and woken via `ensure_role_materialized` — which also wakes an
+    /// already-configured dormant local guest.
+    LocalRoleIncarnation {
+        role_record: &'a RoleIncarnationRecord,
+    },
+    /// A cross-hotel `TaskInvoke` addressed to `delivery_target_guest_id`. Parked
+    /// under the agent-centric guest id and materialized via the dedicated-process
+    /// `{hotel}:philote-{role}` naming scheme (seeding the hotel guest record if
+    /// it does not exist yet). Does not wake local single-process incarnations.
+    CrossHotelGuest { agent_guest_id: &'a str },
+}
+
 /// Special sink role: capabilities reply here when dispatched by the Golgi pipeline.
 const GOLGI_SINK_ROLE: &str = "hotel:golgi";
 
@@ -5733,128 +5756,19 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
-    /// Park a cross-hotel task and trigger role-philote materialization on this hotel.
+    /// Park a task for a dormant target and trigger its materialization, flushed when the
+    /// target philote connects and registers under the parked guest_id.
     ///
-    /// Called when a `TaskInvoke` arrives from the mesh with `delivery_target_guest_id` set
-    /// but the target guest has no live inbox subscriber (idle or not yet spawned).
-    pub(crate) async fn park_and_materialize_role_philote(
-        graph: &GraphDomain,
-        local_node_id: &str,
-        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
-        mat_req: Option<&dyn GuestMaterializationRequester>,
-        source_node: &str,
-        task_id: Uuid,
-        task_json: String,
-        agent_guest_id: &str,
-    ) {
-        // Park the task — flushed when the role philote connects and registers.
-        {
-            let mut guard = parked_inbound.lock().await;
-            guard
-                .entry(agent_guest_id.to_string())
-                .or_default()
-                .push(ParkedInboundTask {
-                    source_node: source_node.to_string(),
-                    task_id,
-                    task_json,
-                    activate_session_id: None,
-                });
-        }
-        info!(
-            agent_guest_id,
-            task_id = %task_id,
-            "Cross-hotel TaskInvoke parked; triggering role-philote materialization."
-        );
-
-        // Resolve the hotel guest record ID from the agent-centric guest_id.
-        let incarnations = graph
-            .list_role_incarnations_by_guest_id(agent_guest_id)
-            .unwrap_or_default();
-        let Some(inc) = incarnations.into_iter().next() else {
-            warn!(
-                agent_guest_id,
-                "No role incarnation found for cross-hotel guest; cannot materialize."
-            );
-            return;
-        };
-        let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
-            warn!(
-                agent_guest_id,
-                "Cannot determine local hotel name; cannot materialize role philote."
-            );
-            return;
-        };
-        let hotel_guest_id = format!("{}:philote-{}", hotel_name, inc.role_name);
-        let socket_path = graph
-            .list_hotels()
-            .ok()
-            .and_then(|hs| {
-                hs.into_iter()
-                    .find(|h| h.capabilities.node_id == local_node_id)
-                    .map(|h| h.ipc_socket_path)
-            })
-            .unwrap_or_default();
-
-        // Create the hotel guest record if it doesn't already exist.
-        if graph
-            .get_guest(&hotel_name, &hotel_guest_id)
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            let config_json = serde_json::json!({
-                "command": "philote",
-                "args": [],
-                "env": {
-                    "PHILOTIC_AGENT_ID": inc.agent_id,
-                    "PHILOTIC_ROLE_NAME": inc.role_name,
-                    "PHILOTIC_HOTEL_SOCKET": socket_path,
-                    "PHILOTIC_NODE_ID": local_node_id,
-                }
-            });
-            let rec = ansible_mesh_core::storage::GuestRecord {
-                hotel_name: hotel_name.clone(),
-                guest_id: hotel_guest_id.clone(),
-                role: inc.role_name.clone(),
-                config_json: config_json.to_string(),
-                is_active: true,
-                active_pid: None,
-                last_active_at: None,
-            };
-            if let Err(e) = graph.seed_guests(&hotel_name, &[rec]) {
-                warn!(
-                    "Failed to seed role-philote guest record [{}]: {e}",
-                    hotel_guest_id
-                );
-            } else {
-                info!("Created role-philote guest record: {}", hotel_guest_id);
-            }
-        }
-
-        if let Some(req) = mat_req {
-            match req.ensure_guest_active(&hotel_guest_id).await {
-                Ok(true) => info!(
-                    "Role-philote [{}] materialization triggered for cross-hotel task.",
-                    hotel_guest_id
-                ),
-                Ok(false) => warn!(
-                    "Role-philote [{}] could not be materialized.",
-                    hotel_guest_id
-                ),
-                Err(e) => warn!(
-                    "Role-philote [{}] materialization error: {e}",
-                    hotel_guest_id
-                ),
-            }
-        }
-    }
-
-    /// Park a task for a *local* role incarnation and trigger its materialization, flushed
-    /// when the role philote registers under `role_record.guest_id` (single-process role
-    /// incarnations live inside the base philote, spawned/woken via `ensure_role_materialized`
-    /// — unlike [`Self::park_and_materialize_role_philote`], which targets the cross-hotel
-    /// dedicated-process naming scheme and does not wake an already-configured local guest).
-    pub(crate) async fn park_and_materialize_local_role(
+    /// The [`ParkTarget`] enum forces the caller to state which materialization semantics
+    /// apply (see its docs — the two arms are intentionally *not* interchangeable):
+    /// - [`ParkTarget::LocalRoleIncarnation`]: local single-process role incarnation,
+    ///   parked under `role_record.guest_id`, woken via [`Self::ensure_role_materialized`].
+    /// - [`ParkTarget::CrossHotelGuest`]: cross-hotel `TaskInvoke` addressed to
+    ///   `delivery_target_guest_id` with no live inbox subscriber, parked under the
+    ///   agent-centric guest id, materialized as a dedicated `{hotel}:philote-{role}`
+    ///   process guest.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn park_and_materialize(
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
@@ -5863,45 +5777,150 @@ impl IpcServer {
         source_node: &str,
         task_id: Uuid,
         task_json: String,
-        role_record: &RoleIncarnationRecord,
+        target: ParkTarget<'_>,
     ) {
-        {
-            let mut guard = parked_inbound.lock().await;
-            guard
-                .entry(role_record.guest_id.clone())
-                .or_default()
-                .push(ParkedInboundTask {
-                    source_node: source_node.to_string(),
-                    task_id,
-                    task_json,
-                    activate_session_id: None,
-                });
-        }
-        info!(
-            guest_id = %role_record.guest_id,
-            task_id = %task_id,
-            "Local role-incarnation task parked; triggering on-demand materialization."
-        );
+        match target {
+            ParkTarget::LocalRoleIncarnation { role_record } => {
+                {
+                    let mut guard = parked_inbound.lock().await;
+                    guard.entry(role_record.guest_id.clone()).or_default().push(
+                        ParkedInboundTask {
+                            source_node: source_node.to_string(),
+                            task_id,
+                            task_json,
+                            activate_session_id: None,
+                        },
+                    );
+                }
+                info!(
+                    guest_id = %role_record.guest_id,
+                    task_id = %task_id,
+                    "Local role-incarnation task parked; triggering on-demand materialization."
+                );
 
-        match Self::ensure_role_materialized(
-            graph,
-            inboxes,
-            mat_req,
-            local_node_id,
-            &role_record.agent_id,
-            &role_record.role_name,
-        )
-        .await
-        {
-            Ok(readiness) => info!(
-                guest_id = %role_record.guest_id,
-                ?readiness,
-                "Local role-incarnation materialization requested."
-            ),
-            Err(e) => warn!(
-                guest_id = %role_record.guest_id,
-                "Local role-incarnation materialization failed: {e}"
-            ),
+                match Self::ensure_role_materialized(
+                    graph,
+                    inboxes,
+                    mat_req,
+                    local_node_id,
+                    &role_record.agent_id,
+                    &role_record.role_name,
+                )
+                .await
+                {
+                    Ok(readiness) => info!(
+                        guest_id = %role_record.guest_id,
+                        ?readiness,
+                        "Local role-incarnation materialization requested."
+                    ),
+                    Err(e) => warn!(
+                        guest_id = %role_record.guest_id,
+                        "Local role-incarnation materialization failed: {e}"
+                    ),
+                }
+            }
+            ParkTarget::CrossHotelGuest { agent_guest_id } => {
+                // Park the task — flushed when the role philote connects and registers.
+                {
+                    let mut guard = parked_inbound.lock().await;
+                    guard
+                        .entry(agent_guest_id.to_string())
+                        .or_default()
+                        .push(ParkedInboundTask {
+                            source_node: source_node.to_string(),
+                            task_id,
+                            task_json,
+                            activate_session_id: None,
+                        });
+                }
+                info!(
+                    agent_guest_id,
+                    task_id = %task_id,
+                    "Cross-hotel TaskInvoke parked; triggering role-philote materialization."
+                );
+
+                // Resolve the hotel guest record ID from the agent-centric guest_id.
+                let incarnations = graph
+                    .list_role_incarnations_by_guest_id(agent_guest_id)
+                    .unwrap_or_default();
+                let Some(inc) = incarnations.into_iter().next() else {
+                    warn!(
+                        agent_guest_id,
+                        "No role incarnation found for cross-hotel guest; cannot materialize."
+                    );
+                    return;
+                };
+                let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    warn!(
+                        agent_guest_id,
+                        "Cannot determine local hotel name; cannot materialize role philote."
+                    );
+                    return;
+                };
+                let hotel_guest_id = format!("{}:philote-{}", hotel_name, inc.role_name);
+                let socket_path = graph
+                    .list_hotels()
+                    .ok()
+                    .and_then(|hs| {
+                        hs.into_iter()
+                            .find(|h| h.capabilities.node_id == local_node_id)
+                            .map(|h| h.ipc_socket_path)
+                    })
+                    .unwrap_or_default();
+
+                // Create the hotel guest record if it doesn't already exist.
+                if graph
+                    .get_guest(&hotel_name, &hotel_guest_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    let config_json = serde_json::json!({
+                        "command": "philote",
+                        "args": [],
+                        "env": {
+                            "PHILOTIC_AGENT_ID": inc.agent_id,
+                            "PHILOTIC_ROLE_NAME": inc.role_name,
+                            "PHILOTIC_HOTEL_SOCKET": socket_path,
+                            "PHILOTIC_NODE_ID": local_node_id,
+                        }
+                    });
+                    let rec = ansible_mesh_core::storage::GuestRecord {
+                        hotel_name: hotel_name.clone(),
+                        guest_id: hotel_guest_id.clone(),
+                        role: inc.role_name.clone(),
+                        config_json: config_json.to_string(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    };
+                    if let Err(e) = graph.seed_guests(&hotel_name, &[rec]) {
+                        warn!(
+                            "Failed to seed role-philote guest record [{}]: {e}",
+                            hotel_guest_id
+                        );
+                    } else {
+                        info!("Created role-philote guest record: {}", hotel_guest_id);
+                    }
+                }
+
+                if let Some(req) = mat_req {
+                    match req.ensure_guest_active(&hotel_guest_id).await {
+                        Ok(true) => info!(
+                            "Role-philote [{}] materialization triggered for cross-hotel task.",
+                            hotel_guest_id
+                        ),
+                        Ok(false) => warn!(
+                            "Role-philote [{}] could not be materialized.",
+                            hotel_guest_id
+                        ),
+                        Err(e) => warn!(
+                            "Role-philote [{}] materialization error: {e}",
+                            hotel_guest_id
+                        ),
+                    }
+                }
+            }
         }
     }
 
@@ -6843,49 +6862,15 @@ impl IpcServer {
         )
     }
 
-    pub(crate) async fn deliver_event_envelope(
-        inboxes: &InboxRegistry,
-        event: &EventEnvelope,
-        operator_surface_tx: Option<&mpsc::Sender<String>>,
-    ) -> bool {
-        match (&event.kind, &event.target_agent_id, &event.payload) {
-            (
-                EventKind::TaskInvoke | EventKind::TaskResult,
-                Some(target_role),
-                EventPayload::Inline { data },
-            ) => {
-                // Route cross-hotel operator surface queries to the in-process worker.
-                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
-                    if let Some(tx) = operator_surface_tx {
-                        let _ = tx.try_send(data.clone()).ok();
-                        return true;
-                    }
-                }
-                let target_guest_id = serde_json::from_str::<serde_json::Value>(data)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("delivery_target_guest_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    });
-                Self::deliver_inbound_task(
-                    inboxes,
-                    &event.source_node_id,
-                    target_role,
-                    target_guest_id.as_deref(),
-                    event.event_id,
-                    data.clone(),
-                )
-                .await;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Like `deliver_event_envelope`, but parks + materializes the role philote when
-    /// `delivery_target_guest_id` is set and no subscriber is currently connected.
-    /// Called from the mesh inbox loop where the full hotel context is available.
+    /// Deliver a mesh event envelope to local inbox subscribers, parking + materializing
+    /// the role philote when `delivery_target_guest_id` is set and no subscriber is
+    /// currently connected. Called from the mesh inbox loop where the full hotel context
+    /// is available.
+    ///
+    /// This is the *only* envelope delivery entry point. A park-less twin
+    /// (`deliver_event_envelope`) used to exist alongside it; it had no remaining callers
+    /// and lacked both the target-node guard and the park path, so it was retired rather
+    /// than left as a footgun.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn deliver_event_envelope_or_park(
         inboxes: &InboxRegistry,
@@ -6972,15 +6957,16 @@ impl IpcServer {
                     )
                     .await;
                 } else if let Some(ref agent_guest_id) = target_guest_id {
-                    Self::park_and_materialize_role_philote(
+                    Self::park_and_materialize(
                         graph,
-                        local_node_id,
+                        inboxes,
                         parked_inbound,
                         mat_req,
+                        local_node_id,
                         &event.source_node_id,
                         event.event_id,
                         data.clone(),
-                        agent_guest_id,
+                        ParkTarget::CrossHotelGuest { agent_guest_id },
                     )
                     .await;
                 } else {
@@ -9189,7 +9175,7 @@ impl IpcServer {
                     )
                 } else if let Some(guest_id) = resolved_target_guest_id.as_deref() {
                     // Inject delivery_target_guest_id so the remote hotel's
-                    // deliver_event_envelope can filter to this specific guest.
+                    // deliver_event_envelope_or_park can filter to this specific guest.
                     if let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&task_json) {
                         if let Some(obj) = payload.as_object_mut() {
                             obj.entry("delivery_target_guest_id")
@@ -17848,6 +17834,168 @@ mod tests {
             parked_inbound.lock().await.is_empty(),
             "must not park a task that belongs to a different node"
         );
+    }
+
+    /// Shared fixture for the two `park_and_materialize` arm tests: a local hotel plus a
+    /// role incarnation `agent-test:orchestrator`. Identical inputs — only the
+    /// [`ParkTarget`] arm differs — so the tests pin down exactly the semantic split that
+    /// PR #80 got wrong when the two twin helpers were separate functions.
+    fn park_test_graph() -> GraphDomain {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/park-materialize-test.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-test".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-test:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: true,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+        graph
+    }
+
+    // PR #80 regression, local arm: a task for a *local* role incarnation must be parked
+    // under the incarnation's own guest_id and materialized via ensure_role_materialized
+    // targeting that same guest_id — NOT the cross-hotel `{hotel}:philote-{role}` scheme
+    // (reusing the cross-hotel helper here once spawned a wrong-named guest that
+    // dead-ended, because nothing ever registers under that name for a local role).
+    #[tokio::test]
+    async fn park_and_materialize_local_role_incarnation_targets_role_guest_id() {
+        let graph = park_test_graph();
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let parked_inbound: ParkedInboundRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+        let role_record = graph
+            .list_role_incarnations_by_guest_id("agent-test:orchestrator")
+            .expect("list role incarnations")
+            .into_iter()
+            .next()
+            .expect("seeded role incarnation");
+        let task_id = Uuid::new_v4();
+
+        IpcServer::park_and_materialize(
+            &graph,
+            &inboxes,
+            &parked_inbound,
+            Some(&mat_req),
+            "local-aiua-01",
+            "local-aiua-01",
+            task_id,
+            "{}".into(),
+            ParkTarget::LocalRoleIncarnation {
+                role_record: &role_record,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            parked_inbound
+                .lock()
+                .await
+                .get("agent-test:orchestrator")
+                .map(Vec::len),
+            Some(1),
+            "task must be parked under the role incarnation's own guest_id"
+        );
+        assert_eq!(mat_req.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mat_req
+                .last_guest_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_deref(),
+            Some("agent-test:orchestrator"),
+            "materialization must target the role incarnation's own guest_id, not a \
+             cross-hotel philote-{{role}} placeholder"
+        );
+        let guest = graph
+            .get_guest("local-hotel", "agent-test:orchestrator")
+            .expect("get_guest should not error")
+            .expect("materialization should have upserted the local role guest record");
+        assert!(
+            guest.is_active,
+            "materialization must flip the dormant role guest active"
+        );
+    }
+
+    // PR #80 regression, cross-hotel arm: a cross-hotel TaskInvoke addressed to an
+    // agent-centric guest_id must be parked under that guest_id but materialized via the
+    // dedicated-process `{hotel}:philote-{role}` naming scheme (seeding its hotel guest
+    // record) — the exact opposite target choice from the local arm above.
+    #[tokio::test]
+    async fn park_and_materialize_cross_hotel_guest_targets_philote_naming_scheme() {
+        let graph = park_test_graph();
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let parked_inbound: ParkedInboundRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+        let task_id = Uuid::new_v4();
+
+        IpcServer::park_and_materialize(
+            &graph,
+            &inboxes,
+            &parked_inbound,
+            Some(&mat_req),
+            "local-aiua-01",
+            "remote-aiua-01",
+            task_id,
+            "{}".into(),
+            ParkTarget::CrossHotelGuest {
+                agent_guest_id: "agent-test:orchestrator",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            parked_inbound
+                .lock()
+                .await
+                .get("agent-test:orchestrator")
+                .map(Vec::len),
+            Some(1),
+            "task must be parked under the agent-centric guest_id it was addressed to"
+        );
+        assert_eq!(mat_req.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mat_req
+                .last_guest_id
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_deref(),
+            Some("local-hotel:philote-orchestrator"),
+            "cross-hotel materialization must target the dedicated-process \
+             {{hotel}}:philote-{{role}} guest, not the agent-centric guest_id"
+        );
+        let guest = graph
+            .get_guest("local-hotel", "local-hotel:philote-orchestrator")
+            .expect("get_guest should not error")
+            .expect("cross-hotel arm must seed the philote hotel guest record");
+        assert!(guest.is_active);
+        assert_eq!(guest.role, "orchestrator");
     }
 
     #[tokio::test]

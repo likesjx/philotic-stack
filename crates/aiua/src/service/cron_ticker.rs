@@ -260,7 +260,7 @@ impl CronTicker {
 
         match (&target_role_record, is_subscribed) {
             (Some(record), false) => {
-                crate::service::ipc::IpcServer::park_and_materialize_local_role(
+                crate::service::ipc::IpcServer::park_and_materialize(
                     &self.graph,
                     &self.inboxes,
                     &self.parked_inbound,
@@ -269,7 +269,9 @@ impl CronTicker {
                     &self.local_node_id,
                     task_id,
                     task_json,
-                    record,
+                    crate::service::ipc::ParkTarget::LocalRoleIncarnation {
+                        role_record: record,
+                    },
                 )
                 .await;
             }
