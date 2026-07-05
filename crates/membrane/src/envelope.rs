@@ -48,6 +48,20 @@ pub struct InboundEnvelope {
     /// Specific guest_id to target for outbound replies, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_reply_guest_id: Option<String>,
+    /// Explicit dispatch routing: when set, the runtime emits the task via
+    /// `EmitTask` to this node instead of a local `CreateTask`. Takes
+    /// precedence over the `raw_transport.target_node` hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node: Option<String>,
+    /// Explicit target guest for dispatch (`EmitTask.target_guest_id`).
+    /// Takes precedence over the `raw_transport.target_id` hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_guest_id: Option<String>,
+    /// Transport-specific fields merged verbatim into the top level of the
+    /// dispatched task payload (e.g. Telegram `chat_id`, `thread_id`,
+    /// `message_kind`). Entries here override same-named standard fields.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Identifies the sender of an inbound message.
