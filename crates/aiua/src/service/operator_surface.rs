@@ -12,14 +12,16 @@ use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::registry::NodeRegistry;
 use ansible_mesh_core::storage::ComponentManifest;
 use philotic_client::{
-    ComponentInventoryEntryView, GuestIdentity, IpcRequest, IpcResponse,
+    ComponentInventoryEntryView, DesktopMembraneTargetGuestInventoryView,
+    DesktopMembraneTargetStatusView, GuestIdentity, IpcRequest, IpcResponse,
     OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
     OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
     OPERATOR_SURFACE_QUERY_ROLE, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
-    OperatorTargetConfigMutationAckView, OperatorTargetConfigView, OperatorTargetPlacementView,
-    OperatorTargetRoleHomeAckView, OperatorTargetSecretEntryView,
-    OperatorTargetSecretInventoryView, OperatorTargetSecretMutationAckView, PhiloticClient,
+    OperatorTargetConfigMutationAckView, OperatorTargetConfigView, OperatorTargetGuestInventoryView,
+    OperatorTargetPlacementView, OperatorTargetRoleHomeAckView, OperatorTargetSecretEntryView,
+    OperatorTargetSecretInventoryView, OperatorTargetSecretMutationAckView,
+    OperatorTargetStatusView, PhiloticClient,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1931,5 +1933,190 @@ impl IpcServer {
                 operator_target_role_home: ack,
             })
         }
+    }
+    pub(super) async fn query_remote_desktop_membrane_guests(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+    ) -> anyhow::Result<DesktopMembraneTargetGuestInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.guests".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target guest inventory".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote guest query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote guest inventory reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote guest inventory reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetGuestInventoryView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote guest inventory reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote guest inventory reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
+    }
+
+    pub(super) async fn query_remote_desktop_membrane_status(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+    ) -> anyhow::Result<DesktopMembraneTargetStatusView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.status".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target daemon status".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote status query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
+            client.recv_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target status reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote target status reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetStatusView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote target status reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote target status reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
     }
 }
