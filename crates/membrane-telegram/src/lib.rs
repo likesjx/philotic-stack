@@ -1203,6 +1203,35 @@ fn approval_callback_content(callback_data: &str) -> String {
     }
 }
 
+/// True when `callback_data` came from an approval inline button
+/// (Approve / Deny / Trust). Used to ack the callback query so Telegram
+/// dismisses the loading spinner — the slash-promotion ack path only fires
+/// for `/`-prefixed callback_data, which approval buttons don't use.
+fn is_approval_callback(callback_data: &str) -> bool {
+    callback_data == "approve"
+        || callback_data.starts_with("approve:")
+        || callback_data == "deny"
+        || callback_data.starts_with("deny:")
+        || callback_data == "trust"
+        || callback_data.starts_with("trust:")
+}
+
+/// Ack a Telegram callback query so the client dismisses the loading spinner.
+async fn answer_callback_query(http_client: &reqwest::Client, tg_base: &str, raw_update: &Value) {
+    if let Some(callback_id) = raw_update
+        .get("callback_query")
+        .and_then(|q| q.get("id"))
+        .and_then(Value::as_str)
+    {
+        let ack_url = format!("{tg_base}answerCallbackQuery");
+        let _ = http_client
+            .post(&ack_url)
+            .json(&json!({ "callback_query_id": callback_id }))
+            .send()
+            .await;
+    }
+}
+
 /// Group-chat detection for the operator gate: explicit chat type wins,
 /// with the negative-chat-id convention as a fallback.
 fn is_group_chat(chat_type: Option<&str>, chat_id: &str) -> bool {
@@ -2145,20 +2174,25 @@ async fn seat_process_update(
                 // Re-surface as a text message with the full command string.
                 envelope.content = data.to_string();
                 // Ack the callback query to dismiss Telegram's loading indicator.
-                if let Some(callback_id) = envelope
-                    .raw_transport_event
-                    .get("callback_query")
-                    .and_then(|q| q.get("id"))
-                    .and_then(Value::as_str)
-                {
-                    let ack_url = format!("{}answerCallbackQuery", ctx.tg_base);
-                    let _ = ctx
-                        .http_client
-                        .post(&ack_url)
-                        .json(&json!({"callback_query_id": callback_id}))
-                        .send()
-                        .await;
-                }
+                answer_callback_query(
+                    &ctx.http_client,
+                    &ctx.tg_base,
+                    &envelope.raw_transport_event,
+                )
+                .await;
+            } else if is_approval_callback(data) {
+                // Approve/Deny/Trust buttons: the envelope already carries the
+                // translated /approve or /deny content for philote, but the
+                // callback query itself was never answered — Telegram keeps
+                // showing the button's loading spinner until it times out.
+                // Ack it here (before the operator gate, so even a dropped
+                // non-operator tap doesn't spin).
+                answer_callback_query(
+                    &ctx.http_client,
+                    &ctx.tg_base,
+                    &envelope.raw_transport_event,
+                )
+                .await;
             }
         }
     }
@@ -3456,6 +3490,24 @@ mod tests {
         assert!(names.contains(&"ping"));
         assert!(names.contains(&"new"));
         assert!(names.contains(&"status"));
+    }
+
+    #[test]
+    fn approval_callback_predicate_matches_buttons_only() {
+        for data in [
+            "approve",
+            "approve:turn-1",
+            "deny",
+            "deny:turn-1",
+            "trust",
+            "trust:turn-1",
+        ] {
+            assert!(super::is_approval_callback(data), "{data} should ack");
+        }
+        // Slash callbacks are acked by the promotion path; others not at all.
+        assert!(!super::is_approval_callback("/role architect"));
+        assert!(!super::is_approval_callback("something-else"));
+        assert!(!super::is_approval_callback("approved"));
     }
 
     #[test]
