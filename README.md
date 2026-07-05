@@ -18,7 +18,7 @@ brew install philotic-web    # installs the operator CLI + all core binaries
 brew install muninn          # installs the cognitive memory store
 ```
 
-This installs the `phil` CLI (symlinked from `philotic-web`), the `aiua` hotel daemon, and all guest binaries (philote, membrane, model-router, tool-runner, graph-datasource).
+This installs the `phil` CLI (symlinked from `philotic-web`), the `aiua` hotel daemon, and all guest binaries (philote, membrane-telegram, membrane-discord, membrane-mcp, model-router, the model-controller-* family, tool-runner, graph-datasource, and the rest of the release set below).
 
 ### From Source
 
@@ -28,16 +28,24 @@ cd philotic-stack
 cargo build --release
 ```
 
-Binaries are built to `target/release/`. The primary ones:
+Binaries are built to `target/release/`. A full release build emits ~24 binaries (the deployed set is pinned in `AIUA_BINS` in the [justfile](justfile) and mirrored by [.github/workflows/build-linux.yml](.github/workflows/build-linux.yml)). The primary ones:
 
 | Binary | Purpose |
 |---|---|
 | `aiua` | Hotel daemon — materializes and supervises all guests |
-| `philotic-web` | Operator CLI (`phil init`, `phil start`, `phil status`) |
-| `philote` | Agent core — cognitive loop, sessions, roles |
-| `membrane` | Telegram gateway |
+| `philotic-web` | Operator CLI (`phil init`, `phil start`, `phil status`) + desktop membrane |
+| `philote` / `philote-worker` | Agent core — cognitive loop, sessions, roles (+ delegated worker) |
+| `membrane-telegram` | Telegram gateway (runs on the MembraneRuntime SDK) |
+| `membrane-discord` | Discord gateway |
+| `membrane-mcp` | MCP gateway |
+| `membrane` | Transitional compatibility binary over the membrane runtime |
 | `model-router` | LLM inference routing |
+| `model-controller-*` | Per-provider model controllers (gemini, elevenlabs, openai, openrouter, mlx, ollama, onnx, parakeet, vision) |
 | `tool-runner` | Sandboxed tool execution |
+| `graph-datasource` / `table-datasource` / `agent-datasource` | Graph and table datasource guests |
+| `life-graph-runner` | LifeGraph / MemGraphRAG runner (from `data-memorygraphrag`) |
+| `router-listener` | Router training tap |
+| `heal-dispatcher` | FunctionGemma self-healing dispatcher |
 
 ## Quick Start
 
@@ -74,7 +82,7 @@ aiua --load-config mesh-config.json
 
 ## Crates
 
-29 crates.
+36 crates live under [`crates/`](crates/): 29 workspace members, 6 `philotic-primitives-*` extraction crates (only `philotic-primitives-mesh` is currently consumed, by `ansible-mesh-core`; the other five have no reverse dependencies yet — disposition tracked as a Phase 3 consolidation slice), and `agent-graph-runner` (superseded by `agent-datasource`, directory deletion pending).
 
 ### Binaries
 
@@ -82,8 +90,8 @@ aiua --load-config mesh-config.json
 |---|---|
 | [`aiua`](crates/aiua/) | Hotel daemon — guest materialization, IPC server, mesh routing, perimeter security |
 | [`philote`](crates/philote/) | Agent core — cognitive loop, session management, role incarnation |
-| [`membrane`](crates/membrane/) | Transitional wrapper over membrane runtime |
-| [`membrane-telegram`](crates/membrane-telegram/) | Telegram / external protocol gateway |
+| [`membrane`](crates/membrane/) | MembraneRuntime SDK library + transitional compatibility binary |
+| [`membrane-telegram`](crates/membrane-telegram/) | Telegram / external protocol gateway (MembraneRuntime SDK + LeaseDriver) |
 | [`membrane-discord`](crates/membrane-discord/) | Discord gateway |
 | [`membrane-mcp`](crates/membrane-mcp/) | MCP gateway |
 | [`philotic-web`](crates/philotic-web/) | Operator CLI + desktop membrane (REST API, WebSocket, operator chat) |
@@ -100,7 +108,7 @@ aiua --load-config mesh-config.json
 
 | Crate | Role |
 |---|---|
-| [`ansible-mesh-core`](crates/ansible-mesh-core/) | Legacy monolith (in process of being extracted into primitives) |
+| [`ansible-mesh-core`](crates/ansible-mesh-core/) | Shared core library — storage traits, `GraphDomain`, mesh types (primitives extraction planned; only mesh primitives extracted so far) |
 | [`philotic-primitives-mesh`](crates/philotic-primitives-mesh/) | Mesh primitives (EventEnvelope, BeaconMessage, etc.) |
 | [`philotic-primitives-hotel`](crates/philotic-primitives-hotel/) | Hotel orchestration primitives |
 | [`philotic-primitives-agent`](crates/philotic-primitives-agent/) | Agent and persona primitives |

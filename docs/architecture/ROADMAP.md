@@ -3,7 +3,7 @@ title: Seam Roadmap
 doc_type: reference
 domain: governance
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-07-05
 tags:
 - roadmap
 - seams
@@ -31,9 +31,7 @@ See [ARCH_RULES_AND_ROADMAP_PROPOSAL.md](ARCH_RULES_AND_ROADMAP_PROPOSAL.md) for
 
 | seam_id | source_proposal | depends_on | status | summary |
 |---|---|---|---|---|
-| `graph-domain-layer` | `GRAPH_LAYER_UNIFICATION_PROPOSAL` | — | not-started | Introduce `GraphDomain` as the required call surface for all domain graph operations; no direct `GraphStorage` backend calls from domain code |
-| `graph-adapter-migration` | `GRAPH_LAYER_UNIFICATION_PROPOSAL` | `graph-domain-layer` | not-started | Migrate existing `GraphStorage` callers in `aiua`, `philote`, and `ansible-mesh-core` to call through `GraphDomain` |
-| `graph-store-instances` | `GRAPH_LAYER_UNIFICATION_PROPOSAL` | `graph-adapter-migration` | not-started | Make storage backend a deployment-time config choice; prove backend swap compiles and passes tests without caller changes |
+| `graph-store-instances` | `GRAPH_LAYER_UNIFICATION_PROPOSAL` | `graph-adapter-migration` | not-started | Make storage backend a deployment-time config choice; prove backend swap compiles and passes tests without caller changes. `SqliteGraphStorage` is still constructed directly at `aiua` bootstrap/CLI wiring points (`main.rs`, `auth.rs`) before being wrapped in `GraphDomain` — backend choice is not yet configuration |
 
 ---
 
@@ -53,11 +51,11 @@ See [ARCH_RULES_AND_ROADMAP_PROPOSAL.md](ARCH_RULES_AND_ROADMAP_PROPOSAL.md) for
 ## Cross-Proposal Dependencies (Summary)
 
 ```
-graph-domain-layer
-  └─ graph-adapter-migration
+graph-domain-layer ✅
+  └─ graph-adapter-migration ✅
        └─ graph-store-instances
 
-graph-domain-layer ──────────────┐
+graph-domain-layer ✅ ────────────┐
                                  ▼
 agent-resource-broker ──────► agent-graph-toolrunner
   │                                └─ agent-graph-mesh-sync
@@ -66,7 +64,7 @@ agent-resource-broker ──────► agent-graph-toolrunner
            └─ functions-gemma-onnx
 ```
 
-The graph layer must land before the agent resource model — `agent-graph-toolrunner` builds on `GraphDomain` as its storage abstraction, and the migration seam proves the abstraction holds across callers before the agent graph extends it.
+The graph layer foundation (`graph-domain-layer`, `graph-adapter-migration`) has landed — `GraphDomain` is the storage abstraction across production callers — so the agent resource model is unblocked on that dependency. `graph-store-instances` (backend as config choice) remains open but does not gate the agent resource seams.
 
 ---
 
@@ -78,6 +76,8 @@ _Seams are moved here when their status becomes `complete`._
 |---|---|---|---|
 | `telegram-poll-lease` | `TELEGRAM_POLL_LEASE_PROPOSAL` | 2026-03 | Poll lease acquire, renew, expiry, home-hotel checks, graceful release, delegated remote polling |
 | `runtime-authority-leases` | `RUNTIME_AUTHORITY_LEASES_PROPOSAL` | 2026-03 | Shared `LeaseEnvelope` and central runtime lease registry; Telegram lease migrated onto abstraction |
+| `graph-domain-layer` | `GRAPH_LAYER_UNIFICATION_PROPOSAL` | 2026-07 (true-up) | `GraphDomain` exists in `crates/ansible-mesh-core/src/domain/` and is load-bearing: every production domain graph operation in `aiua`, `graph-intelligence`, `model-router`, and `philotic-web` goes through it. Marked complete retroactively — the seam shipped incrementally without a status update |
+| `graph-adapter-migration` | `GRAPH_LAYER_UNIFICATION_PROPOSAL` | 2026-07 (true-up) | Verified by grep: no production caller uses `GraphAdapter` directly — remaining direct references are the trait definition/`SqliteGraphStorage` impl in `ansible-mesh-core` and in-crate test mocks (`TestGraphAdapter` in `aiua` guest_manager/ipc tests). `philote` never touches graph storage directly (IPC only). Bootstrap wiring that constructs the backend before wrapping it in `GraphDomain` is the remit of `graph-store-instances`, which stays open |
 
 ---
 
