@@ -488,10 +488,37 @@ impl AnsibleCutoverFlags {
     }
 }
 
+/// Guest supervision (the 5s reconcile/respawn loop) is ON by default.
+/// Opt out with PHILOTIC_DISABLE_GUEST_SUPERVISOR=1. The legacy opt-in var
+/// PHILOTIC_ENABLE_GUEST_SUPERVISOR is still recognized (deprecated): a truthy
+/// value is now a no-op; an explicit falsy value keeps the old disabled behavior.
 fn guest_supervision_enabled() -> bool {
-    std::env::var("PHILOTIC_ENABLE_GUEST_SUPERVISOR")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
+    let disable = std::env::var("PHILOTIC_DISABLE_GUEST_SUPERVISOR").ok();
+    let legacy_enable = std::env::var("PHILOTIC_ENABLE_GUEST_SUPERVISOR").ok();
+    if legacy_enable.is_some() {
+        warn!(
+            "PHILOTIC_ENABLE_GUEST_SUPERVISOR is deprecated: the guest supervisor is now \
+             enabled by default. Use PHILOTIC_DISABLE_GUEST_SUPERVISOR=1 to opt out."
+        );
+    }
+    guest_supervision_enabled_from(disable.as_deref(), legacy_enable.as_deref())
+}
+
+/// Pure decision logic for the supervision gate (unit-testable without env races).
+fn guest_supervision_enabled_from(disable: Option<&str>, legacy_enable: Option<&str>) -> bool {
+    fn truthy(v: &str) -> bool {
+        v == "true" || v == "1"
+    }
+    if let Some(v) = disable {
+        if truthy(v) {
+            return false;
+        }
+    }
+    if let Some(v) = legacy_enable {
+        // Deprecated compat: honor an explicit falsy legacy value as opt-out.
+        return truthy(v);
+    }
+    true
 }
 
 fn smoke_mode_enabled() -> bool {
@@ -8028,11 +8055,16 @@ async fn main() -> Result<()> {
             .with_hotel_socket(&hotel.ipc_socket_path)
             .with_stderr_sink(stderr_tx),
     );
-    let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(
+    let mut guest_manager_inner = crate::service::guest_manager::GuestManager::new(
         hotel_name.clone(),
         graph_domain_arc.clone(),
         materializer,
-    ));
+    );
+    if let Some(hq) = heal_queue_arc.clone() {
+        // Supervisor respawn-budget breaches surface through the heal queue.
+        guest_manager_inner = guest_manager_inner.with_heal_queue(hq);
+    }
+    let guest_manager = Arc::new(guest_manager_inner);
 
     let registry = Arc::new(RwLock::new(NodeRegistry::new()));
 
@@ -8368,7 +8400,7 @@ async fn main() -> Result<()> {
         });
     } else {
         warn!(
-            "Guest supervisor loop is disabled by default until guest heartbeats are implemented."
+            "Guest supervisor loop is disabled via PHILOTIC_DISABLE_GUEST_SUPERVISOR (or a legacy falsy PHILOTIC_ENABLE_GUEST_SUPERVISOR). Dead guests will NOT be auto-respawned."
         );
     }
 
@@ -8478,7 +8510,8 @@ mod tests {
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, enforce_graph_datasource_home,
         execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
-        guest_supervision_enabled, hotel_base_port, hotel_ipc_socket_path,
+        guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
+        hotel_ipc_socket_path,
         local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, nearest_available_base_port, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
@@ -8492,11 +8525,32 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn guest_supervision_defaults_disabled() {
+    fn guest_supervision_defaults_enabled() {
         unsafe {
             std::env::remove_var("PHILOTIC_ENABLE_GUEST_SUPERVISOR");
+            std::env::remove_var("PHILOTIC_DISABLE_GUEST_SUPERVISOR");
         }
-        assert!(!guest_supervision_enabled());
+        assert!(guest_supervision_enabled());
+    }
+
+    #[test]
+    fn guest_supervision_gate_semantics() {
+        // Default: ON with no env vars.
+        assert!(guest_supervision_enabled_from(None, None));
+        // Opt-out via new var.
+        assert!(!guest_supervision_enabled_from(Some("1"), None));
+        assert!(!guest_supervision_enabled_from(Some("true"), None));
+        // A falsy disable value does not opt out.
+        assert!(guest_supervision_enabled_from(Some("0"), None));
+        assert!(guest_supervision_enabled_from(Some("false"), None));
+        // Legacy opt-in var: truthy is a no-op (still on).
+        assert!(guest_supervision_enabled_from(None, Some("1")));
+        assert!(guest_supervision_enabled_from(None, Some("true")));
+        // Legacy compat: explicit falsy legacy value keeps old disabled behavior.
+        assert!(!guest_supervision_enabled_from(None, Some("0")));
+        assert!(!guest_supervision_enabled_from(None, Some("false")));
+        // New disable var wins over legacy truthy.
+        assert!(!guest_supervision_enabled_from(Some("1"), Some("1")));
     }
 
     #[test]

@@ -254,11 +254,88 @@ impl Materializer for LocalProcessMaterializer {
     }
 }
 
+/// Maximum supervisor respawns per guest within [`RESPAWN_BUDGET_WINDOW_SECS`].
+pub(crate) const RESPAWN_BUDGET_MAX: usize = 5;
+/// Sliding flap-protection window (seconds). Also the cool-down after a breach:
+/// the budget resets only after a clean window with no respawn attempts.
+pub(crate) const RESPAWN_BUDGET_WINDOW_SECS: u64 = 600;
+
+/// Outcome of asking the respawn budget whether a guest may be respawned now.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RespawnDecision {
+    /// Respawn permitted; the attempt has been recorded against the budget.
+    /// `resumed` is true when this is the first attempt after a breach cooled down.
+    Allowed { resumed: bool },
+    /// This call breached the budget — caller should mark the guest and alert once.
+    JustExhausted,
+    /// Budget already breached and the clean-window cool-down has not elapsed.
+    StillExhausted,
+}
+
+#[derive(Default)]
+struct GuestRespawnLedger {
+    /// Unix-epoch seconds of respawn attempts inside the sliding window.
+    attempts: Vec<u64>,
+    /// Set when the budget was breached; cleared after a clean window elapses.
+    exhausted_at: Option<u64>,
+}
+
+/// Per-guest flap protection: at most [`RESPAWN_BUDGET_MAX`] respawns per
+/// [`RESPAWN_BUDGET_WINDOW_SECS`] sliding window. On breach the guest is not
+/// respawned again until a full clean window has elapsed since the breach.
+/// Timestamps are injected so tests can drive a fake clock.
+pub(crate) struct RespawnBudget {
+    ledgers: std::sync::Mutex<HashMap<String, GuestRespawnLedger>>,
+}
+
+impl RespawnBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            ledgers: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn check(&self, guest_id: &str, now: u64) -> RespawnDecision {
+        let mut ledgers = self.ledgers.lock().unwrap();
+        let ledger = ledgers.entry(guest_id.to_string()).or_default();
+
+        let mut resumed = false;
+        if let Some(exhausted_at) = ledger.exhausted_at {
+            if now.saturating_sub(exhausted_at) < RESPAWN_BUDGET_WINDOW_SECS {
+                return RespawnDecision::StillExhausted;
+            }
+            // A clean window has elapsed since the breach — reset the budget.
+            ledger.attempts.clear();
+            ledger.exhausted_at = None;
+            resumed = true;
+        }
+
+        ledger
+            .attempts
+            .retain(|t| now.saturating_sub(*t) < RESPAWN_BUDGET_WINDOW_SECS);
+        if ledger.attempts.len() >= RESPAWN_BUDGET_MAX {
+            ledger.exhausted_at = Some(now);
+            return RespawnDecision::JustExhausted;
+        }
+        ledger.attempts.push(now);
+        RespawnDecision::Allowed { resumed }
+    }
+}
+
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// A centralized orchestrator for materializing and dematerializing Guests via a plugin Materializer interface.
 pub struct GuestManager {
     hotel_name: String,
     graph: Arc<GraphDomain>,
     materializer: Arc<Mutex<Box<dyn Materializer>>>,
+    respawn_budget: RespawnBudget,
+    heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
 }
 
 #[async_trait]
@@ -276,11 +353,70 @@ impl GuestManager {
             hotel_name: hotel_name.into(),
             graph,
             materializer: Arc::new(Mutex::new(materializer)),
+            respawn_budget: RespawnBudget::new(),
+            heal_queue: None,
         }
+    }
+
+    /// Attach a heal-queue sink so respawn-budget breaches surface to
+    /// heal-dispatcher / operators.
+    pub fn with_heal_queue(
+        mut self,
+        hq: Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+    ) -> Self {
+        self.heal_queue = Some(hq);
+        self
     }
 
     fn clear_guest_pid(graph: &GraphDomain, hotel_name: &str, guest_id: &str) {
         let _ = graph.set_guest_pid(hotel_name, guest_id, None);
+    }
+
+    fn supervision_state_key(hotel_name: &str, guest_id: &str) -> String {
+        format!("supervision_state:{hotel_name}:{guest_id}")
+    }
+
+    /// Mark the guest in the graph as having exhausted its respawn budget and
+    /// push a heal-queue entry so heal-dispatcher / operators see the breach.
+    fn mark_respawn_budget_exhausted(&self, guest_id: &str, now: u64) {
+        let key = Self::supervision_state_key(&self.hotel_name, guest_id);
+        let value = serde_json::json!({
+            "state": "respawn_budget_exhausted",
+            "since_epoch": now,
+            "max_respawns": RESPAWN_BUDGET_MAX,
+            "window_secs": RESPAWN_BUDGET_WINDOW_SECS,
+        })
+        .to_string();
+        if let Err(e) = self.graph.set_config_value(&key, &value) {
+            warn!(
+                "Supervisor: failed to record supervision_state for [{}]: {}",
+                guest_id, e
+            );
+        }
+        if let Some(hq) = &self.heal_queue {
+            let msg = format!(
+                "supervisor: guest [{guest_id}] exhausted its respawn budget \
+                 ({RESPAWN_BUDGET_MAX} respawns in {RESPAWN_BUDGET_WINDOW_SECS}s); \
+                 respawns paused until a clean {RESPAWN_BUDGET_WINDOW_SECS}s window elapses"
+            );
+            if let Err(e) = hq.push_error(guest_id, &msg) {
+                warn!(
+                    "Supervisor: failed to push respawn-budget heal_queue entry for [{}]: {}",
+                    guest_id, e
+                );
+            }
+        }
+    }
+
+    /// Remove the exhausted mark once the budget cools down and respawns resume.
+    fn clear_respawn_budget_mark(&self, guest_id: &str) {
+        let key = Self::supervision_state_key(&self.hotel_name, guest_id);
+        if let Err(e) = self.graph.remove_config_value(&key) {
+            warn!(
+                "Supervisor: failed to clear supervision_state for [{}]: {}",
+                guest_id, e
+            );
+        }
     }
 
     fn refresh_guest_record(
@@ -604,6 +740,36 @@ impl GuestManager {
                         );
                         continue;
                     }
+                    // Flap protection: a crash-looping guest gets at most
+                    // RESPAWN_BUDGET_MAX respawns per RESPAWN_BUDGET_WINDOW_SECS
+                    // sliding window; on breach, respawns pause until a clean
+                    // window elapses since the breach.
+                    let now = epoch_now();
+                    match self.respawn_budget.check(&current_rec.guest_id, now) {
+                        RespawnDecision::Allowed { resumed } => {
+                            if resumed {
+                                info!(
+                                    "Supervisor: Guest [{}] respawn budget cooled down after a clean window. Resuming respawns.",
+                                    current_rec.guest_id
+                                );
+                                self.clear_respawn_budget_mark(&current_rec.guest_id);
+                            }
+                        }
+                        RespawnDecision::JustExhausted => {
+                            error!(
+                                "Supervisor: Guest [{}] exhausted its respawn budget ({} respawns in {}s). Pausing respawns until a clean {}s window elapses.",
+                                current_rec.guest_id,
+                                RESPAWN_BUDGET_MAX,
+                                RESPAWN_BUDGET_WINDOW_SECS,
+                                RESPAWN_BUDGET_WINDOW_SECS
+                            );
+                            self.mark_respawn_budget_exhausted(&current_rec.guest_id, now);
+                            continue;
+                        }
+                        RespawnDecision::StillExhausted => {
+                            continue;
+                        }
+                    }
                     let config: serde_json::Value =
                         serde_json::from_str(&current_rec.config_json).unwrap_or_default();
                     info!(
@@ -918,6 +1084,200 @@ mod tests {
         assert_eq!(reclaim_count.load(Ordering::SeqCst), 1);
         let guests = graph.list_guests("test-hotel", false).expect("list guests");
         assert_eq!(guests[0].active_pid.as_deref(), Some("spawned-1"));
+    }
+
+    // ── Respawn budget (flap protection) ──────────────────────────────────
+
+    #[test]
+    fn respawn_budget_allows_up_to_max_within_window() {
+        let budget = RespawnBudget::new();
+        for i in 0..RESPAWN_BUDGET_MAX {
+            assert_eq!(
+                budget.check("guest-a", 1_000 + i as u64),
+                RespawnDecision::Allowed { resumed: false },
+                "attempt {i} should be allowed"
+            );
+        }
+        assert_eq!(
+            budget.check("guest-a", 1_000 + RESPAWN_BUDGET_MAX as u64),
+            RespawnDecision::JustExhausted
+        );
+    }
+
+    #[test]
+    fn respawn_budget_stays_exhausted_until_clean_window() {
+        let budget = RespawnBudget::new();
+        for i in 0..RESPAWN_BUDGET_MAX {
+            let _ = budget.check("guest-a", 1_000 + i as u64);
+        }
+        let breach_at = 1_100;
+        assert_eq!(
+            budget.check("guest-a", breach_at),
+            RespawnDecision::JustExhausted
+        );
+        // Any attempt inside the clean-window cool-down stays exhausted.
+        assert_eq!(
+            budget.check("guest-a", breach_at + 1),
+            RespawnDecision::StillExhausted
+        );
+        assert_eq!(
+            budget.check("guest-a", breach_at + RESPAWN_BUDGET_WINDOW_SECS - 1),
+            RespawnDecision::StillExhausted
+        );
+    }
+
+    #[test]
+    fn respawn_budget_resets_after_clean_window() {
+        let budget = RespawnBudget::new();
+        for i in 0..RESPAWN_BUDGET_MAX {
+            let _ = budget.check("guest-a", 1_000 + i as u64);
+        }
+        let breach_at = 1_100;
+        assert_eq!(
+            budget.check("guest-a", breach_at),
+            RespawnDecision::JustExhausted
+        );
+        // A full clean window after the breach resets the budget.
+        let resume_at = breach_at + RESPAWN_BUDGET_WINDOW_SECS;
+        assert_eq!(
+            budget.check("guest-a", resume_at),
+            RespawnDecision::Allowed { resumed: true }
+        );
+        // And the fresh budget allows the remaining attempts again.
+        for i in 1..RESPAWN_BUDGET_MAX {
+            assert_eq!(
+                budget.check("guest-a", resume_at + i as u64),
+                RespawnDecision::Allowed { resumed: false }
+            );
+        }
+        assert_eq!(
+            budget.check("guest-a", resume_at + RESPAWN_BUDGET_MAX as u64),
+            RespawnDecision::JustExhausted
+        );
+    }
+
+    #[test]
+    fn respawn_budget_old_attempts_age_out() {
+        let budget = RespawnBudget::new();
+        // Attempts spaced wider than the window never accumulate to a breach.
+        let mut t = 1_000;
+        for _ in 0..(RESPAWN_BUDGET_MAX * 3) {
+            assert_eq!(
+                budget.check("guest-a", t),
+                RespawnDecision::Allowed { resumed: false }
+            );
+            t += RESPAWN_BUDGET_WINDOW_SECS;
+        }
+    }
+
+    #[test]
+    fn respawn_budget_tracks_guests_independently() {
+        let budget = RespawnBudget::new();
+        for i in 0..RESPAWN_BUDGET_MAX {
+            let _ = budget.check("guest-a", 1_000 + i as u64);
+        }
+        assert_eq!(budget.check("guest-a", 1_100), RespawnDecision::JustExhausted);
+        // guest-b is unaffected by guest-a's breach.
+        assert_eq!(
+            budget.check("guest-b", 1_100),
+            RespawnDecision::Allowed { resumed: false }
+        );
+    }
+
+    /// Heal-queue mock capturing push_error calls.
+    struct MockHealQueue {
+        pushes: StdMutex<Vec<(String, String)>>,
+    }
+
+    impl MockHealQueue {
+        fn new() -> Self {
+            Self {
+                pushes: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ansible_mesh_core::heal_queue::HealQueueStorage for MockHealQueue {
+        fn push_error(&self, guest_id: &str, raw_text: &str) -> Result<String> {
+            self.pushes
+                .lock()
+                .unwrap()
+                .push((guest_id.to_string(), raw_text.to_string()));
+            Ok("mock-id".to_string())
+        }
+        fn pending_errors(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<ansible_mesh_core::heal_queue::HealQueueRow>> {
+            Ok(vec![])
+        }
+        fn update_triage(
+            &self,
+            _id: &str,
+            _severity: &str,
+            _pattern_tag: &str,
+            _heal_action: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn resolve(&self, _id: &str, _outcome: &str) -> Result<()> {
+            Ok(())
+        }
+        fn vacuum_old(&self, _older_than_secs: u64) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_stops_respawning_after_budget_exhausted() {
+        // A guest whose every spawned PID immediately reads as dead simulates a
+        // crash loop: each reconcile pass reclaims and respawns until the
+        // budget breaches, after which respawns stop, the graph is marked, and
+        // exactly one heal-queue entry is pushed.
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: "flappy".into(),
+            role: "membrane".into(),
+            config_json: json!({ "command": "target/debug/membrane" }).to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        }]));
+
+        // MockMaterializer::check_status defaults to false for unknown PIDs,
+        // so every spawned PID is immediately considered dead.
+        let mock = MockMaterializer::new(HashMap::new());
+        let spawn_count = mock.spawn_count.clone();
+        let heal = Arc::new(MockHealQueue::new());
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock))
+            .with_heal_queue(heal.clone());
+
+        // Drive well past the budget within a single real-time window.
+        for _ in 0..(RESPAWN_BUDGET_MAX + 3) {
+            manager
+                .reconcile_all()
+                .await
+                .expect("reconcile should succeed");
+        }
+
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            RESPAWN_BUDGET_MAX,
+            "respawns must stop at the budget"
+        );
+
+        // Breach is marked in the graph...
+        let state = graph
+            .get_config_value("supervision_state:test-hotel:flappy")
+            .expect("config read")
+            .expect("supervision_state should be set");
+        assert!(state.contains("respawn_budget_exhausted"));
+
+        // ...and surfaced to the heal queue exactly once.
+        let pushes = heal.pushes.lock().unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].0, "flappy");
+        assert!(pushes[0].1.contains("respawn budget"));
     }
 
     #[tokio::test]
