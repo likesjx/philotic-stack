@@ -46,7 +46,7 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 | DEF-029 | Approval inline buttons never resolved parked turns (300s timeout, 7 occurrences) | high | fixed | 1 | 2026-07-02 | PR #99 (1b86a45) |
 | DEF-030 | `/role` to current role triggered infinite self-handoff loop | high | fixed | 2 | 2026-07-02 | PR #101 + #102 |
 | DEF-031 | TTS replies delivered as music cards instead of Telegram voice notes | low | fixed | 1 | 2026-07-02 | PR #102 (36e73c2) |
-| DEF-032 | `HotelStateSync` UDP broadcast exceeds 65507 bytes — EMSGSIZE every 30s | medium | open | 1 | 2026-07-03 | fix committed (a5b6f55, `codex/model-catalog-sync`) — unmerged |
+| DEF-032 | `HotelStateSync` UDP broadcast EMSGSIZE every 30s (real ceiling: macOS maxdgram 9216 + 4x int-array wire inflation) | medium | fixed | 3 | 2026-07-03 | PRs #104/#107/#109 + fleet flip `PHILOTIC_BEACON_PAYLOAD_B64=1` (2026-07-04, watched-live-green: 0 EMSGSIZE post-flip; vps receives mac roster) |
 | DEF-033 | `FailTask` never updates persisted `session_turn` status (record-keeping gap) | low | open | 1 | 2026-06-22 | — |
 | DEF-034 | router-listener crashes on startup — missing `router_listener.config` DB key | medium | open | 1 | 2026-06-04 | — |
 
@@ -88,7 +88,9 @@ After the mesh-auth-key mismatch between mbp-jane and mac-jane was fixed, `agent
 
 ### DEF-032: `HotelStateSync` broadcast exceeds UDP datagram ceiling (EMSGSIZE)
 
-**Found**: 2026-07-03 · **Seam**: mesh-transport
+**Found**: 2026-07-03 · **Fixed**: 2026-07-04 · **Seam**: mesh-transport
+
+**Resolution**: three layers — chunk `model_profiles` across datagrams (PR #104, a5b6f55), measure the FULL signed wire size against macOS's real `net.inet.udp.maxdgram` = 9216 ceiling instead of inner-byte proxies (PRs #107/#109), and a dual-read `BeaconPayload` (legacy int-array OR base64) with the sender flipped to base64 fleet-wide via `PHILOTIC_BEACON_PAYLOAD_B64=1` (~1.33x wire inflation vs ~4x — a realistic 20-guest roster could never fit under 9216 in the legacy encoding). Watched-live-green 2026-07-04: 0 EMSGSIZE on mac-jane post-flip; vps-jane journal shows `Hotel state sync from mac-jane: 30 guests, 3 agents` — the first Mac roster ever to cross the mesh.
 
 Adding the `model_profiles` catalog to the `HotelStateSync` payload (on `codex/model-catalog-sync`) pushed the UDP broadcast over the 65507-byte ceiling — `Message too long (os error 40)` every 30s, dropping guests/agents routing state propagation to peers. Benign for local serving, degrades cross-hotel state sync. Fix `a5b6f55` (chunk oversized broadcasts under the ceiling) is committed on `codex/model-catalog-sync` but not yet PR'd/merged — was queued behind a WAN outage on the dev machine.
 
