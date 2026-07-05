@@ -156,6 +156,9 @@ struct MeshRuntimeContext {
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
     ipc_inboxes: crate::service::ipc::InboxRegistry,
     ipc_parked_inbound: crate::service::ipc::ParkedInboundRegistry,
+    /// Hotel-wide single-delivery claim set shared between `CronTicker::fire` and the
+    /// mesh inbound consumer — gives every `TaskInvoke` exactly one delivery owner.
+    ipc_delivery_claims: crate::service::ipc::DeliveryClaimRegistry,
     ipc_materialization_requester:
         Option<std::sync::Arc<dyn crate::service::guest_manager::GuestMaterializationRequester>>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -1689,6 +1692,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
         let inbound_graph = ctx.graph_domain.clone();
         let inbound_inboxes = ctx.ipc_inboxes.clone();
         let inbound_parked = ctx.ipc_parked_inbound.clone();
+        let inbound_delivery_claims = ctx.ipc_delivery_claims.clone();
         let inbound_mat_req = ctx.ipc_materialization_requester.clone();
         let inbound_local_node_id = ctx.caps.node_id.clone();
         let webrtc_signal_tx_inbound = ctx.webrtc_signal_tx.clone();
@@ -1735,6 +1739,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                         &inbound_local_node_id,
                                         &inbound_parked,
                                         inbound_mat_req.as_deref(),
+                                        &inbound_delivery_claims,
                                     )
                                     .await;
                                     // Cron control-plane broadcasts.
@@ -8128,6 +8133,9 @@ async fn main() -> Result<()> {
     let ipc_inboxes = ipc_server.inboxes();
     let ipc_parked_inbound = ipc_server.parked_inbound();
     let ipc_materialization_requester = ipc_server.materialization_requester_arc();
+    // One claim set per hotel process: CronTicker::fire and the mesh inbound
+    // consumer both consult it so a fired TaskInvoke has exactly one delivery owner.
+    let ipc_delivery_claims = crate::service::ipc::new_delivery_claim_registry();
     let network_broadcast_tx = ipc_server.network_broadcast_tx();
     let perimeter_broadcast_tx = network_broadcast_tx.clone();
 
@@ -8184,6 +8192,7 @@ async fn main() -> Result<()> {
             cron_offset_ms,
             ipc_parked_inbound.clone(),
             ipc_materialization_requester.clone(),
+            ipc_delivery_claims.clone(),
         );
         tokio::spawn(async move {
             cron_ticker.run().await;
@@ -8221,6 +8230,7 @@ async fn main() -> Result<()> {
         dispatcher_tx: dispatcher_tx.clone(),
         ipc_inboxes: ipc_inboxes.clone(),
         ipc_parked_inbound: ipc_parked_inbound.clone(),
+        ipc_delivery_claims: ipc_delivery_claims.clone(),
         ipc_materialization_requester: ipc_materialization_requester.clone(),
         shutdown_tx: shutdown_tx.clone(),
         inbox_tx: inbox_tx.clone(),

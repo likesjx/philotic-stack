@@ -23,10 +23,17 @@
 //! The `payload` field supports `{timestamp}`, `{iso_timestamp}`, `{job_id}`,
 //! `{node_id}`, and `{target_role}` placeholders, replaced at fire time via
 //! [`ansible_mesh_core::cron::interpolate_payload`].
+//!
+//! ## Delivery ownership (single consumer)
+//! `fire()` is the *sole* delivery owner of a fired job's `TaskInvoke`: it claims
+//! the event id in the hotel-wide [`DeliveryClaimRegistry`] before appending to
+//! the ledger or delivering/parking. The mesh/ledger consumer
+//! (`IpcServer::deliver_event_envelope_or_park`) consults the same claim set, so
+//! a second observation of the same envelope can never double-deliver.
 
 use crate::LedgerCommand;
 use crate::service::guest_manager::GuestMaterializationRequester;
-use crate::service::ipc::{InboxRegistry, ParkedInboundRegistry};
+use crate::service::ipc::{DeliveryClaimRegistry, InboxRegistry, ParkedInboundRegistry};
 use ansible_mesh_core::cron::{
     CronInterpolationVars, CronJob, interpolate_payload, next_fire_after,
 };
@@ -50,9 +57,16 @@ pub struct CronTicker {
     offset_ms: u64,
     parked_inbound: ParkedInboundRegistry,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
+    /// Hotel-wide single-delivery claim set shared with the mesh/ledger consumer
+    /// (`deliver_event_envelope_or_park`). `fire()` claims each task's event_id
+    /// before the envelope becomes visible anywhere else, making this ticker the
+    /// sole delivery owner of its fires — any other consumer that later observes
+    /// the same envelope is a structural no-op.
+    delivery_claims: DeliveryClaimRegistry,
 }
 
 impl CronTicker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         graph: Arc<GraphDomain>,
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
@@ -61,6 +75,7 @@ impl CronTicker {
         offset_ms: u64,
         parked_inbound: ParkedInboundRegistry,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
+        delivery_claims: DeliveryClaimRegistry,
     ) -> Self {
         Self {
             graph,
@@ -70,6 +85,7 @@ impl CronTicker {
             offset_ms,
             parked_inbound,
             materialization_requester,
+            delivery_claims,
         }
     }
 
@@ -209,6 +225,20 @@ impl CronTicker {
 
         let task_id = Uuid::new_v4();
         let task_json = build_cron_task_json(job, fire_epoch, &self.local_node_id, payload_data);
+
+        // Single-delivery ownership: claim the event id BEFORE the envelope is
+        // visible to any other consumer. `fire()` is the sole delivery owner of
+        // this task; the mesh/ledger consumer (`deliver_event_envelope_or_park`)
+        // consults the same claim set and skips already-claimed event ids, so
+        // double delivery is structurally impossible even if this envelope loops
+        // back through a mesh batch or ledger replay (session-18 dual-consumer race).
+        if !crate::service::ipc::claim_delivery(&self.delivery_claims, task_id) {
+            warn!(
+                "CronTicker: event id {} for job {} already claimed; skipping duplicate delivery",
+                task_id, job.id
+            );
+            return;
+        }
 
         // Durably append TaskInvoke to the event ledger.
         let task_env = EventEnvelope {
@@ -721,6 +751,7 @@ mod tests {
             0,
             parked_inbound.clone(),
             Some(requester.clone() as Arc<dyn GuestMaterializationRequester>),
+            crate::service::ipc::new_delivery_claim_registry(),
         );
 
         ticker.fire(&job, 1_000).await;
@@ -751,6 +782,144 @@ mod tests {
         assert!(
             guest.is_active,
             "materialization must flip the dormant role guest active, not leave it dead"
+        );
+    }
+
+    /// Session-18 regression: a fired cron job's `TaskInvoke` was observable by TWO
+    /// independent consumers — `fire()`'s own delivery and the mesh/ledger consumer
+    /// (`deliver_event_envelope_or_park`) reacting to the same envelope — and which
+    /// one "won" varied per fire. This test simulates both consumers observing one
+    /// fire and asserts the task reaches the subscriber exactly once: `fire()` claims
+    /// the event id first, so the second consumer must be a structural no-op.
+    #[tokio::test]
+    async fn fired_cron_task_is_delivered_exactly_once_across_both_consumers() {
+        use ansible_mesh_core::NodeCapabilities;
+        use ansible_mesh_core::graph::{RoleReadinessState, TurnLoopConfig};
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+        use ansible_mesh_core::storage::HotelRecord;
+        use philotic_client::IpcResponse;
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/cron-single-consumer-test.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-test".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-test:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: true,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed role incarnation");
+
+        let mut job = test_job();
+        job.target_role = "role:agent-test:orchestrator".into();
+
+        // A LIVE subscriber for the role — the warm-guest path (watched-live-proven,
+        // must not regress): fire() delivers directly instead of parking.
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (subscriber_tx, mut subscriber_rx) =
+            tokio::sync::mpsc::unbounded_channel::<IpcResponse>();
+        let mut subscribed_roles = Vec::new();
+        crate::service::ipc::IpcServer::add_subscription(
+            &inboxes,
+            "role:agent-test:orchestrator",
+            Uuid::new_v4(),
+            "agent-test:orchestrator",
+            &[],
+            &subscriber_tx,
+            &mut subscribed_roles,
+        )
+        .await;
+
+        let (dispatcher_tx, mut dispatcher_rx) = crate::service::ipc::test_dispatcher_channel();
+        let parked_inbound: crate::service::ipc::ParkedInboundRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
+        // The single claim set BOTH consumers consult.
+        let delivery_claims = crate::service::ipc::new_delivery_claim_registry();
+
+        let ticker = CronTicker::new(
+            graph.clone(),
+            dispatcher_tx,
+            inboxes.clone(),
+            "local-aiua-01",
+            0,
+            parked_inbound.clone(),
+            None,
+            delivery_claims.clone(),
+        );
+
+        // Consumer 1: the cron fire itself.
+        ticker.fire(&job, 1_000).await;
+
+        // Capture the exact envelope fire() appended to the ledger.
+        let appended = tokio::time::timeout(Duration::from_secs(5), dispatcher_rx.recv())
+            .await
+            .expect("dispatcher channel should yield the appended command")
+            .expect("dispatcher channel should stay open");
+        let crate::LedgerCommand::AppendLocal(envelope) = appended else {
+            panic!("fire() should append the TaskInvoke via AppendLocal");
+        };
+        assert!(
+            matches!(envelope.kind, EventKind::TaskInvoke),
+            "first appended command must be the fired TaskInvoke"
+        );
+
+        // Consumer 2: the mesh/ledger consumer observes the SAME envelope (echoed
+        // batch / ledger replay). It must recognise the claim and deliver nothing.
+        let handled = crate::service::ipc::IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &envelope,
+            None,
+            &graph,
+            "local-aiua-01",
+            &parked_inbound,
+            None,
+            &delivery_claims,
+        )
+        .await;
+        assert!(
+            handled,
+            "second consumer should report the claimed event as handled"
+        );
+
+        let first = subscriber_rx.try_recv();
+        assert!(
+            matches!(first, Ok(IpcResponse::InboundTask { .. })),
+            "the fire must reach the live subscriber exactly once (got {first:?})"
+        );
+        assert!(
+            subscriber_rx.try_recv().is_err(),
+            "the second consumer must NOT deliver the same fire again"
+        );
+        assert!(
+            parked_inbound.lock().await.is_empty(),
+            "nothing may be parked when the subscriber is live and the event is claimed"
         );
     }
 }

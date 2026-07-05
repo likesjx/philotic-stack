@@ -1009,6 +1009,67 @@ pub(crate) struct ParkedInboundTask {
 
 pub(crate) type ParkedInboundRegistry = Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
+/// Bounded in-process set of event ids whose local delivery has already been
+/// claimed by exactly one consumer.
+///
+/// A fired cron job's `TaskInvoke` used to be observable by two independent
+/// delivery paths — `CronTicker::fire`'s own direct delivery/park and the
+/// mesh/ledger consumer (`deliver_event_envelope_or_park`) reacting to the same
+/// envelope — racing non-deterministically (session-18 finding: both "won" the
+/// same fire on an unchanged binary). The claim set gives every event a single
+/// delivery owner structurally: whichever consumer claims the `event_id` first
+/// delivers, every later observer of the same envelope (mesh echo, batch
+/// retransmit before ACK, ledger replay) is a no-op.
+///
+/// Claims are in-process only: they guard duplicate delivery *within* one hotel
+/// process, which is exactly the scope of the race. Cross-hotel duplicate fires
+/// for guaranteed jobs are handled separately by `last_fired_epoch`/`CronFired`.
+#[derive(Debug, Default)]
+pub(crate) struct DeliveryClaims {
+    claimed: std::collections::HashSet<Uuid>,
+    order: std::collections::VecDeque<Uuid>,
+}
+
+impl DeliveryClaims {
+    /// Upper bound on remembered claims; oldest are evicted first. Sized so a
+    /// claim comfortably outlives any realistic mesh retransmit window without
+    /// growing unboundedly over a hotel's uptime.
+    const MAX_CLAIMS: usize = 8192;
+
+    /// Claim delivery ownership of `event_id`. Returns `true` when the caller is
+    /// the first — and therefore only — delivery owner; `false` when another
+    /// consumer already owns it.
+    pub(crate) fn claim(&mut self, event_id: Uuid) -> bool {
+        if !self.claimed.insert(event_id) {
+            return false;
+        }
+        self.order.push_back(event_id);
+        while self.order.len() > Self::MAX_CLAIMS {
+            if let Some(evicted) = self.order.pop_front() {
+                self.claimed.remove(&evicted);
+            }
+        }
+        true
+    }
+}
+
+/// Shared handle to the hotel-wide delivery claim set. Uses a `std` mutex —
+/// the guard is never held across an `.await`.
+pub(crate) type DeliveryClaimRegistry = Arc<std::sync::Mutex<DeliveryClaims>>;
+
+pub(crate) fn new_delivery_claim_registry() -> DeliveryClaimRegistry {
+    Arc::new(std::sync::Mutex::new(DeliveryClaims::default()))
+}
+
+/// Claim delivery ownership of `event_id`. Returns `true` when the caller is
+/// the first — and therefore only — delivery owner.
+pub(crate) fn claim_delivery(claims: &DeliveryClaimRegistry, event_id: Uuid) -> bool {
+    match claims.lock() {
+        Ok(mut guard) => guard.claim(event_id),
+        Err(poisoned) => poisoned.into_inner().claim(event_id),
+    }
+}
+
 /// Which flavor of dormant target a parked task is waiting on.
 ///
 /// Forces the local-vs-cross-hotel materialization semantics to be an explicit
@@ -4699,7 +4760,7 @@ impl IpcServer {
         }
     }
 
-    async fn add_subscription(
+    pub(crate) async fn add_subscription(
         inboxes: &InboxRegistry,
         role: &str,
         conn_id: Uuid,
@@ -6880,6 +6941,7 @@ impl IpcServer {
         local_node_id: &str,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         mat_req: Option<&dyn GuestMaterializationRequester>,
+        delivery_claims: &DeliveryClaimRegistry,
     ) -> bool {
         // An event explicitly addressed to a different node arrived in this hotel's mesh
         // inbox (gossiped/relayed batch). It is not ours to deliver or park here — doing so
@@ -6898,6 +6960,19 @@ impl IpcServer {
                 Some(target_role),
                 EventPayload::Inline { data },
             ) => {
+                // Single-delivery ownership: if another consumer (e.g. CronTicker::fire's
+                // direct delivery, or an earlier arrival of this same envelope in a
+                // retransmitted mesh batch) already claimed this event, it is not ours
+                // to deliver or park — doing so raced non-deterministically against the
+                // cron fire path (session-18 double-consumer finding).
+                if !claim_delivery(delivery_claims, event.event_id) {
+                    info!(
+                        event_id = %event.event_id,
+                        target_role = target_role.as_str(),
+                        "Skipping event delivery: already claimed by another consumer."
+                    );
+                    return true;
+                }
                 if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
                     if let Some(tx) = operator_surface_tx {
                         let _ = tx.try_send(data.clone()).ok();
@@ -17821,6 +17896,7 @@ mod tests {
             "mbp-jane-aiua-01",
             &parked_inbound,
             Some(&mat_req),
+            &new_delivery_claim_registry(),
         )
         .await;
 
@@ -17836,6 +17912,82 @@ mod tests {
         assert!(
             parked_inbound.lock().await.is_empty(),
             "must not park a task that belongs to a different node"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_event_envelope_or_park_delivers_each_event_id_exactly_once() {
+        // Single-delivery ownership: the same envelope can be observed more than
+        // once by the mesh/ledger consumer (retransmitted batch before the ACK
+        // lands, relayed echo). Only the first observation may deliver; every
+        // later one must be a structural no-op via the shared claim set.
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+        let claims = new_delivery_claim_registry();
+
+        let (subscriber_tx, mut subscriber_rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let mut subscribed_roles = Vec::new();
+        IpcServer::add_subscription(
+            &inboxes,
+            "role:agent-test:orchestrator",
+            Uuid::new_v4(),
+            "agent-test:orchestrator",
+            &[],
+            &subscriber_tx,
+            &mut subscribed_roles,
+        )
+        .await;
+
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: "mbp-jane-aiua-01".into(),
+            target_node_id: Some("mbp-jane-aiua-01".into()),
+            source_agent_id: "cron-ticker".into(),
+            target_agent_id: Some("role:agent-test:orchestrator".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: "cron:job-1".into(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({ "cron_job_id": "job-1" }).to_string(),
+            },
+            trace: vec![],
+        };
+
+        for attempt in 0..2 {
+            let handled = IpcServer::deliver_event_envelope_or_park(
+                &inboxes,
+                &event,
+                None,
+                &graph,
+                "mbp-jane-aiua-01",
+                &parked_inbound,
+                Some(&mat_req),
+                &claims,
+            )
+            .await;
+            assert!(handled, "attempt {attempt} should report the event as handled");
+        }
+
+        assert!(
+            matches!(
+                subscriber_rx.try_recv(),
+                Ok(IpcResponse::InboundTask { .. })
+            ),
+            "first observation must deliver the task to the live subscriber"
+        );
+        assert!(
+            subscriber_rx.try_recv().is_err(),
+            "replayed envelope with the same event_id must not be delivered a second time"
+        );
+        assert!(
+            parked_inbound.lock().await.is_empty(),
+            "claimed replay must not park a duplicate copy"
         );
     }
 
