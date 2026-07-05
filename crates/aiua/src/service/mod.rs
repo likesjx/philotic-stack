@@ -2,6 +2,7 @@ pub mod blob;
 pub mod cron_ticker;
 pub mod egress;
 pub mod execution_transport;
+pub mod golgi;
 pub mod guest_manager;
 pub mod ipc;
 pub mod lease;
