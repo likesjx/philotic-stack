@@ -730,6 +730,10 @@ struct ActiveTurn {
     status_message_id: Option<i64>,
     /// Telegram thread the turn belongs to, if any.
     thread_id: Option<String>,
+    /// Accumulated text from `streaming_token` fragments (LLM SSE stream).
+    streaming_draft: String,
+    /// When we last sent an `editMessageText` for streaming (throttle guard).
+    streaming_last_edit: Option<tokio::time::Instant>,
 }
 
 impl ActiveTurn {
@@ -739,12 +743,26 @@ impl ActiveTurn {
             draft_message_id: None,
             status_message_id: None,
             thread_id,
+            streaming_draft: String::new(),
+            streaming_last_edit: None,
         }
     }
 
     fn cancel(self) {
         let _ = self.cancel_typing.send(());
     }
+}
+
+/// Minimum interval between streaming `editMessageText` draft edits, to stay
+/// well under Telegram's per-chat edit rate limit.
+const STREAMING_THROTTLE_MS: u64 = 1500;
+
+/// Throttle guard for streaming draft edits: an edit is due when none has
+/// happened yet or the last one is at least [`STREAMING_THROTTLE_MS`] old.
+fn streaming_edit_due(last_edit: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    last_edit
+        .map(|t| now.duration_since(t).as_millis() as u64 >= STREAMING_THROTTLE_MS)
+        .unwrap_or(true)
 }
 
 /// Start a `sendChatAction(typing)` heartbeat that refreshes every 4 seconds until cancelled.
@@ -2766,6 +2784,60 @@ impl TelegramSeatGuest {
                     }
                 }
             }
+        } else if action == "streaming_token" {
+            // LLM SSE token fragment — accumulate and periodically edit the
+            // in-progress Telegram message. Throttled to ≤1 edit/1500ms to
+            // stay well under Telegram's editMessageText rate limit.
+            //
+            // Note: philote currently aggregates model-router streaming_token
+            // deltas into cumulative partial_reply pushes, so this branch is
+            // the direct-emission path (defense in depth, ported from the
+            // gateway binary).
+            let token = task
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !chat_id.is_empty() && !token.is_empty() {
+                let now = tokio::time::Instant::now();
+                // Accumulate under the lock; snapshot only when an edit is due.
+                let due_snapshot = {
+                    let mut turns = self.active_turns.lock().unwrap();
+                    match turns.get_mut(&session_id) {
+                        Some(active) => {
+                            active.streaming_draft.push_str(&token);
+                            streaming_edit_due(active.streaming_last_edit, now).then(|| {
+                                (
+                                    active.streaming_draft.clone(),
+                                    active.thread_id.clone(),
+                                    active.draft_message_id,
+                                )
+                            })
+                        }
+                        // Token arrived after the turn completed — drop silently.
+                        None => None,
+                    }
+                };
+                if let Some((draft_snapshot, thread_id, draft_message_id)) = due_snapshot {
+                    if let Some(message_id) = upsert_formatted_text(
+                        &self.http_client,
+                        &tg_base,
+                        &chat_id,
+                        thread_id.as_deref(),
+                        draft_message_id,
+                        &draft_snapshot,
+                        None, // no button on streaming drafts
+                    )
+                    .await
+                    {
+                        if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
+                        {
+                            active.draft_message_id = Some(message_id);
+                            active.streaming_last_edit = Some(now);
+                        }
+                    }
+                }
+            }
         } else if action == "turn_status" {
             // Ephemeral status message: shows what the agent is doing right
             // now (e.g. "Searching the web..."). Created on first call,
@@ -2948,6 +3020,18 @@ impl TelegramSeatGuest {
                                 draft_message_id,
                                 &content,
                                 role_button.clone(),
+                            )
+                            .await;
+                        } else if let Some(msg_id) = draft_message_id {
+                            // Voice-only response: delete any streaming/partial
+                            // draft that appeared while the model was generating
+                            // so the chat stays clean (audio only, no leftover
+                            // text fragment).
+                            delete_telegram_message(
+                                &http_client_clone,
+                                &tg_base_clone,
+                                &chat_id,
+                                msg_id,
                             )
                             .await;
                         }
@@ -3490,6 +3574,27 @@ mod tests {
         assert!(names.contains(&"ping"));
         assert!(names.contains(&"new"));
         assert!(names.contains(&"status"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_edit_throttle_allows_first_then_gates_at_1500ms() {
+        let start = tokio::time::Instant::now();
+        // First edit is always due.
+        assert!(super::streaming_edit_due(None, start));
+
+        // Within the throttle window: gated.
+        tokio::time::advance(std::time::Duration::from_millis(1499)).await;
+        assert!(!super::streaming_edit_due(
+            Some(start),
+            tokio::time::Instant::now()
+        ));
+
+        // At/after 1500ms: due again.
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert!(super::streaming_edit_due(
+            Some(start),
+            tokio::time::Instant::now()
+        ));
     }
 
     #[test]
