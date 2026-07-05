@@ -44,3 +44,4 @@ ansible/vault/
 
 # graphify knowledge graph output (rebuildable via 'graphify update .')
 graphify-out/
+dist-ci/
