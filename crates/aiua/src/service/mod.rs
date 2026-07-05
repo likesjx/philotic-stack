@@ -10,3 +10,4 @@ pub mod model_catalog_sync;
 pub mod perimeter;
 pub mod resource_registry;
 pub mod webrtc_guest;
+pub mod webrtc_signaling;
