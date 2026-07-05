@@ -57,7 +57,11 @@ async fn main() -> Result<()> {
         .context("CreateTask failed")?;
 
     eprintln!("smoke: CreateTask response = {resp:?}");
-    eprintln!("smoke: turn injected — watch mac-jane aiua.log for brain bash.exec / obsidian-cli / mempalace,");
-    eprintln!("smoke: and watch the operator's Telegram for brain's reply with the command output.");
+    eprintln!(
+        "smoke: turn injected — watch mac-jane aiua.log for brain bash.exec / obsidian-cli / mempalace,"
+    );
+    eprintln!(
+        "smoke: and watch the operator's Telegram for brain's reply with the command output."
+    );
     Ok(())
 }

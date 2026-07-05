@@ -18,7 +18,7 @@ brew install philotic-web    # installs the operator CLI + all core binaries
 brew install muninn          # installs the cognitive memory store
 ```
 
-This installs the `phil` CLI (symlinked from `philotic-web`), the `aiua` hotel daemon, and all guest binaries (philote, membrane, model-router, tool-runner, graph-runner).
+This installs the `phil` CLI (symlinked from `philotic-web`), the `aiua` hotel daemon, and all guest binaries (philote, membrane, model-router, tool-runner, graph-datasource).
 
 ### From Source
 
@@ -89,7 +89,7 @@ aiua --load-config mesh-config.json
 | [`philotic-web`](crates/philotic-web/) | Operator CLI + desktop membrane (REST API, WebSocket, operator chat) |
 | [`model-router`](crates/model-router/) | Shared LLM inference routing SDK |
 | [`tool-runner`](crates/tool-runner/) | Sandboxed tool execution (Landlock + seccomp via philotic-sandbox) |
-| [`graph-runner`](crates/graph-runner/) | Shared project graph store |
+| [`graph-runner`](crates/graph-runner/) | Retired (deseeded; superseded by `graph-datasource` — crate deletion pending) |
 | [`agent-datasource`](crates/agent-datasource/) | Per-agent cognitive graph partition datasource (`agent.graph.*` tool surface) |
 | [`graph-datasource`](crates/graph-datasource/) | Autonomous graph partition management tool surface |
 | [`graph-intelligence`](crates/graph-intelligence/) | Project intelligence graph + MCP server |

@@ -123,7 +123,7 @@ start-aiua hotel:
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    cargo build -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-datasource -p philotic-web
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
@@ -135,6 +135,7 @@ kill-local-stack:
     @pkill -KILL -f "target/debug/model-controller-openrouter" 2>/dev/null || true
     @pkill -KILL -f "target/debug/tool-runner" 2>/dev/null || true
     @pkill -KILL -f "target/debug/graph-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/graph-datasource" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-mlx" 2>/dev/null || true
     @sleep 0.3
     @rm -f /tmp/philotic-*.sock
@@ -229,9 +230,9 @@ start-parakeet:
 start-tool:
     cargo run -p tool-runner
 
-# Start the Graph Runner (context graph + table adapter)
-start-graph-runner:
-    cargo run -p graph-runner
+# Start the Graph Datasource (Cypher-over-SQLite graph store guest)
+start-graph-datasource:
+    cargo run -p graph-datasource
 
 # Start the full stack in background (requires tmux or similar)
 start:
@@ -351,9 +352,9 @@ smoke-cognitive-reentry:
 smoke-embed:
     bash scripts/smoke-embed-roundtrip.sh
 
-# Run the graph-runner smoke (create → upsert node → get node → export round-trip)
-smoke-graph-runner:
-    bash scripts/smoke-graph-runner-roundtrip.sh
+# Run the graph-datasource smoke (create partition → CREATE node → MATCH → list round-trip)
+smoke-graph-datasource:
+    bash scripts/smoke-graph-datasource-roundtrip.sh
 
 # Run the LifeGraph runner through live hotel IPC.
 # Set PHILOTIC_HOTEL_SOCKET, PHILOTIC_TARGET_NODE, and PHILOTIC_REPLY_NODE for remote hotels.
@@ -426,7 +427,7 @@ smoke-suite:
     bash scripts/smoke-cognitive-roundtrip.sh
     bash scripts/smoke-cognitive-reentry-roundtrip.sh
     bash scripts/smoke-gemini-live-roundtrip.sh
-    bash scripts/smoke-graph-runner-roundtrip.sh
+    bash scripts/smoke-graph-datasource-roundtrip.sh
     bash scripts/smoke-agent-graph-roundtrip.sh
     bash scripts/smoke-desktop-membrane.sh
 
@@ -472,9 +473,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
+    AIUA_BINS="aiua philote membrane membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -580,7 +581,6 @@ vps-push:
       -p membrane-mcp \
       -p model-router \
       -p tool-runner \
-      -p graph-runner \
       -p graph-datasource \
       -p table-datasource \
       -p router-listener \

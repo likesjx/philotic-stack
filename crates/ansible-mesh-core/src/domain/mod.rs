@@ -812,11 +812,7 @@ impl GraphDomain {
     /// Chronos) each set their own target active without clearing the previous
     /// one, leaving two incarnations active simultaneously — the corrupt state
     /// that seeds the role-handoff ping-pong loop.
-    pub fn promote_role_incarnation_active(
-        &self,
-        agent_id: &str,
-        role_name: &str,
-    ) -> Result<()> {
+    pub fn promote_role_incarnation_active(&self, agent_id: &str, role_name: &str) -> Result<()> {
         // Demote any OTHER incarnation of this agent that is currently active.
         for sibling in self.list_role_incarnations(agent_id)? {
             if sibling.role_name != role_name
@@ -830,7 +826,11 @@ impl GraphDomain {
             }
         }
         // Promote the target.
-        self.set_role_incarnation_readiness(agent_id, role_name, RoleReadinessState::ActiveInSession)
+        self.set_role_incarnation_readiness(
+            agent_id,
+            role_name,
+            RoleReadinessState::ActiveInSession,
+        )
     }
 
     /// Find the first role incarnation record with the given role_name, across all agents.

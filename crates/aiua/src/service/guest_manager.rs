@@ -1176,7 +1176,10 @@ mod tests {
         for i in 0..RESPAWN_BUDGET_MAX {
             let _ = budget.check("guest-a", 1_000 + i as u64);
         }
-        assert_eq!(budget.check("guest-a", 1_100), RespawnDecision::JustExhausted);
+        assert_eq!(
+            budget.check("guest-a", 1_100),
+            RespawnDecision::JustExhausted
+        );
         // guest-b is unaffected by guest-a's breach.
         assert_eq!(
             budget.check("guest-b", 1_100),

@@ -61,7 +61,6 @@ jobs:
             -p membrane-mcp \
             -p model-router \
             -p tool-runner \
-            -p graph-runner \
             -p graph-datasource \
             -p table-datasource \
             -p router-listener \
@@ -103,7 +102,7 @@ jobs:
                      model-router model-controller-elevenlabs \
                      model-controller-gemini model-controller-openai \
                      model-controller-onnx model-controller-ollama \
-                     tool-runner graph-runner graph-datasource \
+                     tool-runner graph-datasource \
                      agent-datasource heal-dispatcher life-graph-runner \
                      philotic-web; do
             if [ ! -f "dist/$bin" ]; then

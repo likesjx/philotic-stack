@@ -82,7 +82,10 @@ async fn dispatch_cycle(
         }) => {
             if let Some(n) = data.get("repaired").and_then(|v| v.as_u64()) {
                 if n > 0 {
-                    info!(repaired = n, "heal-dispatcher: zombie turn scan repaired stale turns");
+                    info!(
+                        repaired = n,
+                        "heal-dispatcher: zombie turn scan repaired stale turns"
+                    );
                 }
             }
         }

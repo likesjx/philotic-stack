@@ -6341,29 +6341,6 @@ fn component_templates() -> Vec<ComponentTemplateView> {
             component_config_fields: vec![],
             dependencies: vec![],
         },
-        ComponentTemplateView {
-            id: "graph-runner".into(),
-            label: "Graph Runner".into(),
-            description: "Graph query/tool guest. The hotel usually injects the graph runner id automatically; operator-authored config is minimal.".into(),
-            command: "graph-runner".into(),
-            role: "tool.graph".into(),
-            env_fields: vec![
-                ComponentTemplateFieldView {
-                    key: "PHILOTIC_GRAPH_RUNNER_ID".into(),
-                    label: "Graph Runner ID".into(),
-                    target: "env".into(),
-                    input_kind: "string".into(),
-                    required: false,
-                    secret: false,
-                    vault_only: false,
-                    placeholder: Some("local-telegram:graph-runner".into()),
-                    help: Some("Optional explicit runner id when not hotel-seeded.".into()),
-                    default_value: None,
-                },
-            ],
-            component_config_fields: vec![],
-            dependencies: vec![],
-        },
     ]
 }
 

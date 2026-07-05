@@ -2822,24 +2822,9 @@ fn hotel_shared_guests(
             active_pid: None,
             last_active_at: None,
         },
-        GuestRecord {
-            hotel_name: hotel_name.to_string(),
-            guest_id: format!("{hotel_name}:graph-runner"),
-            role: "tool.graph".into(),
-            config_json: serde_json::json!({
-                "command": "graph-runner",
-                "args": [],
-                "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
-                    "PHILOTIC_NODE_ID": node_id.clone(),
-                    "PHILOTIC_GRAPH_RUNNER_ID": format!("{hotel_name}:graph-runner")
-                }
-            })
-            .to_string(),
-            is_active: true,
-            active_pid: None,
-            last_active_at: None,
-        },
+        // graph-runner is retired (codex/graph-runner-retire): its tools appear in
+        // zero toolset profiles and zero catalog ToolDefinitions, so no agent could
+        // reach it. graph-datasource (below) is the surviving graph store surface.
         GuestRecord {
             hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:graph-datasource"),
@@ -3326,6 +3311,12 @@ fn deactivate_legacy_managed_guests(
                 return false;
             }
             if guest.role == "graph-datasource" {
+                return true;
+            }
+            // graph-runner is retired (codex/graph-runner-retire): deactivate any
+            // stale hotel-seeded rows so fleets stop respawning the old binary.
+            if guest.role == "tool.graph" || guest.guest_id == format!("{hotel_name}:graph-runner")
+            {
                 return true;
             }
 
@@ -6024,7 +6015,7 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
         "target/debug/membrane",
         "target/debug/philote",
         "target/debug/tool-runner",
-        "target/debug/graph-runner",
+        "target/debug/graph-datasource",
         "target/debug/model-controller-gemini",
         "target/debug/model-controller-elevenlabs",
         "target/debug/model-controller-openrouter",
@@ -6046,7 +6037,7 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
             "-p",
             "tool-runner",
             "-p",
-            "graph-runner",
+            "graph-datasource",
             "-p",
             "model-router",
             "--bins",
@@ -6095,18 +6086,21 @@ async fn run_startup_test(
                 other => anyhow::bail!("unexpected graph startup subscribe response: {other:?}"),
             }
 
-            let graph_id = startup_test_emit_graph_tool(
+            // The round-trip runs through graph-datasource (SqliteCypherProvider),
+            // the surviving graph store surface after graph-runner's retirement
+            // (codex/graph-runner-retire): create partition → CREATE node via
+            // Cypher → MATCH it back → list partitions.
+            let create_result = startup_test_emit_graph_tool(
                 &mut client,
                 &local_node_id,
                 "graph.create",
                 serde_json::json!({
-                    "name": graph_name,
-                    "default_visibility": "public",
+                    "graph_id": graph_name,
                     "caller_id": "aiua-startup-graph-client"
                 }),
             )
             .await?;
-            let graph_id = graph_id
+            let graph_id = create_result
                 .get("graph_id")
                 .and_then(serde_json::Value::as_str)
                 .context("graph.create startup reply missing graph_id")?
@@ -6115,69 +6109,77 @@ async fn run_startup_test(
             let node_result = startup_test_emit_graph_tool(
                 &mut client,
                 &local_node_id,
-                "graph.node.upsert",
+                "graph.query",
                 serde_json::json!({
                     "graph_id": graph_id,
-                    "node_type": "Smoke",
-                    "label": "startup smoke node",
-                    "visibility": ["public"],
+                    "query": "CREATE (n:Smoke {id: 'startup-smoke-node', name: 'startup smoke node'})",
                     "caller_id": "aiua-startup-graph-client"
                 }),
             )
             .await?;
             let node_id = node_result
-                .get("node_id")
+                .get("data")
+                .and_then(|data| data.get("id"))
                 .and_then(serde_json::Value::as_str)
-                .context("graph.node.upsert startup reply missing node_id")?
+                .context("graph.query CREATE startup reply missing data.id")?
                 .to_string();
 
-            let get_result = startup_test_emit_graph_tool(
+            let match_result = startup_test_emit_graph_tool(
                 &mut client,
                 &local_node_id,
-                "graph.node.get",
+                "graph.query",
                 serde_json::json!({
                     "graph_id": graph_id,
-                    "node_id": node_id,
+                    "query": "MATCH (n:Smoke {id: 'startup-smoke-node'}) RETURN n",
                     "caller_id": "aiua-startup-graph-client"
                 }),
             )
             .await?;
-            let label = get_result
-                .get("node")
-                .and_then(|node| node.get("label"))
+            let matched = match_result
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .context("graph.query MATCH startup reply missing data array")?;
+            let name = matched
+                .first()
+                .and_then(|node| node.get("properties"))
+                .and_then(|props| props.get("name"))
                 .and_then(serde_json::Value::as_str)
-                .context("graph.node.get startup reply missing node.label")?;
-            if label != "startup smoke node" {
+                .context("graph.query MATCH startup reply missing node properties.name")?;
+            if name != "startup smoke node" {
                 anyhow::bail!(
-                    "unexpected graph.node.get startup label: expected {:?}, got {:?}",
+                    "unexpected graph.query MATCH startup name: expected {:?}, got {:?}",
                     "startup smoke node",
-                    label
+                    name
                 );
             }
 
-            let export_result = startup_test_emit_graph_tool(
+            let list_result = startup_test_emit_graph_tool(
                 &mut client,
                 &local_node_id,
-                "graph.export",
+                "graph.list",
                 serde_json::json!({
-                    "graph_id": graph_id,
                     "caller_id": "aiua-startup-graph-client"
                 }),
             )
             .await?;
-            let node_count = export_result
-                .get("node_count")
-                .and_then(serde_json::Value::as_u64)
-                .context("graph.export startup reply missing node_count")?;
-            if node_count < 1 {
-                anyhow::bail!("expected graph export node_count >= 1, got {}", node_count);
+            let graphs = list_result
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .context("graph.list startup reply missing data array")?;
+            if !graphs.iter().any(|graph| {
+                graph.get("graph_id").and_then(serde_json::Value::as_str) == Some(graph_id.as_str())
+            }) {
+                anyhow::bail!(
+                    "graph.list startup reply did not include graph {:?}",
+                    graph_id
+                );
             }
 
             info!(
                 graph_id = %graph_id,
                 node_id = %node_id,
-                node_count,
-                "Startup graph round-trip succeeded through materialized graph-runner"
+                graph_count = graphs.len(),
+                "Startup graph round-trip succeeded through materialized graph-datasource"
             );
             Ok(())
         }
@@ -7166,6 +7168,10 @@ async fn run_startup_test(
     }
 }
 
+/// Emit a graph tool task at the graph-datasource role and decode the
+/// `datasource_response` envelope it replies with. Returns the `result`
+/// object (`{"status": "created", "graph_id": ...}` for partition creation,
+/// `{"status": "success", "data": ...}` for result sets).
 async fn startup_test_emit_graph_tool(
     client: &mut PhiloticClient,
     local_node_id: &str,
@@ -7178,7 +7184,7 @@ async fn startup_test_emit_graph_tool(
     let response = client
         .send_request(IpcRequest::EmitTask {
             target_node: local_node_id.to_string(),
-            target_role: format!("tool.{tool_name}"),
+            target_role: "graph-datasource".to_string(),
             target_guest_id: None,
             task_json: serde_json::json!({
                 "action": "execute_tool",
@@ -7191,9 +7197,7 @@ async fn startup_test_emit_graph_tool(
                 "caller_roles": ["aiua-startup-graph"],
                 "reply_to": local_node_id,
                 "reply_role": "aiua-startup-graph",
-                "final_reply_to": local_node_id,
-                "final_reply_role": "aiua-startup-graph",
-                "final_reply_guest_id": "aiua-startup-graph-client"
+                "reply_guest_id": "aiua-startup-graph-client"
             })
             .to_string(),
         })
@@ -7207,33 +7211,31 @@ async fn startup_test_emit_graph_tool(
     let reply = tokio::time::timeout(tokio::time::Duration::from_secs(15), client.recv_task())
         .await
         .with_context(|| {
-            format!("{tool_name}: timed out waiting for startup graph tool_result")
+            format!("{tool_name}: timed out waiting for startup graph datasource_response")
         })??;
 
     let IpcResponse::InboundTask { task_json, .. } = reply else {
         anyhow::bail!("{tool_name}: unexpected startup graph reply envelope: {reply:?}");
     };
 
-    let payload: serde_json::Value = serde_json::from_str(&task_json)
-        .with_context(|| format!("{tool_name}: failed to decode startup graph tool_result"))?;
-    let content_str = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .with_context(|| format!("{tool_name}: startup graph tool_result missing content"))?;
-    let content: serde_json::Value = serde_json::from_str(content_str).with_context(|| {
-        format!("{tool_name}: startup graph content was not valid JSON: {content_str}")
+    let payload: serde_json::Value = serde_json::from_str(&task_json).with_context(|| {
+        format!("{tool_name}: failed to decode startup graph datasource_response")
     })?;
-    if content.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        anyhow::bail!(
-            "{tool_name}: startup graph tool returned ok=false: {}",
-            content
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(content_str)
-        );
+    if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
+        anyhow::bail!("{tool_name}: startup graph datasource returned error: {error}");
+    }
+    let result = payload.get("result").cloned().with_context(|| {
+        format!("{tool_name}: startup graph datasource_response missing result")
+    })?;
+    let status = result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches!(status, "success" | "created" | "acknowledged") {
+        anyhow::bail!("{tool_name}: startup graph datasource returned unexpected status: {result}");
     }
 
-    Ok(content)
+    Ok(result)
 }
 
 fn assert_fake_gemini_media_request(
@@ -7622,6 +7624,17 @@ async fn main() -> Result<()> {
     let hotel_name = args
         .hotel
         .context("--hotel is required unless using a subcommand such as `aiua load`")?;
+
+    // The graph round-trip startup test exercises graph-datasource, which is
+    // home-hotel-gated (default: vps-jane). Treat the hotel under test as the
+    // home hotel so the datasource materializes locally for the smoke.
+    if args.test == Some(StartupTest::GraphRoundTrip)
+        && std::env::var_os("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL").is_none()
+    {
+        unsafe {
+            std::env::set_var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL", &hotel_name);
+        }
+    }
 
     enforce_graph_datasource_home(&graph_domain_arc, &hotel_name)?;
     migrate_plaintext_provider_api_keys(&graph_domain_arc)?;
@@ -8503,16 +8516,14 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest,
-        agent_graph_guest_record, agent_graph_runner_guest, agent_identity_record_for_profile,
-        agent_profile_from_config,
+        AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest, agent_graph_guest_record,
+        agent_graph_runner_guest, agent_identity_record_for_profile, agent_profile_from_config,
         all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, enforce_graph_datasource_home,
         execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
         guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
-        hotel_ipc_socket_path,
-        local_capability_advertisements, mesh_target_addr_for_node,
+        hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, nearest_available_base_port, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
         seed_toolset_profiles, startup_test_gemini_base_url,
@@ -8645,7 +8656,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 12); // shared guests omit graph-datasource off the configured home hotel; profile: agent, agent-datasource
+        assert_eq!(guests.len(), 11); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
