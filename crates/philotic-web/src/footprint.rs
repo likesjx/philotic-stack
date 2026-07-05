@@ -12,7 +12,9 @@ const PHILOTIC_BINS: &[&str] = &[
     "model-controller-mlx",
     "tool-runner",
     "graph-runner",
+    // Legacy per-agent graph binary; kept so old processes are still visible.
     "agent-graph-runner",
+    "agent-datasource",
 ];
 
 pub async fn run(kill_pattern: Option<String>) -> Result<()> {
