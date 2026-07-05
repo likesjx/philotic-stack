@@ -14100,8 +14100,6 @@ impl IpcServer {
                     "membrane"
                 } else if g.role == "agent" || g.role.starts_with("agent.") {
                     "agent"
-                } else if g.role == "graph-runner" || g.role.starts_with("graph.") {
-                    "graph-runner"
                 } else if g.role.contains("datasource") || g.role.contains("listener") {
                     "data"
                 } else {
@@ -17971,7 +17969,10 @@ mod tests {
                 &claims,
             )
             .await;
-            assert!(handled, "attempt {attempt} should report the event as handled");
+            assert!(
+                handled,
+                "attempt {attempt} should report the event as handled"
+            );
         }
 
         assert!(

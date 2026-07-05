@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
 use ansible_mesh_core::model_catalog_discovery::{
-    diff_catalog, parse_openrouter_models, CatalogDiffEvent, CatalogDiffKind, DiscoveredModel,
+    CatalogDiffEvent, CatalogDiffKind, DiscoveredModel, diff_catalog, parse_openrouter_models,
 };
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";

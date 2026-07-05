@@ -59,9 +59,14 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
             "AttentionPatch",
             "SystemPatch",
         ],
-        SemanticSpace::RolePersonSemantic => {
-            &["Role", "Aspiration", "Person", "Value", "Preference", "Concern"]
-        }
+        SemanticSpace::RolePersonSemantic => &[
+            "Role",
+            "Aspiration",
+            "Person",
+            "Value",
+            "Preference",
+            "Concern",
+        ],
         SemanticSpace::MemoryBridgeSemantic => &["Commitment", "Decision"],
     }
 }

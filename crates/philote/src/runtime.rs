@@ -9186,14 +9186,16 @@ impl AgentRuntime {
         // Rate-limit actual role SWITCHES (`/role`, `/back`) — not `/roles` listing —
         // so a burst of redelivered switch commands cannot drive an endless
         // orchestrator↔specialist handoff ping-pong. `/roles` is read-only and exempt.
-        let is_role_switch =
-            matches!(command, SlashCommand::Role { .. } | SlashCommand::Back);
+        let is_role_switch = matches!(command, SlashCommand::Role { .. } | SlashCommand::Back);
         let role_switch_throttled = if is_role_switch {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let history = self.role_switch_history.entry(session_id.clone()).or_default();
+            let history = self
+                .role_switch_history
+                .entry(session_id.clone())
+                .or_default();
             while let Some(&front) = history.front() {
                 if now_ms - front > ROLE_SWITCH_WINDOW_MS {
                     history.pop_front();
@@ -9207,13 +9209,13 @@ impl AgentRuntime {
             false
         };
 
-        let (reply_content, update_state, payload, next_active_incarnation) = if role_switch_throttled
-        {
-            warn!(
-                "Throttling rapid role switch for session [{}] ({} switches in {}ms) to avoid a handoff loop",
-                session_id, ROLE_SWITCH_MAX, ROLE_SWITCH_WINDOW_MS
-            );
-            (
+        let (reply_content, update_state, payload, next_active_incarnation) =
+            if role_switch_throttled {
+                warn!(
+                    "Throttling rapid role switch for session [{}] ({} switches in {}ms) to avoid a handoff loop",
+                    session_id, ROLE_SWITCH_MAX, ROLE_SWITCH_WINDOW_MS
+                );
+                (
                 "⚠️ Ignoring rapid role switch to avoid a handoff loop (too many switches in a short window)."
                     .to_string(),
                 "role_switch_throttled",
@@ -9225,241 +9227,248 @@ impl AgentRuntime {
                 }),
                 None,
             )
-        } else {
-        let response = match &command {
-            SlashCommand::Role { role_name } => {
-                let handoff_bundle = self
-                    .sessions
-                    .get(&session_id)
-                    .map(|state| {
-                        state.build_same_identity_handoff_bundle(
-                            role_name,
-                            &command_turn_id,
-                            "manual_role_switch",
-                            Some("orchestrator".into()),
-                        )
-                    })
-                    .unwrap_or_else(|| HandoffBundle {
-                        goal: format!("Switch active role to {role_name} for this session."),
-                        context_excerpt: "Manual role switch requested by user slash command."
-                            .into(),
-                        session_id: session_id.clone(),
-                        initiating_turn_id: command_turn_id.clone(),
-                        return_to: Some("orchestrator".into()),
-                        handoff_reason: Some("manual_role_switch".into()),
-                        from_role: Some("orchestrator".into()),
-                        to_role: Some(role_name.clone()),
-                        active_goal: None,
-                        active_constraints: vec!["same_identity_role_handoff".into()],
-                        relevant_session_facts: Vec::new(),
-                        working_summary: None,
-                        suggested_memory_refs: Vec::new(),
-                        expected_return_mode: Some("required".into()),
-                        cleanup_actions: vec!["switch_active_role".into()],
-                    });
-                let req = IpcRequest::HandoffToRole {
-                    session_id: session_id.clone(),
-                    role_name: role_name.clone(),
-                    handoff_bundle,
-                };
-                let mut attempt = 0u32;
-                loop {
-                    let resp = self.ipc_client.send_request(req.clone()).await?;
-                    match resp {
-                        IpcResponse::HandoffPending { retry_after_ms, .. } => {
-                            attempt += 1;
-                            if attempt >= HANDOFF_MAX_RETRIES {
-                                break resp;
+            } else {
+                let response = match &command {
+                    SlashCommand::Role { role_name } => {
+                        let handoff_bundle = self
+                            .sessions
+                            .get(&session_id)
+                            .map(|state| {
+                                state.build_same_identity_handoff_bundle(
+                                    role_name,
+                                    &command_turn_id,
+                                    "manual_role_switch",
+                                    Some("orchestrator".into()),
+                                )
+                            })
+                            .unwrap_or_else(|| HandoffBundle {
+                                goal: format!(
+                                    "Switch active role to {role_name} for this session."
+                                ),
+                                context_excerpt:
+                                    "Manual role switch requested by user slash command.".into(),
+                                session_id: session_id.clone(),
+                                initiating_turn_id: command_turn_id.clone(),
+                                return_to: Some("orchestrator".into()),
+                                handoff_reason: Some("manual_role_switch".into()),
+                                from_role: Some("orchestrator".into()),
+                                to_role: Some(role_name.clone()),
+                                active_goal: None,
+                                active_constraints: vec!["same_identity_role_handoff".into()],
+                                relevant_session_facts: Vec::new(),
+                                working_summary: None,
+                                suggested_memory_refs: Vec::new(),
+                                expected_return_mode: Some("required".into()),
+                                cleanup_actions: vec!["switch_active_role".into()],
+                            });
+                        let req = IpcRequest::HandoffToRole {
+                            session_id: session_id.clone(),
+                            role_name: role_name.clone(),
+                            handoff_bundle,
+                        };
+                        let mut attempt = 0u32;
+                        loop {
+                            let resp = self.ipc_client.send_request(req.clone()).await?;
+                            match resp {
+                                IpcResponse::HandoffPending { retry_after_ms, .. } => {
+                                    attempt += 1;
+                                    if attempt >= HANDOFF_MAX_RETRIES {
+                                        break resp;
+                                    }
+                                    let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
+                                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms))
+                                        .await;
+                                }
+                                other => break other,
                             }
-                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
-                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                         }
-                        other => break other,
                     }
-                }
-            }
-            SlashCommand::Back => {
-                let req = IpcRequest::HandoffBack {
-                    session_id: session_id.clone(),
-                    summary: "Manual return to orchestrator requested by user slash command."
-                        .into(),
-                    return_to: None,
-                };
-                let mut attempt = 0u32;
-                loop {
-                    let resp = self.ipc_client.send_request(req.clone()).await?;
-                    match resp {
-                        IpcResponse::HandoffPending { retry_after_ms, .. } => {
-                            attempt += 1;
-                            if attempt >= HANDOFF_MAX_RETRIES {
-                                break resp;
+                    SlashCommand::Back => {
+                        let req = IpcRequest::HandoffBack {
+                            session_id: session_id.clone(),
+                            summary:
+                                "Manual return to orchestrator requested by user slash command."
+                                    .into(),
+                            return_to: None,
+                        };
+                        let mut attempt = 0u32;
+                        loop {
+                            let resp = self.ipc_client.send_request(req.clone()).await?;
+                            match resp {
+                                IpcResponse::HandoffPending { retry_after_ms, .. } => {
+                                    attempt += 1;
+                                    if attempt >= HANDOFF_MAX_RETRIES {
+                                        break resp;
+                                    }
+                                    let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
+                                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms))
+                                        .await;
+                                }
+                                other => break other,
                             }
-                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
-                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                         }
-                        other => break other,
                     }
-                }
-            }
-            SlashCommand::Roles => {
-                self.ipc_client
-                    .send_request(IpcRequest::ListRoleIncarnations {
-                        agent_id: self.agent_id.clone(),
-                    })
-                    .await?
-            }
-            _ => unreachable!("handle_role_command only accepts role handoff commands"),
-        };
+                    SlashCommand::Roles => {
+                        self.ipc_client
+                            .send_request(IpcRequest::ListRoleIncarnations {
+                                agent_id: self.agent_id.clone(),
+                            })
+                            .await?
+                    }
+                    _ => unreachable!("handle_role_command only accepts role handoff commands"),
+                };
 
-        match response {
-            IpcResponse::HandoffAck {
-                handoff_guest_id,
-                became_active,
-            } => (
-                format_role_command_reply(&command, became_active),
-                if became_active {
-                    "role_handoff_completed"
-                } else {
-                    "role_handoff_materializing"
-                },
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "role_command": "handoff_to_role",
-                    "handoff_guest_id": handoff_guest_id,
-                    "became_active": became_active,
-                }),
-                became_active.then_some(handoff_guest_id),
-            ),
-            IpcResponse::HandoffBackAck {
-                return_guest_id,
-                became_active,
-            } => (
-                format_role_command_reply(&command, became_active),
-                if became_active {
-                    "role_handoff_completed"
-                } else {
-                    "role_handoff_materializing"
-                },
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "role_command": "handoff_back",
-                    "return_guest_id": return_guest_id,
-                    "became_active": became_active,
-                }),
-                became_active.then_some(return_guest_id),
-            ),
-            IpcResponse::Standard { ok: true, data, .. }
-                if matches!(command, SlashCommand::Roles) =>
-            {
-                let roles = data
-                    .as_ref()
-                    .and_then(|value| value.get("roles"))
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let active_incarnation_id = self
-                    .sessions
-                    .get(&session_id)
-                    .and_then(|state| state.active_incarnation_id.clone());
-                // Build an inline keyboard with one button per role so the user can
-                // tap directly in Telegram to fire `/role <name>`.
-                let keyboard_rows: Vec<Vec<serde_json::Value>> = roles
-                    .iter()
-                    .filter_map(|r| {
-                        let role_name = r.get("role_name")?.as_str()?;
-                        Some(vec![serde_json::json!({
-                            "text": format!("🎭 {role_name}"),
-                            "callback_data": format!("/role {role_name}"),
-                        })])
-                    })
-                    .collect();
-                let roles_keyboard = if keyboard_rows.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::json!({ "inline_keyboard": keyboard_rows }))
-                };
-                roles_keyboard_holder = roles_keyboard;
-                let active_role_name = active_incarnation_id
-                    .as_deref()
-                    .and_then(|id| id.rsplit(':').next())
-                    .unwrap_or("orchestrator");
-                let reply_text = if roles.is_empty() {
-                    format!("Active: {active_role_name}. No configured roles.")
-                } else {
-                    format!("Active: {active_role_name}")
-                };
-                (
-                    reply_text,
-                    "role_list_reported",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "turn_id": command_turn_id,
-                        "chat_id": command_chat_id,
-                        "role_command": "list_roles",
-                        "role_count": roles.len(),
-                        "active_incarnation_id": active_incarnation_id,
-                    }),
-                    None,
-                )
-            }
-            IpcResponse::HandoffPending { role_name, .. } => (
-                format!(
-                    "Role '{role_name}' is still materializing — please try again in a moment."
-                ),
-                "role_handoff_failed",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "error": "handoff_pending_timeout",
-                }),
-                None,
-            ),
-            IpcResponse::Error(message) => (
-                format!("Couldn't switch roles: {message}"),
-                "role_handoff_failed",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "error": message,
-                }),
-                None,
-            ),
-            IpcResponse::Standard {
-                ok: false,
-                code,
-                message,
-                ..
-            } => (
-                format!("Couldn't switch roles: {message} ({code})"),
-                "role_handoff_failed",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "error_code": code,
-                    "error": message,
-                }),
-                None,
-            ),
-            other => (
-                format!("Couldn't handle role command: unexpected hotel response {other:?}"),
-                "role_handoff_failed",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "error": format!("unexpected hotel response: {other:?}"),
-                }),
-                None,
-            ),
-        }
-        };
+                match response {
+                    IpcResponse::HandoffAck {
+                        handoff_guest_id,
+                        became_active,
+                    } => (
+                        format_role_command_reply(&command, became_active),
+                        if became_active {
+                            "role_handoff_completed"
+                        } else {
+                            "role_handoff_materializing"
+                        },
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "role_command": "handoff_to_role",
+                            "handoff_guest_id": handoff_guest_id,
+                            "became_active": became_active,
+                        }),
+                        became_active.then_some(handoff_guest_id),
+                    ),
+                    IpcResponse::HandoffBackAck {
+                        return_guest_id,
+                        became_active,
+                    } => (
+                        format_role_command_reply(&command, became_active),
+                        if became_active {
+                            "role_handoff_completed"
+                        } else {
+                            "role_handoff_materializing"
+                        },
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "role_command": "handoff_back",
+                            "return_guest_id": return_guest_id,
+                            "became_active": became_active,
+                        }),
+                        became_active.then_some(return_guest_id),
+                    ),
+                    IpcResponse::Standard { ok: true, data, .. }
+                        if matches!(command, SlashCommand::Roles) =>
+                    {
+                        let roles = data
+                            .as_ref()
+                            .and_then(|value| value.get("roles"))
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let active_incarnation_id = self
+                            .sessions
+                            .get(&session_id)
+                            .and_then(|state| state.active_incarnation_id.clone());
+                        // Build an inline keyboard with one button per role so the user can
+                        // tap directly in Telegram to fire `/role <name>`.
+                        let keyboard_rows: Vec<Vec<serde_json::Value>> = roles
+                            .iter()
+                            .filter_map(|r| {
+                                let role_name = r.get("role_name")?.as_str()?;
+                                Some(vec![serde_json::json!({
+                                    "text": format!("🎭 {role_name}"),
+                                    "callback_data": format!("/role {role_name}"),
+                                })])
+                            })
+                            .collect();
+                        let roles_keyboard = if keyboard_rows.is_empty() {
+                            None
+                        } else {
+                            Some(serde_json::json!({ "inline_keyboard": keyboard_rows }))
+                        };
+                        roles_keyboard_holder = roles_keyboard;
+                        let active_role_name = active_incarnation_id
+                            .as_deref()
+                            .and_then(|id| id.rsplit(':').next())
+                            .unwrap_or("orchestrator");
+                        let reply_text = if roles.is_empty() {
+                            format!("Active: {active_role_name}. No configured roles.")
+                        } else {
+                            format!("Active: {active_role_name}")
+                        };
+                        (
+                            reply_text,
+                            "role_list_reported",
+                            serde_json::json!({
+                                "session_id": session_id,
+                                "turn_id": command_turn_id,
+                                "chat_id": command_chat_id,
+                                "role_command": "list_roles",
+                                "role_count": roles.len(),
+                                "active_incarnation_id": active_incarnation_id,
+                            }),
+                            None,
+                        )
+                    }
+                    IpcResponse::HandoffPending { role_name, .. } => (
+                        format!(
+                            "Role '{role_name}' is still materializing — please try again in a moment."
+                        ),
+                        "role_handoff_failed",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "error": "handoff_pending_timeout",
+                        }),
+                        None,
+                    ),
+                    IpcResponse::Error(message) => (
+                        format!("Couldn't switch roles: {message}"),
+                        "role_handoff_failed",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "error": message,
+                        }),
+                        None,
+                    ),
+                    IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    } => (
+                        format!("Couldn't switch roles: {message} ({code})"),
+                        "role_handoff_failed",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "error_code": code,
+                            "error": message,
+                        }),
+                        None,
+                    ),
+                    other => (
+                        format!(
+                            "Couldn't handle role command: unexpected hotel response {other:?}"
+                        ),
+                        "role_handoff_failed",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "error": format!("unexpected hotel response: {other:?}"),
+                        }),
+                        None,
+                    ),
+                }
+            };
 
         if let Some(active_incarnation_id) = next_active_incarnation {
             if let Some(state) = self.sessions.get_mut(&session_id) {

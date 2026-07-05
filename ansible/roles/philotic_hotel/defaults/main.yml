@@ -30,7 +30,6 @@ philotic_binaries:
   - membrane-telegram
   - membrane-discord
   - membrane-mcp
-  - graph-runner
   - graph-datasource
   - table-datasource
   - router-listener

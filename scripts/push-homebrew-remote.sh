@@ -44,7 +44,6 @@ cargo build --release --bins \
   -p membrane-discord \
   -p model-router \
   -p tool-runner \
-  -p graph-runner \
   -p graph-datasource \
   -p table-datasource \
   -p router-listener \
