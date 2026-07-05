@@ -11966,41 +11966,44 @@ impl IpcServer {
                                     }
                                 }
 
-                                // Ensure companion agent-graph-runner guest exists.
+                                // Ensure the companion agent-graph guest exists and spawns the
+                                // converged `agent-datasource` binary. Legacy records seeded by
+                                // older builds may still point at `agent-graph-runner`; upgrade
+                                // those in place so both seeding paths use one binary.
                                 let graph_runner_id =
                                     format!("{}:agent-graph-{}", hotel_name, inc.agent_id);
-                                if graph
+                                let runner_needs_seed = match graph
                                     .get_guest(&hotel_name, &graph_runner_id)
                                     .ok()
                                     .flatten()
-                                    .is_none()
                                 {
-                                    let runner_config = serde_json::json!({
-                                        "command": "agent-graph-runner",
-                                        "args": [],
-                                        "env": {
-                                            "PHILOTIC_AGENT_ID": inc.agent_id,
-                                            "PHILOTIC_GRAPH_RUNNER_ID": graph_runner_id,
-                                            "PHILOTIC_IPC_SOCKET": socket_path,
-                                        }
-                                    });
-                                    let runner_rec = ansible_mesh_core::storage::GuestRecord {
-                                        hotel_name: hotel_name.clone(),
-                                        guest_id: graph_runner_id.clone(),
-                                        role: "agent-graph".into(),
-                                        config_json: runner_config.to_string(),
-                                        is_active: true,
-                                        active_pid: None,
-                                        last_active_at: None,
-                                    };
+                                    None => true,
+                                    Some(rec) => {
+                                        serde_json::from_str::<serde_json::Value>(&rec.config_json)
+                                            .ok()
+                                            .and_then(|v| {
+                                                v.get("command")
+                                                    .and_then(|c| c.as_str())
+                                                    .map(str::to_string)
+                                            })
+                                            .as_deref()
+                                            != Some("agent-datasource")
+                                    }
+                                };
+                                if runner_needs_seed {
+                                    let runner_rec = crate::agent_graph_guest_record(
+                                        &hotel_name,
+                                        &inc.agent_id,
+                                        &socket_path,
+                                    );
                                     if let Err(e) = graph.seed_guests(&hotel_name, &[runner_rec]) {
                                         warn!(
-                                            "Failed to seed agent-graph-runner guest [{}]: {e}",
+                                            "Failed to seed agent-graph companion guest [{}]: {e}",
                                             graph_runner_id
                                         );
                                     } else {
                                         info!(
-                                            "Created agent-graph-runner guest: {}",
+                                            "Seeded agent-graph companion guest (agent-datasource): {}",
                                             graph_runner_id
                                         );
                                     }
@@ -12022,18 +12025,18 @@ impl IpcServer {
                                             hotel_guest_id
                                         ),
                                     }
-                                    // Trigger materialization of companion agent-graph-runner.
+                                    // Trigger materialization of the companion agent-graph guest.
                                     match requester.ensure_guest_active(&graph_runner_id).await {
                                         Ok(true) => info!(
-                                            "Agent-graph-runner [{}] materialization triggered.",
+                                            "Agent-graph guest [{}] materialization triggered.",
                                             graph_runner_id
                                         ),
                                         Ok(false) => warn!(
-                                            "Agent-graph-runner [{}] could not be materialized.",
+                                            "Agent-graph guest [{}] could not be materialized.",
                                             graph_runner_id
                                         ),
                                         Err(e) => warn!(
-                                            "Agent-graph-runner [{}] materialization error: {e}",
+                                            "Agent-graph guest [{}] materialization error: {e}",
                                             graph_runner_id
                                         ),
                                     }

@@ -6286,9 +6286,9 @@ fn component_templates() -> Vec<ComponentTemplateView> {
         },
         ComponentTemplateView {
             id: "agent-graph-runner".into(),
-            label: "Agent Graph Runner".into(),
-            description: "Per-agent cognitive graph guest. The agent id is required; the graph DB path is optional unless you want an explicit storage location.".into(),
-            command: "agent-graph-runner".into(),
+            label: "Agent Graph (agent-datasource)".into(),
+            description: "Per-agent cognitive graph guest (agent-datasource binary). The agent id is required; the graph DB path is optional unless you want an explicit storage location.".into(),
+            command: "agent-datasource".into(),
             role: "agent-graph".into(),
             env_fields: vec![
                 ComponentTemplateFieldView {

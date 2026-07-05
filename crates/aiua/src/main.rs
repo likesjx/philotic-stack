@@ -2537,15 +2537,26 @@ fn agent_guests_for_profile(hotel_name: &str, profile: &AgentProfile) -> GuestRe
 /// One per agent; stores per-agent cognitive graph at ~/.philotic/agent-graph-{id}.db.
 fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRecord {
     let hotel = default_hotel_record(hotel_name);
-    let socket_path = hotel.ipc_socket_path;
-    let guest_id = format!("{hotel_name}:agent-graph-{}", profile.agent_id);
+    agent_graph_guest_record(hotel_name, &profile.agent_id, &hotel.ipc_socket_path)
+}
+
+/// Canonical shape for the companion agent-graph guest. Single source of truth
+/// for the spawned binary (`agent-datasource`) so every seeding path — startup
+/// profile seeding (above) and on-demand role-incarnation materialization
+/// (service/ipc.rs) — converges on the same command, args, and env.
+pub(crate) fn agent_graph_guest_record(
+    hotel_name: &str,
+    agent_id: &str,
+    socket_path: &str,
+) -> GuestRecord {
+    let guest_id = format!("{hotel_name}:agent-graph-{agent_id}");
     let mut env = serde_json::json!({
-        "PHILOTIC_AGENT_ID": profile.agent_id,
+        "PHILOTIC_AGENT_ID": agent_id,
         "PHILOTIC_GRAPH_RUNNER_ID": guest_id,
         "PHILOTIC_HOTEL_SOCKET": socket_path,
         "PHILOTIC_IPC_SOCKET": socket_path
     });
-    if let Some(db_path) = agent_graph_db_path(&profile.agent_id) {
+    if let Some(db_path) = agent_graph_db_path(agent_id) {
         if let Some(env) = env.as_object_mut() {
             env.insert(
                 "PHILOTIC_AGENT_GRAPH_DB".into(),
@@ -8451,7 +8462,8 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest,
-        agent_identity_record_for_profile, agent_profile_from_config,
+        agent_graph_guest_record, agent_graph_runner_guest, agent_identity_record_for_profile,
+        agent_profile_from_config,
         all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, enforce_graph_datasource_home,
@@ -8772,6 +8784,51 @@ mod tests {
         unsafe {
             std::env::remove_var("PHILOTIC_GRAPH_DATABASE_DIR");
         }
+    }
+
+    /// Both seeding paths (startup profile seeding and role-incarnation
+    /// materialization in service/ipc.rs) must spawn the same converged
+    /// `agent-datasource` binary with the same env shape.
+    #[test]
+    fn agent_graph_guest_record_spawns_agent_datasource() {
+        let rec = agent_graph_guest_record("test-hotel", "agent-beacon", "/tmp/test.sock");
+        assert_eq!(rec.guest_id, "test-hotel:agent-graph-agent-beacon");
+        assert_eq!(rec.role, "agent-graph");
+        let config: serde_json::Value = serde_json::from_str(&rec.config_json).unwrap();
+        assert_eq!(config["command"].as_str(), Some("agent-datasource"));
+        assert_eq!(
+            config["env"]["PHILOTIC_AGENT_ID"].as_str(),
+            Some("agent-beacon")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_GRAPH_RUNNER_ID"].as_str(),
+            Some("test-hotel:agent-graph-agent-beacon")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
+            Some("/tmp/test.sock")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_IPC_SOCKET"].as_str(),
+            Some("/tmp/test.sock")
+        );
+
+        // The profile-seeding wrapper must yield the identical command.
+        let profile_rec = agent_graph_runner_guest(
+            "test-hotel",
+            &AgentProfile {
+                agent_key: "beacon".into(),
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+                import_workspace: None,
+                is_admin: false,
+                orchestrator_turn_loop_config: None,
+            },
+        );
+        let profile_config: serde_json::Value =
+            serde_json::from_str(&profile_rec.config_json).unwrap();
+        assert_eq!(profile_config["command"].as_str(), Some("agent-datasource"));
+        assert_eq!(profile_rec.guest_id, rec.guest_id);
     }
 
     #[test]
