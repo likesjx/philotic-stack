@@ -13,5 +13,6 @@ pub mod operator_surface;
 pub mod perimeter;
 pub mod resource_registry;
 pub mod role_materialization;
+pub mod session_activity;
 pub mod webrtc_guest;
 pub mod webrtc_signaling;
