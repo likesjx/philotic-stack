@@ -25,12 +25,12 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 ### Primitives Refactor
 
 - [x] Extract mesh envelope primitives into `philotic-primitives-mesh`.
-- [x] Extract hotel/runtime capability and registry primitives into `philotic-primitives-hotel` behind compatibility shims.
-- [x] Extract graph/storage primitives into `philotic-primitives-data` behind compatibility shims.
-- [x] Extract agent/session/memory primitives into `philotic-primitives-agent` behind compatibility shims.
-- [x] Extract tool/skill primitives into `philotic-primitives-tool` behind compatibility shims.
-- [x] Extract tool execution route/config envelopes into `philotic-primitives-tool` where they are shared by session shaping and tool routing.
-- [x] Extract model-routing DTOs into `philotic-primitives-model` behind compatibility shims.
+- [ ] Extract hotel/runtime capability and registry primitives into `philotic-primitives-hotel` behind compatibility shims. <!-- NOT DONE: crate is a `cargo new` stub (only `add(2,2)`), zero live types, not a workspace member. See ARCHITECTURE_STATUS.md "primitives split is NOT implemented" (2026-07-05 correction, PR #128). -->
+- [ ] Extract graph/storage primitives into `philotic-primitives-data` behind compatibility shims. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
+- [ ] Extract agent/session/memory primitives into `philotic-primitives-agent` behind compatibility shims. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
+- [ ] Extract tool/skill primitives into `philotic-primitives-tool` behind compatibility shims. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
+- [ ] Extract tool execution route/config envelopes into `philotic-primitives-tool` where they are shared by session shaping and tool routing. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
+- [ ] Extract model-routing DTOs into `philotic-primitives-model` behind compatibility shims. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
 - [x] Extract the `ModelManagerInvoker` wiring out of `ansible-mesh-core`.
 - [ ] Migrate downstream crates off the remaining `ansible-mesh-core` compatibility imports where direct primitive crates are now clearer.
 
