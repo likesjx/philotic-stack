@@ -255,6 +255,14 @@ pub struct TurnLoopConfig {
     /// next tier. Defaults to `["model", "model.local"]` when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_tiers: Vec<String>,
+    /// Per-role override for the maximum number of paracrine delegation hops
+    /// allowed in a single turn's chain. `None` -> use the agent default (5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_hop_budget: Option<u32>,
+    /// Per-role override for the cumulative wall-clock budget (seconds) of a
+    /// turn's paracrine delegation chain. `None` -> use the agent default (900).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_chain_budget_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

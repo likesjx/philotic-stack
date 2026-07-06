@@ -12,9 +12,10 @@ use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors, MediaRoutingPolicy,
     MemoryAuthority, MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope,
-    MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, RecalledMemoryRecord,
-    SessionState, ToolDefinition, ToolExecutionRoute, ToolRunnerIncarnationBinding, TtsMode,
-    VoiceResponsePolicy, WorkingTurn, merge_session_index,
+    MemoryTemporalKind, MemoryValidationLevel, ParacrineBudgetOutcome, ParacrineThreadStatus,
+    RecalledMemoryRecord, SessionState, ToolDefinition, ToolExecutionRoute,
+    ToolRunnerIncarnationBinding, TtsMode, VoiceResponsePolicy, WorkingTurn, charge_paracrine_hop,
+    merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -2014,6 +2015,8 @@ impl AgentRuntime {
                 fallback_tier: if self.network_offline { 1 } else { 0 },
                 streaming_retry_attempts: 0,
                 streamed_content: String::new(),
+                paracrine_hop_count: 0,
+                paracrine_chain_started_at: None,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -5424,6 +5427,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         }
     }
 
@@ -5859,6 +5864,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));
