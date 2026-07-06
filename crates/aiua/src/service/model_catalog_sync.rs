@@ -26,6 +26,10 @@ use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
 use ansible_mesh_core::model_catalog_discovery::{
     CatalogDiffEvent, CatalogDiffKind, DiscoveredModel, diff_catalog, parse_openrouter_models,
 };
+use ansible_mesh_core::model_routing::{
+    DEFAULT_FALLBACK_TIERS, ProviderRouting, RoutingImpact, routing_impact_for_model,
+};
+use ansible_mesh_core::provider_keys::provider_key_specs;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 /// Config-node key holding the last OpenRouter discovery snapshot, so diffs
@@ -103,17 +107,32 @@ pub async fn run_once(
     // Skip alerts on the first run — with no baseline everything is "Added" and
     // would flood the queue. We just record the baseline.
     if !first_run {
+        // Load the live routing picture once so a catalog change can be re-cast as
+        // a *routing* alert naming the affected ladder, not just catalog news.
+        let providers = provider_routings(graph);
+        let ladders = fallback_ladders(graph);
         for ev in &diffs {
             let Some(text) = heal_text(ev) else { continue };
-            match heal {
-                Some(hq) => {
-                    if let Err(e) = hq.push_error(GUEST_ID, &text) {
-                        warn!("model-catalog-sync: heal push failed: {e}");
-                    } else {
-                        alerts += 1;
-                    }
+            let mut texts = vec![text];
+            // Routing-impact overlay: if this retired / thinking-flipped model is
+            // some provider's configured default_model, name the ladders that
+            // route through it (distinct entry — routing impact, not catalog news).
+            if routing_relevant(ev) {
+                for impact in routing_impact_for_model(&ev.model_ref, &providers, &ladders) {
+                    texts.push(routing_impact_text(ev, &impact));
                 }
-                None => warn!("model-catalog-sync alert (no heal queue): {text}"),
+            }
+            for text in texts {
+                match heal {
+                    Some(hq) => {
+                        if let Err(e) = hq.push_error(GUEST_ID, &text) {
+                            warn!("model-catalog-sync: heal push failed: {e}");
+                        } else {
+                            alerts += 1;
+                        }
+                    }
+                    None => warn!("model-catalog-sync alert (no heal queue): {text}"),
+                }
             }
         }
     }
@@ -145,6 +164,97 @@ fn heal_text(ev: &CatalogDiffEvent) -> Option<String> {
     }
 }
 
+/// The catalog changes that can break routing: a model the provider retired, or
+/// one that flipped to thinking-by-default. Mirrors [`heal_text`]'s gate.
+fn routing_relevant(ev: &CatalogDiffEvent) -> bool {
+    matches!(ev.kind, CatalogDiffKind::Removed)
+        || (matches!(ev.kind, CatalogDiffKind::ReasoningChanged)
+            && ev.reasoning_default == Some(true))
+}
+
+/// A distinct heal entry that names the routing surface a catalog change lands on
+/// (default_model + any fallback ladder routing through the provider), so the
+/// operator sees the routing consequence, not just the catalog fact.
+fn routing_impact_text(ev: &CatalogDiffEvent, impact: &RoutingImpact) -> String {
+    let verb = match ev.kind {
+        CatalogDiffKind::Removed => "RETIRED",
+        _ => "flipped to thinking-by-default for",
+    };
+    let ladders = if impact.affected_ladders.is_empty() {
+        "no configured fallback ladder (default_model only)".to_string()
+    } else {
+        format!(
+            "fallback ladder(s): [{}]",
+            impact.affected_ladders.join(", ")
+        )
+    };
+    format!(
+        "model-catalog ROUTING IMPACT: provider '{}' {verb} '{}', which is the configured default_model for '{}' — affects {}. Turns routing there will escalate into the next tier (or a void) until reconfigured.",
+        ev.provider, ev.model_ref, impact.matched_model, ladders
+    )
+}
+
+/// Read a config-stored string value, tolerating both JSON-quoted and raw forms
+/// (config writers store strings via `serde_json::to_string`, i.e. quoted).
+fn config_string(graph: &GraphDomain, key: &str) -> Option<String> {
+    let raw = graph.get_config_value(key).ok().flatten()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or(raw);
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Build the per-provider routing facts (controller roles + configured
+/// default_model) from the provider key specs and stored config.
+fn provider_routings(graph: &GraphDomain) -> Vec<ProviderRouting> {
+    provider_key_specs()
+        .iter()
+        .map(|spec| {
+            let default_model = spec
+                .default_model_key
+                .and_then(|key| config_string(graph, key))
+                .or_else(|| spec.default_model.map(str::to_string));
+            ProviderRouting {
+                provider: spec.provider.to_string(),
+                allowed_roles: spec.allowed_roles.iter().map(|r| r.to_string()).collect(),
+                default_model,
+            }
+        })
+        .collect()
+}
+
+/// All fallback ladders in play: every role incarnation's configured tiers plus
+/// the default ladder every role without configured tiers actually runs.
+fn fallback_ladders(graph: &GraphDomain) -> Vec<(String, Vec<String>)> {
+    let mut ladders: Vec<(String, Vec<String>)> = Vec::new();
+    ladders.push((
+        "default fallback ladder".to_string(),
+        DEFAULT_FALLBACK_TIERS
+            .iter()
+            .map(|t| t.to_string())
+            .collect(),
+    ));
+    if let Ok(incarnations) = graph.list_all_role_incarnations() {
+        for rec in incarnations {
+            let tiers = &rec.turn_loop_config.fallback_tiers;
+            if tiers.is_empty() {
+                continue;
+            }
+            ladders.push((
+                format!("role:{}:{}", rec.agent_id, rec.role_name),
+                tiers.clone(),
+            ));
+        }
+    }
+    ladders
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +277,45 @@ mod tests {
         assert!(heal_text(&ev(CatalogDiffKind::ReasoningChanged, Some(false))).is_none());
         assert!(heal_text(&ev(CatalogDiffKind::Added, Some(true))).is_none());
         assert!(heal_text(&ev(CatalogDiffKind::ContextChanged, None)).is_none());
+    }
+
+    #[test]
+    fn routing_relevant_matches_heal_text_gate() {
+        assert!(routing_relevant(&ev(CatalogDiffKind::Removed, None)));
+        assert!(routing_relevant(&ev(
+            CatalogDiffKind::ReasoningChanged,
+            Some(true)
+        )));
+        assert!(!routing_relevant(&ev(
+            CatalogDiffKind::ReasoningChanged,
+            Some(false)
+        )));
+        assert!(!routing_relevant(&ev(CatalogDiffKind::Added, None)));
+    }
+
+    #[test]
+    fn routing_impact_text_names_affected_ladder() {
+        // An OpenRouter-prefixed retirement of gemini's default_model resolves onto
+        // the orchestrator ladder that routes tier 0 through "model".
+        let mut event = ev(CatalogDiffKind::Removed, None);
+        event.provider = "openrouter".into();
+        event.model_ref = "google/gemini-2.0-flash-exp".into();
+
+        let providers = vec![ProviderRouting {
+            provider: "gemini".into(),
+            allowed_roles: vec!["model".into(), "model.gemini".into()],
+            default_model: Some("gemini-2.0-flash-exp".into()),
+        }];
+        let ladders = vec![(
+            "role:jane:orchestrator".to_string(),
+            vec!["model".to_string(), "model.local".to_string()],
+        )];
+
+        let impacts = routing_impact_for_model(&event.model_ref, &providers, &ladders);
+        assert_eq!(impacts.len(), 1);
+        let text = routing_impact_text(&event, &impacts[0]);
+        assert!(text.contains("ROUTING IMPACT"));
+        assert!(text.contains("role:jane:orchestrator"));
+        assert!(text.contains("gemini-2.0-flash-exp"));
     }
 }
