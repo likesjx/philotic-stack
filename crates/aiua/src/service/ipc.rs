@@ -1116,6 +1116,12 @@ pub struct IpcServer {
     /// Signal channel: send `()` to trigger a hotel-state broadcast to all backbone peers.
     /// Fired on guest register/deregister so peers stay in sync.
     hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
+    /// Agent-resource-broker registry (agent-resource-broker seam). Records
+    /// resource grants/denials and answers routing-table queries. Inert this
+    /// slice: it does NOT materialize or tear down guests — that stays with the
+    /// GuestManager path. Seeded at boot via `boot_reconcile` and shared with
+    /// the boot reconciler through the same `Arc`.
+    resource_registry: Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
 }
 
 impl IpcServer {
@@ -2128,11 +2134,25 @@ impl IpcServer {
             perimeter_svc: None,
             egress_gw: None,
             hotel_state_dirty_tx: None,
+            resource_registry: Arc::new(Mutex::new(
+                crate::service::resource_registry::ResourceRegistry::new(),
+            )),
         }
     }
 
     pub fn with_hotel_state_dirty_tx(mut self, tx: mpsc::Sender<()>) -> Self {
         self.hotel_state_dirty_tx = Some(tx);
+        self
+    }
+
+    /// Share a boot-seeded resource registry with the front desk. The same
+    /// `Arc` is populated by `boot_reconcile` at startup so live IPC queries
+    /// see the demand-derived tenancy state, not an empty table.
+    pub fn with_resource_registry(
+        mut self,
+        registry: Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
+    ) -> Self {
+        self.resource_registry = registry;
         self
     }
 
@@ -2287,6 +2307,7 @@ impl IpcServer {
                     let perimeter_svc = self.perimeter_svc.clone();
                     let egress_gw = self.egress_gw.clone();
                     let hotel_state_dirty_tx = self.hotel_state_dirty_tx.clone();
+                    let resource_registry = self.resource_registry.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -2318,6 +2339,7 @@ impl IpcServer {
                             perimeter_svc,
                             egress_gw,
                             hotel_state_dirty_tx,
+                            resource_registry,
                         )
                         .await
                         {
@@ -2369,6 +2391,7 @@ impl IpcServer {
         perimeter_svc: Option<Arc<crate::service::perimeter::HotelPerimeterService>>,
         egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
         hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
+        resource_registry: Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -2717,6 +2740,7 @@ impl IpcServer {
                             &mut current_identity,
                             &mut follow_up_responses,
                             operator_surface_tx.as_ref(),
+                            &resource_registry,
                         )
                         .await;
                         // New guest registered — broadcast updated roster to peers.
@@ -3267,6 +3291,7 @@ impl IpcServer {
         current_identity: &mut Option<GuestIdentity>,
         follow_up_responses: &mut Vec<IpcResponse>,
         operator_surface_tx: Option<&mpsc::Sender<String>>,
+        resource_registry: &Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
     ) -> IpcResponse {
         match req {
             IpcRequest::Register(identity) => {
@@ -6425,18 +6450,45 @@ impl IpcServer {
                     )
                 }
             },
-            // Resource broker seam (agent-resource-broker). No callers yet;
-            // hotel-side broker will be wired in the demand-derived-materialization seam.
-            IpcRequest::ResourceRequest(_req) => IpcResponse::error(
-                "resource_request",
-                "NOT_IMPLEMENTED",
-                "resource broker not yet wired",
-            ),
-            IpcRequest::ResourceReleased(_rel) => IpcResponse::error(
-                "resource_released",
-                "NOT_IMPLEMENTED",
-                "resource broker not yet wired",
-            ),
+            // Resource broker seam (agent-resource-broker). The registry records
+            // grants/denials and answers routing-table queries; it does NOT
+            // materialize or tear down guests this slice (that stays with the
+            // GuestManager path). No production guest issues these yet, so this
+            // wiring is observably no-op for existing flows.
+            IpcRequest::ResourceRequest(req) => {
+                use crate::service::resource_registry::RegistryOutcome;
+                let outcome = resource_registry.lock().await.register_request(req);
+                match outcome {
+                    RegistryOutcome::Granted(resource_granted) => {
+                        IpcResponse::ResourceGranted { resource_granted }
+                    }
+                    RegistryOutcome::Materializing(resource_materializing) => {
+                        IpcResponse::ResourceMaterializing {
+                            resource_materializing,
+                        }
+                    }
+                    RegistryOutcome::Denied(resource_denied) => {
+                        IpcResponse::ResourceDenied { resource_denied }
+                    }
+                }
+            }
+            IpcRequest::ResourceReleased(rel) => {
+                let zero_tenants = resource_registry.lock().await.apply_release(&rel);
+                IpcResponse::Standard {
+                    ok: true,
+                    code: "RESOURCE_RELEASED".to_string(),
+                    message: if zero_tenants {
+                        "released; instance now has zero tenants".to_string()
+                    } else {
+                        "released".to_string()
+                    },
+                    corr_id: "resource_released".to_string(),
+                    data: Some(serde_json::json!({
+                        "instance_id": rel.instance_id,
+                        "zero_tenants": zero_tenants,
+                    })),
+                }
+            }
             IpcRequest::RegisterComponent { manifest } => {
                 Self::handle_register_component(graph, materialization_requester, manifest).await
             }
