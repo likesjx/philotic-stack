@@ -6,6 +6,7 @@ pub mod golgi;
 pub mod guest_manager;
 pub mod ipc;
 pub mod lease;
+pub mod lease_handlers;
 pub mod mesh_dispatcher;
 pub mod model_catalog_sync;
 pub mod operator_surface;
