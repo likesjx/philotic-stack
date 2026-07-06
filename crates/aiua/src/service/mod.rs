@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod lease;
 pub mod lease_handlers;
 pub mod mesh_dispatcher;
+pub mod mesh_runtime;
 pub mod model_catalog_sync;
 pub mod operator_surface;
 pub mod perimeter;
