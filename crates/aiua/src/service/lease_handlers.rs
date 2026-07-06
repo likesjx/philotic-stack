@@ -350,8 +350,22 @@ impl IpcServer {
         }
     }
 
+    /// Whether a runtime lease has expired by wall-clock time.
+    ///
+    /// `lease_expires_at == 0` means "no expiry recorded" (e.g. a candidate
+    /// template before `acquire` stamps `now + ttl`) and must NOT be treated as
+    /// expired — dead owners are caught separately by the `*_owner_is_live`
+    /// liveness checks. Only a recorded expiry (`> 0`) at or past the current
+    /// second counts as expired (inclusive boundary, so a lease lapses promptly
+    /// at its TTL rather than lingering an extra second). Telegram-poll and
+    /// Discord-gateway leases share this semantic so `lease_expires_at == 0`
+    /// behaves identically across transports.
+    fn runtime_lease_is_expired(lease: &LeaseEnvelope) -> bool {
+        lease.lease_expires_at > 0 && unix_ts() >= lease.lease_expires_at
+    }
+
     fn telegram_poll_lease_is_expired(lease: &LeaseEnvelope) -> bool {
-        lease.lease_expires_at <= unix_ts()
+        Self::runtime_lease_is_expired(lease)
     }
 
     fn telegram_poll_lease_owner_is_live(
@@ -433,7 +447,7 @@ impl IpcServer {
     }
 
     fn discord_gateway_lease_is_expired(lease: &LeaseEnvelope) -> bool {
-        lease.lease_expires_at > 0 && unix_ts() > lease.lease_expires_at
+        Self::runtime_lease_is_expired(lease)
     }
 
     fn discord_gateway_lease_owner_is_live(
@@ -3110,5 +3124,58 @@ mod tests {
             SubagentLeaseTerms::default().ttl_seconds
         );
         assert_eq!(IpcServer::subagent_renew_ttl_secs(None), 300);
+    }
+
+    fn lease_with_expiry(lease_expires_at: u64) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "telegram_poll".into(),
+            lease_scope: "telegram_poll".into(),
+            authority_hotel: "local-aiua-01".into(),
+            authority_component: Some("aiua".into()),
+            owner_guest_id: "membrane-telegram".into(),
+            owner_hotel: Some("local-aiua-01".into()),
+            owner_component_type: Some("membrane".into()),
+            lease_epoch: 1,
+            lease_expires_at,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn telegram_and_discord_lease_expiry_agree_on_zero_expiry() {
+        // Regression: `lease_expires_at == 0` means "no expiry recorded" and must
+        // be treated identically (not-expired) by both transports. Previously the
+        // telegram predicate (`<= now`) reported 0 as always-expired while discord
+        // (`> 0 && now > expires`) reported it as never-expired.
+        let no_expiry = lease_with_expiry(0);
+        assert!(!IpcServer::telegram_poll_lease_is_expired(&no_expiry));
+        assert!(!IpcServer::discord_gateway_lease_is_expired(&no_expiry));
+        assert_eq!(
+            IpcServer::telegram_poll_lease_is_expired(&no_expiry),
+            IpcServer::discord_gateway_lease_is_expired(&no_expiry),
+            "0 = no expiry recorded must behave identically across transports"
+        );
+    }
+
+    #[test]
+    fn telegram_and_discord_lease_expiry_agree_on_past_and_future() {
+        // A recorded expiry in the past is expired; a future one is not — and both
+        // transports agree.
+        let past = lease_with_expiry(1);
+        assert!(IpcServer::telegram_poll_lease_is_expired(&past));
+        assert!(IpcServer::discord_gateway_lease_is_expired(&past));
+
+        // Inclusive boundary: an expiry at the current second is expired, so a
+        // lease lapses promptly at its TTL (matches the takeover flow).
+        let at_boundary = lease_with_expiry(unix_ts());
+        assert!(IpcServer::telegram_poll_lease_is_expired(&at_boundary));
+        assert!(IpcServer::discord_gateway_lease_is_expired(&at_boundary));
+
+        let future = lease_with_expiry(unix_ts() + 3600);
+        assert!(!IpcServer::telegram_poll_lease_is_expired(&future));
+        assert!(!IpcServer::discord_gateway_lease_is_expired(&future));
     }
 }
