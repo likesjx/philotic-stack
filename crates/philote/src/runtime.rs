@@ -57,6 +57,19 @@ pub const DEFAULT_AGENT_ID: &str = "agent-bjork-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
+const MEMORY_CANDIDATE_POLICY: &str = "Emit memory_candidate only when this exchange contains \
+durable future-useful context: a user preference, explicit decision, stable fact, validation \
+outcome, reality gap, next seam, or recurring pattern. Omit it for greetings, acknowledgments, \
+readiness/status chatter, transient task progress, tool logs, transcripts, or routine task-list \
+churn. The candidate must be atomic: concept is a specific short slug, content is 1-3 sentences \
+and 24-700 characters, tags are optional with 10 or fewer short tags.";
+
+fn cognitive_response_contract(channels: &[&str]) -> Value {
+    json!({
+        "channels": channels,
+        "memory_candidate_policy": MEMORY_CANDIDATE_POLICY,
+    })
+}
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
@@ -526,14 +539,21 @@ fn voice_response_provider_options(policy: &VoiceResponsePolicy) -> Map<String, 
 
 fn voice_response_contract(policy: &VoiceResponsePolicy) -> Value {
     if policy.delivery_mode.is_native_audio() {
-        json!({
-            "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"],
-            "modalities": ["text", "audio"]
-        })
+        let mut contract = cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+            "memory_concept",
+        ]);
+        contract["modalities"] = json!(["text", "audio"]);
+        contract
     } else {
-        json!({
-            "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"]
-        })
+        cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+            "memory_concept",
+        ])
     }
 }
 
@@ -2113,9 +2133,11 @@ impl AgentRuntime {
                     .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
                     .await?;
                 self.sync_session_index(&index_state).await?;
-                let response_contract = Some(serde_json::json!({
-                    "channels": ["spoken_text", "memory_candidate", "active_plan"]
-                }));
+                let response_contract = Some(cognitive_response_contract(&[
+                    "spoken_text",
+                    "memory_candidate",
+                    "active_plan",
+                ]));
                 let response_route = Some(model_response_route(
                     self.sessions.get(&session_id),
                     response_contract.as_ref(),
@@ -2683,9 +2705,12 @@ impl AgentRuntime {
         };
         let (response_contract, provider_options) = voice_delivery_envelope(
             self.sessions.get(&session_id),
-            Some(serde_json::json!({
-                "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"]
-            })),
+            Some(cognitive_response_contract(&[
+                "spoken_text",
+                "memory_candidate",
+                "active_plan",
+                "memory_concept",
+            ])),
         );
         let (target_node, target_role, target_guest_id) = {
             let (node, role, guest_id) = resolve_model_execution_target(
@@ -3213,9 +3238,12 @@ impl AgentRuntime {
             state.clear_handoff_summary();
         }
 
-        let response_contract = Some(
-            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
-        );
+        let response_contract = Some(cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+            "memory_concept",
+        ]));
         let response_route = Some(model_response_route(
             self.sessions.get(&session_id),
             response_contract.as_ref(),
@@ -3895,9 +3923,11 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let response_contract = Some(
-            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-        );
+        let response_contract = Some(cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+        ]));
         let response_route = Some(model_response_route(
             self.sessions.get(&session_id),
             response_contract.as_ref(),
@@ -5892,9 +5922,9 @@ mod tests {
     use super::{
         AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE,
         MAX_ORACLE_EXTRA_TIERS, NoResponseAction, NoResponseClass, ProviderErrorClass,
-        classify_provider_error, context_pressure_pct_from_projection, decide_no_response_action,
-        extract_model_error, extract_model_error_payload, format_role_command_reply,
-        format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
+        classify_provider_error, cognitive_response_contract, context_pressure_pct_from_projection,
+        decide_no_response_action, extract_model_error, extract_model_error_payload,
+        format_role_command_reply, format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
         media_analysis_attachments, next_ladder_tier, normalized_user_content,
         parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
         resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
@@ -6006,6 +6036,22 @@ mod tests {
                 "{class:?} with no tier remaining must evict"
             );
         }
+    }
+
+    #[test]
+    fn cognitive_response_contract_carries_memory_candidate_policy() {
+        let contract = cognitive_response_contract(&["spoken_text", "memory_candidate"]);
+
+        assert_eq!(
+            contract["channels"],
+            serde_json::json!(["spoken_text", "memory_candidate"])
+        );
+        let policy = contract["memory_candidate_policy"]
+            .as_str()
+            .expect("memory candidate policy should be present");
+        assert!(policy.contains("durable future-useful context"));
+        assert!(policy.contains("readiness/status chatter"));
+        assert!(policy.contains("24-700 characters"));
     }
 
     pub(super) fn test_working_turn(phase: TurnPhase) -> WorkingTurn {

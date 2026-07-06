@@ -1,6 +1,6 @@
 use crate::controller::{
-    AttachmentInput, AttemptPolicy, ControllerTask, ModelProvider, NativeLiveProvider,
-    NativeLiveTurnOutput, ProviderOutput, RetryPolicy, TaskKind,
+    AttachmentInput, AttemptPolicy, ControllerTask, DEFAULT_MEMORY_CANDIDATE_POLICY, ModelProvider,
+    NativeLiveProvider, NativeLiveTurnOutput, ProviderOutput, RetryPolicy, TaskKind,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -656,6 +656,7 @@ impl GeminiProvider {
         tools: &[serde_json::Value],
         wants_concept: bool,
         wants_plan: bool,
+        memory_candidate_policy: Option<&str>,
     ) -> Value {
         let tool_list: String = tools
             .iter()
@@ -684,14 +685,15 @@ impl GeminiProvider {
             .join("\n");
 
         let memory_instruction = if wants_concept {
-            " If — and only if — this exchange contains something genuinely worth remembering \
-             (a user preference, a decision made, a fact learned, or a pattern worth recalling later), \
-             include \"memory_candidate\" with fields: \"concept\" (short kebab-case slug), \
-             \"content\" (one or two sentences distilling what is worth keeping), and optional \
-             \"tags\" (array of short strings). Omit memory_candidate entirely for routine \
-             exchanges, simple questions, greetings, or transient state."
+            let policy = memory_candidate_policy.unwrap_or(DEFAULT_MEMORY_CANDIDATE_POLICY);
+            format!(
+                " Follow the Memory candidate policy in the prompt. If and only if the policy says \
+                 this exchange is worth remembering, include \"memory_candidate\" with fields: \
+                 \"concept\" (short slug), \"content\" (atomic durable memory), and optional \
+                 \"tags\" (array of short strings). Policy: {policy}"
+            )
         } else {
-            ""
+            String::new()
         };
 
         let plan_instruction = if wants_plan {
@@ -748,22 +750,24 @@ impl GeminiProvider {
         prompt: &str,
         wants_concept: bool,
         wants_plan: bool,
+        memory_candidate_policy: Option<&str>,
     ) -> Value {
         let system_text = if wants_concept {
-            "When generating your response, produce a JSON object with \"display_text\" \
-             (your full response formatted for text display, markdown is fine) and \
-             \"spoken_text\" (a natural, expressive version for voice delivery — no markdown, \
-             conversational tone, written to be heard). If — and only if — this exchange contains \
-             something genuinely worth remembering (a user preference, a decision, a fact learned, \
-             or a recurring pattern), also include \"memory_candidate\" (an object with \"concept\" \
-             as a short kebab-case slug, \"content\" as one or two sentences distilling what is \
-             worth keeping, and optional \"tags\"). Omit memory_candidate entirely for routine \
-             exchanges, greetings, or transient state."
+            let policy = memory_candidate_policy.unwrap_or(DEFAULT_MEMORY_CANDIDATE_POLICY);
+            format!(
+                "When generating your response, produce a JSON object with \"display_text\" \
+                 (your full response formatted for text display, markdown is fine) and \
+                 \"spoken_text\" (a natural, expressive version for voice delivery, no markdown). \
+                 Follow the Memory candidate policy in the prompt. If and only if the policy says \
+                 this exchange is worth remembering, include \"memory_candidate\" with \
+                 \"concept\", \"content\", and optional \"tags\". Policy: {policy}"
+            )
         } else {
             "When generating your response, produce a JSON object with two fields: \
              \"display_text\" (your full response formatted for text display, \
              markdown is fine) and \"spoken_text\" (a natural, expressive version \
-             for voice delivery — no markdown, conversational tone, written to be heard)."
+             for voice delivery, no markdown, conversational tone, written to be heard)."
+                .to_string()
         };
 
         let mut properties = json!({
@@ -1740,9 +1744,15 @@ impl ModelProvider for GeminiProvider {
                         &task.tools,
                         wants_concept,
                         wants_plan,
+                        task.response_contract.memory_candidate_policy.as_deref(),
                     )
                 } else if use_structured {
-                    Self::structured_text_request_payload(&prompt, wants_concept, wants_plan)
+                    Self::structured_text_request_payload(
+                        &prompt,
+                        wants_concept,
+                        wants_plan,
+                        task.response_contract.memory_candidate_policy.as_deref(),
+                    )
                 } else {
                     Self::request_payload(&prompt)
                 }
@@ -1882,9 +1892,20 @@ impl ModelProvider for GeminiProvider {
                 .composed_prompt_text()
                 .context("Gemini streaming text task missing prompt")?;
             if has_tools {
-                Self::tool_aware_request_payload(&prompt, &task.tools, wants_concept, wants_plan)
+                Self::tool_aware_request_payload(
+                    &prompt,
+                    &task.tools,
+                    wants_concept,
+                    wants_plan,
+                    task.response_contract.memory_candidate_policy.as_deref(),
+                )
             } else if use_structured {
-                Self::structured_text_request_payload(&prompt, wants_concept, wants_plan)
+                Self::structured_text_request_payload(
+                    &prompt,
+                    wants_concept,
+                    wants_plan,
+                    task.response_contract.memory_candidate_policy.as_deref(),
+                )
             } else {
                 Self::request_payload(&prompt)
             }
@@ -2993,6 +3014,7 @@ mod tests {
             })],
             false,
             false,
+            None,
         );
 
         let declaration = &payload["tools"][0]["functionDeclarations"][0];
@@ -3028,8 +3050,13 @@ mod tests {
         // tools.functionDeclarations is unsupported by Gemini — every
         // tool-bearing turn 400'd while tool-less turns (schema, no tools)
         // succeeded on the same model. Function-calling mode wins.
-        let payload =
-            GeminiProvider::tool_aware_request_payload("hello", &[sample_echo_tool()], true, true);
+        let payload = GeminiProvider::tool_aware_request_payload(
+            "hello",
+            &[sample_echo_tool()],
+            true,
+            true,
+            None,
+        );
 
         let generation_config = payload["generationConfig"]
             .as_object()
@@ -3063,7 +3090,7 @@ mod tests {
     #[test]
     fn structured_text_payload_keeps_response_schema() {
         // Tool-less structured turns keep controlled generation exactly as before.
-        let payload = GeminiProvider::structured_text_request_payload("hello", true, true);
+        let payload = GeminiProvider::structured_text_request_payload("hello", true, true, None);
 
         let generation_config = payload["generationConfig"]
             .as_object()
@@ -3150,6 +3177,7 @@ mod tests {
                     &[sample_echo_tool()],
                     wants_concept,
                     wants_plan,
+                    None,
                 );
                 assert_no_controlled_generation_with_tools(
                     &tool_aware,
@@ -3163,6 +3191,7 @@ mod tests {
                     "hello",
                     wants_concept,
                     wants_plan,
+                    None,
                 );
                 assert_no_controlled_generation_with_tools(
                     &structured,

@@ -105,7 +105,15 @@ pub struct ResponseContract {
     pub modalities: Vec<String>,
     pub style: Option<String>,
     pub channels: Vec<String>,
+    pub memory_candidate_policy: Option<String>,
 }
+
+pub const DEFAULT_MEMORY_CANDIDATE_POLICY: &str = "Emit memory_candidate only when this exchange \
+contains durable future-useful context: a user preference, explicit decision, stable fact, \
+validation outcome, reality gap, next seam, or recurring pattern. Omit it for greetings, \
+acknowledgments, readiness/status chatter, transient task progress, tool logs, transcripts, \
+or routine task-list churn. The candidate must be atomic: concept is a specific short slug, \
+content is 1-3 sentences and 24-700 characters, tags are optional with 10 or fewer short tags.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProjectionItem {
@@ -448,6 +456,17 @@ impl ControllerTask {
             if !text.is_empty() {
                 sections.push(format!("[Recalled memory]\n{text}"));
             }
+        }
+
+        if self.wants_channel("memory_candidate") {
+            let policy = self
+                .response_contract
+                .memory_candidate_policy
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .unwrap_or(DEFAULT_MEMORY_CANDIDATE_POLICY);
+            sections.push(format!("[Memory candidate policy]\n{policy}"));
         }
 
         if !self.context.dialogue_window.is_empty() {
@@ -814,6 +833,12 @@ fn parse_response_contract(value: Option<&Value>) -> ResponseContract {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        memory_candidate_policy: object
+            .get("memory_candidate_policy")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -2561,7 +2586,8 @@ mod tests {
                 }
             },
             "response_contract": {
-                "channels": ["display_text", "spoken_text", "working_memory_delta"]
+                "channels": ["display_text", "spoken_text", "working_memory_delta"],
+                "memory_candidate_policy": "Only store durable operator preferences."
             }
         }))
         .unwrap();
@@ -2569,6 +2595,31 @@ mod tests {
         assert!(task.wants_channel("spoken_text"));
         assert!(task.wants_channel("working_memory_delta"));
         assert!(!task.wants_channel("follow_up_questions"));
+        assert_eq!(
+            task.response_contract.memory_candidate_policy.as_deref(),
+            Some("Only store durable operator preferences.")
+        );
+    }
+
+    #[test]
+    fn composed_prompt_includes_memory_candidate_policy_when_requested() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": {
+                    "text": "remember the operator preference"
+                }
+            },
+            "response_contract": {
+                "channels": ["spoken_text", "memory_candidate"],
+                "memory_candidate_policy": "Only store durable operator preferences."
+            }
+        }))
+        .unwrap();
+
+        let prompt = task.composed_prompt_text().expect("prompt should compose");
+        assert!(prompt.contains("[Memory candidate policy]"));
+        assert!(prompt.contains("Only store durable operator preferences."));
     }
 
     #[test]
