@@ -330,7 +330,17 @@ impl IpcServer {
         session.updated_at = now;
         let _ = graph.upsert_session(&session);
 
-        if let (Some(component_id), Some(role)) = (participant_role, participant_role) {
+        if let Some(role) = participant_role {
+            // The participant's `component_id` must identify the concrete guest that
+            // fills `role`, not the role label itself. Prefer the explicit
+            // delivery-target guest id when the payload carries one; only fall back to
+            // the role string when no concrete component id is known (e.g. a raw
+            // publish/create payload recorded before delivery context is attached).
+            let component_id = payload
+                .get("delivery_target_guest_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(role);
             let _ = graph.upsert_session_participant(&SessionParticipantRecord {
                 session_id: session_id.clone(),
                 component_id: component_id.to_string(),
@@ -1039,5 +1049,67 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[test]
+    fn record_session_activity_participant_component_id_is_distinct_from_role() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        // Payload carrying the concrete guest filling the target role.
+        let payload = serde_json::json!({
+            "session_id": "sess-participant-1",
+            "turn_id": "turn-participant-1",
+            "delivery_target_guest_id": "philote-orchestrator-guest-01",
+        });
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &payload,
+            None,
+            None,
+            Some("orchestrator"),
+            "publish_message",
+        );
+
+        let participants = graph
+            .list_session_participants("sess-participant-1")
+            .expect("list participants should work");
+        assert_eq!(participants.len(), 1, "exactly one participant recorded");
+        let participant = &participants[0];
+        // Regression: component_id must be the real guest id, not the role string.
+        assert_eq!(participant.component_id, "philote-orchestrator-guest-01");
+        assert_eq!(participant.role, "orchestrator");
+        assert_ne!(
+            participant.component_id, participant.role,
+            "component_id must not collapse to the role label"
+        );
+    }
+
+    #[test]
+    fn record_session_activity_participant_falls_back_to_role_without_target_guest() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        // No delivery_target_guest_id: no concrete component id is known, so the role
+        // label is the documented fallback for component_id.
+        let payload = serde_json::json!({
+            "session_id": "sess-participant-2",
+            "turn_id": "turn-participant-2",
+        });
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &payload,
+            None,
+            None,
+            Some("gateway"),
+            "publish_message",
+        );
+
+        let participants = graph
+            .list_session_participants("sess-participant-2")
+            .expect("list participants should work");
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].component_id, "gateway");
+        assert_eq!(participants[0].role, "gateway");
     }
 }
