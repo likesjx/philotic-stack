@@ -252,6 +252,66 @@ impl AgentRuntime {
                 let owner_turn_id = owner_turn.as_ref().map(|(_, tid, _)| tid.clone());
                 let owner_chat_id = owner_turn.as_ref().map(|(_, _, cid)| cid.clone());
                 if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    // Charge one delegation hop against the turn's cross-hop budget
+                    // BEFORE closing the thread, so a breach can close it with the
+                    // budget-exhausted disposition instead of Completed. The per-hop
+                    // iteration reset (below) removes the only other bound on
+                    // whisper->re-entry->whisper chains, so this is what stops a
+                    // misbehaving orchestrator<->specialist pair from spinning forever.
+                    let breach = if let Some(state) = self.sessions.get_mut(sid) {
+                        let exec = state.settings.execution.clone();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        state.active_turn.as_mut().and_then(|turn| {
+                            let turn_id = turn.turn_id.clone();
+                            match charge_paracrine_hop(turn, &exec, now) {
+                                ParacrineBudgetOutcome::WithinBudget => None,
+                                ParacrineBudgetOutcome::HopsExhausted { hops, budget } => Some((
+                                    turn_id,
+                                    format!(
+                                        "This delegation chain exceeded its budget of {budget} hops \
+                                         (reached {hops}) and was stopped. A specialist role kept \
+                                         handing work back and forth without resolving. Please \
+                                         restate the request or narrow the task."
+                                    ),
+                                )),
+                                ParacrineBudgetOutcome::TimeExhausted {
+                                    elapsed_secs,
+                                    budget_secs,
+                                } => Some((
+                                    turn_id,
+                                    format!(
+                                        "This delegation chain exceeded its cumulative time budget \
+                                         of {budget_secs}s (ran {elapsed_secs}s) and was stopped. \
+                                         Delegation ran too long without resolving. Please restate \
+                                         the request or narrow the task."
+                                    ),
+                                )),
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
+                    if let Some((turn_id, notice)) = breach {
+                        if let Some(state) = self.sessions.get_mut(sid) {
+                            state.close_paracrine_thread(
+                                pid,
+                                ParacrineThreadStatus::BudgetExhausted,
+                                task.content.clone(),
+                                Some("budget_exhausted".into()),
+                            );
+                        }
+                        warn!(
+                            session_id = %sid,
+                            paracrine_id = %pid,
+                            "paracrine delegation chain exceeded its budget; failing turn"
+                        );
+                        return self.fail_active_turn(sid.clone(), turn_id, notice).await;
+                    }
+
                     if let Some(state) = self.sessions.get_mut(sid) {
                         state.close_paracrine_thread(
                             pid,
@@ -475,10 +535,8 @@ impl AgentRuntime {
         // Defaults to ReflectiveReEntry if absent or unrecognised.
         let explicit_response_routing =
             args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
-                serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
-                    s.to_string(),
-                ))
-                .ok()
+                serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(s.to_string()))
+                    .ok()
             });
         let wait_requested = args
             .get("wait_for_response")
@@ -593,11 +651,7 @@ impl AgentRuntime {
                     let checkpoint_json = state.checkpoint_json();
                     let index_state = state.clone();
                     self.ipc_client
-                        .sync_apartment(
-                            &self.agent_id,
-                            &checkpoint_memory_type,
-                            checkpoint_json,
-                        )
+                        .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
                         .await?;
                     self.sync_session_index(&index_state).await?;
                 }
@@ -732,8 +786,7 @@ impl AgentRuntime {
         };
 
         // Append role attribution tag (same as deliver_text_reply does).
-        let attributed_content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME")
-        {
+        let attributed_content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME") {
             if !role_name.is_empty() {
                 format!("{}\n\n@agent:{}", content, role_name)
             } else {
@@ -842,8 +895,8 @@ impl AgentRuntime {
 mod tests {
     use super::super::tests::{def004_working_turn, run_recording_hotel};
     use super::AgentRuntime;
-    use crate::protocol::InboundTaskPayload;
     use crate::r#loop::TurnPhase;
+    use crate::protocol::InboundTaskPayload;
     use uuid::Uuid;
 
     /// Suppression-path guard: `paracrine_merge_completed` must only suppress the
@@ -917,5 +970,128 @@ mod tests {
             *emitted
         );
         assert_eq!(send_replies[0]["task"]["content"], final_text);
+    }
+
+    /// Cross-hop budget guard: when an `EnrichedToolResult` re-entry pushes the
+    /// turn's delegation chain past its hop budget, the turn must fail with an
+    /// operator-visible notice and the paracrine thread must close with the
+    /// `BudgetExhausted` disposition (not `Completed`, and not re-entering the
+    /// model). Without this, whisper->re-entry->whisper chains have no cross-hop
+    /// bound because each hop resets `iteration` to 0.
+    #[tokio::test]
+    async fn enriched_tool_result_breaching_budget_fails_turn() {
+        use crate::session::ParacrineThreadStatus;
+
+        let socket_path = format!("/tmp/philote-budget-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-budget".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-budget");
+
+        let session_id = "sess-budget";
+        let turn_id = "turn-budget";
+        let pid = "paracrine-budget-1";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Owner turn that has already traversed the full default hop budget (5).
+        let mut turn = def004_working_turn(turn_id, "delegate.whisper");
+        turn.pending_tool_call = None;
+        turn.phase = TurnPhase::WaitingTool;
+        turn.associated_paracrine_ids.push(pid.into());
+        turn.paracrine_hop_count = 5; // default budget; this incoming hop is the 6th
+
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.start_turn(turn);
+            state.open_paracrine_thread(
+                pid.into(),
+                "specialist".into(),
+                "do the thing".into(),
+                philotic_client::ParacrineRouting::EnrichedToolResult,
+                "delegated".into(),
+                "inherit".into(),
+                "inherit".into(),
+            );
+        }
+
+        let exosome = philotic_client::Exosome {
+            prompt: String::new(),
+            context: None,
+            paracrine_id: Some(pid.into()),
+            response_routing: Some(philotic_client::ParacrineRouting::EnrichedToolResult),
+            source_session_id: Some(session_id.into()),
+            source_chat_id: None,
+        };
+
+        runtime
+            .handle_paracrine_response(
+                InboundTaskPayload {
+                    action: Some("paracrine_response".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some(turn_id.into()),
+                    content: Some("specialist reply".into()),
+                    exosome: Some(serde_json::to_value(&exosome).unwrap()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handle paracrine response");
+
+        // The paracrine thread must be closed as BudgetExhausted, not Completed.
+        let thread_status = runtime
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.paracrine_threads.iter().find(|t| t.id == pid))
+            .map(|t| t.status.clone())
+            .expect("thread present");
+        assert!(
+            matches!(thread_status, ParacrineThreadStatus::BudgetExhausted),
+            "thread should be BudgetExhausted, got {thread_status:?}"
+        );
+
+        // The active turn must have been failed (cleared).
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .is_none(),
+            "active turn should be failed and cleared"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        // An operator-visible send_reply must carry the budget notice.
+        let emitted = emitted.lock().unwrap();
+        let budget_reply = emitted.iter().find(|e| {
+            e["task"]["action"] == "send_reply"
+                && e["task"]["content"]
+                    .as_str()
+                    .map(|c| c.contains("delegation chain exceeded its budget"))
+                    .unwrap_or(false)
+        });
+        assert!(
+            budget_reply.is_some(),
+            "expected an operator-visible budget-exhaustion reply: {:#?}",
+            *emitted
+        );
     }
 }

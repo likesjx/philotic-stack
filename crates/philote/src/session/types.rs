@@ -512,6 +512,9 @@ pub enum ParacrineThreadStatus {
     Cancelled,
     Expired,
     Escalated,
+    /// Terminal: the delegation chain was closed because it exhausted its
+    /// cross-hop budget (hop count or cumulative wall-clock).
+    BudgetExhausted,
 }
 
 impl ParacrineThreadStatus {
@@ -523,6 +526,7 @@ impl ParacrineThreadStatus {
             Self::Cancelled => "cancelled",
             Self::Expired => "expired",
             Self::Escalated => "escalated",
+            Self::BudgetExhausted => "budget_exhausted",
         }
     }
 }
@@ -641,6 +645,20 @@ pub struct WorkingTurn {
     /// `partial_reply`. Reset implicitly per turn (new `WorkingTurn` starts empty).
     #[serde(default)]
     pub streamed_content: String,
+    /// Number of paracrine delegation hops this turn's chain has traversed.
+    /// A hop is one `delegate.whisper` -> specialist -> `EnrichedToolResult`
+    /// re-entry. The per-hop re-entry resets `iteration` to 0 (the turn was
+    /// blocked, not thinking), so this is the only cross-hop bound on runaway
+    /// orchestrator<->specialist ping-pong. `#[serde(default)]` so checkpoints
+    /// written before this field deserialize to 0.
+    #[serde(default)]
+    pub paracrine_hop_count: u32,
+    /// Unix-seconds timestamp of the first paracrine hop in this turn's
+    /// delegation chain. `None` until the first hop is charged; used to enforce
+    /// the cumulative wall-clock budget across hops. `#[serde(default)]` so old
+    /// checkpoints deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_chain_started_at: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -998,6 +1016,26 @@ pub struct ExecutionPolicy {
     /// Number of consecutive step failures before the loop surfaces to the user
     /// instead of continuing. Default: 3.
     pub stall_detection_threshold: u32,
+    /// Maximum number of paracrine delegation hops (whisper -> specialist ->
+    /// re-entry) allowed in a single turn's delegation chain before the turn is
+    /// failed. Bounds runaway orchestrator<->specialist ping-pong that the
+    /// per-hop iteration reset would otherwise leave unchecked. Default: 5.
+    /// Serde default so older serialized `ExecutionPolicy` values load.
+    #[serde(default = "default_paracrine_hop_budget")]
+    pub paracrine_hop_budget: u32,
+    /// Cumulative wall-clock budget (seconds) for a turn's paracrine delegation
+    /// chain, measured from the first hop. Default: 900 (15 minutes).
+    /// Serde default so older serialized `ExecutionPolicy` values load.
+    #[serde(default = "default_paracrine_chain_budget_secs")]
+    pub paracrine_chain_budget_secs: u64,
+}
+
+fn default_paracrine_hop_budget() -> u32 {
+    5
+}
+
+fn default_paracrine_chain_budget_secs() -> u64 {
+    900
 }
 
 impl Default for ExecutionPolicy {
@@ -1007,7 +1045,70 @@ impl Default for ExecutionPolicy {
             plan_required_on_skill: true,
             stream_tool_events: true,
             stall_detection_threshold: 3,
+            paracrine_hop_budget: default_paracrine_hop_budget(),
+            paracrine_chain_budget_secs: default_paracrine_chain_budget_secs(),
         }
+    }
+}
+
+impl ExecutionPolicy {
+    /// Apply any paracrine-budget overrides carried on a role's
+    /// [`TurnLoopConfig`](ansible_mesh_core::graph::TurnLoopConfig). Absent
+    /// overrides leave the current (default) values untouched. Called at the
+    /// same sites that apply `iteration_cap`, since settings are re-derived from
+    /// the role activation rather than persisted in the checkpoint.
+    pub fn apply_paracrine_overrides(&mut self, tlc: &ansible_mesh_core::graph::TurnLoopConfig) {
+        if let Some(budget) = tlc.paracrine_hop_budget {
+            self.paracrine_hop_budget = budget;
+        }
+        if let Some(secs) = tlc.paracrine_chain_budget_secs {
+            self.paracrine_chain_budget_secs = secs;
+        }
+    }
+}
+
+/// Outcome of charging one paracrine delegation hop against a turn's budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParacrineBudgetOutcome {
+    /// The hop was charged and the chain is still within both budgets.
+    WithinBudget,
+    /// The chain has exceeded its hop-count budget.
+    HopsExhausted { hops: u32, budget: u32 },
+    /// The chain has exceeded its cumulative wall-clock budget.
+    TimeExhausted { elapsed_secs: u64, budget_secs: u64 },
+}
+
+/// Charge one paracrine delegation hop against `turn`, mutating its hop count
+/// and (on the first hop) its chain start timestamp, then report whether either
+/// budget in `exec` is now exhausted.
+///
+/// Semantics: `paracrine_hop_budget` hops are permitted; the `budget + 1`-th
+/// hop breaches. Time breaches when elapsed since the first hop reaches the
+/// budget. Hop breaches take precedence in reporting when both trip.
+pub fn charge_paracrine_hop(
+    turn: &mut WorkingTurn,
+    exec: &ExecutionPolicy,
+    now: u64,
+) -> ParacrineBudgetOutcome {
+    if turn.paracrine_chain_started_at.is_none() {
+        turn.paracrine_chain_started_at = Some(now);
+    }
+    turn.paracrine_hop_count = turn.paracrine_hop_count.saturating_add(1);
+    let started = turn.paracrine_chain_started_at.unwrap_or(now);
+    let elapsed = now.saturating_sub(started);
+
+    if turn.paracrine_hop_count > exec.paracrine_hop_budget {
+        ParacrineBudgetOutcome::HopsExhausted {
+            hops: turn.paracrine_hop_count,
+            budget: exec.paracrine_hop_budget,
+        }
+    } else if elapsed >= exec.paracrine_chain_budget_secs {
+        ParacrineBudgetOutcome::TimeExhausted {
+            elapsed_secs: elapsed,
+            budget_secs: exec.paracrine_chain_budget_secs,
+        }
+    } else {
+        ParacrineBudgetOutcome::WithinBudget
     }
 }
 
@@ -1380,4 +1481,189 @@ pub struct UserTask {
     pub next_step_idx: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_note: Option<String>,
+}
+
+#[cfg(test)]
+mod paracrine_budget_tests {
+    use super::*;
+    use crate::r#loop::TurnPhase;
+    use uuid::Uuid;
+
+    /// Minimal fresh working turn with the paracrine budget counters at their
+    /// starting values (0 hops, no chain start).
+    fn sample_turn() -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::new_v4(),
+            turn_id: "turn-test".into(),
+            chat_id: "chat-1".into(),
+            primary_user_id: None,
+            user_content: "hi".into(),
+            final_reply_to: "node-1".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+        }
+    }
+
+    #[test]
+    fn default_execution_policy_carries_paracrine_budget() {
+        let exec = ExecutionPolicy::default();
+        assert_eq!(exec.paracrine_hop_budget, 5);
+        assert_eq!(exec.paracrine_chain_budget_secs, 900);
+    }
+
+    #[test]
+    fn charge_increments_hop_count_and_sets_chain_start() {
+        let mut turn = sample_turn();
+        let exec = ExecutionPolicy::default();
+        assert_eq!(turn.paracrine_hop_count, 0);
+        assert_eq!(turn.paracrine_chain_started_at, None);
+
+        let outcome = charge_paracrine_hop(&mut turn, &exec, 1_000);
+        assert_eq!(outcome, ParacrineBudgetOutcome::WithinBudget);
+        assert_eq!(turn.paracrine_hop_count, 1);
+        assert_eq!(turn.paracrine_chain_started_at, Some(1_000));
+
+        // A later hop must not move the chain start (it anchors the wall clock).
+        let _ = charge_paracrine_hop(&mut turn, &exec, 1_050);
+        assert_eq!(turn.paracrine_hop_count, 2);
+        assert_eq!(turn.paracrine_chain_started_at, Some(1_000));
+    }
+
+    #[test]
+    fn hop_budget_permits_exactly_budget_hops_then_breaches() {
+        let mut turn = sample_turn();
+        let exec = ExecutionPolicy::default(); // budget 5 hops
+        // Hops 1..=5 stay within budget.
+        for expected in 1..=5u32 {
+            let outcome = charge_paracrine_hop(&mut turn, &exec, 1_000);
+            assert_eq!(
+                outcome,
+                ParacrineBudgetOutcome::WithinBudget,
+                "hop {expected} should be within budget"
+            );
+            assert_eq!(turn.paracrine_hop_count, expected);
+        }
+        // The 6th hop breaches.
+        let outcome = charge_paracrine_hop(&mut turn, &exec, 1_000);
+        assert_eq!(
+            outcome,
+            ParacrineBudgetOutcome::HopsExhausted { hops: 6, budget: 5 }
+        );
+    }
+
+    #[test]
+    fn cumulative_wall_clock_budget_breaches_on_elapsed() {
+        let mut turn = sample_turn();
+        let exec = ExecutionPolicy::default(); // 900s budget
+        // First hop anchors the clock at t=1000.
+        assert_eq!(
+            charge_paracrine_hop(&mut turn, &exec, 1_000),
+            ParacrineBudgetOutcome::WithinBudget
+        );
+        // A hop 899s later is still within budget.
+        assert_eq!(
+            charge_paracrine_hop(&mut turn, &exec, 1_899),
+            ParacrineBudgetOutcome::WithinBudget
+        );
+        // A hop exactly 900s later breaches on time (well under the 5-hop cap).
+        assert_eq!(
+            charge_paracrine_hop(&mut turn, &exec, 1_900),
+            ParacrineBudgetOutcome::TimeExhausted {
+                elapsed_secs: 900,
+                budget_secs: 900,
+            }
+        );
+    }
+
+    #[test]
+    fn role_override_tightens_hop_budget() {
+        let mut exec = ExecutionPolicy::default();
+        let tlc = ansible_mesh_core::graph::TurnLoopConfig {
+            paracrine_hop_budget: Some(1),
+            paracrine_chain_budget_secs: Some(60),
+            ..Default::default()
+        };
+        exec.apply_paracrine_overrides(&tlc);
+        assert_eq!(exec.paracrine_hop_budget, 1);
+        assert_eq!(exec.paracrine_chain_budget_secs, 60);
+
+        let mut turn = sample_turn();
+        // With the tightened budget, hop 1 is allowed and hop 2 breaches.
+        assert_eq!(
+            charge_paracrine_hop(&mut turn, &exec, 0),
+            ParacrineBudgetOutcome::WithinBudget
+        );
+        assert_eq!(
+            charge_paracrine_hop(&mut turn, &exec, 0),
+            ParacrineBudgetOutcome::HopsExhausted { hops: 2, budget: 1 }
+        );
+    }
+
+    #[test]
+    fn role_override_absent_leaves_defaults() {
+        let mut exec = ExecutionPolicy::default();
+        exec.apply_paracrine_overrides(&ansible_mesh_core::graph::TurnLoopConfig::default());
+        assert_eq!(exec.paracrine_hop_budget, 5);
+        assert_eq!(exec.paracrine_chain_budget_secs, 900);
+    }
+
+    #[test]
+    fn old_checkpoint_without_budget_fields_deserializes_to_defaults() {
+        // Serialize a turn that has non-default budget counters, then strip the
+        // new fields to simulate a checkpoint written before this feature.
+        let mut turn = sample_turn();
+        turn.paracrine_hop_count = 4;
+        turn.paracrine_chain_started_at = Some(12_345);
+        let mut json = serde_json::to_value(&turn).expect("serialize");
+        let obj = json.as_object_mut().expect("object");
+        obj.remove("paracrine_hop_count");
+        obj.remove("paracrine_chain_started_at");
+        assert!(!obj.contains_key("paracrine_hop_count"));
+
+        let restored: WorkingTurn =
+            serde_json::from_value(json).expect("deserialize old checkpoint");
+        assert_eq!(restored.paracrine_hop_count, 0);
+        assert_eq!(restored.paracrine_chain_started_at, None);
+    }
+
+    #[test]
+    fn old_execution_policy_without_budget_fields_deserializes_to_defaults() {
+        // An ExecutionPolicy serialized before the paracrine budget fields existed.
+        let json = serde_json::json!({
+            "iteration_cap": 10,
+            "plan_required_on_skill": true,
+            "stream_tool_events": true,
+            "stall_detection_threshold": 3
+        });
+        let exec: ExecutionPolicy = serde_json::from_value(json).expect("deserialize old policy");
+        assert_eq!(exec.paracrine_hop_budget, 5);
+        assert_eq!(exec.paracrine_chain_budget_secs, 900);
+    }
 }

@@ -3679,6 +3679,13 @@ impl SessionState {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                paracrine_hop_count: turn
+                    .get("paracrine_hop_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                paracrine_chain_started_at: turn
+                    .get("paracrine_chain_started_at")
+                    .and_then(serde_json::Value::as_u64),
             })
         });
 
@@ -4804,6 +4811,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         }
     }
 
@@ -4845,6 +4854,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -5104,6 +5115,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -5154,6 +5167,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -6022,6 +6037,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         let projection = state.build_context_projection("status");
@@ -6115,6 +6132,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         let prompt = state.build_prompt("status");
@@ -6315,6 +6334,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -6399,6 +6420,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -7394,6 +7417,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -7451,6 +7476,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         state.push_tool_history(
@@ -7523,6 +7550,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         state.push_tool_history(
@@ -7596,6 +7625,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         let reentry = state
@@ -7884,6 +7915,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -8157,6 +8190,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         }
     }
 
@@ -8282,6 +8317,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         };
         state.start_turn(turn);
         state.push_tool_history(

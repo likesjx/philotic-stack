@@ -12,9 +12,10 @@ use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors, MediaRoutingPolicy,
     MemoryAuthority, MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope,
-    MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, RecalledMemoryRecord,
-    SessionState, ToolDefinition, ToolExecutionRoute, ToolRunnerIncarnationBinding, TtsMode,
-    VoiceResponsePolicy, WorkingTurn, merge_session_index,
+    MemoryTemporalKind, MemoryValidationLevel, ParacrineBudgetOutcome, ParacrineThreadStatus,
+    RecalledMemoryRecord, SessionState, ToolDefinition, ToolExecutionRoute,
+    ToolRunnerIncarnationBinding, TtsMode, VoiceResponsePolicy, WorkingTurn, charge_paracrine_hop,
+    merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -2014,6 +2015,8 @@ impl AgentRuntime {
                 fallback_tier: if self.network_offline { 1 } else { 0 },
                 streaming_retry_attempts: 0,
                 streamed_content: String::new(),
+                paracrine_hop_count: 0,
+                paracrine_chain_started_at: None,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -5165,6 +5168,13 @@ impl AgentRuntime {
                         {
                             state.settings.execution.iteration_cap = cap.clamp(1, 50);
                         }
+                        if let Some(tlc) = state
+                            .role_activation
+                            .as_ref()
+                            .and_then(|ra| ra.turn_loop_config.clone())
+                        {
+                            state.settings.execution.apply_paracrine_overrides(&tlc);
+                        }
 
                         self.sessions.insert(session_id.to_string(), state);
                         return Ok(());
@@ -5201,6 +5211,9 @@ impl AgentRuntime {
                     .and_then(|c| c.iteration_cap)
                 {
                     state.settings.execution.iteration_cap = cap.clamp(1, 50);
+                }
+                if let Some(tlc) = activation.turn_loop_config.as_ref() {
+                    state.settings.execution.apply_paracrine_overrides(tlc);
                 }
                 state.role_activation = Some(activation);
                 if let Some(profile_name) = toolset_profile_ref.as_deref() {
@@ -5371,7 +5384,7 @@ async fn run_bash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
+        AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
         extract_model_error_payload, format_role_command_reply, format_roles_report,
         loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments,
         normalized_user_content, resolve_media_routing, resolve_model_execution_target,
@@ -5424,6 +5437,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         }
     }
 
@@ -5859,6 +5874,8 @@ mod tests {
             fallback_tier: 0,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));
@@ -6558,5 +6575,86 @@ mod tests {
         assert_eq!(reply["target_node"], "membrane-node-01");
         assert_eq!(reply["target_role"], "membrane");
         assert_eq!(reply["target_guest_id"], "membrane-seat-1");
+    }
+
+    /// Wiring guard: a role whose `TurnLoopConfig` carries paracrine-budget
+    /// overrides must have them applied to the live session's `ExecutionPolicy`
+    /// when the role is activated via a handoff bundle — not merely stored on the
+    /// role record. This is the assertion that survives refactors of the
+    /// activation sites.
+    #[tokio::test]
+    async fn role_activation_applies_paracrine_budget_override() {
+        let socket_path = format!("/tmp/philote-roleovr-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-roleovr".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-roleovr");
+
+        // Register a role whose TurnLoopConfig tightens the paracrine budgets.
+        runtime.configured_roles.insert(
+            "specialist".to_string(),
+            CachedRoleConfig {
+                toolset_profile: "default".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                iteration_cap: None,
+                approval_policy: None,
+                turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
+                    paracrine_hop_budget: Some(9),
+                    paracrine_chain_budget_secs: Some(120),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let session_id = "sess-roleovr";
+        let task_id = Uuid::new_v4();
+        let bundle = philotic_client::HandoffBundle {
+            to_role: Some("specialist".into()),
+            from_role: Some("orchestrator".into()),
+            handoff_reason: Some("test".into()),
+            working_summary: Some("do the thing".into()),
+            ..Default::default()
+        };
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some("turn-roleovr".into()),
+                    handoff_bundle: Some(bundle),
+                    ..Default::default()
+                },
+                task_id,
+            )
+            .await
+            .expect("handoff bundle");
+
+        let exec = &runtime
+            .session(session_id)
+            .expect("session exists")
+            .settings
+            .execution;
+        assert_eq!(
+            exec.paracrine_hop_budget, 9,
+            "role TurnLoopConfig hop budget must be applied at activation"
+        );
+        assert_eq!(
+            exec.paracrine_chain_budget_secs, 120,
+            "role TurnLoopConfig time budget must be applied at activation"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
     }
 }

@@ -334,6 +334,9 @@ impl AgentRuntime {
             {
                 state.settings.execution.iteration_cap = cap.clamp(1, 50);
             }
+            if let Some(tlc) = activation.turn_loop_config.as_ref() {
+                state.settings.execution.apply_paracrine_overrides(tlc);
+            }
             state.role_activation = Some(activation);
             // Synthesise the handoff context: prefer working_summary if the sender provided one
             // (e.g. build_same_identity_handoff_bundle); otherwise fall back to goal + context_excerpt,
