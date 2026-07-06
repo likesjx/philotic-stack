@@ -15,7 +15,9 @@ use crate::service::lease::{
 };
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::graph::MembraneTransportHomeStatus;
-use philotic_client::{GuestIdentity, IpcResponse, LeaseEnvelope, LeaseStatus, SubagentDelegation};
+use philotic_client::{
+    GuestIdentity, IpcResponse, LeaseEnvelope, LeaseStatus, SubagentDelegation, SubagentLeaseTerms,
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -348,8 +350,22 @@ impl IpcServer {
         }
     }
 
+    /// Whether a runtime lease has expired by wall-clock time.
+    ///
+    /// `lease_expires_at == 0` means "no expiry recorded" (e.g. a candidate
+    /// template before `acquire` stamps `now + ttl`) and must NOT be treated as
+    /// expired — dead owners are caught separately by the `*_owner_is_live`
+    /// liveness checks. Only a recorded expiry (`> 0`) at or past the current
+    /// second counts as expired (inclusive boundary, so a lease lapses promptly
+    /// at its TTL rather than lingering an extra second). Telegram-poll and
+    /// Discord-gateway leases share this semantic so `lease_expires_at == 0`
+    /// behaves identically across transports.
+    fn runtime_lease_is_expired(lease: &LeaseEnvelope) -> bool {
+        lease.lease_expires_at > 0 && unix_ts() >= lease.lease_expires_at
+    }
+
     fn telegram_poll_lease_is_expired(lease: &LeaseEnvelope) -> bool {
-        lease.lease_expires_at <= unix_ts()
+        Self::runtime_lease_is_expired(lease)
     }
 
     fn telegram_poll_lease_owner_is_live(
@@ -431,7 +447,7 @@ impl IpcServer {
     }
 
     fn discord_gateway_lease_is_expired(lease: &LeaseEnvelope) -> bool {
-        lease.lease_expires_at > 0 && unix_ts() > lease.lease_expires_at
+        Self::runtime_lease_is_expired(lease)
     }
 
     fn discord_gateway_lease_owner_is_live(
@@ -646,6 +662,7 @@ impl IpcServer {
                     hook_subscriptions: delegation.hook_subscriptions.clone(),
                     completion_route: delegation.completion_route.clone(),
                     failure_route: delegation.failure_route.clone(),
+                    configured_ttl_secs: ttl,
                 },
             );
         }
@@ -1518,6 +1535,16 @@ impl IpcServer {
         IpcResponse::success("release_mcp_membrane_lease", None)
     }
 
+    /// Resolve the TTL (seconds) a subagent-lease renewal should use: honor the
+    /// TTL the delegation skill configured at spawn time (recorded on the hook
+    /// record), falling back to the `SubagentLeaseTerms` default when no hook
+    /// record is registered for the subagent.
+    fn subagent_renew_ttl_secs(record: Option<&SubagentHookRecord>) -> u64 {
+        record
+            .map(|record| record.configured_ttl_secs)
+            .unwrap_or_else(|| SubagentLeaseTerms::default().ttl_seconds)
+    }
+
     pub(super) async fn handle_renew_subagent_lease(
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: &SubagentHookRegistry,
@@ -1535,12 +1562,11 @@ impl IpcServer {
         };
         let scope = Self::subagent_lease_scope(&subagent_guest_id);
         let ttl = {
-            // Read the registered TTL from hook record, fall back to default.
+            // Renew under the TTL the delegation skill configured at spawn time
+            // (stored on the hook record). Fall back to the SubagentLeaseTerms
+            // default only when no hook record is registered for this subagent.
             let guard = subagent_hooks.lock().await;
-            // We can't store ttl in SubagentHookRecord easily without adding a field —
-            // for now use the default 300s. Block F will wire this from the skill record.
-            let _ = guard.get(&subagent_guest_id);
-            300u64
+            Self::subagent_renew_ttl_secs(guard.get(&subagent_guest_id))
         };
         let outcome = {
             let mut guard = subagent_leases.lock().await;
@@ -3063,5 +3089,93 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    fn hook_record_with_ttl(ttl_secs: u64) -> SubagentHookRecord {
+        SubagentHookRecord {
+            persona_guest_id: "persona-1".into(),
+            persona_role: "developer".into(),
+            hook_subscriptions: Vec::new(),
+            completion_route: philotic_client::HookRoute::default(),
+            failure_route: philotic_client::HookRoute::default(),
+            configured_ttl_secs: ttl_secs,
+        }
+    }
+
+    #[test]
+    fn subagent_renew_ttl_honors_configured_record_value() {
+        // A subagent spawned with a non-default lease TTL must renew under the same
+        // terms, not the previously-hardcoded 300s.
+        let record = hook_record_with_ttl(1200);
+        assert_eq!(IpcServer::subagent_renew_ttl_secs(Some(&record)), 1200);
+        assert_ne!(
+            IpcServer::subagent_renew_ttl_secs(Some(&record)),
+            SubagentLeaseTerms::default().ttl_seconds,
+            "custom TTL must not collapse to the default"
+        );
+    }
+
+    #[test]
+    fn subagent_renew_ttl_falls_back_to_default_without_record() {
+        // No hook record registered (e.g. after a restart): fall back to the
+        // SubagentLeaseTerms default.
+        assert_eq!(
+            IpcServer::subagent_renew_ttl_secs(None),
+            SubagentLeaseTerms::default().ttl_seconds
+        );
+        assert_eq!(IpcServer::subagent_renew_ttl_secs(None), 300);
+    }
+
+    fn lease_with_expiry(lease_expires_at: u64) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "telegram_poll".into(),
+            lease_scope: "telegram_poll".into(),
+            authority_hotel: "local-aiua-01".into(),
+            authority_component: Some("aiua".into()),
+            owner_guest_id: "membrane-telegram".into(),
+            owner_hotel: Some("local-aiua-01".into()),
+            owner_component_type: Some("membrane".into()),
+            lease_epoch: 1,
+            lease_expires_at,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn telegram_and_discord_lease_expiry_agree_on_zero_expiry() {
+        // Regression: `lease_expires_at == 0` means "no expiry recorded" and must
+        // be treated identically (not-expired) by both transports. Previously the
+        // telegram predicate (`<= now`) reported 0 as always-expired while discord
+        // (`> 0 && now > expires`) reported it as never-expired.
+        let no_expiry = lease_with_expiry(0);
+        assert!(!IpcServer::telegram_poll_lease_is_expired(&no_expiry));
+        assert!(!IpcServer::discord_gateway_lease_is_expired(&no_expiry));
+        assert_eq!(
+            IpcServer::telegram_poll_lease_is_expired(&no_expiry),
+            IpcServer::discord_gateway_lease_is_expired(&no_expiry),
+            "0 = no expiry recorded must behave identically across transports"
+        );
+    }
+
+    #[test]
+    fn telegram_and_discord_lease_expiry_agree_on_past_and_future() {
+        // A recorded expiry in the past is expired; a future one is not — and both
+        // transports agree.
+        let past = lease_with_expiry(1);
+        assert!(IpcServer::telegram_poll_lease_is_expired(&past));
+        assert!(IpcServer::discord_gateway_lease_is_expired(&past));
+
+        // Inclusive boundary: an expiry at the current second is expired, so a
+        // lease lapses promptly at its TTL (matches the takeover flow).
+        let at_boundary = lease_with_expiry(unix_ts());
+        assert!(IpcServer::telegram_poll_lease_is_expired(&at_boundary));
+        assert!(IpcServer::discord_gateway_lease_is_expired(&at_boundary));
+
+        let future = lease_with_expiry(unix_ts() + 3600);
+        assert!(!IpcServer::telegram_poll_lease_is_expired(&future));
+        assert!(!IpcServer::discord_gateway_lease_is_expired(&future));
     }
 }

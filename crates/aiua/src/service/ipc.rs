@@ -76,6 +76,9 @@ pub(super) struct SubagentHookRecord {
     pub(super) completion_route: HookRoute,
     /// Where to deliver `subagent.failed`.
     pub(super) failure_route: HookRoute,
+    /// Lease TTL (seconds) the delegation skill configured at spawn time.
+    /// Used to renew the subagent lease with the same terms it was acquired under.
+    pub(super) configured_ttl_secs: u64,
 }
 
 /// Maps `subagent_guest_id` → routing record.
@@ -3235,74 +3238,6 @@ impl IpcServer {
             .and_then(|guest| guest.active_pid)
             .and_then(|pid| pid.parse::<u32>().ok())
             .is_some_and(Self::pid_exists))
-    }
-
-    async fn queue_or_deliver_guest_task(
-        graph: &GraphDomain,
-        inboxes: &InboxRegistry,
-        parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
-        materialization_requester: Option<&dyn GuestMaterializationRequester>,
-        local_node_id: &str,
-        target_role: &str,
-        guest_id: &str,
-        task_id: Uuid,
-        task_json: String,
-        activate_session_id: Option<String>,
-    ) -> anyhow::Result<bool> {
-        let task_json = attach_delivery_context(
-            graph,
-            local_node_id,
-            target_role,
-            Some(guest_id),
-            &task_json,
-        );
-        let is_live = {
-            let guard = inboxes.lock().await;
-            guard
-                .get(target_role)
-                .into_iter()
-                .flatten()
-                .any(|subscriber| subscriber.guest_id == guest_id)
-        };
-
-        if is_live {
-            if let Some(session_id) = activate_session_id.as_deref() {
-                Self::update_session_active_incarnation(graph, session_id, guest_id)?;
-            }
-            Self::deliver_inbound_task(
-                inboxes,
-                local_node_id,
-                target_role,
-                Some(guest_id),
-                task_id,
-                task_json,
-            )
-            .await;
-            return Ok(true);
-        }
-
-        {
-            let mut guard = parked_inbound.lock().await;
-            guard
-                .entry(guest_id.to_string())
-                .or_default()
-                .push(ParkedInboundTask {
-                    source_node: local_node_id.to_string(),
-                    task_id,
-                    task_json,
-                    activate_session_id,
-                });
-        }
-
-        if let Some(requester) = materialization_requester {
-            requester.ensure_guest_active(guest_id).await?;
-        } else {
-            warn!(
-                "Task {} parked for guest [{}], but no materialization requester is configured.",
-                task_id, guest_id
-            );
-        }
-        Ok(false)
     }
 
     async fn process_request(
@@ -11541,7 +11476,9 @@ pub(super) fn handle_register_skill(
         SkillValidationState::Draft => ("draft".to_string(), vec![]),
         SkillValidationState::Registered => ("registered".to_string(), vec![]),
         SkillValidationState::Active => ("active".to_string(), vec![]),
-        SkillValidationState::Suspended { reason } => ("suspended".to_string(), vec![reason.clone()]),
+        SkillValidationState::Suspended { reason } => {
+            ("suspended".to_string(), vec![reason.clone()])
+        }
         SkillValidationState::Deprecated => ("deprecated".to_string(), vec![]),
     };
 
@@ -11738,9 +11675,7 @@ pub(crate) mod tests {
             .expect("skill should be persisted");
         assert_eq!(stored.skill_name, "research.assistant");
 
-        let audits = graph
-            .list_skill_registration_audits()
-            .expect("list audits");
+        let audits = graph.list_skill_registration_audits().expect("list audits");
         assert_eq!(audits.len(), 1, "exactly one audit event expected");
         let audit = &audits[0];
         assert_eq!(audit.skill_name, "research.assistant");

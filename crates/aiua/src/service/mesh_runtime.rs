@@ -3,15 +3,15 @@
 //!
 //! Extracted verbatim from `main.rs`; no behavior change.
 
+use ansible_mesh_core::NodeCapabilities;
 use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::event::EventEnvelope;
 use ansible_mesh_core::heartbeat::{
     CapabilitySyncPayload, HeartbeatPayload, emit_capability_sync, emit_heartbeat,
 };
 use ansible_mesh_core::registry::NodeRegistry;
 use ansible_mesh_core::storage::{CursorStorage, EventStorage, HotelRecord};
-use ansible_mesh_core::NodeCapabilities;
-use ansible_mesh_core::event::EventEnvelope;
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,7 +61,8 @@ pub(crate) struct MeshRuntimeContext {
     pub(crate) perimeter_svc: Arc<crate::service::perimeter::HotelPerimeterService>,
     pub(crate) ipc_operator_surface_tx: Option<mpsc::Sender<String>>,
     /// Shared hotel roster snapshot used by BeaconDaemon for anchor handshakes.
-    pub(crate) local_hotel_state: Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>>,
+    pub(crate) local_hotel_state:
+        Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>>,
 }
 
 pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {

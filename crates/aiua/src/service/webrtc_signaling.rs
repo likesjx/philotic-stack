@@ -12,7 +12,10 @@ use uuid::Uuid;
 use super::ipc::IpcServer;
 
 impl IpcServer {
-    pub(crate) fn hotel_exists_for_node(graph: &GraphDomain, target_node_id: &str) -> anyhow::Result<bool> {
+    pub(crate) fn hotel_exists_for_node(
+        graph: &GraphDomain,
+        target_node_id: &str,
+    ) -> anyhow::Result<bool> {
         Ok(graph
             .list_hotels()?
             .into_iter()

@@ -8004,6 +8004,11 @@ mod tests {
 
     #[test]
     fn profile_socket_path_is_hotel_scoped() {
+        // Serialize with the IPC env tests: this test reads PHILOTIC_HOTEL_SOCKET
+        // (inside hotel_ipc_socket_path) and mutates HOME/PHILOTIC_PROFILE, so it
+        // must hold the shared env lock or it races with parallel tests that set
+        // PHILOTIC_HOTEL_SOCKET and can observe a leaked socket path.
+        let _env_guard = crate::service::ipc::tests::ipc_env_guard();
         unsafe {
             std::env::set_var("HOME", "/tmp/codex-home");
             std::env::set_var("PHILOTIC_PROFILE", "jane");
@@ -8026,6 +8031,9 @@ mod tests {
 
     #[test]
     fn explicit_socket_env_overrides_default_derivation() {
+        // Shares PHILOTIC_HOTEL_SOCKET / PHILOTIC_PROFILE with the sibling env
+        // tests; hold the shared lock so they do not race.
+        let _env_guard = crate::service::ipc::tests::ipc_env_guard();
         unsafe {
             std::env::remove_var("PHILOTIC_PROFILE");
             std::env::set_var("PHILOTIC_HOTEL_SOCKET", "/run/philotic/test.sock");
@@ -8094,6 +8102,9 @@ mod tests {
 
     #[test]
     fn graph_datasource_guest_env_is_profile_scoped() {
+        // Mutates HOME / PHILOTIC_PROFILE shared with the sibling env tests; hold
+        // the shared lock so they do not race.
+        let _env_guard = crate::service::ipc::tests::ipc_env_guard();
         unsafe {
             std::env::set_var("HOME", "/tmp/codex-home");
             std::env::set_var("PHILOTIC_PROFILE", "jane");
