@@ -235,6 +235,28 @@ pub struct LoopScript {
     pub steps: Vec<LoopStep>,
 }
 
+/// Per-role overrides for the dialogue-window / tool-history budgets carried on
+/// a session's `ContextWindowPolicy`. Every field is optional and serde-default,
+/// so old `TurnLoopConfig` records (and roles that set none of these) deserialize
+/// cleanly and leave the session's effective policy untouched. Applied at role
+/// activation and reverted to the session baseline on handoff-return, so a terse
+/// specialist and a long-form orchestrator no longer share one budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ContextWindowOverrides {
+    /// Overrides `dialogue_window_minutes` (max age of included turns).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogue_window_minutes: Option<u32>,
+    /// Overrides `dialogue_window_chars` (total char budget of the window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogue_window_chars: Option<usize>,
+    /// Overrides `max_tool_result_chars` (per-tool-result truncation budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_result_chars: Option<usize>,
+    /// Overrides `max_tool_history_entries` (tool-call entries kept per turn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_history_entries: Option<usize>,
+}
+
 /// Per-role runtime loop controls for a role incarnation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TurnLoopConfig {
@@ -263,6 +285,11 @@ pub struct TurnLoopConfig {
     /// turn's paracrine delegation chain. `None` -> use the agent default (900).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paracrine_chain_budget_secs: Option<u64>,
+    /// Per-role overrides for the session's dialogue-window / tool-history
+    /// budgets. `None` -> the session keeps its baseline `ContextWindowPolicy`.
+    /// Serde default so older serialized `TurnLoopConfig` values load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<ContextWindowOverrides>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

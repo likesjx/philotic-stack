@@ -219,6 +219,12 @@ pub struct SessionState {
     /// `None` until a plan_proposal is accepted and persisted to the hotel graph.
     /// Cleared when the task completes, fails, or is cancelled.
     pub active_user_task_id: Option<String>,
+    /// Session-baseline `ContextWindowPolicy` captured the first time a role
+    /// applies context-window overrides via a handoff bundle. Restored (and
+    /// cleared) on `handoff_return` so returning to the orchestrator reverts the
+    /// specialist's tightened/loosened budgets. Live-only — not persisted in the
+    /// checkpoint, since settings are re-derived from `role_activation` on load.
+    pub base_context_window: Option<ContextWindowPolicy>,
 }
 
 impl SessionState {
@@ -256,6 +262,34 @@ impl SessionState {
             agent_graph_snapshot: None,
             graph_preload_dispatched: false,
             active_user_task_id: None,
+            base_context_window: None,
+        }
+    }
+
+    /// Apply a role's context-window overrides to the effective session policy,
+    /// snapshotting the session baseline the first time so `handoff_return` can
+    /// restore it. Reset-to-baseline-then-apply (rather than apply-on-top) so a
+    /// specialist->specialist handoff does not inherit the previous specialist's
+    /// overridden fields — each role's overrides layer on the same baseline.
+    pub fn apply_role_context_window(
+        &mut self,
+        ov: &ansible_mesh_core::graph::ContextWindowOverrides,
+    ) {
+        if self.base_context_window.is_none() {
+            self.base_context_window = Some(self.settings.context_window.clone());
+        }
+        if let Some(base) = self.base_context_window.clone() {
+            self.settings.context_window = base;
+        }
+        self.settings.context_window.apply_overrides(ov);
+    }
+
+    /// Revert the effective context-window policy to the session baseline
+    /// captured at the first role override, then clear the snapshot. No-op when
+    /// no role override was ever applied in this live session.
+    pub fn restore_base_context_window(&mut self) {
+        if let Some(base) = self.base_context_window.take() {
+            self.settings.context_window = base;
         }
     }
 
@@ -3752,6 +3786,7 @@ impl SessionState {
                 .get("active_user_task_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            base_context_window: None,
         })
     }
 }
@@ -8341,5 +8376,69 @@ mod tests {
             !prompt.contains("Call another tool if needed"),
             "should not use old generic footer"
         );
+    }
+
+    #[test]
+    fn role_context_window_snapshots_baseline_and_restores_on_return() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let baseline = state.settings.context_window.clone();
+
+        // A terse specialist tightens the dialogue window and tool history.
+        state.apply_role_context_window(&ansible_mesh_core::graph::ContextWindowOverrides {
+            dialogue_window_chars: Some(2_000),
+            max_tool_history_entries: Some(4),
+            ..Default::default()
+        });
+        assert!(state.base_context_window.is_some(), "baseline snapshotted");
+        assert_eq!(state.settings.context_window.dialogue_window_chars, 2_000);
+        assert_eq!(state.settings.context_window.max_tool_history_entries, 4);
+        // Un-overridden fields stay at the session baseline.
+        assert_eq!(
+            state.settings.context_window.dialogue_window_minutes,
+            baseline.dialogue_window_minutes
+        );
+
+        // Returning to the orchestrator reverts to the baseline and clears the snapshot.
+        state.restore_base_context_window();
+        assert_eq!(state.settings.context_window, baseline);
+        assert!(state.base_context_window.is_none(), "snapshot cleared");
+    }
+
+    #[test]
+    fn role_context_window_second_role_does_not_inherit_first() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let baseline_minutes = state.settings.context_window.dialogue_window_minutes;
+
+        // Specialist A shrinks the window minutes.
+        state.apply_role_context_window(&ansible_mesh_core::graph::ContextWindowOverrides {
+            dialogue_window_minutes: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(state.settings.context_window.dialogue_window_minutes, 3);
+
+        // Specialist B overrides only chars — its window minutes must reset to the
+        // baseline, not inherit A's value (reset-to-baseline-then-apply).
+        state.apply_role_context_window(&ansible_mesh_core::graph::ContextWindowOverrides {
+            dialogue_window_chars: Some(5_000),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.settings.context_window.dialogue_window_minutes, baseline_minutes,
+            "second role must not inherit first role's minutes override"
+        );
+        assert_eq!(state.settings.context_window.dialogue_window_chars, 5_000);
+    }
+
+    #[test]
+    fn restore_context_window_without_snapshot_is_noop() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let baseline = state.settings.context_window.clone();
+        // No override ever applied — restore leaves the effective policy untouched.
+        state.restore_base_context_window();
+        assert_eq!(state.settings.context_window, baseline);
+        assert!(state.base_context_window.is_none());
     }
 }

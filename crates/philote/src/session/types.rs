@@ -976,6 +976,31 @@ impl Default for ContextWindowPolicy {
     }
 }
 
+impl ContextWindowPolicy {
+    /// Apply any per-role context-window overrides carried on a role's
+    /// [`TurnLoopConfig`](ansible_mesh_core::graph::TurnLoopConfig). Absent
+    /// overrides leave the current values untouched; present values are clamped
+    /// to the documented safe ranges, mirroring the `iteration_cap.clamp(1, 50)`
+    /// precedent so a role record cannot push the session outside sane bounds.
+    ///
+    /// This mutates in place, so callers snapshot the session baseline first and
+    /// revert to it on handoff-return (see `SessionState::apply_role_context_window`).
+    pub fn apply_overrides(&mut self, ov: &ansible_mesh_core::graph::ContextWindowOverrides) {
+        if let Some(minutes) = ov.dialogue_window_minutes {
+            self.dialogue_window_minutes = minutes.clamp(2, 60);
+        }
+        if let Some(chars) = ov.dialogue_window_chars {
+            self.dialogue_window_chars = chars.clamp(1_000, 50_000);
+        }
+        if let Some(chars) = ov.max_tool_result_chars {
+            self.max_tool_result_chars = chars.clamp(1_000, 500_000);
+        }
+        if let Some(entries) = ov.max_tool_history_entries {
+            self.max_tool_history_entries = entries.clamp(3, 100);
+        }
+    }
+}
+
 /// Configures the two-axis memory strategy: local rolling window + on-demand recall.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryPolicy {
@@ -1632,6 +1657,43 @@ mod paracrine_budget_tests {
         exec.apply_paracrine_overrides(&ansible_mesh_core::graph::TurnLoopConfig::default());
         assert_eq!(exec.paracrine_hop_budget, 5);
         assert_eq!(exec.paracrine_chain_budget_secs, 900);
+    }
+
+    #[test]
+    fn context_window_override_applies_and_clamps() {
+        let mut policy = ContextWindowPolicy::default();
+        // Values within range apply verbatim; out-of-range values clamp to the
+        // documented bounds rather than pushing the session outside sane limits.
+        policy.apply_overrides(&ansible_mesh_core::graph::ContextWindowOverrides {
+            dialogue_window_minutes: Some(120), // clamps to 60
+            dialogue_window_chars: Some(2_000), // within range
+            max_tool_result_chars: Some(1),     // clamps to 1_000
+            max_tool_history_entries: Some(5),  // within range
+        });
+        assert_eq!(policy.dialogue_window_minutes, 60);
+        assert_eq!(policy.dialogue_window_chars, 2_000);
+        assert_eq!(policy.max_tool_result_chars, 1_000);
+        assert_eq!(policy.max_tool_history_entries, 5);
+    }
+
+    #[test]
+    fn context_window_override_absent_leaves_defaults() {
+        let mut policy = ContextWindowPolicy::default();
+        // A serde-default (all-None) override struct — e.g. from an old role
+        // record — is a no-op and preserves the session's effective policy.
+        policy.apply_overrides(&ansible_mesh_core::graph::ContextWindowOverrides::default());
+        assert_eq!(policy, ContextWindowPolicy::default());
+    }
+
+    #[test]
+    fn old_turn_loop_config_without_context_window_deserializes() {
+        // A TurnLoopConfig persisted before this feature has no `context_window`
+        // key; it must deserialize with the field defaulting to None.
+        let json = serde_json::json!({ "iteration_cap": 7 });
+        let tlc: ansible_mesh_core::graph::TurnLoopConfig =
+            serde_json::from_value(json).expect("deserialize legacy TurnLoopConfig");
+        assert_eq!(tlc.iteration_cap, Some(7));
+        assert!(tlc.context_window.is_none());
     }
 
     #[test]

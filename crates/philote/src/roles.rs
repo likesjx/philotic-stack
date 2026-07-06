@@ -337,6 +337,16 @@ impl AgentRuntime {
             if let Some(tlc) = activation.turn_loop_config.as_ref() {
                 state.settings.execution.apply_paracrine_overrides(tlc);
             }
+            // Snapshot the session-baseline context-window policy and apply this
+            // role's overrides, so a specialist's tightened budgets are reverted
+            // on handoff_return (see handle_handoff_return).
+            if let Some(ov) = activation
+                .turn_loop_config
+                .as_ref()
+                .and_then(|c| c.context_window.as_ref())
+            {
+                state.apply_role_context_window(ov);
+            }
             state.role_activation = Some(activation);
             // Synthesise the handoff context: prefer working_summary if the sender provided one
             // (e.g. build_same_identity_handoff_bundle); otherwise fall back to goal + context_excerpt,
@@ -409,6 +419,9 @@ impl AgentRuntime {
             });
             let prev = state.role_activation.as_ref().map(|r| r.role_name.clone());
             state.role_activation = None;
+            // Revert any per-role context-window overrides applied at activation
+            // back to the session baseline captured on the inbound handoff bundle.
+            state.restore_base_context_window();
             prev
         };
 
