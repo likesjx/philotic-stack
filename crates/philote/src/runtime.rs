@@ -147,7 +147,58 @@ fn should_escalate_tier(error: &TaskErrorPayload) -> bool {
 }
 
 /// Default tier ordering when none is configured in TurnLoopConfig.
-const DEFAULT_FALLBACK_TIERS: &[&str] = &["model", "model.ollama", "model.local"];
+///
+/// Single source of truth in core so the hotel's config-time ladder validation
+/// checks the exact ladder philote runs.
+use ansible_mesh_core::model_routing::DEFAULT_FALLBACK_TIERS;
+
+/// Why a turn is being treated as "the model did not answer". Carried into the
+/// shared policy so the escalation path and the watchdog can never pick
+/// divergent escalate-vs-evict thresholds for the same underlying event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoResponseClass {
+    /// The provider returned an explicit retriable failure (network / timeout /
+    /// rate-limit / provider error) — fired immediately on the error signal.
+    ProviderFailure,
+    /// No signal arrived; the stuck-turn watchdog fired after the WaitingModel
+    /// deadline elapsed.
+    WatchdogTimeout,
+}
+
+/// What to do when the model did not produce a usable answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoResponseAction {
+    /// Re-dispatch the turn to the next fallback tier.
+    EscalateTier,
+    /// Give up on this turn (fail it with a user-visible notice).
+    EvictTurn,
+}
+
+/// The single "model didn't answer" decision table, consulted by BOTH the
+/// provider-failure escalation path and the WaitingModel watchdog (both funnel
+/// through `advance_turn_to_next_fallback_tier`). Keeping one table means their
+/// thresholds cannot silently diverge.
+///
+/// Initial values preserve pre-slice behavior exactly: escalate while a live
+/// fallback tier remains, otherwise evict. Failure class is threaded so a future
+/// slice can diverge (e.g. skip escalation on a hard auth failure) without
+/// re-introducing two uncoordinated code paths — it does not change the action
+/// today. The elapsed deadline is encoded by *which* trigger invoked the policy
+/// (the watchdog only fires past its deadline; provider failures fire on signal).
+pub(crate) fn decide_no_response_action(
+    class: NoResponseClass,
+    tiers_remaining: bool,
+) -> NoResponseAction {
+    match class {
+        NoResponseClass::ProviderFailure | NoResponseClass::WatchdogTimeout => {
+            if tiers_remaining {
+                NoResponseAction::EscalateTier
+            } else {
+                NoResponseAction::EvictTurn
+            }
+        }
+    }
+}
 
 /// Model role for a given tier index. Falls back gracefully when index is out of range.
 fn role_for_tier<'a>(configured_tiers: &'a [String], tier: u8) -> &'a str {
@@ -5400,7 +5451,8 @@ async fn run_bash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
+        AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, NoResponseAction,
+        NoResponseClass, decide_no_response_action, extract_model_error,
         extract_model_error_payload, format_role_command_reply, format_roles_report,
         loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments,
         normalized_user_content, resolve_media_routing, resolve_model_execution_target,
@@ -5417,6 +5469,29 @@ mod tests {
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
+
+    #[test]
+    fn no_response_table_matches_pre_slice_behavior() {
+        // Pre-slice: both the provider-failure path and the WaitingModel watchdog
+        // funnel through advance_turn_to_next_fallback_tier, which escalates while
+        // a tier remains and fails (evicts) only when the last tier is exhausted —
+        // identical for both failure classes.
+        for class in [
+            NoResponseClass::ProviderFailure,
+            NoResponseClass::WatchdogTimeout,
+        ] {
+            assert_eq!(
+                decide_no_response_action(class, true),
+                NoResponseAction::EscalateTier,
+                "{class:?} with a tier remaining must escalate"
+            );
+            assert_eq!(
+                decide_no_response_action(class, false),
+                NoResponseAction::EvictTurn,
+                "{class:?} with no tier remaining must evict"
+            );
+        }
+    }
 
     pub(super) fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
         WorkingTurn {

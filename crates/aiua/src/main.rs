@@ -4628,6 +4628,74 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
     Ok(())
 }
 
+/// Config-time coherence check: every fallback tier a ladder names must resolve
+/// to a live controller role on this hotel. A tier with no seeded+active guest
+/// escalates into a void — the exact failure the gemini thinking-hang incident
+/// escalated into. We do NOT auto-seed controllers here (provider keys may be
+/// absent); this slice is validation + visibility: a loud startup warning and a
+/// heal-queue entry per unreachable tier.
+fn validate_hotel_fallback_ladders(graph: &GraphDomain, hotel_name: &str, db_path: &Path) {
+    use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
+    use ansible_mesh_core::model_routing::{DEFAULT_FALLBACK_TIERS, validate_fallback_ladders};
+
+    // Reachability key = the guest `role` values the task router matches
+    // `target_role` against (exact match, no provider fallback).
+    let active_roles: std::collections::BTreeSet<String> = match graph.list_guests(hotel_name, true)
+    {
+        Ok(guests) => guests.into_iter().map(|g| g.role).collect(),
+        Err(e) => {
+            warn!("fallback-ladder validation: could not list guests: {e:#}");
+            return;
+        }
+    };
+
+    // Ladders in play: the default ladder every role without configured tiers
+    // actually runs, plus each role incarnation's configured tiers.
+    let mut ladders: Vec<(String, Vec<String>)> = vec![(
+        "default fallback ladder".to_string(),
+        DEFAULT_FALLBACK_TIERS
+            .iter()
+            .map(|t| t.to_string())
+            .collect(),
+    )];
+    if let Ok(incarnations) = graph.list_all_role_incarnations() {
+        for rec in incarnations {
+            let tiers = &rec.turn_loop_config.fallback_tiers;
+            if tiers.is_empty() {
+                continue;
+            }
+            ladders.push((
+                format!("role:{}:{}", rec.agent_id, rec.role_name),
+                tiers.clone(),
+            ));
+        }
+    }
+
+    let findings = validate_fallback_ladders(&active_roles, &ladders);
+    if findings.is_empty() {
+        return;
+    }
+
+    let heal = SqliteHealQueueStorage::open(db_path).ok();
+    for finding in &findings {
+        warn!(
+            ladder = %finding.ladder_label,
+            tier_role = %finding.tier_role,
+            hotel = %hotel_name,
+            "MODEL ROUTING GAP: fallback ladder names a tier with no seeded+active controller on this hotel — escalation to this tier targets a void"
+        );
+        if let Some(hq) = heal.as_ref() {
+            let text = format!(
+                "model-routing: fallback ladder '{}' names tier '{}' with no seeded+active controller on hotel '{}' — turns escalating to this tier target a void (seed a controller or remove the tier)",
+                finding.ladder_label, finding.tier_role, hotel_name
+            );
+            if let Err(e) = hq.push_error("model-routing-validation", &text) {
+                warn!("fallback-ladder validation: heal push failed: {e:#}");
+            }
+        }
+    }
+}
+
 fn enable_guest_test_overrides(
     graph: &GraphDomain,
     hotel_name: &str,
@@ -7006,6 +7074,10 @@ async fn main() -> Result<()> {
     seed_abstract_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
     seed_skill_crafting(&graph_domain_arc)?;
+
+    // Config-time model-routing coherence: warn + heal-queue any fallback tier
+    // that names a controller role with no seeded+active guest on this hotel.
+    validate_hotel_fallback_ladders(&graph_domain_arc, &hotel_name, db_path);
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;

@@ -26,6 +26,7 @@ pub mod membership;
 pub mod meshops;
 pub mod model_catalog_discovery;
 pub mod model_manager;
+pub mod model_routing;
 pub mod provider_keys;
 pub mod registry;
 pub mod resources;

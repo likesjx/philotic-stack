@@ -279,7 +279,11 @@ impl AgentRuntime {
                 self.stuck_turn_signature.remove(&session_id);
                 // Do NOT remove total_active_since — the 600s CatchAll budget still applies.
                 let _ = self
-                    .advance_turn_to_next_fallback_tier(session_id, turn_id)
+                    .advance_turn_to_next_fallback_tier(
+                        session_id,
+                        turn_id,
+                        NoResponseClass::WatchdogTimeout,
+                    )
                     .await;
                 continue;
             }
@@ -770,7 +774,11 @@ impl AgentRuntime {
                     "Escalating to next fallback tier after provider failure"
                 );
                 return self
-                    .advance_turn_to_next_fallback_tier(session_id, turn_id)
+                    .advance_turn_to_next_fallback_tier(
+                        session_id,
+                        turn_id,
+                        NoResponseClass::ProviderFailure,
+                    )
                     .await;
             }
         }
@@ -1623,12 +1631,16 @@ impl AgentRuntime {
     }
 
     /// Advance the active turn to the next fallback tier and re-dispatch the
-    /// model request to that tier's role. If already at the last tier, fails
-    /// the turn with a user-visible error.
+    /// model request to that tier's role. The shared [`decide_no_response_action`]
+    /// policy — the same one the watchdog consults via this funnel — chooses
+    /// escalate-vs-evict from the failure class and whether a live tier remains.
+    /// On `EvictTurn` (all tiers exhausted) the turn is failed with a
+    /// user-visible error.
     pub(super) async fn advance_turn_to_next_fallback_tier(
         &mut self,
         session_id: String,
         turn_id: String,
+        class: NoResponseClass,
     ) -> Result<()> {
         // Extract configured tiers before any mutable session borrow.
         let active_role_name: Option<String> = self
@@ -1665,7 +1677,8 @@ impl AgentRuntime {
             DEFAULT_FALLBACK_TIERS.len().saturating_sub(1) as u8
         };
 
-        if current_tier >= max_tier {
+        let tiers_remaining = current_tier < max_tier;
+        if decide_no_response_action(class, tiers_remaining) == NoResponseAction::EvictTurn {
             return self
                 .fail_active_turn(
                     session_id,
