@@ -4583,7 +4583,8 @@ Tool preference:
 - If no tool is needed to answer a question, respond directly — do not call a tool just because one is available.
 
 Approval posture:
-- Governance tools (role.configure, role.list, skill.register, skill.assign, skill.list, handoff.to_role, handoff.back) run without per-action approval.
+- Governance tools (role.configure, role.list, skill.assign, skill.list, handoff.to_role, handoff.back) run without per-action approval.
+- skill.register ALWAYS requires live operator approval and cannot be preapproved or bypassed by policy; every accepted registration is audit-logged.
 - Self-configuration (agent.configure for approval_policy, profile, bindings) runs without approval.
 - Shell execution (bash.exec) and core identity field changes require operator approval.";
 
