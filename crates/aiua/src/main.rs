@@ -7563,6 +7563,14 @@ async fn main() -> Result<()> {
     // Clone before moving into IpcServer so mesh inbound worker can also route to it.
     let inbound_operator_surface_tx = operator_surface_tx.clone();
 
+    // Agent-resource-broker registry (agent-resource-broker seam). Created here so
+    // it can be BOTH seeded by boot_reconcile below AND queried by the front desk
+    // via the shared Arc. Inert this slice: records grants/denials, answers routing
+    // queries; does not materialize/tear down guests (that stays with GuestManager).
+    let resource_registry_arc = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::service::resource_registry::ResourceRegistry::new(),
+    ));
+
     let ipc_server = IpcServer::new(
         socket_path.clone(),
         caps.node_id.clone(),
@@ -7577,6 +7585,7 @@ async fn main() -> Result<()> {
     .with_operator_surface_channel(operator_surface_tx)
     .with_perimeter(perimeter_svc.clone())
     .with_egress(egress_gw.clone())
+    .with_resource_registry(resource_registry_arc.clone())
     .with_hotel_state_dirty_tx(ipc_dirty_tx);
     let ipc_server = if let Some(hq) = heal_queue_arc {
         ipc_server.with_heal_queue(hq)
@@ -7777,8 +7786,11 @@ async fn main() -> Result<()> {
     // resource registry, and logs the demand-derived guest set. Does not yet replace the
     // materialize_all path below; that replacement lands when the registry is proven stable.
     {
-        use crate::service::resource_registry::{ResourceRegistry, boot_reconcile};
-        let mut resource_registry = ResourceRegistry::new();
+        use crate::service::resource_registry::boot_reconcile;
+        // Seed the SHARED registry the front desk already holds, so live
+        // ResourceRequest/ResourceReleased IPC and routing-table queries observe
+        // the demand-derived tenancy state instead of an empty table.
+        let mut resource_registry = resource_registry_arc.lock().await;
         match graph_domain_arc.list_agent_identities() {
             Ok(agents) => {
                 let results = boot_reconcile(&mut resource_registry, &agents);
