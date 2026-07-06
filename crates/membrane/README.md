@@ -1,38 +1,34 @@
-# `membrane` — Compatibility Wrapper
+# `membrane` — Membrane Runtime SDK
 
-`membrane` is a transitional compatibility package that forwards to
-`membrane-telegram`.
+`membrane` is an SDK-only library crate. It provides the base primitives for
+protocol gateway guests (`MembraneRuntime`, `MembraneContext`, envelope and
+lease helpers) and is consumed by the concrete gateway binaries.
+
+This crate no longer ships a standalone `membrane` binary. The dead
+compatibility wrapper was retired once the unified `membrane-telegram` gateway
+passed live operator-turn and approval-button verification.
 
 ## Responsibilities
 
-- Preserve compatibility for existing `membrane` binary references during migration
+- Expose `MembraneRuntime` / `MembraneContext` and the `MembraneGuest` trait
+- Provide shared envelope (`InboundEnvelope`, `OutboundReply`, `SenderInfo`) and
+  lease primitives for gateway guests
 
-## Boot Sequence
+## Consumers
 
-```
-membrane::run()
-  │
-  ├─ PhiloticClient::connect(ansible_port)
-  ├─ client.register(GuestIdentity { guest_id: "membrane-telegram-01" })
-  ├─ Subscribe to hotel events
-  └─ Enter message processing loop
-```
+- `membrane-telegram` — the live Telegram gateway binary (materialized by every hotel)
+- `membrane-mcp` — MCP protocol gateway
+- `membrane-discord` — Discord protocol gateway
 
-## Integration Points
+## Usage
 
-- `membrane-telegram` is the current provider binary that owns the Telegram runtime
-- `aiua` should point Telegram hotels at `membrane-telegram`
-- Future sibling providers should live beside Telegram, not behind the bare `membrane` name
+Import the crate and implement `MembraneGuest` to build a new protocol gateway:
 
-## Running
-
-`membrane` remains runnable as a compatibility wrapper:
-
-```bash
-cargo run -p membrane -- --ansible-port 9000
+```rust
+use membrane::{MembraneRuntime, MembraneContext};
 ```
 
-The preferred Telegram provider binary is:
+To run the live Telegram gateway:
 
 ```bash
 cargo run -p membrane-telegram -- --ansible-port 9000

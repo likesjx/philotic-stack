@@ -1362,6 +1362,8 @@ impl AgentRuntime {
                 fallback_tier: if self.network_offline { 1 } else { 0 },
                 streaming_retry_attempts: 0,
                 streamed_content: String::new(),
+                paracrine_hop_count: 0,
+                paracrine_chain_started_at: None,
             });
             Some((
                 state.checkpoint_memory_type(),

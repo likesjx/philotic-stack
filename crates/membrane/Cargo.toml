@@ -7,10 +7,6 @@ edition = "2024"
 name = "membrane"
 path = "src/lib.rs"
 
-[[bin]]
-name = "membrane"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

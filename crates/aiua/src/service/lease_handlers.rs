@@ -2481,7 +2481,7 @@ mod tests {
                     hotel_name: "local-hotel".into(),
                     guest_id: "membrane-telegram-01".into(),
                     role: "membrane".into(),
-                    config_json: serde_json::json!({ "command": "membrane" }).to_string(),
+                    config_json: serde_json::json!({ "command": "membrane-telegram" }).to_string(),
                     is_active: true,
                     active_pid: Some(std::process::id().to_string()),
                     last_active_at: None,
