@@ -256,8 +256,14 @@ mod tests {
     #[test]
     fn validate_rejects_prefix_and_length_mismatch() {
         let secret = "abcdef0123456789abcdef";
-        assert!(!validate_webhook_secret(secret, Some("abcdef0123456789abcde"))); // truncated
-        assert!(!validate_webhook_secret(secret, Some("abcdef0123456789abcdef0"))); // extended
+        assert!(!validate_webhook_secret(
+            secret,
+            Some("abcdef0123456789abcde")
+        )); // truncated
+        assert!(!validate_webhook_secret(
+            secret,
+            Some("abcdef0123456789abcdef0")
+        )); // extended
     }
 
     #[test]
@@ -283,10 +289,9 @@ mod tests {
 
     #[test]
     fn webhook_without_secret_is_hard_refused() {
-        let result = resolve_transport(
-            &TelegramTransport::Webhook { secret_ref: None },
-            |_| Ok("unused".to_string()),
-        );
+        let result = resolve_transport(&TelegramTransport::Webhook { secret_ref: None }, |_| {
+            Ok("unused".to_string())
+        });
         let err = result.expect_err("webhook without secret must refuse");
         assert!(err.to_string().contains("no webhook secret configured"));
     }

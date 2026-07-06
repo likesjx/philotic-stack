@@ -11476,7 +11476,9 @@ pub(super) fn handle_register_skill(
         SkillValidationState::Draft => ("draft".to_string(), vec![]),
         SkillValidationState::Registered => ("registered".to_string(), vec![]),
         SkillValidationState::Active => ("active".to_string(), vec![]),
-        SkillValidationState::Suspended { reason } => ("suspended".to_string(), vec![reason.clone()]),
+        SkillValidationState::Suspended { reason } => {
+            ("suspended".to_string(), vec![reason.clone()])
+        }
         SkillValidationState::Deprecated => ("deprecated".to_string(), vec![]),
     };
 
@@ -11673,9 +11675,7 @@ pub(crate) mod tests {
             .expect("skill should be persisted");
         assert_eq!(stored.skill_name, "research.assistant");
 
-        let audits = graph
-            .list_skill_registration_audits()
-            .expect("list audits");
+        let audits = graph.list_skill_registration_audits().expect("list audits");
         assert_eq!(audits.len(), 1, "exactly one audit event expected");
         let audit = &audits[0];
         assert_eq!(audit.skill_name, "research.assistant");
