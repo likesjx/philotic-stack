@@ -15,7 +15,9 @@ use crate::service::lease::{
 };
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::graph::MembraneTransportHomeStatus;
-use philotic_client::{GuestIdentity, IpcResponse, LeaseEnvelope, LeaseStatus, SubagentDelegation};
+use philotic_client::{
+    GuestIdentity, IpcResponse, LeaseEnvelope, LeaseStatus, SubagentDelegation, SubagentLeaseTerms,
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -646,6 +648,7 @@ impl IpcServer {
                     hook_subscriptions: delegation.hook_subscriptions.clone(),
                     completion_route: delegation.completion_route.clone(),
                     failure_route: delegation.failure_route.clone(),
+                    configured_ttl_secs: ttl,
                 },
             );
         }
@@ -1518,6 +1521,16 @@ impl IpcServer {
         IpcResponse::success("release_mcp_membrane_lease", None)
     }
 
+    /// Resolve the TTL (seconds) a subagent-lease renewal should use: honor the
+    /// TTL the delegation skill configured at spawn time (recorded on the hook
+    /// record), falling back to the `SubagentLeaseTerms` default when no hook
+    /// record is registered for the subagent.
+    fn subagent_renew_ttl_secs(record: Option<&SubagentHookRecord>) -> u64 {
+        record
+            .map(|record| record.configured_ttl_secs)
+            .unwrap_or_else(|| SubagentLeaseTerms::default().ttl_seconds)
+    }
+
     pub(super) async fn handle_renew_subagent_lease(
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: &SubagentHookRegistry,
@@ -1535,12 +1548,11 @@ impl IpcServer {
         };
         let scope = Self::subagent_lease_scope(&subagent_guest_id);
         let ttl = {
-            // Read the registered TTL from hook record, fall back to default.
+            // Renew under the TTL the delegation skill configured at spawn time
+            // (stored on the hook record). Fall back to the SubagentLeaseTerms
+            // default only when no hook record is registered for this subagent.
             let guard = subagent_hooks.lock().await;
-            // We can't store ttl in SubagentHookRecord easily without adding a field —
-            // for now use the default 300s. Block F will wire this from the skill record.
-            let _ = guard.get(&subagent_guest_id);
-            300u64
+            Self::subagent_renew_ttl_secs(guard.get(&subagent_guest_id))
         };
         let outcome = {
             let mut guard = subagent_leases.lock().await;
@@ -3063,5 +3075,40 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    fn hook_record_with_ttl(ttl_secs: u64) -> SubagentHookRecord {
+        SubagentHookRecord {
+            persona_guest_id: "persona-1".into(),
+            persona_role: "developer".into(),
+            hook_subscriptions: Vec::new(),
+            completion_route: philotic_client::HookRoute::default(),
+            failure_route: philotic_client::HookRoute::default(),
+            configured_ttl_secs: ttl_secs,
+        }
+    }
+
+    #[test]
+    fn subagent_renew_ttl_honors_configured_record_value() {
+        // A subagent spawned with a non-default lease TTL must renew under the same
+        // terms, not the previously-hardcoded 300s.
+        let record = hook_record_with_ttl(1200);
+        assert_eq!(IpcServer::subagent_renew_ttl_secs(Some(&record)), 1200);
+        assert_ne!(
+            IpcServer::subagent_renew_ttl_secs(Some(&record)),
+            SubagentLeaseTerms::default().ttl_seconds,
+            "custom TTL must not collapse to the default"
+        );
+    }
+
+    #[test]
+    fn subagent_renew_ttl_falls_back_to_default_without_record() {
+        // No hook record registered (e.g. after a restart): fall back to the
+        // SubagentLeaseTerms default.
+        assert_eq!(
+            IpcServer::subagent_renew_ttl_secs(None),
+            SubagentLeaseTerms::default().ttl_seconds
+        );
+        assert_eq!(IpcServer::subagent_renew_ttl_secs(None), 300);
     }
 }

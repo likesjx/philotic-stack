@@ -76,6 +76,9 @@ pub(super) struct SubagentHookRecord {
     pub(super) completion_route: HookRoute,
     /// Where to deliver `subagent.failed`.
     pub(super) failure_route: HookRoute,
+    /// Lease TTL (seconds) the delegation skill configured at spawn time.
+    /// Used to renew the subagent lease with the same terms it was acquired under.
+    pub(super) configured_ttl_secs: u64,
 }
 
 /// Maps `subagent_guest_id` → routing record.
