@@ -37,15 +37,31 @@ pub fn gateway_lease_key(bot_token: &str) -> String {
 }
 
 /// Map an `AcquireDiscordGatewayLease` response onto the shared driver outcome.
+///
+/// `IpcResponse` is untagged and `DiscordGatewayLease { granted, lease }` is
+/// structurally identical to `TelegramPollLease`, which is declared first — so
+/// the hotel's correct `DiscordGatewayLease` reply deserializes on the wire as
+/// `TelegramPollLease` on the client. Both variants carry the same
+/// `LeaseEnvelope` (whose `lease_type` already says `discord_gateway`, so there
+/// is no misrouting risk), so we treat them identically. This mirrors the
+/// dual-accept in `philotic-client` `is_expected_response` (DEF-005 family).
 fn map_acquire_response(response: IpcResponse) -> Result<LeaseAcquireOutcome> {
     match response {
         IpcResponse::DiscordGatewayLease {
+            granted: true,
+            lease: Some(lease),
+        }
+        | IpcResponse::TelegramPollLease {
             granted: true,
             lease: Some(lease),
         } => Ok(LeaseAcquireOutcome::Granted {
             epoch: lease.lease_epoch,
         }),
         IpcResponse::DiscordGatewayLease {
+            granted: false,
+            lease,
+        }
+        | IpcResponse::TelegramPollLease {
             granted: false,
             lease,
         } => {
@@ -67,8 +83,15 @@ fn map_acquire_response(response: IpcResponse) -> Result<LeaseAcquireOutcome> {
 /// expired the lease) — the driver re-acquires in place instead of tearing the
 /// seat down, which is the exact fragility the old hand-rolled renew had.
 fn map_renew_response(response: IpcResponse) -> Result<LeaseRenewResult> {
+    // See `map_acquire_response`: the untagged `IpcResponse` collapses
+    // `DiscordGatewayLease` onto the structurally-identical `TelegramPollLease`
+    // on the wire, so accept both here too (DEF-005 family).
     match response {
         IpcResponse::DiscordGatewayLease {
+            granted: true,
+            lease: Some(lease),
+        }
+        | IpcResponse::TelegramPollLease {
             granted: true,
             lease: Some(lease),
         } => Ok(LeaseRenewResult::Ok {
@@ -77,8 +100,16 @@ fn map_renew_response(response: IpcResponse) -> Result<LeaseRenewResult> {
         IpcResponse::DiscordGatewayLease {
             granted: false,
             lease: None,
+        }
+        | IpcResponse::TelegramPollLease {
+            granted: false,
+            lease: None,
         } => Ok(LeaseRenewResult::NeedsReacquire),
         IpcResponse::DiscordGatewayLease {
+            granted: false,
+            lease: Some(lease),
+        }
+        | IpcResponse::TelegramPollLease {
             granted: false,
             lease: Some(lease),
         } => Ok(LeaseRenewResult::Lost {
@@ -362,6 +393,77 @@ mod tests {
                 req_id: "r1".into()
             })
             .is_err()
+        );
+    }
+
+    /// The untagged `IpcResponse` collapses the hotel's `DiscordGatewayLease`
+    /// reply onto the structurally-identical `TelegramPollLease` variant on the
+    /// wire (declared first). The acquire mapping must treat that collapsed
+    /// reply exactly like a `DiscordGatewayLease` reply — otherwise the gateway
+    /// crash-loops at lease acquire and never reaches READY (DEF-005 family).
+    #[test]
+    fn acquire_mapping_accepts_collapsed_telegram_poll_lease_shape() {
+        assert_eq!(
+            map_acquire_response(IpcResponse::TelegramPollLease {
+                granted: true,
+                lease: Some(envelope("us", 3)),
+            })
+            .unwrap(),
+            LeaseAcquireOutcome::Granted { epoch: 3 }
+        );
+        assert_eq!(
+            map_acquire_response(IpcResponse::TelegramPollLease {
+                granted: false,
+                lease: Some(envelope("incumbent", 12)),
+            })
+            .unwrap(),
+            LeaseAcquireOutcome::Held {
+                owner: Some("incumbent".into()),
+                epoch: 12
+            }
+        );
+        assert_eq!(
+            map_acquire_response(IpcResponse::TelegramPollLease {
+                granted: false,
+                lease: None,
+            })
+            .unwrap(),
+            LeaseAcquireOutcome::Held {
+                owner: None,
+                epoch: 0
+            }
+        );
+    }
+
+    /// Same collapse for the renew path: a `TelegramPollLease`-shaped reply must
+    /// map to Ok/NeedsReacquire/Lost identically to `DiscordGatewayLease`.
+    #[test]
+    fn renew_mapping_accepts_collapsed_telegram_poll_lease_shape() {
+        assert_eq!(
+            map_renew_response(IpcResponse::TelegramPollLease {
+                granted: true,
+                lease: Some(envelope("us", 4)),
+            })
+            .unwrap(),
+            LeaseRenewResult::Ok { epoch: 4 }
+        );
+        assert_eq!(
+            map_renew_response(IpcResponse::TelegramPollLease {
+                granted: false,
+                lease: None,
+            })
+            .unwrap(),
+            LeaseRenewResult::NeedsReacquire
+        );
+        assert_eq!(
+            map_renew_response(IpcResponse::TelegramPollLease {
+                granted: false,
+                lease: Some(envelope("other-seat", 9)),
+            })
+            .unwrap(),
+            LeaseRenewResult::Lost {
+                owner: Some("other-seat".into())
+            }
         );
     }
 
