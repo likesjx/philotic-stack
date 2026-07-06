@@ -187,7 +187,20 @@ async fn connect_and_identify(
 
                 let text = match msg {
                     Message::Text(t) => t,
-                    Message::Close(_) => return Ok(GatewayExitReason::Reconnect),
+                    Message::Close(frame) => {
+                        // Discord signals fatal handshake problems via the close
+                        // frame code (4004 auth failed, 4013 invalid intents, 4014
+                        // disallowed/unenabled privileged intents). Dropping it left
+                        // the gateway reconnect-looping with no diagnosable reason.
+                        match frame {
+                            Some(cf) => warn!(
+                                "Gateway closed by Discord: code={} reason={}",
+                                cf.code, cf.reason
+                            ),
+                            None => warn!("Gateway closed by Discord (no close frame)"),
+                        }
+                        return Ok(GatewayExitReason::Reconnect);
+                    }
                     _ => continue,
                 };
 
