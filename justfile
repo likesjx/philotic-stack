@@ -123,7 +123,7 @@ start-aiua hotel:
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-datasource -p philotic-web
+    cargo build -p aiua -p philote -p membrane-telegram -p model-router -p tool-runner -p graph-datasource -p philotic-web
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
@@ -212,7 +212,7 @@ start-aiua-uat:
 
 # Start the Gateway (Telegram Membrane)
 start-gateway:
-    cargo run -p membrane
+    cargo run -p membrane-telegram
 
 # Start the Persona (Philote)
 start-agent:
@@ -244,7 +244,7 @@ status:
     @echo "Checking Philotic Stack local status..."
     @# Ping the Aiua daemon port or check processes.
     @ps aux | grep -v grep | grep "cargo run -p aiua" || echo "Aiua daemon is not running."
-    @ps aux | grep -v grep | grep "cargo run -p membrane" || echo "Membrane gateway is not running."
+    @ps aux | grep -v grep | grep "cargo run -p membrane-telegram" || echo "Membrane gateway is not running."
 
 # Build and install phil symlink to /usr/local/bin (dev workflow shortcut)
 phil-install:
@@ -473,9 +473,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
+    AIUA_BINS="aiua philote membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
+    cargo build --release -p aiua -p philote -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -575,7 +575,6 @@ vps-push:
     ssh -n "${VPS}" "cd '${VPS_CODE}' && \$HOME/.cargo/bin/cargo build --release --bins \
       -p aiua \
       -p philote \
-      -p membrane \
       -p membrane-telegram \
       -p membrane-discord \
       -p membrane-mcp \

@@ -65,7 +65,6 @@ echo "▶ Building release runtime binaries (local)..."
 cargo build --release --bins \
   -p aiua \
   -p philote \
-  -p membrane \
   -p membrane-telegram \
   -p membrane-discord \
   -p model-router \

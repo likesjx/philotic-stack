@@ -26,7 +26,6 @@ philotic_binaries:
   - aiua
   - philote
   - philote-worker
-  - membrane
   - membrane-telegram
   - membrane-discord
   - membrane-mcp
