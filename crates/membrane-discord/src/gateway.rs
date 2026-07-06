@@ -366,10 +366,50 @@ where
 ///   GUILD_MESSAGES     = 1 << 9  = 512
 ///   GUILD_VOICE_STATES = 1 << 7  = 128
 ///   MESSAGE_CONTENT    = 1 << 15 = 32768  (privileged intent, must be enabled in dev portal)
+///
+/// MESSAGE_CONTENT is the only privileged intent requested. Discord rejects the
+/// entire IDENTIFY with close code 4014 ("Disallowed intent(s)") if it is
+/// requested while disabled in the developer portal, so the bot cannot even
+/// reach READY. It is gated behind `PHILOTIC_DISCORD_MESSAGE_CONTENT` (default
+/// enabled) so a seat can be brought up without it — the bot then reaches READY
+/// and handles mentions/DMs/slash commands, just without in-guild message text —
+/// until the portal toggle is confirmed. Set the env to `0`/`false`/`off` to omit it.
 fn compute_intents() -> u64 {
+    let want_message_content = std::env::var("PHILOTIC_DISCORD_MESSAGE_CONTENT")
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true);
+    intents_mask(want_message_content)
+}
+
+/// Pure intent-bitmask builder (env-free, for testing).
+fn intents_mask(want_message_content: bool) -> u64 {
     let guilds: u64 = 1 << 0;
     let guild_voice_states: u64 = 1 << 7;
     let guild_messages: u64 = 1 << 9;
     let message_content: u64 = 1 << 15;
-    guilds | guild_voice_states | guild_messages | message_content
+    let base = guilds | guild_voice_states | guild_messages;
+    if want_message_content {
+        base | message_content
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::intents_mask;
+
+    #[test]
+    fn message_content_toggles_only_the_privileged_bit() {
+        let with = intents_mask(true);
+        let without = intents_mask(false);
+        assert_eq!(with ^ without, 1 << 15, "only MESSAGE_CONTENT should differ");
+        assert_eq!(without & (1 << 15), 0, "disabled mask must omit MESSAGE_CONTENT");
+        // Non-privileged intents are always present regardless of the toggle.
+        for bit in [1u64 << 0, 1 << 7, 1 << 9] {
+            assert_eq!(without & bit, bit);
+            assert_eq!(with & bit, bit);
+        }
+    }
 }
