@@ -594,6 +594,7 @@ impl IpcServer {
                 fallback_tiers: Vec::new(),
                 paracrine_hop_budget: None,
                 paracrine_chain_budget_secs: None,
+                context_window: None,
             },
             home_node: None,
         };

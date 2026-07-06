@@ -132,6 +132,7 @@ fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
             fallback_tiers: Vec::new(),
             paracrine_hop_budget: None,
             paracrine_chain_budget_secs: None,
+            context_window: None,
         },
         home_node: None,
     }
