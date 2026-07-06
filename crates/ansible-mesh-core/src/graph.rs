@@ -159,6 +159,29 @@ pub struct AbstractSkillRecord {
     pub field_sources: serde_json::Value,
 }
 
+/// Append-only audit entry recorded on every accepted `skill.register`.
+///
+/// Node kind: `skill_registration_audit`. Node key: `skill_registration_audit:{audit_id}`.
+/// Captures who (the authenticated IPC peer), what (skill + resulting validation
+/// state), and when a skill entered the catalog. Because skills later project tools
+/// onto agents, this trail lets operators review every registration and closes the
+/// "open to any agent" gap flagged in the security audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SkillRegistrationAuditRecord {
+    /// Unique id for this audit entry (node key suffix).
+    pub audit_id: String,
+    /// Name of the skill that was registered.
+    pub skill_name: String,
+    /// `guest_id` of the registering guest (the authenticated IPC peer).
+    pub registered_by: String,
+    /// Role the registering guest held at registration time.
+    pub registered_by_role: String,
+    /// Resulting validation state (e.g. `validated`, `invalid`, `draft`).
+    pub validation_state: String,
+    /// Unix timestamp (seconds) when the registration was accepted.
+    pub registered_at: u64,
+}
+
 /// A governed workflow record defining an advanced process like handoff or delegation.
 ///
 /// Node kind: `workflow_skill`. Node key: `workflow_skill:{workflow_name}`.

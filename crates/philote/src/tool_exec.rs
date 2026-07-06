@@ -11,6 +11,40 @@
 use super::*;
 
 impl AgentRuntime {
+    /// Classify a tool call against the set of gates that ALWAYS require live
+    /// operator approval and can never be preapproved or bypassed by policy
+    /// (including `auto_approve_all`). Returns a stable gate-kind slug when the
+    /// call is one of these, or `None` otherwise.
+    ///
+    /// This is the single source of truth used by `route_tool_call_execution`;
+    /// keeping it a pure function lets the routing decision be unit-tested
+    /// without constructing a full runtime. Callers still apply the
+    /// `bypass_approval` guard themselves so the post-approval resume can run.
+    pub(super) fn unconditional_approval_gate(
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<&'static str> {
+        match tool_name {
+            // Admin role creation permanently grants elevated authority.
+            "role.configure"
+                if arguments
+                    .get("is_admin")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) =>
+            {
+                Some("admin_role_creation")
+            }
+            // Rules durably and permanently affect agent behavior.
+            "rule.propose" => Some("rule_propose"),
+            // Routing policy proposals are stored durably and influence future routing.
+            "routing.policy.propose" => Some("routing_policy_propose"),
+            // Skill registration writes an abstract skill into the graph that can
+            // later project tools onto agents — must not be silently accepted.
+            "skill.register" => Some("skill_register"),
+            _ => None,
+        }
+    }
+
     pub(super) async fn handle_approval_request(
         &mut self,
         session_id: String,
@@ -278,33 +312,22 @@ impl AgentRuntime {
                     .unwrap_or(false)
             };
 
-            // Admin role creation requires live operator approval regardless of any approval policy.
-            // This check runs before the normal force_approval gate so it can set always_require_human.
-            // Bypassed when bypass_approval is true (already resolved by the operator).
-            let is_admin_role_creation = !bypass_approval
-                && tool_call.tool_name == "role.configure"
-                && tool_call
-                    .arguments
-                    .get("is_admin")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+            // Non-bypassable gates: these tools ALWAYS require live operator approval
+            // regardless of any approval policy (including `auto_approve_all`). The gate
+            // runs before the normal force_approval path so it can set always_require_human.
+            // Skipped when bypass_approval is true (already resolved by the operator on the
+            // post-approval resume). See `unconditional_approval_gate` for the classifier.
+            let unconditional_gate = if bypass_approval {
+                None
+            } else {
+                Self::unconditional_approval_gate(&tool_call.tool_name, &tool_call.arguments)
+            };
+            let is_admin_role_creation = unconditional_gate == Some("admin_role_creation");
+            let is_rule_propose = unconditional_gate == Some("rule_propose");
+            let is_routing_policy_propose = unconditional_gate == Some("routing_policy_propose");
+            let is_skill_register = unconditional_gate == Some("skill_register");
 
-            // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
-            // Rules are durable and permanently affect agent behavior, so human confirmation is required.
-            // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
-            let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
-
-            // routing.policy.propose requires the same live-approval gate: proposals are stored
-            // durably in the hotel graph and influence future routing decisions, so they must
-            // not be silently submitted without operator visibility.
-            let is_routing_policy_propose =
-                !bypass_approval && tool_call.tool_name == "routing.policy.propose";
-
-            if is_admin_role_creation
-                || is_rule_propose
-                || is_routing_policy_propose
-                || force_approval
-            {
+            if unconditional_gate.is_some() || force_approval {
                 // Set pending_tool_call so the approval handler can read it for class lookup.
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     state.set_pending_tool_call(tool_call.clone());
@@ -338,6 +361,13 @@ impl AgentRuntime {
                         "Routing policy proposal requires your explicit live approval.".to_string(),
                         "Routing policy proposal approved.".to_string(),
                     )
+                } else if is_skill_register {
+                    (
+                        "Skill registration requires your explicit live approval. \
+                         This cannot be preapproved or bypassed by policy."
+                            .to_string(),
+                        "Skill registration approved.".to_string(),
+                    )
                 } else {
                     (
                         format!(
@@ -357,7 +387,10 @@ impl AgentRuntime {
                         session_id,
                         turn_id,
                         synthetic,
-                        is_admin_role_creation || is_rule_propose || is_routing_policy_propose,
+                        is_admin_role_creation
+                            || is_rule_propose
+                            || is_routing_policy_propose
+                            || is_skill_register,
                     )
                     .await;
             }
@@ -5772,6 +5805,53 @@ mod tests {
     use super::super::tests::test_working_turn;
     use super::*;
     use crate::r#loop::{ToolCall, TurnPhase};
+
+    #[test]
+    fn skill_register_is_an_unconditional_approval_gate() {
+        // skill.register must ALWAYS require live operator approval — it can project
+        // tools onto agents, so it joins admin role creation / rule.propose /
+        // routing.policy.propose in the non-bypassable gate set.
+        assert_eq!(
+            super::AgentRuntime::unconditional_approval_gate(
+                "skill.register",
+                &serde_json::json!({ "skill_name": "x" })
+            ),
+            Some("skill_register")
+        );
+    }
+
+    #[test]
+    fn unconditional_gate_classifies_known_gates_and_ignores_others() {
+        use super::AgentRuntime as R;
+        assert_eq!(
+            R::unconditional_approval_gate("rule.propose", &serde_json::json!({})),
+            Some("rule_propose")
+        );
+        assert_eq!(
+            R::unconditional_approval_gate("routing.policy.propose", &serde_json::json!({})),
+            Some("routing_policy_propose")
+        );
+        assert_eq!(
+            R::unconditional_approval_gate(
+                "role.configure",
+                &serde_json::json!({ "is_admin": true })
+            ),
+            Some("admin_role_creation")
+        );
+        // Non-admin role.configure is NOT an unconditional gate.
+        assert_eq!(
+            R::unconditional_approval_gate(
+                "role.configure",
+                &serde_json::json!({ "is_admin": false })
+            ),
+            None
+        );
+        // Ordinary tools are never force-gated here.
+        assert_eq!(
+            R::unconditional_approval_gate("echo", &serde_json::json!({})),
+            None
+        );
+    }
 
     #[test]
     fn bound_tool_execution_allows_listed_tools() {

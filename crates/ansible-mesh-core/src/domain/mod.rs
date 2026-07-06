@@ -17,8 +17,8 @@ use crate::cron::CronJob;
 use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
     MembraneTransportHomeRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
-    RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, ToolsetProfileRecord,
-    WorkflowSkillRecord,
+    RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, SkillRegistrationAuditRecord,
+    ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
@@ -1007,6 +1007,52 @@ impl GraphDomain {
         Ok(skills)
     }
 
+    // ── Skill registration audit methods ──────────────────────────────────────
+
+    fn skill_registration_audit_key(audit_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_SKILL_REGISTRATION_AUDIT, audit_id)
+    }
+
+    /// Append an audit entry for an accepted skill registration. Entries are
+    /// keyed by a unique `audit_id`, so this never overwrites prior entries —
+    /// the collection behaves as an append-only trail.
+    pub fn record_skill_registration_audit(
+        &self,
+        record: &SkillRegistrationAuditRecord,
+    ) -> Result<()> {
+        let data = serde_json::to_value(record).context(
+            "GraphDomain::record_skill_registration_audit: serialize SkillRegistrationAuditRecord",
+        )?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::skill_registration_audit_key(&record.audit_id),
+            kind: NODE_KIND_SKILL_REGISTRATION_AUDIT.to_string(),
+            label: Some(record.skill_name.clone()),
+            data,
+        })
+    }
+
+    /// List all recorded skill-registration audit entries. Malformed records are
+    /// skipped with a warning rather than failing the whole listing.
+    pub fn list_skill_registration_audits(&self) -> Result<Vec<SkillRegistrationAuditRecord>> {
+        let mut audits = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_SKILL_REGISTRATION_AUDIT)?
+        {
+            match serde_json::from_value::<SkillRegistrationAuditRecord>(node.data.clone()) {
+                Ok(rec) => audits.push(rec),
+                Err(err) => {
+                    warn!(
+                        node_key = %node.node_key,
+                        "Skipping incompatible skill_registration_audit record during list: {}",
+                        err
+                    );
+                }
+            }
+        }
+        Ok(audits)
+    }
+
     // ── Workflow skill methods ────────────────────────────────────────────────
 
     fn workflow_skill_key(workflow_name: &str) -> String {
@@ -1600,7 +1646,7 @@ mod tests {
     use super::*;
     use crate::graph::{
         AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, RoleIncarnationRecord,
-        ToolsetProfileRecord,
+        SkillRegistrationAuditRecord, ToolsetProfileRecord,
     };
     use crate::sqlite_storage::SqliteGraphStorage;
     use crate::storage::{
@@ -1612,6 +1658,46 @@ mod tests {
         let storage =
             SqliteGraphStorage::open_in_memory().expect("in-memory SqliteGraphStorage failed");
         GraphDomain::new(Arc::new(storage.adapter()))
+    }
+
+    #[test]
+    fn skill_registration_audits_are_append_only() {
+        let domain = make_domain();
+        assert!(domain
+            .list_skill_registration_audits()
+            .expect("list")
+            .is_empty());
+
+        let first = SkillRegistrationAuditRecord {
+            audit_id: "audit-1".into(),
+            skill_name: "research".into(),
+            registered_by: "agent-jane-01:orchestrator".into(),
+            registered_by_role: "orchestrator".into(),
+            validation_state: "validated".into(),
+            registered_at: 1000,
+        };
+        domain
+            .record_skill_registration_audit(&first)
+            .expect("record first audit");
+
+        let second = SkillRegistrationAuditRecord {
+            audit_id: "audit-2".into(),
+            skill_name: "summarize".into(),
+            registered_by: "mgmt-01".into(),
+            registered_by_role: "management".into(),
+            validation_state: "draft".into(),
+            registered_at: 2000,
+        };
+        domain
+            .record_skill_registration_audit(&second)
+            .expect("record second audit");
+
+        // Distinct audit_ids never overwrite — both entries survive.
+        let mut audits = domain.list_skill_registration_audits().expect("list");
+        audits.sort_by(|a, b| a.audit_id.cmp(&b.audit_id));
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0], first);
+        assert_eq!(audits[1], second);
     }
 
     fn caps() -> NodeCapabilities {
