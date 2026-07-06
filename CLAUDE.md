@@ -38,7 +38,7 @@ cargo test -p <crate>       # test a single crate
 
 # Run (requires mesh-config.json)
 just start-aiua             # build + start hotel daemon
-just start-gateway          # cargo run -p membrane
+just start-gateway          # cargo run -p membrane-telegram
 just start-agent            # cargo run -p philote
 just start-model            # cargo run -p model-router (Gemini/ElevenLabs)
 
@@ -94,7 +94,7 @@ Before opening a PR from a worktree:
 just workstream-overlap <slug>
 ```
 
-Hot files include `crates/aiua/src/main.rs`, `crates/aiua/src/service/ipc.rs`, `crates/philote/src/runtime.rs`, `crates/membrane/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/aiua/README.md`, `docs/task.md`.
+Hot files include `crates/aiua/src/main.rs`, `crates/aiua/src/service/ipc.rs`, `crates/philote/src/runtime.rs`, `crates/membrane-telegram/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/aiua/README.md`, `docs/task.md`.
 
 ## Architecture
 

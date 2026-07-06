@@ -38,7 +38,7 @@ Binaries are built to `target/release/`. A full release build emits ~24 binaries
 | `membrane-telegram` | Telegram gateway (runs on the MembraneRuntime SDK) |
 | `membrane-discord` | Discord gateway |
 | `membrane-mcp` | MCP gateway |
-| `membrane` | Transitional compatibility binary over the membrane runtime |
+| `membrane` | MembraneRuntime SDK library (no binary; consumed by the gateway guests) |
 | `model-router` | LLM inference routing |
 | `model-controller-*` | Per-provider model controllers (gemini, elevenlabs, openai, openrouter, mlx, ollama, onnx, parakeet, vision) |
 | `tool-runner` | Sandboxed tool execution |
@@ -90,7 +90,7 @@ aiua --load-config mesh-config.json
 |---|---|
 | [`aiua`](crates/aiua/) | Hotel daemon — guest materialization, IPC server, mesh routing, perimeter security |
 | [`philote`](crates/philote/) | Agent core — cognitive loop, session management, role incarnation |
-| [`membrane`](crates/membrane/) | MembraneRuntime SDK library + transitional compatibility binary |
+| [`membrane`](crates/membrane/) | MembraneRuntime SDK library (lib-only; consumed by the gateway guests) |
 | [`membrane-telegram`](crates/membrane-telegram/) | Telegram / external protocol gateway (MembraneRuntime SDK + LeaseDriver) |
 | [`membrane-discord`](crates/membrane-discord/) | Discord gateway |
 | [`membrane-mcp`](crates/membrane-mcp/) | MCP gateway |

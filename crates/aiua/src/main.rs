@@ -5347,7 +5347,7 @@ fn startup_test_force_kill_pid(pid: u32) -> Result<()> {
 
 fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
     let existing_bins = [
-        "target/debug/membrane",
+        "target/debug/membrane-telegram",
         "target/debug/philote",
         "target/debug/tool-runner",
         "target/debug/graph-datasource",
@@ -5366,7 +5366,7 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
         .args([
             "build",
             "-p",
-            "membrane",
+            "membrane-telegram",
             "-p",
             "philote",
             "-p",
