@@ -22,6 +22,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+pub mod webhook_secret;
+
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
 const MEMBRANE_ERROR_BACKOFF_INITIAL_SECS: u64 = 1;
 const MEMBRANE_ERROR_BACKOFF_MAX_SECS: u64 = 600;
