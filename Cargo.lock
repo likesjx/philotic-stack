@@ -1860,23 +1860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "graph-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "philotic-client",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "ulid",
-]
-
-[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1324,7 +1324,8 @@ pub enum IpcRequest {
     /// Responds with [`IpcResponse::MuninnStatus`].
     RefreshMemoryConfig,
     /// Register a graph instance with the hotel's ODS so it can route graph_id → instance_id.
-    /// Sent by the graph-runner on startup (for all existing graphs) and after each graph.create.
+    /// Historically sent by the retired graph-runner guest on startup (for all existing
+    /// graphs) and after each graph.create; the hotel-side registry handler remains live.
     RegisterGraphInstance {
         graph_id: String,
         instance_id: String,

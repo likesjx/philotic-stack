@@ -14,9 +14,11 @@
 
 ## New Project: Primitives Crate Split
 
-- [ ] Review [PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md).
-- [ ] Map the current `ansible-mesh-core` modules to the target primitive crates and identify the first extraction boundary.
-- [ ] Extract the smallest safe primitive crate boundary once the interface map is stable.
+**CLOSED 2026-07-06** — the split was folded back. `philotic-primitives-mesh` (consumed by `ansible-mesh-core`) is the only primitives crate; the five empty stub crates were deleted (codex/crate-cleanup). See ARCHITECTURE_STATUS.md.
+
+- [ ] ~~Review [PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md).~~
+- [ ] ~~Map the current `ansible-mesh-core` modules to the target primitive crates and identify the first extraction boundary.~~
+- [ ] ~~Extract the smallest safe primitive crate boundary once the interface map is stable.~~
 
 ## Current Work Item Split
 
@@ -24,15 +26,11 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 
 ### Primitives Refactor
 
+**CLOSED 2026-07-06** — split folded back; the five stub crates (`-agent`, `-data`, `-hotel`, `-model`, `-tool`) were empty scaffolds and are deleted. Only the two completed extractions below remain true.
+
 - [x] Extract mesh envelope primitives into `philotic-primitives-mesh`.
-- [ ] Extract hotel/runtime capability and registry primitives into `philotic-primitives-hotel` behind compatibility shims. <!-- NOT DONE: crate is a `cargo new` stub (only `add(2,2)`), zero live types, not a workspace member. See ARCHITECTURE_STATUS.md "primitives split is NOT implemented" (2026-07-05 correction, PR #128). -->
-- [ ] Extract graph/storage primitives into `philotic-primitives-data` behind compatibility shims. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
-- [ ] Extract agent/session/memory primitives into `philotic-primitives-agent` behind compatibility shims. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
-- [ ] Extract tool/skill primitives into `philotic-primitives-tool` behind compatibility shims. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
-- [ ] Extract tool execution route/config envelopes into `philotic-primitives-tool` where they are shared by session shaping and tool routing. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
-- [ ] Extract model-routing DTOs into `philotic-primitives-model` behind compatibility shims. <!-- NOT DONE: empty stub, see ARCHITECTURE_STATUS.md. -->
 - [x] Extract the `ModelManagerInvoker` wiring out of `ansible-mesh-core`.
-- [ ] Migrate downstream crates off the remaining `ansible-mesh-core` compatibility imports where direct primitive crates are now clearer.
+- ~~Extract hotel/runtime, graph/storage, agent/session, tool, and model-routing primitives into per-domain crates behind compatibility shims.~~ <!-- FOLDED BACK 2026-07-06: stubs deleted (codex/crate-cleanup); `ansible-mesh-core` stays the shared library. -->
 
 ## Current Mesh / Transport Pressure
 

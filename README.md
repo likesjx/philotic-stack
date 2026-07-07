@@ -82,7 +82,7 @@ aiua --load-config mesh-config.json
 
 ## Crates
 
-36 crates live under [`crates/`](crates/): 29 workspace members, 6 `philotic-primitives-*` extraction crates (only `philotic-primitives-mesh` is currently consumed, by `ansible-mesh-core`; the other five have no reverse dependencies yet — disposition tracked as a Phase 3 consolidation slice), and `agent-graph-runner` (superseded by `agent-datasource`, directory deletion pending).
+30 crates live under [`crates/`](crates/): 28 workspace members, `philotic-primitives-mesh` (consumed by `ansible-mesh-core` as a path dependency; the other five primitives stubs were empty scaffolds and were folded back and deleted 2026-07-06, alongside the retired `graph-runner` crate), and `agent-graph-runner` (superseded by `agent-datasource`, directory deletion pending).
 
 ### Binaries
 
@@ -97,7 +97,6 @@ aiua --load-config mesh-config.json
 | [`philotic-web`](crates/philotic-web/) | Operator CLI + desktop membrane (REST API, WebSocket, operator chat) |
 | [`model-router`](crates/model-router/) | Shared LLM inference routing SDK |
 | [`tool-runner`](crates/tool-runner/) | Sandboxed tool execution (Landlock + seccomp via philotic-sandbox) |
-| [`graph-runner`](crates/graph-runner/) | Retired (deseeded; superseded by `graph-datasource` — crate deletion pending) |
 | [`agent-datasource`](crates/agent-datasource/) | Per-agent cognitive graph partition datasource (`agent.graph.*` tool surface) |
 | [`graph-datasource`](crates/graph-datasource/) | Autonomous graph partition management tool surface |
 | [`graph-intelligence`](crates/graph-intelligence/) | Project intelligence graph + MCP server |
@@ -108,13 +107,8 @@ aiua --load-config mesh-config.json
 
 | Crate | Role |
 |---|---|
-| [`ansible-mesh-core`](crates/ansible-mesh-core/) | Shared core library — storage traits, `GraphDomain`, mesh types (primitives extraction planned; only mesh primitives extracted so far) |
-| [`philotic-primitives-mesh`](crates/philotic-primitives-mesh/) | Mesh primitives (EventEnvelope, BeaconMessage, etc.) |
-| [`philotic-primitives-hotel`](crates/philotic-primitives-hotel/) | Hotel orchestration primitives |
-| [`philotic-primitives-agent`](crates/philotic-primitives-agent/) | Agent and persona primitives |
-| [`philotic-primitives-data`](crates/philotic-primitives-data/) | Data and storage primitives |
-| [`philotic-primitives-model`](crates/philotic-primitives-model/) | Model routing and context primitives |
-| [`philotic-primitives-tool`](crates/philotic-primitives-tool/) | Tool execution primitives |
+| [`ansible-mesh-core`](crates/ansible-mesh-core/) | Shared core library — storage traits, `GraphDomain`, mesh types (only mesh primitives were extracted; the wider primitives split was folded back 2026-07-06) |
+| [`philotic-primitives-mesh`](crates/philotic-primitives-mesh/) | Mesh primitives (EventEnvelope, BeaconMessage, etc.) — the only primitives crate; the six-crate split was folded back (2026-07-06) |
 | [`philotic-client`](crates/philotic-client/) | Guest SDK — IPC client for hotel communication |
 | [`memory-core`](crates/memory-core/) | MemoryEngine trait, CognitiveEngine, Muninn integration |
 | [`philotic-graph`](crates/philotic-graph/) | Core graph intelligence and SVE tooling |
