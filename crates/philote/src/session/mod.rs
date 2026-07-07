@@ -215,6 +215,15 @@ pub struct SessionState {
     pub agent_graph_snapshot: Option<String>,
     /// Whether a graph preload has been dispatched this session (to avoid duplicate fetches).
     pub graph_preload_dispatched: bool,
+    /// Cached LifeGraph recall packets prefetched out-of-band (fire-and-forget
+    /// `life.recall` to the runner). Injected into the active turn's
+    /// `recalled_memories` at turn start when fresh. Checkpoint-persisted.
+    pub life_recall_cache: Vec<LifeRecallCacheEntry>,
+    /// Whether the session-load LifeGraph prefetch has been dispatched. Live-only —
+    /// resets on restart so a fresh process re-primes the cache.
+    pub life_recall_prefetch_dispatched: bool,
+    /// Log-once flag for a degraded/unreachable LifeGraph runner. Live-only.
+    pub life_autorecall_degraded_logged: bool,
     /// ID of the `UserTask` created when the agent proposed the current plan.
     /// `None` until a plan_proposal is accepted and persisted to the hotel graph.
     /// Cleared when the task completes, fails, or is cancelled.
@@ -261,6 +270,9 @@ impl SessionState {
             pending_preapproval_thresholds: std::collections::HashMap::new(),
             agent_graph_snapshot: None,
             graph_preload_dispatched: false,
+            life_recall_cache: Vec::new(),
+            life_recall_prefetch_dispatched: false,
+            life_autorecall_degraded_logged: false,
             active_user_task_id: None,
             base_context_window: None,
         }
@@ -1430,6 +1442,71 @@ impl SessionState {
 
     pub fn resolve_tool_route(&self, tool_name: &str) -> Option<&ToolExecutionRoute> {
         self.tool_assembly.execution_routes.get(tool_name)
+    }
+
+    /// Replace (or insert) the cached LifeGraph prefetch packet for a strategy.
+    pub fn upsert_life_recall_cache(&mut self, entry: LifeRecallCacheEntry) {
+        if let Some(existing) = self
+            .life_recall_cache
+            .iter_mut()
+            .find(|cached| cached.strategy == entry.strategy)
+        {
+            *existing = entry;
+        } else {
+            self.life_recall_cache.push(entry);
+        }
+    }
+
+    /// Inject cached LifeGraph context into the active turn's `recalled_memories`.
+    ///
+    /// Non-blocking by construction: only the cache is consulted — never the
+    /// runner. Entries older than `max_age_secs` are skipped (stale), records are
+    /// deduplicated by node id (against both the cache lanes and any memories the
+    /// Muninn lane already recalled), and total injected content is capped at
+    /// `char_budget` chars with a truncation marker. Returns the number of
+    /// records injected.
+    pub fn inject_cached_life_context(
+        &mut self,
+        max_age_secs: u64,
+        now: u64,
+        char_budget: usize,
+    ) -> usize {
+        let Some(turn) = self.active_turn.as_ref() else {
+            return 0;
+        };
+        if turn.user_content.trim_start().starts_with('/') {
+            return 0;
+        }
+
+        let mut seen_ids: std::collections::HashSet<String> = turn
+            .recalled_memories
+            .iter()
+            .filter_map(|memory| memory.id.clone())
+            .collect();
+
+        let mut candidates: Vec<RecalledMemoryRecord> = Vec::new();
+        for entry in &self.life_recall_cache {
+            if entry.fetched_at.saturating_add(max_age_secs) < now {
+                continue; // stale — skip; the out-of-band prefetch will refresh it
+            }
+            for record in &entry.records {
+                if let Some(id) = record.id.as_deref() {
+                    if !seen_ids.insert(id.to_string()) {
+                        continue;
+                    }
+                }
+                candidates.push(record.clone());
+            }
+        }
+
+        let budgeted = apply_life_recall_char_budget(candidates, char_budget);
+        let injected = budgeted.len();
+        if injected > 0 {
+            if let Some(turn) = self.active_turn.as_mut() {
+                turn.recalled_memories.extend(budgeted);
+            }
+        }
+        injected
     }
 
     pub fn rebuild_default_tool_assembly(&mut self) {
@@ -3392,6 +3469,7 @@ impl SessionState {
             "parked_approval_turn": parked_approval_turn,
             "parked_plan_turn": parked_plan_turn,
             "active_user_task_id": self.active_user_task_id,
+            "life_recall_cache": self.life_recall_cache,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
                     "turn_id": turn.turn_id,
@@ -3785,6 +3863,13 @@ impl SessionState {
             pending_preapproval_thresholds,
             agent_graph_snapshot: None,
             graph_preload_dispatched: false,
+            life_recall_cache: checkpoint
+                .get("life_recall_cache")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Vec<LifeRecallCacheEntry>>(value).ok())
+                .unwrap_or_default(),
+            life_recall_prefetch_dispatched: false,
+            life_autorecall_degraded_logged: false,
             active_user_task_id: checkpoint
                 .get("active_user_task_id")
                 .and_then(serde_json::Value::as_str)
@@ -3792,6 +3877,49 @@ impl SessionState {
             base_context_window: None,
         })
     }
+}
+
+/// Truncation marker appended when the LifeGraph char budget cuts content.
+pub const LIFE_RECALL_TRUNCATION_MARKER: &str = "… [LifeGraph context truncated at char budget]";
+
+/// Enforce the total char budget over LifeGraph records (concept + content).
+///
+/// Records are kept in ranked order until the budget is exhausted. The record
+/// that crosses the budget is content-truncated (when meaningful room remains)
+/// and tagged with [`LIFE_RECALL_TRUNCATION_MARKER`]; everything after it is
+/// dropped so the injected context stays lean.
+pub fn apply_life_recall_char_budget(
+    records: Vec<RecalledMemoryRecord>,
+    char_budget: usize,
+) -> Vec<RecalledMemoryRecord> {
+    let mut out: Vec<RecalledMemoryRecord> = Vec::new();
+    let mut used = 0usize;
+    for mut record in records {
+        let record_chars = record.concept.chars().count() + record.content.chars().count();
+        if used + record_chars <= char_budget {
+            used += record_chars;
+            out.push(record);
+            continue;
+        }
+        // Budget crossed: truncate this record into the remaining room when it
+        // is still meaningful, otherwise just mark the previous record.
+        let remaining = char_budget.saturating_sub(used + record.concept.chars().count());
+        if remaining >= 40 {
+            record.content = record
+                .content
+                .chars()
+                .take(remaining)
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            record.content.push_str(LIFE_RECALL_TRUNCATION_MARKER);
+            out.push(record);
+        } else if let Some(last) = out.last_mut() {
+            last.content.push_str(LIFE_RECALL_TRUNCATION_MARKER);
+        }
+        break;
+    }
+    out
 }
 
 /// Returns true if `phrase` appears in `text` as a standalone word/phrase, not as a
@@ -4803,12 +4931,13 @@ mod tests {
     use super::{
         ActivePlan, ApprovalPolicy, ApprovalRiskHint, ComponentExecutionRoute,
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
-        ContextLayerId, ContextMutability, HookRequest, HookResult, MemoryAuthority,
-        MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel,
-        ParacrineThreadStatus, PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest,
-        ResponseRouteMode, RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
-        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, TurnRecord,
-        VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings,
+        ContextLayerId, ContextMutability, HookRequest, HookResult, LIFE_RECALL_TRUNCATION_MARKER,
+        LifeRecallCacheEntry, MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope,
+        MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, PlanStep,
+        PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation,
+        SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
+        TransportReplyTargetBinding, TtsMode, TurnRecord, VoiceDeliveryMode, VoiceResponsePolicy,
+        WorkingTurn, apply_life_recall_char_budget, default_tool_assembly_for_bindings,
         merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
@@ -8231,6 +8360,205 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
         }
+    }
+
+    fn make_plain_turn() -> WorkingTurn {
+        let mut turn = make_turn_with_plan(ActivePlan {
+            goal: "unused".into(),
+            status: "active".into(),
+            steps: Vec::new(),
+            context_1_advisory: None,
+        });
+        turn.active_plan = None;
+        turn.user_content = "run your morning steward pass".into();
+        turn
+    }
+
+    fn life_record(id: &str, content: &str) -> RecalledMemoryRecord {
+        RecalledMemoryRecord {
+            id: Some(id.to_string()),
+            vault_id: Some("life-graph".into()),
+            concept: "OpenLoop".into(),
+            content: content.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn life_recall_cache_round_trips_through_checkpoint() {
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "re_entry_context".into(),
+            fetched_at: 1_750_000_000,
+            query_text: "morning steward pass".into(),
+            records: vec![life_record(
+                "life:open-loop:1",
+                "Renew passport before trip",
+            )],
+        });
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+
+        assert_eq!(restored.life_recall_cache, state.life_recall_cache);
+        // Live-only flags must reset so a restart re-primes the cache.
+        assert!(!restored.life_recall_prefetch_dispatched);
+        assert!(!restored.life_autorecall_degraded_logged);
+    }
+
+    #[test]
+    fn upsert_life_recall_cache_replaces_per_strategy() {
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "re_entry_context".into(),
+            fetched_at: 100,
+            query_text: String::new(),
+            records: vec![life_record("life:a", "old")],
+        });
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "re_entry_context".into(),
+            fetched_at: 200,
+            query_text: String::new(),
+            records: vec![life_record("life:b", "new")],
+        });
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "open_loops_by_context".into(),
+            fetched_at: 200,
+            query_text: String::new(),
+            records: Vec::new(),
+        });
+
+        assert_eq!(state.life_recall_cache.len(), 2);
+        let re_entry = state
+            .life_recall_cache
+            .iter()
+            .find(|entry| entry.strategy == "re_entry_context")
+            .expect("re_entry entry");
+        assert_eq!(re_entry.fetched_at, 200);
+        assert_eq!(re_entry.records[0].id.as_deref(), Some("life:b"));
+    }
+
+    #[test]
+    fn inject_cached_life_context_skips_stale_entries() {
+        let now = 10_000u64;
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        state.start_turn(make_plain_turn());
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "re_entry_context".into(),
+            fetched_at: now - 4_000, // older than max age 1800 → stale
+            query_text: String::new(),
+            records: vec![life_record("life:stale", "stale loop")],
+        });
+
+        let injected = state.inject_cached_life_context(1_800, now, 2_500);
+        assert_eq!(injected, 0, "stale cache must be skipped, not injected");
+        assert!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .recalled_memories
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn inject_cached_life_context_injects_fresh_and_dedupes() {
+        let now = 10_000u64;
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = make_plain_turn();
+        // Muninn lane already recalled this node id — must not double-inject.
+        turn.recalled_memories = vec![life_record("life:dup", "already recalled")];
+        state.start_turn(turn);
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "re_entry_context".into(),
+            fetched_at: now - 10,
+            query_text: String::new(),
+            records: vec![
+                life_record("life:dup", "duplicate of muninn record"),
+                life_record("life:fresh", "renew passport before August trip"),
+            ],
+        });
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "open_loops_by_context".into(),
+            fetched_at: now - 10,
+            query_text: String::new(),
+            // Same node surfaced by both strategies — inject once.
+            records: vec![life_record(
+                "life:fresh",
+                "renew passport before August trip",
+            )],
+        });
+
+        let injected = state.inject_cached_life_context(1_800, now, 2_500);
+        assert_eq!(injected, 1);
+        let memories = &state.active_turn.as_ref().unwrap().recalled_memories;
+        assert_eq!(memories.len(), 2);
+        assert_eq!(memories[1].id.as_deref(), Some("life:fresh"));
+        assert_eq!(memories[1].vault_id.as_deref(), Some("life-graph"));
+    }
+
+    #[test]
+    fn inject_cached_life_context_skips_slash_command_turns() {
+        let now = 10_000u64;
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = make_plain_turn();
+        turn.user_content = "/status".into();
+        state.start_turn(turn);
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "re_entry_context".into(),
+            fetched_at: now,
+            query_text: String::new(),
+            records: vec![life_record("life:x", "loop")],
+        });
+
+        assert_eq!(state.inject_cached_life_context(1_800, now, 2_500), 0);
+    }
+
+    #[test]
+    fn apply_life_recall_char_budget_truncates_with_marker() {
+        let records = vec![
+            life_record("life:1", &"a".repeat(2_000)),
+            life_record("life:2", &"b".repeat(2_000)),
+            life_record("life:3", &"c".repeat(2_000)),
+        ];
+
+        let budgeted = apply_life_recall_char_budget(records, 2_500);
+
+        assert_eq!(budgeted.len(), 2, "third record must be dropped");
+        assert_eq!(budgeted[0].content.chars().count(), 2_000);
+        assert!(
+            budgeted[1].content.ends_with(LIFE_RECALL_TRUNCATION_MARKER),
+            "crossing record must carry the truncation marker"
+        );
+        let total: usize = budgeted
+            .iter()
+            .map(|record| record.concept.chars().count() + record.content.chars().count())
+            .sum();
+        assert!(
+            total <= 2_500 + LIFE_RECALL_TRUNCATION_MARKER.chars().count(),
+            "total injected chars must respect the budget (marker exempt), got {total}"
+        );
     }
 
     #[test]

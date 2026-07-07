@@ -11,12 +11,12 @@ use crate::protocol::{
 use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors,
-    HANDOFF_CONTEXT_EXCERPT_MAX_CHARS, MediaRoutingPolicy, MemoryAuthority, MemoryShapingContext,
-    MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel,
-    PARACRINE_MERGE_CONTENT_MAX_CHARS, PARACRINE_WHISPER_PROMPT_MAX_CHARS, ParacrineBudgetOutcome,
-    ParacrineThreadStatus, RecalledMemoryRecord, SessionState, ToolDefinition, ToolExecutionRoute,
-    ToolRunnerIncarnationBinding, TtsMode, VoiceResponsePolicy, WorkingTurn, charge_paracrine_hop,
-    merge_session_index, truncate_for_wire,
+    HANDOFF_CONTEXT_EXCERPT_MAX_CHARS, LifeRecallCacheEntry, MediaRoutingPolicy, MemoryAuthority,
+    MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind,
+    MemoryValidationLevel, PARACRINE_MERGE_CONTENT_MAX_CHARS, PARACRINE_WHISPER_PROMPT_MAX_CHARS,
+    ParacrineBudgetOutcome, ParacrineThreadStatus, RecalledMemoryRecord, SessionState,
+    ToolDefinition, ToolExecutionRoute, ToolRunnerIncarnationBinding, TtsMode, VoiceResponsePolicy,
+    WorkingTurn, charge_paracrine_hop, merge_session_index, truncate_for_wire,
 };
 use anyhow::Result;
 use memory_core::{
@@ -1560,6 +1560,10 @@ impl AgentRuntime {
         self.ensure_session_loaded(&session_id, &source).await?;
         self.refresh_bindings_from_snapshot(&session_id).await;
         self.dispatch_graph_preload_once(&session_id).await;
+        // LifeGraph auto-recall lane: prime the cache once per session load so
+        // the first turn can already inject graph context (fire-and-forget).
+        self.dispatch_life_recall_prefetch_once(&session_id, &content)
+            .await;
 
         let (final_reply_to, final_reply_role, final_reply_guest_id) = {
             let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
@@ -2174,6 +2178,9 @@ impl AgentRuntime {
         }
 
         self.maybe_auto_recall_turn_memory(&session_id).await?;
+        // LifeGraph auto-recall lane: inject cached graph context beside the
+        // Muninn lane. Cache-only — never blocks the turn on the runner.
+        self.maybe_inject_life_graph_context(&session_id).await;
 
         let (
             checkpoint_memory_type,
@@ -3795,6 +3802,13 @@ impl AgentRuntime {
     /// Store the result from a fire-and-forget graph.query preload into the session snapshot.
     /// The snapshot is then injected as an AgentGraph context layer on the next model call.
     async fn handle_datasource_response(&mut self, task: InboundTaskPayload) -> Result<()> {
+        // LifeGraph auto-recall prefetch responses carry a sentinel turn id and
+        // are pure cache refreshes — they must never be routed as tool results.
+        if task.turn_id.as_deref() == Some(LIFE_AUTORECALL_PREFETCH_TURN_ID) {
+            self.handle_life_recall_prefetch_response(&task);
+            return Ok(());
+        }
+
         let session_id = match &task.session_id {
             Some(s) if !s.is_empty() => s.clone(),
             _ => return Ok(()),

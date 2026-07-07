@@ -111,6 +111,167 @@ pub(super) fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+pub(super) fn unix_ts_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// LifeGraph auto-recall lane (prefetch → cache → turn-start injection)
+// ---------------------------------------------------------------------------
+
+/// Sentinel turn id carried on prefetch dispatches and echoed back on the
+/// runner's `datasource_response`. Distinguishes cache-refresh responses from
+/// model-initiated `life.recall` tool results (which carry a real turn id).
+pub(super) const LIFE_AUTORECALL_PREFETCH_TURN_ID: &str = "life-autorecall-prefetch";
+
+/// Total char budget (concept + content) for injected LifeGraph context.
+pub(super) const LIFE_AUTORECALL_CHAR_BUDGET: usize = 2500;
+
+/// Named recall strategies prefetched for every session/turn.
+pub(super) const LIFE_AUTORECALL_STRATEGIES: [&str; 2] =
+    ["re_entry_context", "open_loops_by_context"];
+
+/// Max context packets requested per prefetch strategy — kept small so the
+/// injected context stays lean.
+pub(super) const LIFE_AUTORECALL_MAX_PACKETS: usize = 4;
+
+/// Max chars of the recent-topic snippet used as `query_text`.
+const LIFE_AUTORECALL_QUERY_SNIPPET_CHARS: usize = 400;
+
+pub(super) fn life_autorecall_disabled_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// Env opt-out: `PHILOTIC_DISABLE_LIFE_AUTORECALL=1` disables the whole lane.
+pub(super) fn life_autorecall_disabled() -> bool {
+    life_autorecall_disabled_value(
+        std::env::var("PHILOTIC_DISABLE_LIFE_AUTORECALL")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Operator-decided agent → V005 LifeGraph domain lens. Passed as
+/// `RetrievalQuery.active_role` so ranking can bias toward the agent's domain
+/// WITHOUT filtering out cross-domain results (soft boundaries).
+///
+/// Matches on id segments (split at non-alphanumerics) so `aria` never
+/// shadows `ariel` inside ids like `agent-ariel-01`.
+pub(super) fn life_domain_slug_for_agent(agent_id: &str) -> Option<&'static str> {
+    for segment in agent_id.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        let slug = match segment.to_ascii_lowercase().as_str() {
+            "astrid" => Some("librarian"),
+            "ariel" => Some("communications"),
+            "jane" => Some("companion"),
+            "aria" => Some("architect"),
+            "beacon" => Some("chief_of_staff"),
+            "bjork" => Some("musician"),
+            "coach" => Some("human"),
+            _ => None,
+        };
+        if slug.is_some() {
+            return slug;
+        }
+    }
+    None
+}
+
+/// Build the `execute_tool` task JSON for one prefetch strategy.
+///
+/// The runner parses `arguments` as a `RetrievalQuery` (plus `named_strategy`)
+/// and auto-embeds `query_text` — no local ONNX sidecar is required. The
+/// sentinel `turn_id` rides the return route so the response is recognized as
+/// a cache refresh instead of a tool result.
+pub(super) fn life_recall_prefetch_task_json(
+    agent_id: &str,
+    session_id: &str,
+    local_node: &str,
+    named_strategy: &str,
+    query_text: &str,
+) -> Value {
+    let snippet: String = query_text
+        .chars()
+        .take(LIFE_AUTORECALL_QUERY_SNIPPET_CHARS)
+        .collect();
+    let mut arguments = serde_json::json!({
+        "query_id": format!(
+            "autorecall:{named_strategy}:{}",
+            Uuid::new_v4().simple()
+        ),
+        "query_text": snippet,
+        "named_strategy": named_strategy,
+        "operator_intent": "auto_recall_turn_context",
+        "max_context_packets": LIFE_AUTORECALL_MAX_PACKETS,
+    });
+    if let Some(domain) = life_domain_slug_for_agent(agent_id) {
+        arguments["active_role"] = Value::String(domain.to_string());
+    }
+    serde_json::json!({
+        "action": "execute_tool",
+        "tool_name": "life.recall",
+        "arguments": arguments,
+        "reply_to": local_node,
+        "reply_role": "agent",
+        "reply_guest_id": agent_id,
+        "session_id": session_id,
+        "turn_id": LIFE_AUTORECALL_PREFETCH_TURN_ID,
+        "chat_id": "",
+    })
+}
+
+fn parse_iso_to_unix(value: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|ts| ts.timestamp().max(0) as u64)
+}
+
+/// Map a prefetch `datasource_response` result into recalled-memory records.
+///
+/// Expects the datasource envelope `{"status":"success","data":{...}}` where
+/// `data.context_packet` is a serialized `RetrievalContextPacket`. Returns
+/// `None` for degraded results (embed failure, missing packet, parse errors).
+pub(super) fn life_recall_records_from_result(
+    result: &Value,
+) -> Option<(String, Vec<RecalledMemoryRecord>)> {
+    let data = result.get("data")?;
+    let strategy = data
+        .get("named_strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("semantic_pivot")
+        .to_string();
+    let packet: data_memorygraphrag::RetrievalContextPacket =
+        serde_json::from_value(data.get("context_packet")?.clone()).ok()?;
+
+    let records = packet
+        .ranked_packets
+        .iter()
+        .map(|ranked| {
+            let evidence = &ranked.packet;
+            RecalledMemoryRecord {
+                id: Some(evidence.claim_ref.id.clone()),
+                vault_id: Some("life-graph".to_string()),
+                concept: evidence.claim_ref.label.clone(),
+                content: evidence.claim_summary.clone(),
+                tags: vec![strategy.clone()],
+                memory_type: Some("life_graph".to_string()),
+                confidence: Some(evidence.confidence),
+                source: Some("life-graph".to_string()),
+                created_at: evidence.observed_at.as_deref().and_then(parse_iso_to_unix),
+                recall_reason: Some(format!("life.recall:{strategy} score={:.2}", ranked.score)),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    Some((strategy, records))
+}
+
 pub(super) fn memory_enum_arg(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
@@ -985,6 +1146,204 @@ impl AgentRuntime {
                     })
                     .to_string(),
                 })
+                .await;
+        }
+    }
+
+    /// Fire the session-load LifeGraph prefetch once per session load.
+    ///
+    /// The flag is live-only (not checkpointed) so every process restart
+    /// re-primes the cache with the first inbound turn's content.
+    pub(super) async fn dispatch_life_recall_prefetch_once(
+        &mut self,
+        session_id: &str,
+        query_text: &str,
+    ) {
+        let should_dispatch = self
+            .sessions
+            .get_mut(session_id)
+            .map(|state| {
+                if state.life_recall_prefetch_dispatched {
+                    false
+                } else {
+                    state.life_recall_prefetch_dispatched = true;
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_dispatch {
+            self.dispatch_life_recall_prefetch(session_id, query_text)
+                .await;
+        }
+    }
+
+    /// Fire-and-forget `life.recall` prefetch toward the LifeGraph runner.
+    ///
+    /// This never blocks a turn: the response arrives later as a
+    /// `datasource_response` task (routed by the sentinel turn id
+    /// [`LIFE_AUTORECALL_PREFETCH_TURN_ID`]) and only updates the session cache.
+    /// One task is emitted per named strategy in [`LIFE_AUTORECALL_STRATEGIES`].
+    ///
+    /// Gating: skipped when `PHILOTIC_DISABLE_LIFE_AUTORECALL=1`, when the
+    /// session's profile has no `life_graph` class bound (no `life.recall`
+    /// route), or when the seed text is empty / a slash command.
+    pub(super) async fn dispatch_life_recall_prefetch(
+        &mut self,
+        session_id: &str,
+        query_text: &str,
+    ) {
+        if life_autorecall_disabled() {
+            return;
+        }
+        let query_text = query_text.trim();
+        if query_text.is_empty() || query_text.starts_with('/') {
+            return;
+        }
+        let Some((target_node, target_role)) = self.sessions.get(session_id).and_then(|state| {
+            state.resolve_tool_route("life.recall").map(|route| {
+                let node = if route.target_node.trim().is_empty() {
+                    life_graph_runner_node_id()
+                } else {
+                    route.target_node.clone()
+                };
+                let role = if route.target_role.trim().is_empty() {
+                    "life-graph-runner".to_string()
+                } else {
+                    route.target_role.clone()
+                };
+                (node, role)
+            })
+        }) else {
+            debug!(
+                session_id = %session_id,
+                "LifeGraph auto-recall prefetch skipped: no life.recall route bound for this profile"
+            );
+            return;
+        };
+
+        let local_node = local_node_id();
+        for strategy in LIFE_AUTORECALL_STRATEGIES {
+            let task_json = life_recall_prefetch_task_json(
+                &self.agent_id,
+                session_id,
+                &local_node,
+                strategy,
+                query_text,
+            );
+            if let Err(err) = self
+                .ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: target_node.clone(),
+                    target_role: target_role.clone(),
+                    target_guest_id: None,
+                    task_json: task_json.to_string(),
+                })
+                .await
+            {
+                debug!(
+                    session_id = %session_id,
+                    strategy = %strategy,
+                    error = %err,
+                    "LifeGraph auto-recall prefetch emit failed (lane degrades to no-injection)"
+                );
+            }
+        }
+    }
+
+    /// Absorb a LifeGraph prefetch `datasource_response` into the session cache.
+    ///
+    /// Success replaces the per-strategy cache entry; failures (runner
+    /// unreachable, embed failure, malformed packet) leave the cache untouched
+    /// and log once per session at debug — the turn is never failed.
+    pub(super) fn handle_life_recall_prefetch_response(&mut self, task: &InboundTaskPayload) {
+        let Some(session_id) = task.session_id.as_deref().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let Some(state) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+
+        if let Some(error) = task.error.as_ref() {
+            if !state.life_autorecall_degraded_logged {
+                state.life_autorecall_degraded_logged = true;
+                debug!(
+                    session_id = %session_id,
+                    error = %error.message,
+                    "LifeGraph auto-recall prefetch failed — lane degrades to no-injection"
+                );
+            }
+            return;
+        }
+
+        let Some((strategy, records)) = task
+            .result
+            .as_ref()
+            .and_then(life_recall_records_from_result)
+        else {
+            if !state.life_autorecall_degraded_logged {
+                state.life_autorecall_degraded_logged = true;
+                debug!(
+                    session_id = %session_id,
+                    "LifeGraph auto-recall prefetch returned no usable context packet — lane degrades to no-injection"
+                );
+            }
+            return;
+        };
+
+        state.life_autorecall_degraded_logged = false;
+        let record_count = records.len();
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: strategy.clone(),
+            fetched_at: unix_ts_now(),
+            query_text: String::new(),
+            records,
+        });
+        info!(
+            session_id = %session_id,
+            strategy = %strategy,
+            records = record_count,
+            "LifeGraph auto-recall cache refreshed"
+        );
+    }
+
+    /// Turn-start injection: surface cached LifeGraph context to the model.
+    ///
+    /// Runs beside (after) the Muninn auto-recall lane and extends
+    /// `active_turn.recalled_memories` with cached, fresh, deduplicated records
+    /// under [`LIFE_AUTORECALL_CHAR_BUDGET`]. Purely local — never waits on the
+    /// runner, so a degraded runner simply means no injection.
+    pub(super) async fn maybe_inject_life_graph_context(&mut self, session_id: &str) {
+        if life_autorecall_disabled() {
+            return;
+        }
+        let injected = {
+            let Some(state) = self.sessions.get_mut(session_id) else {
+                return;
+            };
+            if state.resolve_tool_route("life.recall").is_none() {
+                return;
+            }
+            let max_age_secs = state.settings.memory.life_recall_max_age_secs;
+            state.inject_cached_life_context(
+                max_age_secs,
+                unix_ts_now(),
+                LIFE_AUTORECALL_CHAR_BUDGET,
+            )
+        };
+        if injected > 0 {
+            info!(
+                session_id = %session_id,
+                records = injected,
+                "LifeGraph auto-recall injected cached graph context into turn"
+            );
+            let _ = self
+                .emit_turn_event(
+                    session_id,
+                    "life_autorecall_injected",
+                    Some(format!(
+                        "Injected {injected} LifeGraph context record(s) from prefetch cache"
+                    )),
+                )
                 .await;
         }
     }
@@ -1902,6 +2261,189 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn life_recall_prefetch_task_json_matches_runner_contract() {
+        let long_topic = "x".repeat(600);
+        let task = life_recall_prefetch_task_json(
+            "agent-beacon-01",
+            "sess-1",
+            "mbp-jane-aiua-01",
+            "re_entry_context",
+            &long_topic,
+        );
+
+        assert_eq!(task["action"], "execute_tool");
+        assert_eq!(task["tool_name"], "life.recall");
+        assert_eq!(task["turn_id"], LIFE_AUTORECALL_PREFETCH_TURN_ID);
+        assert_eq!(task["session_id"], "sess-1");
+        assert_eq!(task["reply_to"], "mbp-jane-aiua-01");
+        assert_eq!(task["reply_role"], "agent");
+        assert_eq!(task["reply_guest_id"], "agent-beacon-01");
+
+        let args = &task["arguments"];
+        assert_eq!(args["named_strategy"], "re_entry_context");
+        assert_eq!(args["active_role"], "chief_of_staff");
+        assert_eq!(
+            args["max_context_packets"],
+            LIFE_AUTORECALL_MAX_PACKETS as u64
+        );
+        assert!(
+            args["query_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("autorecall:re_entry_context:")
+        );
+        assert_eq!(
+            args["query_text"].as_str().unwrap().chars().count(),
+            400,
+            "query_text must be snipped to the snippet budget"
+        );
+
+        // The runner deserializes `arguments` as a RetrievalQuery and runs the
+        // plan contract validation — this dispatch must survive both.
+        let query: data_memorygraphrag::RetrievalQuery =
+            serde_json::from_value(args.clone()).expect("arguments parse as RetrievalQuery");
+        query.validate().expect("query passes contract validation");
+        assert_eq!(query.active_role.as_deref(), Some("chief_of_staff"));
+        assert_eq!(query.max_context_packets, LIFE_AUTORECALL_MAX_PACKETS);
+    }
+
+    #[test]
+    fn life_domain_map_distinguishes_aria_from_ariel() {
+        assert_eq!(
+            life_domain_slug_for_agent("agent-ariel-01"),
+            Some("communications")
+        );
+        assert_eq!(
+            life_domain_slug_for_agent("agent-aria-01"),
+            Some("architect")
+        );
+        assert_eq!(
+            life_domain_slug_for_agent("agent-astrid-01"),
+            Some("librarian")
+        );
+        assert_eq!(
+            life_domain_slug_for_agent("agent-jane-01"),
+            Some("companion")
+        );
+        assert_eq!(
+            life_domain_slug_for_agent("agent-beacon-01"),
+            Some("chief_of_staff")
+        );
+        assert_eq!(
+            life_domain_slug_for_agent("agent-bjork-01"),
+            Some("musician")
+        );
+        assert_eq!(life_domain_slug_for_agent("agent-coach-01"), Some("human"));
+        assert_eq!(life_domain_slug_for_agent("agent-unknown-01"), None);
+    }
+
+    #[test]
+    fn life_recall_records_from_result_maps_context_packet() {
+        let result = serde_json::json!({
+            "status": "success",
+            "data": {
+                "status": "ok",
+                "named_strategy": "open_loops_by_context",
+                "fallback_used": false,
+                "context_packet": {
+                    "context_id": "ctx:q1",
+                    "query_id": "q1",
+                    "strategy": "memory_aware_graph_rank",
+                    "ranked_packets": [{
+                        "packet": {
+                            "packet_id": "evidence:1",
+                            "claim_ref": {
+                                "id": "life:open-loop:abc",
+                                "label": "OpenLoop",
+                                "datasource": "life-graph"
+                            },
+                            "claim_summary": "Renew passport before the August trip",
+                            "source_refs": [{
+                                "source_id": "membrane:telegram",
+                                "source_kind": "runtime_observation",
+                                "reliability": {"score": 0.9, "basis": "direct_observation"}
+                            }],
+                            "passage_refs": [],
+                            "confidence": 0.82,
+                            "validation_state": "proposed",
+                            "observed_at": "2026-07-01T12:00:00Z",
+                            "source_reliability": 0.9,
+                            "conflict_ids": [],
+                            "adjudication_status": "not_needed",
+                            "metadata": {}
+                        },
+                        "score": 0.7,
+                        "matched_policy_filters": [],
+                        "evidence_path": []
+                    }],
+                    "omitted_conflict_ids": [],
+                    "token_budget": 800,
+                    "generated_at": "2026-07-06T00:00:00Z"
+                }
+            }
+        });
+
+        let (strategy, records) =
+            life_recall_records_from_result(&result).expect("packet maps to records");
+
+        assert_eq!(strategy, "open_loops_by_context");
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.id.as_deref(), Some("life:open-loop:abc"));
+        assert_eq!(record.vault_id.as_deref(), Some("life-graph"));
+        assert_eq!(record.concept, "OpenLoop");
+        assert_eq!(record.content, "Renew passport before the August trip");
+        assert_eq!(record.memory_type.as_deref(), Some("life_graph"));
+        assert_eq!(record.confidence, Some(0.82));
+        assert_eq!(record.source.as_deref(), Some("life-graph"));
+        assert!(
+            record.created_at.is_some(),
+            "observed_at must map to created_at"
+        );
+        assert_eq!(record.tags, vec!["open_loops_by_context".to_string()]);
+        assert!(
+            record
+                .recall_reason
+                .as_deref()
+                .unwrap()
+                .contains("life.recall:open_loops_by_context")
+        );
+    }
+
+    #[test]
+    fn life_recall_records_from_result_rejects_degraded_results() {
+        // Runner reachable but embedding sidecar down.
+        let embed_failed = serde_json::json!({
+            "status": "success",
+            "data": {"status": "embed_failed", "detail": "auto-embedding failed"}
+        });
+        assert!(life_recall_records_from_result(&embed_failed).is_none());
+
+        // Envelope without data at all.
+        assert!(
+            life_recall_records_from_result(&serde_json::json!({"status": "success"})).is_none()
+        );
+
+        // Malformed context packet.
+        let malformed = serde_json::json!({
+            "status": "success",
+            "data": {"status": "ok", "named_strategy": "re_entry_context", "context_packet": {"nope": true}}
+        });
+        assert!(life_recall_records_from_result(&malformed).is_none());
+    }
+
+    #[test]
+    fn life_autorecall_env_gate_values() {
+        assert!(life_autorecall_disabled_value(Some("1")));
+        assert!(life_autorecall_disabled_value(Some("true")));
+        assert!(life_autorecall_disabled_value(Some(" yes ")));
+        assert!(!life_autorecall_disabled_value(Some("0")));
+        assert!(!life_autorecall_disabled_value(Some("")));
+        assert!(!life_autorecall_disabled_value(Some("false")));
+        assert!(!life_autorecall_disabled_value(None));
+    }
 
     #[test]
     fn direct_life_observe_parser_handles_telegram_open_loop_request() {
