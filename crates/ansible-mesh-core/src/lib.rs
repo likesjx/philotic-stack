@@ -7,6 +7,7 @@ pub mod agent;
 pub mod agent_graph_storage;
 pub mod attention_steward;
 pub mod authz;
+pub mod autonomy;
 pub mod beacon;
 pub mod capability;
 pub mod catalog_rights;
