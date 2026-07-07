@@ -318,11 +318,44 @@ impl GeminiProvider {
         aliases
     }
 
+    /// JSON Schema keys that Gemini's FunctionDeclaration `Schema` reliably
+    /// accepts across API variants (v1beta REST with API key or OAuth bearer).
+    ///
+    /// Anything else — `default`, `minItems`, `minimum`/`maximum`,
+    /// `additionalProperties`, `$schema`, `title`, `oneOf`/`anyOf`, ... — must
+    /// be stripped before the request is sent: Gemini rejects declarations
+    /// carrying unsupported keywords with a bare
+    /// `400 INVALID_ARGUMENT: Request contains an invalid argument.`
+    /// (observed live on vps-jane when the life.* tool contracts landed exact
+    /// JSON schemas; every tool-bearing turn failed, including the daily
+    /// steward cron).
+    const GEMINI_FUNCTION_SCHEMA_KEYS: &'static [&'static str] = &[
+        "type",
+        "description",
+        "nullable",
+        "enum",
+        "items",
+        "properties",
+        "required",
+    ];
+
+    /// Sanitize a tool `input_schema` into a Gemini-valid function declaration
+    /// parameter schema:
+    /// - drop every keyword outside [`Self::GEMINI_FUNCTION_SCHEMA_KEYS`],
+    ///   recursively (Gemini 400s on unsupported keywords like `default`);
+    /// - fold a stripped `default` into the description so the hint still
+    ///   reaches the model;
+    /// - infer a missing `type` from shape;
+    /// - keep `enum` only on string schemas (Gemini restricts enum to STRING);
+    /// - keep `required` entries only when they name declared properties.
     fn normalize_function_parameters(schema: &Value) -> Value {
         match schema {
             Value::Object(map) => {
                 let mut normalized = serde_json::Map::new();
                 for (key, value) in map {
+                    if !Self::GEMINI_FUNCTION_SCHEMA_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
                     let normalized_value = match key.as_str() {
                         "properties" => Value::Object(
                             value
@@ -346,6 +379,27 @@ impl GeminiProvider {
                     normalized.insert(key.clone(), normalized_value);
                 }
 
+                // Fold a stripped "default" into the description so the hint
+                // still reaches the model. Skip null/empty composites — they
+                // carry no signal worth the tokens.
+                if let Some(default) = map.get("default").filter(|value| !value.is_null()) {
+                    let rendered = match default {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    if !rendered.is_empty() && rendered != "[]" && rendered != "{}" {
+                        let suffix = format!("Defaults to {rendered}.");
+                        let description =
+                            match normalized.get("description").and_then(Value::as_str) {
+                                Some(existing) if !existing.trim().is_empty() => {
+                                    format!("{} {}", existing.trim_end(), suffix)
+                                }
+                                _ => suffix,
+                            };
+                        normalized.insert("description".into(), Value::String(description));
+                    }
+                }
+
                 if !normalized.contains_key("type") {
                     let inferred = if normalized.contains_key("properties") {
                         "object"
@@ -355,6 +409,48 @@ impl GeminiProvider {
                         "string"
                     };
                     normalized.insert("type".into(), Value::String(inferred.into()));
+                }
+
+                // Gemini only accepts "enum" on string schemas.
+                let is_string_type = normalized
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|declared| declared.eq_ignore_ascii_case("string"))
+                    .unwrap_or(false);
+                if !is_string_type {
+                    normalized.remove("enum");
+                }
+
+                // "required" may only name declared properties.
+                let filtered_required =
+                    normalized
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .map(|required| {
+                            let property_names: std::collections::HashSet<&str> = normalized
+                                .get("properties")
+                                .and_then(Value::as_object)
+                                .map(|props| props.keys().map(String::as_str).collect())
+                                .unwrap_or_default();
+                            required
+                                .iter()
+                                .filter(|entry| {
+                                    entry
+                                        .as_str()
+                                        .map(|name| property_names.contains(name))
+                                        .unwrap_or(false)
+                                })
+                                .cloned()
+                                .collect::<Vec<Value>>()
+                        });
+                match filtered_required {
+                    Some(filtered) if filtered.is_empty() => {
+                        normalized.remove("required");
+                    }
+                    Some(filtered) => {
+                        normalized.insert("required".into(), Value::Array(filtered));
+                    }
+                    None => {}
                 }
 
                 Value::Object(normalized)
@@ -737,6 +833,32 @@ impl GeminiProvider {
         Ok(json!({
             "contents": [{"parts": parts}]
         }))
+    }
+
+    /// Render a Gemini error body as its message plus any structured detail
+    /// the API attached (`error.status`, `error.details`).
+    ///
+    /// Gemini's top-level message is often just "Request contains an invalid
+    /// argument." — when present, the details name the offending field, so
+    /// keep them in the surfaced error instead of dropping them.
+    fn api_error_detail(body: &Value) -> String {
+        let error = body.get("error");
+        let message = error
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        let mut rendered = message.to_string();
+        if let Some(status) = error.and_then(|e| e.get("status")).and_then(Value::as_str) {
+            rendered.push_str(&format!(" [{status}]"));
+        }
+        if let Some(details) = error
+            .and_then(|e| e.get("details"))
+            .filter(|d| !d.is_null())
+        {
+            let details_text: String = details.to_string().chars().take(600).collect();
+            rendered.push_str(&format!(" details={details_text}"));
+        }
+        rendered
     }
 
     fn parse_response_text(status: reqwest::StatusCode, body: Value) -> String {
@@ -1497,12 +1619,11 @@ impl ModelProvider for GeminiProvider {
         let body = response.json::<Value>().await?;
 
         if !status.is_success() {
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            bail!("Gemini API error ({}): {}", status.as_u16(), message);
+            bail!(
+                "Gemini API error ({}): {}",
+                status.as_u16(),
+                Self::api_error_detail(&body)
+            );
         }
 
         if use_structured {
@@ -1623,12 +1744,11 @@ impl ModelProvider for GeminiProvider {
             // On HTTP error, read the full body and propagate as a failure so
             // the philote tier-escalation logic can route to a fallback provider.
             let body = response.json::<Value>().await.unwrap_or_default();
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            bail!("Gemini API error ({}): {}", status.as_u16(), message);
+            bail!(
+                "Gemini API error ({}): {}",
+                status.as_u16(),
+                Self::api_error_detail(&body)
+            );
         }
 
         // Read the SSE byte stream, splitting on newlines.
@@ -2683,6 +2803,133 @@ mod tests {
             declaration["parameters"]["properties"]["text"]["type"],
             serde_json::json!("string")
         );
+    }
+
+    /// Recursively assert a function-declaration parameter schema only uses
+    /// keywords Gemini accepts, and that `required` names declared properties.
+    fn assert_gemini_valid_schema(schema: &serde_json::Value, path: &str) {
+        let serde_json::Value::Object(map) = schema else {
+            panic!("schema at [{path}] is not an object: {schema}");
+        };
+        for (key, value) in map {
+            assert!(
+                GeminiProvider::GEMINI_FUNCTION_SCHEMA_KEYS.contains(&key.as_str()),
+                "Gemini-unsupported schema keyword [{key}] at [{path}]"
+            );
+            match key.as_str() {
+                "properties" => {
+                    for (name, prop_schema) in
+                        value.as_object().expect("properties must be an object")
+                    {
+                        assert_gemini_valid_schema(prop_schema, &format!("{path}.{name}"));
+                    }
+                }
+                "items" => assert_gemini_valid_schema(value, &format!("{path}[]")),
+                _ => {}
+            }
+        }
+        if let Some(required) = map.get("required").and_then(serde_json::Value::as_array) {
+            let properties = map
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("required without properties at [{path}]"));
+            for entry in required {
+                let name = entry.as_str().expect("required entries must be strings");
+                assert!(
+                    properties.contains_key(name),
+                    "required [{name}] not among properties at [{path}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sanitizes_gemini_rejected_schema_keywords() {
+        // Regression for the live vps-jane failure (2026-07-05): once the
+        // life.* tool contracts landed exact JSON schemas, Gemini rejected
+        // every tool-bearing turn with
+        // `400 INVALID_ARGUMENT: Request contains an invalid argument.`
+        // because the declarations carried keywords like "default" that
+        // FunctionDeclaration schemas do not support.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "life.observe",
+            "description": "Propose a grounded observation.",
+            "input_schema": {
+                "type": "object",
+                "required": ["observation_id", "evidence", "ghost_field"],
+                "properties": {
+                    "observation_id": { "type": "string" },
+                    "evidence": {
+                        "type": "object",
+                        "required": ["validation_state"],
+                        "properties": {
+                            "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                            "validation_state": {
+                                "type": "string",
+                                "enum": ["inferred", "proposed"],
+                                "default": "proposed"
+                            },
+                            "source_refs": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": { "type": "object", "default": {} }
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "default": {},
+                                "additionalProperties": true
+                            }
+                        }
+                    },
+                    "count": { "type": "integer", "enum": [1, 2], "default": 1 }
+                }
+            }
+        })]);
+
+        assert_eq!(declarations.len(), 1);
+        let parameters = &declarations[0]["parameters"];
+        assert_gemini_valid_schema(parameters, "life_observe.parameters");
+
+        // A stripped "default" survives as a description hint.
+        let validation_state =
+            &parameters["properties"]["evidence"]["properties"]["validation_state"];
+        assert!(validation_state.get("default").is_none());
+        assert!(
+            validation_state["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Defaults to proposed.")
+        );
+        // "enum" on non-string types is dropped.
+        assert!(parameters["properties"]["count"].get("enum").is_none());
+        // "required" entries that do not name declared properties are dropped.
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["observation_id", "evidence"])
+        );
+    }
+
+    #[test]
+    fn life_tool_catalog_schemas_produce_gemini_valid_declarations() {
+        // The exact schemas Beacon's steward turns project — straight from the
+        // philote catalog — must sanitize into Gemini-valid declarations.
+        let tools: Vec<serde_json::Value> = agent_core::catalog::tool_catalog()
+            .values()
+            .filter(|definition| definition.tool_name.starts_with("life."))
+            .map(|definition| serde_json::to_value(definition).expect("serialize ToolDefinition"))
+            .collect();
+        assert!(
+            tools.len() >= 6,
+            "expected the life.* catalog tools, found {}",
+            tools.len()
+        );
+
+        let declarations = GeminiProvider::function_declarations(&tools);
+        assert_eq!(declarations.len(), tools.len());
+        for declaration in &declarations {
+            let name = declaration["name"].as_str().unwrap_or("?");
+            assert_gemini_valid_schema(&declaration["parameters"], &format!("{name}.parameters"));
+        }
     }
 
     #[test]

@@ -2842,6 +2842,7 @@ dependencies = [
  "mlx-runner",
  "onnx-runner",
  "parakeet-runner",
+ "philote",
  "philotic-client",
  "reqwest",
  "serde",
