@@ -22,6 +22,166 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use tracing::{info, warn};
 
+/// Default minimum cosine similarity gate for the named recall strategies.
+///
+/// Live calibration (2026-07-07, post data-hygiene, 53 live fully-embedded
+/// nodes): the realistic conversational probe "open loops about errands and
+/// daily tasks" returned top-3 similarities 0.505 / 0.320 / 0.192. Real hits
+/// live in the 0.19-0.51 band, so the previous hardcoded gates (0.4 for
+/// OpenLoop/Event, 0.35 for Goal) excluded most of them and forced the raw
+/// recency fallback (`fallback_used=true`) on every production recall —
+/// returning rows with NO semantic relevance instead of low-similarity
+/// vector hits. 0.18 sits just under the observed real-hit floor while
+/// still cutting unrelated noise.
+const DEFAULT_RECALL_MIN_SIMILARITY: f32 = 0.18;
+
+/// Runner-side env override for the recall similarity gate.
+/// Parsed once per process; clamped to `[0.0, 0.9]`; invalid values fall
+/// back to [`DEFAULT_RECALL_MIN_SIMILARITY`] with a warning.
+const RECALL_MIN_SIMILARITY_ENV: &str = "PHILOTIC_LIFE_RECALL_MIN_SIMILARITY";
+
+/// Fallback top-up hits are rescaled so their best score lands at this
+/// fraction of the weakest vector hit's score: recency-scan rows are always
+/// ranked strictly below every semantically-matched row while preserving
+/// their relative order among themselves.
+const FALLBACK_TOPUP_DAMP: f32 = 0.9;
+
+/// Pure parse of the similarity-gate override (testable without env).
+fn parse_recall_min_similarity(raw: Option<&str>) -> f32 {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_RECALL_MIN_SIMILARITY;
+    };
+    match raw.parse::<f32>() {
+        Ok(v) if v.is_finite() => v.clamp(0.0, 0.9),
+        _ => {
+            warn!(
+                value = raw,
+                default = DEFAULT_RECALL_MIN_SIMILARITY,
+                "invalid {RECALL_MIN_SIMILARITY_ENV}; using default"
+            );
+            DEFAULT_RECALL_MIN_SIMILARITY
+        }
+    }
+}
+
+/// Env-reading variant, uncached (used by the cached getter and by tests).
+fn recall_min_similarity_from_env() -> f32 {
+    parse_recall_min_similarity(std::env::var(RECALL_MIN_SIMILARITY_ENV).ok().as_deref())
+}
+
+/// The effective recall similarity gate: env override parsed once, cached
+/// for the life of the runner process.
+fn recall_min_similarity() -> f32 {
+    static CACHE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(recall_min_similarity_from_env)
+}
+
+/// How the raw recency-scan fallback participated in a recall response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackUsage {
+    /// Vector search alone filled the packet (or nothing was found at all).
+    None,
+    /// Vector search returned some hits but fewer than
+    /// `max_context_packets`; the remainder was topped up from the raw
+    /// fallback, ranked below every vector hit.
+    ToppedUp,
+    /// Vector search returned zero hits; the packet is entirely raw
+    /// fallback rows.
+    Full,
+}
+
+impl FallbackUsage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "false",
+            Self::ToppedUp => "topped_up",
+            Self::Full => "full_fallback",
+        }
+    }
+}
+
+type ScoredTuple = (projection::VectorHit, f32, Vec<PolicyFilter>);
+
+fn sort_hits_desc(hits: &mut [projection::ScoredHit]) {
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Blend vector-search hits with raw recency-fallback hits.
+///
+/// - Enough vector hits (>= `max_context_packets`) or an empty fallback:
+///   vector hits only, [`FallbackUsage::None`].
+/// - Some vector hits but fewer than `max_context_packets`: top up with the
+///   best fallback rows (deduped by node id), marked `fallback_origin` and
+///   rescaled strictly below the weakest vector hit — semantic relevance
+///   always outranks recency ([`FallbackUsage::ToppedUp`]).
+/// - Zero vector hits: the packet is entirely fallback rows, all marked
+///   `fallback_origin` ([`FallbackUsage::Full`]); if the fallback is also
+///   empty this is [`FallbackUsage::None`].
+fn blend_with_fallback(
+    vector_scored: Vec<ScoredTuple>,
+    fallback_scored: Vec<ScoredTuple>,
+    max_context_packets: usize,
+) -> (Vec<projection::ScoredHit>, FallbackUsage) {
+    let mark_fallback = |tuple: ScoredTuple| {
+        let mut scored: projection::ScoredHit = tuple.into();
+        scored.fallback_origin = true;
+        scored
+    };
+
+    let mut vector: Vec<projection::ScoredHit> =
+        vector_scored.into_iter().map(Into::into).collect();
+    sort_hits_desc(&mut vector);
+
+    if vector.is_empty() {
+        if fallback_scored.is_empty() {
+            return (Vec::new(), FallbackUsage::None);
+        }
+        let mut full: Vec<projection::ScoredHit> =
+            fallback_scored.into_iter().map(mark_fallback).collect();
+        sort_hits_desc(&mut full);
+        return (full, FallbackUsage::Full);
+    }
+
+    let needed = max_context_packets.saturating_sub(vector.len());
+    if needed == 0 || fallback_scored.is_empty() {
+        return (vector, FallbackUsage::None);
+    }
+
+    let seen: HashSet<&str> = vector.iter().map(|s| s.hit.node_id()).collect();
+    let mut top_up: Vec<projection::ScoredHit> = fallback_scored
+        .iter()
+        .filter(|(hit, _, _)| !seen.contains(hit.node_id()))
+        .cloned()
+        .map(mark_fallback)
+        .collect();
+    sort_hits_desc(&mut top_up);
+    top_up.truncate(needed);
+    if top_up.is_empty() {
+        return (vector, FallbackUsage::None);
+    }
+
+    // Rescale so the best top-up row sits at FALLBACK_TOPUP_DAMP of the
+    // weakest vector hit: strictly below every semantic hit, relative
+    // order among fallback rows preserved.
+    let floor = vector.last().map(|s| s.score).unwrap_or(0.0);
+    let max_top_up = top_up.first().map(|s| s.score).unwrap_or(0.0);
+    let scale = if max_top_up > 0.0 {
+        (floor * FALLBACK_TOPUP_DAMP) / max_top_up
+    } else {
+        0.0
+    };
+    for scored in &mut top_up {
+        scored.score = (scored.score * scale).clamp(0.0, 1.0);
+    }
+
+    vector.extend(top_up);
+    (vector, FallbackUsage::ToppedUp)
+}
+
 struct MemgraphConfig {
     uri: String,
     user: String,
@@ -399,7 +559,7 @@ impl LifeGraphProvider {
         };
 
         let top_k = query_val.max_context_packets * 3;
-        let min_similarity = 0.3_f32;
+        let min_similarity = recall_min_similarity();
         let now = chrono::Utc::now();
         let now_iso = now.to_rfc3339();
 
@@ -412,7 +572,7 @@ impl LifeGraphProvider {
                     SemanticSpace::LifeEventSemantic,
                     &["OpenLoop"],
                     top_k.max(10),
-                    0.4,
+                    min_similarity,
                     &embedding,
                 )
                 .await?;
@@ -423,7 +583,7 @@ impl LifeGraphProvider {
                     SemanticSpace::GoalSystemSemantic,
                     &["Goal"],
                     top_k.max(8),
-                    0.35,
+                    min_similarity,
                     &embedding,
                 )
                 .await?;
@@ -446,7 +606,7 @@ impl LifeGraphProvider {
                         SemanticSpace::MemoryBridgeSemantic,
                         &["Commitment"],
                         5,
-                        0.3,
+                        min_similarity,
                         &embedding,
                     )
                     .await?;
@@ -458,7 +618,7 @@ impl LifeGraphProvider {
                     SemanticSpace::LifeEventSemantic,
                     &["Event"],
                     6,
-                    0.4,
+                    min_similarity,
                     &embedding,
                 )
                 .await?;
@@ -467,7 +627,7 @@ impl LifeGraphProvider {
                     SemanticSpace::GoalSystemSemantic,
                     &["Goal"],
                     5,
-                    0.35,
+                    min_similarity,
                     &embedding,
                 )
                 .await?;
@@ -500,7 +660,7 @@ impl LifeGraphProvider {
         let weights = resolve_ranking_weights(&task.parameters, &query_val, named_strategy);
         let active_role = query_val.active_role.as_deref();
         let domain_edge_ids = self.domain_edge_node_ids(active_role, &all_hits).await;
-        let mut scored = score_hits(
+        let vector_scored = score_hits(
             all_hits,
             filters,
             &weights,
@@ -509,37 +669,40 @@ impl LifeGraphProvider {
             &domain_edge_ids,
         );
 
-        let fallback_used = if scored.is_empty() {
+        // Blend, don't cliff: when vector search yields fewer hits than
+        // max_context_packets, top up from the raw recency fallback (ranked
+        // below every vector hit, marked fallback_origin) instead of an
+        // all-or-nothing switch.
+        let max_packets = query_val.max_context_packets.max(1);
+        let fallback_scored = if vector_scored.len() < max_packets {
             let fallback_labels = named_strategy.fallback_labels(&query_val);
             if fallback_labels.is_empty() {
-                false
+                Vec::new()
             } else {
-                let limit = query_val.max_context_packets.max(1) * 3;
+                let limit = max_packets * 3;
                 let cypher = raw_recall_fallback_cypher(&fallback_labels, limit);
                 let result = self.execute_cypher(&cypher).await?;
                 let fallback_hits = projection::parse_vector_search_rows(&result);
                 let fallback_domain_ids =
                     self.domain_edge_node_ids(active_role, &fallback_hits).await;
-                scored = score_hits(
+                score_hits(
                     fallback_hits,
                     filters,
                     &weights,
                     &now,
                     active_role,
                     &fallback_domain_ids,
-                );
-                !scored.is_empty()
+                )
             }
         } else {
-            false
+            Vec::new()
         };
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let (mut candidates, fallback_usage) =
+            blend_with_fallback(vector_scored, fallback_scored, max_packets);
 
         // Graph expansion (read side): one bounded living-cycle hop from the
         // ranked parents, batched into a single Cypher round trip. Expansion
         // failures never fail the recall — vector-only results still return.
-        let mut candidates: Vec<projection::ScoredHit> =
-            scored.into_iter().map(Into::into).collect();
         let expansion_policy = &query_val.expansion_policy;
         let mut expansion_count = 0usize;
         if expansion_policy.max_hops >= 1
@@ -611,7 +774,7 @@ impl LifeGraphProvider {
             query_id = %query_val.query_id,
             result_count = packet.ranked_packets.len(),
             expansion_count,
-            fallback_used,
+            fallback_used = fallback_usage.as_str(),
             "life.recall: context packet projected"
         );
 
@@ -628,7 +791,7 @@ impl LifeGraphProvider {
         Ok(ProviderOutput::ResultSet(json!({
             "status": "ok",
             "named_strategy": named_strategy.as_str(),
-            "fallback_used": fallback_used,
+            "fallback_used": fallback_usage.as_str(),
             "context_packet": packet_json,
             "cross_agent_context_packet": cross_agent_packet_json,
         })))
@@ -1078,6 +1241,7 @@ impl LifeGraphProvider {
                 score: candidate.score,
                 matched_policy_filters: Vec::new(),
                 expansion_origin,
+                fallback_origin: false,
                 hit: candidate.hit,
             });
         }
@@ -1118,7 +1282,7 @@ impl LifeGraphProvider {
         Ok(ProviderOutput::ResultSet(json!({
             "status": "ok",
             "named_strategy": NamedRecallStrategy::CrossDomainEntanglement.as_str(),
-            "fallback_used": false,
+            "fallback_used": FallbackUsage::None.as_str(),
             "entanglement": {
                 "threshold": entanglement::CROSS_DOMAIN_MIN_SIMILARITY,
                 "domain_a_sweep_hits": domain_a_sweep,
@@ -1754,6 +1918,154 @@ mod tests {
             (scored[0].1 - scored[1].1).abs() < f32::EPSILON,
             "without an active_role the domain bias must be a no-op"
         );
+    }
+
+    // ── Recall similarity gate (const + env override) ─────────────────────
+
+    #[test]
+    fn recall_min_similarity_defaults_when_unset_or_blank() {
+        assert!(
+            (parse_recall_min_similarity(None) - DEFAULT_RECALL_MIN_SIMILARITY).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (parse_recall_min_similarity(Some("")) - DEFAULT_RECALL_MIN_SIMILARITY).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (parse_recall_min_similarity(Some("   ")) - DEFAULT_RECALL_MIN_SIMILARITY).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn recall_min_similarity_parses_override() {
+        assert!((parse_recall_min_similarity(Some("0.5")) - 0.5).abs() < f32::EPSILON);
+        assert!((parse_recall_min_similarity(Some(" 0.25 ")) - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn recall_min_similarity_clamps_to_valid_band() {
+        assert!((parse_recall_min_similarity(Some("2.0")) - 0.9).abs() < f32::EPSILON);
+        assert!(parse_recall_min_similarity(Some("-1")).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn recall_min_similarity_invalid_falls_back_to_default() {
+        for invalid in ["high", "0.4.2", "NaN", "inf"] {
+            assert!(
+                (parse_recall_min_similarity(Some(invalid)) - DEFAULT_RECALL_MIN_SIMILARITY).abs()
+                    < f32::EPSILON,
+                "{invalid:?} should fall back to the default gate"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_min_similarity_reads_env_override() {
+        // Only this test touches RECALL_MIN_SIMILARITY_ENV; nothing else in
+        // this crate's tests reads the environment concurrently.
+        unsafe { std::env::set_var(RECALL_MIN_SIMILARITY_ENV, "0.25") };
+        assert!((recall_min_similarity_from_env() - 0.25).abs() < f32::EPSILON);
+        unsafe { std::env::remove_var(RECALL_MIN_SIMILARITY_ENV) };
+        assert!(
+            (recall_min_similarity_from_env() - DEFAULT_RECALL_MIN_SIMILARITY).abs() < f32::EPSILON
+        );
+    }
+
+    // ── Fallback blend ─────────────────────────────────────────────────────
+
+    fn scored_tuple(id: &str, score: f32) -> ScoredTuple {
+        (
+            projection::VectorHit {
+                bolt_id: 1,
+                label: "OpenLoop".to_string(),
+                properties: json!({
+                    "id": id,
+                    "title": "loop",
+                    "confidence": 0.7,
+                    "validation_state": "proposed",
+                    "status": "open"
+                }),
+                similarity: 0.5,
+            },
+            score,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn fallback_usage_serializes_tri_state() {
+        assert_eq!(FallbackUsage::None.as_str(), "false");
+        assert_eq!(FallbackUsage::ToppedUp.as_str(), "topped_up");
+        assert_eq!(FallbackUsage::Full.as_str(), "full_fallback");
+    }
+
+    #[test]
+    fn blend_uses_vector_hits_only_when_enough() {
+        let vector = vec![
+            scored_tuple("v1", 0.8),
+            scored_tuple("v2", 0.6),
+            scored_tuple("v3", 0.5),
+        ];
+        let (out, usage) = blend_with_fallback(vector, vec![scored_tuple("f1", 0.9)], 3);
+        assert_eq!(usage, FallbackUsage::None);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|s| !s.fallback_origin));
+    }
+
+    #[test]
+    fn blend_tops_up_below_weakest_vector_hit() {
+        let vector = vec![scored_tuple("v1", 0.8), scored_tuple("v2", 0.4)];
+        let fallback = vec![
+            scored_tuple("v2", 0.9), // duplicate node id: deduped
+            scored_tuple("f1", 0.7),
+            scored_tuple("f2", 0.3),
+            scored_tuple("f3", 0.2),
+        ];
+        let (out, usage) = blend_with_fallback(vector, fallback, 4);
+
+        assert_eq!(usage, FallbackUsage::ToppedUp);
+        // 2 vector hits + top-up limited to (max_context_packets - 2).
+        assert_eq!(out.len(), 4);
+        assert!(!out[0].fallback_origin && !out[1].fallback_origin);
+        assert!(out[2].fallback_origin && out[3].fallback_origin);
+        // The duplicate never appears twice.
+        assert_eq!(out.iter().filter(|s| s.hit.node_id() == "v2").count(), 1);
+        // Top-up rows rank strictly below the weakest vector hit, with
+        // their relative order preserved (f1 above f2).
+        assert!(out[2].score < out[1].score);
+        assert_eq!(out[2].hit.node_id(), "f1");
+        assert!(out[2].score > out[3].score);
+        assert_eq!(out[3].hit.node_id(), "f2");
+    }
+
+    #[test]
+    fn blend_all_duplicate_fallback_is_not_counted_as_topped_up() {
+        let vector = vec![scored_tuple("v1", 0.8)];
+        let fallback = vec![scored_tuple("v1", 0.9)];
+        let (out, usage) = blend_with_fallback(vector, fallback, 3);
+        assert_eq!(usage, FallbackUsage::None);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].fallback_origin);
+    }
+
+    #[test]
+    fn blend_full_fallback_when_zero_vector_hits() {
+        let fallback = vec![scored_tuple("f1", 0.3), scored_tuple("f2", 0.5)];
+        let (out, usage) = blend_with_fallback(Vec::new(), fallback, 3);
+        assert_eq!(usage, FallbackUsage::Full);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|s| s.fallback_origin));
+        // Sorted descending by score.
+        assert_eq!(out[0].hit.node_id(), "f2");
+    }
+
+    #[test]
+    fn blend_empty_everything_reports_no_fallback() {
+        let (out, usage) = blend_with_fallback(Vec::new(), Vec::new(), 3);
+        assert!(out.is_empty());
+        assert_eq!(usage, FallbackUsage::None);
     }
 
     #[test]

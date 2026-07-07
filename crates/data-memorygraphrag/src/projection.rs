@@ -356,6 +356,7 @@ pub fn fold_expansion_hits(
         folded.push(ScoredHit {
             score: (parent.score * decay).clamp(0.0, 1.0),
             matched_policy_filters: Vec::new(),
+            fallback_origin: false,
             expansion_origin: Some(ExpansionOrigin {
                 origin: GraphRecordRef {
                     id: parent.hit.node_id().to_string(),
@@ -611,6 +612,10 @@ pub struct ScoredHit {
     pub score: f32,
     pub matched_policy_filters: Vec<PolicyFilter>,
     pub expansion_origin: Option<ExpansionOrigin>,
+    /// True when the hit came from the raw recency-scan fallback rather
+    /// than vector search — surfaced as `metadata["fallback_origin"]` so
+    /// consumers can weight recency-only rows below semantic matches.
+    pub fallback_origin: bool,
 }
 
 impl From<(VectorHit, f32, Vec<PolicyFilter>)> for ScoredHit {
@@ -620,6 +625,7 @@ impl From<(VectorHit, f32, Vec<PolicyFilter>)> for ScoredHit {
             score,
             matched_policy_filters,
             expansion_origin: None,
+            fallback_origin: false,
         }
     }
 }
@@ -648,6 +654,7 @@ pub fn project_context_packet(
             score,
             matched_policy_filters: matched,
             expansion_origin,
+            fallback_origin,
         } = scored;
         let cost = token_estimate(&hit);
         if tokens_used + cost > token_budget && !ranked_packets.is_empty() {
@@ -659,6 +666,11 @@ pub fn project_context_packet(
             datasource: Some("life-graph".into()),
         };
         let mut packet = project_hit_to_evidence_packet(&hit, generated_at);
+        if fallback_origin {
+            if let Some(meta) = packet.metadata.as_object_mut() {
+                meta.insert("fallback_origin".into(), true.into());
+            }
+        }
         let evidence_path = match &expansion_origin {
             Some(exp) => {
                 if let Some(meta) = packet.metadata.as_object_mut() {
@@ -1316,5 +1328,42 @@ mod tests {
         assert!(packet.metadata["similarity"].as_f64().unwrap() > 0.9);
         assert_eq!(packet.claim_ref.label, "Goal");
         assert_eq!(packet.adjudication_status, AdjudicationStatus::NotNeeded);
+    }
+
+    #[test]
+    fn project_context_packet_marks_fallback_origin_metadata() {
+        let vector = parent_hit("l:ol:vec", 0.7);
+        let mut fallback = parent_hit("l:ol:fb", 0.3);
+        fallback.fallback_origin = true;
+
+        let packet = project_context_packet(
+            "ctx:test",
+            "q:test",
+            RetrievalStrategy::MemoryAwareGraphRank,
+            vec![vector, fallback],
+            vec![],
+            10_000,
+            "2026-07-07T00:00:00Z",
+        );
+
+        assert_eq!(packet.ranked_packets.len(), 2);
+        // Vector hits carry no fallback marker at all.
+        assert!(
+            packet.ranked_packets[0]
+                .packet
+                .metadata
+                .get("fallback_origin")
+                .is_none()
+        );
+        // Fallback top-up rows are clearly marked for consumers.
+        assert_eq!(
+            packet.ranked_packets[1].packet.metadata["fallback_origin"],
+            true
+        );
+        // They remain projection-synthesised evidence packets.
+        assert_eq!(
+            packet.ranked_packets[1].packet.metadata["from_vector_search"],
+            true
+        );
     }
 }
