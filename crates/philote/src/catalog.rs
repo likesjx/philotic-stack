@@ -1891,7 +1891,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "The prompt or question for the specialist."
+                        "description": "A succinct structured brief for the specialist — state the goal, the minimum essential context, any constraints, and the expected return format. Do NOT paste conversation transcripts, tool output, or your full working context; the specialist keeps its own session context per conversation. Budget: ~4000 characters — anything longer is truncated before dispatch."
                     },
                     "reply_to": {
                         "type": "string",
@@ -1900,7 +1900,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "routing": {
                         "type": "string",
                         "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward", "priority_re_entry", "approval_resolution"],
-                        "description": "How to handle the specialist's response when it arrives. Defaults to cognitive_re_entry."
+                        "description": "How to handle the specialist's response when it arrives. Defaults to reflective_re_entry (the orchestrator reflects on the reply privately and decides whether to surface it)."
                     },
                     "wait_for_response": {
                         "type": "boolean",

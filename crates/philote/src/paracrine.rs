@@ -507,6 +507,18 @@ impl AgentRuntime {
                     .await;
             }
         };
+        // Succinctness budget: whisper prompts are briefs, not context dumps.
+        let raw_prompt_chars = prompt.chars().count();
+        let prompt = truncate_for_wire(&prompt, PARACRINE_WHISPER_PROMPT_MAX_CHARS);
+        if raw_prompt_chars > PARACRINE_WHISPER_PROMPT_MAX_CHARS {
+            warn!(
+                session_id = %payload.session_id,
+                role = %role,
+                prompt_chars = raw_prompt_chars,
+                budget = PARACRINE_WHISPER_PROMPT_MAX_CHARS,
+                "delegate.whisper: prompt exceeded succinctness budget; truncated"
+            );
+        }
 
         // `reply_to` controls where the specialist's response goes.
         // "self"     → back to this philote as paracrine_response
@@ -739,6 +751,17 @@ impl AgentRuntime {
                     .await;
             }
         };
+        // Succinctness budget: a merge is a distilled answer, not a transcript.
+        let raw_merge_chars = content.chars().count();
+        let content = truncate_for_wire(&content, PARACRINE_MERGE_CONTENT_MAX_CHARS);
+        if raw_merge_chars > PARACRINE_MERGE_CONTENT_MAX_CHARS {
+            warn!(
+                session_id = %session_id,
+                merge_chars = raw_merge_chars,
+                budget = PARACRINE_MERGE_CONTENT_MAX_CHARS,
+                "delegate.merge: content exceeded succinctness budget; truncated"
+            );
+        }
 
         // Capture routing info from the active turn before muting it.
         let (
@@ -896,8 +919,107 @@ mod tests {
     use super::super::tests::{def004_working_turn, run_recording_hotel};
     use super::AgentRuntime;
     use crate::r#loop::TurnPhase;
-    use crate::protocol::InboundTaskPayload;
+    use crate::protocol::{InboundTaskPayload, ToolExecutionPayload};
+    use crate::session::PARACRINE_WHISPER_PROMPT_MAX_CHARS;
     use uuid::Uuid;
+
+    /// Succinctness budget: a `delegate.whisper` prompt longer than
+    /// `PARACRINE_WHISPER_PROMPT_MAX_CHARS` must be truncated (with an explicit
+    /// omission marker) before it is recorded on the paracrine thread and
+    /// dispatched over the wire.
+    #[tokio::test]
+    async fn whisper_prompt_over_budget_is_truncated_before_dispatch() {
+        let socket_path = format!("/tmp/philote-succinct-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-succinct".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-succinct");
+
+        let session_id = "sess-succinct";
+        let turn_id = "turn-succinct";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn(turn_id, "delegate.whisper");
+        turn.pending_tool_call = None;
+        turn.phase = TurnPhase::WaitingTool;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        const OVERAGE: usize = 500;
+        let huge_prompt = "p".repeat(PARACRINE_WHISPER_PROMPT_MAX_CHARS + OVERAGE);
+        let payload = ToolExecutionPayload {
+            action: "execute_tool",
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            chat_id: "555".into(),
+            tool_name: "delegate.whisper".into(),
+            arguments: serde_json::json!({
+                "role": "specialist",
+                "prompt": huge_prompt,
+                "wait_for_response": true,
+            }),
+            execution_mode: "local_agent".into(),
+            agent_id: "agent-succinct".into(),
+            user_id: None,
+            runner_id: None,
+            incarnation_id: None,
+            hotel_id: None,
+            environment_id: None,
+            task_runner_kind: None,
+            task_runner_config: None,
+            selection_reason: None,
+            workspace_ref: None,
+            task_runner_overlay: None,
+            return_route: None,
+            reply_to: "node-1".into(),
+            reply_role: "agent".into(),
+            reply_guest_id: None,
+            final_reply_to: "membrane-node-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: Some("membrane-seat-1".into()),
+        };
+
+        runtime
+            .execute_delegate_whisper_tool(payload)
+            .await
+            .expect("whisper dispatch");
+
+        let goal = runtime
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.paracrine_threads.first())
+            .map(|t| t.goal.clone())
+            .expect("paracrine thread opened");
+
+        assert!(
+            goal.chars().count() < PARACRINE_WHISPER_PROMPT_MAX_CHARS + 64,
+            "dispatched prompt must be bounded, got {} chars",
+            goal.chars().count()
+        );
+        assert!(
+            goal.contains(&format!("[truncated: {OVERAGE} chars omitted]")),
+            "expected omission marker in truncated prompt"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
 
     /// Suppression-path guard: `paracrine_merge_completed` must only suppress the
     /// final reply for turns that actually have a paracrine origin. A plain

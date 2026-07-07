@@ -4031,11 +4031,14 @@ impl AgentRuntime {
                     .and_then(|a| a.get("active_goal"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                let context_summary = args
-                    .and_then(|a| a.get("context_summary"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                // Succinctness budget: handoff excerpts orient the target role;
+                // the durable context stays in the session checkpoint.
+                let context_summary = truncate_for_wire(
+                    args.and_then(|a| a.get("context_summary"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    HANDOFF_CONTEXT_EXCERPT_MAX_CHARS,
+                );
 
                 let target_focus_framing = args
                     .and_then(|a| a.get("target_focus_framing"))
