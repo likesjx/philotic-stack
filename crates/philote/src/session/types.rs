@@ -503,6 +503,27 @@ pub struct RecalledMemoryRecord {
     pub spacetime_frame: Option<MemorySpacetimeFrame>,
 }
 
+/// One cached LifeGraph prefetch result, keyed by named recall strategy.
+///
+/// Populated out-of-band by the fire-and-forget `life.recall` prefetch lane
+/// (session load + after each completed turn) and injected into
+/// `WorkingTurn::recalled_memories` at turn start when fresh. Persisted in the
+/// session checkpoint so a restart keeps the last known graph context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeRecallCacheEntry {
+    /// Named recall strategy that produced this packet
+    /// (e.g. `re_entry_context`, `open_loops_by_context`).
+    pub strategy: String,
+    /// Unix timestamp (seconds) when the packet arrived from the runner.
+    pub fetched_at: u64,
+    /// The query text the prefetch was issued with (for observability).
+    #[serde(default)]
+    pub query_text: String,
+    /// Already-mapped recalled-memory records ready for turn injection.
+    #[serde(default)]
+    pub records: Vec<RecalledMemoryRecord>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParacrineThreadStatus {
@@ -1014,6 +1035,16 @@ pub struct MemoryPolicy {
     /// `memory.recall` without an explicit limit.
     /// Default: 5, min: 1, max: 20.
     pub recall_limit: usize,
+    /// Maximum age (seconds) of a cached LifeGraph prefetch packet before it is
+    /// considered stale and skipped at turn-start injection.
+    /// Default: 1800 (30 minutes). Staleness-by-one-turn is intended: the cache
+    /// is refreshed out-of-band, never fetched synchronously at turn start.
+    #[serde(default = "default_life_recall_max_age_secs")]
+    pub life_recall_max_age_secs: u64,
+}
+
+pub(crate) fn default_life_recall_max_age_secs() -> u64 {
+    1800
 }
 
 impl Default for MemoryPolicy {
@@ -1022,6 +1053,7 @@ impl Default for MemoryPolicy {
             memory_window_size: 10,
             long_term_recall_enabled: true,
             recall_limit: 5,
+            life_recall_max_age_secs: default_life_recall_max_age_secs(),
         }
     }
 }

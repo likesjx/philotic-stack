@@ -1933,6 +1933,12 @@ impl AgentRuntime {
             })
             .await?;
 
+        // LifeGraph auto-recall lane: refresh the prefetch cache after each
+        // completed turn so the NEXT turn starts with current graph context
+        // (staleness-by-one-turn is the intended latency design).
+        self.dispatch_life_recall_prefetch(&session_id, &completed_turn.user_content)
+            .await;
+
         // Capture for attend hook before moving into reply_payload.
         let _attend_turn_id = turn_id.clone();
         let _attend_content = content.clone();
