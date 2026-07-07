@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         drop_log.len()
     );
 
-    let scored: Vec<(projection::VectorHit, f32, Vec<PolicyFilter>)> = surviving
+    let scored: Vec<projection::ScoredHit> = surviving
         .into_iter()
         .map(|hit| {
             let age_secs = hit
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 age_secs,
                 role_matched,
             );
-            (hit, score, vec![])
+            projection::ScoredHit::from((hit, score, vec![]))
         })
         .collect();
 
