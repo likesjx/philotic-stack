@@ -159,7 +159,13 @@ impl LifeGraphProvider {
             .param(
                 "observed_role",
                 compiled.observed_role.as_deref().unwrap_or(""),
-            );
+            )
+            // Sentinels ('' / -1.0) become null in the compiled CASE clauses.
+            .param(
+                "origin_engram_id",
+                compiled.origin_engram_id.as_deref().unwrap_or(""),
+            )
+            .param("origin_trust", compiled.origin_trust.unwrap_or(-1.0));
 
         let mut rows = graph.execute(q).await?;
         let first_row = rows.next().await?;
@@ -328,6 +334,8 @@ impl LifeGraphProvider {
             "validation_state": compiled.validation_state,
             "observed_by": compiled.observed_by,
             "observed_role": compiled.observed_role,
+            "origin_engram_id": compiled.origin_engram_id,
+            "origin_trust": compiled.origin_trust,
             "embed_status": embed_status,
             "edges": edge_reports,
         })))

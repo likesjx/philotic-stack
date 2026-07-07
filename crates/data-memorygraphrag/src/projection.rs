@@ -455,6 +455,16 @@ pub fn hit_matches_domain(hit: &VectorHit, domain_slug: &str) -> bool {
         == Some(domain_slug)
 }
 
+/// Minimum `origin_trust` (Muninn source reliability recorded at write time)
+/// for a node to earn the Muninn-origin confirmation lift.
+pub const MUNINN_ORIGIN_TRUST_THRESHOLD: f64 = 0.7;
+
+/// Confirmation-term lift applied to unconfirmed nodes whose Muninn origin
+/// trust meets [`MUNINN_ORIGIN_TRUST_THRESHOLD`]. Added to the node's stored
+/// confidence and capped at 1.0, so a Muninn-trusted node can approach — but
+/// never outrank — an operator-confirmed node on the confirmation axis.
+pub const MUNINN_ORIGIN_TRUST_BONUS: f32 = 0.15;
+
 /// Composite ranking score. Returns a value in `[0.0, 1.0]`.
 ///
 /// `age_secs`: seconds elapsed since `observed_at`, pre-computed by the caller
@@ -477,10 +487,24 @@ pub fn ranking_score(
     let age_days = age_secs as f32 / 86_400.0;
     let recency = (-age_days / 20.0_f32).exp().clamp(0.0, 1.0);
 
-    // Confirmed nodes score 1.0; others use their stored confidence.
+    // Confirmed nodes score 1.0; others use their stored confidence, plus a
+    // small confirmation-style lift for high-trust Muninn-origin nodes (the
+    // first fusion term of the lifegraph-muninn-promotion seam). Nodes
+    // without an `origin_trust` property — everything written before Muninn
+    // provenance preservation — rank exactly as before.
     let confirmation = match hit.validation_state() {
         ValidationState::Confirmed => 1.0_f32,
-        _ => hit.confidence(),
+        _ => {
+            let base = hit.confidence();
+            let muninn_trusted = hit
+                .prop_f64("origin_trust")
+                .is_some_and(|t| t >= MUNINN_ORIGIN_TRUST_THRESHOLD);
+            if muninn_trusted {
+                (base + MUNINN_ORIGIN_TRUST_BONUS).min(1.0)
+            } else {
+                base
+            }
+        }
     };
 
     // Active Commitment bonus.
@@ -532,6 +556,7 @@ pub fn project_hit_to_evidence_packet(hit: &VectorHit, generated_at: &str) -> Ev
     let basis = match hit.prop_str("provenance").unwrap_or("agent_inferred") {
         "operator_confirmed" | "user_input" => ReliabilityBasis::OperatorConfirmed,
         "transcript" | "calendar" => ReliabilityBasis::DirectObservation,
+        "muninn_engram" => ReliabilityBasis::MuninnTrust,
         _ => ReliabilityBasis::AgentInferred,
     };
 
@@ -876,6 +901,91 @@ mod tests {
         let hub = ranking_score(&make_hit("Person", 0.8), &weights, 0, false);
 
         assert!(specific > hub, "specific label should rank higher than hub");
+    }
+
+    #[test]
+    fn ranking_score_muninn_origin_trust_bonus_on_and_off() {
+        let make_hit = |extra: Value| {
+            let mut props = open_loop_props("l:ol:muninn", "Muninn-origin loop", 0.5, "proposed");
+            if let (Some(base), Some(add)) = (props.as_object_mut(), extra.as_object()) {
+                for (k, v) in add {
+                    base.insert(k.clone(), v.clone());
+                }
+            }
+            VectorHit {
+                bolt_id: 1,
+                label: "OpenLoop".to_string(),
+                properties: props,
+                similarity: 0.6,
+            }
+        };
+        let weights = RankingWeights::default();
+
+        // Old node with no origin_trust property: exactly the base score.
+        let plain = ranking_score(&make_hit(json!({})), &weights, 0, false);
+        // High-trust Muninn origin: earns the confirmation-term lift.
+        let trusted = ranking_score(
+            &make_hit(json!({ "origin_trust": 0.9 })),
+            &weights,
+            0,
+            false,
+        );
+        // Below-threshold trust: no lift.
+        let untrusted = ranking_score(
+            &make_hit(json!({ "origin_trust": 0.4 })),
+            &weights,
+            0,
+            false,
+        );
+
+        assert!(
+            trusted > plain,
+            "high-trust Muninn origin must outrank the identical plain hit"
+        );
+        assert!(
+            (trusted - plain - weights.confirmation * MUNINN_ORIGIN_TRUST_BONUS).abs() < 0.001,
+            "lift should equal confirmation weight x bonus (unclamped range)"
+        );
+        assert!(
+            (untrusted - plain).abs() < f32::EPSILON,
+            "below-threshold origin_trust must not change ranking"
+        );
+
+        // Confirmed nodes are already at the confirmation ceiling: no change.
+        let confirmed = |extra: Value| {
+            let mut hit = make_hit(extra);
+            hit.properties["validation_state"] = json!("confirmed");
+            hit
+        };
+        assert!(
+            (ranking_score(
+                &confirmed(json!({ "origin_trust": 0.9 })),
+                &weights,
+                0,
+                false
+            ) - ranking_score(&confirmed(json!({})), &weights, 0, false))
+            .abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn project_hit_maps_muninn_engram_provenance_to_muninn_trust_basis() {
+        let mut props = open_loop_props("l:ol:muninn-proj", "Muninn loop", 0.7, "proposed");
+        props["provenance"] = json!("muninn_engram");
+        props["origin_trust"] = json!(0.85);
+        let hit = VectorHit {
+            bolt_id: 7,
+            label: "OpenLoop".to_string(),
+            properties: props,
+            similarity: 0.8,
+        };
+
+        let packet = project_hit_to_evidence_packet(&hit, "2026-07-07T00:00:00Z");
+        assert_eq!(
+            packet.source_refs[0].reliability.basis,
+            crate::ReliabilityBasis::MuninnTrust
+        );
     }
 
     #[test]
