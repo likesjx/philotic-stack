@@ -188,7 +188,7 @@ impl VectorHit {
 }
 
 /// Build a `VectorHit` from one `bolt_node_to_json`-shaped value.
-fn hit_from_bolt_node(node: &Value, similarity: f32) -> VectorHit {
+pub(crate) fn hit_from_bolt_node(node: &Value, similarity: f32) -> VectorHit {
     let bolt_id = node.get("id").and_then(Value::as_i64).unwrap_or(-1);
     let label = node
         .get("labels")

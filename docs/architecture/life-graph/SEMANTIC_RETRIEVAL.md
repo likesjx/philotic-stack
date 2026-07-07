@@ -249,6 +249,15 @@ LIMIT 8
 
 **Note**: This is the most expensive strategy. Only invoke when the operator explicitly asks a cross-domain question or when a `DriftFinding` requests entanglement analysis.
 
+**Implementation** (`data-memorygraphrag::entanglement`): the runner implements this as a dual-similarity intersection plus one-hop living-cycle bridge discovery.
+
+1. The same candidate labels (`Signal`, `Event`, `OpenLoop`, `Goal`) are swept against **both** domain embeddings (floor 0.3 so near-threshold second-side scores are still observed).
+2. Nodes at or above the 0.4 threshold on **both** sides are true semantic entanglement, ranked by `min(score_a, score_b)` and labeled `entanglement_kind = semantic_both`.
+3. Strong single-side hits become bridge anchors: nodes one living-cycle hop (`OWNS|SHAPES|SETS|SPAWNS|RELATES_TO`) from a strong domain-A hit AND a strong domain-B hit are labeled `bridge`, scored `min(best_a_anchor, best_b_anchor) × 0.6`.
+4. Up to 3 single-domain hits per side are kept for context, damped ×0.5 and labeled `domain_a_only` / `domain_b_only`.
+
+Each ranked packet carries `entanglement_kind`, per-side similarities, `entangled_via` anchors (for bridges), and a human-readable `entanglement_reason`; the response envelope adds per-kind counts and an `explanations` array answering WHY each hit is entangled.
+
 ---
 
 ## Policy Filter Rules
