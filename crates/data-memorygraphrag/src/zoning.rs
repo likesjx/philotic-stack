@@ -94,6 +94,37 @@ pub const DOMAIN_ROLE_SEEDS: &[DomainRoleSeed] = &[
 /// Identifier stamped on every node the V005 seed touches.
 pub const ZONING_SEED_VERSION: &str = "V005";
 
+/// Map an agent identity string (e.g. `agent-beacon`, `agent:astrid`,
+/// `agent-ariel-01`) to its V005 domain slug via the steward map.
+///
+/// Matches on id segments (split at non-alphanumerics) so `aria` never
+/// shadows `ariel` inside ids like `agent-ariel-01`. Mirrors philote's
+/// `life_domain_slug_for_agent` so provenance written by the auto-recall lane
+/// round-trips to the same domain at ranking time.
+pub fn domain_slug_for_agent(agent_id: &str) -> Option<&'static str> {
+    for segment in agent_id.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        if segment.is_empty() {
+            continue;
+        }
+        let lower = segment.to_ascii_lowercase();
+        if let Some(seed) = DOMAIN_ROLE_SEEDS
+            .iter()
+            .find(|seed| seed.steward_agent == lower)
+        {
+            return Some(seed.domain_slug);
+        }
+    }
+    None
+}
+
+/// The stable Role node id anchoring a domain slug, if the slug is known.
+pub fn role_node_id_for_domain(domain_slug: &str) -> Option<&'static str> {
+    DOMAIN_ROLE_SEEDS
+        .iter()
+        .find(|seed| seed.domain_slug == domain_slug)
+        .map(|seed| seed.role_node_id)
+}
+
 fn escape_cypher_literal(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -191,6 +222,34 @@ mod tests {
             );
             assert!(stmt.contains("r.zoning_seed = \"V005\""));
         }
+    }
+
+    #[test]
+    fn domain_slug_for_agent_matches_on_id_segments() {
+        assert_eq!(
+            domain_slug_for_agent("agent-beacon"),
+            Some("chief_of_staff")
+        );
+        assert_eq!(domain_slug_for_agent("agent:astrid"), Some("librarian"));
+        // Segment match: `aria` must not shadow `ariel`.
+        assert_eq!(
+            domain_slug_for_agent("agent-ariel-01"),
+            Some("communications")
+        );
+        assert_eq!(domain_slug_for_agent("ARIA"), Some("architect"));
+        assert_eq!(domain_slug_for_agent("agent:unknown"), None);
+        assert_eq!(domain_slug_for_agent(""), None);
+    }
+
+    #[test]
+    fn role_node_id_for_domain_round_trips_seeds() {
+        for seed in DOMAIN_ROLE_SEEDS {
+            assert_eq!(
+                role_node_id_for_domain(seed.domain_slug),
+                Some(seed.role_node_id)
+            );
+        }
+        assert_eq!(role_node_id_for_domain("not_a_domain"), None);
     }
 
     #[test]

@@ -386,6 +386,16 @@ impl Default for ExpansionPolicy {
     }
 }
 
+/// Composite ranking weights for LifeGraph retrieval.
+///
+/// The five base weights (`semantic_similarity`, `graph_specificity`,
+/// `recency`, `confirmation`, `active_commitment`) sum to 1.0 by default.
+/// `role_relevance` is an *additive soft-zoning bonus* on top of that base:
+/// it is only earned by hits tied to the caller's `active_role` domain (via a
+/// living-cycle edge to the V005 domain Role node, or `observed_by`
+/// provenance mapping to the domain's steward agent). It biases ranking
+/// toward the caller's domain WITHOUT ever filtering cross-domain hits — the
+/// final score is clamped to `[0.0, 1.0]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankingWeights {
     pub semantic_similarity: f32,
@@ -393,6 +403,14 @@ pub struct RankingWeights {
     pub recency: f32,
     pub confirmation: f32,
     pub active_commitment: f32,
+    /// Soft domain-affinity bonus; defaults to 0.15. Kept `serde(default)` so
+    /// pre-existing five-field wire payloads still deserialize.
+    #[serde(default = "default_role_relevance_weight")]
+    pub role_relevance: f32,
+}
+
+fn default_role_relevance_weight() -> f32 {
+    0.15
 }
 
 impl Default for RankingWeights {
@@ -403,6 +421,7 @@ impl Default for RankingWeights {
             recency: 0.1,
             confirmation: 0.15,
             active_commitment: 0.1,
+            role_relevance: default_role_relevance_weight(),
         }
     }
 }
@@ -496,6 +515,11 @@ impl RetrievalQuery {
             &mut violations,
             "ranking_weights.active_commitment",
             self.ranking_weights.active_commitment,
+        );
+        require_unit_interval(
+            &mut violations,
+            "ranking_weights.role_relevance",
+            self.ranking_weights.role_relevance,
         );
 
         finish_validation(violations)
@@ -1993,6 +2017,35 @@ mod tests {
 
         assert!(plan.allowed());
         assert_eq!(plan.tool_name, LifeGraphToolName::LifeRecall);
+    }
+
+    #[test]
+    fn ranking_weights_deserialize_legacy_five_field_payload() {
+        // Pre-role_relevance wire payloads must keep deserializing; the new
+        // bonus weight defaults in.
+        let weights: RankingWeights = serde_json::from_value(serde_json::json!({
+            "semantic_similarity": 0.45,
+            "graph_specificity": 0.2,
+            "recency": 0.1,
+            "confirmation": 0.15,
+            "active_commitment": 0.1
+        }))
+        .expect("legacy five-field ranking_weights should deserialize");
+        assert!((weights.role_relevance - 0.15).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn retrieval_query_rejects_out_of_range_role_relevance() {
+        let mut query = retrieval_query();
+        query.ranking_weights.role_relevance = 1.5;
+        let err = query
+            .validate()
+            .expect_err("role_relevance above 1.0 should be rejected");
+        assert!(
+            err.violations
+                .iter()
+                .any(|v| v.contains("ranking_weights.role_relevance"))
+        );
     }
 
     #[test]

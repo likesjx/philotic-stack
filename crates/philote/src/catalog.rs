@@ -2986,7 +2986,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                             "graph_specificity": {"type": "number", "default": 0.2},
                             "recency": {"type": "number", "default": 0.1},
                             "confirmation": {"type": "number", "default": 0.15},
-                            "active_commitment": {"type": "number", "default": 0.1}
+                            "active_commitment": {"type": "number", "default": 0.1},
+                            "role_relevance": {"type": "number", "default": 0.15}
                         }
                     },
                     "active_role": {"type": "string"},
