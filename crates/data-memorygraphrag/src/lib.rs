@@ -7,6 +7,7 @@
 pub mod attention_observer;
 pub mod cypher;
 pub mod projection;
+pub mod zoning;
 
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
