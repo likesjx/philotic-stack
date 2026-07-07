@@ -272,12 +272,44 @@ impl AgentRuntime {
         &mut self,
         session_id: String,
         turn_id: String,
-        tool_call: ToolCall,
+        mut tool_call: ToolCall,
         // When `true`, the approval gate is skipped entirely — the caller has already
         // obtained a manual or preapproved resolution and must not re-gate the tool.
         bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
+            // Per-agent provenance: life.observe writes must record WHO observed
+            // (canonical agent id), not just the membrane transport. Stamp the
+            // runtime's identity (and active role, if any) unless already set.
+            if tool_call.tool_name == "life.observe" {
+                if let Some(args) = tool_call.arguments.as_object_mut() {
+                    let has_observed_by = args
+                        .get("observed_by")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|v| !v.trim().is_empty());
+                    if !has_observed_by {
+                        args.insert(
+                            "observed_by".into(),
+                            serde_json::Value::String(self.agent_id.clone()),
+                        );
+                    }
+                    if args.get("observed_role").is_none_or(|v| v.is_null()) {
+                        let observed_role = self
+                            .sessions
+                            .get(&session_id)
+                            .and_then(|state| {
+                                state
+                                    .role_activation
+                                    .as_ref()
+                                    .map(|activation| activation.role_name.clone())
+                            })
+                            .or_else(|| self.role_name.clone());
+                        if let Some(role) = observed_role {
+                            args.insert("observed_role".into(), serde_json::Value::String(role));
+                        }
+                    }
+                }
+            }
             // Agent-level approval enforcement: if the tool's policy annotation marks it as
             // requiring approval, and the current approval policy does not preapprove it,
             // synthesize an ApprovalRequest before executing. This runs independently of

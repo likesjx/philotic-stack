@@ -133,6 +133,10 @@ impl LifeGraphProvider {
         let now = chrono::Utc::now().to_rfc3339();
         let compiled = cypher::compile_observe(&input, &now)
             .map_err(|e| anyhow::anyhow!("Cypher compilation failed: {e}"))?;
+        // Compile edges up-front so an unknown rel_type rejects the request
+        // before any node write happens.
+        let compiled_edges = cypher::compile_observe_edges(&input)
+            .map_err(|e| anyhow::anyhow!("edge Cypher compilation failed: {e}"))?;
 
         let graph = self.connect().await?;
 
@@ -146,7 +150,12 @@ impl LifeGraphProvider {
             .param("observed_at", compiled.observed_at.as_str())
             .param("claim_summary", compiled.claim_summary.as_str())
             .param("observation_id", compiled.observation_id.as_str())
-            .param("packet_id", compiled.packet_id.as_str());
+            .param("packet_id", compiled.packet_id.as_str())
+            .param("observed_by", compiled.observed_by.as_str())
+            .param(
+                "observed_role",
+                compiled.observed_role.as_deref().unwrap_or(""),
+            );
 
         let mut rows = graph.execute(q).await?;
         let first_row = rows.next().await?;
@@ -161,8 +170,57 @@ impl LifeGraphProvider {
             label = %compiled.label,
             observation_id = %compiled.observation_id,
             packet_id = %compiled.packet_id,
+            observed_by = %compiled.observed_by,
             "life.observe: proposed evidence node written to Memgraph"
         );
+
+        // Living-cycle edge writes: MERGE'd idempotently against the freshly
+        // written node. Missing targets create nothing and are reported per
+        // edge; edge failures never fail the node write.
+        let mut edge_reports = Vec::with_capacity(compiled_edges.len());
+        for edge in &compiled_edges {
+            let edge_query = query(&edge.query)
+                .param("id", compiled.node_id.as_str())
+                .param("target_id", edge.target_id.as_str())
+                .param("created_at", now.as_str())
+                .param("observation_id", compiled.observation_id.as_str())
+                .param("observed_by", compiled.observed_by.as_str());
+            let status = match graph.execute(edge_query).await {
+                Ok(mut rows) => match rows.next().await {
+                    Ok(Some(_)) => "written",
+                    Ok(None) => {
+                        warn!(
+                            node_id = %compiled.node_id,
+                            rel_type = %edge.rel_type,
+                            target_id = %edge.target_id,
+                            "life.observe edge target not found; edge skipped"
+                        );
+                        "target_missing"
+                    }
+                    Err(e) => {
+                        warn!(
+                            rel_type = %edge.rel_type,
+                            target_id = %edge.target_id,
+                            "life.observe edge result read failed: {e}"
+                        );
+                        "failed"
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        rel_type = %edge.rel_type,
+                        target_id = %edge.target_id,
+                        "life.observe edge MERGE failed: {e}"
+                    );
+                    "failed"
+                }
+            };
+            edge_reports.push(json!({
+                "rel_type": edge.rel_type,
+                "target_id": edge.target_id,
+                "status": status,
+            }));
+        }
 
         // Embed-on-write: compute embedding for the claim_summary and write it back.
         // Explicit error on dim mismatch — a wrong embedding silently breaks retrieval.
@@ -264,7 +322,10 @@ impl LifeGraphProvider {
             "observation_id": compiled.observation_id,
             "packet_id": compiled.packet_id,
             "validation_state": compiled.validation_state,
+            "observed_by": compiled.observed_by,
+            "observed_role": compiled.observed_role,
             "embed_status": embed_status,
+            "edges": edge_reports,
         })))
     }
 

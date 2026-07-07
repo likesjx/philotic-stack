@@ -1315,12 +1315,36 @@ impl GrowthLoopPolicy {
     }
 }
 
+/// A typed living-cycle edge proposed alongside a `life.observe` node write.
+///
+/// `rel_type` must be one of [`cypher::LIVING_CYCLE_REL_TYPES`]
+/// (OWNS / SHAPES / SETS / SPAWNS / RELATES_TO). Unknown rel_types are
+/// rejected before the node write. A `target_id` that matches no existing
+/// node creates nothing — the miss is reported in the response envelope
+/// without failing the node write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveEdge {
+    pub rel_type: String,
+    pub target_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifeObserveInput {
     pub observation_id: String,
     pub evidence: EvidencePacket,
     #[serde(default)]
     pub proposed_graph_refs: Vec<GraphRecordRef>,
+    /// Canonical agent identity that made this observation (e.g. "agent-astrid-01").
+    /// Distinct from `source_membrane`, which records the transport the evidence
+    /// arrived over. Defaults to None for old callers (persisted as "agent:unknown").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_by: Option<String>,
+    /// Active role name of the observing agent, if any (e.g. "orchestrator").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_role: Option<String>,
+    /// Optional living-cycle edges to MERGE idempotently with the node write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<ObserveEdge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1462,6 +1486,20 @@ impl MemoryGraphRagRunner {
         if let Err(err) = input.evidence.validate() {
             violations.extend(err.violations);
         }
+        for (idx, edge) in input.edges.iter().enumerate() {
+            if !cypher::is_living_cycle_rel_type(&edge.rel_type) {
+                violations.push(format!(
+                    "edges[{idx}].rel_type '{}' is not a living-cycle relation (expected one of {})",
+                    edge.rel_type,
+                    cypher::LIVING_CYCLE_REL_TYPES.join(", ")
+                ));
+            }
+            require_non_empty(
+                &mut violations,
+                &format!("edges[{idx}].target_id"),
+                &edge.target_id,
+            );
+        }
         finish_validation(violations)?;
 
         Ok(RunnerPlan {
@@ -1474,6 +1512,9 @@ impl MemoryGraphRagRunner {
                     "observation_id": input.observation_id,
                     "evidence": input.evidence,
                     "proposed_graph_refs": input.proposed_graph_refs,
+                    "observed_by": input.observed_by,
+                    "observed_role": input.observed_role,
+                    "edges": input.edges,
                 }),
             }],
             requires_operator: false,
@@ -2143,6 +2184,88 @@ mod tests {
                 .expect("recall feedback spec")
                 .mutates_graph
         );
+    }
+
+    #[test]
+    fn observe_input_roundtrips_provenance_and_edges() {
+        let input = LifeObserveInput {
+            observation_id: "obs:prov:1".into(),
+            evidence: evidence_packet(),
+            proposed_graph_refs: vec![],
+            observed_by: Some("agent-beacon-01".into()),
+            observed_role: Some("chief_of_staff".into()),
+            edges: vec![ObserveEdge {
+                rel_type: "OWNS".into(),
+                target_id: "life:role:chief-of-staff".into(),
+            }],
+        };
+
+        let json = serde_json::to_value(&input).expect("serialize observe input");
+        assert_eq!(json["observed_by"], "agent-beacon-01");
+        assert_eq!(json["observed_role"], "chief_of_staff");
+        assert_eq!(json["edges"][0]["rel_type"], "OWNS");
+        assert_eq!(json["edges"][0]["target_id"], "life:role:chief-of-staff");
+
+        let back: LifeObserveInput = serde_json::from_value(json).expect("roundtrip");
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn observe_input_is_backward_compatible_with_old_callers() {
+        // Payload shaped exactly like a pre-provenance caller.
+        let legacy = serde_json::json!({
+            "observation_id": "obs:legacy:1",
+            "evidence": serde_json::to_value(evidence_packet()).unwrap(),
+            "proposed_graph_refs": [],
+        });
+
+        let parsed: LifeObserveInput =
+            serde_json::from_value(legacy).expect("legacy payload must still parse");
+        assert_eq!(parsed.observed_by, None);
+        assert_eq!(parsed.observed_role, None);
+        assert!(parsed.edges.is_empty());
+    }
+
+    #[test]
+    fn runner_observe_plan_carries_provenance_and_edges() {
+        let runner = MemoryGraphRagRunner::default();
+        let plan = runner
+            .plan(LifeGraphToolRequest::LifeObserve(LifeObserveInput {
+                observation_id: "obs:prov:2".into(),
+                evidence: evidence_packet(),
+                proposed_graph_refs: vec![],
+                observed_by: Some("agent-astrid-01".into()),
+                observed_role: None,
+                edges: vec![ObserveEdge {
+                    rel_type: "RELATES_TO".into(),
+                    target_id: "life:role:librarian".into(),
+                }],
+            }))
+            .expect("observe should plan");
+
+        assert!(plan.allowed());
+        assert_eq!(plan.steps[0].payload["observed_by"], "agent-astrid-01");
+        assert_eq!(plan.steps[0].payload["edges"][0]["rel_type"], "RELATES_TO");
+    }
+
+    #[test]
+    fn runner_observe_plan_rejects_unknown_rel_type() {
+        let runner = MemoryGraphRagRunner::default();
+        let err = runner
+            .plan(LifeGraphToolRequest::LifeObserve(LifeObserveInput {
+                observation_id: "obs:prov:3".into(),
+                evidence: evidence_packet(),
+                proposed_graph_refs: vec![],
+                observed_by: Some("agent-astrid-01".into()),
+                observed_role: None,
+                edges: vec![ObserveEdge {
+                    rel_type: "DESTROYS".into(),
+                    target_id: "life:role:librarian".into(),
+                }],
+            }))
+            .expect_err("unknown rel_type must be rejected");
+
+        assert!(err.to_string().contains("DESTROYS"));
     }
 
     #[test]

@@ -38,7 +38,9 @@ Every node and every agent-written or inferred edge **must** carry these propert
 
 | Property | Type | Description |
 |---|---|---|
-| `source_membrane` | `string` | Membrane or agent that wrote this record (e.g. `membrane:telegram`, `agent:beacon`) |
+| `source_membrane` | `string` | Transport the evidence arrived over (e.g. `membrane:telegram`, `hotel:mbp-jane`) |
+| `observed_by` | `string` | Canonical agent identity that made the observation (e.g. `agent-astrid-01`). `agent:unknown` for legacy writes (V005+) |
+| `observed_role` | `string \| null` | Active role of the observing agent at write time (e.g. `chief_of_staff`), if any (V005+) |
 | `provenance` | `string` | Claim origin: `user_input`, `transcript`, `calendar`, `health_data`, `agent_inferred`, `operator_confirmed` |
 | `confidence` | `float` | 0.0–1.0. Inferred facts start low; rise with evidence and operator confirmation |
 | `validation_state` | `string` | `inferred` \| `proposed` \| `confirmed` \| `retired` \| `conflicted` |
@@ -46,6 +48,8 @@ Every node and every agent-written or inferred edge **must** carry these propert
 | `last_confirmed_at` | `string \| null` | ISO 8601 timestamp of last operator or strong-evidence confirmation |
 
 Operator-created nodes may omit provenance fields; they are required on agent-written records.
+
+`life.observe` also accepts an optional `edges[]` field (`{rel_type, target_id}`) MERGE'd idempotently with the node write. `rel_type` must be one of the living-cycle set `OWNS | SHAPES | SETS | SPAWNS | RELATES_TO` (unknown rel_types are rejected before the node write); a `target_id` matching no existing node creates nothing and is reported as `target_missing` in the response envelope. Domain zoning Role nodes (`domain_slug`, `steward_agent`) are seeded by `migrations/V005__domain_role_zoning_seed.cypher`.
 
 ## Embedding Metadata
 
