@@ -347,8 +347,26 @@ impl GeminiProvider {
     ///   reaches the model;
     /// - infer a missing `type` from shape;
     /// - keep `enum` only on string schemas (Gemini restricts enum to STRING);
-    /// - keep `required` entries only when they name declared properties.
-    fn normalize_function_parameters(schema: &Value) -> Value {
+    /// - keep `required` entries only when they name declared properties;
+    /// - repair structurally invalid residue that keyword-stripping alone
+    ///   leaves behind (see below).
+    ///
+    /// The last step is the fix for the residual live 400s: even after stripping
+    /// unsupported keywords, Gemini's FunctionDeclaration schema subset rejects
+    /// an OBJECT with empty/missing `properties` (`should be non-empty for OBJECT
+    /// type`) and an ARRAY with no `items`, both with an empty-details
+    /// `INVALID_ARGUMENT`. The catalog carries free-form `{"type":"object"}`
+    /// blobs (e.g. `metadata`, `passage_refs.items`, `*_node_refs.items`) that
+    /// Gemini's subset cannot express, so:
+    /// - a NON-root OBJECT with empty/missing properties is downgraded to a
+    ///   JSON-encoded `string` (the field stays present so `required` remains
+    ///   satisfiable, and the runner already handles these as `serde_json::Value`);
+    /// - an ARRAY missing `items` gets `items: {"type":"string"}`.
+    ///
+    /// The ROOT parameters object is left as `{"type":"object","properties":{}}`
+    /// when empty — Gemini accepts empty properties only at the top level, and
+    /// no-argument tools rely on that shape.
+    fn normalize_function_parameters(schema: &Value, is_root: bool) -> Value {
         match schema {
             Value::Object(map) => {
                 let mut normalized = serde_json::Map::new();
@@ -366,14 +384,17 @@ impl GeminiProvider {
                                         .map(|(prop_name, prop_schema)| {
                                             (
                                                 prop_name.clone(),
-                                                Self::normalize_function_parameters(prop_schema),
+                                                Self::normalize_function_parameters(
+                                                    prop_schema,
+                                                    false,
+                                                ),
                                             )
                                         })
                                         .collect::<serde_json::Map<String, Value>>()
                                 })
                                 .unwrap_or_default(),
                         ),
-                        "items" => Self::normalize_function_parameters(value),
+                        "items" => Self::normalize_function_parameters(value, false),
                         _ => value.clone(),
                     };
                     normalized.insert(key.clone(), normalized_value);
@@ -453,10 +474,129 @@ impl GeminiProvider {
                     None => {}
                 }
 
+                // Repair structurally invalid residue that keyword-stripping
+                // leaves behind (Gemini rejects these with empty-details 400s).
+                let declared_type = normalized
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t.to_ascii_lowercase());
+                match declared_type.as_deref() {
+                    Some("object") if !is_root => {
+                        let has_properties = normalized
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .map(|props| !props.is_empty())
+                            .unwrap_or(false);
+                        if !has_properties {
+                            // A free-form object Gemini's subset cannot express.
+                            // Downgrade to a JSON-encoded string so the field
+                            // stays present and Gemini-valid.
+                            let note = "Provide as a JSON-encoded object.";
+                            let description = match normalized
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|text| !text.is_empty())
+                            {
+                                Some(existing) if existing.contains(note) => existing.to_string(),
+                                Some(existing) => format!("{existing} {note}"),
+                                None => note.to_string(),
+                            };
+                            let mut repaired = serde_json::Map::new();
+                            repaired.insert("type".into(), Value::String("string".into()));
+                            repaired.insert("description".into(), Value::String(description));
+                            return Value::Object(repaired);
+                        }
+                    }
+                    Some("array") => {
+                        if !normalized.contains_key("items") {
+                            normalized.insert("items".into(), json!({ "type": "string" }));
+                        }
+                    }
+                    _ => {}
+                }
+
                 Value::Object(normalized)
             }
             _ => schema.clone(),
         }
+    }
+
+    /// Strict structural validator for a sanitized Gemini function-declaration
+    /// parameter schema. Returns `Err(reason)` when the schema violates the
+    /// FunctionDeclaration Schema subset Gemini accepts:
+    /// - only [`Self::GEMINI_FUNCTION_SCHEMA_KEYS`] keywords;
+    /// - a non-root OBJECT must have non-empty `properties`;
+    /// - an ARRAY must declare `items`;
+    /// - `enum` only on STRING;
+    /// - `required` entries must name declared properties.
+    ///
+    /// Used as a `debug_assert` gate in [`Self::function_declarations`] and as
+    /// the test gate, so any future catalog schema that sanitizes to invalid
+    /// fails at build/test time instead of live.
+    fn validate_gemini_declaration_schema(
+        schema: &Value,
+        path: &str,
+        is_root: bool,
+    ) -> Result<(), String> {
+        let Value::Object(map) = schema else {
+            return Ok(());
+        };
+        for key in map.keys() {
+            if !Self::GEMINI_FUNCTION_SCHEMA_KEYS.contains(&key.as_str()) {
+                return Err(format!("unsupported schema keyword [{key}] at [{path}]"));
+            }
+        }
+        let declared_type = map
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|t| t.to_ascii_lowercase());
+        match declared_type.as_deref() {
+            Some("object") => {
+                let props = map.get("properties").and_then(Value::as_object);
+                let non_empty = props.map(|p| !p.is_empty()).unwrap_or(false);
+                if !is_root && !non_empty {
+                    return Err(format!("OBJECT with empty/missing properties at [{path}]"));
+                }
+                if let Some(props) = props {
+                    for (name, prop) in props {
+                        Self::validate_gemini_declaration_schema(
+                            prop,
+                            &format!("{path}.{name}"),
+                            false,
+                        )?;
+                    }
+                }
+            }
+            Some("array") => match map.get("items") {
+                None => return Err(format!("ARRAY without items at [{path}]")),
+                Some(items) => {
+                    Self::validate_gemini_declaration_schema(items, &format!("{path}[]"), false)?;
+                }
+            },
+            _ => {}
+        }
+        if map.contains_key("enum") && declared_type.as_deref() != Some("string") {
+            return Err(format!("enum on non-STRING type at [{path}]"));
+        }
+        if let Some(required) = map.get("required").and_then(Value::as_array) {
+            let empty = serde_json::Map::new();
+            let props = map
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap_or(&empty);
+            for entry in required {
+                let name = entry
+                    .as_str()
+                    .ok_or_else(|| format!("required entry is not a string at [{path}]"))?;
+                if !props.contains_key(name) {
+                    return Err(format!(
+                        "required [{name}] not among properties at [{path}]"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn function_declarations(tools: &[serde_json::Value]) -> Vec<Value> {
@@ -476,8 +616,24 @@ impl GeminiProvider {
                     .unwrap_or(tool_name);
                 let parameters = tool
                     .get("input_schema")
-                    .map(Self::normalize_function_parameters)
+                    .map(|schema| Self::normalize_function_parameters(schema, true))
                     .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+
+                // Fail loud in debug/test builds if a sanitized declaration is
+                // still structurally invalid for Gemini, so catalog schema drift
+                // is caught at build time instead of as a live empty-details 400.
+                if cfg!(debug_assertions) {
+                    if let Err(reason) = Self::validate_gemini_declaration_schema(
+                        &parameters,
+                        &format!("{alias}.parameters"),
+                        true,
+                    ) {
+                        debug_assert!(
+                            false,
+                            "sanitized Gemini declaration [{alias}] is invalid: {reason}"
+                        );
+                    }
+                }
 
                 Some(json!({
                     "name": alias,
@@ -2930,6 +3086,138 @@ mod tests {
             let name = declaration["name"].as_str().unwrap_or("?");
             assert_gemini_valid_schema(&declaration["parameters"], &format!("{name}.parameters"));
         }
+    }
+
+    #[test]
+    fn full_catalog_schemas_sanitize_to_valid_gemini_declarations() {
+        // Build-time gate for the WHOLE catalog (not just life.*): the residual
+        // live 400 (2026-07-07, Beacon "open loops") came from schema residue
+        // that #148's life.*-only test never exercised. Any tool whose schema
+        // sanitizes to a structurally invalid Gemini declaration must fail here,
+        // not in production with an empty-details INVALID_ARGUMENT.
+        let tools: Vec<serde_json::Value> = agent_core::catalog::tool_catalog()
+            .values()
+            .map(|definition| serde_json::to_value(definition).expect("serialize ToolDefinition"))
+            .collect();
+        assert!(!tools.is_empty(), "catalog must expose tools");
+
+        let declarations = GeminiProvider::function_declarations(&tools);
+        assert_eq!(declarations.len(), tools.len());
+        let mut failures = Vec::new();
+        for declaration in &declarations {
+            let name = declaration["name"].as_str().unwrap_or("?");
+            if let Err(reason) = GeminiProvider::validate_gemini_declaration_schema(
+                &declaration["parameters"],
+                &format!("{name}.parameters"),
+                true,
+            ) {
+                failures.push(reason);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "invalid Gemini declarations after sanitization:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn sanitizer_repairs_empty_object_property_to_string() {
+        // Residue class 1: a free-form `{"type":"object"}` property (e.g. the
+        // catalog's `metadata`) sanitizes to a JSON-encoded string.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "life.observe",
+            "description": "Propose an observation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "metadata": { "type": "object", "default": {} }
+                }
+            }
+        })]);
+        let metadata = &declarations[0]["parameters"]["properties"]["metadata"];
+        assert_eq!(metadata["type"], serde_json::json!("string"));
+        assert!(metadata.get("properties").is_none());
+        assert!(
+            metadata["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("JSON-encoded object")
+        );
+        GeminiProvider::validate_gemini_declaration_schema(
+            &declarations[0]["parameters"],
+            "life_observe.parameters",
+            true,
+        )
+        .expect("repaired declaration must validate");
+    }
+
+    #[test]
+    fn sanitizer_repairs_array_of_empty_objects() {
+        // Residue class 2: `items: {"type":"object"}` (e.g. `passage_refs`,
+        // `*_node_refs`) — the empty-object item is downgraded to a string.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "life.recall.feedback",
+            "description": "Record feedback.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "noisy_node_refs": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "default": []
+                    }
+                }
+            }
+        })]);
+        let items = &declarations[0]["parameters"]["properties"]["noisy_node_refs"]["items"];
+        assert_eq!(items["type"], serde_json::json!("string"));
+        GeminiProvider::validate_gemini_declaration_schema(
+            &declarations[0]["parameters"],
+            "feedback.parameters",
+            true,
+        )
+        .expect("repaired declaration must validate");
+    }
+
+    #[test]
+    fn sanitizer_adds_items_to_array_without_items() {
+        // Residue class 3: an ARRAY that declares no `items` gets a string item.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "media.transform",
+            "description": "Transform media.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "stages": { "type": "array", "description": "Ordered stages." }
+                }
+            }
+        })]);
+        let stages = &declarations[0]["parameters"]["properties"]["stages"];
+        assert_eq!(stages["items"]["type"], serde_json::json!("string"));
+        GeminiProvider::validate_gemini_declaration_schema(
+            &declarations[0]["parameters"],
+            "transform.parameters",
+            true,
+        )
+        .expect("repaired declaration must validate");
+    }
+
+    #[test]
+    fn root_empty_object_parameters_are_preserved() {
+        // The ROOT params object stays `{type:object, properties:{}}` — Gemini
+        // accepts empty properties only at the top level and no-arg tools rely
+        // on it; the empty-object repair must NOT fire at the root.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "noop",
+            "description": "No args.",
+            "input_schema": { "type": "object", "properties": {} }
+        })]);
+        let params = &declarations[0]["parameters"];
+        assert_eq!(params["type"], serde_json::json!("object"));
+        assert!(params["properties"].is_object());
+        GeminiProvider::validate_gemini_declaration_schema(params, "noop.parameters", true)
+            .expect("root empty-object params are valid");
     }
 
     #[test]
