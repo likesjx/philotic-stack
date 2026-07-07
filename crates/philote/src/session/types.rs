@@ -1137,6 +1137,40 @@ pub fn charge_paracrine_hop(
     }
 }
 
+// ── Paracrine wire-payload succinctness budgets ─────────────────────────────
+//
+// Whisper prompts, merge summaries, and handoff context excerpts are all
+// model-authored free text that crosses the IPC/mesh wire and lands verbatim
+// in another philote's context window. None of them need to be long: a
+// whisper is a brief (goal / context / constraints / expected return), a
+// merge is a distilled answer, and a handoff excerpt is orientation — the
+// durable truth stays in the session checkpoint and memory. These caps stop
+// a verbose model from dumping its whole context across the wire.
+
+/// Maximum characters for a `delegate.whisper` prompt. Longer prompts are
+/// truncated with an explicit marker before dispatch.
+pub const PARACRINE_WHISPER_PROMPT_MAX_CHARS: usize = 4_000;
+
+/// Maximum characters for a `delegate.merge` content payload (the specialist's
+/// distilled answer back to the orchestrator or user).
+pub const PARACRINE_MERGE_CONTENT_MAX_CHARS: usize = 6_000;
+
+/// Maximum characters for a `HandoffBundle.context_excerpt` (role handoffs).
+pub const HANDOFF_CONTEXT_EXCERPT_MAX_CHARS: usize = 1_200;
+
+/// Truncate `text` to at most `max_chars` characters (char-boundary safe),
+/// appending an explicit omission marker when anything was cut. Returns the
+/// input unchanged (no reallocation of content) when it already fits.
+pub fn truncate_for_wire(text: &str, max_chars: usize) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return text.to_string();
+    }
+    let keep: String = text.chars().take(max_chars).collect();
+    let omitted = total_chars - max_chars;
+    format!("{keep}\n…[truncated: {omitted} chars omitted]")
+}
+
 /// Top-level settings tree for a philote session.
 /// Stored in the context graph keyed by agent_id; fetched at session init.
 /// Configurable via `agent.configure` with `settings.*` config path prefix.
@@ -1513,6 +1547,35 @@ mod paracrine_budget_tests {
     use super::*;
     use crate::r#loop::TurnPhase;
     use uuid::Uuid;
+
+    #[test]
+    fn truncate_for_wire_leaves_short_text_unchanged() {
+        assert_eq!(truncate_for_wire("hello", 10), "hello");
+        assert_eq!(truncate_for_wire("", 10), "");
+        // Exactly at the budget: unchanged, no marker.
+        assert_eq!(truncate_for_wire("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_for_wire_cuts_long_text_with_marker() {
+        let long = "x".repeat(100);
+        let out = truncate_for_wire(&long, 40);
+        assert!(out.starts_with(&"x".repeat(40)));
+        assert!(out.ends_with("…[truncated: 60 chars omitted]"), "{out}");
+    }
+
+    #[test]
+    fn truncate_for_wire_is_char_boundary_safe_for_multibyte() {
+        // 10 multibyte chars; cutting at 4 chars must not panic or split a char.
+        let text = "héllö wörld…™✓✗";
+        let total = text.chars().count();
+        let out = truncate_for_wire(text, 4);
+        assert!(out.starts_with("héll"));
+        assert!(
+            out.ends_with(&format!("…[truncated: {} chars omitted]", total - 4)),
+            "{out}"
+        );
+    }
 
     /// Minimal fresh working turn with the paracrine budget counters at their
     /// starting values (0 hops, no chain start).

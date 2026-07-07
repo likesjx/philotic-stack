@@ -10,12 +10,13 @@ use crate::protocol::{
 };
 use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
-    ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors, MediaRoutingPolicy,
-    MemoryAuthority, MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope,
-    MemoryTemporalKind, MemoryValidationLevel, ParacrineBudgetOutcome, ParacrineThreadStatus,
-    RecalledMemoryRecord, SessionState, ToolDefinition, ToolExecutionRoute,
+    ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors,
+    HANDOFF_CONTEXT_EXCERPT_MAX_CHARS, MediaRoutingPolicy, MemoryAuthority, MemoryShapingContext,
+    MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel,
+    PARACRINE_MERGE_CONTENT_MAX_CHARS, PARACRINE_WHISPER_PROMPT_MAX_CHARS, ParacrineBudgetOutcome,
+    ParacrineThreadStatus, RecalledMemoryRecord, SessionState, ToolDefinition, ToolExecutionRoute,
     ToolRunnerIncarnationBinding, TtsMode, VoiceResponsePolicy, WorkingTurn, charge_paracrine_hop,
-    merge_session_index,
+    merge_session_index, truncate_for_wire,
 };
 use anyhow::Result;
 use memory_core::{

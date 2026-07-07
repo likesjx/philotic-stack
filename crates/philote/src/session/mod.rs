@@ -1728,7 +1728,7 @@ impl SessionState {
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "The response to deliver to the orchestrator."
+                            "description": "The response to deliver to the orchestrator. Deliver a distilled answer — conclusions, key findings, and recommended next step — not your working transcript or raw tool output. Budget: ~6000 characters; anything longer is truncated."
                         }
                     },
                     "required": ["content"]
@@ -3214,9 +3214,12 @@ impl SessionState {
 
         HandoffBundle {
             goal: format!("Switch active role to {target_role} for this session."),
-            context_excerpt: format!(
-                "Same-identity role handoff requested. Current summary: {}",
-                self.summary_text()
+            context_excerpt: truncate_for_wire(
+                &format!(
+                    "Same-identity role handoff requested. Current summary: {}",
+                    self.summary_text()
+                ),
+                HANDOFF_CONTEXT_EXCERPT_MAX_CHARS,
             ),
             session_id: self.session_id.clone(),
             initiating_turn_id: initiating_turn_id.to_string(),
