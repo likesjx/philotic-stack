@@ -66,6 +66,12 @@ pub struct ObserveCypher {
     pub claim_summary: String,
     pub observation_id: String,
     pub packet_id: String,
+    /// Muninn origin: engram ID of the first `MuninnEngram` source ref, if any.
+    /// Preserved on the node so promotion (lifegraph-muninn-promotion seam)
+    /// can trace a Life Graph fact back to its Muninn continuity source.
+    pub origin_engram_id: Option<String>,
+    /// Muninn origin: reliability score of that source ref (0.0–1.0).
+    pub origin_trust: Option<f64>,
 }
 
 /// One compiled living-cycle edge MERGE for a `life.observe` request.
@@ -158,6 +164,20 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         .map(|s| source_kind_to_provenance(&s.source_kind))
         .unwrap_or_else(|| "agent_inferred".to_string());
 
+    // Muninn-origin preservation: the first MuninnEngram source ref pins the
+    // origin engram ID and its reliability score onto the node. Non-Muninn
+    // writes leave both null; nodes written before this field existed simply
+    // never carry it (retrieval treats absence as "no Muninn origin").
+    let muninn_origin = input
+        .evidence
+        .source_refs
+        .iter()
+        .find(|s| matches!(s.source_kind, SourceKind::MuninnEngram));
+    let origin_engram_id = muninn_origin
+        .map(|s| s.source_id.clone())
+        .filter(|id| !id.trim().is_empty());
+    let origin_trust = muninn_origin.map(|s| f64::from(s.reliability.score));
+
     let validation_state = validation_state_str(&input.evidence.validation_state);
 
     let observed_at = input
@@ -193,7 +213,9 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
             "n.observation_id = $observation_id, ",
             "n.packet_id = $packet_id, ",
             "n.observed_by = $observed_by, ",
-            "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END ",
+            "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
+            "n.origin_engram_id = CASE $origin_engram_id WHEN '' THEN null ELSE $origin_engram_id END, ",
+            "n.origin_trust = CASE WHEN $origin_trust < 0.0 THEN null ELSE $origin_trust END ",
             "ON MATCH SET ",
             "n.confidence = $confidence, ",
             "n.observation_id = $observation_id, ",
@@ -220,6 +242,8 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         claim_summary: input.evidence.claim_summary.clone(),
         observation_id: input.observation_id.clone(),
         packet_id: input.evidence.packet_id.clone(),
+        origin_engram_id,
+        origin_trust,
     })
 }
 
@@ -449,7 +473,9 @@ fn source_kind_to_provenance(kind: &SourceKind) -> String {
     match kind {
         SourceKind::OperatorConfirmation => "operator_confirmed",
         SourceKind::MembraneEvent => "transcript",
-        SourceKind::MuninnEngram => "agent_inferred",
+        // Preserved verbatim so Muninn-origin nodes remain distinguishable in
+        // the graph — do NOT collapse this into "agent_inferred".
+        SourceKind::MuninnEngram => "muninn_engram",
         SourceKind::GraphPassage => "agent_inferred",
         SourceKind::ImportedRecord => "calendar",
         SourceKind::AgentInference => "agent_inferred",
@@ -622,6 +648,106 @@ mod tests {
 
         assert_eq!(compiled.observed_by, OBSERVED_BY_UNKNOWN);
         assert_eq!(compiled.observed_role, None);
+    }
+
+    #[test]
+    fn compile_observe_muninn_source_preserves_origin() {
+        let mut input = minimal_observe_input("Signal");
+        input.evidence.claim_ref.id = "life:signal:muninn-origin".to_string();
+        input.evidence.source_refs = vec![SourceRef {
+            source_id: "muninn:01ABCDEF".to_string(),
+            source_kind: SourceKind::MuninnEngram,
+            reliability: SourceReliability {
+                score: 0.85,
+                basis: ReliabilityBasis::MuninnTrust,
+            },
+            uri: None,
+            captured_at: None,
+        }];
+        let compiled = compile_observe(&input, "2026-07-07T00:00:00Z").unwrap();
+
+        assert_eq!(compiled.provenance, "muninn_engram");
+        assert_eq!(
+            compiled.origin_engram_id.as_deref(),
+            Some("muninn:01ABCDEF")
+        );
+        assert!((compiled.origin_trust.unwrap() - 0.85).abs() < 1e-5);
+        assert!(compiled.query.contains(
+            "n.origin_engram_id = CASE $origin_engram_id WHEN '' THEN null ELSE $origin_engram_id END"
+        ));
+        assert!(compiled.query.contains(
+            "n.origin_trust = CASE WHEN $origin_trust < 0.0 THEN null ELSE $origin_trust END"
+        ));
+    }
+
+    #[test]
+    fn compile_observe_muninn_origin_found_behind_other_sources() {
+        let mut input = minimal_observe_input("OpenLoop");
+        input.evidence.claim_ref.id = "life:open-loop:mixed-sources".to_string();
+        input.evidence.source_refs.push(SourceRef {
+            source_id: "muninn:01SECOND".to_string(),
+            source_kind: SourceKind::MuninnEngram,
+            reliability: SourceReliability {
+                score: 0.7,
+                basis: ReliabilityBasis::MuninnTrust,
+            },
+            uri: None,
+            captured_at: None,
+        });
+        let compiled = compile_observe(&input, "2026-07-07T00:00:00Z").unwrap();
+
+        // First source ref still drives transport + provenance...
+        assert_eq!(compiled.source_membrane, "membrane:telegram");
+        assert_eq!(compiled.provenance, "transcript");
+        // ...but the Muninn origin is preserved from the later source ref.
+        assert_eq!(
+            compiled.origin_engram_id.as_deref(),
+            Some("muninn:01SECOND")
+        );
+        assert!((compiled.origin_trust.unwrap() - 0.7).abs() < 1e-5);
+    }
+
+    #[test]
+    fn compile_observe_non_muninn_source_leaves_origin_null() {
+        let input = minimal_observe_input("Signal");
+        let compiled = compile_observe(&input, "2026-07-07T00:00:00Z").unwrap();
+
+        assert_eq!(compiled.origin_engram_id, None);
+        assert_eq!(compiled.origin_trust, None);
+        assert_eq!(compiled.provenance, "transcript");
+    }
+
+    #[test]
+    fn compile_observe_old_payload_without_muninn_fields_still_compiles() {
+        // A wire payload predating Muninn provenance preservation: no new
+        // input fields exist, so an old-style life.observe body must
+        // deserialize and compile with null origin properties.
+        let payload = serde_json::json!({
+            "observation_id": "obs-legacy",
+            "evidence": {
+                "packet_id": "pkt-legacy",
+                "claim_ref": { "id": "signal-legacy", "label": "Signal" },
+                "claim_summary": "legacy signal",
+                "source_refs": [{
+                    "source_id": "membrane:telegram",
+                    "source_kind": "membrane_event",
+                    "reliability": { "score": 0.9, "basis": "direct_observation" }
+                }],
+                "passage_refs": [],
+                "confidence": 0.8,
+                "validation_state": "proposed",
+                "source_reliability": 0.9,
+                "conflict_ids": [],
+                "adjudication_status": "not_needed",
+                "metadata": null
+            },
+            "proposed_graph_refs": []
+        });
+        let input: LifeObserveInput = serde_json::from_value(payload).unwrap();
+        let compiled = compile_observe(&input, "2026-07-07T00:00:00Z").unwrap();
+
+        assert_eq!(compiled.origin_engram_id, None);
+        assert_eq!(compiled.origin_trust, None);
     }
 
     #[test]

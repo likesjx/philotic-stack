@@ -3,7 +3,7 @@ title: Life Graph Schema
 doc_type: specification
 domain: memory-context
 status: proposed
-last_updated: 2026-06-04
+last_updated: 2026-07-07
 tags:
 - life-graph
 - schema
@@ -41,7 +41,9 @@ Every node and every agent-written or inferred edge **must** carry these propert
 | `source_membrane` | `string` | Transport the evidence arrived over (e.g. `membrane:telegram`, `hotel:mbp-jane`) |
 | `observed_by` | `string` | Canonical agent identity that made the observation (e.g. `agent-astrid-01`). `agent:unknown` for legacy writes (V005+) |
 | `observed_role` | `string \| null` | Active role of the observing agent at write time (e.g. `chief_of_staff`), if any (V005+) |
-| `provenance` | `string` | Claim origin: `user_input`, `transcript`, `calendar`, `health_data`, `agent_inferred`, `operator_confirmed` |
+| `provenance` | `string` | Claim origin: `user_input`, `transcript`, `calendar`, `health_data`, `agent_inferred`, `operator_confirmed`, `muninn_engram` |
+| `origin_engram_id` | `string \| null` | Muninn engram ID when the observation's source was a `muninn_engram` source ref (source_kind `MuninnEngram`); `null` otherwise. Written at observe time so promotion stays auditable |
+| `origin_trust` | `float \| null` | Reliability score (0.0–1.0) of that Muninn source ref at write time; `null` when no Muninn origin |
 | `confidence` | `float` | 0.0–1.0. Inferred facts start low; rise with evidence and operator confirmation |
 | `validation_state` | `string` | `inferred` \| `proposed` \| `confirmed` \| `retired` \| `conflicted` |
 | `observed_at` | `string` | ISO 8601 timestamp when first observed |
@@ -50,6 +52,17 @@ Every node and every agent-written or inferred edge **must** carry these propert
 Operator-created nodes may omit provenance fields; they are required on agent-written records.
 
 `life.observe` also accepts an optional `edges[]` field (`{rel_type, target_id}`) MERGE'd idempotently with the node write. `rel_type` must be one of the living-cycle set `OWNS | SHAPES | SETS | SPAWNS | RELATES_TO` (unknown rel_types are rejected before the node write); a `target_id` matching no existing node creates nothing and is reported as `target_missing` in the response envelope. Domain zoning Role nodes (`domain_slug`, `steward_agent`) are seeded by `migrations/V005__domain_role_zoning_seed.cypher`.
+
+### Muninn Promotion Contract (seam: `lifegraph-muninn-promotion`)
+
+How a Muninn continuity memory becomes Life Graph truth:
+
+1. **Entry — origin preserved, never laundered.** A `life.observe` whose evidence carries a `MuninnEngram` source ref writes the node with `provenance = "muninn_engram"`, `origin_engram_id` = the engram's ID, and `origin_trust` = the source ref's reliability score. The Muninn origin is never collapsed into `agent_inferred`. The first `MuninnEngram` source ref wins when several are present; when a non-Muninn source ref comes first, it still drives `provenance`/`source_membrane` (transport truth) while the Muninn origin fields are preserved alongside.
+2. **Proposed, not confirmed.** Muninn-origin nodes enter as `validation_state = proposed` like any other agent observation. Muninn is a continuity authority, not a Life Graph truth authority — a high-trust engram does not skip the gate.
+3. **Retrieval bias, bounded.** Ranking gives unconfirmed nodes with `origin_trust >= 0.7` a small confirmation-term lift (`+0.15` on the confirmation axis, capped at 1.0) so trusted continuity surfaces more readily — but it can never outrank operator confirmation on that axis. Nodes written before this contract (no `origin_trust` property) rank exactly as before.
+4. **Hardening — the existing `life.commit` gate.** Promotion to `validation_state = confirmed` happens only through the existing `life.commit` confirmation path (operator confirmation or strong-evidence adjudication). No automated Muninn-to-confirmed promotion exists; building one is a deliberate future decision, not an implicit behaviour of this contract.
+
+`origin_engram_id` keeps the promotion auditable end-to-end: a confirmed fact can always be traced back to the engram that seeded it (and disputed via the conflict-handoff path if Muninn and the graph later disagree).
 
 ## Embedding Metadata
 
