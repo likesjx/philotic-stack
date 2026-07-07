@@ -36,3 +36,9 @@ pub const NODE_KIND_USER_TASK: &str = "user_task";
 
 // Model graph (doc:model-graph-flywheel / doc:hardened-model-dispatch)
 pub const NODE_KIND_MODEL_PROFILE: &str = "model_profile";
+
+// Autopoiesis Slice A1 (doc:AUTOPOIESIS_PROPOSAL)
+/// Per-lane earned-autonomy grant (posture, budget, earned counters).
+pub const NODE_KIND_AUTONOMY_GRANT: &str = "autonomy_grant";
+/// Append-only decision record for autonomous actions (what/why/evidence/undo).
+pub const NODE_KIND_AUTONOMY_AUDIT: &str = "autonomy_audit";

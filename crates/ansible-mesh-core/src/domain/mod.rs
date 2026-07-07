@@ -13,6 +13,10 @@
 //! `"abstract_tool:bash.exec"`, `"rule:rule-001"`. This keeps keys globally
 //! unique within a store and makes kind-scoped lookups fast.
 
+use crate::autonomy::{
+    record_outcome, AuditOutcome, AutonomyAuditRecord, AutonomyGrant, AutonomyLane, Outcome,
+    Transition,
+};
 use crate::cron::CronJob;
 use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
@@ -1637,6 +1641,170 @@ impl GraphDomain {
 
         Ok(profiles)
     }
+
+    // ── Autonomy grant methods (Autopoiesis Slice A1) ─────────────────────────
+
+    fn autonomy_grant_key(lane: &str) -> String {
+        format!("{}:{}", NODE_KIND_AUTONOMY_GRANT, lane)
+    }
+
+    fn autonomy_audit_key(audit_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_AUTONOMY_AUDIT, audit_id)
+    }
+
+    /// Upsert a per-lane autonomy grant as a graph node.
+    pub fn upsert_autonomy_grant(&self, grant: &AutonomyGrant) -> Result<()> {
+        let data = serde_json::to_value(grant)
+            .context("GraphDomain::upsert_autonomy_grant: serialize AutonomyGrant")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::autonomy_grant_key(grant.lane.as_str()),
+            kind: NODE_KIND_AUTONOMY_GRANT.to_string(),
+            label: Some(grant.lane.as_str().to_string()),
+            data,
+        })
+    }
+
+    /// Load the autonomy grant for `lane`.
+    pub fn get_autonomy_grant(&self, lane: &str) -> Result<Option<AutonomyGrant>> {
+        match self.adapter.get_node(&Self::autonomy_grant_key(lane))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::get_autonomy_grant: deserialize AutonomyGrant")?,
+            )),
+        }
+    }
+
+    /// Load the grant for `lane`, creating it at the safest posture
+    /// ([`crate::autonomy::AutonomyPosture::ProposalOnly`]) if absent.
+    ///
+    /// Grants are never created above ProposalOnly — trust is earned per-lane
+    /// via operator-confirmed outcomes (Autonomy Contract rule 2).
+    pub fn get_or_create_autonomy_grant(&self, lane: &str, now: u64) -> Result<AutonomyGrant> {
+        if let Some(grant) = self.get_autonomy_grant(lane)? {
+            return Ok(grant);
+        }
+        let grant = AutonomyGrant::new(AutonomyLane::new(lane), now);
+        self.upsert_autonomy_grant(&grant)?;
+        Ok(grant)
+    }
+
+    /// List all autonomy grants.
+    pub fn list_autonomy_grants(&self) -> Result<Vec<AutonomyGrant>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_AUTONOMY_GRANT)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_autonomy_grants: deserialize AutonomyGrant")
+            })
+            .collect()
+    }
+
+    /// Apply an [`Outcome`] to the grant for `lane` and persist the result.
+    ///
+    /// When the transition freezes the lane (consecutive-failure ceiling),
+    /// this also writes an `autonomy_audit` record describing the freeze so
+    /// operator review has an anchor. Returns the transition.
+    pub fn record_autonomy_outcome(
+        &self,
+        lane: &str,
+        outcome: Outcome,
+        now: u64,
+    ) -> Result<Transition> {
+        let mut grant = self.get_or_create_autonomy_grant(lane, now)?;
+        let transition = record_outcome(&mut grant, outcome, now);
+        self.upsert_autonomy_grant(&grant)?;
+        if transition == Transition::Frozen {
+            let audit = AutonomyAuditRecord::new(
+                format!("freeze:{}:{}", lane, now),
+                grant.lane.clone(),
+                format!(
+                    "lane frozen: {} consecutive failures reached ceiling {}",
+                    grant.earned.consecutive_failures, grant.budget.max_consecutive_failures
+                ),
+                &format!(
+                    "consecutive_failures={} max_consecutive_failures={} posture retained at {:?}",
+                    grant.earned.consecutive_failures,
+                    grant.budget.max_consecutive_failures,
+                    grant.posture
+                ),
+                "operator review: clear via GraphDomain::clear_autonomy_freeze",
+                grant.posture,
+                now,
+            );
+            self.record_autonomy_audit(&audit)?;
+        }
+        Ok(transition)
+    }
+
+    /// Explicit operator action: clear a lane's freeze flag and reset its
+    /// consecutive-failure streak. Returns `false` when no grant exists.
+    pub fn clear_autonomy_freeze(&self, lane: &str, now: u64) -> Result<bool> {
+        let Some(mut grant) = self.get_autonomy_grant(lane)? else {
+            return Ok(false);
+        };
+        grant.frozen_until_operator_review = false;
+        grant.earned.consecutive_failures = 0;
+        grant.updated_at = now;
+        self.upsert_autonomy_grant(&grant)?;
+        Ok(true)
+    }
+
+    /// Record an autonomy audit entry. Distinct `audit_id`s never overwrite —
+    /// the trail is append-only by construction.
+    pub fn record_autonomy_audit(&self, audit: &AutonomyAuditRecord) -> Result<()> {
+        let data = serde_json::to_value(audit)
+            .context("GraphDomain::record_autonomy_audit: serialize AutonomyAuditRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::autonomy_audit_key(&audit.audit_id),
+            kind: NODE_KIND_AUTONOMY_AUDIT.to_string(),
+            label: Some(audit.lane.as_str().to_string()),
+            data,
+        })
+    }
+
+    /// Load one audit record by id.
+    pub fn get_autonomy_audit(&self, audit_id: &str) -> Result<Option<AutonomyAuditRecord>> {
+        match self.adapter.get_node(&Self::autonomy_audit_key(audit_id))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_autonomy_audit: deserialize AutonomyAuditRecord",
+            )?)),
+        }
+    }
+
+    /// List all audit records for `lane`, oldest first.
+    pub fn list_autonomy_audits_by_lane(&self, lane: &str) -> Result<Vec<AutonomyAuditRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_AUTONOMY_AUDIT)? {
+            let record: AutonomyAuditRecord = serde_json::from_value(node.data).context(
+                "GraphDomain::list_autonomy_audits_by_lane: deserialize AutonomyAuditRecord",
+            )?;
+            if record.lane.as_str() == lane {
+                out.push(record);
+            }
+        }
+        out.sort_by_key(|r| r.created_at);
+        Ok(out)
+    }
+
+    /// Update the review outcome on an existing audit record. Returns `false`
+    /// when the record does not exist.
+    pub fn set_autonomy_audit_outcome(
+        &self,
+        audit_id: &str,
+        outcome: AuditOutcome,
+        now: u64,
+    ) -> Result<bool> {
+        let Some(mut record) = self.get_autonomy_audit(audit_id)? else {
+            return Ok(false);
+        };
+        record.outcome = outcome;
+        record.updated_at = now;
+        self.record_autonomy_audit(&record)?;
+        Ok(true)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1658,6 +1826,194 @@ mod tests {
         let storage =
             SqliteGraphStorage::open_in_memory().expect("in-memory SqliteGraphStorage failed");
         GraphDomain::new(Arc::new(storage.adapter()))
+    }
+
+    #[test]
+    fn autonomy_grant_storage_round_trip() {
+        let domain = make_domain();
+        let lane = crate::autonomy::LANE_GRAPH_BRIDGE_EDGES;
+        assert!(domain.get_autonomy_grant(lane).expect("get").is_none());
+
+        // First creation always starts at ProposalOnly — the safest level.
+        let created = domain
+            .get_or_create_autonomy_grant(lane, 1_000)
+            .expect("create");
+        assert_eq!(
+            created.posture,
+            crate::autonomy::AutonomyPosture::ProposalOnly
+        );
+        assert_eq!(created.earned.required_for_promotion, 5);
+
+        // Round-trip: what we stored is what we load.
+        let loaded = domain
+            .get_autonomy_grant(lane)
+            .expect("get")
+            .expect("grant exists");
+        assert_eq!(loaded, created);
+
+        // get_or_create is idempotent — no reset of an existing grant.
+        let mut mutated = loaded.clone();
+        mutated.posture = crate::autonomy::AutonomyPosture::ConfirmFirst;
+        mutated.earned.confirmed_good_outcomes = 3;
+        mutated.updated_at = 2_000;
+        domain.upsert_autonomy_grant(&mutated).expect("upsert");
+        let again = domain
+            .get_or_create_autonomy_grant(lane, 9_999)
+            .expect("get_or_create existing");
+        assert_eq!(again, mutated);
+
+        // Second lane shows up alongside the first in list.
+        domain
+            .get_or_create_autonomy_grant(crate::autonomy::LANE_FLEET_HEAL_SLICES, 3_000)
+            .expect("create second");
+        let mut grants = domain.list_autonomy_grants().expect("list");
+        grants.sort_by(|a, b| a.lane.as_str().cmp(b.lane.as_str()));
+        assert_eq!(grants.len(), 2);
+        assert_eq!(
+            grants[0].lane.as_str(),
+            crate::autonomy::LANE_FLEET_HEAL_SLICES
+        );
+        assert_eq!(grants[1].lane.as_str(), lane);
+    }
+
+    #[test]
+    fn autonomy_outcome_persists_and_freeze_writes_audit() {
+        let domain = make_domain();
+        let lane = crate::autonomy::LANE_WORK_FILE_PROPOSALS;
+
+        // Failures up to the ceiling freeze the lane and write an audit record.
+        let mut last = Transition::NoChange;
+        let cap = crate::autonomy::AutonomyBudget::default().max_consecutive_failures;
+        for i in 0..cap {
+            last = domain
+                .record_autonomy_outcome(lane, Outcome::Failure, 1_000 + u64::from(i))
+                .expect("record failure");
+        }
+        assert_eq!(last, Transition::Frozen);
+        let grant = domain
+            .get_autonomy_grant(lane)
+            .expect("get")
+            .expect("grant exists");
+        assert!(grant.frozen_until_operator_review);
+        let audits = domain
+            .list_autonomy_audits_by_lane(lane)
+            .expect("list audits");
+        assert_eq!(audits.len(), 1);
+        assert!(audits[0].audit_id.starts_with("freeze:"));
+        assert_eq!(audits[0].outcome, AuditOutcome::Pending);
+
+        // Unfreeze semantics: explicit operator action clears the flag and
+        // resets the failure streak.
+        assert!(domain.clear_autonomy_freeze(lane, 5_000).expect("clear"));
+        let grant = domain
+            .get_autonomy_grant(lane)
+            .expect("get")
+            .expect("grant exists");
+        assert!(!grant.frozen_until_operator_review);
+        assert_eq!(grant.earned.consecutive_failures, 0);
+        assert_eq!(grant.updated_at, 5_000);
+
+        // Clearing an unknown lane reports false.
+        assert!(!domain
+            .clear_autonomy_freeze("no.such_lane", 5_001)
+            .expect("clear unknown"));
+    }
+
+    #[test]
+    fn autonomy_audit_round_trip_and_list_by_lane() {
+        let domain = make_domain();
+        let lane_a = crate::autonomy::LANE_STEWARD_ACTIVE_CHECKINS;
+        let lane_b = crate::autonomy::LANE_WORK_EXECUTE_SLICES;
+
+        let newer = AutonomyAuditRecord::new(
+            "audit-2",
+            AutonomyLane::new(lane_a),
+            "sent active check-in",
+            "5 confirmed SIL entries",
+            "retract the check-in message",
+            crate::autonomy::AutonomyPosture::AutoWithAudit,
+            2_000,
+        );
+        let older = AutonomyAuditRecord::new(
+            "audit-1",
+            AutonomyLane::new(lane_a),
+            "sent active check-in",
+            "operator confirmed entry",
+            "retract the check-in message",
+            crate::autonomy::AutonomyPosture::ConfirmFirst,
+            1_000,
+        );
+        let other_lane = AutonomyAuditRecord::new(
+            "audit-3",
+            AutonomyLane::new(lane_b),
+            "drafted slice plan",
+            "top scored proposal",
+            "close the draft PR",
+            crate::autonomy::AutonomyPosture::ProposalOnly,
+            1_500,
+        );
+        // Insert out of order to prove created_at sorting.
+        domain.record_autonomy_audit(&newer).expect("record newer");
+        domain.record_autonomy_audit(&older).expect("record older");
+        domain
+            .record_autonomy_audit(&other_lane)
+            .expect("record other lane");
+
+        let audits = domain.list_autonomy_audits_by_lane(lane_a).expect("list");
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0], older);
+        assert_eq!(audits[1], newer);
+
+        // Outcome update round-trips.
+        assert!(domain
+            .set_autonomy_audit_outcome("audit-1", AuditOutcome::Confirmed, 3_000)
+            .expect("set outcome"));
+        let updated = domain
+            .get_autonomy_audit("audit-1")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(updated.outcome, AuditOutcome::Confirmed);
+        assert_eq!(updated.updated_at, 3_000);
+        assert_eq!(updated.created_at, 1_000);
+        assert!(!domain
+            .set_autonomy_audit_outcome("missing", AuditOutcome::Reversed, 3_001)
+            .expect("set missing"));
+    }
+
+    #[test]
+    fn autonomy_state_machine_round_trips_through_storage() {
+        // Pure-function transitions survive persistence: promote a lane to
+        // ConfirmFirst through stored outcomes, then reverse it back down.
+        let domain = make_domain();
+        let lane = crate::autonomy::LANE_GRAPH_BRIDGE_EDGES;
+        let mut last = Transition::NoChange;
+        for i in 0..5u64 {
+            last = domain
+                .record_autonomy_outcome(lane, Outcome::ConfirmedGood, 100 + i)
+                .expect("confirm");
+        }
+        assert_eq!(
+            last,
+            Transition::Promoted {
+                from: crate::autonomy::AutonomyPosture::ProposalOnly,
+                to: crate::autonomy::AutonomyPosture::ConfirmFirst,
+            }
+        );
+        let t = domain
+            .record_autonomy_outcome(lane, Outcome::OperatorReversal, 200)
+            .expect("reversal");
+        assert_eq!(
+            t,
+            Transition::Demoted {
+                from: crate::autonomy::AutonomyPosture::ConfirmFirst,
+                to: crate::autonomy::AutonomyPosture::ProposalOnly,
+            }
+        );
+        let grant = domain
+            .get_autonomy_grant(lane)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(grant.earned.confirmed_good_outcomes, 0);
     }
 
     #[test]
