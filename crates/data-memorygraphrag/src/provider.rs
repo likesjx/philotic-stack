@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use data_memorygraphrag::LIFE_GRAPH_EMBEDDING_DIMS;
 use data_memorygraphrag::cypher;
+use data_memorygraphrag::entanglement;
 use data_memorygraphrag::projection;
 use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
@@ -464,28 +465,11 @@ impl LifeGraphProvider {
                 .await?;
             }
             NamedRecallStrategy::CrossDomainEntanglement => {
-                let domain_a_embedding = embedding_from_key(&task.parameters, "domain_a_embedding")
-                    .unwrap_or_else(|| embedding.clone());
-                let domain_b_embedding = embedding_from_key(&task.parameters, "domain_b_embedding")
-                    .unwrap_or_else(|| embedding.clone());
-                self.extend_vector_hits(
-                    &mut all_hits,
-                    SemanticSpace::LifeEventSemantic,
-                    &["Signal"],
-                    8,
-                    0.4,
-                    &domain_a_embedding,
-                )
-                .await?;
-                self.extend_vector_hits(
-                    &mut all_hits,
-                    SemanticSpace::GoalSystemSemantic,
-                    &["Goal"],
-                    8,
-                    0.4,
-                    &domain_b_embedding,
-                )
-                .await?;
+                // Dual-similarity intersection + living-cycle bridge discovery
+                // — a dedicated pipeline, not the shared concat/score path.
+                return self
+                    .handle_cross_domain_recall(task, &query_val, &embedding, &now_iso)
+                    .await;
             }
             NamedRecallStrategy::SemanticPivot => {
                 for pivot in &query_val.semantic_pivots {
@@ -948,6 +932,202 @@ impl LifeGraphProvider {
             all_hits.extend(projection::parse_vector_search_rows(&result));
         }
         Ok(())
+    }
+
+    /// Dedicated pipeline for `cross_domain_entanglement`: score candidates
+    /// against BOTH domain embeddings, keep the intersection above threshold
+    /// (ranked by `min(score_a, score_b)`), then discover living-cycle bridge
+    /// nodes reachable from a strong hit on each side. Every hit in the
+    /// packet is labeled with `entanglement_kind` and a human-readable
+    /// `entanglement_reason` saying WHY it is entangled.
+    async fn handle_cross_domain_recall(
+        &self,
+        task: &DatasourceTask,
+        query_val: &RetrievalQuery,
+        fallback_embedding: &[f32],
+        now_iso: &str,
+    ) -> Result<ProviderOutput> {
+        let domain_a_embedding = embedding_from_key(&task.parameters, "domain_a_embedding")
+            .unwrap_or_else(|| fallback_embedding.to_vec());
+        let domain_b_embedding = embedding_from_key(&task.parameters, "domain_b_embedding")
+            .unwrap_or_else(|| fallback_embedding.to_vec());
+
+        // Dual sweep: the SAME candidate labels are scored against each
+        // domain embedding so the intersection is well-defined.
+        let per_label_top_k = (query_val.max_context_packets * 2).max(8);
+        let mut hits_a = Vec::new();
+        let mut hits_b = Vec::new();
+        for (space, label) in entanglement::candidate_spaces() {
+            self.extend_vector_hits(
+                &mut hits_a,
+                space.clone(),
+                &[label],
+                per_label_top_k,
+                entanglement::CROSS_DOMAIN_SEARCH_FLOOR,
+                &domain_a_embedding,
+            )
+            .await?;
+            self.extend_vector_hits(
+                &mut hits_b,
+                space,
+                &[label],
+                per_label_top_k,
+                entanglement::CROSS_DOMAIN_SEARCH_FLOOR,
+                &domain_b_embedding,
+            )
+            .await?;
+        }
+        let domain_a_sweep = hits_a.len();
+        let domain_b_sweep = hits_b.len();
+
+        let intersection = entanglement::intersect_domain_hits(
+            hits_a,
+            hits_b,
+            entanglement::CROSS_DOMAIN_MIN_SIMILARITY,
+        );
+
+        // Bridge discovery: one living-cycle hop from a strong domain-A hit
+        // AND a strong domain-B hit. Failures degrade to vector-only
+        // entanglement — never fail the recall.
+        let anchors_a = intersection.domain_a_anchors();
+        let anchors_b = intersection.domain_b_anchors();
+        let mut bridges = Vec::new();
+        if !anchors_a.is_empty() && !anchors_b.is_empty() {
+            let a_ids: Vec<&str> = anchors_a.keys().map(String::as_str).collect();
+            let b_ids: Vec<&str> = anchors_b.keys().map(String::as_str).collect();
+            let cypher = entanglement::bridge_discovery_cypher(&a_ids, &b_ids, 16);
+            match self.execute_cypher(&cypher).await {
+                Ok(result) => {
+                    let rows = entanglement::parse_bridge_rows(&result);
+                    bridges = entanglement::fold_bridge_hits(
+                        rows,
+                        &anchors_a,
+                        &anchors_b,
+                        entanglement::BRIDGE_SCORE_DECAY,
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        query_id = %query_val.query_id,
+                        "cross_domain_entanglement: bridge discovery failed; \
+                         returning vector-only entanglement: {e}"
+                    );
+                }
+            }
+        }
+
+        let candidates = entanglement::assemble_entangled_candidates(
+            intersection,
+            bridges,
+            entanglement::MAX_SINGLE_DOMAIN_CONTEXT_HITS,
+        );
+
+        // Policy filters apply per candidate exactly as elsewhere; the
+        // entanglement score is authoritative (no re-ranking by weights).
+        let filters = &query_val.policy_filters;
+        let mut metadata_by_id: std::collections::HashMap<String, Value> =
+            std::collections::HashMap::new();
+        let mut explanations = Vec::new();
+        let mut kind_counts: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
+        let mut scored: Vec<projection::ScoredHit> = Vec::new();
+        for candidate in candidates {
+            let (surviving, _drop_log) =
+                projection::apply_policy_filters(vec![candidate.hit.clone()], filters);
+            if surviving.is_empty() {
+                continue;
+            }
+            *kind_counts.entry(candidate.kind.as_str()).or_insert(0) += 1;
+            let node_id = candidate.hit.node_id().to_string();
+            metadata_by_id.insert(node_id.clone(), candidate.metadata());
+            explanations.push(json!({
+                "node_id": node_id,
+                "title": candidate.hit.title(),
+                "label": candidate.hit.label,
+                "entanglement_kind": candidate.kind.as_str(),
+                "reason": candidate.reason(),
+            }));
+            let expansion_origin = if candidate.kind == entanglement::EntanglementKind::Bridge {
+                candidate
+                    .domain_a_anchors
+                    .first()
+                    .map(|anchor| projection::ExpansionOrigin {
+                        origin: GraphRecordRef {
+                            id: anchor.id.clone(),
+                            label: anchor.label.clone(),
+                            datasource: Some("life-graph".into()),
+                        },
+                        rel_type: candidate
+                            .bridge_a_rel_types
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "RELATES_TO".to_string()),
+                    })
+            } else {
+                None
+            };
+            scored.push(projection::ScoredHit {
+                score: candidate.score,
+                matched_policy_filters: Vec::new(),
+                expansion_origin,
+                hit: candidate.hit,
+            });
+        }
+
+        let context_id = format!("ctx:{}", query_val.query_id);
+        let token_budget = query_val.max_context_packets * 200;
+        let mut packet = projection::project_context_packet(
+            &context_id,
+            &query_val.query_id,
+            query_val.strategy.clone(),
+            scored,
+            Vec::new(),
+            token_budget,
+            now_iso,
+        );
+        entanglement::annotate_packet(&mut packet, &metadata_by_id);
+
+        info!(
+            query_id = %query_val.query_id,
+            result_count = packet.ranked_packets.len(),
+            semantic_both = kind_counts.get("semantic_both").copied().unwrap_or(0),
+            bridge = kind_counts.get("bridge").copied().unwrap_or(0),
+            domain_a_strong = anchors_a.len(),
+            domain_b_strong = anchors_b.len(),
+            "cross_domain_entanglement: context packet projected"
+        );
+
+        let packet_json =
+            serde_json::to_value(&packet).context("failed to serialize RetrievalContextPacket")?;
+        let cross_agent_packet = ContextPacket::from_lifegraph_retrieval(
+            &packet,
+            format!("LifeGraph recall for {}", query_val.query_text),
+            query_val.active_role.clone(),
+        );
+        let cross_agent_packet_json = serde_json::to_value(&cross_agent_packet)
+            .context("failed to serialize cross-agent ContextPacket")?;
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "named_strategy": NamedRecallStrategy::CrossDomainEntanglement.as_str(),
+            "fallback_used": false,
+            "entanglement": {
+                "threshold": entanglement::CROSS_DOMAIN_MIN_SIMILARITY,
+                "domain_a_sweep_hits": domain_a_sweep,
+                "domain_b_sweep_hits": domain_b_sweep,
+                "domain_a_strong_hits": anchors_a.len(),
+                "domain_b_strong_hits": anchors_b.len(),
+                "counts": {
+                    "semantic_both": kind_counts.get("semantic_both").copied().unwrap_or(0),
+                    "bridge": kind_counts.get("bridge").copied().unwrap_or(0),
+                    "domain_a_only": kind_counts.get("domain_a_only").copied().unwrap_or(0),
+                    "domain_b_only": kind_counts.get("domain_b_only").copied().unwrap_or(0),
+                },
+                "explanations": explanations,
+            },
+            "context_packet": packet_json,
+            "cross_agent_context_packet": cross_agent_packet_json,
+        })))
     }
 }
 
