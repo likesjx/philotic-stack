@@ -2,8 +2,8 @@
 title: Philotic Primitives Crate Structure
 doc_type: proposal
 domain: runtime-sessions
-status: accepted-current-slice
-last_updated: 2026-04-09
+status: superseded-folded-back
+last_updated: 2026-07-06
 tags:
 - architecture
 - crate-structure
@@ -21,6 +21,13 @@ tracks_domains:
 ---
 
 # Philotic Primitives Crate Structure Proposal
+
+> **STATUS (2026-07-06): folded back.** Only `philotic-primitives-mesh` was ever
+> extracted (consumed by `ansible-mesh-core`). The other five crates remained
+> empty `cargo new` scaffolds with zero reverse dependencies and were deleted
+> in `codex/crate-cleanup`. The six-crate split described below is no longer
+> the plan of record; `ansible-mesh-core` stays the shared library. Kept for
+> historical context.
 
 ## Goal
 
