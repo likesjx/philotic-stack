@@ -543,13 +543,73 @@ impl LifeGraphProvider {
         };
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+        // Graph expansion (read side): one bounded living-cycle hop from the
+        // ranked parents, batched into a single Cypher round trip. Expansion
+        // failures never fail the recall — vector-only results still return.
+        let mut candidates: Vec<projection::ScoredHit> =
+            scored.into_iter().map(Into::into).collect();
+        let expansion_policy = &query_val.expansion_policy;
+        let mut expansion_count = 0usize;
+        if expansion_policy.max_hops >= 1
+            && expansion_policy.max_nodes > 0
+            && !candidates.is_empty()
+        {
+            let expansion_cypher = {
+                let rel_types =
+                    projection::expansion_rel_types(&expansion_policy.allowed_edge_types);
+                let seeds: Vec<&str> = candidates
+                    .iter()
+                    .take(query_val.max_context_packets.max(1))
+                    .map(|c| c.hit.node_id())
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                if rel_types.is_empty() || seeds.is_empty() {
+                    None
+                } else {
+                    Some(projection::expansion_cypher(
+                        &seeds,
+                        &rel_types,
+                        expansion_policy.max_nodes,
+                    ))
+                }
+            };
+            if let Some(cypher) = expansion_cypher {
+                match self.execute_cypher(&cypher).await {
+                    Ok(result) => {
+                        let expansion_hits = projection::parse_expansion_rows(&result);
+                        let folded = projection::fold_expansion_hits(
+                            &candidates,
+                            expansion_hits,
+                            filters,
+                            projection::EXPANSION_SCORE_DECAY,
+                            expansion_policy.max_nodes,
+                        );
+                        expansion_count = folded.len();
+                        candidates.extend(folded);
+                        candidates.sort_by(|a, b| {
+                            b.score
+                                .partial_cmp(&a.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                    Err(e) => {
+                        warn!(
+                            query_id = %query_val.query_id,
+                            "life.recall: living-cycle expansion failed; \
+                             returning vector-only results: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
         let context_id = format!("ctx:{}", query_val.query_id);
         let token_budget = query_val.max_context_packets * 200;
         let packet = projection::project_context_packet(
             &context_id,
             &query_val.query_id,
             query_val.strategy.clone(),
-            scored,
+            candidates,
             Vec::new(),
             token_budget,
             &now_iso,
@@ -558,6 +618,7 @@ impl LifeGraphProvider {
         info!(
             query_id = %query_val.query_id,
             result_count = packet.ranked_packets.len(),
+            expansion_count,
             fallback_used,
             "life.recall: context packet projected"
         );

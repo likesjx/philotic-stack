@@ -187,6 +187,28 @@ impl VectorHit {
     }
 }
 
+/// Build a `VectorHit` from one `bolt_node_to_json`-shaped value.
+fn hit_from_bolt_node(node: &Value, similarity: f32) -> VectorHit {
+    let bolt_id = node.get("id").and_then(Value::as_i64).unwrap_or(-1);
+    let label = node
+        .get("labels")
+        .and_then(Value::as_array)
+        .and_then(|ls| ls.first())
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown")
+        .to_string();
+    let properties = node
+        .get("properties")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    VectorHit {
+        bolt_id,
+        label,
+        properties,
+        similarity,
+    }
+}
+
 /// Parse the `rows` array from `MemgraphCypherProvider::execute_cypher` output.
 pub fn parse_vector_search_rows(result: &Value) -> Vec<VectorHit> {
     let rows = match result.get("rows").and_then(Value::as_array) {
@@ -201,28 +223,151 @@ pub fn parse_vector_search_rows(result: &Value) -> Vec<VectorHit> {
             Some(n) => n,
             None => continue,
         };
-        let bolt_id = node.get("id").and_then(Value::as_i64).unwrap_or(-1);
-        let label = node
-            .get("labels")
-            .and_then(Value::as_array)
-            .and_then(|ls| ls.first())
-            .and_then(Value::as_str)
-            .unwrap_or("Unknown")
-            .to_string();
-        let properties = node
-            .get("properties")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default()));
         let similarity = row.get("similarity").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        hits.push(hit_from_bolt_node(node, similarity));
+    }
+    hits
+}
 
-        hits.push(VectorHit {
-            bolt_id,
-            label,
-            properties,
-            similarity,
+// ── Graph expansion (read side) ───────────────────────────────────────────────
+
+/// Score multiplier applied to expansion-discovered hits: they inherit their
+/// parent's score decayed by this factor, so a hop away always ranks below
+/// the hit that surfaced it.
+pub const EXPANSION_SCORE_DECAY: f32 = 0.6;
+
+/// Effective relationship types for read-side expansion: the intersection of
+/// the caller's `ExpansionPolicy.allowed_edge_types` with the living-cycle
+/// vocabulary. An empty allowlist means all living-cycle types. Unknown
+/// caller-supplied types are ignored (never interpolated into Cypher).
+pub fn expansion_rel_types(allowed_edge_types: &[String]) -> Vec<&'static str> {
+    if allowed_edge_types.is_empty() {
+        return crate::cypher::LIVING_CYCLE_REL_TYPES.to_vec();
+    }
+    crate::cypher::LIVING_CYCLE_REL_TYPES
+        .iter()
+        .copied()
+        .filter(|rel| allowed_edge_types.iter().any(|allowed| allowed == rel))
+        .collect()
+}
+
+fn escape_single_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Single-round-trip, one-hop expansion over living-cycle edges for a batch
+/// of seed node ids (no per-hit N+1 against Memgraph).
+///
+/// `rel_types` must come from [`expansion_rel_types`] — only whitelisted
+/// living-cycle types are ever interpolated. Retired neighbours are excluded
+/// in-query; the caller applies the remaining `PolicyFilter`s via
+/// [`fold_expansion_hits`]. `max_rows` bounds the round trip
+/// (`ExpansionPolicy.max_nodes`).
+pub fn expansion_cypher(seed_ids: &[&str], rel_types: &[&str], max_rows: usize) -> String {
+    let ids = seed_ids
+        .iter()
+        .map(|id| format!("'{}'", escape_single_quoted(id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "MATCH (n)-[r:{rels}]-(related) \
+         WHERE n.id IN [{ids}] \
+         AND related.id IS NOT NULL \
+         AND coalesce(related.validation_state, 'inferred') <> 'retired' \
+         RETURN n.id AS origin_id, type(r) AS rel_type, related AS node \
+         LIMIT {max_rows}",
+        rels = rel_types.join("|"),
+        ids = ids,
+        max_rows = max_rows,
+    )
+}
+
+/// One neighbour discovered by [`expansion_cypher`]: the seed node it was
+/// reached from, the living-cycle relationship, and the neighbour itself.
+#[derive(Debug, Clone)]
+pub struct ExpansionHit {
+    pub origin_id: String,
+    pub rel_type: String,
+    pub hit: VectorHit,
+}
+
+/// Parse `RETURN n.id AS origin_id, type(r) AS rel_type, related AS node`
+/// rows from `execute_cypher` output.
+pub fn parse_expansion_rows(result: &Value) -> Vec<ExpansionHit> {
+    let rows = match result.get("rows").and_then(Value::as_array) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let mut hits = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Some(origin_id), Some(rel_type), Some(node)) = (
+            row.get("origin_id").and_then(Value::as_str),
+            row.get("rel_type").and_then(Value::as_str),
+            row.get("node"),
+        ) else {
+            continue;
+        };
+        hits.push(ExpansionHit {
+            origin_id: origin_id.to_string(),
+            rel_type: rel_type.to_string(),
+            hit: hit_from_bolt_node(node, 0.0),
         });
     }
     hits
+}
+
+/// Fold expansion-discovered neighbours into scored candidates.
+///
+/// Each surviving neighbour becomes a [`ScoredHit`] carrying
+/// `expansion_origin` provenance, scored `parent_score * decay`. Neighbours
+/// are dropped when they duplicate a parent (or an earlier expansion), fail
+/// the caller's `PolicyFilter`s, reference an unknown origin, or would exceed
+/// `max_nodes` (the `ExpansionPolicy.max_nodes` cap).
+pub fn fold_expansion_hits(
+    parents: &[ScoredHit],
+    expansion: Vec<ExpansionHit>,
+    filters: &[PolicyFilter],
+    decay: f32,
+    max_nodes: usize,
+) -> Vec<ScoredHit> {
+    let mut seen: std::collections::HashSet<String> = parents
+        .iter()
+        .map(|p| p.hit.node_id().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut folded = Vec::new();
+    for exp in expansion {
+        if folded.len() >= max_nodes {
+            break;
+        }
+        let Some(parent) = parents.iter().find(|p| p.hit.node_id() == exp.origin_id) else {
+            continue;
+        };
+        let node_id = exp.hit.node_id().to_string();
+        if node_id.is_empty() || seen.contains(&node_id) {
+            continue;
+        }
+        // PolicyFilters apply to expanded nodes exactly as to vector hits.
+        let (surviving, _drop_log) = apply_policy_filters(vec![exp.hit], filters);
+        let Some(hit) = surviving.into_iter().next() else {
+            continue;
+        };
+        seen.insert(node_id);
+        folded.push(ScoredHit {
+            score: (parent.score * decay).clamp(0.0, 1.0),
+            matched_policy_filters: Vec::new(),
+            expansion_origin: Some(ExpansionOrigin {
+                origin: GraphRecordRef {
+                    id: parent.hit.node_id().to_string(),
+                    label: parent.hit.label.clone(),
+                    datasource: Some("life-graph".into()),
+                },
+                rel_type: exp.rel_type,
+            }),
+            hit,
+        });
+    }
+    folded
 }
 
 // ── Policy filtering ──────────────────────────────────────────────────────────
@@ -424,15 +569,47 @@ pub fn project_hit_to_evidence_packet(hit: &VectorHit, generated_at: &str) -> Ev
     }
 }
 
+/// Provenance of an expansion-discovered hit: the ranked parent it was
+/// reached from and the living-cycle relationship that connects them.
+#[derive(Debug, Clone)]
+pub struct ExpansionOrigin {
+    pub origin: GraphRecordRef,
+    pub rel_type: String,
+}
+
+/// A hit ready for context-packet projection: score, matched filters, and
+/// (for expansion-discovered hits) the origin provenance that turns
+/// `evidence_path` into a real multi-node path.
+#[derive(Debug, Clone)]
+pub struct ScoredHit {
+    pub hit: VectorHit,
+    pub score: f32,
+    pub matched_policy_filters: Vec<PolicyFilter>,
+    pub expansion_origin: Option<ExpansionOrigin>,
+}
+
+impl From<(VectorHit, f32, Vec<PolicyFilter>)> for ScoredHit {
+    fn from((hit, score, matched_policy_filters): (VectorHit, f32, Vec<PolicyFilter>)) -> Self {
+        Self {
+            hit,
+            score,
+            matched_policy_filters,
+            expansion_origin: None,
+        }
+    }
+}
+
 /// Assemble a `RetrievalContextPacket` from scored, filtered hits.
 ///
-/// `hits`: `(VectorHit, score, matched_policy_filters)` sorted descending by score.
+/// `hits`: [`ScoredHit`]s sorted descending by score.
 /// Drops from the tail when `token_budget` would be exceeded.
+/// Expansion-discovered hits get a two-node `evidence_path`
+/// (`origin -> hit`) and `expansion_origin` / `expansion_rel_type` metadata.
 pub fn project_context_packet(
     context_id: &str,
     query_id: &str,
     strategy: RetrievalStrategy,
-    hits: Vec<(VectorHit, f32, Vec<PolicyFilter>)>,
+    hits: Vec<ScoredHit>,
     omitted_conflict_ids: Vec<String>,
     token_budget: usize,
     generated_at: &str,
@@ -440,7 +617,13 @@ pub fn project_context_packet(
     let mut ranked_packets = Vec::new();
     let mut tokens_used = 0usize;
 
-    for (hit, score, matched) in hits {
+    for scored in hits {
+        let ScoredHit {
+            hit,
+            score,
+            matched_policy_filters: matched,
+            expansion_origin,
+        } = scored;
         let cost = token_estimate(&hit);
         if tokens_used + cost > token_budget && !ranked_packets.is_empty() {
             break;
@@ -450,12 +633,23 @@ pub fn project_context_packet(
             label: hit.label.clone(),
             datasource: Some("life-graph".into()),
         };
-        let packet = project_hit_to_evidence_packet(&hit, generated_at);
+        let mut packet = project_hit_to_evidence_packet(&hit, generated_at);
+        let evidence_path = match &expansion_origin {
+            Some(exp) => {
+                if let Some(meta) = packet.metadata.as_object_mut() {
+                    meta.insert("expansion_origin".into(), exp.origin.id.clone().into());
+                    meta.insert("expansion_rel_type".into(), exp.rel_type.clone().into());
+                    meta.insert("from_expansion".into(), true.into());
+                }
+                vec![exp.origin.clone(), claim_ref]
+            }
+            None => vec![claim_ref],
+        };
         ranked_packets.push(RankedEvidencePacket {
             packet,
             score,
             matched_policy_filters: matched,
-            evidence_path: vec![claim_ref],
+            evidence_path,
         });
         tokens_used += cost;
     }
@@ -780,11 +974,11 @@ mod tests {
         let hits = parse_vector_search_rows(&result);
         let weights = RankingWeights::default();
 
-        let scored: Vec<(VectorHit, f32, Vec<PolicyFilter>)> = hits
+        let scored: Vec<ScoredHit> = hits
             .into_iter()
             .map(|h| {
                 let s = ranking_score(&h, &weights, 0, false);
-                (h, s, vec![])
+                ScoredHit::from((h, s, vec![]))
             })
             .collect();
 
@@ -803,6 +997,196 @@ mod tests {
             "budget should cap candidates"
         );
         assert!(packet.token_budget == 100);
+    }
+
+    // ── Graph expansion (read side) ───────────────────────────────────────
+
+    fn expansion_row(origin_id: &str, rel_type: &str, bolt_id: i64, props: Value) -> Value {
+        json!({
+            "origin_id": origin_id,
+            "rel_type": rel_type,
+            "node": {
+                "kind": "node",
+                "id": bolt_id,
+                "labels": ["Goal"],
+                "properties": props
+            }
+        })
+    }
+
+    fn parent_hit(id: &str, score: f32) -> ScoredHit {
+        ScoredHit::from((
+            VectorHit {
+                bolt_id: 1,
+                label: "OpenLoop".to_string(),
+                properties: open_loop_props(id, "Parent loop", 0.8, "confirmed"),
+                similarity: 0.9,
+            },
+            score,
+            vec![],
+        ))
+    }
+
+    #[test]
+    fn expansion_cypher_matches_living_cycle_edges_in_one_round_trip() {
+        let rel_types = expansion_rel_types(&[]);
+        let cypher = expansion_cypher(&["l:ol:a", "l:ol:b'quote"], &rel_types, 32);
+
+        assert!(cypher.contains("MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO]-(related)"));
+        assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
+        assert!(cypher.contains("coalesce(related.validation_state, 'inferred') <> 'retired'"));
+        assert!(cypher.contains("RETURN n.id AS origin_id, type(r) AS rel_type, related AS node"));
+        assert!(cypher.contains("LIMIT 32"));
+    }
+
+    #[test]
+    fn expansion_rel_types_intersects_allowlist_with_living_cycle_vocabulary() {
+        assert_eq!(
+            expansion_rel_types(&[]),
+            vec!["OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO"]
+        );
+        assert_eq!(
+            expansion_rel_types(&["OWNS".into(), "BOGUS_TYPE".into()]),
+            vec!["OWNS"]
+        );
+        // A fully-unknown allowlist yields no rel types (expansion disabled),
+        // never an injection vector.
+        assert!(expansion_rel_types(&["DROP_ALL".into()]).is_empty());
+    }
+
+    #[test]
+    fn parse_expansion_rows_extracts_origin_and_rel_type() {
+        let result = json!({
+            "rows": [
+                expansion_row("l:ol:a", "RELATES_TO", 7,
+                    json!({ "id": "g:health", "title": "Health goal" })),
+                // Missing origin_id → skipped.
+                json!({ "rel_type": "OWNS", "node": { "id": 8, "labels": ["Goal"], "properties": {} } })
+            ]
+        });
+        let hits = parse_expansion_rows(&result);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].origin_id, "l:ol:a");
+        assert_eq!(hits[0].rel_type, "RELATES_TO");
+        assert_eq!(hits[0].hit.node_id(), "g:health");
+        assert!(parse_expansion_rows(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn fold_expansion_hits_applies_decay_scoring() {
+        let parents = vec![parent_hit("l:ol:a", 0.8)];
+        let expansion = parse_expansion_rows(&json!({
+            "rows": [expansion_row("l:ol:a", "RELATES_TO", 7,
+                json!({ "id": "g:health", "title": "Health goal",
+                         "confidence": 0.7, "validation_state": "proposed" }))]
+        }));
+
+        let folded = fold_expansion_hits(&parents, expansion, &[], EXPANSION_SCORE_DECAY, 32);
+
+        assert_eq!(folded.len(), 1);
+        assert!((folded[0].score - 0.8 * EXPANSION_SCORE_DECAY).abs() < 0.001);
+        let origin = folded[0].expansion_origin.as_ref().unwrap();
+        assert_eq!(origin.origin.id, "l:ol:a");
+        assert_eq!(origin.origin.label, "OpenLoop");
+        assert_eq!(origin.rel_type, "RELATES_TO");
+    }
+
+    #[test]
+    fn fold_expansion_hits_policy_filters_expanded_nodes() {
+        let parents = vec![parent_hit("l:ol:a", 0.8)];
+        let expansion = parse_expansion_rows(&json!({
+            "rows": [
+                expansion_row("l:ol:a", "OWNS", 7,
+                    json!({ "id": "g:retired", "title": "Retired goal",
+                             "confidence": 0.9, "validation_state": "retired" })),
+                expansion_row("l:ol:a", "OWNS", 8,
+                    json!({ "id": "g:weak", "title": "Weak goal",
+                             "confidence": 0.1, "validation_state": "inferred" })),
+                expansion_row("l:ol:a", "OWNS", 9,
+                    json!({ "id": "g:live", "title": "Live goal",
+                             "confidence": 0.8, "validation_state": "confirmed" })),
+            ]
+        }));
+
+        let folded = fold_expansion_hits(
+            &parents,
+            expansion,
+            &[PolicyFilter::ExcludeRetired, PolicyFilter::RequireEvidence],
+            EXPANSION_SCORE_DECAY,
+            32,
+        );
+
+        assert_eq!(folded.len(), 1, "retired + low-confidence hits must drop");
+        assert_eq!(folded[0].hit.node_id(), "g:live");
+    }
+
+    #[test]
+    fn fold_expansion_hits_dedupes_and_caps_at_max_nodes() {
+        let parents = vec![parent_hit("l:ol:a", 0.8), parent_hit("l:ol:b", 0.6)];
+        let expansion = parse_expansion_rows(&json!({
+            "rows": [
+                // Duplicate of a parent → skipped.
+                expansion_row("l:ol:a", "RELATES_TO", 5, json!({ "id": "l:ol:b" })),
+                // Unknown origin → skipped.
+                expansion_row("l:ol:missing", "OWNS", 6, json!({ "id": "g:orphan" })),
+                expansion_row("l:ol:a", "OWNS", 7, json!({ "id": "g:one" })),
+                // Same node reached twice → folded once.
+                expansion_row("l:ol:b", "SHAPES", 7, json!({ "id": "g:one" })),
+                expansion_row("l:ol:a", "SETS", 8, json!({ "id": "g:two" })),
+                expansion_row("l:ol:b", "SPAWNS", 9, json!({ "id": "g:three" })),
+            ]
+        }));
+
+        let folded = fold_expansion_hits(&parents, expansion, &[], EXPANSION_SCORE_DECAY, 2);
+
+        assert_eq!(folded.len(), 2, "max_nodes must cap folded expansion hits");
+        assert_eq!(folded[0].hit.node_id(), "g:one");
+        assert_eq!(folded[1].hit.node_id(), "g:two");
+    }
+
+    #[test]
+    fn project_context_packet_folds_expansion_into_multi_node_evidence_path() {
+        let parent = parent_hit("l:ol:a", 0.8);
+        let expansion = parse_expansion_rows(&json!({
+            "rows": [expansion_row("l:ol:a", "RELATES_TO", 7,
+                json!({ "id": "g:health", "title": "Health goal",
+                         "confidence": 0.7, "validation_state": "proposed" }))]
+        }));
+        let mut hits = vec![parent];
+        let folded = fold_expansion_hits(&hits, expansion, &[], EXPANSION_SCORE_DECAY, 32);
+        hits.extend(folded);
+
+        let packet = project_context_packet(
+            "ctx:test",
+            "q:test",
+            RetrievalStrategy::MemoryAwareGraphRank,
+            hits,
+            vec![],
+            10_000,
+            "2026-07-06T20:00:00Z",
+        );
+
+        assert_eq!(packet.ranked_packets.len(), 2);
+        // Parent keeps its single-node path and no expansion tags.
+        let parent_packet = &packet.ranked_packets[0];
+        assert_eq!(parent_packet.evidence_path.len(), 1);
+        assert!(
+            parent_packet
+                .packet
+                .metadata
+                .get("expansion_origin")
+                .is_none()
+        );
+        // Expansion hit carries the real multi-node path plus provenance tags.
+        let expanded = &packet.ranked_packets[1];
+        assert_eq!(expanded.evidence_path.len(), 2);
+        assert_eq!(expanded.evidence_path[0].id, "l:ol:a");
+        assert_eq!(expanded.evidence_path[0].label, "OpenLoop");
+        assert_eq!(expanded.evidence_path[1].id, "g:health");
+        assert_eq!(expanded.packet.metadata["expansion_origin"], "l:ol:a");
+        assert_eq!(expanded.packet.metadata["expansion_rel_type"], "RELATES_TO");
+        assert_eq!(expanded.packet.metadata["from_expansion"], true);
+        assert!(expanded.score < parent_packet.score);
     }
 
     #[test]
