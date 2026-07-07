@@ -3,12 +3,14 @@ use async_trait::async_trait;
 use data_memorygraphrag::LIFE_GRAPH_EMBEDDING_DIMS;
 use data_memorygraphrag::cypher;
 use data_memorygraphrag::projection;
+use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, GraphRecordRef,
     LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchProposalInput,
-    LifeResolveInput, MemoryGraphRagRunner, PatchKind, PatchRisk, PolicyFilter, ReliabilityBasis,
-    RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery, RunnerConfig,
-    RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef, SourceReliability, ValidationState,
+    LifeResolveInput, MemoryGraphRagRunner, PatchKind, PatchRisk, PolicyFilter, RankingWeights,
+    ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery,
+    RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef,
+    SourceReliability, ValidationState,
 };
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
 use neo4rs::{
@@ -16,6 +18,7 @@ use neo4rs::{
     Graph, Row, query,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use tracing::{info, warn};
 
 struct MemgraphConfig {
@@ -333,6 +336,14 @@ impl LifeGraphProvider {
         let query_val: RetrievalQuery = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.recall parameters as RetrievalQuery")?;
         let named_strategy = NamedRecallStrategy::from_task(task);
+        if !named_strategy.agrees_with(&query_val.strategy) {
+            warn!(
+                named_strategy = named_strategy.as_str(),
+                retrieval_strategy = ?query_val.strategy,
+                "life.recall: RetrievalQuery.strategy disagrees with named_strategy; \
+                 named_strategy drives dispatch"
+            );
+        }
         if !matches!(named_strategy, NamedRecallStrategy::CommitmentsApproaching) {
             self.runner
                 .plan(LifeGraphToolRequest::LifeRecall(query_val.clone()))
@@ -494,8 +505,17 @@ impl LifeGraphProvider {
         }
 
         let filters = &query_val.policy_filters;
-        let weights = &query_val.ranking_weights;
-        let mut scored = score_hits(all_hits, filters, weights, &now);
+        let weights = resolve_ranking_weights(&task.parameters, &query_val, named_strategy);
+        let active_role = query_val.active_role.as_deref();
+        let domain_edge_ids = self.domain_edge_node_ids(active_role, &all_hits).await;
+        let mut scored = score_hits(
+            all_hits,
+            filters,
+            &weights,
+            &now,
+            active_role,
+            &domain_edge_ids,
+        );
 
         let fallback_used = if scored.is_empty() {
             let fallback_labels = named_strategy.fallback_labels(&query_val);
@@ -506,7 +526,16 @@ impl LifeGraphProvider {
                 let cypher = raw_recall_fallback_cypher(&fallback_labels, limit);
                 let result = self.execute_cypher(&cypher).await?;
                 let fallback_hits = projection::parse_vector_search_rows(&result);
-                scored = score_hits(fallback_hits, filters, weights, &now);
+                let fallback_domain_ids =
+                    self.domain_edge_node_ids(active_role, &fallback_hits).await;
+                scored = score_hits(
+                    fallback_hits,
+                    filters,
+                    &weights,
+                    &now,
+                    active_role,
+                    &fallback_domain_ids,
+                );
                 !scored.is_empty()
             }
         } else {
@@ -794,6 +823,50 @@ impl LifeGraphProvider {
         Ok(())
     }
 
+    /// Node ids among `hits` tied to the caller's domain by a living-cycle
+    /// edge to the V005 domain Role node.
+    ///
+    /// Best-effort bias signal: any failure (unknown slug, Cypher error)
+    /// degrades to an empty set with a warning — ranking then falls back to
+    /// the property-only provenance check. Never filters anything.
+    async fn domain_edge_node_ids(
+        &self,
+        active_role: Option<&str>,
+        hits: &[projection::VectorHit],
+    ) -> HashSet<String> {
+        let Some(slug) = active_role else {
+            return HashSet::new();
+        };
+        let Some(role_node_id) = zoning::role_node_id_for_domain(slug) else {
+            warn!(
+                active_role = slug,
+                "life.recall: active_role is not a known V005 domain slug; \
+                 living-cycle role bonus skipped"
+            );
+            return HashSet::new();
+        };
+        let node_ids: Vec<&str> = hits
+            .iter()
+            .map(|hit| hit.node_id())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if node_ids.is_empty() {
+            return HashSet::new();
+        }
+        let cypher = domain_edge_nodes_cypher(role_node_id, &node_ids);
+        match self.execute_cypher(&cypher).await {
+            Ok(result) => parse_node_id_rows(&result),
+            Err(e) => {
+                warn!(
+                    active_role = slug,
+                    "life.recall: living-cycle domain edge lookup failed; \
+                     role bonus degrades to provenance-only: {e}"
+                );
+                HashSet::new()
+            }
+        }
+    }
+
     async fn extend_vector_hits(
         &self,
         all_hits: &mut Vec<projection::VectorHit>,
@@ -828,22 +901,91 @@ enum NamedRecallStrategy {
 }
 
 impl NamedRecallStrategy {
+    /// Strict enum validation of a wire strategy name. `None` for anything
+    /// outside the documented vocabulary.
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "semantic_pivot" => Some(Self::SemanticPivot),
+            "open_loops_by_context" => Some(Self::OpenLoopsByContext),
+            "goals_and_next_actions" => Some(Self::GoalsAndNextActions),
+            "commitments_approaching" => Some(Self::CommitmentsApproaching),
+            "re_entry_context" => Some(Self::ReEntryContext),
+            "cross_domain_entanglement" => Some(Self::CrossDomainEntanglement),
+            _ => None,
+        }
+    }
+
     fn from_task(task: &DatasourceTask) -> Self {
-        let raw = task
+        // Explicit strategy keys are validated strictly (wire compat: unknown
+        // values still degrade to semantic_pivot, but loudly instead of
+        // silently).
+        if let Some(raw) = task
             .parameters
             .get("named_strategy")
             .or_else(|| task.parameters.get("strategy_name"))
-            .or_else(|| task.parameters.get("operator_intent"))
             .and_then(Value::as_str)
-            .unwrap_or("");
+        {
+            return match Self::parse(raw) {
+                Some(strategy) => strategy,
+                None => {
+                    warn!(
+                        named_strategy = raw,
+                        "life.recall: unknown named_strategy; expected one of \
+                         semantic_pivot, open_loops_by_context, goals_and_next_actions, \
+                         commitments_approaching, re_entry_context, \
+                         cross_domain_entanglement; falling back to semantic_pivot"
+                    );
+                    Self::SemanticPivot
+                }
+            };
+        }
 
-        match raw {
-            "open_loops_by_context" => Self::OpenLoopsByContext,
-            "goals_and_next_actions" => Self::GoalsAndNextActions,
-            "commitments_approaching" => Self::CommitmentsApproaching,
-            "re_entry_context" => Self::ReEntryContext,
-            "cross_domain_entanglement" => Self::CrossDomainEntanglement,
-            _ => Self::SemanticPivot,
+        // operator_intent is a soft hint, not a strategy field — it may carry
+        // free text, so an unrecognized value is not warned about.
+        task.parameters
+            .get("operator_intent")
+            .and_then(Value::as_str)
+            .and_then(Self::parse)
+            .unwrap_or(Self::SemanticPivot)
+    }
+
+    /// Whether `RetrievalQuery.strategy` is consistent with this named
+    /// strategy. The named recipes are memory-aware graph-rank plans, so any
+    /// explicit non-default `strategy` alongside them is a caller
+    /// inconsistency worth a warning (dispatch still follows named_strategy).
+    fn agrees_with(self, strategy: &RetrievalStrategy) -> bool {
+        match self {
+            // SemanticPivot is both the explicit strategy and the fallback
+            // when no named_strategy is given — never warn for it.
+            Self::SemanticPivot => true,
+            _ => matches!(strategy, RetrievalStrategy::MemoryAwareGraphRank),
+        }
+    }
+
+    /// Server-side default ranking weight profile used when the caller omits
+    /// `ranking_weights`. Base weights sum to 1.0; `role_relevance` rides on
+    /// top as the soft-zoning bonus (score clamps at 1.0).
+    fn default_ranking_weights(self) -> RankingWeights {
+        match self {
+            // Re-entry cares about what happened *recently*.
+            Self::ReEntryContext => RankingWeights {
+                semantic_similarity: 0.35,
+                graph_specificity: 0.15,
+                recency: 0.30,
+                confirmation: 0.15,
+                active_commitment: 0.05,
+                ..RankingWeights::default()
+            },
+            // Open loops care about what is still *actively committed*.
+            Self::OpenLoopsByContext => RankingWeights {
+                semantic_similarity: 0.35,
+                graph_specificity: 0.15,
+                recency: 0.10,
+                confirmation: 0.10,
+                active_commitment: 0.30,
+                ..RankingWeights::default()
+            },
+            _ => RankingWeights::default(),
         }
     }
 
@@ -883,21 +1025,93 @@ impl NamedRecallStrategy {
     }
 }
 
+/// Ranking weights for a recall request: the caller's explicit
+/// `ranking_weights` win; when omitted, the named strategy's server-side
+/// default profile applies.
+fn resolve_ranking_weights(
+    parameters: &Value,
+    query: &RetrievalQuery,
+    named_strategy: NamedRecallStrategy,
+) -> RankingWeights {
+    let caller_supplied = parameters
+        .get("ranking_weights")
+        .is_some_and(|value| !value.is_null());
+    if caller_supplied {
+        query.ranking_weights.clone()
+    } else {
+        named_strategy.default_ranking_weights()
+    }
+}
+
+/// Score policy-filtered hits, applying the soft-zoning role bonus.
+///
+/// A hit earns the `role_relevance` bonus when the caller has an
+/// `active_role` domain and the hit either has a living-cycle edge to that
+/// domain's Role node (`domain_edge_ids`, provider-fetched) or its
+/// provenance/zoning properties tie it to the domain. The bonus never
+/// filters: unmatched hits keep their full base score.
 fn score_hits(
     hits: Vec<projection::VectorHit>,
     filters: &[PolicyFilter],
-    weights: &data_memorygraphrag::RankingWeights,
+    weights: &RankingWeights,
     now: &chrono::DateTime<chrono::Utc>,
+    active_role: Option<&str>,
+    domain_edge_ids: &HashSet<String>,
 ) -> Vec<(projection::VectorHit, f32, Vec<PolicyFilter>)> {
     let (surviving, _drop_log) = projection::apply_policy_filters(hits, filters);
     surviving
         .into_iter()
         .map(|hit| {
             let age_secs = compute_age_secs(hit.prop_str("observed_at"), now);
-            let score = projection::ranking_score(&hit, weights, age_secs);
+            let role_matched = active_role.is_some_and(|slug| {
+                domain_edge_ids.contains(hit.node_id())
+                    || projection::hit_matches_domain(&hit, slug)
+            });
+            let score = projection::ranking_score(&hit, weights, age_secs, role_matched);
             (hit, score, Vec::new())
         })
         .collect()
+}
+
+fn escape_cypher_single_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Cypher for the living-cycle domain membership check: which of `node_ids`
+/// have a living-cycle edge (either direction) to the domain's Role node.
+fn domain_edge_nodes_cypher(role_node_id: &str, node_ids: &[&str]) -> String {
+    let ids = node_ids
+        .iter()
+        .map(|id| format!("'{}'", escape_cypher_single_quoted(id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rel_types = cypher::LIVING_CYCLE_REL_TYPES
+        .iter()
+        .map(|rel| format!("'{rel}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "MATCH (n)-[r]-(role:Role {{id: '{role_id}'}}) \
+         WHERE type(r) IN [{rel_types}] AND n.id IN [{ids}] \
+         RETURN DISTINCT n.id AS node_id",
+        role_id = escape_cypher_single_quoted(role_node_id),
+        rel_types = rel_types,
+        ids = ids,
+    )
+}
+
+/// Parse `RETURN ... AS node_id` rows into a set of node ids.
+fn parse_node_id_rows(result: &Value) -> HashSet<String> {
+    result
+        .get("rows")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("node_id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn raw_recall_fallback_cypher(labels: &[&str], limit: usize) -> String {
@@ -1102,6 +1316,221 @@ mod tests {
             NamedRecallStrategy::from_task(&task),
             NamedRecallStrategy::SemanticPivot
         );
+    }
+
+    #[test]
+    fn named_strategy_parse_validates_against_real_enum() {
+        assert_eq!(
+            NamedRecallStrategy::parse("open_loops_by_context"),
+            Some(NamedRecallStrategy::OpenLoopsByContext)
+        );
+        assert_eq!(
+            NamedRecallStrategy::parse("semantic_pivot"),
+            Some(NamedRecallStrategy::SemanticPivot)
+        );
+        assert_eq!(NamedRecallStrategy::parse("surprise_me"), None);
+        assert_eq!(NamedRecallStrategy::parse(""), None);
+    }
+
+    #[test]
+    fn free_text_operator_intent_does_not_dispatch_a_named_strategy() {
+        // operator_intent is a soft hint: free text falls through quietly.
+        let task = task_with_params(json!({ "operator_intent": "attention planning" }));
+        assert_eq!(
+            NamedRecallStrategy::from_task(&task),
+            NamedRecallStrategy::SemanticPivot
+        );
+    }
+
+    #[test]
+    fn named_strategy_agreement_with_retrieval_strategy() {
+        // The named recipes are memory-aware graph-rank plans.
+        assert!(
+            NamedRecallStrategy::OpenLoopsByContext
+                .agrees_with(&RetrievalStrategy::MemoryAwareGraphRank)
+        );
+        assert!(
+            !NamedRecallStrategy::OpenLoopsByContext.agrees_with(&RetrievalStrategy::SemanticPivot)
+        );
+        assert!(
+            !NamedRecallStrategy::ReEntryContext.agrees_with(&RetrievalStrategy::VectorThenExpand)
+        );
+        // SemanticPivot is also the no-named-strategy fallback: never warns.
+        assert!(NamedRecallStrategy::SemanticPivot.agrees_with(&RetrievalStrategy::SemanticPivot));
+        assert!(
+            NamedRecallStrategy::SemanticPivot
+                .agrees_with(&RetrievalStrategy::MemoryAwareGraphRank)
+        );
+    }
+
+    #[test]
+    fn re_entry_context_default_weights_favor_recency() {
+        let weights = NamedRecallStrategy::ReEntryContext.default_ranking_weights();
+        let base = RankingWeights::default();
+        assert!(weights.recency > base.recency);
+        assert!(weights.recency > weights.active_commitment);
+        let sum = weights.semantic_similarity
+            + weights.graph_specificity
+            + weights.recency
+            + weights.confirmation
+            + weights.active_commitment;
+        assert!((sum - 1.0).abs() < 0.001, "base weights should sum to 1.0");
+        assert!((weights.role_relevance - base.role_relevance).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn open_loops_default_weights_favor_active_commitment() {
+        let weights = NamedRecallStrategy::OpenLoopsByContext.default_ranking_weights();
+        let base = RankingWeights::default();
+        assert!(weights.active_commitment > base.active_commitment);
+        assert!(weights.active_commitment > weights.recency);
+        let sum = weights.semantic_similarity
+            + weights.graph_specificity
+            + weights.recency
+            + weights.confirmation
+            + weights.active_commitment;
+        assert!((sum - 1.0).abs() < 0.001, "base weights should sum to 1.0");
+        // Other strategies keep the contract default.
+        assert_eq!(
+            NamedRecallStrategy::SemanticPivot.default_ranking_weights(),
+            RankingWeights::default()
+        );
+        assert_eq!(
+            NamedRecallStrategy::GoalsAndNextActions.default_ranking_weights(),
+            RankingWeights::default()
+        );
+    }
+
+    #[test]
+    fn resolve_ranking_weights_prefers_caller_supplied_weights() {
+        let params = json!({
+            "named_strategy": "re_entry_context",
+            "ranking_weights": {
+                "semantic_similarity": 0.9,
+                "graph_specificity": 0.025,
+                "recency": 0.025,
+                "confirmation": 0.025,
+                "active_commitment": 0.025
+            }
+        });
+        let query: RetrievalQuery = serde_json::from_value(json!({
+            "query_id": "q:explicit",
+            "query_text": "explicit weights",
+            "ranking_weights": params["ranking_weights"].clone()
+        }))
+        .unwrap();
+        let weights = resolve_ranking_weights(&params, &query, NamedRecallStrategy::ReEntryContext);
+        assert!((weights.semantic_similarity - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn resolve_ranking_weights_uses_strategy_defaults_when_omitted() {
+        // The auto-recall lane omits ranking_weights entirely.
+        let params = json!({
+            "query_id": "q:auto",
+            "query_text": "auto recall",
+            "named_strategy": "re_entry_context",
+            "active_role": "chief_of_staff"
+        });
+        let query: RetrievalQuery = serde_json::from_value(params.clone()).unwrap();
+        let weights = resolve_ranking_weights(&params, &query, NamedRecallStrategy::ReEntryContext);
+        assert_eq!(
+            weights,
+            NamedRecallStrategy::ReEntryContext.default_ranking_weights()
+        );
+        assert_ne!(weights, RankingWeights::default());
+    }
+
+    fn domain_hit(id: &str, observed_by: &str) -> projection::VectorHit {
+        projection::VectorHit {
+            bolt_id: 1,
+            label: "OpenLoop".to_string(),
+            properties: json!({
+                "id": id,
+                "title": "loop",
+                "confidence": 0.7,
+                "validation_state": "proposed",
+                "status": "open",
+                "observed_by": observed_by,
+                "observed_at": "2026-07-01T10:00:00Z"
+            }),
+            similarity: 0.8,
+        }
+    }
+
+    #[test]
+    fn score_hits_applies_role_bonus_without_filtering_cross_domain_hits() {
+        let now = chrono::Utc::now();
+        let weights = RankingWeights::default();
+        let hits = vec![
+            domain_hit("l:ol:mine", "agent-beacon"),
+            domain_hit("l:ol:other", "agent-astrid"),
+            domain_hit("l:ol:edge-only", "agent:unknown"),
+        ];
+        let mut edge_ids = HashSet::new();
+        edge_ids.insert("l:ol:edge-only".to_string());
+
+        let scored = score_hits(hits, &[], &weights, &now, Some("chief_of_staff"), &edge_ids);
+
+        // Soft boundaries: every hit survives, none are filtered.
+        assert_eq!(scored.len(), 3, "role bias must never filter hits");
+
+        let score_of = |id: &str| {
+            scored
+                .iter()
+                .find(|(hit, _, _)| hit.node_id() == id)
+                .map(|(_, score, _)| *score)
+                .unwrap()
+        };
+        // Provenance match and living-cycle edge match both earn the bonus;
+        // the cross-domain hit keeps its (lower) base score.
+        assert!(score_of("l:ol:mine") > score_of("l:ol:other"));
+        assert!(score_of("l:ol:edge-only") > score_of("l:ol:other"));
+        assert!(
+            (score_of("l:ol:mine") - score_of("l:ol:other") - weights.role_relevance).abs() < 0.001
+        );
+    }
+
+    #[test]
+    fn score_hits_without_active_role_applies_no_bonus() {
+        let now = chrono::Utc::now();
+        let weights = RankingWeights::default();
+        let hits = vec![
+            domain_hit("l:ol:mine", "agent-beacon"),
+            domain_hit("l:ol:other", "agent-astrid"),
+        ];
+        let scored = score_hits(hits, &[], &weights, &now, None, &HashSet::new());
+        assert_eq!(scored.len(), 2);
+        assert!(
+            (scored[0].1 - scored[1].1).abs() < f32::EPSILON,
+            "without an active_role the domain bias must be a no-op"
+        );
+    }
+
+    #[test]
+    fn domain_edge_nodes_cypher_matches_living_cycle_edges_only() {
+        let cypher =
+            domain_edge_nodes_cypher("life:role:chief-of-staff", &["l:ol:a", "l:ol:b'quote"]);
+        assert!(cypher.contains("(role:Role {id: 'life:role:chief-of-staff'})"));
+        assert!(cypher.contains("type(r) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO']"));
+        assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
+        assert!(cypher.contains("RETURN DISTINCT n.id AS node_id"));
+    }
+
+    #[test]
+    fn parse_node_id_rows_collects_ids() {
+        let result = json!({
+            "rows": [
+                { "node_id": "l:ol:a" },
+                { "node_id": "l:ol:b" },
+                { "unrelated": true }
+            ]
+        });
+        let ids = parse_node_id_rows(&result);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("l:ol:a"));
+        assert!(ids.contains("l:ol:b"));
+        assert!(parse_node_id_rows(&json!({})).is_empty());
     }
 
     fn feedback_input(rating: RetrievalFeedbackRating) -> RetrievalFeedbackInput {

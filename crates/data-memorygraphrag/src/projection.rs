@@ -289,11 +289,43 @@ pub fn apply_policy_filters(
 /// Hub labels that appear in many contexts — penalised in graph specificity.
 const HUB_LABELS: &[&str] = &["Person", "Event", "Project"];
 
+/// Cheap, property-only check: does this hit belong to the given V005 domain?
+///
+/// True when either:
+///   - the node's `observed_by` provenance maps to the domain's steward agent
+///     (segment-matched, e.g. `agent-beacon` → `chief_of_staff`), or
+///   - the node itself carries the domain's `domain_slug` property (the V005
+///     Role nodes do).
+///
+/// The living-cycle edge check (edge to the domain's Role node) requires a
+/// graph round-trip and is layered on by the provider — see
+/// `LifeGraphProvider::domain_edge_node_ids`. This is a *bias signal*, never
+/// a filter: soft boundaries.
+pub fn hit_matches_domain(hit: &VectorHit, domain_slug: &str) -> bool {
+    if hit.prop_str("domain_slug") == Some(domain_slug) {
+        return true;
+    }
+    hit.prop_str("observed_by")
+        .and_then(crate::zoning::domain_slug_for_agent)
+        == Some(domain_slug)
+}
+
 /// Composite ranking score. Returns a value in `[0.0, 1.0]`.
 ///
 /// `age_secs`: seconds elapsed since `observed_at`, pre-computed by the caller
 /// to keep this crate dependency-free (no chrono, no time parsing).
-pub fn ranking_score(hit: &VectorHit, weights: &RankingWeights, age_secs: u64) -> f32 {
+///
+/// `role_matched`: whether the hit is tied to the caller's `active_role`
+/// domain (living-cycle edge to the domain Role node, or provenance/zoning
+/// property match — see [`hit_matches_domain`]). When true the
+/// `role_relevance` weight is added as a soft bonus; when the caller has no
+/// active role, pass `false` and ranking is exactly the role-agnostic base.
+pub fn ranking_score(
+    hit: &VectorHit,
+    weights: &RankingWeights,
+    age_secs: u64,
+    role_matched: bool,
+) -> f32 {
     let sim = hit.similarity.clamp(0.0, 1.0);
 
     // Exponential decay: ~14-day half-life.
@@ -321,11 +353,15 @@ pub fn ranking_score(hit: &VectorHit, weights: &RankingWeights, age_secs: u64) -
         1.0_f32
     };
 
+    // Soft-zoning bonus: earned only by domain-tied hits, never subtracted.
+    let role_relevance = if role_matched { 1.0_f32 } else { 0.0_f32 };
+
     (weights.semantic_similarity * sim
         + weights.recency * recency
         + weights.confirmation * confirmation
         + weights.active_commitment * active_commitment
-        + weights.graph_specificity * specificity)
+        + weights.graph_specificity * specificity
+        + weights.role_relevance * role_relevance)
         .clamp(0.0, 1.0)
 }
 
@@ -618,9 +654,9 @@ mod tests {
         let weights = RankingWeights::default();
 
         // age = 0: full recency score
-        let score_fresh = ranking_score(&hit, &weights, 0);
+        let score_fresh = ranking_score(&hit, &weights, 0, false);
         // age = 60 days in seconds
-        let score_stale = ranking_score(&hit, &weights, 60 * 86_400);
+        let score_stale = ranking_score(&hit, &weights, 60 * 86_400, false);
 
         assert!(score_fresh > score_stale, "fresh hit should rank higher");
         assert!(score_fresh > 0.5, "fresh confirmed hit should score well");
@@ -642,10 +678,81 @@ mod tests {
         };
 
         let weights = RankingWeights::default();
-        let specific = ranking_score(&make_hit("OpenLoop", 0.8), &weights, 0);
-        let hub = ranking_score(&make_hit("Person", 0.8), &weights, 0);
+        let specific = ranking_score(&make_hit("OpenLoop", 0.8), &weights, 0, false);
+        let hub = ranking_score(&make_hit("Person", 0.8), &weights, 0, false);
 
         assert!(specific > hub, "specific label should rank higher than hub");
+    }
+
+    #[test]
+    fn ranking_score_applies_role_relevance_bonus_when_matched() {
+        let result = json!({
+            "rows": [
+                bolt_node_row(1, "OpenLoop",
+                    open_loop_props("l:ol:domain", "Domain-tied loop", 0.5, "proposed"),
+                    0.6)
+            ]
+        });
+        let hit = parse_vector_search_rows(&result).pop().unwrap();
+        let weights = RankingWeights::default();
+
+        let unmatched = ranking_score(&hit, &weights, 60 * 86_400, false);
+        let matched = ranking_score(&hit, &weights, 60 * 86_400, true);
+
+        assert!(
+            matched > unmatched,
+            "role-matched hit must rank above the identical unmatched hit"
+        );
+        assert!(
+            (matched - unmatched - weights.role_relevance).abs() < 0.001,
+            "bonus delta should equal the role_relevance weight (unclamped range)"
+        );
+
+        // Zero weight disables the bonus entirely.
+        let weights_off = RankingWeights {
+            role_relevance: 0.0,
+            ..RankingWeights::default()
+        };
+        assert!(
+            (ranking_score(&hit, &weights_off, 0, true)
+                - ranking_score(&hit, &weights_off, 0, false))
+            .abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn hit_matches_domain_via_observed_by_provenance() {
+        let make_hit = |props: Value| VectorHit {
+            bolt_id: 1,
+            label: "OpenLoop".to_string(),
+            properties: props,
+            similarity: 0.8,
+        };
+
+        // observed_by steward maps to the domain.
+        let beacon_hit = make_hit(json!({ "id": "l:ol:x", "observed_by": "agent-beacon" }));
+        assert!(hit_matches_domain(&beacon_hit, "chief_of_staff"));
+        assert!(!hit_matches_domain(&beacon_hit, "librarian"));
+
+        // Segment matching: ariel is communications, not architect (aria).
+        let ariel_hit = make_hit(json!({ "id": "l:ol:y", "observed_by": "agent-ariel-01" }));
+        assert!(hit_matches_domain(&ariel_hit, "communications"));
+        assert!(!hit_matches_domain(&ariel_hit, "architect"));
+
+        // V005 Role nodes carry domain_slug directly.
+        let role_hit = VectorHit {
+            bolt_id: 2,
+            label: "Role".to_string(),
+            properties: json!({ "id": "life:role:chief-of-staff",
+                                 "domain_slug": "chief_of_staff" }),
+            similarity: 0.8,
+        };
+        assert!(hit_matches_domain(&role_hit, "chief_of_staff"));
+
+        // No provenance at all: no match, but (soft boundary) never an error.
+        let bare_hit = make_hit(json!({ "id": "l:ol:z" }));
+        assert!(!hit_matches_domain(&bare_hit, "chief_of_staff"));
     }
 
     #[test]
@@ -676,7 +783,7 @@ mod tests {
         let scored: Vec<(VectorHit, f32, Vec<PolicyFilter>)> = hits
             .into_iter()
             .map(|h| {
-                let s = ranking_score(&h, &weights, 0);
+                let s = ranking_score(&h, &weights, 0, false);
                 (h, s, vec![])
             })
             .collect();

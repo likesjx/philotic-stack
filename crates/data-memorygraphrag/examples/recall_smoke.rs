@@ -102,7 +102,16 @@ async fn main() -> anyhow::Result<()> {
                     elapsed.num_seconds().max(0) as u64
                 })
                 .unwrap_or(0);
-            let score = projection::ranking_score(&hit, &recall_query.ranking_weights, age_secs);
+            let role_matched = recall_query
+                .active_role
+                .as_deref()
+                .is_some_and(|slug| projection::hit_matches_domain(&hit, slug));
+            let score = projection::ranking_score(
+                &hit,
+                &recall_query.ranking_weights,
+                age_secs,
+                role_matched,
+            );
             (hit, score, vec![])
         })
         .collect();
