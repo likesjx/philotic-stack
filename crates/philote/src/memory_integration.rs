@@ -698,6 +698,7 @@ pub(super) fn direct_life_observe_input(
     turn_id: &str,
     chat_id: &str,
     agent_id: &str,
+    observed_role: Option<&str>,
 ) -> Value {
     let now_iso = chrono::Utc::now().to_rfc3339();
     let suffix = Uuid::new_v4().simple().to_string();
@@ -707,6 +708,10 @@ pub(super) fn direct_life_observe_input(
     let observation_id = format!("obs:{suffix}");
 
     serde_json::json!({
+        // Per-agent provenance: observed_by is the canonical agent identity;
+        // source_membrane (in source_refs) stays the transport it came from.
+        "observed_by": agent_id,
+        "observed_role": observed_role,
         "observation_id": observation_id,
         "evidence": {
             "packet_id": packet_id,
@@ -1286,8 +1291,26 @@ impl AgentRuntime {
                 .await;
         };
 
-        let arguments =
-            direct_life_observe_input(&command, &session_id, &turn_id, &chat_id, &self.agent_id);
+        // Per-agent provenance: prefer the session's active role, then this
+        // runtime's role-incarnation name (if any).
+        let observed_role = self
+            .sessions
+            .get(&session_id)
+            .and_then(|state| {
+                state
+                    .role_activation
+                    .as_ref()
+                    .map(|activation| activation.role_name.clone())
+            })
+            .or_else(|| self.role_name.clone());
+        let arguments = direct_life_observe_input(
+            &command,
+            &session_id,
+            &turn_id,
+            &chat_id,
+            &self.agent_id,
+            observed_role.as_deref(),
+        );
         let payload = ToolExecutionPayload {
             action: "execute_tool",
             session_id: session_id.clone(),
@@ -1913,6 +1936,7 @@ mod tests {
             "turn-1",
             "123",
             "agent-beacon",
+            Some("chief_of_staff"),
         );
 
         assert_eq!(value["evidence"]["claim_ref"]["label"], "OpenLoop");
@@ -1929,6 +1953,66 @@ mod tests {
             value["evidence"]["metadata"]["route"],
             "philote_direct_life_observe"
         );
+    }
+
+    #[test]
+    fn direct_life_observe_input_carries_agent_provenance_not_membrane() {
+        let command = super::DirectLifeObserveCommand {
+            label: "OpenLoop".into(),
+            claim_summary: "Schedule rowing habit on weekly Saturdays".into(),
+            source_id: "membrane:telegram".into(),
+            confidence: 0.8,
+        };
+
+        let value = super::direct_life_observe_input(
+            &command,
+            "telegram:123:agent-beacon",
+            "turn-1",
+            "123",
+            "agent-beacon",
+            Some("chief_of_staff"),
+        );
+
+        // observed_by is the canonical agent identity, distinct from the
+        // membrane transport recorded in source_refs.
+        assert_eq!(value["observed_by"], "agent-beacon");
+        assert_eq!(value["observed_role"], "chief_of_staff");
+        assert_eq!(
+            value["evidence"]["source_refs"][0]["source_id"],
+            "membrane:telegram"
+        );
+
+        // Roundtrips through the runner contract with provenance intact.
+        let parsed: data_memorygraphrag::LifeObserveInput =
+            serde_json::from_value(value).expect("direct input should satisfy the contract");
+        assert_eq!(parsed.observed_by.as_deref(), Some("agent-beacon"));
+        assert_eq!(parsed.observed_role.as_deref(), Some("chief_of_staff"));
+        assert!(parsed.edges.is_empty());
+    }
+
+    #[test]
+    fn direct_life_observe_input_without_role_omits_observed_role() {
+        let command = super::DirectLifeObserveCommand {
+            label: "Signal".into(),
+            claim_summary: "A plain observation".into(),
+            source_id: "membrane:telegram".into(),
+            confidence: 0.7,
+        };
+
+        let value = super::direct_life_observe_input(
+            &command,
+            "telegram:123:agent-astrid",
+            "turn-1",
+            "123",
+            "agent-astrid",
+            None,
+        );
+
+        assert_eq!(value["observed_by"], "agent-astrid");
+        let parsed: data_memorygraphrag::LifeObserveInput =
+            serde_json::from_value(value).expect("direct input should satisfy the contract");
+        assert_eq!(parsed.observed_by.as_deref(), Some("agent-astrid"));
+        assert_eq!(parsed.observed_role, None);
     }
 
     #[test]

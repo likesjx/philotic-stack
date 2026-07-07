@@ -77,6 +77,9 @@ fn record_observation_input(signal: &AttentionStewardSignal, _now_iso: &str) -> 
             }),
         },
         proposed_graph_refs: vec![],
+        observed_by: None,
+        observed_role: None,
+        edges: vec![],
     }
 }
 
@@ -130,6 +133,9 @@ fn propose_sil_input(
             }),
         },
         proposed_graph_refs: vec![],
+        observed_by: None,
+        observed_role: None,
+        edges: vec![],
     }
 }
 

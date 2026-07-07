@@ -37,6 +37,18 @@ const KNOWN_LABELS: &[&str] = &[
     "StewardshipInstruction",
 ];
 
+/// Living-cycle relationship types allowed on `life.observe` edge writes.
+/// The soft-zoning design routes all agent domains through this small,
+/// closed vocabulary; anything else is rejected before the node write.
+pub const LIVING_CYCLE_REL_TYPES: &[&str] = &["OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO"];
+
+pub fn is_living_cycle_rel_type(rel_type: &str) -> bool {
+    LIVING_CYCLE_REL_TYPES.contains(&rel_type)
+}
+
+/// Fallback written to `observed_by` when the caller predates per-agent provenance.
+pub const OBSERVED_BY_UNKNOWN: &str = "agent:unknown";
+
 /// Validated, compiled `life.observe` Cypher ready for execution.
 #[derive(Debug)]
 pub struct ObserveCypher {
@@ -46,12 +58,24 @@ pub struct ObserveCypher {
     pub confidence: f64,
     pub source_membrane: String,
     pub provenance: String,
+    pub observed_by: String,
+    pub observed_role: Option<String>,
     pub validation_state: String,
     pub observed_at: String,
     pub created_at: String,
     pub claim_summary: String,
     pub observation_id: String,
     pub packet_id: String,
+}
+
+/// One compiled living-cycle edge MERGE for a `life.observe` request.
+/// The MATCH on the target means a missing target creates nothing; the
+/// provider reports the miss in the response envelope instead of failing.
+#[derive(Debug)]
+pub struct ObserveEdgeCypher {
+    pub query: String,
+    pub rel_type: String,
+    pub target_id: String,
 }
 
 #[derive(Debug)]
@@ -142,6 +166,16 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         .clone()
         .unwrap_or_else(|| now_iso.to_string());
 
+    let observed_by = input
+        .observed_by
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| OBSERVED_BY_UNKNOWN.to_string());
+    let observed_role = input
+        .observed_role
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+
     // Label is whitelisted above — safe to interpolate. All string values are
     // escaped via escape_cypher_str before embedding in the query.
     let query = format!(
@@ -157,11 +191,15 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
             "n.last_confirmed_at = null, ",
             "n.claim_summary = $claim_summary, ",
             "n.observation_id = $observation_id, ",
-            "n.packet_id = $packet_id ",
+            "n.packet_id = $packet_id, ",
+            "n.observed_by = $observed_by, ",
+            "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END ",
             "ON MATCH SET ",
             "n.confidence = $confidence, ",
             "n.observation_id = $observation_id, ",
-            "n.packet_id = $packet_id ",
+            "n.packet_id = $packet_id, ",
+            "n.observed_by = $observed_by, ",
+            "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END ",
             "RETURN n.id AS id, n.validation_state AS validation_state",
         ),
         label = label
@@ -174,6 +212,8 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         confidence: input.evidence.confidence as f64,
         source_membrane,
         provenance,
+        observed_by,
+        observed_role,
         validation_state: validation_state.to_string(),
         observed_at,
         created_at: now_iso.to_string(),
@@ -181,6 +221,58 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         observation_id: input.observation_id.clone(),
         packet_id: input.evidence.packet_id.clone(),
     })
+}
+
+/// Compile the optional living-cycle edges of a `life.observe` request.
+///
+/// Unknown rel_types are a hard error (callers should reject before the node
+/// write). Compiled queries `MATCH` the target by id, so a missing target
+/// simply produces no row — the provider reports it as `target_missing`
+/// without failing the node write.
+pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdgeCypher>, String> {
+    let label = &input.evidence.claim_ref.label;
+    if !is_known_label(label) {
+        return Err(format!("unknown Life Graph label: {label}"));
+    }
+
+    let mut compiled = Vec::with_capacity(input.edges.len());
+    for edge in &input.edges {
+        if !is_living_cycle_rel_type(&edge.rel_type) {
+            return Err(format!(
+                "unknown living-cycle rel_type: {} (expected one of {})",
+                edge.rel_type,
+                LIVING_CYCLE_REL_TYPES.join(", ")
+            ));
+        }
+        if edge.target_id.trim().is_empty() {
+            return Err("edge target_id must not be empty".to_string());
+        }
+
+        // Label and rel_type are both whitelisted above — safe to interpolate.
+        // All values travel as bound parameters.
+        let query = format!(
+            concat!(
+                "MATCH (n:{label} {{id: $id}}) ",
+                "MATCH (t {{id: $target_id}}) ",
+                "MERGE (n)-[r:{rel_type}]->(t) ",
+                "ON CREATE SET ",
+                "r.created_at = $created_at, ",
+                "r.observation_id = $observation_id, ",
+                "r.observed_by = $observed_by ",
+                "RETURN t.id AS target_id",
+            ),
+            label = label,
+            rel_type = edge.rel_type
+        );
+
+        compiled.push(ObserveEdgeCypher {
+            query,
+            rel_type: edge.rel_type.clone(),
+            target_id: edge.target_id.clone(),
+        });
+    }
+
+    Ok(compiled)
 }
 
 pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCypher, String> {
@@ -462,6 +554,9 @@ mod tests {
                 metadata: serde_json::Value::Null,
             },
             proposed_graph_refs: vec![],
+            observed_by: None,
+            observed_role: None,
+            edges: vec![],
         }
     }
 
@@ -491,6 +586,104 @@ mod tests {
         input.evidence.claim_ref.label = "Gadget".to_string();
         let err = compile_observe(&input, "2026-06-04T12:00:00Z").unwrap_err();
         assert!(err.contains("Gadget"));
+    }
+
+    #[test]
+    fn compile_observe_defaults_observed_by_for_legacy_callers() {
+        let input = minimal_observe_input("Signal");
+        let compiled = compile_observe(&input, "2026-06-04T12:00:00Z").unwrap();
+
+        assert_eq!(compiled.observed_by, OBSERVED_BY_UNKNOWN);
+        assert_eq!(compiled.observed_role, None);
+        assert!(compiled.query.contains("n.observed_by = $observed_by"));
+        assert!(compiled.query.contains("n.observed_role = CASE"));
+    }
+
+    #[test]
+    fn compile_observe_carries_agent_provenance_distinct_from_membrane() {
+        let mut input = minimal_observe_input("OpenLoop");
+        input.evidence.claim_ref.id = "life:open-loop:prov".to_string();
+        input.observed_by = Some("agent-astrid-01".to_string());
+        input.observed_role = Some("librarian".to_string());
+        let compiled = compile_observe(&input, "2026-06-04T12:00:00Z").unwrap();
+
+        assert_eq!(compiled.observed_by, "agent-astrid-01");
+        assert_eq!(compiled.observed_role.as_deref(), Some("librarian"));
+        // Transport stays what it truly was.
+        assert_eq!(compiled.source_membrane, "membrane:telegram");
+    }
+
+    #[test]
+    fn compile_observe_blank_observed_by_falls_back_to_unknown() {
+        let mut input = minimal_observe_input("Signal");
+        input.observed_by = Some("   ".to_string());
+        input.observed_role = Some(String::new());
+        let compiled = compile_observe(&input, "2026-06-04T12:00:00Z").unwrap();
+
+        assert_eq!(compiled.observed_by, OBSERVED_BY_UNKNOWN);
+        assert_eq!(compiled.observed_role, None);
+    }
+
+    #[test]
+    fn compile_observe_edges_merges_living_cycle_rel_types() {
+        let mut input = minimal_observe_input("Goal");
+        input.evidence.claim_ref.id = "life:goal:row-weekly".to_string();
+        input.observed_by = Some("agent-beacon-01".to_string());
+        input.edges = vec![
+            crate::ObserveEdge {
+                rel_type: "OWNS".into(),
+                target_id: "life:role:chief-of-staff".into(),
+            },
+            crate::ObserveEdge {
+                rel_type: "RELATES_TO".into(),
+                target_id: "life:role:musician".into(),
+            },
+        ];
+
+        let compiled = compile_observe_edges(&input).unwrap();
+        assert_eq!(compiled.len(), 2);
+        assert_eq!(compiled[0].rel_type, "OWNS");
+        assert_eq!(compiled[0].target_id, "life:role:chief-of-staff");
+        assert!(compiled[0].query.contains("MATCH (n:Goal {id: $id})"));
+        assert!(compiled[0].query.contains("MATCH (t {id: $target_id})"));
+        assert!(compiled[0].query.contains("MERGE (n)-[r:OWNS]->(t)"));
+        assert!(compiled[0].query.contains("r.observed_by = $observed_by"));
+        assert!(compiled[1].query.contains("MERGE (n)-[r:RELATES_TO]->(t)"));
+    }
+
+    #[test]
+    fn compile_observe_edges_rejects_unknown_rel_type() {
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "DESTROYS".into(),
+            target_id: "life:role:musician".into(),
+        }];
+
+        let err = compile_observe_edges(&input).unwrap_err();
+        assert!(err.contains("DESTROYS"));
+        assert!(err.contains("OWNS"));
+    }
+
+    #[test]
+    fn compile_observe_edges_rejects_empty_target() {
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "SETS".into(),
+            target_id: "  ".into(),
+        }];
+
+        let err = compile_observe_edges(&input).unwrap_err();
+        assert!(err.contains("target_id"));
+    }
+
+    #[test]
+    fn living_cycle_rel_type_set_is_the_approved_vocabulary() {
+        assert_eq!(
+            LIVING_CYCLE_REL_TYPES,
+            &["OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO"]
+        );
+        assert!(is_living_cycle_rel_type("SHAPES"));
+        assert!(!is_living_cycle_rel_type("owns"));
     }
 
     #[test]
