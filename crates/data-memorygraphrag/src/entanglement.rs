@@ -928,12 +928,14 @@ mod tests {
                 score: 0.52,
                 matched_policy_filters: Vec::new(),
                 expansion_origin: None,
+                fallback_origin: false,
             },
             ScoredHit {
                 hit: hit("l:plain", "Signal", "Unrelated", 0.5),
                 score: 0.30,
                 matched_policy_filters: Vec::new(),
                 expansion_origin: None,
+                fallback_origin: false,
             },
         ];
         let mut packet = project_context_packet(
