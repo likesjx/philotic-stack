@@ -1,3 +1,4 @@
+mod anthropic;
 mod elevenlabs;
 mod gemini;
 pub mod mlx;
@@ -6,6 +7,7 @@ pub mod onnx;
 mod openai;
 pub mod parakeet;
 
+pub use anthropic::AnthropicProvider;
 pub use elevenlabs::ElevenLabsProvider;
 pub use gemini::{GeminiAuth, GeminiProvider};
 pub use mlx::MlxProvider;

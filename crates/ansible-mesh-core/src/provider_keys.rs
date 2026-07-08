@@ -25,6 +25,23 @@ pub struct ProviderKeySpec {
 
 pub const PROVIDER_KEY_SPECS: &[ProviderKeySpec] = &[
     ProviderKeySpec {
+        provider: "anthropic",
+        display_name: "Anthropic",
+        vault_name: "anthropic_api_key",
+        api_key_ref_key: "anthropic_api_key_ref",
+        legacy_api_key_key: "anthropic_api_key",
+        env_api_key: "PHILOTIC_ANTHROPIC_API_KEY",
+        env_api_key_ref: "PHILOTIC_ANTHROPIC_API_KEY_REF",
+        default_model_key: Some("anthropic_default_model"),
+        base_url_key: Some("anthropic_base_url"),
+        embedding_model_key: None,
+        fallback_models_key: None,
+        route_key: None,
+        default_model: Some("claude-sonnet-5"),
+        default_base_url: Some("https://api.anthropic.com"),
+        allowed_roles: &["model", "model.anthropic"],
+    },
+    ProviderKeySpec {
         provider: "gemini",
         display_name: "Gemini",
         vault_name: "gemini_api_key",

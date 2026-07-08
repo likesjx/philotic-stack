@@ -1947,6 +1947,108 @@ pub(crate) fn agent_graph_guest_record(
     }
 }
 
+/// Activation gates for hotel-shared model controllers whose usefulness depends
+/// on operator-supplied keys (anthropic/openai) or a locally running service
+/// (ollama). Cloud controllers with no key are seeded `is_active: false` so the
+/// guest supervisor never spawns a controller that can only fail turns; the
+/// operator activates by providing the key and re-running `aiua load`.
+#[derive(Debug, Clone, Copy, Default)]
+struct SharedControllerGates {
+    anthropic_key_present: bool,
+    openai_key_present: bool,
+    ollama_reachable: bool,
+}
+
+/// True when the provider's API key is discoverable through any supported
+/// source: the endpoint-scoped env overrides (`PHILOTIC_<PROVIDER>_API_KEY[_REF]`),
+/// an optional vendor-standard bare env var (e.g. `ANTHROPIC_API_KEY`), or the
+/// vault-backed config refs already loaded into the Context Graph.
+fn provider_key_configured(graph: &GraphDomain, provider: &str, bare_env: Option<&str>) -> bool {
+    use ansible_mesh_core::provider_keys::provider_key_spec;
+    let Some(spec) = provider_key_spec(provider) else {
+        return false;
+    };
+    let env_set = |key: &str| {
+        std::env::var(key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    if env_set(spec.env_api_key) || env_set(spec.env_api_key_ref) {
+        return true;
+    }
+    if bare_env.map(env_set).unwrap_or(false) {
+        return true;
+    }
+    let config_set = |key: &str| {
+        graph
+            .get_config_value(key)
+            .ok()
+            .flatten()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    config_set(spec.api_key_ref_key) || config_set(spec.legacy_api_key_key)
+}
+
+/// Ollama has no API key — gate on a configured base URL or the default local
+/// port answering a TCP connect (400ms budget, load-time only).
+fn ollama_available(graph: &GraphDomain) -> bool {
+    let env_set = std::env::var("PHILOTIC_OLLAMA_BASE_URL")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if env_set {
+        return true;
+    }
+    let config_set = graph
+        .get_config_value("ollama_base_url")
+        .ok()
+        .flatten()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if config_set {
+        return true;
+    }
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 11434)),
+        std::time::Duration::from_millis(400),
+    )
+    .is_ok()
+}
+
+fn detect_shared_controller_gates(graph: &GraphDomain) -> SharedControllerGates {
+    let gates = SharedControllerGates {
+        anthropic_key_present: provider_key_configured(
+            graph,
+            "anthropic",
+            Some("ANTHROPIC_API_KEY"),
+        ),
+        openai_key_present: provider_key_configured(graph, "openai", Some("OPENAI_API_KEY")),
+        ollama_reachable: ollama_available(graph),
+    };
+    if !gates.anthropic_key_present {
+        info!(
+            "model-controller-anthropic seeded INACTIVE — provide an Anthropic key \
+             (vault ref `anthropic_api_key_ref`, or PHILOTIC_ANTHROPIC_API_KEY / \
+             ANTHROPIC_API_KEY env) and re-run `aiua load` to activate."
+        );
+    }
+    if !gates.openai_key_present {
+        info!(
+            "model-controller-openai seeded INACTIVE — provide an OpenAI key \
+             (vault ref `openai_api_key_ref`, or PHILOTIC_OPENAI_API_KEY / \
+             OPENAI_API_KEY env) and re-run `aiua load` to activate."
+        );
+    }
+    if !gates.ollama_reachable {
+        info!(
+            "model-controller-ollama seeded INACTIVE — no Ollama server detected \
+             (set `ollama_base_url` / PHILOTIC_OLLAMA_BASE_URL or start Ollama on \
+             127.0.0.1:11434) and re-run `aiua load` to activate."
+        );
+    }
+    gates
+}
+
 /// Hotel-level shared guests: one membrane for all agents, plus model controllers.
 /// `blob_port` must come from the stored hotel record (via `reconcile_hotel_record`),
 /// not from `default_hotel_record`, to avoid writing a stale hash-derived URL.
@@ -1954,6 +2056,7 @@ fn hotel_shared_guests(
     hotel_name: &str,
     profiles: &[AgentProfile],
     blob_port: u16,
+    controller_gates: SharedControllerGates,
 ) -> Vec<GuestRecord> {
     let hotel = default_hotel_record(hotel_name);
     let socket_path = hotel.ipc_socket_path;
@@ -2119,6 +2222,64 @@ fn hotel_shared_guests(
             })
             .to_string(),
             is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        // ── Full model suite: anthropic / openai / ollama controllers ────────
+        // Cloud controllers activate only when their key is discoverable
+        // (env override, bare vendor env var, or vault-backed config ref);
+        // ollama activates only when a local server is configured/reachable.
+        // detect_shared_controller_gates logs a "provide key to activate" hint
+        // for every gated-off controller at load time.
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-anthropic"),
+            role: "model.anthropic".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-anthropic",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: controller_gates.anthropic_key_present,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-openai"),
+            role: "model.openai".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-openai",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: controller_gates.openai_key_present,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-ollama"),
+            role: "model.ollama".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-ollama",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_OLLAMA_GUEST_ID": format!("{hotel_name}:model-controller-ollama")
+                }
+            })
+            .to_string(),
+            is_active: controller_gates.ollama_reachable,
             active_pid: None,
             last_active_at: None,
         },
@@ -2300,6 +2461,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
         hotel_name,
         std::slice::from_ref(profile),
         default_hotel_record(hotel_name).blob_port,
+        SharedControllerGates::default(),
     );
     guests.push(agent_guests_for_profile(hotel_name, profile));
     guests.push(agent_graph_runner_guest(hotel_name, profile));
@@ -6845,6 +7007,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         hotel_name,
         &all_profiles,
         hotel.blob_port,
+        detect_shared_controller_gates(&graph_domain),
     ));
 
     deactivate_legacy_managed_guests(
@@ -8084,7 +8247,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 11); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource
+        assert_eq!(guests.len(), 14); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource; +3 full-suite controllers (anthropic/openai/ollama)
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
@@ -8110,6 +8273,68 @@ mod tests {
         assert!(!roster.is_empty());
         assert_eq!(roster[0]["agent_key"].as_str(), Some("beta"));
         assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-beta-01"));
+    }
+
+    #[test]
+    fn full_suite_controllers_seed_inactive_without_keys() {
+        // Default gates = no cloud keys, no local ollama → the three new
+        // controllers are seeded (visible/activatable) but NOT active, so the
+        // supervisor never spawns a controller that can only fail turns.
+        let guests = default_guest_seed("gated-hotel");
+        for role in ["model.anthropic", "model.openai", "model.ollama"] {
+            let guest = guests
+                .iter()
+                .find(|g| g.role == role)
+                .unwrap_or_else(|| panic!("missing seeded controller for {role}"));
+            assert!(!guest.is_active, "{role} must seed inactive without a key");
+        }
+    }
+
+    #[test]
+    fn full_suite_controllers_activate_when_gated_on() {
+        let profile = default_agent_profile_for_hotel("keyed-hotel");
+        let guests = super::hotel_shared_guests(
+            "keyed-hotel",
+            std::slice::from_ref(&profile),
+            default_hotel_record("keyed-hotel").blob_port,
+            super::SharedControllerGates {
+                anthropic_key_present: true,
+                openai_key_present: true,
+                ollama_reachable: true,
+            },
+        );
+
+        let anthropic = guests
+            .iter()
+            .find(|g| g.role == "model.anthropic")
+            .expect("anthropic controller");
+        assert!(anthropic.is_active);
+        assert_eq!(anthropic.guest_id, "keyed-hotel:model-controller-anthropic");
+        let config: serde_json::Value = serde_json::from_str(&anthropic.config_json).unwrap();
+        assert_eq!(
+            config["command"].as_str(),
+            Some("model-controller-anthropic")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
+            Some("/tmp/philotic-keyed-hotel.sock")
+        );
+
+        assert!(
+            guests
+                .iter()
+                .any(|g| g.role == "model.openai" && g.is_active)
+        );
+        let ollama = guests
+            .iter()
+            .find(|g| g.role == "model.ollama")
+            .expect("ollama controller");
+        assert!(ollama.is_active);
+        let ollama_config: serde_json::Value = serde_json::from_str(&ollama.config_json).unwrap();
+        assert_eq!(
+            ollama_config["env"]["PHILOTIC_OLLAMA_GUEST_ID"].as_str(),
+            Some("keyed-hotel:model-controller-ollama")
+        );
     }
 
     #[test]
