@@ -189,12 +189,29 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
         let heartbeat_hotel = ctx.hotel.clone();
         let heartbeat_caps = ctx.caps.clone();
         let heartbeat_perimeter = ctx.perimeter_svc.clone();
+        let heartbeat_registry = ctx.registry.clone();
         let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        let execution_reachability =
+                            execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
+                        let node_health =
+                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name, &heartbeat_perimeter);
+
+                        // Self-observe: keep the LOCAL node fresh in the registry so
+                        // operator-target views (desktop membrane, edge clients) always
+                        // include a local target — even on an isolated hotel with no
+                        // backbone peers. Peers discard our beacons, so nothing else
+                        // ever inserts the local node.
+                        heartbeat_registry.write().await.observe_heartbeat(
+                            heartbeat_caps.clone(),
+                            Some(execution_reachability.clone()),
+                            Some(node_health.clone()),
+                        );
+
                         let targets = match mesh_targets_for_graph(heartbeat_graph.as_ref(), &heartbeat_caps.node_id) {
                             Ok(targets) => targets,
                             Err(err) => {
@@ -205,10 +222,6 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                         if targets.is_empty() {
                             continue;
                         }
-                        let execution_reachability =
-                            execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
-                        let node_health =
-                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name, &heartbeat_perimeter);
                         for (_target_node_id, target_addr) in targets {
                             let Ok(target) = target_addr.parse::<SocketAddr>() else {
                                 warn!("Skipping invalid heartbeat target address {}", target_addr);
