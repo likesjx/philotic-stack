@@ -491,6 +491,7 @@ mod tests {
                 status: "healthy".into(),
                 last_healthy_secs: 1,
                 updated_secs: 2,
+                ..Default::default()
             }],
         };
 
@@ -543,6 +544,7 @@ mod tests {
             status: "healthy".into(),
             last_healthy_secs: 1_720_000_000,
             updated_secs: 1_720_000_100,
+            ..Default::default()
         }
     }
 

@@ -633,8 +633,51 @@ pub struct ModelProfileRecord {
     /// Unix timestamp of when this record was last updated.
     #[serde(default)]
     pub updated_secs: u64,
+    /// Whether the provider reliably supports native tool/function calling.
+    /// Defaults to `true` for records written before this field existed so the
+    /// routing oracle never filters legacy records more aggressively than the
+    /// pre-oracle dispatcher did.
+    #[serde(default = "default_true")]
+    pub supports_tools: bool,
+    /// Whether the provider reliably returns structured (JSON-contract) output.
+    /// Same permissive legacy default as `supports_tools`.
+    #[serde(default = "default_true")]
+    pub supports_structured: bool,
+    /// Coarse speed/capability tier: "fast", "heavy", or "" when unknown.
+    #[serde(default)]
+    pub model_tier: String,
+    /// Consecutive dispatch failures since the last success. Drives the
+    /// degrade-after-N transition in `apply_model_outcome`.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+}
+
+impl Default for ModelProfileRecord {
+    fn default() -> Self {
+        Self {
+            model_ref: String::new(),
+            node_id: String::new(),
+            provider: String::new(),
+            task_kinds: Vec::new(),
+            trust_tier: String::new(),
+            max_context_tokens: 0,
+            latency_p50_ms: 0,
+            error_rate: 0.0,
+            status: default_model_status(),
+            last_healthy_secs: 0,
+            updated_secs: 0,
+            supports_tools: true,
+            supports_structured: true,
+            model_tier: String::new(),
+            consecutive_failures: 0,
+        }
+    }
 }
 
 fn default_model_status() -> String {
     "healthy".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }

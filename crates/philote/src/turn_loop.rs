@@ -289,6 +289,7 @@ impl AgentRuntime {
                         session_id,
                         turn_id,
                         NoResponseClass::WatchdogTimeout,
+                        None,
                     )
                     .await;
                 continue;
@@ -784,6 +785,7 @@ impl AgentRuntime {
                         session_id,
                         turn_id,
                         NoResponseClass::ProviderFailure,
+                        error_payload.provider.clone(),
                     )
                     .await;
             }
@@ -1640,13 +1642,22 @@ impl AgentRuntime {
     /// model request to that tier's role. The shared [`decide_no_response_action`]
     /// policy — the same one the watchdog consults via this funnel — chooses
     /// escalate-vs-evict from the failure class and whether a live tier remains.
-    /// On `EvictTurn` (all tiers exhausted) the turn is failed with a
-    /// user-visible error.
+    ///
+    /// When the static ladder is exhausted, the hotel's routing oracle is
+    /// consulted for the next-best *different* provider before giving up
+    /// (`failed_provider` and every ladder provider are excluded, so the
+    /// reroute can never land back on a provider that already failed this
+    /// turn). Operator intent wins: the configured `fallback_tiers` always
+    /// run first; the oracle is only the safety net beneath them, capped at
+    /// [`MAX_ORACLE_EXTRA_TIERS`] extra dispatches and disabled entirely by
+    /// `PHILOTIC_DISABLE_ROUTING_ORACLE=1`. On `EvictTurn` (all tiers and
+    /// oracle options exhausted) the turn is failed with a user-visible error.
     pub(super) async fn advance_turn_to_next_fallback_tier(
         &mut self,
         session_id: String,
         turn_id: String,
         class: NoResponseClass,
+        failed_provider: Option<String>,
     ) -> Result<()> {
         // Extract configured tiers before any mutable session borrow.
         let active_role_name: Option<String> = self
@@ -1684,7 +1695,25 @@ impl AgentRuntime {
         };
 
         let tiers_remaining = current_tier < max_tier;
-        if decide_no_response_action(class, tiers_remaining) == NoResponseAction::EvictTurn {
+
+        // Ladder exhausted: ask the routing oracle for a next-best different
+        // provider before giving up. Static tiers keep precedence — this
+        // branch is only reachable when no configured tier remains.
+        let oracle_role: Option<String> = if tiers_remaining {
+            None
+        } else {
+            self.consult_routing_oracle(
+                &configured_tiers,
+                current_tier,
+                max_tier,
+                failed_provider.as_deref(),
+            )
+            .await
+        };
+
+        if oracle_role.is_none()
+            && decide_no_response_action(class, tiers_remaining) == NoResponseAction::EvictTurn
+        {
             return self
                 .fail_active_turn(
                     session_id,
@@ -1695,7 +1724,8 @@ impl AgentRuntime {
         }
 
         let next_tier = current_tier + 1;
-        let next_role = role_for_tier(&configured_tiers, next_tier).to_string();
+        let next_role =
+            oracle_role.unwrap_or_else(|| role_for_tier(&configured_tiers, next_tier).to_string());
 
         // Gather everything we need before dropping the mutable state borrow.
         let plan = {
@@ -1813,6 +1843,86 @@ impl AgentRuntime {
             .await?;
 
         Ok(())
+    }
+
+    /// Ask the hotel's routing oracle for the next-best live model controller
+    /// once the static fallback ladder is exhausted. Returns the controller
+    /// role to dispatch to, or `None` when the oracle is disabled, the extra-
+    /// tier budget is spent, the IPC query fails, or every ranked option is a
+    /// role/provider this turn already tried.
+    ///
+    /// The exclude list is every provider implied by the ladder's tiers plus
+    /// the provider that just failed, so the oracle can never route straight
+    /// back into the failure (the hotel also filters `exclude_providers`
+    /// server-side and only returns roles with a live guest).
+    async fn consult_routing_oracle(
+        &mut self,
+        configured_tiers: &[String],
+        current_tier: u8,
+        max_tier: u8,
+        failed_provider: Option<&str>,
+    ) -> Option<String> {
+        if ansible_mesh_core::model_oracle::routing_oracle_disabled() {
+            return None;
+        }
+        if current_tier >= max_tier.saturating_add(MAX_ORACLE_EXTRA_TIERS) {
+            return None;
+        }
+
+        let ladder: Vec<String> = if configured_tiers.is_empty() {
+            DEFAULT_FALLBACK_TIERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            configured_tiers.to_vec()
+        };
+        let tried_roles: std::collections::HashSet<String> = ladder.iter().cloned().collect();
+        let mut exclude_providers: Vec<String> =
+            ladder.iter().filter_map(|r| provider_for_role(r)).collect();
+        if let Some(p) = failed_provider {
+            if !exclude_providers.iter().any(|x| x == p) {
+                exclude_providers.push(p.to_string());
+            }
+        }
+
+        let resp = match self
+            .ipc_client
+            .send_request(IpcRequest::QueryModelRoute {
+                request_class: "cognitive".to_string(),
+                needs_tools: true,
+                needs_structured: true,
+                approx_context_tokens: 0,
+                latency_class: "interactive".to_string(),
+                trust_ceiling: "remote_cloud".to_string(),
+                exclude_providers,
+            })
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!("Routing oracle query failed: {e}");
+                return None;
+            }
+        };
+
+        let (role, provider) = match resp {
+            IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            } => pick_oracle_role(&data, &tried_roles)?,
+            _ => return None,
+        };
+
+        info!(
+            provider_from = %failed_provider.unwrap_or("unknown"),
+            provider_to = %provider,
+            target_role = %role,
+            reason = "fallback_ladder_exhausted",
+            "Routing oracle reroute: dispatching beneath exhausted ladder"
+        );
+        Some(role)
     }
 
     pub(super) async fn complete_agent_response(

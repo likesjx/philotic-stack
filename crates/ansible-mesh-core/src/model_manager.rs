@@ -454,6 +454,7 @@ mod tests {
             status: "healthy".into(),
             last_healthy_secs: 1,
             updated_secs: 2,
+            ..Default::default()
         }]);
         let openrouter = projections
             .iter()

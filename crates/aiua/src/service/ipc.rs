@@ -7827,6 +7827,34 @@ impl IpcServer {
                 Self::handle_record_autonomy_outcome(graph, &audit_id, &outcome, now)
             }
 
+            IpcRequest::QueryModelRoute {
+                request_class,
+                needs_tools,
+                needs_structured,
+                approx_context_tokens,
+                latency_class,
+                trust_ceiling,
+                exclude_providers,
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Self::handle_query_model_route(
+                    graph,
+                    heal_queue.as_deref(),
+                    local_node_id,
+                    &request_class,
+                    needs_tools,
+                    needs_structured,
+                    approx_context_tokens,
+                    &latency_class,
+                    &trust_ceiling,
+                    &exclude_providers,
+                    now,
+                )
+            }
+
             IpcRequest::AgentMigrateToHotel {
                 agent_id,
                 dest_hotel,
@@ -7879,6 +7907,135 @@ impl IpcServer {
     /// Clock (`now`) and env reader are injected so tests run without
     /// wall-clock time or process environment.
     #[allow(clippy::too_many_arguments)]
+    /// Handle [`IpcRequest::QueryModelRoute`] — the routing oracle's IPC face.
+    ///
+    /// Ranks the local hotel's live model profiles against the caller's need
+    /// (pure `model_oracle::rank_models_with`), maps providers onto controller
+    /// roles, and keeps only roles backed by a live guest — the same
+    /// reachability rule `validate_fallback_ladders` enforces at config time.
+    /// When the query carries `exclude_providers` (a failure-driven reroute),
+    /// the switch is logged and pushed to the heal queue as an
+    /// `oracle_reroute` info entry so reroute patterns surface in dev briefs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_query_model_route(
+        graph: &GraphDomain,
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        local_node_id: &str,
+        request_class: &str,
+        needs_tools: bool,
+        needs_structured: bool,
+        approx_context_tokens: u32,
+        latency_class: &str,
+        trust_ceiling: &str,
+        exclude_providers: &[String],
+        now_secs: u64,
+    ) -> IpcResponse {
+        use ansible_mesh_core::model_oracle as oracle;
+
+        const CORR: &str = "query_model_route";
+
+        if oracle::routing_oracle_disabled() {
+            return IpcResponse::success(
+                CORR,
+                Some(serde_json::json!({ "ranked": [], "disabled": true })),
+            );
+        }
+
+        let profiles = match graph.list_model_profiles() {
+            Ok(p) => p,
+            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
+        };
+        // Prefer profiles observed on this node; fall back to the full mesh
+        // view when the local node has no profiles yet (fresh hotel).
+        let local: Vec<_> = profiles
+            .iter()
+            .filter(|p| p.node_id == local_node_id)
+            .cloned()
+            .collect();
+        let candidates = if local.is_empty() { profiles } else { local };
+
+        let need = oracle::RouteNeed {
+            request_class: request_class.to_string(),
+            needs_tools,
+            needs_structured,
+            approx_context_tokens,
+            latency_class: oracle::LatencyClass::parse(latency_class),
+            trust_ceiling: trust_ceiling.to_string(),
+        };
+        let ranked = oracle::rank_models_with(
+            &candidates,
+            &need,
+            now_secs,
+            oracle::degrade_cooloff_secs_from_env(),
+        );
+
+        // A tier is reachable iff a live guest serves its role — same rule as
+        // validate_fallback_ladders.
+        let active_roles: std::collections::BTreeSet<String> =
+            Self::local_hotel_name(graph, local_node_id)
+                .and_then(|hotel| graph.list_guests(&hotel, true).ok())
+                .map(|guests| guests.into_iter().map(|g| g.role).collect())
+                .unwrap_or_default();
+
+        let mut seen_roles: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let entries: Vec<serde_json::Value> = ranked
+            .iter()
+            .filter(|r| !exclude_providers.iter().any(|x| x == &r.provider))
+            .filter_map(|r| {
+                let role = oracle::controller_role_for_provider(&r.provider);
+                if !active_roles.contains(&role) || !seen_roles.insert(role.clone()) {
+                    return None;
+                }
+                Some(serde_json::json!({
+                    "role": role,
+                    "provider": r.provider,
+                    "model_ref": r.model_ref,
+                    "score": r.score,
+                    "reasons": r.reasons,
+                }))
+            })
+            .take(3)
+            .collect();
+
+        // Observability: a non-empty exclude list means a provider just
+        // failed and the oracle is rerouting around it.
+        if !exclude_providers.is_empty() {
+            if let Some(first) = entries.first() {
+                let provider_from = exclude_providers.join(",");
+                let provider_to = first
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                info!(
+                    provider_from = %provider_from,
+                    provider_to = %provider_to,
+                    reason = "fallback_ladder_exhausted",
+                    "Routing oracle reroute"
+                );
+                if let Some(hq) = heal_queue {
+                    let raw_text = format!(
+                        "[model-oracle] reroute {provider_from} -> {provider_to} (fallback ladder exhausted, request_class={request_class})"
+                    );
+                    match hq.push_error("model-oracle", &raw_text) {
+                        Ok(id) => {
+                            if let Err(e) =
+                                hq.update_triage(&id, "info", "oracle_reroute", "oracle_reroute")
+                            {
+                                warn!("oracle_reroute heal entry triage failed: {e}");
+                            }
+                        }
+                        Err(e) => warn!("oracle_reroute heal entry push failed: {e}"),
+                    }
+                }
+            }
+        }
+
+        IpcResponse::success(
+            CORR,
+            Some(serde_json::json!({ "ranked": entries, "disabled": false })),
+        )
+    }
+
     pub(crate) fn handle_file_heal_work_item(
         graph: &GraphDomain,
         heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
@@ -10652,12 +10809,10 @@ impl IpcServer {
             provider: "onnx".to_string(),
             task_kinds: vec!["image.ocr".to_string(), "image.ground".to_string()],
             trust_tier: "local_experimental".to_string(),
-            max_context_tokens: 0,
-            latency_p50_ms: 0,
-            error_rate: 0.0,
-            status: "healthy".to_string(),
-            last_healthy_secs: 0,
-            updated_secs: 0,
+            // ONNX/Florence has no tool calling or JSON-contract support.
+            supports_tools: false,
+            supports_structured: false,
+            ..Default::default()
         };
         if let Err(e) = graph.upsert_model_profile(&profile) {
             return IpcResponse::error("vision_setup", "PROFILE_REGISTER_ERROR", &e.to_string());
@@ -12808,6 +12963,268 @@ pub(crate) mod tests {
                 operator_target_components,
             } => operator_target_components,
             other => panic!("unexpected operator target components response: {other:?}"),
+        }
+    }
+
+    // ── QueryModelRoute handler (routing oracle) ──────────────────────────────
+
+    mod query_model_route {
+        use super::*;
+        use ansible_mesh_core::graph::ModelProfileRecord;
+        use ansible_mesh_core::heal_queue::{HealQueueRow, HealQueueStorage};
+
+        const NODE: &str = "local-aiua-01";
+        const NOW: u64 = 1_800_000_000;
+
+        /// Serialises tests in this module because the handler reads the
+        /// PHILOTIC_DISABLE_ROUTING_ORACLE env kill switch.
+        static ORACLE_ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+        fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+            ORACLE_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        /// Trait mock that records heal-queue interactions so tests can
+        /// assert on the exact push/triage calls the handler makes.
+        #[derive(Default)]
+        struct RecordingHealQueue {
+            pushed: StdMutex<Vec<(String, String)>>,
+            triaged: StdMutex<Vec<(String, String, String, String)>>,
+        }
+
+        impl HealQueueStorage for RecordingHealQueue {
+            fn push_error(&self, guest_id: &str, raw_text: &str) -> anyhow::Result<String> {
+                self.pushed
+                    .lock()
+                    .unwrap()
+                    .push((guest_id.to_string(), raw_text.to_string()));
+                Ok("hq-test-1".to_string())
+            }
+            fn pending_errors(&self, _limit: usize) -> anyhow::Result<Vec<HealQueueRow>> {
+                Ok(vec![])
+            }
+            fn update_triage(
+                &self,
+                id: &str,
+                severity: &str,
+                pattern_tag: &str,
+                heal_action: &str,
+            ) -> anyhow::Result<()> {
+                self.triaged.lock().unwrap().push((
+                    id.to_string(),
+                    severity.to_string(),
+                    pattern_tag.to_string(),
+                    heal_action.to_string(),
+                ));
+                Ok(())
+            }
+            fn resolve(&self, _id: &str, _outcome: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn vacuum_old(&self, _older_than_secs: u64) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        fn seeded_graph() -> GraphDomain {
+            let graph = register_skill_test_graph();
+            graph
+                .upsert_hotel(&HotelRecord {
+                    hotel_name: "local-hotel".into(),
+                    capabilities: NodeCapabilities {
+                        node_id: NODE.into(),
+                        roles: vec![],
+                        models: vec![],
+                        tools: vec![],
+                        constraints: Default::default(),
+                    },
+                    mesh_port: 9000,
+                    blob_port: 9001,
+                    execution_port: 9002,
+                    ipc_socket_path: "/tmp/test.sock".into(),
+                    active_pid: None,
+                    mesh_host: None,
+                })
+                .expect("seed hotel");
+            for (role, guest_id, active) in [
+                ("model", "mc-gemini", true),
+                ("model.anthropic", "mc-anthropic", true),
+                ("model.openrouter", "mc-openrouter", true),
+                ("model.ollama", "mc-ollama", false),
+            ] {
+                graph
+                    .upsert_guest(&GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: guest_id.into(),
+                        role: role.into(),
+                        config_json: "{}".into(),
+                        is_active: active,
+                        active_pid: None,
+                        last_active_at: None,
+                    })
+                    .expect("seed guest");
+            }
+            for (provider, status, latency, updated) in [
+                // Freshly degraded — inside cool-off, must be frozen out.
+                ("gemini", "degraded", 900_u64, NOW - 10),
+                ("anthropic", "healthy", 800, NOW - 30),
+                ("openrouter", "healthy", 4_000, NOW - 30),
+                // Healthy but its controller guest is inactive.
+                ("ollama", "healthy", 300, NOW - 30),
+            ] {
+                graph
+                    .upsert_model_profile(&ModelProfileRecord {
+                        model_ref: provider.into(),
+                        node_id: NODE.into(),
+                        provider: provider.into(),
+                        task_kinds: vec!["text.generate".into()],
+                        trust_tier: "remote_cloud".into(),
+                        latency_p50_ms: latency,
+                        status: status.into(),
+                        last_healthy_secs: NOW - 60,
+                        updated_secs: updated,
+                        supports_tools: true,
+                        supports_structured: true,
+                        ..Default::default()
+                    })
+                    .expect("seed profile");
+            }
+            graph
+        }
+
+        fn call(
+            graph: &GraphDomain,
+            hq: Option<&dyn HealQueueStorage>,
+            exclude: &[String],
+        ) -> serde_json::Value {
+            let resp = IpcServer::handle_query_model_route(
+                graph,
+                hq,
+                NODE,
+                "cognitive",
+                true,
+                true,
+                0,
+                "interactive",
+                "remote_cloud",
+                exclude,
+                NOW,
+            );
+            match resp {
+                IpcResponse::Standard {
+                    ok: true,
+                    data: Some(data),
+                    ..
+                } => data,
+                other => panic!("expected ok Standard with data, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn ranks_live_healthy_providers_and_skips_failed_frozen_and_dead_roles() {
+            let _guard = lock_env();
+            let graph = seeded_graph();
+            let data = call(&graph, None, &["gemini".to_string()]);
+            assert_eq!(data["disabled"], false);
+            let ranked = data["ranked"].as_array().expect("ranked array");
+            let roles: Vec<&str> = ranked.iter().map(|e| e["role"].as_str().unwrap()).collect();
+            // anthropic (fast) outranks openrouter (slow); gemini excluded
+            // (failed provider AND frozen-degraded); ollama's role has no
+            // live guest.
+            assert_eq!(roles, vec!["model.anthropic", "model.openrouter"]);
+            assert!(
+                ranked[0]["score"].as_f64().unwrap() > ranked[1]["score"].as_f64().unwrap(),
+                "ranking must be score-descending"
+            );
+        }
+
+        #[test]
+        fn reroute_pushes_oracle_reroute_heal_entry() {
+            let _guard = lock_env();
+            let graph = seeded_graph();
+            let hq = RecordingHealQueue::default();
+            let data = call(&graph, Some(&hq), &["gemini".to_string()]);
+            assert!(!data["ranked"].as_array().unwrap().is_empty());
+            let pushed = hq.pushed.lock().unwrap();
+            assert_eq!(pushed.len(), 1);
+            assert_eq!(pushed[0].0, "model-oracle");
+            assert!(pushed[0].1.contains("gemini -> anthropic"));
+            let triaged = hq.triaged.lock().unwrap();
+            assert_eq!(triaged.len(), 1);
+            let (id, severity, pattern_tag, heal_action) = &triaged[0];
+            assert_eq!(id, "hq-test-1");
+            assert_eq!(severity, "info");
+            assert_eq!(pattern_tag, "oracle_reroute");
+            assert_eq!(heal_action, "oracle_reroute");
+        }
+
+        #[test]
+        fn no_heal_entry_without_exclusions() {
+            let _guard = lock_env();
+            let graph = seeded_graph();
+            let hq = RecordingHealQueue::default();
+            let data = call(&graph, Some(&hq), &[]);
+            assert!(!data["ranked"].as_array().unwrap().is_empty());
+            assert!(hq.pushed.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn kill_switch_disables_oracle() {
+            let _guard = lock_env();
+            let graph = seeded_graph();
+            unsafe { std::env::set_var("PHILOTIC_DISABLE_ROUTING_ORACLE", "1") };
+            let data = call(&graph, None, &["gemini".to_string()]);
+            unsafe { std::env::remove_var("PHILOTIC_DISABLE_ROUTING_ORACLE") };
+            assert_eq!(data["disabled"], true);
+            assert!(data["ranked"].as_array().unwrap().is_empty());
+        }
+
+        #[test]
+        fn query_model_route_request_round_trips_on_the_wire() {
+            let req = philotic_client::IpcRequest::QueryModelRoute {
+                request_class: "cognitive".into(),
+                needs_tools: true,
+                needs_structured: true,
+                approx_context_tokens: 12_000,
+                latency_class: "interactive".into(),
+                trust_ceiling: "remote_cloud".into(),
+                exclude_providers: vec!["gemini".into()],
+            };
+            let wire = serde_json::to_string(&req).expect("serialize");
+            let back: philotic_client::IpcRequest =
+                serde_json::from_str(&wire).expect("deserialize");
+            match back {
+                philotic_client::IpcRequest::QueryModelRoute {
+                    request_class,
+                    exclude_providers,
+                    ..
+                } => {
+                    assert_eq!(request_class, "cognitive");
+                    assert_eq!(exclude_providers, vec!["gemini".to_string()]);
+                }
+                other => panic!("unexpected variant: {other:?}"),
+            }
+            // Back-compat: exclude_providers is defaulted when absent so an
+            // older philote binary's payload still parses.
+            let legacy = serde_json::json!({
+                "operation": "query_model_route",
+                "payload": {
+                    "request_class": "cognitive",
+                    "needs_tools": false,
+                    "needs_structured": false,
+                    "approx_context_tokens": 0,
+                    "latency_class": "background",
+                    "trust_ceiling": "remote_cloud"
+                }
+            });
+            let parsed: philotic_client::IpcRequest =
+                serde_json::from_value(legacy).expect("legacy parse");
+            assert!(matches!(
+                parsed,
+                philotic_client::IpcRequest::QueryModelRoute { .. }
+            ));
         }
     }
 
