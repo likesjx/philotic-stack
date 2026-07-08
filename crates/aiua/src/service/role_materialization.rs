@@ -244,6 +244,24 @@ impl IpcServer {
         let is_registered = |guest_id: &str| live_agent_guests.iter().any(|live| live == guest_id);
         let mut provenance_hint =
             Self::local_delivery_provenance_hint(&session, local_hotel_name.as_deref());
+        // Guard (2026-07-06 parked-tool-result incident): an agent-role task must never
+        // be delivered to — or parked for — a guest whose role is not an agent role.
+        // A tool dispatch that leaked into `agent_runtime_provenance` would otherwise
+        // park the agent's tool RESULT for the runner that produced it (e.g.
+        // vps-jane:life-graph-runner), a guest that never consumes agent tasks, and the
+        // turn dies at the watchdog. Reject such hints loudly so the next poisoning is
+        // self-diagnosing.
+        if let Some(hint) = provenance_hint.as_ref() {
+            if !Self::guest_can_fill_agent_placement(graph, local_node_id, &hint.guest_id) {
+                warn!(
+                    "Session [{}] persisted local delivery guest [{}] has a non-agent role; \
+                     rejecting poisoned placement provenance (tool/datasource dispatches must \
+                     not set agent placement — parked-tool-result incident).",
+                    session_id, hint.guest_id
+                );
+                provenance_hint = None;
+            }
+        }
         if let (Some(active_guest_id), Some(hint)) = (
             session.active_incarnation_id.as_deref(),
             provenance_hint.as_ref(),
@@ -263,6 +281,30 @@ impl IpcServer {
         if let Some(active_guest_id) = session.active_incarnation_id.clone() {
             if is_registered(&active_guest_id) {
                 return AgentRouteResolution::Deliver(Some(active_guest_id));
+            }
+
+            // Registration-name mismatch (enabler of the parked-tool-result incident):
+            // a single-process philote registers under its bare agent id while the
+            // session's active_incarnation_id stores "{agent_id}:{role_name}", so the
+            // live registry lookup above misses and routing used to fall through to the
+            // provenance-hint / park paths. Normalize: if the incarnation's base agent
+            // (its ":"-prefix) is the session's primary agent or the incarnation's own
+            // agent_id, and that base is live, deliver to it directly.
+            if let Some((base_agent_id, _role_name)) = active_guest_id.split_once(':') {
+                let base_is_this_agent = session.primary_agent_id.as_deref() == Some(base_agent_id)
+                    || graph
+                        .list_role_incarnations_by_guest_id(&active_guest_id)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .any(|record| record.agent_id == base_agent_id);
+                if base_is_this_agent && is_registered(base_agent_id) {
+                    info!(
+                        "Active incarnation [{}] is not registered for session [{}]; delivering to its live base agent registration [{}].",
+                        active_guest_id, session_id, base_agent_id
+                    );
+                    return AgentRouteResolution::Deliver(Some(base_agent_id.to_string()));
+                }
             }
 
             if let Some(hint) = provenance_hint.as_ref() {
@@ -2013,6 +2055,244 @@ mod tests {
             AgentRouteResolution::Park {
                 guest_id: "agent-jane:developer".into()
             }
+        );
+    }
+
+    // Guard regression (2026-07-06 parked-tool-result incident): a placement-provenance
+    // hint naming a non-agent infrastructure guest (here the life-graph-runner, whose
+    // guest record role is "life-graph-runner") must be rejected — never parked for.
+    // Before the fix this exact setup parked the agent's tool RESULT for the runner
+    // itself and the turn died at the watchdog. With the poisoned hint rejected, routing
+    // falls back to parking for the primary agent's configured orchestrator incarnation.
+    #[tokio::test]
+    async fn resolve_agent_route_rejects_poisoned_non_agent_provenance_hint() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+            })
+            .expect("seed orchestrator role");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[
+                    // The tool runner: configured locally, so the pre-fix code path
+                    // would happily Park for it under a transport_continuity marker.
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "vps-jane:life-graph-runner".into(),
+                        role: "life-graph-runner".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    },
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "agent-beacon:orchestrator".into(),
+                        role: "agent".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    },
+                ],
+            )
+            .expect("seed local guests");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-poisoned-hint".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "vps-jane:life-graph-runner",
+                        "delivery_target_role": "life-graph-runner",
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "updated_at": now.saturating_sub(1)
+                    }
+                }),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            None,
+            &serde_json::json!({
+                "session_id": "sess-poisoned-hint",
+                "action": "tool_result",
+                "content": "life.observe result returning to the agent"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_ne!(
+            route,
+            AgentRouteResolution::Park {
+                guest_id: "vps-jane:life-graph-runner".into()
+            },
+            "agent-role task must never be parked for a tool-runner guest"
+        );
+        assert_eq!(
+            route,
+            AgentRouteResolution::Park {
+                guest_id: "agent-beacon:orchestrator".into()
+            },
+            "poisoned hint rejected; routing must fall back to the agent's orchestrator"
+        );
+    }
+
+    // Enabler regression (2026-07-06 parked-tool-result incident): philote registers
+    // under its bare agent id ("agent-beacon") while the session's
+    // active_incarnation_id stores "agent-beacon:orchestrator". The registry lookup
+    // must normalize to the live base-agent registration and deliver there directly —
+    // before the fix the miss handed routing to the (poisoned) provenance-hint park
+    // path.
+    #[tokio::test]
+    async fn resolve_agent_route_delivers_to_live_base_agent_for_unregistered_incarnation() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "vps-jane:life-graph-runner".into(),
+                    role: "life-graph-runner".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed runner guest");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-incarnation-mismatch".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "vps-jane:life-graph-runner",
+                        "delivery_target_role": "life-graph-runner",
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "updated_at": now.saturating_sub(1)
+                    }
+                }),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+
+        // Live registry: the philote registered under its BARE agent id, not the
+        // incarnation id stored on the session — the standing mismatch from the
+        // incident.
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let mut subscribed_roles = Vec::new();
+        IpcServer::add_subscription(
+            &inboxes,
+            "agent",
+            Uuid::new_v4(),
+            "agent-beacon",
+            &[],
+            &tx,
+            &mut subscribed_roles,
+        )
+        .await;
+
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            None,
+            &serde_json::json!({
+                "session_id": "sess-incarnation-mismatch",
+                "action": "tool_result",
+                "content": "life.observe result returning to the agent"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            route,
+            AgentRouteResolution::Deliver(Some("agent-beacon".into())),
+            "unregistered incarnation must normalize to its live base-agent registration"
         );
     }
 

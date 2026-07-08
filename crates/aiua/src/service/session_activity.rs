@@ -201,7 +201,23 @@ impl IpcServer {
             summary_json["reflex_policy_records"] = reflex_policy_records.clone();
             session.summary_json = summary_json;
         }
-        {
+        // Placement-provenance gate (2026-07-06 parked-tool-result incident): EmitTask
+        // records EVERY dispatch through here, including tool/datasource invokes (e.g.
+        // a life.* invoke addressed to vps-jane:life-graph-runner). Persisting a tool
+        // dispatch's delivery context as `agent_runtime_provenance` made the RUNNER the
+        // session's "persisted local delivery guest", so the runner's own RESULT was
+        // parked for the runner (resolve_agent_route provenance-hint park) and the
+        // agent's turn died at the watchdog — 6/6 life.* turns in one session. Only
+        // genuine agent-turn deliveries — a dispatch whose target role is "agent" or a
+        // "role:{agent_id}:{role_name}" incarnation routing key — may update placement
+        // provenance. This is a forced, explicit decision at the recording site:
+        // tool/datasource/gateway/model dispatches and status-only updates (no dispatch
+        // role) must leave placement provenance untouched.
+        let dispatch_is_agent_turn_delivery = matches!(
+            participant_role,
+            Some(role) if role == "agent" || role.starts_with("role:")
+        );
+        if dispatch_is_agent_turn_delivery {
             let marker_kind = payload
                 .get("placement_marker_kind")
                 .and_then(serde_json::Value::as_str)
@@ -1111,5 +1127,142 @@ mod tests {
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].component_id, "gateway");
         assert_eq!(participants[0].role, "gateway");
+    }
+
+    // Regression for the 2026-07-06 parked-tool-result incident: recording a TOOL
+    // dispatch (delivery context stamped with the runner as target guest) must NOT
+    // update the session's agent_runtime_provenance. Before the fix, the life.*
+    // invoke to vps-jane:life-graph-runner became the session's "persisted local
+    // delivery guest", so the runner's own RESULT was parked for the runner and the
+    // agent turn died at the watchdog (6/6 life.* turns in one session).
+    #[test]
+    fn tool_dispatch_recording_does_not_poison_agent_runtime_provenance() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        // 1. Genuine agent-turn delivery establishes placement provenance.
+        let agent_delivery = serde_json::json!({
+            "session_id": "sess-tool-poison",
+            "turn_id": "turn-1",
+            "agent_id": "agent-beacon",
+            "delivery_hotel": "vps-jane",
+            "delivery_node_id": "vps-jane-aiua-01",
+            "delivery_target_role": "agent",
+            "delivery_target_guest_id": "agent-beacon",
+            "transport": "operator_chat",
+        });
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &agent_delivery,
+            None,
+            Some("running"),
+            Some("agent"),
+            "emit_task",
+        );
+        let session = graph
+            .get_session("sess-tool-poison")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_target_guest_id"],
+            "agent-beacon",
+            "agent-turn delivery must establish placement provenance"
+        );
+
+        // 2. Tool dispatch to the life-graph-runner — delivery context names the RUNNER.
+        let tool_dispatch = serde_json::json!({
+            "session_id": "sess-tool-poison",
+            "turn_id": "turn-1",
+            "action": "tool_invoke",
+            "tool_name": "life.observe",
+            "agent_id": "agent-beacon",
+            "delivery_hotel": "vps-jane",
+            "delivery_node_id": "vps-jane-aiua-01",
+            "delivery_target_role": "life-graph-runner",
+            "delivery_target_guest_id": "vps-jane:life-graph-runner",
+        });
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &tool_dispatch,
+            None,
+            Some("running"),
+            Some("life-graph-runner"),
+            "emit_task",
+        );
+        let session = graph
+            .get_session("sess-tool-poison")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_target_guest_id"],
+            "agent-beacon",
+            "tool dispatch must not overwrite agent placement provenance with the runner"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_target_role"],
+            "agent"
+        );
+    }
+
+    // Companion to the poisoning regression: a session whose FIRST recorded dispatch is
+    // a tool invoke must not gain agent placement provenance at all, while a
+    // role-incarnation routing-key delivery ("role:{agent}:{role}") still counts as a
+    // genuine agent-turn delivery.
+    #[test]
+    fn provenance_gate_skips_tool_dispatch_but_accepts_role_routing_key() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        let tool_dispatch = serde_json::json!({
+            "session_id": "sess-tool-first",
+            "turn_id": "turn-1",
+            "delivery_hotel": "vps-jane",
+            "delivery_target_role": "life-graph-runner",
+            "delivery_target_guest_id": "vps-jane:life-graph-runner",
+        });
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &tool_dispatch,
+            None,
+            Some("running"),
+            Some("life-graph-runner"),
+            "emit_task",
+        );
+        let session = graph
+            .get_session("sess-tool-first")
+            .expect("session lookup")
+            .expect("session exists");
+        assert!(
+            session
+                .summary_json
+                .get("agent_runtime_provenance")
+                .is_none(),
+            "tool dispatch must not create agent placement provenance"
+        );
+
+        let role_delivery = serde_json::json!({
+            "session_id": "sess-tool-first",
+            "turn_id": "turn-2",
+            "delivery_hotel": "vps-jane",
+            "delivery_target_role": "role:agent-beacon:orchestrator",
+            "delivery_target_guest_id": "agent-beacon:orchestrator",
+        });
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &role_delivery,
+            None,
+            Some("running"),
+            Some("role:agent-beacon:orchestrator"),
+            "emit_task",
+        );
+        let session = graph
+            .get_session("sess-tool-first")
+            .expect("session lookup")
+            .expect("session exists");
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_target_guest_id"],
+            "agent-beacon:orchestrator",
+            "role-incarnation routing-key delivery must update placement provenance"
+        );
     }
 }
