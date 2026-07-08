@@ -2017,7 +2017,11 @@ fn ollama_available(graph: &GraphDomain) -> bool {
 
 fn detect_shared_controller_gates(graph: &GraphDomain) -> SharedControllerGates {
     let gates = SharedControllerGates {
-        anthropic_key_present: provider_key_configured(graph, "anthropic", Some("ANTHROPIC_API_KEY")),
+        anthropic_key_present: provider_key_configured(
+            graph,
+            "anthropic",
+            Some("ANTHROPIC_API_KEY"),
+        ),
         openai_key_present: provider_key_configured(graph, "openai", Some("OPENAI_API_KEY")),
         ollama_reachable: ollama_available(graph),
     };

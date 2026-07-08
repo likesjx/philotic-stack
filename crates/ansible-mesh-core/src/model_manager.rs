@@ -436,8 +436,7 @@ mod tests {
             assert_eq!(availability.context_window_tokens, Some(200_000));
         }
         // Remote-cloud provider: lifegraph/secret-sensitivity data must not route here.
-        let decision =
-            evaluate_model_trust(anthropic, &trust_policy_for_sensitivity("lifegraph"));
+        let decision = evaluate_model_trust(anthropic, &trust_policy_for_sensitivity("lifegraph"));
         assert!(!decision.allowed);
     }
 

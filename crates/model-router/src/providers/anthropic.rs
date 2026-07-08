@@ -107,7 +107,12 @@ impl AnthropicProvider {
 
     /// Model selection: explicit task model > `model_tier` provider option > default.
     fn request_model<'a>(&'a self, task: &'a ControllerTask) -> &'a str {
-        if let Some(model) = task.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        if let Some(model) = task
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
             return model;
         }
         match task
@@ -846,7 +851,10 @@ mod tests {
     #[test]
     fn base_url_strips_trailing_v1() {
         let provider = provider_with(Some("https://api.anthropic.com/v1/".into()));
-        assert_eq!(provider.messages_url(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            provider.messages_url(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
@@ -931,10 +939,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(provider.request_model(&heavy), "claude-opus-4-8");
-        assert_eq!(
-            provider.request_model(&fast),
-            "claude-haiku-4-5-20251001"
-        );
+        assert_eq!(provider.request_model(&fast), "claude-haiku-4-5-20251001");
         assert_eq!(provider.request_model(&pinned), "claude-3-9-test");
     }
 
