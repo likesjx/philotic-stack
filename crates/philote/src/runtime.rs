@@ -49,6 +49,10 @@ mod tool_exec;
 mod memory_integration;
 use memory_integration::*;
 
+#[path = "life_capture.rs"]
+mod life_capture;
+use life_capture::*;
+
 pub const DEFAULT_AGENT_ID: &str = "agent-bjork-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
@@ -1141,6 +1145,9 @@ pub struct AgentRuntime {
     /// burst of `/role`/`/back` commands (e.g. a membrane redelivery storm) so a
     /// rapid switch storm cannot drive an endless role-handoff ping-pong.
     role_switch_history: HashMap<String, std::collections::VecDeque<i64>>,
+    /// Dedup + budget ledger for the LifeGraph auto-capture lane (Slice E2).
+    /// Live-only (never checkpointed), mirroring the prefetch-dispatched flag.
+    life_capture_ledger: LifeCaptureLedger,
 }
 
 impl AgentRuntime {
@@ -1160,6 +1167,7 @@ impl AgentRuntime {
             role_switch_history: HashMap::new(),
             network_offline: false,
             role_name: None,
+            life_capture_ledger: LifeCaptureLedger::default(),
         }
     }
 
@@ -3911,6 +3919,13 @@ impl AgentRuntime {
         // are pure cache refreshes — they must never be routed as tool results.
         if task.turn_id.as_deref() == Some(LIFE_AUTORECALL_PREFETCH_TURN_ID) {
             self.handle_life_recall_prefetch_response(&task);
+            return Ok(());
+        }
+
+        // LifeGraph auto-capture acks carry their own sentinel turn id and are
+        // pure observability — they must never be routed as tool results.
+        if task.turn_id.as_deref() == Some(LIFE_AUTOCAPTURE_TURN_ID) {
+            self.handle_life_autocapture_response(&task);
             return Ok(());
         }
 

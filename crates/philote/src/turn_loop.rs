@@ -2001,6 +2001,14 @@ impl AgentRuntime {
         memory_concept: Option<String>,
         memory_candidate: Option<MemoryCandidate>,
     ) -> Result<()> {
+        // LifeGraph auto-capture fork (Slice E2): lived-fact candidates ALSO
+        // flow to the graph as proposed nodes. Fork, not move — the Muninn
+        // Attend hook below still receives the same candidate. Runs before
+        // turn completion so the turn event has an active turn to attach to;
+        // fire-and-forget, so it never blocks or fails the reply.
+        self.maybe_autocapture_life_fact(&session_id, memory_candidate.as_ref())
+            .await;
+
         let plan_budget = self.plan_continuation_budget_for(&session_id);
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state, plan_followup) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
