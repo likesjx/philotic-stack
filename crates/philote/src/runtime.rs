@@ -219,10 +219,12 @@ fn role_for_tier<'a>(configured_tiers: &'a [String], tier: u8) -> &'a str {
                     .unwrap_or("model.local")
             })
     } else {
+        // Out-of-range clamp mirrors the last tier of DEFAULT_FALLBACK_TIERS
+        // (the local last resort).
         DEFAULT_FALLBACK_TIERS
             .get(idx)
             .copied()
-            .unwrap_or("model.local")
+            .unwrap_or("model.ollama")
     }
 }
 
