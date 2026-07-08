@@ -385,9 +385,24 @@ pub struct TaskErrorPayload {
     pub retryable: Option<bool>,
     /// Narrow error subtype for precise routing decisions.
     /// Values: "network_error", "streaming_timeout", "rate_limit",
-    /// "provider_error", "content_error", "empty_response".
+    /// "provider_error", "content_error", "empty_response",
+    /// "invalid_request", "provider_auth".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_kind: Option<String>,
+    /// HTTP status code from the provider, when one could be determined
+    /// (e.g. 400, 429, 503). Additive — absent from older controllers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Machine-readable escalation class so consumers don't string-parse
+    /// `message`. Values: "retry_same_provider" (transient — the same
+    /// provider may succeed on retry), "switch_provider" (the request will
+    /// fail identically on the same provider — 4xx contract errors,
+    /// refusals, rate limits), "fatal" (auth/key misconfiguration — retrying
+    /// anywhere is pointless until an operator intervenes). Additive —
+    /// absent from older controllers; consumers must keep a sub_kind/string
+    /// fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +502,8 @@ impl TaskErrorPayload {
             capability: capability.map(str::to_string),
             retryable: None,
             sub_kind: None,
+            status: None,
+            error_class: None,
         }
     }
 
@@ -506,6 +523,8 @@ impl TaskErrorPayload {
             provider: None,
             retryable: Some(false),
             sub_kind: None,
+            status: None,
+            error_class: None,
         }
     }
 
@@ -524,6 +543,8 @@ impl TaskErrorPayload {
             capability: None,
             retryable: Some(true),
             sub_kind: None,
+            status: None,
+            error_class: None,
         }
     }
 
@@ -538,6 +559,8 @@ impl TaskErrorPayload {
             capability: None,
             retryable: Some(true),
             sub_kind: None,
+            status: None,
+            error_class: None,
         }
     }
 
@@ -557,6 +580,12 @@ impl TaskErrorPayload {
         }
         if let Some(retryable) = self.retryable {
             parts.push(format!("retryable={retryable}"));
+        }
+        if let Some(status) = self.status {
+            parts.push(format!("status={status}"));
+        }
+        if let Some(error_class) = self.error_class.as_deref() {
+            parts.push(format!("error_class={error_class}"));
         }
         parts.join(" | ")
     }
@@ -2781,6 +2810,8 @@ mod tests {
             capability: Some("voice.synthesize".into()),
             retryable: Some(false),
             sub_kind: None,
+            status: None,
+            error_class: None,
         };
 
         let rendered = payload.display_message();
