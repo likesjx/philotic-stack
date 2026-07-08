@@ -1568,7 +1568,9 @@ impl GraphDomain {
     }
 
     /// Record the outcome of a single dispatch attempt, updating the profile's
-    /// latency_p50_ms (EMA α=0.25) and error_rate (EMA α=0.1).
+    /// latency_p50_ms (EMA α=0.25) and error_rate (EMA α=0.1), degrading after
+    /// N consecutive failures and recovering on the first success (the shared
+    /// state machine in [`crate::model_oracle::apply_model_outcome`]).
     pub fn observe_model_outcome(
         &self,
         model_ref: &str,
@@ -1583,37 +1585,30 @@ impl GraphDomain {
 
         let mut profile = self
             .get_model_profile(model_ref, node_id)?
-            .unwrap_or_else(|| ModelProfileRecord {
-                model_ref: model_ref.to_string(),
-                node_id: node_id.to_string(),
-                provider: model_ref.to_string(),
-                task_kinds: Vec::new(),
-                trust_tier: String::new(),
-                max_context_tokens: 0,
-                latency_p50_ms: latency_ms,
-                error_rate: 0.0,
-                status: "healthy".to_string(),
-                last_healthy_secs: 0,
-                updated_secs: now,
+            .unwrap_or_else(|| {
+                // The provider id doubles as the model_ref at this granularity;
+                // seed capability flags honestly from the provider name.
+                let (supports_tools, supports_structured) =
+                    crate::model_oracle::seed_capabilities_for_provider(model_ref);
+                ModelProfileRecord {
+                    model_ref: model_ref.to_string(),
+                    node_id: node_id.to_string(),
+                    provider: model_ref.to_string(),
+                    latency_p50_ms: latency_ms,
+                    updated_secs: now,
+                    supports_tools,
+                    supports_structured,
+                    ..Default::default()
+                }
             });
 
-        // Exponential moving averages
-        const LATENCY_ALPHA: f64 = 0.25;
-        const ERROR_ALPHA: f32 = 0.1;
-        profile.latency_p50_ms = ((1.0 - LATENCY_ALPHA) * profile.latency_p50_ms as f64
-            + LATENCY_ALPHA * latency_ms as f64) as u64;
-        let outcome = if success { 0.0f32 } else { 1.0f32 };
-        profile.error_rate = (1.0 - ERROR_ALPHA) * profile.error_rate + ERROR_ALPHA * outcome;
-
-        if success {
-            profile.last_healthy_secs = now;
-        }
-        profile.status = if profile.error_rate > 0.5 {
-            "degraded".to_string()
-        } else {
-            "healthy".to_string()
-        };
-        profile.updated_secs = now;
+        crate::model_oracle::apply_model_outcome(
+            &mut profile,
+            latency_ms,
+            success,
+            now,
+            crate::model_oracle::degrade_threshold_from_env(),
+        );
 
         self.upsert_model_profile(&profile)
     }

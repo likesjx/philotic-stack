@@ -10652,12 +10652,10 @@ impl IpcServer {
             provider: "onnx".to_string(),
             task_kinds: vec!["image.ocr".to_string(), "image.ground".to_string()],
             trust_tier: "local_experimental".to_string(),
-            max_context_tokens: 0,
-            latency_p50_ms: 0,
-            error_rate: 0.0,
-            status: "healthy".to_string(),
-            last_healthy_secs: 0,
-            updated_secs: 0,
+            // ONNX/Florence has no tool calling or JSON-contract support.
+            supports_tools: false,
+            supports_structured: false,
+            ..Default::default()
         };
         if let Err(e) = graph.upsert_model_profile(&profile) {
             return IpcResponse::error("vision_setup", "PROFILE_REGISTER_ERROR", &e.to_string());
