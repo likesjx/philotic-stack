@@ -1392,6 +1392,9 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderConfigs {
+    pub anthropic_api_key: Option<String>,
+    pub anthropic_base_url: Option<String>,
+    pub anthropic_default_model: Option<String>,
     pub gemini_api_key: Option<String>,
     pub gemini_oauth_access_token: Option<String>,
     pub gemini_oauth_project_id: Option<String>,
@@ -1419,6 +1422,19 @@ pub struct ProviderConfigs {
 impl ProviderConfigs {
     pub async fn load(ipc_client: &mut PhiloticClient) -> Result<Self> {
         Ok(Self {
+            // Endpoint-scoped vault ref / PHILOTIC_ANTHROPIC_API_KEY first;
+            // the vendor-standard bare ANTHROPIC_API_KEY is the last-resort
+            // fallback for ephemeral/CI runs.
+            anthropic_api_key: match load_provider_api_key(ipc_client, "anthropic").await? {
+                Some(key) => Some(key),
+                None => env_override("ANTHROPIC_API_KEY"),
+            },
+            anthropic_base_url: env_override("PHILOTIC_ANTHROPIC_BASE_URL").or(
+                fetch_config_string(ipc_client, "anthropic_base_url").await?,
+            ),
+            anthropic_default_model: env_override("PHILOTIC_ANTHROPIC_DEFAULT_MODEL").or(
+                fetch_config_string(ipc_client, "anthropic_default_model").await?,
+            ),
             gemini_api_key: load_provider_api_key(ipc_client, "gemini").await?,
             gemini_oauth_access_token: load_env_or_config_secret_string(
                 ipc_client,

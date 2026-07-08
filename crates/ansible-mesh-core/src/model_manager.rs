@@ -119,8 +119,35 @@ pub struct ModelCatalogProjection {
     pub trust_guidance: Vec<ModelTrustDecision>,
 }
 
+/// Conservative catalog context-window for the seeded Claude models.
+/// (Haiku 4.5 is 200K; Sonnet 5 / Opus 4.8 support up to 1M via the API —
+/// the seed records the guaranteed-everywhere floor, not the ceiling.)
+const ANTHROPIC_SEED_CONTEXT_WINDOW_TOKENS: u32 = 200_000;
+
 pub fn seeded_model_catalog() -> Vec<ModelCatalogRecord> {
+    let anthropic = {
+        let mut record = catalog_record(
+            "anthropic",
+            "anthropic-hosted",
+            "claude",
+            &[
+                "anthropic",
+                "claude-sonnet-5",
+                "claude-opus-4-8",
+                "claude-haiku-4-5-20251001",
+            ],
+            &["text", "image"],
+            &[("text.generate", 0.86), ("media.analyze", 0.8)],
+            "supported",
+        );
+        for availability in &mut record.provider_availability {
+            availability.context_window_tokens = Some(ANTHROPIC_SEED_CONTEXT_WINDOW_TOKENS);
+        }
+        record
+    };
+
     let mut records = vec![
+        anthropic,
         catalog_record(
             "gemini",
             "google-hosted",
@@ -370,6 +397,7 @@ mod tests {
             .map(|record| record.provider.as_str())
             .collect();
         for provider in [
+            "anthropic",
             "gemini",
             "openai",
             "openrouter",
@@ -380,6 +408,37 @@ mod tests {
         ] {
             assert!(providers.contains(provider), "missing {provider}");
         }
+    }
+
+    #[test]
+    fn anthropic_catalog_seeds_claude_models_with_context_windows() {
+        let catalog = seeded_model_catalog();
+        let anthropic = catalog
+            .iter()
+            .find(|record| record.provider == "anthropic")
+            .expect("anthropic catalog record");
+        assert_eq!(anthropic.provider_display_name, "Anthropic");
+        assert_eq!(anthropic.endpoint_family, "anthropic-hosted");
+        for model in [
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(
+                anthropic.model_refs.iter().any(|m| m == model),
+                "missing model ref {model}"
+            );
+            let availability = anthropic
+                .provider_availability
+                .iter()
+                .find(|a| a.model_ref == model)
+                .expect("availability row");
+            assert_eq!(availability.context_window_tokens, Some(200_000));
+        }
+        // Remote-cloud provider: lifegraph/secret-sensitivity data must not route here.
+        let decision =
+            evaluate_model_trust(anthropic, &trust_policy_for_sensitivity("lifegraph"));
+        assert!(!decision.allowed);
     }
 
     #[test]
