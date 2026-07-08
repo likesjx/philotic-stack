@@ -1334,6 +1334,15 @@ pub enum IpcRequest {
         model_profile: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window_policy: Option<String>,
+        /// Ordered model-role fallback ladder for this role incarnation.
+        /// `None` (the default when omitted) PRESERVES whatever ladder is
+        /// already on the record — every existing IPC caller that predates
+        /// this field keeps its DB-edited ladder intact instead of it being
+        /// silently wiped to empty on every reconfigure. `Some(tiers)` sets
+        /// the ladder explicitly (each tier must be a non-empty string). A
+        /// brand-new role with `None` gets `DEFAULT_FALLBACK_TIERS`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_tiers: Option<Vec<String>>,
     },
     /// Execute a governed workflow through the hotel's workflow plane.
     ExecuteWorkflow {
@@ -2925,6 +2934,61 @@ mod tests {
 
     fn test_socket_path() -> String {
         format!("/tmp/pc-{}.sock", Uuid::new_v4().simple())
+    }
+
+    #[test]
+    fn configure_role_deserializes_old_payload_without_fallback_tiers() {
+        // Wire-compat: a pre-existing caller (or a recorded fixture) that never
+        // knew about `fallback_tiers` must still deserialize cleanly, with the
+        // field defaulting to `None` (preserve semantics), not an empty Vec.
+        let old_payload = serde_json::json!({
+            "operation": "configure_role",
+            "payload": {
+                "agent_id": "agent-jane-01",
+                "role_name": "developer",
+                "guest_id": "agent-jane-01:developer",
+                "calling_role": "orchestrator",
+                "toolset_profile": "developer",
+            }
+        });
+        let req: IpcRequest = serde_json::from_value(old_payload).expect("decode legacy payload");
+        match req {
+            IpcRequest::ConfigureRole { fallback_tiers, .. } => {
+                assert_eq!(fallback_tiers, None);
+            }
+            other => panic!("expected ConfigureRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn configure_role_round_trips_fallback_tiers() {
+        let req = IpcRequest::ConfigureRole {
+            agent_id: "agent-jane-01".into(),
+            role_name: "orchestrator".into(),
+            guest_id: "agent-jane-01:orchestrator".into(),
+            calling_role: "orchestrator".into(),
+            toolset_profile: "orchestrator".into(),
+            role_identity_addendum: None,
+            role_manifest: None,
+            is_admin: false,
+            inactive_ttl_seconds: None,
+            iteration_cap: None,
+            approval_policy: None,
+            model_profile: None,
+            context_window_policy: None,
+            fallback_tiers: Some(vec!["model".into(), "model.openrouter".into()]),
+        };
+        let json = serde_json::to_value(&req).expect("serialize");
+        let decoded: IpcRequest = serde_json::from_value(json).expect("deserialize");
+        match decoded {
+            IpcRequest::ConfigureRole { fallback_tiers, .. } => {
+                assert_eq!(
+                    fallback_tiers,
+                    Some(vec!["model".to_string(), "model.openrouter".to_string()])
+                );
+            }
+            other => panic!("expected ConfigureRole, got {:?}", other),
+        }
     }
 
     #[test]

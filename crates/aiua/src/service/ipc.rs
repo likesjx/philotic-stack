@@ -5554,6 +5554,7 @@ impl IpcServer {
                 approval_policy,
                 model_profile,
                 context_window_policy,
+                fallback_tiers,
             } => {
                 Self::configure_role_record(
                     graph,
@@ -5574,6 +5575,7 @@ impl IpcServer {
                     approval_policy,
                     model_profile,
                     context_window_policy,
+                    fallback_tiers,
                 )
                 .await
             }
@@ -5660,6 +5662,13 @@ impl IpcServer {
                             .get("context_window_policy")
                             .and_then(|v| v.as_str())
                             .map(str::to_string),
+                        arguments.get("fallback_tiers").and_then(|v| {
+                            v.as_array().map(|arr| {
+                                arr.iter()
+                                    .filter_map(|t| t.as_str().map(str::to_string))
+                                    .collect::<Vec<String>>()
+                            })
+                        }),
                     )
                     .await;
                     match response {

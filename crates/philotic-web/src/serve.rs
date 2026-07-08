@@ -4959,6 +4959,10 @@ async fn ipc_patch_role(
                     .to_string()
             }))
             .filter(|policy| !policy.trim().is_empty()),
+            // This endpoint doesn't expose ladder editing yet; `None` now means
+            // "preserve" server-side (see ConfigureRole fix), so the patch no
+            // longer silently wipes a DB-edited fallback ladder.
+            fallback_tiers: None,
         })
         .await?
     {

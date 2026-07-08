@@ -1850,6 +1850,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "string",
                         "description": "Stringified JSON describing context packaging rules."
                     },
+                    "fallback_tiers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter', 'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it never clears a previously configured ladder. Pass an explicit non-empty list only when you intend to replace it."
+                    },
                     "reasoning": {
                         "type": "object",
                         "description": "Required reasoning for this role's existence, purpose, and capability posture.",
@@ -1980,6 +1985,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "context_window_policy": {
                         "type": "string",
                         "description": "Stringified JSON describing context packaging rules."
+                    },
+                    "fallback_tiers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter', 'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it never clears a previously configured ladder. Pass an explicit non-empty list only when you intend to replace it."
                     },
                     "reasoning": {
                         "type": "object",
