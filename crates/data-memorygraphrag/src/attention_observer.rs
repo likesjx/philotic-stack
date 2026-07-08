@@ -21,7 +21,7 @@ pub fn decision_to_observe_input(
     signal: &AttentionStewardSignal,
     now_iso: &str,
 ) -> Option<LifeObserveInput> {
-    match decision.response {
+    match &decision.response {
         AttentionStewardResponse::RecordObservation => {
             Some(record_observation_input(signal, now_iso))
         }
@@ -29,6 +29,14 @@ pub fn decision_to_observe_input(
             .proposed_sil_entry
             .as_ref()
             .map(|sil| propose_sil_input(sil, signal, now_iso)),
+        // Slice A5: an authorized check-in that the steward.active_checkins
+        // lane did NOT clear for push delivery (ConfirmFirst / ProposalOnly
+        // posture, exhausted budget, kill switch, or no delivery route) is
+        // written as a proposed Signal tagged `awaiting_operator_posture`
+        // instead of interrupting the operator.
+        AttentionStewardResponse::ActiveCheckIn { message, sil_ref } => Some(
+            active_checkin_awaiting_posture_input(message, sil_ref.as_deref(), signal, now_iso),
+        ),
         AttentionStewardResponse::DeferSignal | AttentionStewardResponse::UpdateSilMetadata => None,
     }
 }
@@ -130,6 +138,74 @@ fn propose_sil_input(
                 "status": sil.status,
                 "evidence_refs": sil.evidence_refs,
                 "signal_id": signal.signal_id,
+            }),
+        },
+        proposed_graph_refs: vec![],
+        observed_by: None,
+        observed_role: None,
+        edges: vec![],
+    }
+}
+
+/// Slice A5 degraded path: a gate-open check-in the autonomy lane refused to
+/// push is proposed into the LifeGraph as a Signal node awaiting operator
+/// posture review, so nothing is lost and nothing interrupts.
+fn active_checkin_awaiting_posture_input(
+    message: &str,
+    sil_ref: Option<&str>,
+    signal: &AttentionStewardSignal,
+    now_iso: &str,
+) -> LifeObserveInput {
+    // Stable node ID from signal_id so re-evaluation of the same signal is idempotent.
+    let node_id = format!("checkin:proposed:{}", signal.signal_id);
+    let ulid = Ulid::new().to_string().to_lowercase();
+    let observation_id = format!("obs:checkin:{ulid}");
+    let packet_id = format!("pkt:checkin:{ulid}");
+
+    let mut policy_tags = signal.policy_tags.clone();
+    if !policy_tags.iter().any(|t| t == "awaiting_operator_posture") {
+        policy_tags.push("awaiting_operator_posture".to_string());
+    }
+
+    LifeObserveInput {
+        observation_id,
+        evidence: EvidencePacket {
+            packet_id,
+            claim_ref: GraphRecordRef {
+                id: node_id,
+                label: "Signal".to_string(),
+                datasource: Some("life-graph".to_string()),
+            },
+            claim_summary: message.to_string(),
+            source_refs: vec![SourceRef {
+                source_id: format!("hotel:{}", signal.source_hotel),
+                source_kind: SourceKind::AgentInference,
+                reliability: SourceReliability {
+                    score: 0.75,
+                    basis: ReliabilityBasis::AgentInferred,
+                },
+                uri: None,
+                captured_at: Some(signal.observed_at.clone()),
+            }],
+            passage_refs: vec![],
+            confidence: 0.75,
+            validation_state: ValidationState::Proposed,
+            observed_at: Some(now_iso.to_string()),
+            valid_time_range: None,
+            source_reliability: 0.75,
+            conflict_ids: vec![],
+            adjudication_status: AdjudicationStatus::NotNeeded,
+            metadata: serde_json::json!({
+                "signal_type": signal.signal_type,
+                "scope": signal.scope,
+                "cadence": signal.cadence,
+                "priority": signal.priority,
+                "policy_tags": policy_tags,
+                "subject_refs": signal.subject_refs,
+                "signal_id": signal.signal_id,
+                "checkin_kind": "active_checkin",
+                "sil_ref": sil_ref,
+                "confirmed_sil_entries": signal.confirmed_sil_entries,
             }),
         },
         proposed_graph_refs: vec![],
@@ -253,6 +329,53 @@ mod tests {
         let input = decision_to_observe_input(&decision, &signal, "2026-06-04T20:01:00Z").unwrap();
         cypher::compile_observe(&input, "2026-06-04T20:01:00Z")
             .expect("Signal observe input should compile to valid Cypher");
+    }
+
+    #[test]
+    fn active_checkin_awaiting_posture_produces_tagged_signal_node() {
+        use ansible_mesh_core::attention_steward::{ACTIVE_CHECKIN_POLICY_TAG, ActivationState};
+
+        let mut signal = valid_signal();
+        signal.policy_tags.push(ACTIVE_CHECKIN_POLICY_TAG.into());
+        signal.confirmed_sil_entries = 6;
+        signal.sil_ref = Some("sil:confirmed:01jz-example".into());
+
+        let decision = AttentionStewardPolicy::default().evaluate_at_with_activation(
+            &signal,
+            &ActivationState::from_signal(&signal),
+            "2026-06-04T20:01:00Z".parse().unwrap(),
+        );
+        assert!(matches!(
+            decision.response,
+            AttentionStewardResponse::ActiveCheckIn { .. }
+        ));
+
+        let input = decision_to_observe_input(&decision, &signal, "2026-06-04T20:01:00Z")
+            .expect("degraded ActiveCheckIn should produce input");
+
+        assert_eq!(input.evidence.claim_ref.label, "Signal");
+        assert_eq!(
+            input.evidence.claim_ref.id,
+            "checkin:proposed:cron:job-42:1717531200"
+        );
+        assert_eq!(input.evidence.validation_state, ValidationState::Proposed);
+        let tags = input.evidence.metadata["policy_tags"]
+            .as_array()
+            .expect("policy_tags array");
+        assert!(tags.iter().any(|t| t == "awaiting_operator_posture"));
+        assert_eq!(
+            input.evidence.metadata["sil_ref"].as_str(),
+            Some("sil:confirmed:01jz-example")
+        );
+        assert_eq!(
+            input.evidence.metadata["checkin_kind"].as_str(),
+            Some("active_checkin")
+        );
+
+        // And it must compile to valid Cypher like the other inputs.
+        use crate::cypher;
+        cypher::compile_observe(&input, "2026-06-04T20:01:00Z")
+            .expect("awaiting-posture check-in input should compile to valid Cypher");
     }
 
     #[test]

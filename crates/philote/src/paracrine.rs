@@ -16,7 +16,8 @@ impl AgentRuntime {
         task_id: Uuid,
     ) -> Result<()> {
         use ansible_mesh_core::attention_steward::{
-            AttentionStewardPolicy, AttentionStewardResponse, AttentionStewardSignal,
+            ActivationState, AttentionStewardPolicy, AttentionStewardResponse,
+            AttentionStewardSignal,
         };
         use data_memorygraphrag::attention_observer;
 
@@ -36,12 +37,19 @@ impl AgentRuntime {
                 return Ok(());
             }
         };
-        let decision = AttentionStewardPolicy::default().evaluate_now(&attention_signal);
-        let response = match decision.response {
+        // Slice A5 activation sourcing (v0): the confirmed SIL count travels in
+        // the signal payload itself (steward cron includes it; 0 default keeps
+        // the gate closed). Counting via the life-graph runner is async/remote,
+        // so activation stays hotel-local and synchronous for now.
+        let activation = ActivationState::from_signal(&attention_signal);
+        let decision = AttentionStewardPolicy::default()
+            .evaluate_now_with_activation(&attention_signal, &activation);
+        let response = match &decision.response {
             AttentionStewardResponse::RecordObservation => "record_observation",
             AttentionStewardResponse::ProposeSilEntry => "propose_sil_entry",
             AttentionStewardResponse::UpdateSilMetadata => "update_sil_metadata",
             AttentionStewardResponse::DeferSignal => "defer_signal",
+            AttentionStewardResponse::ActiveCheckIn { .. } => "active_checkin",
         };
 
         info!(
@@ -53,6 +61,23 @@ impl AgentRuntime {
             reason = %decision.reason,
             "attention steward observed paracrine signal"
         );
+
+        // Slice A5: an authorized check-in consults the hotel's
+        // steward.active_checkins autonomy lane. AutoWithAudit (budget
+        // available) → deliver as an OOB push to the session's membrane, the
+        // same way the turn watchdog surfaces its "I got stuck" notice.
+        // ConfirmFirst / ProposalOnly / budget exhausted / kill switch / no
+        // route → fall through to the fire-and-forget life.observe path below,
+        // which writes the check-in as a proposed Signal tagged
+        // `awaiting_operator_posture`.
+        if let AttentionStewardResponse::ActiveCheckIn { message, sil_ref } = &decision.response {
+            if self
+                .try_deliver_steward_checkin(&attention_signal, message, sil_ref.as_deref())
+                .await
+            {
+                return Ok(());
+            }
+        }
 
         let now_iso = chrono::Utc::now().to_rfc3339();
         if let Some(observe_input) =
@@ -82,6 +107,187 @@ impl AgentRuntime {
         }
 
         Ok(())
+    }
+
+    /// Attempt AutoWithAudit push delivery of an earned steward check-in
+    /// (Slice A5). Returns `true` only when the check-in was actually pushed —
+    /// any refusal (no delivery route, lane posture below AutoWithAudit,
+    /// exhausted daily budget, frozen lane, kill switch, IPC failure) returns
+    /// `false` so the caller degrades to the `awaiting_operator_posture`
+    /// life.observe path.
+    async fn try_deliver_steward_checkin(
+        &mut self,
+        signal: &ansible_mesh_core::attention_steward::AttentionStewardSignal,
+        message: &str,
+        sil_ref: Option<&str>,
+    ) -> bool {
+        use ansible_mesh_core::autonomy::LANE_STEWARD_ACTIVE_CHECKINS;
+
+        // Resolve the delivery route BEFORE consuming budget so an
+        // undeliverable check-in never burns an autonomy action.
+        let Some((session_id, chat_id, target_node, target_role, target_guest_id)) =
+            self.steward_checkin_route()
+        else {
+            warn!(
+                signal_id = %signal.signal_id,
+                "steward check-in has no membrane delivery route; degrading to awaiting_operator_posture"
+            );
+            return false;
+        };
+
+        let consume = self
+            .ipc_client
+            .send_request(IpcRequest::ConsumeAutonomyAction {
+                lane: LANE_STEWARD_ACTIVE_CHECKINS.into(),
+                action_summary: format!("steward active check-in for signal {}", signal.signal_id),
+                evidence: format!(
+                    "confirmed_sil_entries={}; sil_ref={}; message={}",
+                    signal.confirmed_sil_entries,
+                    sil_ref.unwrap_or("-"),
+                    message,
+                ),
+                reversal_hint: "operator dismissal/reversal demotes lane \
+                                steward.active_checkins one posture level \
+                                (record_outcome OperatorReversal)"
+                    .into(),
+            })
+            .await;
+
+        let (allowed, posture, reason) = match &consume {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => (
+                data.get("allowed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                data.get("posture")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                data.get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            Ok(other) => {
+                warn!(
+                    signal_id = %signal.signal_id,
+                    response = ?other,
+                    "steward check-in: unexpected ConsumeAutonomyAction response; degrading"
+                );
+                (false, "unknown".into(), "unexpected_response".into())
+            }
+            Err(e) => {
+                warn!(
+                    signal_id = %signal.signal_id,
+                    error = %e,
+                    "steward check-in: ConsumeAutonomyAction IPC failed; degrading"
+                );
+                (false, "unknown".into(), "ipc_error".into())
+            }
+        };
+
+        if !allowed {
+            info!(
+                signal_id = %signal.signal_id,
+                posture = %posture,
+                reason = %reason,
+                "steward check-in not cleared for push; writing awaiting_operator_posture signal"
+            );
+            return false;
+        }
+
+        // AutoWithAudit + budget consumed: push the check-in out-of-band via
+        // the session's membrane (same emit shape as the watchdog notice).
+        let notify_req = IpcRequest::EmitTask {
+            target_node,
+            target_role,
+            target_guest_id,
+            task_json: serde_json::json!({
+                "action": "send_reply",
+                "session_id": session_id,
+                "turn_id": "",
+                "chat_id": chat_id,
+                "content": message,
+                "final": true,
+            })
+            .to_string(),
+        };
+        match self.ipc_client.send_request(notify_req).await {
+            Ok(_) => {
+                info!(
+                    signal_id = %signal.signal_id,
+                    session_id = %session_id,
+                    sil_ref = sil_ref.unwrap_or("-"),
+                    "steward active check-in delivered via steward.active_checkins lane"
+                );
+                true
+            }
+            Err(e) => {
+                // Budget already consumed and audited hotel-side; surface the
+                // failure but still degrade so the check-in is not lost.
+                warn!(
+                    signal_id = %signal.signal_id,
+                    error = %e,
+                    "steward check-in push failed after budget consume; degrading"
+                );
+                false
+            }
+        }
+    }
+
+    /// Pick the membrane delivery route for a steward check-in: the most
+    /// recently active session with a derivable chat, preferring direct
+    /// (non-group) Telegram chats. Chat id comes from the active turn when one
+    /// exists, else from the `telegram:{chat_id}:…` session id shape. Returns
+    /// `(session_id, chat_id, target_node, target_role, target_guest_id)`.
+    fn steward_checkin_route(&self) -> Option<(String, String, String, String, Option<String>)> {
+        let mut best: Option<(bool, u64, String, String)> = None; // (is_direct, recency, sid, chat)
+        for (session_id, state) in &self.sessions {
+            let chat_id = state
+                .active_turn
+                .as_ref()
+                .map(|t| t.chat_id.clone())
+                .filter(|c| !c.is_empty())
+                .or_else(|| {
+                    session_id
+                        .strip_prefix("telegram:")
+                        .and_then(|rest| rest.split(':').next())
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_string)
+                });
+            let Some(chat_id) = chat_id else { continue };
+            let is_direct = !chat_id.starts_with('-');
+            let recency = if state.active_turn.is_some() {
+                u64::MAX
+            } else {
+                state.recent_turns.last().map(|t| t.created_at).unwrap_or(0)
+            };
+            let better = match &best {
+                None => true,
+                Some((best_direct, best_recency, _, _)) => {
+                    (is_direct, recency) > (*best_direct, *best_recency)
+                }
+            };
+            if better {
+                best = Some((is_direct, recency, session_id.clone(), chat_id));
+            }
+        }
+        let (_, _, session_id, chat_id) = best?;
+        let target = self
+            .sessions
+            .get(&session_id)
+            .expect("session exists")
+            .resolved_transport_reply_target(local_node_id(), "membrane", None);
+        Some((
+            session_id,
+            chat_id,
+            target.target_node,
+            target.target_role,
+            target.target_guest_id,
+        ))
     }
 
     /// Lookaside routing reflex — dispatches an incoming `paracrine_response`
@@ -922,6 +1128,318 @@ mod tests {
     use crate::protocol::{InboundTaskPayload, ToolExecutionPayload};
     use crate::session::PARACRINE_WHISPER_PROMPT_MAX_CHARS;
     use uuid::Uuid;
+
+    /// Stub hotel like `run_recording_hotel`, but answers
+    /// `ConsumeAutonomyAction` with a configurable grant decision and records
+    /// the consultation alongside emitted tasks.
+    async fn run_grant_hotel(
+        listener: tokio::net::UnixListener,
+        emitted: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        allow: bool,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        loop {
+            let buf = match async {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await?;
+                Ok::<_, std::io::Error>(buf)
+            }
+            .await
+            {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+
+            let req: philotic_client::IpcRequest =
+                serde_json::from_slice(&buf).expect("decode request");
+            let reply = match &req {
+                philotic_client::IpcRequest::GetConfig { key } => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::ConfigData {
+                        key: key.clone(),
+                        value_json: None,
+                    })
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::ConsumeAutonomyAction {
+                    lane,
+                    action_summary,
+                    ..
+                } => {
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "consume_autonomy_action": {
+                            "lane": lane,
+                            "action_summary": action_summary,
+                        },
+                    }));
+                    let data = if allow {
+                        serde_json::json!({
+                            "allowed": true,
+                            "posture": "auto_with_audit",
+                            "audit_id": "autonomy_action:test",
+                        })
+                    } else {
+                        serde_json::json!({
+                            "allowed": false,
+                            "posture": "confirm_first",
+                            "reason": "posture_requires_confirmation",
+                        })
+                    };
+                    serde_json::to_vec(&philotic_client::IpcResponse::success(
+                        "consume_autonomy_action",
+                        Some(data),
+                    ))
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::EmitTask {
+                    target_node,
+                    target_role,
+                    target_guest_id,
+                    task_json,
+                } => {
+                    let task: serde_json::Value =
+                        serde_json::from_str(task_json).unwrap_or(serde_json::Value::Null);
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "target_node": target_node,
+                        "target_role": target_role,
+                        "target_guest_id": target_guest_id,
+                        "task": task,
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+                _ => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+            };
+
+            let len = u32::try_from(reply.len()).expect("frame length fits u32");
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .expect("write header");
+            stream.write_all(&reply).await.expect("write payload");
+        }
+    }
+
+    fn checkin_signal_json(confirmed_sil_entries: u32) -> serde_json::Value {
+        serde_json::json!({
+            "signal_id": "cron:steward-1:1000",
+            "signal_type": "open_loop_staleness",
+            "scope": "personal",
+            "source_hotel": "test-hotel",
+            "target_role_type": "attention-steward",
+            "subject_refs": ["lifegraph:open_loop"],
+            "cadence": "daily",
+            "priority": "medium",
+            "observed_at": "2026-06-04T20:00:00Z",
+            "expires_at": null,
+            "payload_summary": "Gentle nudge: the dentist form is still open.",
+            "policy_tags": ["active_checkin"],
+            "confirmed_sil_entries": confirmed_sil_entries,
+            "sil_ref": "sil:confirmed:01jz-example",
+        })
+    }
+
+    async fn steward_runtime(
+        socket_path: &str,
+    ) -> (
+        AgentRuntime,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let listener = tokio::net::UnixListener::bind(socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_grant_hotel(listener, emitted.clone(), true));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-steward".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-steward");
+        // A telegram session whose id encodes the chat gives the check-in a
+        // delivery route even with no active turn.
+        runtime
+            .ensure_session_loaded("telegram:555:jane", "telegram")
+            .await
+            .expect("session load");
+        (runtime, server, emitted)
+    }
+
+    /// Gate open + AutoWithAudit grant: the check-in is pushed to the
+    /// session's membrane via the OOB send_reply path, budget consultation
+    /// goes through lane steward.active_checkins, and no life.observe write
+    /// happens (the hotel-side audit record is the ledger).
+    #[tokio::test]
+    async fn earned_checkin_with_auto_grant_pushes_to_membrane() {
+        let socket_path = format!("/tmp/philote-steward-a-{}.sock", Uuid::new_v4().simple());
+        let (mut runtime, server, emitted) = steward_runtime(&socket_path).await;
+
+        runtime
+            .handle_paracrine_signal(
+                InboundTaskPayload {
+                    action: Some("paracrine_signal".into()),
+                    paracrine_signal: Some(checkin_signal_json(6)),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handle signal");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let consult = emitted
+            .iter()
+            .find(|e| e.get("consume_autonomy_action").is_some())
+            .expect("grant consulted");
+        assert_eq!(
+            consult["consume_autonomy_action"]["lane"],
+            "steward.active_checkins"
+        );
+        let push = emitted
+            .iter()
+            .find(|e| e["task"]["action"] == "send_reply")
+            .expect("check-in pushed to membrane");
+        assert_eq!(push["target_role"], "membrane");
+        assert_eq!(push["task"]["chat_id"], "555");
+        assert_eq!(
+            push["task"]["content"],
+            "Gentle nudge: the dentist form is still open."
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|e| e["task"]["tool_name"] == "life.observe"),
+            "delivered check-in must not also write life.observe: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Gate open but the lane refuses (ConfirmFirst posture): no push —
+    /// the check-in degrades to a life.observe proposed Signal tagged
+    /// awaiting_operator_posture.
+    #[tokio::test]
+    async fn earned_checkin_below_auto_posture_degrades_to_observe() {
+        let socket_path = format!("/tmp/philote-steward-b-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_grant_hotel(listener, emitted.clone(), false));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-steward".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-steward");
+        runtime
+            .ensure_session_loaded("telegram:555:jane", "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_paracrine_signal(
+                InboundTaskPayload {
+                    action: Some("paracrine_signal".into()),
+                    paracrine_signal: Some(checkin_signal_json(6)),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handle signal");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e.get("consume_autonomy_action").is_some()),
+            "grant must be consulted"
+        );
+        assert!(
+            !emitted.iter().any(|e| e["task"]["action"] == "send_reply"),
+            "ConfirmFirst posture must not push: {:#?}",
+            *emitted
+        );
+        let observe = emitted
+            .iter()
+            .find(|e| e["task"]["tool_name"] == "life.observe")
+            .expect("degraded check-in writes life.observe");
+        assert_eq!(observe["target_role"], "life-graph-runner");
+        let claim_id = observe["task"]["arguments"]["evidence"]["claim_ref"]["id"]
+            .as_str()
+            .expect("claim id");
+        assert!(
+            claim_id.starts_with("checkin:proposed:"),
+            "expected proposed check-in node, got {claim_id}"
+        );
+        let tags = observe["task"]["arguments"]["evidence"]["metadata"]["policy_tags"]
+            .as_array()
+            .expect("policy tags");
+        assert!(tags.iter().any(|t| t == "awaiting_operator_posture"));
+    }
+
+    /// Gate closed (confirmed SIL entries below threshold): even with a
+    /// would-allow grant, the policy degrades to a plain RecordObservation —
+    /// the lane is never consulted and nothing is pushed.
+    #[tokio::test]
+    async fn checkin_below_sil_threshold_never_consults_lane() {
+        let socket_path = format!("/tmp/philote-steward-c-{}.sock", Uuid::new_v4().simple());
+        let (mut runtime, server, emitted) = steward_runtime(&socket_path).await;
+
+        runtime
+            .handle_paracrine_signal(
+                InboundTaskPayload {
+                    action: Some("paracrine_signal".into()),
+                    paracrine_signal: Some(checkin_signal_json(4)),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handle signal");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            !emitted
+                .iter()
+                .any(|e| e.get("consume_autonomy_action").is_some()),
+            "closed gate must not consult the lane: {:#?}",
+            *emitted
+        );
+        assert!(!emitted.iter().any(|e| e["task"]["action"] == "send_reply"));
+        let observe = emitted
+            .iter()
+            .find(|e| e["task"]["tool_name"] == "life.observe")
+            .expect("closed gate still records the observation");
+        let claim_id = observe["task"]["arguments"]["evidence"]["claim_ref"]["id"]
+            .as_str()
+            .expect("claim id");
+        assert!(
+            claim_id.starts_with("signal:paracrine:"),
+            "expected plain observation node, got {claim_id}"
+        );
+    }
 
     /// Succinctness budget: a `delegate.whisper` prompt longer than
     /// `PARACRINE_WHISPER_PROMPT_MAX_CHARS` must be truncated (with an explicit
