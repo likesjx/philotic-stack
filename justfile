@@ -133,6 +133,9 @@ kill-local-stack:
     @pkill -KILL -f "target/debug/model-controller-gemini" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-elevenlabs" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-openrouter" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-anthropic" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-openai" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-ollama" 2>/dev/null || true
     @pkill -KILL -f "target/debug/tool-runner" 2>/dev/null || true
     @pkill -KILL -f "target/debug/graph-runner" 2>/dev/null || true
     @pkill -KILL -f "target/debug/graph-datasource" 2>/dev/null || true
@@ -473,7 +476,7 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
+    AIUA_BINS="aiua philote membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-anthropic model-controller-openai model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
     echo "▶ Building release binaries..."
     cargo build --release -p aiua -p philote -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
