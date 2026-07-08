@@ -1425,7 +1425,10 @@ impl ProviderConfigs {
             // Endpoint-scoped vault ref / PHILOTIC_ANTHROPIC_API_KEY first;
             // the vendor-standard bare ANTHROPIC_API_KEY is the last-resort
             // fallback for ephemeral/CI runs.
-            anthropic_api_key: match load_provider_api_key(ipc_client, "anthropic").await? {
+            anthropic_api_key: match isolate_provider_key_failure(
+                "anthropic",
+                load_provider_api_key(ipc_client, "anthropic").await,
+            ) {
                 Some(key) => Some(key),
                 None => env_override("ANTHROPIC_API_KEY"),
             },
@@ -1433,15 +1436,21 @@ impl ProviderConfigs {
                 .or(fetch_config_string(ipc_client, "anthropic_base_url").await?),
             anthropic_default_model: env_override("PHILOTIC_ANTHROPIC_DEFAULT_MODEL")
                 .or(fetch_config_string(ipc_client, "anthropic_default_model").await?),
-            gemini_api_key: load_provider_api_key(ipc_client, "gemini").await?,
-            gemini_oauth_access_token: load_env_or_config_secret_string(
-                ipc_client,
-                "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN",
-                "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN_REF",
-                "gemini_oauth_access_token",
-                "gemini_oauth_access_token_ref",
-            )
-            .await?,
+            gemini_api_key: isolate_provider_key_failure(
+                "gemini",
+                load_provider_api_key(ipc_client, "gemini").await,
+            ),
+            gemini_oauth_access_token: isolate_provider_key_failure(
+                "gemini_oauth",
+                load_env_or_config_secret_string(
+                    ipc_client,
+                    "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN",
+                    "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN_REF",
+                    "gemini_oauth_access_token",
+                    "gemini_oauth_access_token_ref",
+                )
+                .await,
+            ),
             gemini_oauth_project_id: env_override("PHILOTIC_GEMINI_OAUTH_PROJECT_ID")
                 .or(fetch_config_string(ipc_client, "gemini_oauth_project_id").await?),
             gemini_base_url: env_override("PHILOTIC_GEMINI_BASE_URL").or(fetch_config_string(
@@ -1449,7 +1458,10 @@ impl ProviderConfigs {
                 "gemini_base_url",
             )
             .await?),
-            elevenlabs_api_key: load_provider_api_key(ipc_client, "elevenlabs").await?,
+            elevenlabs_api_key: isolate_provider_key_failure(
+                "elevenlabs",
+                load_provider_api_key(ipc_client, "elevenlabs").await,
+            ),
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
             ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL").or(fetch_config_string(
@@ -1462,15 +1474,21 @@ impl ProviderConfigs {
                 "ollama_model",
             )
             .await?),
-            openai_oauth_access_token: load_env_or_config_secret_string(
-                ipc_client,
-                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
-                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN_REF",
-                "openai_oauth_access_token",
-                "openai_oauth_access_token_ref",
-            )
-            .await?,
-            openai_api_key: load_provider_api_key(ipc_client, "openai").await?,
+            openai_oauth_access_token: isolate_provider_key_failure(
+                "openai_oauth",
+                load_env_or_config_secret_string(
+                    ipc_client,
+                    "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
+                    "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN_REF",
+                    "openai_oauth_access_token",
+                    "openai_oauth_access_token_ref",
+                )
+                .await,
+            ),
+            openai_api_key: isolate_provider_key_failure(
+                "openai",
+                load_provider_api_key(ipc_client, "openai").await,
+            ),
             openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL").or(fetch_config_string(
                 ipc_client,
                 "openai_base_url",
@@ -1485,7 +1503,10 @@ impl ProviderConfigs {
                 .or(fetch_config_string(ipc_client, "openai_default_model").await?),
             openai_default_embedding_model: env_override("PHILOTIC_OPENAI_DEFAULT_EMBEDDING_MODEL")
                 .or(fetch_config_string(ipc_client, "openai_default_embedding_model").await?),
-            openrouter_api_key: load_provider_api_key(ipc_client, "openrouter").await?,
+            openrouter_api_key: isolate_provider_key_failure(
+                "openrouter",
+                load_provider_api_key(ipc_client, "openrouter").await,
+            ),
             openrouter_base_url: env_override("PHILOTIC_OPENROUTER_BASE_URL")
                 .or(fetch_config_string(ipc_client, "openrouter_base_url").await?),
             openrouter_default_model: env_override("PHILOTIC_OPENROUTER_DEFAULT_MODEL")
@@ -1839,6 +1860,32 @@ async fn load_provider_api_key_by_spec(
 /// load (which would silently break voice synthesis). Only the "is not
 /// accessible" ACL case is softened; every other failure (decrypt, transport,
 /// malformed response, or a denial of the controller's *own* key) stays fatal.
+/// Isolate a per-provider key-fetch failure so it cannot sink the whole
+/// provider-config refresh.
+///
+/// `ProviderConfigs::load` reloads *every* provider's key on each task. Before
+/// this guard, a single undecryptable vault row (e.g. a stale `openai_api_key`
+/// encrypted under a rotated master key) hard-failed the entire refresh and
+/// took down ALL providers — a bad OpenAI key broke Gemini turns. Instead, the
+/// failed provider's key degrades to `None` (its own dispatch path will report
+/// "provider not configured" and tiered fallback can escalate) while every
+/// other provider stays live. The failure is logged at ERROR so it stays
+/// visible. Transport-level IPC failures still fail the overall load through
+/// the plain-config fetches, which remain fatal.
+fn isolate_provider_key_failure(provider: &str, result: Result<Option<String>>) -> Option<String> {
+    match result {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::error!(
+                provider,
+                error = %err,
+                "Provider key fetch failed during config refresh; continuing without this provider so the others stay live"
+            );
+            None
+        }
+    }
+}
+
 async fn fetch_provider_secret_soft_on_denial(
     ipc_client: &mut PhiloticClient,
     secret_ref: &str,
@@ -2582,5 +2629,30 @@ mod tests {
 
         assert!(payload.contains("\"kind\":\"audio_artifact\""));
         assert!(payload.contains("\"audio_base64\":\"aGVsbG8=\""));
+    }
+
+    #[test]
+    fn isolate_provider_key_failure_passes_through_success() {
+        assert_eq!(
+            super::isolate_provider_key_failure("gemini", Ok(Some("key-123".into()))),
+            Some("key-123".to_string())
+        );
+        assert_eq!(
+            super::isolate_provider_key_failure("gemini", Ok(None)),
+            None
+        );
+    }
+
+    #[test]
+    fn isolate_provider_key_failure_degrades_errors_to_none() {
+        // A single undecryptable vault row (e.g. a stale openai key encrypted
+        // under a rotated master key) must not sink the whole config refresh.
+        let result = super::isolate_provider_key_failure(
+            "openai",
+            Err(anyhow::anyhow!(
+                "secret fetch failed: failed to decrypt vault secret"
+            )),
+        );
+        assert_eq!(result, None);
     }
 }
