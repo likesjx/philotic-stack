@@ -1842,6 +1842,50 @@ pub enum IpcRequest {
         #[serde(default)]
         evidence_lines: Vec<String>,
     },
+    /// Guest → hotel: ask permission to take one autonomous action on an
+    /// autonomy lane (Autopoiesis Slice A2; A1 grant machinery, lane
+    /// `graph.bridge_edges` first).
+    ///
+    /// The hotel consults the lane kill switch, the per-lane `AutonomyGrant`
+    /// posture, freeze state, and daily action budget — exactly the A3
+    /// shape — and, for ConfirmFirst/AutoWithAudit postures, writes a
+    /// Pending `autonomy_audit` record from `action_summary` / `evidence` /
+    /// `reversal_hint` before answering.
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{allowed, posture, audit_id?, reason?}`:
+    /// - `allowed=true, posture="auto_with_audit", audit_id` → act now.
+    /// - `allowed=false, posture="confirm_first", audit_id` → file the
+    ///   ready-to-apply spec as `awaiting_confirmation`; the operator's
+    ///   confirmation applies it and reports the outcome.
+    /// - `allowed=false` with no `audit_id` (posture `proposal_only`, lane
+    ///   disabled/frozen, or budget exhausted — see `reason`) → prose-only.
+    ///
+    /// No new `IpcResponse` variant — the untagged-ordering invariant
+    /// (all-optional variants like `MemoryConfig` stay last) is untouched.
+    ConsumeAutonomyAction {
+        lane: String,
+        action_summary: String,
+        evidence: String,
+        reversal_hint: String,
+    },
+    /// Operator/steward → hotel: report the reviewed outcome of an audited
+    /// autonomous action so the lane earns (or loses) trust (Autopoiesis
+    /// Slice A2; feeds A1's `record_autonomy_outcome`).
+    ///
+    /// `outcome` is `"confirmed_good"` or `"reversed"`. The hotel stamps the
+    /// `autonomy_audit` record and applies the grant transition (promotion /
+    /// demotion / failure-streak bookkeeping). Recording is idempotent: a
+    /// second report against an already-reviewed audit id is refused with
+    /// `recorded=false, reason="already_recorded"` so one confirmation can
+    /// never double-count toward promotion.
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{recorded, lane?, transition?, posture?, reason?}`.
+    RecordAutonomyOutcome {
+        audit_id: String,
+        outcome: String,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
@@ -3361,6 +3405,86 @@ mod tests {
                 let data = data.expect("data");
                 assert_eq!(data["filed"], true);
                 assert_eq!(data["work_item_id"], "wi-1");
+            }
+            other => panic!("expected Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn autonomy_action_requests_serde_round_trip() {
+        // Slice A2 variants live at the END of IpcRequest and respond with
+        // Standard only — no new IpcResponse variant, so the untagged-ordering
+        // invariant (all-optional variants like MemoryConfig stay last) holds.
+        let req = IpcRequest::ConsumeAutonomyAction {
+            lane: "graph.bridge_edges".into(),
+            action_summary: "bridge 2 RELATES_TO edge(s)".into(),
+            evidence: "feedback_id=feedback:recall:1 rating=Disconnected".into(),
+            reversal_hint: "MATCH ()-[r:RELATES_TO {feedback_signal_id: 'f1'}]-() DELETE r".into(),
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"consume_autonomy_action\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::ConsumeAutonomyAction {
+                lane,
+                action_summary,
+                evidence,
+                reversal_hint,
+            } => {
+                assert_eq!(lane, "graph.bridge_edges");
+                assert!(action_summary.contains("RELATES_TO"));
+                assert!(evidence.contains("Disconnected"));
+                assert!(reversal_hint.contains("DELETE r"));
+            }
+            other => panic!("expected ConsumeAutonomyAction, got {other:?}"),
+        }
+
+        let req = IpcRequest::RecordAutonomyOutcome {
+            audit_id: "autonomy:graph.bridge_edges:abc".into(),
+            outcome: "confirmed_good".into(),
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"record_autonomy_outcome\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::RecordAutonomyOutcome { audit_id, outcome } => {
+                assert_eq!(audit_id, "autonomy:graph.bridge_edges:abc");
+                assert_eq!(outcome, "confirmed_good");
+            }
+            other => panic!("expected RecordAutonomyOutcome, got {other:?}"),
+        }
+
+        // Pre-existing request shapes are unaffected by the appended variants.
+        let old = serde_json::json!({
+            "operation": "file_heal_work_item",
+            "payload": {
+                "pattern_tag": "panic",
+                "guest_id": "philote-01",
+                "occurrence_count": 1,
+                "window_secs": 900,
+            }
+        });
+        let back: IpcRequest = serde_json::from_value(old).expect("old request");
+        assert!(matches!(back, IpcRequest::FileHealWorkItem { .. }));
+
+        // The consult response is a plain Standard ack carrying the decision.
+        let resp = serde_json::json!({
+            "ok": true,
+            "code": "OK",
+            "message": "Success",
+            "corr_id": "consume_autonomy_action",
+            "data": {
+                "allowed": false,
+                "posture": "confirm_first",
+                "audit_id": "autonomy:graph.bridge_edges:abc"
+            }
+        });
+        let back: IpcResponse = serde_json::from_value(resp).expect("response");
+        match back {
+            IpcResponse::Standard { ok: true, data, .. } => {
+                let data = data.expect("data");
+                assert_eq!(data["allowed"], false);
+                assert_eq!(data["posture"], "confirm_first");
             }
             other => panic!("expected Standard, got {other:?}"),
         }

@@ -6,12 +6,12 @@ use data_memorygraphrag::entanglement;
 use data_memorygraphrag::projection;
 use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
-    AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, GraphRecordRef,
-    LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchProposalInput,
-    LifeResolveInput, MemoryGraphRagRunner, PatchKind, PatchRisk, PolicyFilter, RankingWeights,
-    ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery,
-    RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef,
-    SourceReliability, ValidationState,
+    AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
+    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchApplyInput,
+    LifePatchProposalInput, LifeResolveInput, MemoryGraphRagRunner, PatchApplyDecision, PatchGate,
+    PatchKind, PatchRisk, PolicyFilter, RankingWeights, ReliabilityBasis, RetrievalFeedbackInput,
+    RetrievalFeedbackRating, RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget,
+    SemanticSpace, SourceKind, SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
 };
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
 use neo4rs::{
@@ -20,6 +20,7 @@ use neo4rs::{
 };
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Default minimum cosine similarity gate for the named recall strategies.
@@ -203,9 +204,162 @@ impl MemgraphConfig {
     }
 }
 
+// ── Autonomy gate (Autopoiesis Slice A2, lane graph.bridge_edges) ────────────
+
+/// The hotel's answer to a `ConsumeAutonomyAction` consult.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutonomyDecision {
+    pub allowed: bool,
+    pub posture: Option<String>,
+    pub audit_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl AutonomyDecision {
+    fn from_response_data(data: &Value) -> Self {
+        let get = |key: &str| {
+            data.get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+        };
+        Self {
+            allowed: data
+                .get("allowed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            posture: get("posture"),
+            audit_id: get("audit_id"),
+            reason: get("reason"),
+        }
+    }
+}
+
+/// How the runner reaches the hotel's autonomy grant machinery. The runner is
+/// a guest — it never touches `GraphDomain` directly; it asks over IPC and
+/// the hotel owns the decision (kill switch, posture, budget, audit).
+#[async_trait]
+pub trait AutonomyGate: Send + Sync {
+    async fn consume_action(
+        &self,
+        lane: &str,
+        action_summary: &str,
+        evidence: &str,
+        reversal_hint: &str,
+    ) -> Result<AutonomyDecision>;
+
+    /// Report an operator-reviewed outcome (`"confirmed_good"` |
+    /// `"reversed"`) against a hotel audit id.
+    async fn record_outcome(&self, audit_id: &str, outcome: &str) -> Result<Value>;
+}
+
+/// Production [`AutonomyGate`]: a short-lived hotel IPC connection per
+/// consult. Registers under the side role `"autonomy-consult"` — nothing
+/// routes tasks to that role, so the ephemeral connection can never steal
+/// inbox work from the runner's main controller connection.
+pub struct HotelAutonomyGate;
+
+impl HotelAutonomyGate {
+    async fn hotel_request(req: philotic_client::IpcRequest) -> Result<Value> {
+        use philotic_client::{GuestIdentity, IpcResponse, PhiloticClient};
+
+        let runner_id = std::env::var("PHILOTIC_LIFE_GRAPH_RUNNER_ID")
+            .or_else(|_| std::env::var("PHILOTIC_GRAPH_RUNNER_ID"))
+            .unwrap_or_else(|_| "life-graph-runner".to_string());
+        let identity = GuestIdentity {
+            guest_id: format!("{runner_id}-autonomy"),
+            role: "autonomy-consult".to_string(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .context("autonomy consult: hotel IPC connect failed")?;
+        match client.send_request(req).await? {
+            IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            } => Ok(data),
+            IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            } => anyhow::bail!("autonomy consult refused by hotel: {code}: {message}"),
+            other => anyhow::bail!("autonomy consult: unexpected hotel response: {other:?}"),
+        }
+    }
+}
+
+#[async_trait]
+impl AutonomyGate for HotelAutonomyGate {
+    async fn consume_action(
+        &self,
+        lane: &str,
+        action_summary: &str,
+        evidence: &str,
+        reversal_hint: &str,
+    ) -> Result<AutonomyDecision> {
+        let data = Self::hotel_request(philotic_client::IpcRequest::ConsumeAutonomyAction {
+            lane: lane.to_string(),
+            action_summary: action_summary.to_string(),
+            evidence: evidence.to_string(),
+            reversal_hint: reversal_hint.to_string(),
+        })
+        .await?;
+        Ok(AutonomyDecision::from_response_data(&data))
+    }
+
+    async fn record_outcome(&self, audit_id: &str, outcome: &str) -> Result<Value> {
+        Self::hotel_request(philotic_client::IpcRequest::RecordAutonomyOutcome {
+            audit_id: audit_id.to_string(),
+            outcome: outcome.to_string(),
+        })
+        .await
+    }
+}
+
+/// What the runner does with the derived edge specs, by hotel posture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BridgeAction {
+    /// AutoWithAudit: MERGE the edges now; the audit record is the ledger.
+    ApplyNow { audit_id: String },
+    /// ConfirmFirst: do NOT write — file the patch `awaiting_confirmation`
+    /// with the ready-to-apply specs embedded; `life.patch.apply` executes
+    /// them on operator confirm.
+    AwaitConfirmation { audit_id: String },
+    /// ProposalOnly / lane disabled / frozen / budget exhausted /
+    /// consult unavailable: prose-only patch, exactly as before Slice A2.
+    ProseOnly { reason: String },
+}
+
+/// Pure mapping from the hotel's decision to the runner's behavior.
+/// Fail-safe: anything malformed (missing audit id, unknown posture)
+/// degrades to prose-only — the loop never writes without a granted posture
+/// AND an audit anchor.
+fn plan_bridge_action(decision: &AutonomyDecision) -> BridgeAction {
+    let posture = decision.posture.as_deref().unwrap_or("");
+    match (decision.allowed, posture, decision.audit_id.as_ref()) {
+        (true, "auto_with_audit", Some(audit_id)) => BridgeAction::ApplyNow {
+            audit_id: audit_id.clone(),
+        },
+        (false, "confirm_first", Some(audit_id)) => BridgeAction::AwaitConfirmation {
+            audit_id: audit_id.clone(),
+        },
+        _ => BridgeAction::ProseOnly {
+            reason: decision
+                .reason
+                .clone()
+                .or_else(|| decision.posture.clone().map(|p| format!("posture_{p}")))
+                .unwrap_or_else(|| "no_grant".to_string()),
+        },
+    }
+}
+
 pub struct LifeGraphProvider {
     config: MemgraphConfig,
     runner: MemoryGraphRagRunner,
+    autonomy: Arc<dyn AutonomyGate>,
 }
 
 impl LifeGraphProvider {
@@ -218,6 +372,7 @@ impl LifeGraphProvider {
                 datasource_id,
                 default_embedding_model: "text-embedding-3-small".to_string(),
             }),
+            autonomy: Arc::new(HotelAutonomyGate),
         }
     }
 
@@ -266,6 +421,7 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.resolve" | "life.conflict.resolve" => self.handle_resolve(task).await,
             "life.conflict" | "life.conflict.handle" => self.handle_conflict(task).await,
             "life.patch.propose" => self.handle_patch_propose(task).await,
+            "life.patch.apply" => self.handle_patch_apply(task).await,
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -972,11 +1128,60 @@ impl LifeGraphProvider {
         let mut rows = graph.execute(q).await?;
         let _ = rows.next().await?;
 
-        let generated_patch = recall_feedback_patch_proposal(&input);
+        // ── Feedback-to-action (Autopoiesis Slice A2) ─────────────────────
+        // SafeAutoUpdate feedback whose remedy is structural and unambiguous
+        // (disconnected/missing with an anchor + candidate node ids) is
+        // routed through the hotel's graph.bridge_edges autonomy lane. The
+        // patch node is always written — it is the audit trail's evidence —
+        // but its status and embedded edge specs depend on the lane posture.
+        let mut generated_patch = recall_feedback_patch_proposal(&input);
+        let mut bridge_summary: Option<Value> = None;
+        let mut patch_status = cypher::PATCH_STATUS_PROPOSED;
+        if let Some(patch) = generated_patch.as_mut() {
+            let specs = feedback_edge_specs(&input, &now);
+            if patch.risk.gate() == PatchGate::SafeAutoUpdate && !specs.is_empty() {
+                let action = self.consult_bridge_lane(&input, &specs).await;
+                match action {
+                    BridgeAction::ApplyNow { audit_id } => {
+                        let (edges_written, missing_targets) =
+                            Self::execute_bridge_edges(&graph, &specs).await?;
+                        patch.edge_specs = specs;
+                        patch.autonomy_audit_id = Some(audit_id.clone());
+                        patch_status = cypher::PATCH_STATUS_APPLIED;
+                        bridge_summary = Some(json!({
+                            "action": "applied",
+                            "audit_id": audit_id,
+                            "edges_written": edges_written,
+                            "missing_targets": missing_targets,
+                        }));
+                    }
+                    BridgeAction::AwaitConfirmation { audit_id } => {
+                        patch.edge_specs = specs;
+                        patch.autonomy_audit_id = Some(audit_id.clone());
+                        patch_status = cypher::PATCH_STATUS_AWAITING_CONFIRMATION;
+                        bridge_summary = Some(json!({
+                            "action": "awaiting_confirmation",
+                            "audit_id": audit_id,
+                            "edge_spec_count": patch.edge_specs.len(),
+                        }));
+                    }
+                    BridgeAction::ProseOnly { reason } => {
+                        bridge_summary = Some(json!({
+                            "action": "prose_only",
+                            "reason": reason,
+                        }));
+                    }
+                }
+            }
+        }
+
         let generated_patch_summary = if let Some(patch) = &generated_patch {
-            let compiled_patch = cypher::compile_patch_proposal(patch, &now).map_err(|e| {
-                anyhow::anyhow!("life.recall.feedback patch Cypher compilation failed: {e}")
-            })?;
+            let compiled_patch =
+                cypher::compile_patch_proposal_with_status(patch, &now, patch_status).map_err(
+                    |e| {
+                        anyhow::anyhow!("life.recall.feedback patch Cypher compilation failed: {e}")
+                    },
+                )?;
             let mut patch_rows = graph
                 .execute(
                     query(&compiled_patch.query)
@@ -997,6 +1202,7 @@ impl LifeGraphProvider {
                 "label": compiled_patch.label,
                 "risk": compiled_patch.risk,
                 "status": compiled_patch.status,
+                "bridge": bridge_summary,
             }))
         } else {
             None
@@ -1019,6 +1225,229 @@ impl LifeGraphProvider {
             "improvement_steps": improvement_steps,
             "generated_patch": generated_patch_summary,
             "requires_operator": plan.requires_operator,
+        })))
+    }
+
+    /// Ask the hotel's `graph.bridge_edges` lane for permission to bridge.
+    /// Any consult failure degrades to prose-only with a reason — the loop
+    /// never writes on an unanswered question.
+    async fn consult_bridge_lane(
+        &self,
+        input: &RetrievalFeedbackInput,
+        specs: &[FeedbackEdgeSpec],
+    ) -> BridgeAction {
+        use ansible_mesh_core::autonomy::LANE_GRAPH_BRIDGE_EDGES;
+
+        let anchor = specs
+            .first()
+            .map(|s| s.from_id.as_str())
+            .unwrap_or_default();
+        let action_summary = format!(
+            "bridge {} RELATES_TO edge(s) from '{}' for {:?} recall feedback {}",
+            specs.len(),
+            anchor,
+            input.rating,
+            input.feedback_id,
+        );
+        let evidence = format!(
+            "feedback_id={} packet_id={} rating={:?} query_summary={:?} \
+             connectivity_ratio={:?} anchor={} targets=[{}]",
+            input.feedback_id,
+            input.packet_id,
+            input.rating,
+            input.query_summary.as_deref().unwrap_or(""),
+            input.connectivity_ratio(),
+            anchor,
+            specs
+                .iter()
+                .map(|s| s.to_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        let reversal_hint = format!(
+            "MATCH ()-[r:RELATES_TO {{feedback_signal_id: '{}'}}]-() DELETE r",
+            input.feedback_id
+        );
+
+        match self
+            .autonomy
+            .consume_action(
+                LANE_GRAPH_BRIDGE_EDGES,
+                &action_summary,
+                &evidence,
+                &reversal_hint,
+            )
+            .await
+        {
+            Ok(decision) => plan_bridge_action(&decision),
+            Err(e) => {
+                warn!(
+                    feedback_id = %input.feedback_id,
+                    "feedback-to-action: autonomy consult failed, staying prose-only: {e:#}"
+                );
+                BridgeAction::ProseOnly {
+                    reason: "autonomy_unavailable".to_string(),
+                }
+            }
+        }
+    }
+
+    /// Execute the compiled bridge-edge MERGEs. Missing endpoints write
+    /// nothing and are reported rather than failing (mirrors the
+    /// `life.observe` edge path). Returns `(edges_written, missing_targets)`.
+    async fn execute_bridge_edges(
+        graph: &Graph,
+        specs: &[FeedbackEdgeSpec],
+    ) -> Result<(usize, Vec<String>)> {
+        let mut written = 0usize;
+        let mut missing = Vec::new();
+        for spec in specs {
+            let compiled = cypher::compile_feedback_bridge_edge(spec)
+                .map_err(|e| anyhow::anyhow!("bridge edge Cypher compilation failed: {e}"))?;
+            let mut rows = graph
+                .execute(
+                    query(&compiled.query)
+                        .param("from_id", compiled.from_id.as_str())
+                        .param("to_id", compiled.to_id.as_str())
+                        .param("created_at", compiled.created_at.as_str())
+                        .param("created_by", compiled.created_by.as_str())
+                        .param("feedback_signal_id", compiled.feedback_signal_id.as_str()),
+                )
+                .await?;
+            match rows.next().await {
+                Ok(Some(_)) => {
+                    written += 1;
+                    info!(
+                        from_id = %spec.from_id,
+                        to_id = %spec.to_id,
+                        feedback_signal_id = %spec.feedback_signal_id,
+                        "feedback-to-action: bridge edge merged"
+                    );
+                }
+                Ok(None) => {
+                    warn!(
+                        from_id = %spec.from_id,
+                        to_id = %spec.to_id,
+                        "feedback-to-action: bridge edge endpoint not found; edge skipped"
+                    );
+                    missing.push(spec.to_id.clone());
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("bridge edge MERGE failed: {e}"));
+                }
+            }
+        }
+        Ok((written, missing))
+    }
+
+    /// Handle `life.patch.apply` — the confirmation actuator for
+    /// `awaiting_confirmation` patches (Autopoiesis Slice A2).
+    ///
+    /// Confirm: applies the embedded edge specs, marks the patch `applied`,
+    /// and reports `confirmed_good` against the patch's hotel audit id so
+    /// the `graph.bridge_edges` lane earns toward promotion. Reject: marks
+    /// the patch `rejected` and reports `reversed` (demotes the lane).
+    async fn handle_patch_apply(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifePatchApplyInput = serde_json::from_value(task.parameters.clone())
+            .context("failed to parse life.patch.apply parameters as LifePatchApplyInput")?;
+        if let Err(e) = input.validate() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "blocked",
+                "reasons": e.violations,
+            })));
+        }
+
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(query(cypher::patch_lookup_query()).param("patch_id", input.patch_id.as_str()))
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "not_found",
+                "patch_id": input.patch_id,
+            })));
+        };
+        let current_status: String = row.get("status").unwrap_or_default();
+        let patch_json: String = row.get("patch_json").unwrap_or_default();
+        if current_status != cypher::PATCH_STATUS_AWAITING_CONFIRMATION {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "not_applicable",
+                "patch_id": input.patch_id,
+                "current_status": current_status,
+            })));
+        }
+        let patch: LifePatchProposalInput = serde_json::from_str(&patch_json)
+            .context("life.patch.apply: stored patch_json failed to parse")?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let (new_status, edges_written, missing_targets, outcome) = match input.decision {
+            PatchApplyDecision::Confirm => {
+                let (written, missing) =
+                    Self::execute_bridge_edges(&graph, &patch.edge_specs).await?;
+                (
+                    cypher::PATCH_STATUS_APPLIED,
+                    written,
+                    missing,
+                    "confirmed_good",
+                )
+            }
+            PatchApplyDecision::Reject => {
+                (cypher::PATCH_STATUS_REJECTED, 0, Vec::new(), "reversed")
+            }
+        };
+
+        let mut rows = graph
+            .execute(
+                query(cypher::patch_status_update_query())
+                    .param("patch_id", input.patch_id.as_str())
+                    .param("status", new_status)
+                    .param("updated_at", now.as_str()),
+            )
+            .await?;
+        let _ = rows.next().await?;
+
+        // Report the outcome to the hotel so the lane earns (or demotes).
+        // Best-effort: the graph mutation above is the operator-visible
+        // truth; a failed report is surfaced in the response for retry.
+        let mut outcome_reported = false;
+        if let Some(audit_id) = patch.autonomy_audit_id.as_deref() {
+            match self.autonomy.record_outcome(audit_id, outcome).await {
+                Ok(data) => {
+                    outcome_reported = data
+                        .get("recorded")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let transition = data
+                        .get("transition")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    info!(
+                        patch_id = %input.patch_id,
+                        audit_id,
+                        outcome,
+                        transition = %transition,
+                        "life.patch.apply: autonomy outcome recorded"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        patch_id = %input.patch_id,
+                        audit_id,
+                        "life.patch.apply: autonomy outcome report failed: {e:#}"
+                    );
+                }
+            }
+        }
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": new_status,
+            "patch_id": input.patch_id,
+            "edges_written": edges_written,
+            "missing_targets": missing_targets,
+            "audit_id": patch.autonomy_audit_id,
+            "outcome": outcome,
+            "outcome_reported": outcome_reported,
         })))
     }
 
@@ -1626,6 +2055,8 @@ fn recall_feedback_patch_proposal(
         evidence_packets: evidence,
         risk,
         operator_approved: false,
+        edge_specs: Vec::new(),
+        autonomy_audit_id: None,
     })
 }
 
@@ -2115,6 +2546,8 @@ mod tests {
                 datasource: Some("life-graph".into()),
             }],
             evidence_packets: vec![],
+            query_context_ref: None,
+            connected_candidate_refs: vec![],
         }
     }
 
@@ -2165,6 +2598,140 @@ mod tests {
         assert!(cypher.contains("MATCH (c:Commitment)"));
         assert!(cypher.contains("c.due_at <= '2026-06-08T09:00:00Z'"));
         assert!(cypher.contains("RETURN c AS node, 1.0 AS similarity"));
+    }
+
+    // ── Feedback-to-action gating (Autopoiesis Slice A2) ─────────────────────
+
+    fn decision(allowed: bool, posture: Option<&str>, audit_id: Option<&str>) -> AutonomyDecision {
+        AutonomyDecision {
+            allowed,
+            posture: posture.map(str::to_string),
+            audit_id: audit_id.map(str::to_string),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn plan_bridge_action_gates_by_posture() {
+        // AutoWithAudit: write the edge now.
+        assert_eq!(
+            plan_bridge_action(&decision(true, Some("auto_with_audit"), Some("a1"))),
+            BridgeAction::ApplyNow {
+                audit_id: "a1".into()
+            }
+        );
+
+        // ConfirmFirst: do NOT write — file the ready-to-apply spec.
+        assert_eq!(
+            plan_bridge_action(&decision(false, Some("confirm_first"), Some("a2"))),
+            BridgeAction::AwaitConfirmation {
+                audit_id: "a2".into()
+            }
+        );
+
+        // ProposalOnly (day one for every fresh grant): prose-only, as today.
+        assert_eq!(
+            plan_bridge_action(&AutonomyDecision {
+                allowed: false,
+                posture: Some("proposal_only".into()),
+                audit_id: None,
+                reason: Some("posture_proposal_only".into()),
+            }),
+            BridgeAction::ProseOnly {
+                reason: "posture_proposal_only".into()
+            }
+        );
+    }
+
+    #[test]
+    fn plan_bridge_action_fails_safe_on_malformed_decisions() {
+        // allowed=true without an audit anchor must NOT write.
+        assert!(matches!(
+            plan_bridge_action(&decision(true, Some("auto_with_audit"), None)),
+            BridgeAction::ProseOnly { .. }
+        ));
+        // confirm_first without an audit id cannot await a confirmation.
+        assert!(matches!(
+            plan_bridge_action(&decision(false, Some("confirm_first"), None)),
+            BridgeAction::ProseOnly { .. }
+        ));
+        // allowed=true with a non-auto posture is inconsistent — refuse.
+        assert!(matches!(
+            plan_bridge_action(&decision(true, Some("confirm_first"), Some("a1"))),
+            BridgeAction::ProseOnly { .. }
+        ));
+        // Refusal reasons surface for the response envelope.
+        assert_eq!(
+            plan_bridge_action(&AutonomyDecision {
+                allowed: false,
+                posture: None,
+                audit_id: None,
+                reason: Some("lane_disabled".into()),
+            }),
+            BridgeAction::ProseOnly {
+                reason: "lane_disabled".into()
+            }
+        );
+        assert_eq!(
+            plan_bridge_action(&AutonomyDecision {
+                allowed: false,
+                posture: None,
+                audit_id: None,
+                reason: None,
+            }),
+            BridgeAction::ProseOnly {
+                reason: "no_grant".into()
+            }
+        );
+    }
+
+    #[test]
+    fn autonomy_decision_parses_hotel_response_data() {
+        let parsed = AutonomyDecision::from_response_data(&json!({
+            "allowed": false,
+            "posture": "confirm_first",
+            "audit_id": "autonomy:graph.bridge_edges:abc",
+        }));
+        assert_eq!(
+            parsed,
+            decision(
+                false,
+                Some("confirm_first"),
+                Some("autonomy:graph.bridge_edges:abc")
+            )
+        );
+
+        // Missing / empty fields degrade safely.
+        let parsed = AutonomyDecision::from_response_data(&json!({}));
+        assert!(!parsed.allowed);
+        assert_eq!(parsed.posture, None);
+        assert_eq!(parsed.audit_id, None);
+        assert!(matches!(
+            plan_bridge_action(&parsed),
+            BridgeAction::ProseOnly { .. }
+        ));
+    }
+
+    #[test]
+    fn disconnected_feedback_with_anchor_derives_specs_but_missing_variant_respects_refs() {
+        // The provider derives edge specs only for SafeAutoUpdate ratings
+        // that carry an anchor + candidates; the fixture has an anchor but
+        // no connected_candidate_refs, so disconnected derives nothing.
+        let mut feedback = feedback_input(RetrievalFeedbackRating::Disconnected);
+        feedback.query_context_ref = Some("life:open_loop:anchor".into());
+        assert!(feedback_edge_specs(&feedback, "2026-07-07T00:00:00Z").is_empty());
+
+        feedback.connected_candidate_refs = vec!["life:project:phi".into()];
+        let specs = feedback_edge_specs(&feedback, "2026-07-07T00:00:00Z");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].to_id, "life:project:phi");
+
+        // Missing feedback bridges to its missing_context_refs.
+        let mut feedback = feedback_input(RetrievalFeedbackRating::Missing);
+        feedback.query_context_ref = Some("life:open_loop:anchor".into());
+        let specs = feedback_edge_specs(&feedback, "2026-07-07T00:00:00Z");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].to_id, "life:goal:graph");
     }
 }
 

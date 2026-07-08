@@ -1152,6 +1152,17 @@ pub struct RetrievalFeedbackInput {
     pub stale_node_refs: Vec<GraphRecordRef>,
     #[serde(default)]
     pub evidence_packets: Vec<EvidencePacket>,
+    /// Node id of the query-context anchor this recall was grounded in
+    /// (e.g. the OpenLoop/Goal node the caller was working from). When set
+    /// alongside candidate refs, `disconnected`/`missing` feedback carries an
+    /// unambiguous structural remedy: bridge anchor → candidate (Slice A2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_context_ref: Option<String>,
+    /// For `disconnected` feedback: node ids of the candidates that WERE
+    /// relevant but not connected enough to the anchor to rank. Together with
+    /// `query_context_ref` these define ready-to-apply bridge edges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected_candidate_refs: Vec<String>,
 }
 
 impl RetrievalFeedbackInput {
@@ -1199,6 +1210,73 @@ impl RetrievalFeedbackInput {
             Some(self.connected_candidate_count as f32 / self.candidate_count as f32)
         }
     }
+}
+
+/// `created_by` stamp carried by every bridge edge written (or proposed) by
+/// the feedback-to-action loop (Autopoiesis Slice A2).
+pub const FEEDBACK_EDGE_CREATED_BY: &str = "feedback-to-action";
+
+/// A ready-to-apply living-cycle bridge edge derived from actionable
+/// retrieval feedback (Autopoiesis Slice A2, lane `graph.bridge_edges`).
+///
+/// Always `RELATES_TO` — the neutral living-cycle vocabulary edge. The spec
+/// is embedded verbatim in the patch node's `patch_json` so a ConfirmFirst
+/// patch stays executable later without re-deriving anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackEdgeSpec {
+    /// Anchor node id (the query context the recall was grounded in).
+    pub from_id: String,
+    /// Candidate / missing-context node id to bridge to.
+    pub to_id: String,
+    /// Living-cycle relationship type; always `"RELATES_TO"` for Slice A2.
+    pub rel_type: String,
+    /// Provenance stamp — [`FEEDBACK_EDGE_CREATED_BY`].
+    pub created_by: String,
+    /// The `Signal` node id of the feedback that motivated this edge.
+    pub feedback_signal_id: String,
+    /// ISO timestamp captured when the spec was derived.
+    pub created_at: String,
+}
+
+/// Derive ready-to-apply bridge edge specs from retrieval feedback.
+///
+/// Only `disconnected` and `missing` feedback with BOTH a query-context
+/// anchor (`query_context_ref`) and candidate node ids
+/// (`connected_candidate_refs` / `missing_context_refs`) yield specs — those
+/// are the cases whose structural remedy is unambiguous. Everything else
+/// returns an empty vec and stays prose-only. Blank ids, self-edges, and
+/// duplicate targets are dropped.
+pub fn feedback_edge_specs(input: &RetrievalFeedbackInput, now_iso: &str) -> Vec<FeedbackEdgeSpec> {
+    let Some(anchor) = input
+        .query_context_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    let targets: &[String] = match input.rating {
+        RetrievalFeedbackRating::Disconnected => &input.connected_candidate_refs,
+        RetrievalFeedbackRating::Missing => &input.missing_context_refs,
+        _ => return Vec::new(),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty() && *t != anchor)
+        .filter(|t| seen.insert(t.to_string()))
+        .map(|t| FeedbackEdgeSpec {
+            from_id: anchor.to_string(),
+            to_id: t.to_string(),
+            rel_type: "RELATES_TO".to_string(),
+            created_by: FEEDBACK_EDGE_CREATED_BY.to_string(),
+            feedback_signal_id: input.feedback_id.clone(),
+            created_at: now_iso.to_string(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1397,6 +1475,53 @@ pub struct LifePatchProposalInput {
     pub risk: PatchRisk,
     #[serde(default)]
     pub operator_approved: bool,
+    /// Ready-to-apply bridge edge specs (Autopoiesis Slice A2). Empty for
+    /// prose-only patches. When the patch is `awaiting_confirmation`, these
+    /// are exactly what `life.patch.apply` executes on operator confirm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_specs: Vec<FeedbackEdgeSpec>,
+    /// Hotel-side `autonomy_audit` record id for the `graph.bridge_edges`
+    /// lane action behind this patch. `life.patch.apply` reports the
+    /// confirm/reverse outcome against this id so the lane earns (or loses)
+    /// trust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy_audit_id: Option<String>,
+}
+
+/// Operator decision on an `awaiting_confirmation` patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchApplyDecision {
+    /// Apply the embedded edge specs and report `confirmed_good`.
+    Confirm,
+    /// Do not apply; mark the patch rejected and report `reversed`.
+    Reject,
+}
+
+/// Input for `life.patch.apply` — the confirmation actuator for
+/// `awaiting_confirmation` patches (Autopoiesis Slice A2).
+///
+/// The operator/steward confirming the patch (a) applies the embedded edge
+/// specs and (b) reports the outcome to the hotel so the
+/// `graph.bridge_edges` lane earns (confirm) or demotes (reject).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifePatchApplyInput {
+    pub patch_id: String,
+    pub decision: PatchApplyDecision,
+    /// Must be true — this tool IS the operator confirmation step.
+    #[serde(default)]
+    pub operator_approved: bool,
+}
+
+impl LifePatchApplyInput {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "patch_id", &self.patch_id);
+        if !self.operator_approved {
+            violations.push("life.patch.apply requires operator_approved=true".into());
+        }
+        finish_validation(violations)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2354,6 +2479,8 @@ mod tests {
             noisy_node_refs: vec![],
             stale_node_refs: vec![],
             evidence_packets: vec![evidence_packet()],
+            query_context_ref: None,
+            connected_candidate_refs: vec![],
         };
 
         let plan = runner
@@ -2399,6 +2526,8 @@ mod tests {
             noisy_node_refs: vec![],
             stale_node_refs: vec![],
             evidence_packets: vec![evidence_packet()],
+            query_context_ref: None,
+            connected_candidate_refs: vec![],
         };
 
         let plan = runner
@@ -2533,6 +2662,8 @@ mod tests {
                     evidence_packets: vec![evidence_packet()],
                     risk: PatchRisk::High,
                     operator_approved: false,
+                    edge_specs: vec![],
+                    autonomy_audit_id: None,
                 },
             ))
             .expect("patch proposal should plan");
@@ -2584,6 +2715,8 @@ mod tests {
                 evidence_packets: vec![evidence_packet()],
                 risk: PatchRisk::Low,
                 operator_approved: false,
+                edge_specs: vec![],
+                autonomy_audit_id: None,
             })
             .expect("low-risk patch should evaluate");
 
@@ -2609,6 +2742,8 @@ mod tests {
                 evidence_packets: vec![evidence_packet()],
                 risk: PatchRisk::Medium,
                 operator_approved: false,
+                edge_specs: vec![],
+                autonomy_audit_id: None,
             })
             .expect("medium-risk patch should evaluate");
 
@@ -2638,5 +2773,173 @@ mod tests {
                 .iter()
                 .any(|violation| violation.contains("drift_category"))
         );
+    }
+
+    // ── Feedback-to-action edge specs (Autopoiesis Slice A2) ─────────────────
+
+    fn bridge_feedback(rating: RetrievalFeedbackRating) -> RetrievalFeedbackInput {
+        RetrievalFeedbackInput {
+            feedback_id: "feedback:recall:a2".into(),
+            packet_id: "packet:recall:a2".into(),
+            query_summary: Some("open loops for the graph project".into()),
+            rating,
+            note: None,
+            candidate_count: 4,
+            connected_candidate_count: 1,
+            missing_context_refs: vec!["life:goal:graph".into(), "life:goal:graph".into()],
+            noisy_node_refs: vec![],
+            stale_node_refs: vec![],
+            evidence_packets: vec![],
+            query_context_ref: Some("life:open_loop:anchor".into()),
+            connected_candidate_refs: vec![
+                "life:project:phi".into(),
+                " ".into(),
+                "life:open_loop:anchor".into(),
+                "life:project:phi".into(),
+                "life:decision:d1".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn feedback_edge_specs_derived_for_disconnected_and_missing_only() {
+        let now = "2026-07-07T00:00:00Z";
+
+        // Disconnected: anchor → connected_candidate_refs, with blank ids,
+        // self-edges, and duplicates dropped.
+        let specs =
+            feedback_edge_specs(&bridge_feedback(RetrievalFeedbackRating::Disconnected), now);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].from_id, "life:open_loop:anchor");
+        assert_eq!(specs[0].to_id, "life:project:phi");
+        assert_eq!(specs[1].to_id, "life:decision:d1");
+        for spec in &specs {
+            assert_eq!(spec.rel_type, "RELATES_TO");
+            assert_eq!(spec.created_by, FEEDBACK_EDGE_CREATED_BY);
+            assert_eq!(spec.feedback_signal_id, "feedback:recall:a2");
+            assert_eq!(spec.created_at, now);
+        }
+
+        // Missing: anchor → missing_context_refs (deduped).
+        let specs = feedback_edge_specs(&bridge_feedback(RetrievalFeedbackRating::Missing), now);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].to_id, "life:goal:graph");
+
+        // Every other rating stays prose-only regardless of refs.
+        for rating in [
+            RetrievalFeedbackRating::Useful,
+            RetrievalFeedbackRating::Noisy,
+            RetrievalFeedbackRating::Stale,
+            RetrievalFeedbackRating::Overconfident,
+        ] {
+            let specs = feedback_edge_specs(&bridge_feedback(rating.clone()), now);
+            assert!(specs.is_empty(), "{rating:?} must not derive edge specs");
+        }
+
+        // No anchor → no specs, even for disconnected feedback.
+        let mut anchorless = bridge_feedback(RetrievalFeedbackRating::Disconnected);
+        anchorless.query_context_ref = None;
+        assert!(feedback_edge_specs(&anchorless, now).is_empty());
+        anchorless.query_context_ref = Some("   ".into());
+        assert!(feedback_edge_specs(&anchorless, now).is_empty());
+
+        // Anchor but no candidates → no specs.
+        let mut no_candidates = bridge_feedback(RetrievalFeedbackRating::Disconnected);
+        no_candidates.connected_candidate_refs = vec![];
+        assert!(feedback_edge_specs(&no_candidates, now).is_empty());
+    }
+
+    #[test]
+    fn retrieval_feedback_input_serde_back_compat() {
+        // A sender built before Slice A2 (no query_context_ref /
+        // connected_candidate_refs) must still deserialize.
+        let input: RetrievalFeedbackInput = serde_json::from_value(serde_json::json!({
+            "feedback_id": "feedback:old:1",
+            "packet_id": "packet:old:1",
+            "rating": "disconnected",
+        }))
+        .expect("old feedback shape must parse");
+        assert_eq!(input.query_context_ref, None);
+        assert!(input.connected_candidate_refs.is_empty());
+        assert!(feedback_edge_specs(&input, "2026-07-07T00:00:00Z").is_empty());
+
+        // New fields are omitted from the wire when unset (old readers are
+        // untouched) and round-trip when set.
+        let json = serde_json::to_value(&input).expect("serialize");
+        assert!(json.get("query_context_ref").is_none());
+        assert!(json.get("connected_candidate_refs").is_none());
+
+        let full = bridge_feedback(RetrievalFeedbackRating::Disconnected);
+        let json = serde_json::to_value(&full).expect("serialize");
+        let back: RetrievalFeedbackInput = serde_json::from_value(json).expect("round trip");
+        assert_eq!(back, full);
+    }
+
+    #[test]
+    fn patch_proposal_serde_back_compat_with_edge_specs() {
+        // Old patch JSON (no edge_specs / autonomy_audit_id) still parses.
+        let patch: LifePatchProposalInput = serde_json::from_value(serde_json::json!({
+            "patch_id": "patch:old",
+            "patch_kind": "system_patch",
+            "summary": "s",
+            "rationale": "r",
+            "risk": "low",
+        }))
+        .expect("old patch shape must parse");
+        assert!(patch.edge_specs.is_empty());
+        assert_eq!(patch.autonomy_audit_id, None);
+        let json = serde_json::to_value(&patch).expect("serialize");
+        assert!(json.get("edge_specs").is_none());
+        assert!(json.get("autonomy_audit_id").is_none());
+
+        // A patch carrying specs round-trips them — this is what makes an
+        // awaiting_confirmation patch executable later.
+        let mut patch = patch;
+        patch.edge_specs = feedback_edge_specs(
+            &bridge_feedback(RetrievalFeedbackRating::Disconnected),
+            "2026-07-07T00:00:00Z",
+        );
+        patch.autonomy_audit_id = Some("autonomy:graph.bridge_edges:abc".into());
+        let json = serde_json::to_string(&patch).expect("serialize");
+        let back: LifePatchProposalInput = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back.edge_specs, patch.edge_specs);
+        assert_eq!(
+            back.autonomy_audit_id.as_deref(),
+            Some("autonomy:graph.bridge_edges:abc")
+        );
+    }
+
+    #[test]
+    fn life_patch_apply_input_requires_operator_approval() {
+        let input: LifePatchApplyInput = serde_json::from_value(serde_json::json!({
+            "patch_id": "patch:recall-feedback:f1",
+            "decision": "confirm",
+        }))
+        .expect("apply input parses");
+        assert_eq!(input.decision, PatchApplyDecision::Confirm);
+        let err = input.validate().expect_err("operator approval required");
+        assert!(
+            err.violations
+                .iter()
+                .any(|v| v.contains("operator_approved"))
+        );
+
+        let ok = LifePatchApplyInput {
+            patch_id: "patch:recall-feedback:f1".into(),
+            decision: PatchApplyDecision::Reject,
+            operator_approved: true,
+        };
+        ok.validate().expect("approved input validates");
+        assert_eq!(
+            serde_json::to_value(&ok).expect("serialize")["decision"],
+            "reject"
+        );
+
+        let blank = LifePatchApplyInput {
+            patch_id: "  ".into(),
+            decision: PatchApplyDecision::Confirm,
+            operator_approved: true,
+        };
+        assert!(blank.validate().is_err());
     }
 }

@@ -2,7 +2,7 @@
 // No I/O — all functions are deterministic and fully testable.
 
 use crate::{
-    ConflictHandoff, ConflictHandoffStatus, LifeCommitInput, LifeObserveInput,
+    ConflictHandoff, ConflictHandoffStatus, FeedbackEdgeSpec, LifeCommitInput, LifeObserveInput,
     LifePatchProposalInput, LifeResolveInput, PatchKind, RetrievalFeedbackInput,
     RetrievalFeedbackRating, SourceKind, ValidationState,
 };
@@ -391,6 +391,30 @@ pub fn compile_patch_proposal(
     input: &LifePatchProposalInput,
     now_iso: &str,
 ) -> Result<PatchProposalCypher, String> {
+    compile_patch_proposal_with_status(input, now_iso, PATCH_STATUS_PROPOSED)
+}
+
+/// Patch node lifecycle statuses (Autopoiesis Slice A2).
+pub const PATCH_STATUS_PROPOSED: &str = "proposed";
+/// The patch carries ready-to-apply edge specs and a hotel audit id; it is
+/// waiting for `life.patch.apply` (operator confirmation).
+pub const PATCH_STATUS_AWAITING_CONFIRMATION: &str = "awaiting_confirmation";
+/// The embedded edge specs were executed (auto or via confirmation).
+pub const PATCH_STATUS_APPLIED: &str = "applied";
+/// The operator rejected the patch; nothing was written.
+pub const PATCH_STATUS_REJECTED: &str = "rejected";
+
+/// [`compile_patch_proposal`] with an explicit lifecycle status. Slice A2
+/// files SafeAutoUpdate patches as `awaiting_confirmation` (ConfirmFirst
+/// posture) or `applied` (AutoWithAudit) instead of plain `proposed`.
+pub fn compile_patch_proposal_with_status(
+    input: &LifePatchProposalInput,
+    now_iso: &str,
+    status: &str,
+) -> Result<PatchProposalCypher, String> {
+    if status.trim().is_empty() {
+        return Err("patch status must not be empty".to_string());
+    }
     let patch_json = serde_json::to_string(input).map_err(|e| e.to_string())?;
     let label = patch_label(&input.patch_kind);
 
@@ -417,10 +441,84 @@ pub fn compile_patch_proposal(
         summary: input.summary.clone(),
         rationale: input.rationale.clone(),
         risk: format!("{:?}", input.risk).to_ascii_lowercase(),
-        status: "proposed".to_string(),
+        status: status.to_string(),
         proposed_at: now_iso.to_string(),
         patch_json,
     })
+}
+
+/// One compiled feedback bridge-edge MERGE (Autopoiesis Slice A2, lane
+/// `graph.bridge_edges`).
+///
+/// Both endpoints are `MATCH`ed by id, so a missing node writes nothing —
+/// the caller reports the miss instead of failing. The MERGE is idempotent:
+/// re-applying the same spec never duplicates the edge, and `ON CREATE SET`
+/// preserves the original provenance stamp.
+#[derive(Debug)]
+pub struct BridgeEdgeCypher {
+    pub query: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub created_by: String,
+    pub feedback_signal_id: String,
+    pub created_at: String,
+}
+
+pub fn compile_feedback_bridge_edge(spec: &FeedbackEdgeSpec) -> Result<BridgeEdgeCypher, String> {
+    if !is_living_cycle_rel_type(&spec.rel_type) {
+        return Err(format!(
+            "unknown living-cycle rel_type: {} (expected one of {})",
+            spec.rel_type,
+            LIVING_CYCLE_REL_TYPES.join(", ")
+        ));
+    }
+    if spec.from_id.trim().is_empty() || spec.to_id.trim().is_empty() {
+        return Err("bridge edge endpoints must not be empty".to_string());
+    }
+    if spec.from_id == spec.to_id {
+        return Err("bridge edge must not be a self-edge".to_string());
+    }
+
+    // rel_type is whitelisted above — safe to interpolate. All values travel
+    // as bound parameters.
+    let query = format!(
+        concat!(
+            "MATCH (a {{id: $from_id}}) ",
+            "MATCH (b {{id: $to_id}}) ",
+            "MERGE (a)-[r:{rel_type}]->(b) ",
+            "ON CREATE SET ",
+            "r.created_at = $created_at, ",
+            "r.created_by = $created_by, ",
+            "r.feedback_signal_id = $feedback_signal_id ",
+            "RETURN b.id AS target_id",
+        ),
+        rel_type = spec.rel_type
+    );
+
+    Ok(BridgeEdgeCypher {
+        query,
+        from_id: spec.from_id.clone(),
+        to_id: spec.to_id.clone(),
+        created_by: spec.created_by.clone(),
+        feedback_signal_id: spec.feedback_signal_id.clone(),
+        created_at: spec.created_at.clone(),
+    })
+}
+
+/// Lookup a patch node by id regardless of patch label — returns its current
+/// status and the embedded `patch_json` (which carries the edge specs and
+/// the hotel audit id). Used by `life.patch.apply`.
+pub fn patch_lookup_query() -> &'static str {
+    "MATCH (p {id: $patch_id}) WHERE p.patch_json IS NOT NULL \
+     RETURN p.status AS status, p.patch_json AS patch_json LIMIT 1"
+}
+
+/// Update a patch node's lifecycle status. Used by `life.patch.apply` to
+/// move `awaiting_confirmation` → `applied` / `rejected`.
+pub fn patch_status_update_query() -> &'static str {
+    "MATCH (p {id: $patch_id}) WHERE p.patch_json IS NOT NULL \
+     SET p.status = $status, p.status_updated_at = $updated_at \
+     RETURN p.id AS id, p.status AS status"
 }
 
 pub fn compile_recall_feedback(
@@ -947,6 +1045,8 @@ mod tests {
                 evidence_packets: vec![minimal_observe_input("Signal").evidence],
                 risk: crate::PatchRisk::Medium,
                 operator_approved: false,
+                edge_specs: vec![],
+                autonomy_audit_id: None,
             },
             "2026-06-05T09:00:00Z",
         )
@@ -972,6 +1072,8 @@ mod tests {
             noisy_node_refs: vec![],
             stale_node_refs: vec![],
             evidence_packets: vec![minimal_observe_input("Signal").evidence],
+            query_context_ref: None,
+            connected_candidate_refs: vec![],
         };
         let growth_evaluation = serde_json::json!({
             "disposition": "apply_with_audit",
@@ -987,5 +1089,120 @@ mod tests {
         assert!(compiled.query.contains("MERGE (s:Signal"));
         assert!(compiled.feedback_json.contains("packet:recall:1"));
         assert!(compiled.evaluation_json.contains("apply_with_audit"));
+    }
+
+    // ── Feedback bridge edges (Autopoiesis Slice A2) ──────────────────────────
+
+    fn bridge_spec() -> FeedbackEdgeSpec {
+        FeedbackEdgeSpec {
+            from_id: "life:open_loop:anchor".into(),
+            to_id: "life:project:phi".into(),
+            rel_type: "RELATES_TO".into(),
+            created_by: crate::FEEDBACK_EDGE_CREATED_BY.into(),
+            feedback_signal_id: "feedback:recall:a2".into(),
+            created_at: "2026-07-07T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn compile_feedback_bridge_edge_is_idempotent_merge_with_provenance() {
+        let compiled = compile_feedback_bridge_edge(&bridge_spec()).unwrap();
+
+        // Idempotent MERGE between MATCHed endpoints: a re-apply never
+        // duplicates the edge, and a missing endpoint writes nothing.
+        assert!(compiled.query.contains("MATCH (a {id: $from_id})"));
+        assert!(compiled.query.contains("MATCH (b {id: $to_id})"));
+        assert!(compiled.query.contains("MERGE (a)-[r:RELATES_TO]->(b)"));
+        // ON CREATE SET keeps the original provenance stamp on re-merge.
+        assert!(compiled.query.contains("ON CREATE SET"));
+        assert!(compiled.query.contains("r.created_by = $created_by"));
+        assert!(
+            compiled
+                .query
+                .contains("r.feedback_signal_id = $feedback_signal_id")
+        );
+        assert!(compiled.query.contains("r.created_at = $created_at"));
+        assert!(compiled.query.contains("RETURN b.id AS target_id"));
+        // Values travel as bound params, never interpolated.
+        assert!(!compiled.query.contains("life:open_loop:anchor"));
+        assert_eq!(compiled.created_by, "feedback-to-action");
+        assert_eq!(compiled.feedback_signal_id, "feedback:recall:a2");
+    }
+
+    #[test]
+    fn compile_feedback_bridge_edge_rejects_bad_specs() {
+        let mut spec = bridge_spec();
+        spec.rel_type = "CAUSED".into();
+        assert!(
+            compile_feedback_bridge_edge(&spec)
+                .unwrap_err()
+                .contains("unknown living-cycle rel_type")
+        );
+
+        let mut spec = bridge_spec();
+        spec.to_id = "  ".into();
+        assert!(
+            compile_feedback_bridge_edge(&spec)
+                .unwrap_err()
+                .contains("must not be empty")
+        );
+
+        let mut spec = bridge_spec();
+        spec.to_id = spec.from_id.clone();
+        assert!(
+            compile_feedback_bridge_edge(&spec)
+                .unwrap_err()
+                .contains("self-edge")
+        );
+    }
+
+    #[test]
+    fn compile_patch_proposal_with_status_embeds_edge_specs() {
+        let input = crate::LifePatchProposalInput {
+            patch_id: "patch:recall-feedback:a2".into(),
+            patch_kind: PatchKind::SystemPatch,
+            summary: "Bridge disconnected recall candidates.".into(),
+            rationale: "Feedback carried an unambiguous structural remedy.".into(),
+            evidence_packets: vec![minimal_observe_input("Signal").evidence],
+            risk: crate::PatchRisk::Low,
+            operator_approved: false,
+            edge_specs: vec![bridge_spec()],
+            autonomy_audit_id: Some("autonomy:graph.bridge_edges:abc".into()),
+        };
+
+        let compiled = compile_patch_proposal_with_status(
+            &input,
+            "2026-07-07T00:00:00Z",
+            "awaiting_confirmation",
+        )
+        .unwrap();
+        assert_eq!(compiled.status, PATCH_STATUS_AWAITING_CONFIRMATION);
+        // The ready-to-apply spec and audit anchor ride in patch_json — the
+        // patch node alone is enough for life.patch.apply to execute later.
+        assert!(compiled.patch_json.contains("life:project:phi"));
+        assert!(compiled.patch_json.contains("RELATES_TO"));
+        assert!(
+            compiled
+                .patch_json
+                .contains("autonomy:graph.bridge_edges:abc")
+        );
+
+        // Default entry point still files plain proposals.
+        let compiled = compile_patch_proposal(&input, "2026-07-07T00:00:00Z").unwrap();
+        assert_eq!(compiled.status, PATCH_STATUS_PROPOSED);
+
+        assert!(
+            compile_patch_proposal_with_status(&input, "2026-07-07T00:00:00Z", " ")
+                .unwrap_err()
+                .contains("status")
+        );
+    }
+
+    #[test]
+    fn patch_apply_queries_target_patch_nodes_only() {
+        assert!(patch_lookup_query().contains("p.patch_json IS NOT NULL"));
+        assert!(patch_lookup_query().contains("$patch_id"));
+        assert!(patch_status_update_query().contains("SET p.status = $status"));
+        assert!(patch_status_update_query().contains("p.status_updated_at = $updated_at"));
     }
 }
