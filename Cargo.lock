@@ -1166,6 +1166,7 @@ dependencies = [
  "chrono",
  "datasource",
  "neo4rs",
+ "philotic-client",
  "reqwest",
  "serde",
  "serde_json",

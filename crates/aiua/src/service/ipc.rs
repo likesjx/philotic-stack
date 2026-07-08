@@ -7798,6 +7798,35 @@ impl IpcServer {
                 )
             }
 
+            IpcRequest::ConsumeAutonomyAction {
+                lane,
+                action_summary,
+                evidence,
+                reversal_hint,
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Self::handle_consume_autonomy_action(
+                    graph,
+                    &lane,
+                    &action_summary,
+                    &evidence,
+                    &reversal_hint,
+                    now,
+                    &|key| std::env::var(key).ok(),
+                )
+            }
+
+            IpcRequest::RecordAutonomyOutcome { audit_id, outcome } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Self::handle_record_autonomy_outcome(graph, &audit_id, &outcome, now)
+            }
+
             IpcRequest::AgentMigrateToHotel {
                 agent_id,
                 dest_hotel,
@@ -8077,6 +8106,224 @@ impl IpcServer {
             trace: vec!["ipc:cron-sync-remove".into()],
         };
         let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
+    }
+
+    // ── Autonomy lane consult (Autopoiesis Slice A2) ──────────────────────────
+
+    /// Handle [`IpcRequest::ConsumeAutonomyAction`] — a guest asking to take
+    /// one autonomous action on `lane` (first consumer: the life-graph
+    /// runner's feedback-to-action loop, lane `graph.bridge_edges`).
+    ///
+    /// Pipeline mirrors A3's `handle_file_heal_work_item`: lane kill switch →
+    /// grant posture → daily budget (`try_consume_daily_action`, which also
+    /// enforces the freeze flag) → Pending `autonomy_audit` record.
+    ///
+    /// Decision table (`data` in the Standard response):
+    /// - kill switch set → `{allowed:false, reason:"lane_disabled"}`
+    /// - posture ProposalOnly → `{allowed:false, posture:"proposal_only",
+    ///   reason:"posture_proposal_only"}` — no budget, no audit; the caller
+    ///   stays prose-only. This is every fresh lane's day-one answer.
+    /// - frozen / budget exhausted → `{allowed:false, reason:...}`
+    /// - posture ConfirmFirst → `{allowed:false, posture:"confirm_first",
+    ///   audit_id}` — the caller files a ready-to-apply spec awaiting
+    ///   operator confirmation.
+    /// - posture AutoWithAudit → `{allowed:true, posture:"auto_with_audit",
+    ///   audit_id}` — the caller acts now; the audit record is the ledger.
+    ///
+    /// Clock (`now`) and env reader are injected so tests run without
+    /// wall-clock time or process environment.
+    pub(crate) fn handle_consume_autonomy_action(
+        graph: &GraphDomain,
+        lane: &str,
+        action_summary: &str,
+        evidence: &str,
+        reversal_hint: &str,
+        now: u64,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> IpcResponse {
+        use ansible_mesh_core::autonomy::{
+            AutonomyAuditRecord, AutonomyLane, AutonomyPosture, lane_enabled,
+            try_consume_daily_action,
+        };
+
+        const CORR: &str = "consume_autonomy_action";
+        if lane.trim().is_empty() {
+            return IpcResponse::error(CORR, "INVALID_LANE", "lane must not be empty");
+        }
+        let lane_id = AutonomyLane::new(lane);
+
+        // 1. Kill switch overrides everything, always (Autonomy Contract rule 3).
+        if !lane_enabled(&lane_id, env) {
+            debug!(lane, "autonomy action refused: lane kill switch set");
+            return IpcResponse::success(
+                CORR,
+                Some(serde_json::json!({
+                    "allowed": false, "reason": "lane_disabled"
+                })),
+            );
+        }
+
+        // 2. Grant posture. ProposalOnly consumes nothing — the lane has not
+        // earned filing actions yet, so the caller stays prose-only.
+        let mut grant = match graph.get_or_create_autonomy_grant(lane, now) {
+            Ok(grant) => grant,
+            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
+        };
+        if grant.posture == AutonomyPosture::ProposalOnly {
+            debug!(lane, "autonomy action refused: posture proposal_only");
+            return IpcResponse::success(
+                CORR,
+                Some(serde_json::json!({
+                    "allowed": false,
+                    "posture": "proposal_only",
+                    "reason": "posture_proposal_only",
+                })),
+            );
+        }
+
+        // 3. Budget: frozen lanes and exhausted daily budgets refuse.
+        if !try_consume_daily_action(&mut grant, now) {
+            let reason = if grant.frozen_until_operator_review {
+                "lane_frozen"
+            } else {
+                "daily_budget_exhausted"
+            };
+            debug!(lane, reason, "autonomy action refused by grant");
+            return IpcResponse::success(
+                CORR,
+                Some(serde_json::json!({
+                    "allowed": false,
+                    "posture": posture_str(grant.posture),
+                    "reason": reason,
+                })),
+            );
+        }
+        if let Err(e) = graph.upsert_autonomy_grant(&grant) {
+            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
+        }
+
+        // 4. Audit record first (the ledger) — Pending until the operator
+        // confirms or reverses via RecordAutonomyOutcome.
+        let audit_id = format!("autonomy:{}:{}", lane, Uuid::new_v4());
+        let audit = AutonomyAuditRecord::new(
+            audit_id.clone(),
+            lane_id,
+            action_summary,
+            evidence,
+            reversal_hint,
+            grant.posture,
+            now,
+        );
+        if let Err(e) = graph.record_autonomy_audit(&audit) {
+            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
+        }
+
+        let allowed = grant.posture == AutonomyPosture::AutoWithAudit;
+        info!(
+            lane,
+            audit_id = %audit_id,
+            posture = posture_str(grant.posture),
+            allowed,
+            "autonomy action consulted"
+        );
+        IpcResponse::success(
+            CORR,
+            Some(serde_json::json!({
+                "allowed": allowed,
+                "posture": posture_str(grant.posture),
+                "audit_id": audit_id,
+            })),
+        )
+    }
+
+    /// Handle [`IpcRequest::RecordAutonomyOutcome`] — the operator/steward
+    /// reporting the reviewed outcome of an audited autonomous action.
+    ///
+    /// `outcome`: `"confirmed_good"` → audit Confirmed + grant
+    /// `Outcome::ConfirmedGood` (counts toward promotion);
+    /// `"reversed"` → audit Reversed + grant `Outcome::OperatorReversal`
+    /// (demotes one posture level). Idempotent per audit id: an
+    /// already-reviewed audit refuses with `reason:"already_recorded"` so a
+    /// double-confirm never double-counts toward promotion.
+    pub(crate) fn handle_record_autonomy_outcome(
+        graph: &GraphDomain,
+        audit_id: &str,
+        outcome: &str,
+        now: u64,
+    ) -> IpcResponse {
+        use ansible_mesh_core::autonomy::{AuditOutcome, Outcome, Transition};
+
+        const CORR: &str = "record_autonomy_outcome";
+        let (audit_outcome, grant_outcome) = match outcome {
+            "confirmed_good" => (AuditOutcome::Confirmed, Outcome::ConfirmedGood),
+            "reversed" => (AuditOutcome::Reversed, Outcome::OperatorReversal),
+            other => {
+                return IpcResponse::error(
+                    CORR,
+                    "INVALID_OUTCOME",
+                    format!("unknown outcome '{other}' (expected confirmed_good | reversed)"),
+                );
+            }
+        };
+
+        let audit = match graph.get_autonomy_audit(audit_id) {
+            Ok(Some(audit)) => audit,
+            Ok(None) => {
+                return IpcResponse::error(
+                    CORR,
+                    "AUDIT_NOT_FOUND",
+                    format!("no autonomy_audit record with id '{audit_id}'"),
+                );
+            }
+            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
+        };
+        if audit.outcome != AuditOutcome::Pending {
+            return IpcResponse::success(
+                CORR,
+                Some(serde_json::json!({
+                    "recorded": false,
+                    "reason": "already_recorded",
+                    "lane": audit.lane.as_str(),
+                })),
+            );
+        }
+
+        if let Err(e) = graph.set_autonomy_audit_outcome(audit_id, audit_outcome, now) {
+            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
+        }
+        let transition =
+            match graph.record_autonomy_outcome(audit.lane.as_str(), grant_outcome, now) {
+                Ok(transition) => transition,
+                Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
+            };
+        let transition_str = match transition {
+            Transition::NoChange => "no_change",
+            Transition::Promoted { .. } => "promoted",
+            Transition::Demoted { .. } => "demoted",
+            Transition::Frozen => "frozen",
+        };
+        let posture = graph
+            .get_autonomy_grant(audit.lane.as_str())
+            .ok()
+            .flatten()
+            .map(|g| posture_str(g.posture));
+
+        info!(
+            audit_id,
+            lane = audit.lane.as_str(),
+            outcome,
+            transition = transition_str,
+            "autonomy outcome recorded"
+        );
+        IpcResponse::success(
+            CORR,
+            Some(serde_json::json!({
+                "recorded": true,
+                "lane": audit.lane.as_str(),
+                "transition": transition_str,
+                "posture": posture,
+            })),
+        )
     }
 
     // ── Agent migration ───────────────────────────────────────────────────────
@@ -11792,6 +12039,18 @@ pub(super) fn unix_ts() -> u64 {
         .as_secs()
 }
 
+/// Wire string for an autonomy posture in ConsumeAutonomyAction /
+/// RecordAutonomyOutcome response payloads (matches the grant's serde
+/// snake_case representation).
+fn posture_str(posture: ansible_mesh_core::autonomy::AutonomyPosture) -> &'static str {
+    use ansible_mesh_core::autonomy::AutonomyPosture;
+    match posture {
+        AutonomyPosture::ProposalOnly => "proposal_only",
+        AutonomyPosture::ConfirmFirst => "confirm_first",
+        AutonomyPosture::AutoWithAudit => "auto_with_audit",
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -12004,6 +12263,305 @@ pub(crate) mod tests {
                 items[0].evidence.last().expect("last line"),
                 &format!("{:0>300}", 39)
             );
+        }
+    }
+
+    // ── Autonomy lane consult (Autopoiesis Slice A2) ──────────────────────────
+
+    mod autonomy_lane_consult {
+        use super::*;
+        use ansible_mesh_core::autonomy::{AuditOutcome, AutonomyPosture, LANE_GRAPH_BRIDGE_EDGES};
+
+        const T0: u64 = 1_750_000_000;
+        const NO_ENV: &dyn Fn(&str) -> Option<String> = &|_| None;
+
+        fn graph() -> GraphDomain {
+            register_skill_test_graph()
+        }
+
+        fn consult(
+            graph: &GraphDomain,
+            now: u64,
+            env: &dyn Fn(&str) -> Option<String>,
+        ) -> serde_json::Value {
+            let resp = IpcServer::handle_consume_autonomy_action(
+                graph,
+                LANE_GRAPH_BRIDGE_EDGES,
+                "bridge 2 RELATES_TO edge(s) from 'life:open_loop:anchor' for \
+                 Disconnected recall feedback feedback:recall:a2",
+                "feedback_id=feedback:recall:a2 rating=Disconnected \
+                 anchor=life:open_loop:anchor targets=[life:project:phi]",
+                "MATCH ()-[r:RELATES_TO {feedback_signal_id: 'feedback:recall:a2'}]-() DELETE r",
+                now,
+                env,
+            );
+            match resp {
+                IpcResponse::Standard {
+                    ok: true,
+                    data: Some(data),
+                    ..
+                } => data,
+                other => panic!("expected ok Standard with data, got {other:?}"),
+            }
+        }
+
+        fn record(graph: &GraphDomain, audit_id: &str, outcome: &str, now: u64) -> IpcResponse {
+            IpcServer::handle_record_autonomy_outcome(graph, audit_id, outcome, now)
+        }
+
+        fn set_posture(graph: &GraphDomain, posture: AutonomyPosture, now: u64) {
+            let mut grant = graph
+                .get_or_create_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES, now)
+                .expect("grant");
+            grant.posture = posture;
+            graph.upsert_autonomy_grant(&grant).expect("upsert grant");
+        }
+
+        #[test]
+        fn fresh_grant_is_proposal_only_and_consumes_nothing() {
+            // The point of the slice: on day one this lane still does not
+            // write. A fresh grant answers proposal_only — no audit record,
+            // no budget spend — and the runner stays prose-only.
+            let graph = graph();
+            let data = consult(&graph, T0, NO_ENV);
+            assert_eq!(data["allowed"], false);
+            assert_eq!(data["posture"], "proposal_only");
+            assert_eq!(data["reason"], "posture_proposal_only");
+            assert!(data.get("audit_id").is_none());
+
+            let grant = graph
+                .get_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES)
+                .expect("grant lookup")
+                .expect("grant created");
+            assert_eq!(grant.posture, AutonomyPosture::ProposalOnly);
+            assert_eq!(grant.actions_today, 0, "refusal must not consume budget");
+            assert!(
+                graph
+                    .list_autonomy_audits_by_lane(LANE_GRAPH_BRIDGE_EDGES)
+                    .expect("audits")
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn confirm_first_files_pending_audit_and_withholds_permission() {
+            let graph = graph();
+            set_posture(&graph, AutonomyPosture::ConfirmFirst, T0);
+
+            let data = consult(&graph, T0 + 1, NO_ENV);
+            assert_eq!(data["allowed"], false);
+            assert_eq!(data["posture"], "confirm_first");
+            let audit_id = data["audit_id"].as_str().expect("audit id").to_string();
+
+            // Budget consumed: filing an awaiting-confirmation spec IS the
+            // lane's daily action.
+            let grant = graph
+                .get_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES)
+                .expect("grant lookup")
+                .expect("grant exists");
+            assert_eq!(grant.actions_today, 1);
+
+            // The audit record is Pending and carries the caller's
+            // action/evidence/reversal content verbatim.
+            let audit = graph
+                .get_autonomy_audit(&audit_id)
+                .expect("get audit")
+                .expect("audit exists");
+            assert_eq!(audit.lane.as_str(), LANE_GRAPH_BRIDGE_EDGES);
+            assert_eq!(audit.outcome, AuditOutcome::Pending);
+            assert_eq!(audit.posture_at_action, AutonomyPosture::ConfirmFirst);
+            assert!(audit.action_summary.contains("RELATES_TO"));
+            assert!(audit.evidence.contains("feedback:recall:a2"));
+            assert!(audit.reversal_hint.contains("DELETE r"));
+        }
+
+        #[test]
+        fn auto_with_audit_allows_action_with_audit_anchor() {
+            let graph = graph();
+            set_posture(&graph, AutonomyPosture::AutoWithAudit, T0);
+
+            let data = consult(&graph, T0 + 1, NO_ENV);
+            assert_eq!(data["allowed"], true);
+            assert_eq!(data["posture"], "auto_with_audit");
+            let audit_id = data["audit_id"].as_str().expect("audit id");
+            let audit = graph
+                .get_autonomy_audit(audit_id)
+                .expect("get audit")
+                .expect("audit exists");
+            assert_eq!(audit.outcome, AuditOutcome::Pending);
+            assert_eq!(audit.posture_at_action, AutonomyPosture::AutoWithAudit);
+        }
+
+        #[test]
+        fn kill_switch_disables_lane_before_grant_creation() {
+            let graph = graph();
+            let env = |key: &str| {
+                (key == "PHILOTIC_AUTONOMY_DISABLE_GRAPH_BRIDGE_EDGES").then(|| "1".to_string())
+            };
+            let data = consult(&graph, T0, &env);
+            assert_eq!(data["allowed"], false);
+            assert_eq!(data["reason"], "lane_disabled");
+            assert!(
+                graph
+                    .get_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES)
+                    .expect("grant lookup")
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn frozen_lane_and_exhausted_budget_refuse() {
+            let graph = graph();
+            let mut grant = graph
+                .get_or_create_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES, T0)
+                .expect("grant");
+            grant.posture = AutonomyPosture::AutoWithAudit;
+            grant.frozen_until_operator_review = true;
+            graph.upsert_autonomy_grant(&grant).expect("upsert grant");
+
+            let data = consult(&graph, T0 + 1, NO_ENV);
+            assert_eq!(data["allowed"], false);
+            assert_eq!(data["reason"], "lane_frozen");
+
+            grant.frozen_until_operator_review = false;
+            grant.budget.max_actions_per_day = 0;
+            graph.upsert_autonomy_grant(&grant).expect("upsert grant");
+            let data = consult(&graph, T0 + 2, NO_ENV);
+            assert_eq!(data["allowed"], false);
+            assert_eq!(data["reason"], "daily_budget_exhausted");
+            assert!(
+                graph
+                    .list_autonomy_audits_by_lane(LANE_GRAPH_BRIDGE_EDGES)
+                    .expect("audits")
+                    .is_empty(),
+                "refused consults must not write audit records"
+            );
+        }
+
+        #[test]
+        fn confirmed_outcomes_feed_grant_promotion() {
+            // The earning loop: ConfirmFirst + 5 operator-confirmed outcomes
+            // promotes the lane to AutoWithAudit (A1's required_for_promotion
+            // default). Each confirm flows through the same IPC surface the
+            // life.patch.apply actuator uses.
+            let graph = graph();
+            set_posture(&graph, AutonomyPosture::ConfirmFirst, T0);
+
+            for i in 1..=5u64 {
+                let data = consult(&graph, T0 + i, NO_ENV);
+                let audit_id = data["audit_id"].as_str().expect("audit id").to_string();
+                let resp = record(&graph, &audit_id, "confirmed_good", T0 + 100 + i);
+                let IpcResponse::Standard {
+                    ok: true,
+                    data: Some(data),
+                    ..
+                } = resp
+                else {
+                    panic!("expected ok Standard");
+                };
+                assert_eq!(data["recorded"], true);
+                assert_eq!(data["lane"], LANE_GRAPH_BRIDGE_EDGES);
+                let expected_transition = if i == 5 { "promoted" } else { "no_change" };
+                assert_eq!(data["transition"], expected_transition, "outcome {i}");
+                // Audit record stamped Confirmed.
+                let audit = graph
+                    .get_autonomy_audit(&audit_id)
+                    .expect("get audit")
+                    .expect("audit exists");
+                assert_eq!(audit.outcome, AuditOutcome::Confirmed);
+            }
+
+            let grant = graph
+                .get_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES)
+                .expect("grant lookup")
+                .expect("grant exists");
+            assert_eq!(grant.posture, AutonomyPosture::AutoWithAudit);
+            assert_eq!(grant.earned.confirmed_good_outcomes, 0, "counter resets");
+        }
+
+        #[test]
+        fn reversal_demotes_and_recording_is_idempotent() {
+            let graph = graph();
+            set_posture(&graph, AutonomyPosture::ConfirmFirst, T0);
+            let data = consult(&graph, T0 + 1, NO_ENV);
+            let audit_id = data["audit_id"].as_str().expect("audit id").to_string();
+
+            let resp = record(&graph, &audit_id, "reversed", T0 + 2);
+            let IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            } = resp
+            else {
+                panic!("expected ok Standard");
+            };
+            assert_eq!(data["recorded"], true);
+            assert_eq!(data["transition"], "demoted");
+            assert_eq!(data["posture"], "proposal_only");
+            let audit = graph
+                .get_autonomy_audit(&audit_id)
+                .expect("get audit")
+                .expect("audit exists");
+            assert_eq!(audit.outcome, AuditOutcome::Reversed);
+
+            // Second report against the same audit: refused, no double count.
+            let resp = record(&graph, &audit_id, "confirmed_good", T0 + 3);
+            let IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            } = resp
+            else {
+                panic!("expected ok Standard");
+            };
+            assert_eq!(data["recorded"], false);
+            assert_eq!(data["reason"], "already_recorded");
+            let grant = graph
+                .get_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES)
+                .expect("grant lookup")
+                .expect("grant exists");
+            assert_eq!(grant.posture, AutonomyPosture::ProposalOnly);
+            assert_eq!(grant.earned.confirmed_good_outcomes, 0);
+        }
+
+        #[test]
+        fn invalid_outcomes_and_unknown_audits_error() {
+            let graph = graph();
+            let resp = record(
+                &graph,
+                "autonomy:graph.bridge_edges:missing",
+                "confirmed_good",
+                T0,
+            );
+            let IpcResponse::Standard {
+                ok: false, code, ..
+            } = resp
+            else {
+                panic!("expected error Standard");
+            };
+            assert_eq!(code, "AUDIT_NOT_FOUND");
+
+            set_posture(&graph, AutonomyPosture::ConfirmFirst, T0);
+            let data = consult(&graph, T0 + 1, NO_ENV);
+            let audit_id = data["audit_id"].as_str().expect("audit id");
+            let resp = record(&graph, audit_id, "sideways", T0 + 2);
+            let IpcResponse::Standard {
+                ok: false, code, ..
+            } = resp
+            else {
+                panic!("expected error Standard");
+            };
+            assert_eq!(code, "INVALID_OUTCOME");
+
+            let resp =
+                IpcServer::handle_consume_autonomy_action(&graph, "  ", "s", "e", "r", T0, NO_ENV);
+            let IpcResponse::Standard {
+                ok: false, code, ..
+            } = resp
+            else {
+                panic!("expected error Standard");
+            };
+            assert_eq!(code, "INVALID_LANE");
         }
     }
 
