@@ -1,8 +1,11 @@
+mod recurrence;
+
 use ansible_mesh_core::heal_queue::HealQueueRow;
 use anyhow::Result;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use recurrence::{Breach, RecurrenceTracker};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const ROLE: &str = "heal-dispatcher";
 const GUEST_ID: &str = "heal-dispatcher-01";
@@ -12,13 +15,27 @@ const POLL_INTERVAL_SECS: u64 = 30;
 // Max entries fetched per cycle.
 const BATCH_LIMIT: usize = 20;
 
+// Prefix of the operator-visibility heal-queue entries the hotel writes when a
+// work item is filed. Never track these for recurrence — they are our own echo.
+const WORK_ITEM_FILED_PREFIX: &str = "work_item_filed:";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     info!("heal-dispatcher starting");
 
+    // Recurrence state is in-memory: a dispatcher restart resets every window
+    // (acceptable — a recurring pattern re-accumulates within one window, and
+    // the hotel dedups any double filing into a count bump). Owned by main so
+    // IPC reconnects do NOT reset it.
+    let mut tracker = RecurrenceTracker::from_env(|key| std::env::var(key).ok());
+    let intel_graph_url = std::env::var("PHILOTIC_INTEL_GRAPH_URL")
+        .ok()
+        .map(|url| url.trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty());
+
     loop {
-        match run().await {
+        match run(&mut tracker, intel_graph_url.as_deref()).await {
             Ok(()) => {
                 info!("heal-dispatcher exiting cleanly");
                 break;
@@ -36,7 +53,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run() -> Result<()> {
+async fn run(tracker: &mut RecurrenceTracker, intel_graph_url: Option<&str>) -> Result<()> {
     let identity = GuestIdentity {
         guest_id: GUEST_ID.to_string(),
         role: ROLE.to_string(),
@@ -57,7 +74,16 @@ async fn run() -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     loop {
         interval.tick().await;
-        if let Err(e) = dispatch_cycle(&mut ipc, &http, &ollama_url, &ollama_model).await {
+        if let Err(e) = dispatch_cycle(
+            &mut ipc,
+            &http,
+            &ollama_url,
+            &ollama_model,
+            tracker,
+            intel_graph_url,
+        )
+        .await
+        {
             if is_ipc_disconnect(&e) {
                 return Err(e);
             }
@@ -71,6 +97,8 @@ async fn dispatch_cycle(
     http: &reqwest::Client,
     ollama_url: &str,
     ollama_model: &str,
+    tracker: &mut RecurrenceTracker,
+    intel_graph_url: Option<&str>,
 ) -> Result<()> {
     // Proactively repair session turns stuck in "running" for more than 5 minutes.
     match ipc
@@ -110,7 +138,16 @@ async fn dispatch_cycle(
     );
 
     for row in rows {
-        process_row(ipc, http, ollama_url, ollama_model, &row).await;
+        process_row(
+            ipc,
+            http,
+            ollama_url,
+            ollama_model,
+            tracker,
+            intel_graph_url,
+            &row,
+        )
+        .await;
     }
     Ok(())
 }
@@ -120,6 +157,8 @@ async fn process_row(
     http: &reqwest::Client,
     ollama_url: &str,
     ollama_model: &str,
+    tracker: &mut RecurrenceTracker,
+    intel_graph_url: Option<&str>,
     row: &HealQueueRow,
 ) {
     let (severity, pattern_tag, heal_action) =
@@ -137,6 +176,28 @@ async fn process_row(
     {
         warn!(id = %row.id, "triage write failed: {e}");
         return;
+    }
+
+    // Recurrence tracking (Autopoiesis Slice A3): a (pattern_tag, guest_id)
+    // pair breaching the sliding-window threshold files a heal work item on
+    // the hotel through the fleet.heal_slices autonomy lane.
+    if !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(breach) = tracker.record(&pattern_tag, &row.guest_id, now, &row.raw_text) {
+            file_heal_work_item(
+                ipc,
+                http,
+                intel_graph_url,
+                &pattern_tag,
+                &row.guest_id,
+                breach,
+                tracker.window_secs(),
+            )
+            .await;
+        }
     }
 
     // Execute the action and record outcome.
@@ -159,6 +220,161 @@ async fn process_row(
         outcome = %outcome,
         "heal-dispatcher: entry resolved"
     );
+}
+
+// ── Work-item filing (Autopoiesis Slice A3) ───────────────────────────────────
+
+/// File a heal work item on the hotel via `IpcRequest::FileHealWorkItem`.
+///
+/// The hotel owns the autonomy decision (kill switch, grant freeze, daily
+/// budget) and the durable record (autonomy_audit + heal_work_item nodes in
+/// the hotel context graph). This side only reports the breach — and, when
+/// the hotel confirms a fresh filing, mirrors it to the intel graph
+/// best-effort.
+async fn file_heal_work_item(
+    ipc: &mut PhiloticClient,
+    http: &reqwest::Client,
+    intel_graph_url: Option<&str>,
+    pattern_tag: &str,
+    guest_id: &str,
+    breach: Breach,
+    window_secs: u64,
+) {
+    let response = ipc
+        .send_request(IpcRequest::FileHealWorkItem {
+            pattern_tag: pattern_tag.to_string(),
+            guest_id: guest_id.to_string(),
+            occurrence_count: breach.count,
+            window_secs,
+            evidence_lines: breach.evidence,
+        })
+        .await;
+
+    let data = match response {
+        Ok(IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        }) => data,
+        Ok(other) => {
+            warn!(
+                pattern_tag,
+                guest_id,
+                ?other,
+                "heal work item filing got unexpected response"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                pattern_tag,
+                guest_id, "heal work item filing IPC error: {e}"
+            );
+            return;
+        }
+    };
+
+    let filed = data.get("filed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let deduped = data
+        .get("deduped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let work_item_id = data
+        .get("work_item_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if filed {
+        info!(
+            pattern_tag,
+            guest_id,
+            work_item_id = %work_item_id,
+            count = breach.count,
+            window_secs,
+            "heal work item filed"
+        );
+        // Best-effort intel-graph mirror — never blocks or fails the filing.
+        if let Some(url) = intel_graph_url {
+            push_intel_graph_record(
+                http,
+                url,
+                pattern_tag,
+                guest_id,
+                breach.count,
+                window_secs,
+                &work_item_id,
+            )
+            .await;
+        }
+    } else if deduped {
+        info!(
+            pattern_tag,
+            guest_id,
+            work_item_id = %work_item_id,
+            "heal work item already open — hotel bumped count/last_seen"
+        );
+    } else {
+        let reason = data
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        debug!(
+            pattern_tag,
+            guest_id, reason, "heal work item filing refused by autonomy grant"
+        );
+    }
+}
+
+/// Mirror a fresh filing into the intel graph via `POST /api/decide` — the
+/// graph server's decision-recording endpoint (there is no proposal-create
+/// REST route; the decision node + mutation is the reviewable breadcrumb that
+/// links the filing to the Autopoiesis proposal). Best-effort with a short
+/// timeout: the intel-graph server lives on the dev machine and is often
+/// down; the hotel-graph work item is the durable record.
+async fn push_intel_graph_record(
+    http: &reqwest::Client,
+    base_url: &str,
+    pattern_tag: &str,
+    guest_id: &str,
+    count: u32,
+    window_secs: u64,
+    work_item_id: &str,
+) {
+    let body = serde_json::json!({
+        "target_node": "doc:AUTOPOIESIS_PROPOSAL",
+        "action": "heal_work_item_filed",
+        "to_value": work_item_id,
+        "reason": format!(
+            "recurring heal pattern '{pattern_tag}' on {guest_id} ({count}x in {window_secs}s) \
+             filed as hotel-graph heal_work_item {work_item_id}"
+        ),
+        "agent": "heal-dispatcher",
+    });
+    let result = http
+        .post(format!("{base_url}/api/decide"))
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            info!(work_item_id, "heal work item mirrored to intel graph");
+        }
+        Ok(resp) => {
+            debug!(
+                work_item_id,
+                status = %resp.status(),
+                "intel graph mirror rejected (best-effort, ignoring)"
+            );
+        }
+        Err(e) => {
+            debug!(
+                work_item_id,
+                "intel graph unreachable, skipping mirror (best-effort): {e}"
+            );
+        }
+    }
 }
 
 // ── Classifier ────────────────────────────────────────────────────────────────

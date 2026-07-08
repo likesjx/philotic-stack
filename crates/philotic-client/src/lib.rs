@@ -1813,6 +1813,35 @@ pub enum IpcRequest {
     ApplyAgentBundle {
         bundle_json: String,
     },
+    /// Heal-dispatcher → hotel: a recurring `(pattern_tag, guest_id)` failure
+    /// pattern breached the filing threshold; file (or bump) a
+    /// `heal_work_item` node through the `fleet.heal_slices` autonomy lane
+    /// (Autopoiesis Slice A3 — ProposalOnly posture: filing IS the action).
+    ///
+    /// The hotel consults the lane kill switch, grant freeze state, and daily
+    /// action budget before filing, writes an `autonomy_audit` record plus the
+    /// work-item node, and pushes a resolved `work_item_filed` heal-queue info
+    /// entry for operator visibility. Dedup: one OPEN work item per
+    /// `(pattern_tag, guest_id)` — a re-breach while open bumps count/last_seen.
+    ///
+    /// `evidence_lines` are capped hotel-side to
+    /// [`ansible_mesh_core::heal_queue::MAX_HEAL_EVIDENCE_LINES`] lines /
+    /// [`ansible_mesh_core::heal_queue::MAX_HEAL_EVIDENCE_BYTES`] bytes total.
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{filed, deduped, reason?, work_item_id?, audit_id?}`. No new
+    /// `IpcResponse` variant is introduced, so the untagged-ordering invariant
+    /// (all-optional variants like `MemoryConfig` stay last) is untouched.
+    ///
+    /// NOTE: new `IpcRequest` variants are appended at the END of this enum.
+    FileHealWorkItem {
+        pattern_tag: String,
+        guest_id: String,
+        occurrence_count: u32,
+        window_secs: u64,
+        #[serde(default)]
+        evidence_lines: Vec<String>,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
@@ -3253,5 +3282,87 @@ mod tests {
         assert_eq!(route.node, "compat-node");
         assert_eq!(route.role, "membrane");
         assert_eq!(route.guest_id, None);
+    }
+    #[test]
+    fn file_heal_work_item_request_serde_round_trip() {
+        // New variant appended at the END of IpcRequest (externally-order-safe:
+        // the enum is internally tagged by "operation", so existing wire shapes
+        // are untouched; the END placement is a repo convention).
+        let req = IpcRequest::FileHealWorkItem {
+            pattern_tag: "connection_refused".into(),
+            guest_id: "membrane-telegram-01".into(),
+            occurrence_count: 5,
+            window_secs: 1800,
+            evidence_lines: vec!["connection refused".into(), "econnrefused".into()],
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"file_heal_work_item\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::FileHealWorkItem {
+                pattern_tag,
+                guest_id,
+                occurrence_count,
+                window_secs,
+                evidence_lines,
+            } => {
+                assert_eq!(pattern_tag, "connection_refused");
+                assert_eq!(guest_id, "membrane-telegram-01");
+                assert_eq!(occurrence_count, 5);
+                assert_eq!(window_secs, 1800);
+                assert_eq!(evidence_lines.len(), 2);
+            }
+            other => panic!("expected FileHealWorkItem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_heal_work_item_request_back_compat() {
+        // A sender built before evidence_lines existed (field omitted) must
+        // still deserialize — the field defaults to empty.
+        let wire = serde_json::json!({
+            "operation": "file_heal_work_item",
+            "payload": {
+                "pattern_tag": "panic",
+                "guest_id": "philote-01",
+                "occurrence_count": 7,
+                "window_secs": 900,
+            }
+        });
+        let back: IpcRequest = serde_json::from_value(wire).expect("deserialize");
+        match back {
+            IpcRequest::FileHealWorkItem { evidence_lines, .. } => {
+                assert!(evidence_lines.is_empty());
+            }
+            other => panic!("expected FileHealWorkItem, got {other:?}"),
+        }
+
+        // Pre-existing request shapes are unaffected by the appended variant.
+        let old = serde_json::json!({
+            "operation": "get_heal_queue_pending",
+            "payload": { "limit": 5 }
+        });
+        let back: IpcRequest = serde_json::from_value(old).expect("old request");
+        assert!(matches!(back, IpcRequest::GetHealQueuePending { limit: 5 }));
+
+        // The filing response is a plain Standard ack (no new IpcResponse
+        // variant), so the untagged-ordering invariant is untouched: a
+        // Standard payload with data must still parse as Standard.
+        let resp = serde_json::json!({
+            "ok": true,
+            "code": "OK",
+            "message": "Success",
+            "corr_id": "file_heal_work_item",
+            "data": { "filed": true, "deduped": false, "work_item_id": "wi-1" }
+        });
+        let back: IpcResponse = serde_json::from_value(resp).expect("response");
+        match back {
+            IpcResponse::Standard { ok: true, data, .. } => {
+                let data = data.expect("data");
+                assert_eq!(data["filed"], true);
+                assert_eq!(data["work_item_id"], "wi-1");
+            }
+            other => panic!("expected Standard, got {other:?}"),
+        }
     }
 }
