@@ -303,6 +303,14 @@ worktree-prune:
 test:
     cargo test --workspace
 
+# Build the Apple edge client (PhiloticKit + PhiloticApp for macOS and iOS Simulator).
+app-build:
+    ./scripts/apple-app-build.sh
+
+# Test the Apple edge client (PhiloticKit swift test, then both PhiloticApp builds).
+app-test:
+    ./scripts/apple-app-test.sh
+
 # Run the heavier binary-level smoke test
 smoke-binaries:
     ./scripts/smoke-binary-roundtrip.sh

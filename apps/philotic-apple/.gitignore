@@ -1,0 +1,30 @@
+# Xcode derived data, user state, and generated project files.
+# PhiloticApp/PhiloticApp.xcodeproj is regenerated from project.yml by
+# `xcodegen generate` (wired into `just app-build` / `just app-test`), so it
+# is not checked in.
+
+## Build products
+build/
+DerivedData/
+*.xcarchive
+
+## Generated Xcode project (regenerated via `xcodegen generate`)
+PhiloticApp/PhiloticApp.xcodeproj/
+
+## Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+## Per-user Xcode state (relevant if a project is ever checked in)
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+## Simulator / device logs and crash reports incidentally captured locally
+*.ips
+*.crash
+
+## macOS noise
+.DS_Store
