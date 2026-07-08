@@ -736,6 +736,10 @@ struct ActiveTurn {
     streaming_draft: String,
     /// When we last sent an `editMessageText` for streaming (throttle guard).
     streaming_last_edit: Option<tokio::time::Instant>,
+    /// The raw text last rendered into the draft message. Lets the final-reply
+    /// path skip the finalisation edit when the draft already shows the full
+    /// final text (Telegram would reject it with "message is not modified").
+    draft_text: String,
 }
 
 impl ActiveTurn {
@@ -747,6 +751,7 @@ impl ActiveTurn {
             thread_id,
             streaming_draft: String::new(),
             streaming_last_edit: None,
+            draft_text: String::new(),
         }
     }
 
@@ -765,6 +770,14 @@ fn streaming_edit_due(last_edit: Option<tokio::time::Instant>, now: tokio::time:
     last_edit
         .map(|t| now.duration_since(t).as_millis() as u64 >= STREAMING_THROTTLE_MS)
         .unwrap_or(true)
+}
+
+/// True when the draft message already shows exactly the final reply text, so
+/// the finalisation edit can be skipped: Telegram would reject the no-op edit
+/// with 400 "message is not modified" anyway. Common on ordinary turns because
+/// philote's cumulative `partial_reply` pushes converge on the full final text.
+fn draft_already_final(draft_text: &str, final_text: &str) -> bool {
+    !draft_text.is_empty() && draft_text == final_text
 }
 
 /// Start a `sendChatAction(typing)` heartbeat that refreshes every 4 seconds until cancelled.
@@ -882,7 +895,23 @@ async fn edit_telegram_text(
     });
 
     match http_client.post(&edit_url).json(&payload).send().await {
-        Ok(res) => res.status().is_success(),
+        Ok(res) => {
+            let status = res.status();
+            if status.is_success() {
+                return true;
+            }
+            let body = res.text().await.unwrap_or_default();
+            // Telegram returns 400 "Bad Request: message is not modified" when
+            // the new text is identical to what the message already shows —
+            // the message is already in the desired state, so this is success.
+            // Treating it as failure caused a sendMessage fallback next to the
+            // still-visible draft: one turn, two identical replies.
+            if body.to_lowercase().contains("message is not modified") {
+                return true;
+            }
+            warn!("editMessageText failed: status={} body={}", status, body);
+            false
+        }
         Err(e) => {
             error!("editMessageText failed: {}", e);
             false
@@ -943,13 +972,14 @@ async fn upsert_formatted_text(
     };
     let last_idx = chunks.len() - 1;
 
-    let first_message_id = match existing_message_id {
-        Some(message_id)
-            if edit_telegram_text(http_client, tg_base, chat_id, message_id, first_chunk).await =>
-        {
+    let first_message_id = if let Some(message_id) = existing_message_id {
+        if edit_telegram_text(http_client, tg_base, chat_id, message_id, first_chunk).await {
             Some(message_id)
-        }
-        _ => {
+        } else {
+            // The edit genuinely failed, so the existing draft still shows
+            // stale partial content. Delete it (best-effort) before sending a
+            // replacement so exactly one message survives the turn.
+            delete_telegram_message(http_client, tg_base, chat_id, message_id).await;
             let markup = if last_idx == 0 {
                 reply_markup.clone()
             } else {
@@ -965,6 +995,21 @@ async fn upsert_formatted_text(
             )
             .await
         }
+    } else {
+        let markup = if last_idx == 0 {
+            reply_markup.clone()
+        } else {
+            None
+        };
+        send_telegram_text(
+            http_client,
+            tg_base,
+            chat_id,
+            thread_id,
+            first_chunk,
+            markup,
+        )
+        .await
     };
 
     for (i, chunk) in chunks.iter().enumerate().skip(1) {
@@ -2797,6 +2842,7 @@ impl TelegramSeatGuest {
                 {
                     if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id) {
                         active.draft_message_id = Some(message_id);
+                        active.draft_text = content;
                     }
                 }
             }
@@ -2850,6 +2896,7 @@ impl TelegramSeatGuest {
                         {
                             active.draft_message_id = Some(message_id);
                             active.streaming_last_edit = Some(now);
+                            active.draft_text = draft_snapshot;
                         }
                     }
                 }
@@ -2891,16 +2938,22 @@ impl TelegramSeatGuest {
         } else {
             // send_reply (or any unrecognised action): deliver to Telegram and
             // cancel the typing heartbeat for this session.
-            let (draft_message_id, status_message_id, active_thread_id) = {
+            let (draft_message_id, draft_text, status_message_id, active_thread_id) = {
                 let removed = self.active_turns.lock().unwrap().remove(&session_id);
                 if let Some(active) = removed {
                     let draft_message_id = active.draft_message_id;
+                    let draft_text = active.draft_text.clone();
                     let status_message_id = active.status_message_id;
                     let active_thread_id = active.thread_id.clone();
                     active.cancel();
-                    (draft_message_id, status_message_id, active_thread_id)
+                    (
+                        draft_message_id,
+                        draft_text,
+                        status_message_id,
+                        active_thread_id,
+                    )
                 } else {
-                    (None, None, None)
+                    (None, String::new(), None, None)
                 }
             };
 
@@ -3028,16 +3081,25 @@ impl TelegramSeatGuest {
 
                         // Also send text as a follow-up caption if requested.
                         if send_text_caption && !content.is_empty() {
-                            let _ = upsert_formatted_text(
-                                &http_client_clone,
-                                &tg_base_clone,
-                                &chat_id,
-                                thread_id_clone.as_deref(),
-                                draft_message_id,
-                                &content,
-                                role_button.clone(),
-                            )
-                            .await;
+                            if draft_message_id.is_some()
+                                && draft_already_final(&draft_text, &content)
+                            {
+                                info!(
+                                    "Draft already shows the final caption for Chat [{}]; skipping edit.",
+                                    chat_id
+                                );
+                            } else {
+                                let _ = upsert_formatted_text(
+                                    &http_client_clone,
+                                    &tg_base_clone,
+                                    &chat_id,
+                                    thread_id_clone.as_deref(),
+                                    draft_message_id,
+                                    &content,
+                                    role_button.clone(),
+                                )
+                                .await;
+                            }
                         } else if let Some(msg_id) = draft_message_id {
                             // Voice-only response: delete any streaming/partial
                             // draft that appeared while the model was generating
@@ -3053,20 +3115,31 @@ impl TelegramSeatGuest {
                         }
                     } else if !content.is_empty() {
                         // Text-only path.
-                        info!(
-                            "Sending final response back to Telegram Chat [{}]...",
-                            chat_id
-                        );
-                        let _ = upsert_formatted_text(
-                            &http_client_clone,
-                            &tg_base_clone,
-                            &chat_id,
-                            thread_id_clone.as_deref(),
-                            draft_message_id,
-                            &content,
-                            role_button.clone(),
-                        )
-                        .await;
+                        if draft_message_id.is_some() && draft_already_final(&draft_text, &content)
+                        {
+                            // The draft message already shows the full final
+                            // text — editing would only earn a "message is not
+                            // modified" 400 from Telegram. The turn is done.
+                            info!(
+                                "Draft already shows the final reply for Chat [{}]; skipping edit.",
+                                chat_id
+                            );
+                        } else {
+                            info!(
+                                "Sending final response back to Telegram Chat [{}]...",
+                                chat_id
+                            );
+                            let _ = upsert_formatted_text(
+                                &http_client_clone,
+                                &tg_base_clone,
+                                &chat_id,
+                                thread_id_clone.as_deref(),
+                                draft_message_id,
+                                &content,
+                                role_button.clone(),
+                            )
+                            .await;
+                        }
                     }
                 });
             } else {
@@ -3778,5 +3851,175 @@ mod tests {
         assert_eq!(next_error_backoff_secs(300), 600);
         assert_eq!(next_error_backoff_secs(600), 600);
         assert_eq!(next_error_backoff_secs(900), 600);
+    }
+
+    // --- Draft finalisation: exactly one message must survive each turn. ---
+
+    use super::{draft_already_final, upsert_formatted_text};
+    use std::sync::{Arc, Mutex};
+
+    /// How the mock Telegram API should answer `editMessageText`.
+    #[derive(Clone, Copy)]
+    enum MockEdit {
+        Ok,
+        NotModified,
+        Fail,
+    }
+
+    /// Spawn a minimal mock Telegram Bot API server. Returns the `tg_base`
+    /// URL (trailing slash included, matching production) and the ordered
+    /// list of API method paths it received.
+    async fn spawn_mock_telegram(edit_response: MockEdit) -> (String, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = calls.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let calls = recorder.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let path = loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= header_end + 4 + content_length {
+                                break headers
+                                    .lines()
+                                    .next()
+                                    .and_then(|l| l.split_whitespace().nth(1))
+                                    .unwrap_or("")
+                                    .to_string();
+                            }
+                        }
+                    };
+                    let method = path.rsplit('/').next().unwrap_or("").to_string();
+                    calls.lock().unwrap().push(method.clone());
+                    let (status_line, body) = match method.as_str() {
+                        "editMessageText" => match edit_response {
+                            MockEdit::Ok => ("HTTP/1.1 200 OK", r#"{"ok":true,"result":true}"#),
+                            MockEdit::NotModified => (
+                                "HTTP/1.1 400 Bad Request",
+                                r#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}"#,
+                            ),
+                            MockEdit::Fail => (
+                                "HTTP/1.1 400 Bad Request",
+                                r#"{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}"#,
+                            ),
+                        },
+                        "sendMessage" => (
+                            "HTTP/1.1 200 OK",
+                            r#"{"ok":true,"result":{"message_id":777}}"#,
+                        ),
+                        _ => ("HTTP/1.1 200 OK", r#"{"ok":true,"result":true}"#),
+                    };
+                    let response = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/bot-test/"), calls)
+    }
+
+    #[tokio::test]
+    async fn upsert_edit_not_modified_is_success_without_fallback_send() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::NotModified).await;
+        let client = reqwest::Client::new();
+
+        let result =
+            upsert_formatted_text(&client, &tg_base, "123", None, Some(42), "final text", None)
+                .await;
+
+        // The draft already shows this text: the turn is complete, the draft
+        // message id survives, and no second message is sent.
+        assert_eq!(result, Some(42));
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["editMessageText".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn upsert_edit_failure_deletes_stale_draft_then_sends_exactly_once() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Fail).await;
+        let client = reqwest::Client::new();
+
+        let result =
+            upsert_formatted_text(&client, &tg_base, "123", None, Some(42), "final text", None)
+                .await;
+
+        // Genuine edit failure: the stale draft is deleted before the
+        // fallback send, so exactly one message survives.
+        assert_eq!(result, Some(777));
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                "editMessageText".to_string(),
+                "deleteMessage".to_string(),
+                "sendMessage".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_without_draft_sends_plain_message_once() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let client = reqwest::Client::new();
+
+        let result =
+            upsert_formatted_text(&client, &tg_base, "123", None, None, "final text", None).await;
+
+        assert_eq!(result, Some(777));
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["sendMessage".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn upsert_edit_success_edits_in_place_without_send() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let client = reqwest::Client::new();
+
+        let result =
+            upsert_formatted_text(&client, &tg_base, "123", None, Some(42), "final text", None)
+                .await;
+
+        assert_eq!(result, Some(42));
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["editMessageText".to_string()]);
+    }
+
+    #[test]
+    fn draft_already_final_requires_exact_nonempty_match() {
+        // Full final text already rendered in the draft: skip the edit call.
+        assert!(draft_already_final("final text", "final text"));
+        // No draft text recorded: must not skip.
+        assert!(!draft_already_final("", "final text"));
+        // Draft holds partial content: must edit.
+        assert!(!draft_already_final("final", "final text"));
     }
 }
