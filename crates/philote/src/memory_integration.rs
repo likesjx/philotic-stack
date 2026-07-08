@@ -1005,6 +1005,9 @@ pub(super) struct MemoryCandidate {
     pub(super) concept: String,
     pub(super) content: String,
     pub(super) tags: Vec<String>,
+    /// Optional model-attached confidence (0.0-1.0). Consumed by the
+    /// LifeGraph auto-capture lane; the Muninn write path ignores it.
+    pub(super) confidence: Option<f64>,
 }
 
 pub(super) fn parse_memory_candidate(value: Option<&Value>) -> Option<MemoryCandidate> {
@@ -1035,10 +1038,16 @@ pub(super) fn parse_memory_candidate(value: Option<&Value>) -> Option<MemoryCand
         })
         .unwrap_or_default();
 
+    let confidence = candidate
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .map(|value| value.clamp(0.0, 1.0));
+
     Some(MemoryCandidate {
         concept,
         content,
         tags,
+        confidence,
     })
 }
 
