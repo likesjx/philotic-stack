@@ -133,6 +133,7 @@ fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
             paracrine_hop_budget: None,
             paracrine_chain_budget_secs: None,
             context_window: None,
+            plan_continuation_budget: None,
         },
         home_node: None,
     }

@@ -8,6 +8,12 @@
 
 use super::*;
 
+use crate::plan_eval::{
+    DEFAULT_PLAN_CONTINUATION_BUDGET, PlanEvalVerdict, evaluate_plan, plan_continuation_brief,
+    plan_continuation_disabled, plan_stop_notice,
+};
+use crate::session::CarryoverPlan;
+
 impl AgentRuntime {
     /// Scan all active sessions and evict (or escalate) any turn stuck in a waiting
     /// phase past its deadline. Deadlines:
@@ -1885,7 +1891,8 @@ impl AgentRuntime {
         memory_concept: Option<String>,
         memory_candidate: Option<MemoryCandidate>,
     ) -> Result<()> {
-        let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
+        let plan_budget = self.plan_continuation_budget_for(&session_id);
+        let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state, plan_followup) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("deliver_text_reply: unknown session {}", session_id);
                 return Ok(());
@@ -1907,13 +1914,31 @@ impl AgentRuntime {
             }
             state.set_active_turn_phase(TurnPhase::Completed);
 
+            // Plan-eval-repeat: derive the completion verdict for this turn's
+            // plan (or a deferred carryover) and update the checkpointed
+            // carryover BEFORE the checkpoint below is built.
+            let plan_followup = plan_followup_after_turn(state, &completed_turn, plan_budget);
+
             (
                 completed_turn,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
+                plan_followup,
             )
         };
+
+        // Routing snapshot for post-completion plan events / continuation, taken
+        // before `completed_turn` fields are moved into the reply payload below.
+        let plan_route = plan_followup.as_ref().map(|_| {
+            (
+                completed_turn.turn_id.clone(),
+                completed_turn.chat_id.clone(),
+                completed_turn.final_reply_to.clone(),
+                completed_turn.final_reply_role.clone(),
+                completed_turn.final_reply_guest_id.clone(),
+            )
+        });
 
         self.ipc_client
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
@@ -2036,6 +2061,34 @@ impl AgentRuntime {
 
         // After completing this turn, schedule the next pending user task for dispatch.
         self.drain_next_user_task(&attend_session_id);
+
+        // Plan-eval-repeat: emit the plan_eval event and either synthesize a
+        // budgeted continuation turn or notify the operator why the loop stopped.
+        // Runs after the drain so a queued user task keeps priority — the
+        // carryover then resumes after that user turn completes.
+        if let (Some(followup), Some((p_turn_id, p_chat_id, p_reply_to, p_reply_role, p_guest))) =
+            (plan_followup, plan_route)
+        {
+            if let Err(e) = self
+                .dispatch_plan_followup(
+                    &attend_session_id,
+                    followup,
+                    plan_budget,
+                    p_turn_id,
+                    p_chat_id,
+                    p_reply_to,
+                    p_reply_role,
+                    p_guest,
+                )
+                .await
+            {
+                warn!(
+                    session_id = %attend_session_id,
+                    "Plan follow-up dispatch failed (non-fatal): {}",
+                    e
+                );
+            }
+        }
 
         // Attend hook (Slice E): fire-and-forget autobiographical memory write.
         // Only saves when the model provided an explicit memory_candidate — raw turn
@@ -2161,5 +2214,368 @@ impl AgentRuntime {
         self.drain_next_user_task(&drain_session_id);
 
         Ok(())
+    }
+
+    // ── Plan-eval-repeat ────────────────────────────────────────────────────
+
+    /// Effective auto-continuation budget for this session's active role.
+    /// `configured_roles` (live `role.configure` state) wins over the
+    /// `turn_loop_config` embedded in the role activation; default 3.
+    pub(super) fn plan_continuation_budget_for(&self, session_id: &str) -> u32 {
+        let state = self.sessions.get(session_id);
+        let role_name = state
+            .and_then(|s| s.role_activation.as_ref())
+            .map(|ra| ra.role_name.clone());
+        role_name
+            .as_deref()
+            .and_then(|rn| self.configured_roles.get(rn))
+            .and_then(|c| c.turn_loop_config.plan_continuation_budget)
+            .or_else(|| {
+                state
+                    .and_then(|s| s.role_activation.as_ref())
+                    .and_then(|ra| ra.turn_loop_config.as_ref())
+                    .and_then(|tlc| tlc.plan_continuation_budget)
+            })
+            .unwrap_or(DEFAULT_PLAN_CONTINUATION_BUDGET)
+    }
+
+    /// Emit a plan-lifecycle turn event (`plan_eval` / `plan_continuation`)
+    /// with explicit routing — the turn has already completed, so the standard
+    /// `emit_turn_event` (which reads `active_turn`) cannot be used.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn emit_plan_turn_event(
+        &mut self,
+        session_id: &str,
+        event: &str,
+        detail: Option<String>,
+        turn_id: &str,
+        chat_id: &str,
+        reply_to: &str,
+        reply_role: &str,
+        reply_guest_id: Option<String>,
+    ) -> Result<()> {
+        let payload = TurnEventPayload {
+            action: "turn_event",
+            event: event.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            chat_id: chat_id.to_string(),
+            partial_content: detail,
+        };
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: reply_to.to_string(),
+                target_role: reply_role.to_string(),
+                target_guest_id: reply_guest_id,
+                task_json: serde_json::to_string(&payload)?,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Act on the plan-eval outcome after a turn completed: emit the
+    /// `plan_eval` event, then synthesize a continuation turn through
+    /// `pending_drains` (verdict continue, budget remaining, no user work
+    /// waiting) or send the operator one tight stop notice.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn dispatch_plan_followup(
+        &mut self,
+        session_id: &str,
+        followup: PlanFollowup,
+        budget: u32,
+        turn_id: String,
+        chat_id: String,
+        reply_to: String,
+        reply_role: String,
+        reply_guest_id: Option<String>,
+    ) -> Result<()> {
+        match followup {
+            PlanFollowup::Settled { eval_json } => {
+                self.emit_plan_turn_event(
+                    session_id,
+                    "plan_eval",
+                    Some(eval_json.to_string()),
+                    &turn_id,
+                    &chat_id,
+                    &reply_to,
+                    &reply_role,
+                    reply_guest_id,
+                )
+                .await
+            }
+            PlanFollowup::Stop { eval_json, notice } => {
+                if let Some(eval_json) = eval_json {
+                    let _ = self
+                        .emit_plan_turn_event(
+                            session_id,
+                            "plan_eval",
+                            Some(eval_json.to_string()),
+                            &turn_id,
+                            &chat_id,
+                            &reply_to,
+                            &reply_role,
+                            reply_guest_id.clone(),
+                        )
+                        .await;
+                }
+                // One tight operator message: done / undone / why stopped.
+                let reply_payload = FinalReplyPayload {
+                    action: "send_reply",
+                    session_id: session_id.to_string(),
+                    turn_id,
+                    chat_id,
+                    content: notice,
+                    audio_artifact: None,
+                    send_text_caption: false,
+                    reply_markup: None,
+                };
+                self.ipc_client
+                    .send_request(IpcRequest::EmitTask {
+                        target_node: reply_to,
+                        target_role: reply_role,
+                        target_guest_id: reply_guest_id,
+                        task_json: serde_json::to_string(&reply_payload)?,
+                    })
+                    .await?;
+                Ok(())
+            }
+            PlanFollowup::Continue { eval_json } => {
+                if let Some(eval_json) = eval_json {
+                    let _ = self
+                        .emit_plan_turn_event(
+                            session_id,
+                            "plan_eval",
+                            Some(eval_json.to_string()),
+                            &turn_id,
+                            &chat_id,
+                            &reply_to,
+                            &reply_role,
+                            reply_guest_id.clone(),
+                        )
+                        .await;
+                }
+
+                // User priority: if a user task is queued (or already drained
+                // for dispatch), let it run first. The carryover stays put and
+                // resumes after that turn completes.
+                let user_waiting = self
+                    .sessions
+                    .get(session_id)
+                    .map(|s| s.pending_user_task_count() > 0)
+                    .unwrap_or(false)
+                    || self
+                        .pending_drains
+                        .iter()
+                        .any(|(_, t)| t.session_id.as_deref() == Some(session_id));
+                if user_waiting {
+                    info!(
+                        session_id = %session_id,
+                        "Plan continuation deferred — queued user work takes priority; \
+                         carryover will resume after it completes."
+                    );
+                    return Ok(());
+                }
+
+                // Charge the budget and synthesize the continuation brief.
+                let brief = {
+                    let Some(state) = self.sessions.get_mut(session_id) else {
+                        return Ok(());
+                    };
+                    let Some(carry) = state.carryover_plan.as_mut() else {
+                        return Ok(());
+                    };
+                    let brief = plan_continuation_brief(carry, budget);
+                    carry.continuations_used += 1;
+                    brief
+                };
+                // Re-persist so the charged budget survives a restart.
+                let _ = self.persist_session_checkpoint(session_id).await;
+
+                let continuation_turn_id = Uuid::new_v4().to_string();
+                let continuation = InboundTaskPayload {
+                    action: Some("plan_continuation".into()),
+                    session_id: Some(session_id.to_string()),
+                    turn_id: Some(continuation_turn_id),
+                    chat_id: Some(chat_id.clone()),
+                    content: Some(brief),
+                    final_reply_to: Some(reply_to.clone()),
+                    final_reply_role: Some(reply_role.clone()),
+                    final_reply_guest_id: reply_guest_id.clone(),
+                    ..Default::default()
+                };
+                self.pending_drains
+                    .push_back((Uuid::new_v4(), continuation));
+
+                let used = self
+                    .sessions
+                    .get(session_id)
+                    .and_then(|s| s.carryover_plan.as_ref())
+                    .map(|c| c.continuations_used)
+                    .unwrap_or(0);
+                info!(
+                    session_id = %session_id,
+                    continuations_used = used,
+                    budget,
+                    "Plan continuation synthesized"
+                );
+                let detail = serde_json::json!({
+                    "continuations_used": used,
+                    "budget": budget,
+                })
+                .to_string();
+                let _ = self
+                    .emit_plan_turn_event(
+                        session_id,
+                        "plan_continuation",
+                        Some(detail),
+                        &turn_id,
+                        &chat_id,
+                        &reply_to,
+                        &reply_role,
+                        reply_guest_id,
+                    )
+                    .await;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Follow-up decision derived from a completed turn's plan eval.
+#[derive(Debug)]
+pub(super) enum PlanFollowup {
+    /// Plan settled (complete, or continuation disabled) — emit the eval event only.
+    Settled { eval_json: Value },
+    /// Plan cannot proceed (blocked, or budget exhausted) — notify the operator.
+    Stop {
+        eval_json: Option<Value>,
+        notice: String,
+    },
+    /// Plan should continue — synthesize a continuation if no user work waits.
+    Continue { eval_json: Option<Value> },
+}
+
+/// Run the plan eval for a completed turn and update the session's carryover.
+///
+/// Mutates `state.carryover_plan` (create / update / clear) so the caller's
+/// subsequent `checkpoint_json()` persists the new carryover state. Returns
+/// `None` when the turn has no plan involvement (or is a scripted-loop /
+/// paracrine-specialist turn, which the continuation loop deliberately skips).
+pub(super) fn plan_followup_after_turn(
+    state: &mut SessionState,
+    completed_turn: &WorkingTurn,
+    budget: u32,
+) -> Option<PlanFollowup> {
+    if completed_turn.scripted_loop_context.is_some() || completed_turn.paracrine_origin.is_some() {
+        return None;
+    }
+    let disabled = plan_continuation_disabled();
+
+    if let Some(plan) = completed_turn.active_plan.as_ref() {
+        if plan.steps.is_empty() {
+            state.carryover_plan = None;
+            return None;
+        }
+        // The same plan (by goal) continues an existing carryover's budget and
+        // step flags; a different plan replaces it (user redirected the work).
+        let (prior_done, used, origin) = match state.carryover_plan.as_ref() {
+            Some(c) if c.plan.goal == plan.goal => (
+                Some(c.steps_done.clone()),
+                c.continuations_used,
+                c.created_turn_id.clone(),
+            ),
+            _ => (None, 0, completed_turn.turn_id.clone()),
+        };
+
+        let outcome = evaluate_plan(
+            plan,
+            prior_done.as_deref(),
+            &completed_turn.working_tool_history,
+        );
+        let eval_json = outcome.event_json();
+        info!(
+            session_id = %state.session_id,
+            steps_done = outcome.steps_done,
+            steps_total = outcome.steps_total,
+            verdict = outcome.verdict.as_str(),
+            basis = outcome.basis.as_str(),
+            "Plan eval"
+        );
+
+        match outcome.verdict {
+            PlanEvalVerdict::Complete => {
+                state.carryover_plan = None;
+                Some(PlanFollowup::Settled { eval_json })
+            }
+            PlanEvalVerdict::Blocked => {
+                let carry = CarryoverPlan {
+                    plan: plan.clone(),
+                    steps_done: outcome.steps_done_flags.clone(),
+                    continuations_used: used,
+                    created_turn_id: origin,
+                };
+                state.carryover_plan = None;
+                let notice =
+                    plan_stop_notice(&carry, "a step failed or no forward progress was made");
+                Some(PlanFollowup::Stop {
+                    eval_json: Some(eval_json),
+                    notice,
+                })
+            }
+            PlanEvalVerdict::Continue => {
+                if disabled {
+                    state.carryover_plan = None;
+                    return Some(PlanFollowup::Settled { eval_json });
+                }
+                let carry = CarryoverPlan {
+                    plan: plan.clone(),
+                    steps_done: outcome.steps_done_flags.clone(),
+                    continuations_used: used,
+                    created_turn_id: origin,
+                };
+                if used >= budget {
+                    state.carryover_plan = None;
+                    let notice = plan_stop_notice(
+                        &carry,
+                        &format!("auto-continuation budget of {budget} exhausted"),
+                    );
+                    return Some(PlanFollowup::Stop {
+                        eval_json: Some(eval_json),
+                        notice,
+                    });
+                }
+                state.carryover_plan = Some(carry);
+                Some(PlanFollowup::Continue {
+                    eval_json: Some(eval_json),
+                })
+            }
+        }
+    } else if state.carryover_plan.is_some() {
+        // A turn without its own plan completed while a carryover exists — an
+        // interleaved user turn finished. Resume the deferred carryover without
+        // re-evaluating against this unrelated turn's tool history.
+        if disabled {
+            state.carryover_plan = None;
+            return None;
+        }
+        let used = state
+            .carryover_plan
+            .as_ref()
+            .map(|c| c.continuations_used)
+            .unwrap_or(0);
+        if used >= budget {
+            let carry = state.carryover_plan.take().expect("checked above");
+            let notice = plan_stop_notice(
+                &carry,
+                &format!("auto-continuation budget of {budget} exhausted"),
+            );
+            return Some(PlanFollowup::Stop {
+                eval_json: None,
+                notice,
+            });
+        }
+        Some(PlanFollowup::Continue { eval_json: None })
+    } else {
+        None
     }
 }

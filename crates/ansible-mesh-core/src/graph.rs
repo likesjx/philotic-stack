@@ -313,6 +313,12 @@ pub struct TurnLoopConfig {
     /// Serde default so older serialized `TurnLoopConfig` values load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<ContextWindowOverrides>,
+    /// Per-role override for the number of automatic plan-continuation turns
+    /// the plan-eval-repeat loop may synthesize for a single carried-over plan.
+    /// `None` -> use the agent default (3). Serde default so older serialized
+    /// `TurnLoopConfig` values load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_continuation_budget: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

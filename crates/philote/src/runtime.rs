@@ -1586,6 +1586,25 @@ impl AgentRuntime {
             )
         };
 
+        // Plan-continuation hygiene: a synthesized continuation is only valid
+        // while its carryover still exists (it may have been cleared via
+        // `/plan drop`) and while no new plan proposal is parked awaiting the
+        // operator — a pending proposal is a redirect and wins over the old plan.
+        if task.action.as_deref() == Some("plan_continuation") {
+            let valid = self
+                .sessions
+                .get(&session_id)
+                .map(|s| s.carryover_plan.is_some() && !s.has_parked_plan_turn())
+                .unwrap_or(false);
+            if !valid {
+                info!(
+                    session_id = %session_id,
+                    "Dropping orphaned plan continuation (carryover cleared or a new plan is parked)."
+                );
+                return Ok(());
+            }
+        }
+
         if let Some(command) = parse_slash_command(&content) {
             match command {
                 _ if command_bypasses_turn_start(&command) => {
@@ -1700,6 +1719,21 @@ impl AgentRuntime {
                 SlashCommand::Tts { .. } => {}
                 SlashCommand::Voice { .. } => {}
                 SlashCommand::Abandon { .. } => {}
+                SlashCommand::Plan { drop } => {
+                    // Resolved without starting a turn so it works mid-turn too.
+                    return self
+                        .handle_plan_command(
+                            task_id,
+                            session_id,
+                            turn_id,
+                            chat_id,
+                            final_reply_to,
+                            final_reply_role,
+                            final_reply_guest_id,
+                            drop,
+                        )
+                        .await;
+                }
                 SlashCommand::Correct {
                     turn_id: voice_turn_id,
                     text,
@@ -2037,6 +2071,30 @@ impl AgentRuntime {
                 )
             };
 
+            // Plan continuation turns are seeded with the carried-over plan
+            // (completed steps marked done) so the model sees exactly what is
+            // left, and enter pre-confirmed so the plan gate does not re-park.
+            let is_plan_continuation = task.action.as_deref() == Some("plan_continuation");
+            let (seeded_plan, seeded_plan_confirmed) = if is_plan_continuation {
+                match state.carryover_plan.as_ref() {
+                    Some(carry) => {
+                        let mut plan = carry.plan.clone();
+                        for (i, step) in plan.steps.iter_mut().enumerate() {
+                            if carry.steps_done.get(i).copied().unwrap_or(false) {
+                                step.status = "done".into();
+                            }
+                        }
+                        if plan.status == "planning" {
+                            plan.status = "executing".into();
+                        }
+                        (Some(plan), true)
+                    }
+                    None => (None, false),
+                }
+            } else {
+                (None, false)
+            };
+
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -2052,7 +2110,7 @@ impl AgentRuntime {
                 pending_approval: None,
                 working_tool_history: Vec::new(),
                 recalled_memories: Vec::new(),
-                active_plan: None,
+                active_plan: seeded_plan,
                 consecutive_step_failures: 0,
                 provider_repair_note: None,
                 provider_repair_attempts: 0,
@@ -2066,7 +2124,7 @@ impl AgentRuntime {
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
                 paracrine_merge_completed: false,
-                plan_confirmed: false,
+                plan_confirmed: seeded_plan_confirmed,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
                 streaming_retry_attempts: 0,
@@ -2248,6 +2306,8 @@ impl AgentRuntime {
                 SlashCommand::ApprovalClear { .. } => Ok(()),
                 // Correct always returns from the pre-turn gate above; unreachable here.
                 SlashCommand::Correct { .. } => Ok(()),
+                // Plan always returns from the pre-turn gate above; unreachable here.
+                SlashCommand::Plan { .. } => Ok(()),
                 SlashCommand::Tts { .. } | SlashCommand::Voice { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
@@ -2546,6 +2606,14 @@ impl AgentRuntime {
             let final_reply_to = active_turn.final_reply_to.clone();
             let final_reply_role = active_turn.final_reply_role.clone();
             let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
+            // A new plan proposal is a redirect: it replaces any plan the
+            // plan-eval-repeat loop was still carrying over.
+            if state.carryover_plan.take().is_some() {
+                info!(
+                    session_id = %session_id,
+                    "New plan proposal replaces the existing plan carryover."
+                );
+            }
             state.set_active_turn_phase(TurnPhase::PlanningDiscussion);
             state.park_active_turn_for_plan();
             (
@@ -4686,7 +4754,8 @@ impl AgentRuntime {
                 | SlashCommand::Deny { .. }
                 | SlashCommand::ApprovalClear { .. }
                 | SlashCommand::Abandon { .. }
-                | SlashCommand::Correct { .. } => (
+                | SlashCommand::Correct { .. }
+                | SlashCommand::Plan { .. } => (
                     "Unsupported session control command.".to_string(),
                     "session_control_unsupported",
                     serde_json::json!({
@@ -4784,6 +4853,58 @@ impl AgentRuntime {
             reply_content,
             update_state,
             payload,
+        )
+        .await
+    }
+
+    /// `/plan` — show plan/carryover status; `/plan drop` — clear the carryover.
+    /// Resolved without starting a turn so the command works while a turn (or a
+    /// synthesized plan continuation) is in flight.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_plan_command(
+        &mut self,
+        task_id: Uuid,
+        session_id: String,
+        turn_id: String,
+        chat_id: String,
+        reply_to: String,
+        reply_role: String,
+        reply_guest_id: Option<String>,
+        drop: bool,
+    ) -> Result<()> {
+        let (reply, dropped) = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                warn!("handle_plan_command: unknown session {}", session_id);
+                return Ok(());
+            };
+            if drop {
+                if state.carryover_plan.take().is_some() {
+                    (
+                        "Plan carryover dropped — no further auto-continuations.".to_string(),
+                        true,
+                    )
+                } else {
+                    ("No plan carryover to drop.".to_string(), false)
+                }
+            } else {
+                (state.plan_status_text(), false)
+            }
+        };
+        if dropped {
+            // Persist immediately so the drop survives a restart.
+            self.persist_session_checkpoint(&session_id).await?;
+        }
+        self.complete_command_without_turn(
+            task_id,
+            session_id,
+            turn_id,
+            chat_id,
+            reply_to,
+            reply_role,
+            reply_guest_id,
+            reply,
+            None,
+            None,
         )
         .await
     }
@@ -5474,13 +5595,13 @@ mod tests {
         should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
-    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+    use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
     };
     use crate::session::{
-        ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        ResponseRouteMode, SessionState, WorkingTurn,
+        ActivePlan, ApprovalPolicy, CarryoverPlan, ComponentExecutionRoute, ComponentRouteAssembly,
+        ComponentRouteBinding, PlanStep, ResponseRouteMode, SessionState, WorkingTurn,
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
@@ -6870,6 +6991,565 @@ mod tests {
                 "baseline snapshot must be cleared on return"
             );
         }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // ── Plan-eval-repeat loop ───────────────────────────────────────────────
+
+    /// Serializes tests that read or mutate PHILOTIC_DISABLE_PLAN_CONTINUATION,
+    /// since env vars are process-global and tests run concurrently.
+    static PLAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn plan_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        PLAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn plan_with_statuses(goal: &str, statuses: &[&str]) -> ActivePlan {
+        ActivePlan {
+            goal: goal.into(),
+            steps: statuses
+                .iter()
+                .enumerate()
+                .map(|(i, st)| PlanStep {
+                    id: i as u32 + 1,
+                    description: format!("work item {}", i + 1),
+                    tool_name: None,
+                    status: (*st).to_string(),
+                })
+                .collect(),
+            status: "executing".into(),
+            context_1_advisory: None,
+        }
+    }
+
+    async fn plan_test_runtime(
+        tag: &str,
+    ) -> (
+        AgentRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        String,
+    ) {
+        let socket_path = format!("/tmp/philote-{}-{}.sock", tag, Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+        let identity = philotic_client::GuestIdentity {
+            guest_id: format!("agent-{tag}"),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let runtime = AgentRuntime::new(client, format!("agent-{tag}"));
+        (runtime, emitted, server, socket_path)
+    }
+
+    fn respond_payload(session_id: &str, turn_id: &str, text: &str) -> InboundTaskPayload {
+        InboundTaskPayload {
+            action: Some("model_response".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some(turn_id.into()),
+            agent_action: Some(serde_json::json!({
+                "kind": "respond",
+                "content": text,
+            })),
+            content: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_continuation_synthesized_after_partial_plan_respond() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plancont").await;
+        let session_id = "sess-plancont";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Turn completing with a 3-step plan, only step 1 model-reported done.
+        {
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-1".into();
+            turn.active_plan = Some(plan_with_statuses(
+                "ship it",
+                &["done", "pending", "pending"],
+            ));
+            runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session")
+                .start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(
+                session_id,
+                "turn-plan-1",
+                "progress so far",
+            ))
+            .await
+            .expect("respond");
+
+        // Carryover persisted with the eval flags; one continuation charged.
+        {
+            let state = runtime.session(session_id).expect("session");
+            let carry = state.carryover_plan.as_ref().expect("carryover persisted");
+            assert_eq!(carry.steps_done, vec![true, false, false]);
+            assert_eq!(carry.continuations_used, 1);
+            assert_eq!(carry.created_turn_id, "turn-plan-1");
+        }
+
+        // Exactly one continuation task queued through pending_drains.
+        assert_eq!(runtime.pending_drains.len(), 1, "one continuation queued");
+        let (drain_id, drain_task) = runtime.pending_drains.pop_front().expect("drain");
+        assert_eq!(drain_task.action.as_deref(), Some("plan_continuation"));
+        let brief = drain_task.content.clone().expect("brief content");
+        assert!(brief.contains("[Plan continuation 1/3]"), "{brief}");
+        assert!(brief.contains("work item 2"), "{brief}");
+        assert!(brief.contains("work item 3"), "{brief}");
+        assert!(
+            !brief.contains("Completed steps:\n- step 2"),
+            "done list must not include pending steps: {brief}"
+        );
+
+        // Dispatching the continuation seeds the new turn with the carried-over
+        // plan (done steps marked) and enters pre-confirmed.
+        runtime
+            .handle_user_message(drain_task, drain_id)
+            .await
+            .expect("continuation turn starts");
+        {
+            let state = runtime.session(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("continuation turn");
+            assert!(turn.plan_confirmed, "continuation must be pre-confirmed");
+            let plan = turn.active_plan.as_ref().expect("plan seeded");
+            assert_eq!(plan.steps[0].status, "done");
+            assert_eq!(plan.steps[1].status, "pending");
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let plan_evals: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_eval")
+            .collect();
+        assert_eq!(plan_evals.len(), 1, "one plan_eval event: {:#?}", *emitted);
+        let detail: serde_json::Value = serde_json::from_str(
+            plan_evals[0]["task"]["partial_content"]
+                .as_str()
+                .expect("plan_eval detail"),
+        )
+        .expect("plan_eval detail is JSON");
+        assert_eq!(detail["verdict"], "continue");
+        assert_eq!(detail["basis"], "model_reported");
+        assert_eq!(detail["steps_done"], 1);
+        assert_eq!(detail["steps_total"], 3);
+        assert!(
+            emitted.iter().any(|e| e["task"]["action"] == "turn_event"
+                && e["task"]["event"] == "plan_continuation"),
+            "plan_continuation event must be emitted: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "continuation turn must re-enter the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_continuation_budget_exhaustion_notifies_and_clears() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("planbudget").await;
+        let session_id = "sess-planbudget";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            // Carryover already spent the full default budget (3).
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                continuations_used: 3,
+                created_turn_id: "turn-origin".into(),
+            });
+            // This continuation made progress (step 2 done) but one step remains.
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-4".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-4", "more progress"))
+            .await
+            .expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "carryover must be cleared when the budget is exhausted"
+        );
+        assert!(
+            runtime.pending_drains.is_empty(),
+            "no further continuation may be synthesized"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let notices: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "send_reply"
+                    && e["task"]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("budget")
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "one stop notice: {:#?}", *emitted);
+        let notice = notices[0]["task"]["content"].as_str().unwrap();
+        assert!(notice.contains("2/3 steps done"), "{notice}");
+        assert!(notice.contains("work item 3"), "{notice}");
+        assert!(notice.contains("/plan drop"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn plan_continuation_kill_switch_disables_carryover() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::set_var("PHILOTIC_DISABLE_PLAN_CONTINUATION", "1");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plankill").await;
+        let session_id = "sess-plankill";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-k".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "pending"]));
+            runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session")
+                .start_turn(turn);
+        }
+
+        let result = runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-k", "partial"))
+            .await;
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        result.expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "kill switch must prevent carryover persistence"
+        );
+        assert!(
+            runtime.pending_drains.is_empty(),
+            "kill switch must prevent continuation synthesis"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_eval"),
+            "plan_eval event still emitted for observability"
+        );
+        assert!(
+            !emitted.iter().any(|e| e["task"]["action"] == "turn_event"
+                && e["task"]["event"] == "plan_continuation"),
+            "no continuation event under kill switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_plan_proposal_replaces_carryover() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("planredir").await;
+        let session_id = "sess-planredir";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("old goal", &["done", "pending"]),
+                steps_done: vec![true, false],
+                continuations_used: 1,
+                created_turn_id: "turn-old".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::Thinking);
+            turn.turn_id = "turn-redirect".into();
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_plan_proposal(
+                session_id.to_string(),
+                "turn-redirect".to_string(),
+                PlanProposalAction {
+                    summary: "brand new direction".into(),
+                    steps: vec![serde_json::json!({"description": "step one"})],
+                    approval_risk_hint: None,
+                },
+            )
+            .await
+            .expect("plan proposal");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "a new plan proposal must replace the carried-over plan"
+        );
+        assert!(
+            state.parked_plan_turn.is_some(),
+            "proposal parks the turn for operator confirmation"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn queued_user_task_defers_plan_continuation() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("plandefer").await;
+        let session_id = "sess-plandefer";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-d".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "pending"]));
+            state.start_turn(turn);
+            // A user message arrived mid-turn and was queued.
+            state.enqueue_user_task(
+                Uuid::new_v4(),
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("quick interrupt question".into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-d", "partial"))
+            .await
+            .expect("respond");
+
+        // The drained task must be the user's, not a continuation.
+        assert_eq!(runtime.pending_drains.len(), 1);
+        let (_, drained) = runtime.pending_drains.pop_front().expect("drain");
+        assert_ne!(drained.action.as_deref(), Some("plan_continuation"));
+        assert_eq!(drained.content.as_deref(), Some("quick interrupt question"));
+        // Carryover retained with the budget uncharged — resumes later.
+        {
+            let carry = runtime
+                .session(session_id)
+                .expect("session")
+                .carryover_plan
+                .clone()
+                .expect("carryover retained during deferral");
+            assert_eq!(carry.continuations_used, 0);
+        }
+
+        // The interleaved user turn completes without a plan of its own →
+        // the deferred carryover resumes with a synthesized continuation.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-user-1".into();
+            state.start_turn(turn);
+        }
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-user-1", "answered"))
+            .await
+            .expect("user turn respond");
+
+        assert_eq!(runtime.pending_drains.len(), 1, "carryover resumed");
+        let (_, resumed) = runtime.pending_drains.pop_front().expect("drain");
+        assert_eq!(resumed.action.as_deref(), Some("plan_continuation"));
+        assert_eq!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .carryover_plan
+                .as_ref()
+                .expect("carryover still present")
+                .continuations_used,
+            1
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn plan_command_shows_and_drops_carryover() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plancmd").await;
+        let session_id = "sess-plancmd";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .carryover_plan = Some(CarryoverPlan {
+            plan: plan_with_statuses("ship it", &["done", "pending"]),
+            steps_done: vec![true, false],
+            continuations_used: 1,
+            created_turn_id: "turn-origin".into(),
+        });
+
+        // /plan → status report.
+        runtime
+            .handle_plan_command(
+                Uuid::new_v4(),
+                session_id.to_string(),
+                "turn-cmd-1".to_string(),
+                "555".to_string(),
+                "membrane-node-01".to_string(),
+                "membrane".to_string(),
+                None,
+                false,
+            )
+            .await
+            .expect("plan status");
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .carryover_plan
+                .is_some(),
+            "status must not clear the carryover"
+        );
+
+        // /plan drop → cleared.
+        runtime
+            .handle_plan_command(
+                Uuid::new_v4(),
+                session_id.to_string(),
+                "turn-cmd-2".to_string(),
+                "555".to_string(),
+                "membrane-node-01".to_string(),
+                "membrane".to_string(),
+                None,
+                true,
+            )
+            .await
+            .expect("plan drop");
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .carryover_plan
+                .is_none(),
+            "drop must clear the carryover"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let replies: Vec<&str> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .filter_map(|e| e["task"]["content"].as_str())
+            .collect();
+        assert!(
+            replies.iter().any(|r| r.contains("ship it")
+                && r.contains("1/2 steps done")
+                && r.contains("work item 2")),
+            "status reply must describe the carryover: {replies:#?}"
+        );
+        assert!(
+            replies.iter().any(|r| r.contains("dropped")),
+            "drop reply must confirm: {replies:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_plan_continuation_is_dropped() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("planorphan").await;
+        let session_id = "sess-planorphan";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // No carryover exists (e.g. operator ran /plan drop) — a stale
+        // continuation task must be dropped without starting a turn.
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    action: Some("plan_continuation".into()),
+                    session_id: Some(session_id.into()),
+                    content: Some("[Plan continuation 1/3] Continue executing".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("orphan handled");
+
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "orphaned continuation must not start a turn"
+        );
 
         drop(runtime);
         let _ = server.await;

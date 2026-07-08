@@ -243,7 +243,7 @@ pub struct RoleActivation {
 
 /// A single step inside an `ActivePlan`. Tracks the description, optional bound
 /// tool, and lifecycle status of the step.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanStep {
     pub id: u32,
     pub description: String,
@@ -256,7 +256,7 @@ pub struct PlanStep {
 /// The model's declared execution plan for the current turn.
 /// Captured from the model response and threaded through re-entry turns so the
 /// model can update step status as it executes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivePlan {
     pub goal: String,
     pub steps: Vec<PlanStep>,
@@ -266,6 +266,32 @@ pub struct ActivePlan {
     /// This is advisory only; approval policy still decides whether a tool may run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_1_advisory: Option<Context1Advisory>,
+}
+
+/// A plan carried across turns by the plan-eval-repeat loop.
+///
+/// Created when a turn completes (final Respond) with an `ActivePlan` whose
+/// steps are not all done. Persisted on `SessionState` (checkpointed with
+/// backward-compatible serde defaults) and consumed to synthesize budgeted
+/// auto-continuation turns until the plan completes, blocks, or the budget
+/// is exhausted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarryoverPlan {
+    /// The plan as last seen on the completed turn.
+    pub plan: ActivePlan,
+    /// Index-aligned per-step completion mirror from the last plan eval.
+    pub steps_done: Vec<bool>,
+    /// Number of continuation turns already synthesized for this plan.
+    #[serde(default)]
+    pub continuations_used: u32,
+    /// The turn that originally produced this carryover.
+    pub created_turn_id: String,
+}
+
+impl CarryoverPlan {
+    pub fn steps_done_count(&self) -> usize {
+        self.steps_done.iter().filter(|d| **d).count()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
