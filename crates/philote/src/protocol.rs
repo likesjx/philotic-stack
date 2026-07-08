@@ -112,6 +112,11 @@ pub struct InboundTaskPayload {
     /// before model invocation and emit `approval_required` back to the sender.
     #[serde(default)]
     pub requires_approval: bool,
+    /// Present on tasks delivered by the aiua CronTicker (both the legacy
+    /// message shape and the paracrine_signal shape carry it). Used to
+    /// distinguish synthetic/scheduled prompts from operator-authored ones.
+    #[serde(default)]
+    pub cron_job_id: Option<String>,
 }
 
 // Transitional note: older emitters may still carry failures in

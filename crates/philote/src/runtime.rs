@@ -1792,7 +1792,7 @@ impl AgentRuntime {
             }
         }
 
-        if let Some(life_observe) = parse_direct_life_observe_command(&content) {
+        if let Some(life_observe) = direct_life_observe_command_for_task(&task, &content) {
             return self
                 .handle_direct_life_observe_command(
                     task_id,
