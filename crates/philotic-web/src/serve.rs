@@ -7386,8 +7386,34 @@ fn default_operator_display_name() -> String {
         .unwrap_or_else(|| "Operator".into())
 }
 
+/// Mirrors the hotel's deterministic root-key resolution order (env -> key file ->
+/// macOS Keychain) so the reported source matches what `aiua` actually uses. Keep in
+/// sync with `aiua::vault::load_or_create_root_key`.
 fn detect_root_user_key_ref(hotel: &str) -> RootUserKeyRefStatusView {
     let account = vault_root_key_account();
+
+    if let Ok(key_bytes) = load_root_key_from_env() {
+        return RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: Some(format!("env://PHILOTIC_VAULT_MASTER_KEY/{account}")),
+            public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
+            rotation_state: "active".into(),
+            source_kind: "env".into(),
+        };
+    }
+
+    if let Ok(key_bytes) = load_root_key_from_file() {
+        return RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: Some(format!("file://~/.philotic/vault-master-key.env/{account}")),
+            public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
+            rotation_state: "active".into(),
+            source_kind: "key-file".into(),
+        };
+    }
+
     if cfg!(target_os = "macos") {
         let keychain_ref = format!("keychain://ai.philotic.hotel-vault/{account}");
         match load_root_key_from_keychain(&account) {
@@ -7415,32 +7441,45 @@ fn detect_root_user_key_ref(hotel: &str) -> RootUserKeyRefStatusView {
         }
     }
 
-    match load_root_key_from_env() {
-        Ok(key_bytes) => RootUserKeyRefStatusView {
-            user_id: default_operator_user_id(hotel),
-            key_purpose: "vault-root-key".into(),
-            vault_ref: Some(format!(
-                "env://PHILOTIC_VAULT_MASTER_KEY/{}",
-                vault_root_key_account()
-            )),
-            public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
-            rotation_state: "active".into(),
-            source_kind: "env".into(),
-        },
-        Err(_) => RootUserKeyRefStatusView {
-            user_id: default_operator_user_id(hotel),
-            key_purpose: "vault-root-key".into(),
-            vault_ref: None,
-            public_fingerprint: None,
-            rotation_state: "unavailable".into(),
-            source_kind: "missing".into(),
-        },
+    RootUserKeyRefStatusView {
+        user_id: default_operator_user_id(hotel),
+        key_purpose: "vault-root-key".into(),
+        vault_ref: None,
+        public_fingerprint: None,
+        rotation_state: "unavailable".into(),
+        source_kind: "missing".into(),
     }
 }
 
 fn load_root_key_from_env() -> Result<Vec<u8>> {
     let raw = std::env::var("PHILOTIC_VAULT_MASTER_KEY")?;
     decode_root_key(raw.trim(), "PHILOTIC_VAULT_MASTER_KEY")
+}
+
+/// Reads the operator-provisioned root key file, mirroring
+/// `aiua::vault::load_env_file_root_key`.
+fn load_root_key_from_file() -> Result<Vec<u8>> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    let path = std::path::PathBuf::from(home)
+        .join(".philotic")
+        .join("vault-master-key.env");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|err| anyhow!("failed to read {}: {err}", path.display()))?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim() == "PHILOTIC_VAULT_MASTER_KEY" {
+                return decode_root_key(value.trim(), &path.display().to_string());
+            }
+        }
+    }
+    anyhow::bail!(
+        "{} did not contain PHILOTIC_VAULT_MASTER_KEY",
+        path.display()
+    )
 }
 
 fn load_root_key_from_keychain(account: &str) -> Result<Option<Vec<u8>>> {
@@ -7500,6 +7539,7 @@ fn root_user_key_source_kind(vault_ref: &Option<String>) -> String {
     match vault_ref.as_deref() {
         Some(value) if value.starts_with("keychain://") => "keychain".into(),
         Some(value) if value.starts_with("env://") => "env".into(),
+        Some(value) if value.starts_with("file://") => "key-file".into(),
         Some(_) => "opaque".into(),
         None => "missing".into(),
     }
