@@ -1913,6 +1913,29 @@ pub enum IpcRequest {
         #[serde(default)]
         exclude_providers: Vec<String>,
     },
+    /// Guest → hotel: push a pre-classified turn-level failure event into the
+    /// self-heal queue (turn-failure heal intake). Used by philote for
+    /// failures only the agent loop can see: watchdog evictions
+    /// (`stuck_turn_evicted:{phase}`), fallback-ladder exhaustion
+    /// (`fallback_exhausted:{last_provider}`), and paracrine budget breaches
+    /// (`paracrine_budget_exhausted`).
+    ///
+    /// The hotel stores the entry pre-triaged (severity + pattern_tag set at
+    /// insert) so the heal-dispatcher's A3 recurrence counter aggregates it
+    /// without re-classification, and applies flood control: the same
+    /// `(guest_id, pattern_tag)` within the flood window collapses.
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{collapsed, id?}`. No new `IpcResponse` variant, so the
+    /// untagged-ordering invariant (all-optional variants like `MemoryConfig`
+    /// stay last) is untouched. New `IpcRequest` variants append after this
+    /// one.
+    PushHealEvent {
+        guest_id: String,
+        severity: String,
+        pattern_tag: String,
+        detail: String,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
@@ -3512,6 +3535,71 @@ mod tests {
                 let data = data.expect("data");
                 assert_eq!(data["allowed"], false);
                 assert_eq!(data["posture"], "confirm_first");
+            }
+            other => panic!("expected Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_heal_event_request_serde_round_trip_and_back_compat() {
+        // PushHealEvent lives at the END of IpcRequest and responds with
+        // Standard only — no new IpcResponse variant, so the untagged-ordering
+        // invariant (all-optional variants like MemoryConfig stay last) holds.
+        let req = IpcRequest::PushHealEvent {
+            guest_id: "agent-jane-01".into(),
+            severity: "medium".into(),
+            pattern_tag: "stuck_turn_evicted:WaitingTool".into(),
+            detail: "Turn watchdog evicted stuck turn after 91s in WaitingTool.".into(),
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"push_heal_event\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::PushHealEvent {
+                guest_id,
+                severity,
+                pattern_tag,
+                detail,
+            } => {
+                assert_eq!(guest_id, "agent-jane-01");
+                assert_eq!(severity, "medium");
+                assert_eq!(pattern_tag, "stuck_turn_evicted:WaitingTool");
+                assert!(detail.contains("watchdog"));
+            }
+            other => panic!("expected PushHealEvent, got {other:?}"),
+        }
+
+        // Pre-existing request shapes are unaffected by the appended variant.
+        let old = serde_json::json!({
+            "operation": "push_heal_entry",
+            "payload": { "guest_id": "g-1", "raw_text": "boom" }
+        });
+        let back: IpcRequest = serde_json::from_value(old).expect("old request");
+        assert!(matches!(back, IpcRequest::PushHealEntry { .. }));
+
+        let old = serde_json::json!({
+            "operation": "fail_task",
+            "payload": {
+                "task_id": "5f2a1a1e-0000-0000-0000-000000000001",
+                "error_code": "MODEL_EMPTY_RESPONSE",
+                "reason": "Model failed",
+            }
+        });
+        let back: IpcRequest = serde_json::from_value(old).expect("old fail_task");
+        assert!(matches!(back, IpcRequest::FailTask { .. }));
+
+        // The push response is a plain Standard ack.
+        let resp = serde_json::json!({
+            "ok": true,
+            "code": "OK",
+            "message": "Success",
+            "corr_id": "push_heal_event",
+            "data": { "collapsed": false, "id": "hq-1" }
+        });
+        let back: IpcResponse = serde_json::from_value(resp).expect("response");
+        match back {
+            IpcResponse::Standard { ok: true, data, .. } => {
+                assert_eq!(data.expect("data")["collapsed"], false);
             }
             other => panic!("expected Standard, got {other:?}"),
         }

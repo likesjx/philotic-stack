@@ -3765,6 +3765,15 @@ impl IpcServer {
                         Err(e) => warn!("FailTask: get_session_turn {sid}:{tid} error: {e}"),
                     }
                 }
+                // Turn-failure heal intake: provider/model failures flow into
+                // the self-heal queue so the heal-dispatcher and A3
+                // pattern-filing lane see them instead of only the operator.
+                Self::push_turn_failure_heal_entry(
+                    heal_queue,
+                    current_identity.as_ref().map(|i| i.guest_id.as_str()),
+                    &error_code,
+                    &reason,
+                );
                 Self::record_session_activity_from_value(
                     graph,
                     &serde_json::json!({
@@ -7729,6 +7738,19 @@ impl IpcServer {
                 ),
             },
 
+            IpcRequest::PushHealEvent {
+                guest_id,
+                severity,
+                pattern_tag,
+                detail,
+            } => Self::handle_push_heal_event(
+                heal_queue,
+                &guest_id,
+                &severity,
+                &pattern_tag,
+                &detail,
+            ),
+
             IpcRequest::GetHealQueuePending { limit } => match heal_queue.as_deref() {
                 Some(hq) => match hq.pending_errors(limit) {
                     Ok(rows) => IpcResponse::HealQueuePending { rows },
@@ -8034,6 +8056,103 @@ impl IpcServer {
             CORR,
             Some(serde_json::json!({ "ranked": entries, "disabled": false })),
         )
+    }
+
+    /// Turn-failure heal intake (self-heal): classify a FailTask's
+    /// `error_code`/`reason` and, when it carries provider/model failure
+    /// markers (`kind=provider_failure | component=model-router | provider=X`
+    /// or a bare `MODEL_EMPTY_RESPONSE`), push a pre-triaged heal-queue entry
+    /// so the heal-dispatcher and A3 recurrence counter see turn-level
+    /// failures. Best-effort: never affects the FailTask response.
+    ///
+    /// Entry shape:
+    /// - `guest_id`: `model-controller-{provider}` when the provider marker is
+    ///   present (the model-controller guest naming convention), else
+    ///   `turn:{caller_guest_id}`.
+    /// - `severity`/`pattern_tag`: from the shared classifier
+    ///   (`provider_4xx:{provider}`, `provider_timeout:{provider}`,
+    ///   `model_empty_response`, …) so the dispatcher aggregates without
+    ///   re-classifying.
+    /// - `raw_text`: `[{error_code}] {reason}` capped to 2 KB.
+    ///
+    /// Flood control lives in `push_classified`: the same
+    /// `(guest_id, pattern_tag)` within the flood window collapses.
+    pub(crate) fn push_turn_failure_heal_entry(
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        caller_guest_id: Option<&str>,
+        error_code: &str,
+        reason: &str,
+    ) {
+        use ansible_mesh_core::heal_queue::{cap_turn_failure_text, classify_turn_failure};
+
+        let Some(hq) = heal_queue else {
+            return;
+        };
+        // Classify on the full line (markers may sit at the end), then cap
+        // what gets stored.
+        let full_line = format!("[{error_code}] {reason}");
+        let Some(class) = classify_turn_failure(&full_line) else {
+            return;
+        };
+        let line = cap_turn_failure_text(&full_line);
+        let guest_id = match class.provider.as_deref() {
+            Some(provider) => format!("model-controller-{provider}"),
+            None => format!("turn:{}", caller_guest_id.unwrap_or("unknown")),
+        };
+        match hq.push_classified(&guest_id, &line, &class.severity, &class.pattern_tag) {
+            Ok(Some(id)) => info!(
+                id = %id,
+                guest_id = %guest_id,
+                pattern_tag = %class.pattern_tag,
+                "turn failure pushed to heal queue"
+            ),
+            Ok(None) => debug!(
+                guest_id = %guest_id,
+                pattern_tag = %class.pattern_tag,
+                "turn failure collapsed into recent heal entry (flood window)"
+            ),
+            Err(e) => warn!("turn failure heal push failed: {e}"),
+        }
+    }
+
+    /// Handle [`IpcRequest::PushHealEvent`] — a guest-reported, pre-classified
+    /// turn-level failure (philote watchdog evictions, fallback-ladder
+    /// exhaustion, paracrine budget breaches). Stored pre-triaged; flood
+    /// control collapses the same `(guest_id, pattern_tag)` within the window.
+    pub(crate) fn handle_push_heal_event(
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        guest_id: &str,
+        severity: &str,
+        pattern_tag: &str,
+        detail: &str,
+    ) -> IpcResponse {
+        use ansible_mesh_core::heal_queue::cap_turn_failure_text;
+
+        const CORR: &str = "push_heal_event";
+        let Some(hq) = heal_queue else {
+            return IpcResponse::error(
+                CORR,
+                "UNAVAILABLE",
+                "heal_queue not configured".to_string(),
+            );
+        };
+        let detail = cap_turn_failure_text(detail);
+        match hq.push_classified(guest_id, &detail, severity, pattern_tag) {
+            Ok(Some(id)) => {
+                info!(
+                    id = %id,
+                    guest_id = %guest_id,
+                    pattern_tag = %pattern_tag,
+                    "guest heal event pushed to heal queue"
+                );
+                IpcResponse::success(
+                    CORR,
+                    Some(serde_json::json!({ "collapsed": false, "id": id })),
+                )
+            }
+            Ok(None) => IpcResponse::success(CORR, Some(serde_json::json!({ "collapsed": true }))),
+            Err(e) => IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e}")),
+        }
     }
 
     pub(crate) fn handle_file_heal_work_item(
@@ -12963,6 +13082,216 @@ pub(crate) mod tests {
                 operator_target_components,
             } => operator_target_components,
             other => panic!("unexpected operator target components response: {other:?}"),
+        }
+    }
+
+    // ── Turn-failure heal intake ───────────────────────────────────────────────
+
+    mod turn_failure_intake {
+        use super::*;
+        use ansible_mesh_core::heal_queue::{HealQueueRow, HealQueueStorage};
+        use std::sync::Mutex as StdMutex;
+
+        /// Records `push_classified` calls: `(guest_id, raw_text, severity, pattern_tag)`.
+        #[derive(Default)]
+        struct ClassifiedRecorder {
+            pushed: StdMutex<Vec<(String, String, String, String)>>,
+        }
+
+        impl HealQueueStorage for ClassifiedRecorder {
+            fn push_error(&self, _guest_id: &str, _raw_text: &str) -> anyhow::Result<String> {
+                panic!("turn-failure intake must use push_classified, not push_error");
+            }
+            fn push_classified(
+                &self,
+                guest_id: &str,
+                raw_text: &str,
+                severity: &str,
+                pattern_tag: &str,
+            ) -> anyhow::Result<Option<String>> {
+                self.pushed.lock().unwrap().push((
+                    guest_id.to_string(),
+                    raw_text.to_string(),
+                    severity.to_string(),
+                    pattern_tag.to_string(),
+                ));
+                Ok(Some("hq-intake-1".to_string()))
+            }
+            fn pending_errors(&self, _limit: usize) -> anyhow::Result<Vec<HealQueueRow>> {
+                Ok(vec![])
+            }
+            fn update_triage(
+                &self,
+                _id: &str,
+                _severity: &str,
+                _pattern_tag: &str,
+                _heal_action: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn resolve(&self, _id: &str, _outcome: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn vacuum_old(&self, _older_than_secs: u64) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        fn intake(
+            caller: Option<&str>,
+            error_code: &str,
+            reason: &str,
+        ) -> Vec<(String, String, String, String)> {
+            let hq = ClassifiedRecorder::default();
+            IpcServer::push_turn_failure_heal_entry(Some(&hq), caller, error_code, reason);
+            hq.pushed.lock().unwrap().clone()
+        }
+
+        #[test]
+        fn provider_400_maps_to_model_controller_guest_and_4xx_tag() {
+            let pushed = intake(
+                Some("agent-jane-01"),
+                "MODEL_EMPTY_RESPONSE",
+                "Model failed: Gemini API error 400 Bad Request: empty field \
+                 | kind=provider_failure | component=model-router | provider=gemini \
+                 | capability=text.generate",
+            );
+            assert_eq!(pushed.len(), 1);
+            let (guest_id, raw, severity, tag) = &pushed[0];
+            assert_eq!(guest_id, "model-controller-gemini");
+            assert_eq!(severity, "medium");
+            assert_eq!(tag, "provider_4xx:gemini");
+            assert!(raw.starts_with("[MODEL_EMPTY_RESPONSE]"));
+            assert!(raw.contains("provider=gemini"));
+        }
+
+        #[test]
+        fn provider_timeout_maps_to_timeout_tag() {
+            let pushed = intake(
+                Some("agent-jane-01"),
+                "PROVIDER_FAILURE",
+                "request timed out | kind=provider_failure | provider=anthropic",
+            );
+            assert_eq!(pushed.len(), 1);
+            assert_eq!(pushed[0].0, "model-controller-anthropic");
+            assert_eq!(pushed[0].3, "provider_timeout:anthropic");
+        }
+
+        #[test]
+        fn bare_model_empty_response_uses_turn_caller_guest() {
+            let pushed = intake(
+                Some("agent-jane-01"),
+                "MODEL_EMPTY_RESPONSE",
+                "The model returned no usable output.",
+            );
+            assert_eq!(pushed.len(), 1);
+            assert_eq!(pushed[0].0, "turn:agent-jane-01");
+            assert_eq!(pushed[0].3, "model_empty_response");
+
+            // No caller identity → turn:unknown.
+            let pushed = intake(None, "MODEL_EMPTY_RESPONSE", "nothing usable");
+            assert_eq!(pushed[0].0, "turn:unknown");
+        }
+
+        #[test]
+        fn non_turn_failures_and_philote_reported_classes_do_not_push() {
+            // Watchdog evictions are reported by philote via PushHealEvent.
+            assert!(
+                intake(
+                    Some("agent-jane-01"),
+                    "TURN_WATCHDOG_TIMEOUT",
+                    "Turn watchdog evicted stuck turn after 91s in WaitingTool.",
+                )
+                .is_empty()
+            );
+            // Fallback exhaustion is reported by philote via PushHealEvent.
+            assert!(
+                intake(
+                    Some("agent-jane-01"),
+                    "MODEL_EMPTY_RESPONSE",
+                    "All model providers failed. Please try again later.",
+                )
+                .is_empty()
+            );
+            // Unrelated failure codes never reach the heal queue.
+            assert!(
+                intake(
+                    Some("agent-jane-01"),
+                    "APPROVAL_CANCELLED",
+                    "operator cancelled approval request",
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn raw_text_is_capped_to_2kb() {
+            let long_reason = format!(
+                "boom 400 {} | kind=provider_failure | provider=gemini",
+                "x".repeat(4096)
+            );
+            let pushed = intake(Some("a"), "PROVIDER_FAILURE", &long_reason);
+            assert_eq!(pushed.len(), 1);
+            assert!(pushed[0].1.len() <= ansible_mesh_core::heal_queue::MAX_TURN_FAILURE_RAW_BYTES);
+        }
+
+        #[test]
+        fn push_heal_event_handler_stores_pre_triaged_and_reports_collapse() {
+            use ansible_mesh_core::heal_queue::SqliteHealQueueStorage;
+            let hq = SqliteHealQueueStorage::open(":memory:").expect("heal queue");
+
+            let resp = IpcServer::handle_push_heal_event(
+                Some(&hq),
+                "agent-jane-01",
+                "medium",
+                "stuck_turn_evicted:WaitingTool",
+                "Turn watchdog evicted stuck turn after 91s in WaitingTool.",
+            );
+            match resp {
+                IpcResponse::Standard {
+                    ok: true,
+                    data: Some(data),
+                    ..
+                } => assert_eq!(data["collapsed"], false),
+                other => panic!("expected ok Standard, got {other:?}"),
+            }
+            let rows = hq.pending_errors(10).expect("pending");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].guest_id, "agent-jane-01");
+            assert_eq!(rows[0].severity, "medium");
+            assert_eq!(
+                rows[0].pattern_tag.as_deref(),
+                Some("stuck_turn_evicted:WaitingTool")
+            );
+
+            // Second identical event inside the flood window collapses.
+            let resp = IpcServer::handle_push_heal_event(
+                Some(&hq),
+                "agent-jane-01",
+                "medium",
+                "stuck_turn_evicted:WaitingTool",
+                "Turn watchdog evicted stuck turn after 92s in WaitingTool.",
+            );
+            match resp {
+                IpcResponse::Standard {
+                    ok: true,
+                    data: Some(data),
+                    ..
+                } => assert_eq!(data["collapsed"], true),
+                other => panic!("expected ok Standard, got {other:?}"),
+            }
+            assert_eq!(hq.pending_errors(10).expect("pending").len(), 1);
+
+            // No heal queue configured → UNAVAILABLE error, never a panic.
+            let resp = IpcServer::handle_push_heal_event(None, "g", "medium", "t", "d");
+            match resp {
+                IpcResponse::Standard {
+                    ok: false, code, ..
+                } => {
+                    assert_eq!(code, "UNAVAILABLE")
+                }
+                other => panic!("expected error Standard, got {other:?}"),
+            }
         }
     }
 
