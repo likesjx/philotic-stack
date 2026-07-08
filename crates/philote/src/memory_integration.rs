@@ -699,17 +699,59 @@ pub(super) struct DirectLifeObserveCommand {
     pub(super) confidence: f64,
 }
 
+/// The imperative anchor must begin within this many characters of the start
+/// of the message. Operator commands lead with the imperative; charter/cron
+/// prompts bury the phrase mid-text.
+const DIRECT_LIFE_OBSERVE_ANCHOR_WINDOW: usize = 24;
+
+/// Direct commands are short. Anything longer is a briefing/charter prompt
+/// that deserves a real model turn, never the parser shortcut.
+const DIRECT_LIFE_OBSERVE_MAX_CHARS: usize = 300;
+
+/// True when the inbound task was manufactured by a scheduler or another
+/// automated loop rather than typed by an operator. Such tasks must never be
+/// short-circuited by the direct life.observe parser (session 2026-07-08:
+/// Beacon's steward cron prompt contained the literal phrase "life.observe it
+/// now" and the entire chartered pass collapsed into a junk OpenLoop write).
+pub(super) fn inbound_task_from_synthetic_source(task: &InboundTaskPayload) -> bool {
+    task.cron_job_id.is_some()
+        || task.transport.as_deref() == Some("cron")
+        || task.source.as_deref() == Some("cron-ticker")
+        || task.paracrine_signal.is_some()
+}
+
+/// Runtime entry point: the direct life.observe shortcut only applies to
+/// operator-authored tasks; synthetic (cron/paracrine) tasks always take the
+/// full model turn.
+pub(super) fn direct_life_observe_command_for_task(
+    task: &InboundTaskPayload,
+    content: &str,
+) -> Option<DirectLifeObserveCommand> {
+    if inbound_task_from_synthetic_source(task) {
+        return None;
+    }
+    parse_direct_life_observe_command(content)
+}
+
 pub(super) fn parse_direct_life_observe_command(content: &str) -> Option<DirectLifeObserveCommand> {
     let trimmed = content.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.chars().count() > DIRECT_LIFE_OBSERVE_MAX_CHARS {
         return None;
     }
 
     let lower = trimmed.to_lowercase();
-    let explicit_life_observe = lower.contains("life.observe");
-    let explicit_record_open_loop =
-        lower.contains("record this open loop") || lower.contains("record an open loop");
-    if !explicit_life_observe && !explicit_record_open_loop {
+    // Bare "life.observe" mid-text is NOT a trigger — the message must either
+    // START with "life.observe" or carry an imperative record anchor near the
+    // front. This keeps prompts that merely mention the tool name (charters,
+    // briefings, quoted text) on the normal model path.
+    let starts_with_life_observe = lower.starts_with("life.observe");
+    let anchored = |phrase: &str| {
+        lower
+            .find(phrase)
+            .is_some_and(|idx| idx <= DIRECT_LIFE_OBSERVE_ANCHOR_WINDOW)
+    };
+    let explicit_record_imperative = anchored("record this") || anchored("record an open loop");
+    if !starts_with_life_observe && !explicit_record_imperative {
         return None;
     }
 
@@ -731,12 +773,21 @@ pub(super) fn parse_direct_life_observe_command(content: &str) -> Option<DirectL
 
     let confidence = extract_direct_life_observe_confidence(trimmed).unwrap_or(0.8);
 
-    let claim_summary = extract_direct_life_observe_claim(trimmed)
+    let mut claim_summary = extract_direct_life_observe_claim(trimmed)
         .unwrap_or_else(|| trimmed.to_string())
         .trim()
         .trim_matches('"')
         .trim()
         .to_string();
+
+    // A message that leads with "life.observe" should not carry the tool name
+    // into the claim text.
+    if claim_summary.to_lowercase().starts_with("life.observe") {
+        claim_summary = claim_summary["life.observe".len()..]
+            .trim_start_matches([':', '=', ',', '-'])
+            .trim()
+            .to_string();
+    }
 
     if claim_summary.is_empty() {
         return None;
@@ -2457,7 +2508,7 @@ mod tests {
     #[test]
     fn direct_life_observe_parser_handles_telegram_open_loop_request() {
         let parsed = super::parse_direct_life_observe_command(
-            "Beacon, please use life.observe to record this open loop: \
+            "Use life.observe to record this open loop: \
              I need to schedule the rowing habit for weekly Saturdays. \
              Use label OpenLoop, source membrane:telegram, confidence 0.8",
         )
@@ -2470,6 +2521,110 @@ mod tests {
         );
         assert_eq!(parsed.source_id, "membrane:telegram");
         assert_eq!(parsed.confidence, 0.8);
+    }
+
+    #[test]
+    fn direct_life_observe_parser_accepts_message_starting_with_life_observe() {
+        let parsed = super::parse_direct_life_observe_command(
+            "life.observe: the vps deploy key rotates monthly",
+        )
+        .expect("message starting with life.observe should parse");
+        assert_eq!(parsed.label, "Signal");
+        assert_eq!(parsed.claim_summary, "the vps deploy key rotates monthly");
+    }
+
+    #[test]
+    fn direct_life_observe_parser_accepts_record_this_imperative() {
+        let parsed = super::parse_direct_life_observe_command(
+            "Record this: mbp-jane aiua.log still lacks newsyslog rotation",
+        )
+        .expect("record this imperative should parse");
+        assert_eq!(parsed.label, "Signal");
+        assert_eq!(
+            parsed.claim_summary,
+            "mbp-jane aiua.log still lacks newsyslog rotation"
+        );
+    }
+
+    #[test]
+    fn direct_life_observe_parser_rejects_mid_text_life_observe_mention() {
+        // Bare "life.observe" mid-text (the steward-cron hijack phrase) must
+        // not trigger — the message neither starts with the tool name nor
+        // carries a near-front record imperative.
+        assert!(
+            super::parse_direct_life_observe_command(
+                "Beacon, when you get a chance life.observe it now please",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_life_observe_parser_rejects_anchor_outside_window() {
+        assert!(
+            super::parse_direct_life_observe_command(
+                "After you finish the morning sweep please record this open loop: check DNS",
+            )
+            .is_none(),
+            "imperative buried past the anchor window must not trigger"
+        );
+    }
+
+    #[test]
+    fn direct_life_observe_parser_rejects_long_charter_text() {
+        // Charter-like prompts are long; even if they open with an anchor the
+        // length cap keeps them on the model path.
+        let charter = format!(
+            "life.observe it now. You are Beacon, chief of staff. {} Close with a brief.",
+            "Survey the life graph for open loops, stale signals, and overdue commitments. "
+                .repeat(8)
+        );
+        assert!(charter.chars().count() > 300);
+        assert!(super::parse_direct_life_observe_command(&charter).is_none());
+    }
+
+    #[test]
+    fn cron_sourced_task_never_short_circuits_direct_life_observe() {
+        // The legacy cron shape promotes payload fields, so `source` can look
+        // like a transport ("telegram") — cron_job_id is the honest marker.
+        let task: InboundTaskPayload = serde_json::from_str(
+            r#"{
+                "cron_job_id": "99ee33ef",
+                "target_role": "role:agent-beacon:orchestrator",
+                "fire_epoch": 1783854000000,
+                "source": "telegram",
+                "chat_id": "7898847424",
+                "content": "life.observe it now"
+            }"#,
+        )
+        .expect("cron task payload deserializes");
+
+        assert!(super::inbound_task_from_synthetic_source(&task));
+        // Even though the content alone would parse (starts with the phrase,
+        // short), the synthetic-source gate must win.
+        assert!(super::parse_direct_life_observe_command("life.observe it now").is_some());
+        assert!(
+            super::direct_life_observe_command_for_task(&task, "life.observe it now").is_none()
+        );
+    }
+
+    #[test]
+    fn paracrine_and_cron_transport_tasks_are_synthetic() {
+        let paracrine: InboundTaskPayload = serde_json::from_str(
+            r#"{"action":"paracrine_signal","source":"cron-ticker","transport":"cron","paracrine_signal":{"signal_type":"heartbeat"}}"#,
+        )
+        .unwrap();
+        assert!(super::inbound_task_from_synthetic_source(&paracrine));
+
+        let operator: InboundTaskPayload = serde_json::from_str(
+            r#"{"source":"telegram","transport":"telegram","sender_id":"7898847424","content":"life.observe: sink is leaking"}"#,
+        )
+        .unwrap();
+        assert!(!super::inbound_task_from_synthetic_source(&operator));
+        assert!(
+            super::direct_life_observe_command_for_task(&operator, "life.observe: sink is leaking")
+                .is_some()
+        );
     }
 
     #[test]
