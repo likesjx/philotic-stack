@@ -124,11 +124,15 @@ impl WorkerRuntime {
 
         // Dispatch to the model role.
         let task_id = Uuid::new_v4();
+        // Do NOT pin a model here: an explicit `model` becomes ControllerTask.model
+        // and overrides the provider's per-TaskKind default. `gemini-1.5-flash-latest`
+        // was a retired Google model, so this path 4xx'd on every subagent turn.
+        // Omitting `model` lets the gemini controller apply its TextGenerate default
+        // (GEMINI_TEXT_DEFAULT_MODEL + thinkingBudget=0) — the single source of truth.
         let model_request = serde_json::json!({
             "task":       "subagent_turn",
             "session_id": format!("worker-{}-{}", self.worker_id, task_id),
             "content":    prompt,
-            "model":      "gemini-1.5-flash-latest",
         });
 
         self.ipc_client
