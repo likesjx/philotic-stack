@@ -21,12 +21,18 @@ use std::collections::BTreeSet;
 /// `fallback_tiers`. Tier 0 is attempted first; on retriable failure the loop
 /// advances to the next tier.
 ///
+/// Ordering rationale (operator directive, 2026-07): gemini (`model`) is the
+/// primary; `model.openrouter` is the first fallback because OpenRouter
+/// controllers are live on all hotels and cloud reliability beats local;
+/// `model.ollama` is the local last resort — ollama is unstable and must never
+/// be the first fallback.
+///
 /// NOTE: `model.ollama` is intentionally listed even though the hotel does not
 /// auto-seed an ollama controller — validation surfaces the gap loudly rather
 /// than silently escalating into a void. Both philote and the hotel's config
 /// validation read this constant so their notion of "the default ladder" cannot
 /// diverge.
-pub const DEFAULT_FALLBACK_TIERS: &[&str] = &["model", "model.ollama", "model.local"];
+pub const DEFAULT_FALLBACK_TIERS: &[&str] = &["model", "model.openrouter", "model.ollama"];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // (a) Fallback-ladder validation
@@ -162,14 +168,45 @@ mod tests {
 
     #[test]
     fn validation_flags_unseeded_tier() {
-        // model + model.local are live; model.ollama is not (the real gap in the
-        // shipped DEFAULT_FALLBACK_TIERS).
-        let active = roles(&["model", "model.local", "model.elevenlabs"]);
+        // model + model.openrouter are live; model.ollama is not (the real gap
+        // in the shipped DEFAULT_FALLBACK_TIERS).
+        let active = roles(&["model", "model.openrouter", "model.elevenlabs"]);
         let ladders = vec![ladder("default fallback ladder", DEFAULT_FALLBACK_TIERS)];
         let findings = validate_fallback_ladders(&active, &ladders);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].tier_role, "model.ollama");
         assert_eq!(findings[0].ladder_label, "default fallback ladder");
+    }
+
+    #[test]
+    fn default_ladder_puts_openrouter_before_ollama() {
+        // Operator directive: ollama is unstable — openrouter (live on all
+        // hotels) must be the first fallback after the gemini primary, with
+        // ollama demoted to local last resort.
+        assert_eq!(
+            DEFAULT_FALLBACK_TIERS,
+            &["model", "model.openrouter", "model.ollama"]
+        );
+        let openrouter_idx = DEFAULT_FALLBACK_TIERS
+            .iter()
+            .position(|t| *t == "model.openrouter")
+            .expect("default ladder must include model.openrouter");
+        let ollama_idx = DEFAULT_FALLBACK_TIERS
+            .iter()
+            .position(|t| *t == "model.ollama")
+            .expect("default ladder must include model.ollama");
+        assert!(openrouter_idx < ollama_idx);
+        assert_eq!(DEFAULT_FALLBACK_TIERS[0], "model");
+    }
+
+    #[test]
+    fn validation_accepts_default_ladder_when_openrouter_and_ollama_live() {
+        // Phase-3 hotel validation must accept the new default order when the
+        // controllers are seeded (openrouter controllers are live on all
+        // three hotels).
+        let active = roles(&["model", "model.openrouter", "model.ollama"]);
+        let ladders = vec![ladder("default fallback ladder", DEFAULT_FALLBACK_TIERS)];
+        assert!(validate_fallback_ladders(&active, &ladders).is_empty());
     }
 
     #[test]
