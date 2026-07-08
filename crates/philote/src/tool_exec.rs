@@ -842,7 +842,8 @@ impl AgentRuntime {
                 | SlashCommand::Abandon { .. }
                 | SlashCommand::Tts { .. }
                 | SlashCommand::Voice { .. }
-                | SlashCommand::Correct { .. } => {}
+                | SlashCommand::Correct { .. }
+                | SlashCommand::Plan { .. } => {}
             }
             (
                 state.checkpoint_memory_type(),
@@ -1067,7 +1068,8 @@ impl AgentRuntime {
             | SlashCommand::Abandon { .. }
             | SlashCommand::Tts { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Correct { .. } => {}
+            | SlashCommand::Correct { .. }
+            | SlashCommand::Plan { .. } => {}
         }
 
         Ok(())

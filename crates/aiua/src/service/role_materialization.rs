@@ -595,6 +595,7 @@ impl IpcServer {
                 paracrine_hop_budget: None,
                 paracrine_chain_budget_secs: None,
                 context_window: None,
+                plan_continuation_budget: None,
             },
             home_node: None,
         };

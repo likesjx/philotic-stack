@@ -82,6 +82,11 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
                 "Submit a correction for the most recent transcription (Whisper flywheel).".into(),
             usage_hint: Some("/correct <turn_id> <corrected text>".into()),
         },
+        CommandManifestEntry {
+            command: "plan".into(),
+            description: "Show plan carryover status, or drop the carried-over plan.".into(),
+            usage_hint: Some("/plan [drop]".into()),
+        },
     ]
 }
 
@@ -141,6 +146,10 @@ pub enum SlashCommand {
         turn_id: String,
         text: String,
     },
+    /// Show plan carryover status (`/plan`) or drop the carried-over plan (`/plan drop`).
+    Plan {
+        drop: bool,
+    },
 }
 
 impl SlashCommand {
@@ -171,6 +180,7 @@ impl SlashCommand {
             Self::Tts { .. } => None,
             Self::Voice { .. } => None,
             Self::Correct { .. } => None,
+            Self::Plan { .. } => None,
         }
     }
 
@@ -251,6 +261,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             turn_id: (*turn_id).to_string(),
             text: rest.join(" "),
         }),
+        ["/plan"] => Some(SlashCommand::Plan { drop: false }),
+        ["/plan", "drop", ..] => Some(SlashCommand::Plan { drop: true }),
+        ["/plan", "status", ..] => Some(SlashCommand::Plan { drop: false }),
         _ => None,
     }
 }
@@ -419,6 +432,24 @@ mod tests {
                 voice_id: Some("af_heart".into()),
             })
         );
+    }
+
+    #[test]
+    fn parses_plan_command() {
+        assert_eq!(
+            parse_slash_command("/plan"),
+            Some(SlashCommand::Plan { drop: false })
+        );
+        assert_eq!(
+            parse_slash_command("/plan status"),
+            Some(SlashCommand::Plan { drop: false })
+        );
+        assert_eq!(
+            parse_slash_command("/plan drop"),
+            Some(SlashCommand::Plan { drop: true })
+        );
+        // Unknown subcommand is not a plan command.
+        assert_eq!(parse_slash_command("/plan bogus"), None);
     }
 
     #[test]

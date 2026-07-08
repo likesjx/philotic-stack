@@ -202,6 +202,11 @@ pub struct SessionState {
     pub parked_plan_turn: Option<WorkingTurn>,
     /// Wall-clock instant when the plan turn was parked. Not persisted.
     pub parked_plan_since: Option<std::time::Instant>,
+    /// Plan carried over from a completed turn whose steps were not all done.
+    /// The plan-eval-repeat loop synthesizes budgeted continuation turns from
+    /// this until the plan completes, blocks, or the budget is exhausted.
+    /// Checkpoint-persisted with a backward-compatible default of `None`.
+    pub carryover_plan: Option<CarryoverPlan>,
     /// Consecutive successful executions per tool name within this session.
     /// Resets to 0 on any failure. Used to auto-grant standing approval once
     /// the agent has demonstrated reliability on a specific tool.
@@ -266,6 +271,7 @@ impl SessionState {
             parked_approval_since: None,
             parked_plan_turn: None,
             parked_plan_since: None,
+            carryover_plan: None,
             tool_success_streak: std::collections::HashMap::new(),
             pending_preapproval_thresholds: std::collections::HashMap::new(),
             agent_graph_snapshot: None,
@@ -1630,6 +1636,71 @@ impl SessionState {
 
     fn context1_preapproval_classes() -> &'static [&'static str] {
         &["utility", "workspace"]
+    }
+
+    /// Human-readable plan status for the `/plan` slash command: covers the
+    /// active turn's plan, a parked plan proposal, and any plan carryover held
+    /// by the plan-eval-repeat loop.
+    pub fn plan_status_text(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+
+        if let Some(plan) = self
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.as_ref())
+        {
+            let done = plan.steps.iter().filter(|s| s.status == "done").count();
+            lines.push(format!(
+                "Active plan (in-flight turn): goal='{}', status='{}', {}/{} steps done.",
+                plan.goal,
+                plan.status,
+                done,
+                plan.steps.len()
+            ));
+        }
+
+        if self.parked_plan_turn.is_some() {
+            lines.push(
+                "A plan proposal is parked awaiting your confirmation — reply to confirm, \
+                 or /deny to cancel."
+                    .into(),
+            );
+        }
+
+        match self.carryover_plan.as_ref() {
+            Some(carry) => {
+                let total = carry.plan.steps.len();
+                lines.push(format!(
+                    "Plan carryover: goal='{}', {}/{} steps done, {} auto-continuation(s) used.",
+                    carry.plan.goal,
+                    carry.steps_done_count(),
+                    total,
+                    carry.continuations_used
+                ));
+                let remaining: Vec<String> = carry
+                    .plan
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !carry.steps_done.get(*i).copied().unwrap_or(false))
+                    .map(|(_, s)| format!("  - step {}: {}", s.id, s.description))
+                    .collect();
+                if !remaining.is_empty() {
+                    lines.push("Remaining steps:".into());
+                    lines.extend(remaining);
+                }
+                lines.push("Use /plan drop to discard the carryover.".into());
+            }
+            None => {
+                if lines.is_empty() {
+                    lines.push("No active, parked, or carried-over plan.".into());
+                } else {
+                    lines.push("No plan carryover.".into());
+                }
+            }
+        }
+
+        lines.join("\n")
     }
 
     pub fn session_status_text(&self) -> String {
@@ -3468,6 +3539,7 @@ impl SessionState {
             "active_turn": active_turn,
             "parked_approval_turn": parked_approval_turn,
             "parked_plan_turn": parked_plan_turn,
+            "carryover_plan": self.carryover_plan,
             "active_user_task_id": self.active_user_task_id,
             "life_recall_cache": self.life_recall_cache,
             "recent_turns": self.recent_turns.iter().map(|turn| {
@@ -3825,6 +3897,13 @@ impl SessionState {
             .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
             .filter(|t| t.phase == TurnPhase::PlanningDiscussion);
 
+        // Restore the plan carryover if one was checkpointed. Missing key
+        // (older checkpoints) or unparseable value degrades to None.
+        let carryover_plan = checkpoint
+            .get("carryover_plan")
+            .and_then(|v| if v.is_null() { None } else { Some(v) })
+            .and_then(|v| serde_json::from_value::<CarryoverPlan>(v.clone()).ok());
+
         Some(Self {
             session_id,
             agent_id,
@@ -3859,6 +3938,7 @@ impl SessionState {
             parked_approval_since: None,
             parked_plan_turn,
             parked_plan_since: None,
+            carryover_plan,
             tool_success_streak,
             pending_preapproval_thresholds,
             agent_graph_snapshot: None,
@@ -4929,7 +5009,7 @@ fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePlan, ApprovalPolicy, ApprovalRiskHint, ComponentExecutionRoute,
+        ActivePlan, ApprovalPolicy, ApprovalRiskHint, CarryoverPlan, ComponentExecutionRoute,
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
         ContextLayerId, ContextMutability, HookRequest, HookResult, LIFE_RECALL_TRUNCATION_MARKER,
         LifeRecallCacheEntry, MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope,
@@ -4981,6 +5061,89 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
         }
+    }
+
+    fn test_carryover_plan() -> CarryoverPlan {
+        CarryoverPlan {
+            plan: ActivePlan {
+                goal: "ship the feature".into(),
+                steps: vec![
+                    PlanStep {
+                        id: 1,
+                        description: "read config".into(),
+                        tool_name: None,
+                        status: "done".into(),
+                    },
+                    PlanStep {
+                        id: 2,
+                        description: "apply fix".into(),
+                        tool_name: Some("bash.exec".into()),
+                        status: "pending".into(),
+                    },
+                ],
+                status: "executing".into(),
+                context_1_advisory: None,
+            },
+            steps_done: vec![true, false],
+            continuations_used: 2,
+            created_turn_id: "turn-origin".into(),
+        }
+    }
+
+    #[test]
+    fn carryover_plan_round_trips_through_checkpoint() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.carryover_plan = Some(test_carryover_plan());
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+
+        assert_eq!(restored.carryover_plan, state.carryover_plan);
+        let carry = restored.carryover_plan.expect("carryover restored");
+        assert_eq!(carry.continuations_used, 2);
+        assert_eq!(carry.steps_done, vec![true, false]);
+        assert_eq!(carry.created_turn_id, "turn-origin");
+    }
+
+    #[test]
+    fn checkpoint_without_carryover_plan_restores_none() {
+        // Simulate a checkpoint written by an older binary: no carryover_plan key.
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut checkpoint = state.checkpoint_json();
+        checkpoint
+            .as_object_mut()
+            .expect("checkpoint is an object")
+            .remove("carryover_plan");
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert!(restored.carryover_plan.is_none());
+    }
+
+    #[test]
+    fn carryover_plan_without_continuations_used_defaults_to_zero() {
+        // Forward-compat: a checkpoint whose carryover lacks the counter field
+        // (or was written before it existed) must deserialize with 0.
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut checkpoint = state.checkpoint_json();
+        let mut carry = serde_json::to_value(test_carryover_plan()).expect("serialize carryover");
+        carry
+            .as_object_mut()
+            .expect("carryover is an object")
+            .remove("continuations_used");
+        checkpoint
+            .as_object_mut()
+            .expect("checkpoint is an object")
+            .insert("carryover_plan".into(), carry);
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert_eq!(
+            restored
+                .carryover_plan
+                .expect("carryover restored")
+                .continuations_used,
+            0
+        );
     }
 
     #[test]
