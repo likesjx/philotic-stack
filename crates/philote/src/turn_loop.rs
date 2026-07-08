@@ -757,43 +757,105 @@ impl AgentRuntime {
                     )
                     .await;
             }
-            // Network / timeout / rate-limit errors: escalate to next fallback tier.
-            if should_escalate_tier(&error_payload) {
-                // For streaming_timeout specifically, allow one same-tier retry before
-                // escalating — handles transient empty SSE responses from Gemini.
-                if error_payload.sub_kind.as_deref() == Some("streaming_timeout") {
-                    let attempts = self
-                        .sessions
-                        .get(&session_id)
-                        .map(|s| s.streaming_retry_attempts())
-                        .unwrap_or(0);
-                    if attempts < 1 {
-                        if let Some(state) = self.sessions.get_mut(&session_id) {
-                            state.increment_streaming_retry_attempts();
+            match classify_provider_error(&error_payload) {
+                // Transient failures (network / 5xx / streaming stall): retry
+                // may succeed — same tier once for streaming_timeout, next
+                // tier otherwise.
+                ProviderErrorClass::RetrySameProvider => {
+                    // For streaming_timeout specifically, allow one same-tier retry before
+                    // escalating — handles transient empty SSE responses from Gemini.
+                    if error_payload.sub_kind.as_deref() == Some("streaming_timeout") {
+                        let attempts = self
+                            .sessions
+                            .get(&session_id)
+                            .map(|s| s.streaming_retry_attempts())
+                            .unwrap_or(0);
+                        if attempts < 1 {
+                            if let Some(state) = self.sessions.get_mut(&session_id) {
+                                state.increment_streaming_retry_attempts();
+                            }
+                            warn!(
+                                session_id = %session_id,
+                                "Retrying same tier after streaming_timeout (attempt 1)"
+                            );
+                            return self
+                                .retry_active_turn_after_provider_failure(session_id, turn_id, None)
+                                .await;
                         }
-                        warn!(
-                            session_id = %session_id,
-                            "Retrying same tier after streaming_timeout (attempt 1)"
-                        );
-                        return self
-                            .retry_active_turn_after_provider_failure(session_id, turn_id, None)
-                            .await;
                     }
+                    warn!(
+                        session_id = %session_id,
+                        sub_kind = %sub_kind,
+                        provider = %error_payload.provider.as_deref().unwrap_or("unknown"),
+                        "Escalating to next fallback tier after provider failure"
+                    );
+                    return self
+                        .advance_turn_to_next_fallback_tier(
+                            session_id,
+                            turn_id,
+                            NoResponseClass::ProviderFailure,
+                            error_payload.provider.clone(),
+                        )
+                        .await;
                 }
-                warn!(
-                    session_id = %session_id,
-                    sub_kind = %sub_kind,
-                    provider = %error_payload.provider.as_deref().unwrap_or("unknown"),
-                    "Escalating to next fallback tier after provider failure"
-                );
-                return self
-                    .advance_turn_to_next_fallback_tier(
-                        session_id,
-                        turn_id,
-                        NoResponseClass::ProviderFailure,
-                        error_payload.provider.clone(),
+                // Contract failures (4xx / INVALID_ARGUMENT / refusal / rate
+                // limit): retrying the same provider fails identically —
+                // transparently switch providers mid-turn. Skips same-provider
+                // ladder tiers; consults the routing oracle on exhaustion.
+                ProviderErrorClass::SwitchProvider => {
+                    warn!(
+                        session_id = %session_id,
+                        sub_kind = %sub_kind,
+                        status = ?error_payload.status,
+                        provider = %error_payload.provider.as_deref().unwrap_or("unknown"),
+                        "Provider contract failure — switching providers mid-turn"
+                    );
+                    return self
+                        .advance_turn_to_next_fallback_tier(
+                            session_id,
+                            turn_id,
+                            NoResponseClass::ProviderContractFailure,
+                            error_payload.provider.clone(),
+                        )
+                        .await;
+                }
+                // Auth/key misconfiguration: no retry against this provider
+                // helps until an operator fixes the key — fail fast and flag
+                // the heal queue so the outage becomes a work item.
+                ProviderErrorClass::Fatal => {
+                    let provider = error_payload
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| "unknown".into());
+                    warn!(
+                        session_id = %session_id,
+                        sub_kind = %sub_kind,
+                        provider = %provider,
+                        "Fatal provider auth failure — failing turn fast"
+                    );
+                    self.push_heal_event(
+                        &format!("provider_auth:{provider}"),
+                        &format!(
+                            "Provider {provider} rejected credentials for session {session_id} \
+                             turn {turn_id}: {}",
+                            error_payload.message
+                        ),
                     )
                     .await;
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            turn_id,
+                            format!(
+                                "Model provider {provider} rejected its credentials \
+                                 (auth/key error). An operator needs to fix the key."
+                            ),
+                        )
+                        .await;
+                }
+                // Not a model-provider escalation signal — fall through to the
+                // generic fail path below.
+                ProviderErrorClass::Unclassified => {}
             }
         }
 
@@ -1700,7 +1762,18 @@ impl AgentRuntime {
             DEFAULT_FALLBACK_TIERS.len().saturating_sub(1) as u8
         };
 
-        let tiers_remaining = current_tier < max_tier;
+        // On a contract failure the failed provider's remaining ladder tiers
+        // are skipped — the same request fails identically there. The skip can
+        // exhaust the ladder early, which then falls to the oracle as usual.
+        let skip_failed_provider = class == NoResponseClass::ProviderContractFailure;
+        let ladder_next = next_ladder_tier(
+            &configured_tiers,
+            current_tier,
+            max_tier,
+            failed_provider.as_deref(),
+            skip_failed_provider,
+        );
+        let tiers_remaining = ladder_next <= max_tier;
 
         // Ladder exhausted: ask the routing oracle for a next-best different
         // provider before giving up. Static tiers keep precedence — this
@@ -1741,7 +1814,14 @@ impl AgentRuntime {
                 .await;
         }
 
-        let next_tier = current_tier + 1;
+        // Oracle dispatches count tiers linearly (current + 1) so the
+        // MAX_ORACLE_EXTRA_TIERS budget stays exact; ladder dispatches land on
+        // the (possibly skip-advanced) next live tier.
+        let next_tier = if oracle_role.is_some() {
+            current_tier.saturating_add(1)
+        } else {
+            ladder_next
+        };
         let next_role =
             oracle_role.unwrap_or_else(|| role_for_tier(&configured_tiers, next_tier).to_string());
 
@@ -1804,6 +1884,25 @@ impl AgentRuntime {
         let _ = self
             .emit_turn_event(&session_id, "loop_recovering", None)
             .await;
+
+        // Surface the provider switch (from → to, why) so membranes can show
+        // "switching models…" through the existing turn-event path.
+        {
+            let switch_from = failed_provider.as_deref().unwrap_or("unknown");
+            let switch_to = provider_for_role(&next_role).unwrap_or_else(|| next_role.clone());
+            let switch_reason = match class {
+                NoResponseClass::ProviderFailure => "provider_failure",
+                NoResponseClass::ProviderContractFailure => "provider_contract_failure",
+                NoResponseClass::WatchdogTimeout => "model_timeout",
+            };
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "provider_switch",
+                    Some(format!("{switch_from} -> {switch_to} ({switch_reason})")),
+                )
+                .await;
+        }
 
         let response_contract = Some(
             serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),

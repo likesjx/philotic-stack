@@ -1160,6 +1160,36 @@ async fn emit_dispatch_status(
     .await;
 }
 
+/// Extract an HTTP status code (400..=599) from a provider error message.
+///
+/// Providers format failures as e.g. `"Gemini API error (400): ..."` or append
+/// a bracketed ` [503]` on streaming errors. Only 3-digit tokens delimited by
+/// `(`/`)`/`[`/`]`/`:`/space (or string boundaries) count, so token counts like
+/// "4096 tokens" never match.
+fn extract_http_status(message: &str) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let is_delim = |c: u8| matches!(c, b'(' | b')' | b'[' | b']' | b':' | b' ' | b',' | b'.');
+    for i in 0..bytes.len().saturating_sub(2) {
+        if !bytes[i..i + 3].iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let before_ok = i == 0 || is_delim(bytes[i - 1]);
+        let after_ok = i + 3 == bytes.len() || is_delim(bytes[i + 3]);
+        if !before_ok || !after_ok {
+            continue;
+        }
+        if let Ok(n) = std::str::from_utf8(&bytes[i..i + 3])
+            .unwrap_or("")
+            .parse::<u16>()
+        {
+            if (400..=599).contains(&n) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 fn classify_provider_failure(
     capability: Option<&str>,
     provider: Option<&str>,
@@ -1171,6 +1201,7 @@ fn classify_provider_failure(
         provider,
         message.to_string(),
     );
+    payload.status = extract_http_status(message);
 
     let malformed_tool_call = message.contains("tool_call.arguments missing from")
         || message.contains("returned invalid tool_call")
@@ -1180,6 +1211,9 @@ fn classify_provider_failure(
         payload.code = Some("MODEL_INVALID_TOOL_CALL".into());
         payload.retryable = Some(true);
         payload.sub_kind = Some("content_error".into());
+        // If the same provider mangles the repaired request too, the caller
+        // should switch providers rather than fail the turn.
+        payload.error_class = Some("switch_provider".into());
         return payload;
     }
 
@@ -1195,6 +1229,7 @@ fn classify_provider_failure(
     if is_network {
         payload.sub_kind = Some("network_error".into());
         payload.retryable = Some(true);
+        payload.error_class = Some("retry_same_provider".into());
         return payload;
     }
 
@@ -1202,13 +1237,16 @@ fn classify_provider_failure(
     if message.contains("streaming_timeout") {
         payload.sub_kind = Some("streaming_timeout".into());
         payload.retryable = Some(true);
+        payload.error_class = Some("retry_same_provider".into());
         return payload;
     }
 
-    // Rate limit (HTTP 429).
+    // Rate limit (HTTP 429). Immediate same-provider retry will 429 again —
+    // the next different-provider tier is the productive move.
     if message.contains("429") || message.contains("rate limit") || message.contains("quota") {
         payload.sub_kind = Some("rate_limit".into());
         payload.retryable = Some(true);
+        payload.error_class = Some("switch_provider".into());
         return payload;
     }
 
@@ -1227,10 +1265,12 @@ fn classify_provider_failure(
     {
         payload.sub_kind = Some("provider_auth".into());
         payload.retryable = Some(false);
+        payload.error_class = Some("fatal".into());
         return payload;
     }
 
-    // Generic provider-side HTTP error (5xx or non-retryable 4xx).
+    // Generic provider-side HTTP error (5xx) — transient; retrying (same
+    // provider or next tier) may succeed.
     if message.contains("500")
         || message.contains("502")
         || message.contains("503")
@@ -1238,6 +1278,22 @@ fn classify_provider_failure(
     {
         payload.sub_kind = Some("provider_error".into());
         payload.retryable = Some(true);
+        payload.error_class = Some("retry_same_provider".into());
+        return payload;
+    }
+
+    // Contract-level 4xx (400 INVALID_ARGUMENT, 404, 422, refusal…): the exact
+    // same request will fail identically on this provider — switch providers.
+    let is_contract_4xx = matches!(payload.status, Some(s) if (400..500).contains(&s))
+        || lower_message.contains("invalid_argument")
+        || lower_message.contains("invalid argument")
+        || lower_message.contains("failed_precondition")
+        || lower_message.contains("bad request");
+
+    if is_contract_4xx {
+        payload.sub_kind = Some("invalid_request".into());
+        payload.retryable = Some(false);
+        payload.error_class = Some("switch_provider".into());
         return payload;
     }
 
@@ -1337,7 +1393,7 @@ impl ReplyRoute {
 
 #[cfg(test)]
 mod failure_tests {
-    use super::classify_provider_failure;
+    use super::{classify_provider_failure, extract_http_status};
 
     #[test]
     fn classify_provider_failure_marks_malformed_tool_calls_retryable() {
@@ -1380,6 +1436,82 @@ mod failure_tests {
         assert_eq!(payload.capability.as_deref(), Some("text.generate"));
         assert_eq!(payload.sub_kind.as_deref(), Some("provider_auth"));
         assert_eq!(payload.retryable, Some(false));
+        assert_eq!(payload.error_class.as_deref(), Some("fatal"));
+        assert_eq!(payload.status, Some(400));
+    }
+
+    /// Forensic 2026-07-08: a Gemini 400 INVALID_ARGUMENT must carry a
+    /// machine-readable switch_provider class so philote engages the fallback
+    /// ladder instead of failing the turn as MODEL_EMPTY_RESPONSE.
+    #[test]
+    fn classify_provider_failure_marks_contract_400_switch_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Gemini API error (400): Request contains an invalid argument. INVALID_ARGUMENT",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("invalid_request"));
+        assert_eq!(payload.retryable, Some(false));
+        assert_eq!(payload.error_class.as_deref(), Some("switch_provider"));
+        assert_eq!(payload.status, Some(400));
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_5xx_retry_same_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Gemini API error (503): The model is overloaded. Please try again later.",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("provider_error"));
+        assert_eq!(payload.retryable, Some(true));
+        assert_eq!(payload.error_class.as_deref(), Some("retry_same_provider"));
+        assert_eq!(payload.status, Some(503));
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_rate_limit_switch_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Gemini API error (429): Resource has been exhausted (e.g. check quota).",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("rate_limit"));
+        assert_eq!(payload.error_class.as_deref(), Some("switch_provider"));
+        assert_eq!(payload.status, Some(429));
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_network_retry_same_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("ollama"),
+            "error sending request for url (http://127.0.0.1:11434/api/chat)",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("network_error"));
+        assert_eq!(payload.error_class.as_deref(), Some("retry_same_provider"));
+    }
+
+    #[test]
+    fn extract_http_status_reads_provider_error_formats() {
+        assert_eq!(
+            extract_http_status("Gemini API error (400): bad request"),
+            Some(400)
+        );
+        assert_eq!(
+            extract_http_status("Anthropic API error (529): overloaded"),
+            Some(529)
+        );
+        assert_eq!(extract_http_status("stream stalled [503]"), Some(503));
+        assert_eq!(extract_http_status("HTTP 404 model not found"), Some(404));
+        // Token counts and non-status digits never match.
+        assert_eq!(extract_http_status("prompt is 4096 tokens"), None);
+        assert_eq!(extract_http_status("id 123456 rejected"), None);
+        assert_eq!(extract_http_status("no digits at all"), None);
     }
 }
 

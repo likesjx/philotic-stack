@@ -137,18 +137,80 @@ fn is_content_error(error: &TaskErrorPayload) -> bool {
         || error.code.as_deref() == Some("MODEL_INVALID_TOOL_CALL")
 }
 
-/// True for errors that should escalate to the next provider fallback tier.
-fn should_escalate_tier(error: &TaskErrorPayload) -> bool {
-    matches!(
-        error.sub_kind.as_deref(),
-        Some("network_error")
-            | Some("streaming_timeout")
-            | Some("rate_limit")
-            | Some("provider_auth")
-            | Some("provider_error")
-    ) || (error.kind == "provider_failure"
-        && error.retryable.unwrap_or(false)
-        && !is_content_error(error))
+/// Escalation class for a provider failure — decides what the turn loop does
+/// with the error signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderErrorClass {
+    /// Transient (network / 5xx / streaming stall): a retry may succeed —
+    /// same-tier retry where the sub_kind allows it, otherwise next tier.
+    RetrySameProvider,
+    /// The request will fail identically on the same provider (4xx contract
+    /// errors, INVALID_ARGUMENT, refusals, rate limits): advance to the next
+    /// fallback tier, skipping tiers that dispatch to the failed provider.
+    SwitchProvider,
+    /// Auth/key misconfiguration: no retry against this provider can help
+    /// until an operator intervenes — surface to the user fast (plus a heal
+    /// event so the outage becomes an A3 work item).
+    Fatal,
+    /// Not a model-provider escalation signal (tool/transport/voice errors):
+    /// fall through to the generic fail path.
+    Unclassified,
+}
+
+/// Classify a provider failure into an escalation class.
+///
+/// Prefers the machine-readable `error_class` stamped by newer model-router
+/// controllers; falls back to `sub_kind` / HTTP `status` / kind heuristics for
+/// older controllers that predate the field. The final fallback maps any
+/// otherwise-unclassified `provider_failure` on the text path to
+/// `SwitchProvider`: an unrecognized provider error must engage the fallback
+/// ladder, not insta-fail the turn (forensic 2026-07-08 — nine Gemini 400s
+/// died as MODEL_EMPTY_RESPONSE while a healthy model.ollama tier sat idle).
+pub(crate) fn classify_provider_error(error: &TaskErrorPayload) -> ProviderErrorClass {
+    // 1. Machine-readable class from the controller wins.
+    match error.error_class.as_deref() {
+        Some("fatal") => return ProviderErrorClass::Fatal,
+        Some("switch_provider") => return ProviderErrorClass::SwitchProvider,
+        Some("retry_same_provider") => return ProviderErrorClass::RetrySameProvider,
+        _ => {}
+    }
+
+    // 2. sub_kind fallback (older controllers).
+    match error.sub_kind.as_deref() {
+        Some("provider_auth") => return ProviderErrorClass::Fatal,
+        Some("network_error") | Some("streaming_timeout") | Some("provider_error") => {
+            return ProviderErrorClass::RetrySameProvider;
+        }
+        Some("rate_limit") | Some("invalid_request") => {
+            return ProviderErrorClass::SwitchProvider;
+        }
+        _ => {}
+    }
+
+    if error.kind != "provider_failure" {
+        return ProviderErrorClass::Unclassified;
+    }
+
+    // 3. HTTP status fallback.
+    if let Some(status) = error.status {
+        return match status {
+            401 | 403 => ProviderErrorClass::Fatal,
+            400..=499 => ProviderErrorClass::SwitchProvider,
+            _ => ProviderErrorClass::RetrySameProvider,
+        };
+    }
+
+    // 4. Un-annotated provider_failure. Only the text-generation path may
+    // engage the fallback ladder — voice/embedding failures have their own
+    // handling and must not re-dispatch generate_text. Content errors reach
+    // here only after the repair attempt is spent; switching providers is
+    // then the productive move.
+    let text_capability = matches!(error.capability.as_deref(), None | Some("text.generate"));
+    if text_capability {
+        ProviderErrorClass::SwitchProvider
+    } else {
+        ProviderErrorClass::Unclassified
+    }
 }
 
 /// Default tier ordering when none is configured in TurnLoopConfig.
@@ -163,8 +225,12 @@ use ansible_mesh_core::model_routing::DEFAULT_FALLBACK_TIERS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoResponseClass {
     /// The provider returned an explicit retriable failure (network / timeout /
-    /// rate-limit / provider error) — fired immediately on the error signal.
+    /// provider error) — fired immediately on the error signal.
     ProviderFailure,
+    /// The provider rejected the request contract (4xx / INVALID_ARGUMENT /
+    /// refusal / rate limit): the same request fails identically on the same
+    /// provider, so the ladder walk skips tiers that dispatch to it.
+    ProviderContractFailure,
     /// No signal arrived; the stuck-turn watchdog fired after the WaitingModel
     /// deadline elapsed.
     WatchdogTimeout,
@@ -195,7 +261,9 @@ pub(crate) fn decide_no_response_action(
     tiers_remaining: bool,
 ) -> NoResponseAction {
     match class {
-        NoResponseClass::ProviderFailure | NoResponseClass::WatchdogTimeout => {
+        NoResponseClass::ProviderFailure
+        | NoResponseClass::ProviderContractFailure
+        | NoResponseClass::WatchdogTimeout => {
             if tiers_remaining {
                 NoResponseAction::EscalateTier
             } else {
@@ -203,6 +271,34 @@ pub(crate) fn decide_no_response_action(
             }
         }
     }
+}
+
+/// The next ladder tier to dispatch after `current_tier` fails.
+///
+/// On a contract failure (`skip_failed_provider = true` with a known failed
+/// provider) tiers whose role dispatches to that same provider are skipped —
+/// the request would fail identically there. Returns a tier > `max_tier` when
+/// the ladder is exhausted (possibly *by* the skip). Pure so the skip contract
+/// is unit-testable without IPC.
+fn next_ladder_tier(
+    configured_tiers: &[String],
+    current_tier: u8,
+    max_tier: u8,
+    failed_provider: Option<&str>,
+    skip_failed_provider: bool,
+) -> u8 {
+    let mut next = current_tier.saturating_add(1);
+    if skip_failed_provider {
+        if let Some(failed) = failed_provider {
+            while next <= max_tier
+                && provider_for_role(role_for_tier(configured_tiers, next)).as_deref()
+                    == Some(failed)
+            {
+                next = next.saturating_add(1);
+            }
+        }
+    }
+    next
 }
 
 /// Model role for a given tier index. Falls back gracefully when index is out of range.
@@ -5666,11 +5762,12 @@ async fn run_bash_command(
 mod tests {
     use super::{
         AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE,
-        MAX_ORACLE_EXTRA_TIERS, NoResponseAction, NoResponseClass, decide_no_response_action,
-        extract_model_error, extract_model_error_payload, format_role_command_reply,
-        format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
-        media_analysis_attachments, normalized_user_content, pick_oracle_role, provider_for_role,
-        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
+        MAX_ORACLE_EXTRA_TIERS, NoResponseAction, NoResponseClass, ProviderErrorClass,
+        classify_provider_error, decide_no_response_action, extract_model_error,
+        extract_model_error_payload, format_role_command_reply, format_roles_report,
+        loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments, next_ladder_tier,
+        normalized_user_content, pick_oracle_role, provider_for_role, resolve_media_routing,
+        resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -6142,6 +6239,8 @@ mod tests {
                 capability: Some("voice.synthesize".into()),
                 retryable: Some(false),
                 sub_kind: None,
+                status: None,
+                error_class: None,
             }),
             ..Default::default()
         };
@@ -6191,6 +6290,8 @@ mod tests {
                 capability: Some("text.generate".into()),
                 retryable: Some(true),
                 sub_kind: None,
+                status: None,
+                error_class: None,
             }),
             ..Default::default()
         };
@@ -6213,6 +6314,8 @@ mod tests {
             capability: Some("text.generate".into()),
             retryable: Some(true),
             sub_kind: None,
+            status: None,
+            error_class: None,
         };
 
         let mut state =
@@ -6261,7 +6364,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_auth_failure_escalates_fallback_tier_without_same_provider_repair() {
+    fn provider_auth_failure_is_fatal_without_same_provider_repair() {
         let error = TaskErrorPayload {
             kind: "provider_failure".into(),
             message: "Gemini API error (400): API key expired. Please renew the API key.".into(),
@@ -6271,12 +6374,139 @@ mod tests {
             capability: Some("text.generate".into()),
             retryable: Some(false),
             sub_kind: Some("provider_auth".into()),
+            status: None,
+            error_class: None,
         };
 
         let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
 
         assert!(!should_attempt_provider_repair(&error, Some(&state)));
-        assert!(super::should_escalate_tier(&error));
+        assert_eq!(classify_provider_error(&error), ProviderErrorClass::Fatal);
+    }
+
+    // ── Provider-error classification matrix ─────────────────────────────
+
+    fn provider_error(sub_kind: Option<&str>, status: Option<u16>) -> TaskErrorPayload {
+        TaskErrorPayload {
+            kind: "provider_failure".into(),
+            message: "Provider invocation failed".into(),
+            component: Some("model-router".into()),
+            provider: Some("gemini".into()),
+            capability: Some("text.generate".into()),
+            sub_kind: sub_kind.map(str::to_string),
+            status,
+            ..Default::default()
+        }
+    }
+
+    /// The forensic 2026-07-08 gap: a Gemini 400 with no sub_kind and no
+    /// error_class (old-controller envelope) must engage the fallback ladder
+    /// — never insta-fail the turn as MODEL_EMPTY_RESPONSE.
+    #[test]
+    fn classification_matrix_routes_each_error_class() {
+        // 4xx contract errors → switch provider.
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("invalid_request"), Some(400))),
+            ProviderErrorClass::SwitchProvider
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(None, Some(400))),
+            ProviderErrorClass::SwitchProvider,
+            "status-only 400 must switch providers"
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("rate_limit"), Some(429))),
+            ProviderErrorClass::SwitchProvider
+        );
+        // The exact forensic shape: kind=provider_failure, nothing else set.
+        assert_eq!(
+            classify_provider_error(&provider_error(None, None)),
+            ProviderErrorClass::SwitchProvider,
+            "un-annotated provider_failure on the text path must engage the ladder"
+        );
+
+        // 5xx / timeout / network → retryable (existing escalate behavior).
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("provider_error"), Some(503))),
+            ProviderErrorClass::RetrySameProvider
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("streaming_timeout"), None)),
+            ProviderErrorClass::RetrySameProvider
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("network_error"), None)),
+            ProviderErrorClass::RetrySameProvider
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(None, Some(500))),
+            ProviderErrorClass::RetrySameProvider,
+            "status-only 5xx is transient"
+        );
+
+        // Auth → fatal.
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("provider_auth"), Some(401))),
+            ProviderErrorClass::Fatal
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(None, Some(401))),
+            ProviderErrorClass::Fatal,
+            "status-only 401 is fatal"
+        );
+
+        // Machine-readable error_class from a new controller wins over everything.
+        let mut annotated = provider_error(Some("provider_error"), Some(503));
+        annotated.error_class = Some("switch_provider".into());
+        assert_eq!(
+            classify_provider_error(&annotated),
+            ProviderErrorClass::SwitchProvider
+        );
+        let mut fatal_annotated = provider_error(None, None);
+        fatal_annotated.error_class = Some("fatal".into());
+        assert_eq!(
+            classify_provider_error(&fatal_annotated),
+            ProviderErrorClass::Fatal
+        );
+
+        // Non-text capabilities and non-provider kinds fall through to the
+        // generic fail path.
+        let mut voice = provider_error(None, None);
+        voice.capability = Some("voice.synthesize".into());
+        assert_eq!(
+            classify_provider_error(&voice),
+            ProviderErrorClass::Unclassified
+        );
+        let transport = TaskErrorPayload::transport_error("philote", "socket closed");
+        assert_eq!(
+            classify_provider_error(&transport),
+            ProviderErrorClass::Unclassified
+        );
+    }
+
+    /// A contract failure must skip remaining ladder tiers that dispatch to
+    /// the failed provider — the same request fails identically there.
+    #[test]
+    fn next_ladder_tier_skips_failed_provider_tiers_on_contract_failure() {
+        let ladder: Vec<String> = vec![
+            "model".into(),        // gemini
+            "model.gemini".into(), // gemini again — must be skipped
+            "model.ollama".into(), // ollama
+        ];
+
+        // Contract failure on gemini at tier 0 → tier 2 (model.ollama).
+        assert_eq!(next_ladder_tier(&ladder, 0, 2, Some("gemini"), true), 2);
+        // Transient failure keeps the plain +1 walk (no skip).
+        assert_eq!(next_ladder_tier(&ladder, 0, 2, Some("gemini"), false), 1);
+        // Skip can exhaust the ladder: gemini fails at tier 0 of an all-gemini tail.
+        let gemini_only: Vec<String> = vec!["model".into(), "model.gemini".into()];
+        assert_eq!(
+            next_ladder_tier(&gemini_only, 0, 1, Some("gemini"), true),
+            2,
+            "skipping past the end signals exhaustion (oracle next)"
+        );
+        // Unknown failed provider → no skip.
+        assert_eq!(next_ladder_tier(&ladder, 0, 2, None, true), 1);
     }
 
     #[test]
@@ -7151,6 +7381,263 @@ mod tests {
                 .expect("detail")
                 .contains("All model providers failed"),
             "detail must describe the exhaustion: {heal:#?}"
+        );
+    }
+
+    // ── Provider 4xx mid-turn switch (forensic 2026-07-08) ───────────────────
+
+    /// The forensic gap end-to-end: a Gemini 400 arriving as an old-controller
+    /// envelope (kind=provider_failure, no sub_kind, no error_class) must NOT
+    /// fail the turn — the SAME turn must be re-dispatched to the next ladder
+    /// tier (model.openrouter under the post-#175 default ladder), a
+    /// `provider_switch` turn event must surface, and the fallback reply must
+    /// be delivered to the user.
+    #[tokio::test]
+    async fn provider_400_switches_provider_mid_turn_and_delivers_reply() {
+        let socket_path = format!("/tmp/philote-4xxswitch-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-4xx-switch".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-4xx-switch");
+
+        let session_id = "sess-4xx-switch";
+        let turn_id = "turn-4xx-switch";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Seed an in-flight turn waiting on the tier-0 (gemini) model, bound
+        // to a membrane transport target.
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Gemini 400 arrives — old-controller shape: no sub_kind, no
+        // error_class, no status. Exactly what died as MODEL_EMPTY_RESPONSE.
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "Gemini API error (400): Request contains an invalid argument.".into(),
+                    component: Some("model-router".into()),
+                    provider: Some("gemini".into()),
+                    capability: Some("text.generate".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("400 must not error the loop");
+
+        // The turn survives, advanced to tier 1 (model.openrouter), still WaitingModel.
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state
+                .active_turn
+                .as_ref()
+                .expect("turn must survive the 400 — it switches providers, not fails");
+            assert_eq!(
+                turn.fallback_tier, 1,
+                "must advance to the next ladder tier"
+            );
+            assert_eq!(turn.phase, TurnPhase::WaitingModel);
+        }
+
+        // The fallback tier answers on the same turn → reply delivered.
+        let final_text = "Openrouter fallback answer.";
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                agent_action: Some(serde_json::json!({
+                    "kind": "respond",
+                    "content": final_text,
+                })),
+                content: Some(final_text.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("fallback respond");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+
+        // The re-dispatch went to the model.openrouter controller role.
+        let redispatches: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert_eq!(
+            redispatches.len(),
+            1,
+            "exactly one fallback re-dispatch: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            redispatches[0]["target_role"], "model.openrouter",
+            "the 400 must engage the static ladder's next tier"
+        );
+
+        // A provider_switch turn event surfaced from → to → reason.
+        let switches: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "turn_event" && e["task"]["event"] == "provider_switch"
+            })
+            .collect();
+        assert_eq!(
+            switches.len(),
+            1,
+            "one provider_switch event: {:#?}",
+            *emitted
+        );
+        let detail = switches[0]["task"]["partial_content"]
+            .as_str()
+            .expect("switch detail");
+        assert!(
+            detail.contains("gemini") && detail.contains("openrouter"),
+            "switch detail must carry from/to providers: {detail}"
+        );
+
+        // No failure surfaced — the user got the fallback answer.
+        let replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(replies.len(), 1, "one final reply: {:#?}", *emitted);
+        assert!(
+            replies[0]["task"]["content"]
+                .as_str()
+                .expect("reply content")
+                .contains("Openrouter fallback answer"),
+            "user must see the fallback answer, not an error: {:#?}",
+            replies[0]
+        );
+        assert!(
+            emitted.iter().all(|e| e["heal_event"].is_null()),
+            "a successful mid-turn switch must not push heal events: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Fatal auth failures fail the turn fast (no pointless provider ladder
+    /// walk with a dead key) and flag the heal queue so the outage becomes an
+    /// operator work item.
+    #[tokio::test]
+    async fn fatal_auth_failure_fails_fast_and_pushes_heal_event() {
+        let socket_path = format!("/tmp/philote-authfatal-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-auth-fatal".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-auth-fatal");
+
+        let session_id = "sess-auth-fatal";
+        let turn_id = "turn-auth-fatal";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "Gemini API error (400): API key expired.".into(),
+                    provider: Some("gemini".into()),
+                    capability: Some("text.generate".into()),
+                    retryable: Some(false),
+                    sub_kind: Some("provider_auth".into()),
+                    error_class: Some("fatal".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("auth failure handled");
+
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "fatal auth must fail the turn fast"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            !emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "no ladder walk with a dead key: {:#?}",
+            *emitted
+        );
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| !e["heal_event"].is_null())
+            .collect();
+        assert_eq!(heal_events.len(), 1, "one heal event: {:#?}", *emitted);
+        assert_eq!(
+            heal_events[0]["heal_event"]["pattern_tag"],
+            "provider_auth:gemini"
+        );
+        assert!(
+            emitted.iter().any(|e| {
+                e["task"]["action"] == "send_reply"
+                    && e["task"]["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("rejected its credentials"))
+            }),
+            "user must get a fast, clear auth notice: {:#?}",
+            *emitted
         );
     }
 
