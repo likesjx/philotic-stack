@@ -222,6 +222,43 @@ fn role_for_tier<'a>(configured_tiers: &'a [String], tier: u8) -> &'a str {
     }
 }
 
+/// Maximum extra dispatch attempts the routing oracle may add beneath an
+/// exhausted fallback ladder before the turn is evicted. Keeps a pathological
+/// oracle loop bounded (the 600 s CatchAll turn budget is the hard ceiling).
+pub(crate) const MAX_ORACLE_EXTRA_TIERS: u8 = 2;
+
+/// Inverse of the hotel's controller-role seeding: which provider a ladder
+/// tier role dispatches to. Used to build the oracle's exclude list from the
+/// tiers a turn has already burned through. Unknown roles map to `None`
+/// (nothing to exclude).
+fn provider_for_role(role: &str) -> Option<String> {
+    match role {
+        "model" => Some("gemini".to_string()),
+        "model.local" => Some("onnx".to_string()),
+        _ => role.strip_prefix("model.").map(str::to_string),
+    }
+}
+
+/// Pick the first oracle-ranked entry whose role is not already in the
+/// turn's ladder. Returns `(role, provider)`. Pure so the skip-tried-roles
+/// contract is unit-testable without IPC.
+fn pick_oracle_role(
+    data: &serde_json::Value,
+    tried_roles: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    data.get("ranked")?.as_array()?.iter().find_map(|entry| {
+        let role = entry.get("role")?.as_str()?;
+        if tried_roles.contains(role) {
+            return None;
+        }
+        let provider = entry
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        Some((role.to_string(), provider.to_string()))
+    })
+}
+
 fn provider_repair_note(error: &TaskErrorPayload) -> String {
     let provider = error.provider.as_deref().unwrap_or("the model");
     format!(
@@ -5587,12 +5624,12 @@ async fn run_bash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, NoResponseAction,
-        NoResponseClass, decide_no_response_action, extract_model_error,
-        extract_model_error_payload, format_role_command_reply, format_roles_report,
-        loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments,
-        normalized_user_content, resolve_media_routing, resolve_model_execution_target,
-        should_attempt_provider_repair,
+        AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE,
+        MAX_ORACLE_EXTRA_TIERS, NoResponseAction, NoResponseClass, decide_no_response_action,
+        extract_model_error, extract_model_error_payload, format_role_command_reply,
+        format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
+        media_analysis_attachments, normalized_user_content, pick_oracle_role, provider_for_role,
+        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -5605,6 +5642,78 @@ mod tests {
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
+
+    // ── Routing-oracle helpers ────────────────────────────────────────────
+
+    #[test]
+    fn provider_for_role_inverts_hotel_seeding() {
+        assert_eq!(provider_for_role("model").as_deref(), Some("gemini"));
+        assert_eq!(provider_for_role("model.local").as_deref(), Some("onnx"));
+        assert_eq!(
+            provider_for_role("model.anthropic").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            provider_for_role("model.openrouter").as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(provider_for_role("tool"), None);
+    }
+
+    #[test]
+    fn pick_oracle_role_skips_roles_already_in_the_ladder() {
+        let data = serde_json::json!({
+            "ranked": [
+                { "role": "model", "provider": "gemini", "score": 0.9 },
+                { "role": "model.anthropic", "provider": "anthropic", "score": 0.8 },
+                { "role": "model.openrouter", "provider": "openrouter", "score": 0.7 }
+            ]
+        });
+        let tried: std::collections::HashSet<String> =
+            ["model".to_string(), "model.local".to_string()].into();
+        let (role, provider) = pick_oracle_role(&data, &tried).expect("pick");
+        assert_eq!(role, "model.anthropic");
+        assert_eq!(provider, "anthropic");
+    }
+
+    #[test]
+    fn pick_oracle_role_none_when_all_options_tried_or_empty() {
+        let tried: std::collections::HashSet<String> = ["model.anthropic".to_string()].into();
+        let data = serde_json::json!({
+            "ranked": [ { "role": "model.anthropic", "provider": "anthropic", "score": 0.8 } ]
+        });
+        assert!(pick_oracle_role(&data, &tried).is_none());
+        assert!(pick_oracle_role(&serde_json::json!({ "ranked": [] }), &tried).is_none());
+        assert!(pick_oracle_role(&serde_json::json!({}), &tried).is_none());
+    }
+
+    #[test]
+    fn pick_oracle_role_tolerates_malformed_entries() {
+        // Entries missing role are skipped, not fatal; missing provider
+        // degrades to "unknown".
+        let data = serde_json::json!({
+            "ranked": [
+                { "provider": "gemini", "score": 0.9 },
+                { "role": "model.openai", "score": 0.7 }
+            ]
+        });
+        let tried = std::collections::HashSet::new();
+        let (role, provider) = pick_oracle_role(&data, &tried).expect("pick");
+        assert_eq!(role, "model.openai");
+        assert_eq!(provider, "unknown");
+    }
+
+    #[test]
+    fn oracle_extra_tier_budget_bounds_reroutes() {
+        // The consult gate: current_tier >= max_tier + MAX_ORACLE_EXTRA_TIERS
+        // stops further oracle dispatches. With a 1-tier ladder (max_tier 0)
+        // and the default budget of 2, tiers 0 and 1 may consult; tier 2 may
+        // not.
+        let max_tier: u8 = 0;
+        assert!(0 < max_tier.saturating_add(MAX_ORACLE_EXTRA_TIERS));
+        assert!(1 < max_tier.saturating_add(MAX_ORACLE_EXTRA_TIERS));
+        assert!(2 >= max_tier.saturating_add(MAX_ORACLE_EXTRA_TIERS));
+    }
 
     #[test]
     fn no_response_table_matches_pre_slice_behavior() {
