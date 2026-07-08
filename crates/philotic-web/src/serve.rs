@@ -4,7 +4,27 @@
 //! explicit bootstrap/login ceremony before issuing a bounded same-origin
 //! operator session cookie for the embedded UI.
 //!
+//! Environment / config knobs:
+//!   PHILOTIC_WEB_BIND        (or config `web_bind`)        — bind host IP, default 127.0.0.1.
+//!                            Set to a Tailscale interface IP to expose to the tailnet.
+//!   PHILOTIC_WEB_EDGE_TOKEN  (or config `web_edge_token`)  — bearer token for device/edge
+//!                            clients (constant-time compared) accepted alongside operator
+//!                            session cookies.
+//!   PHILOTIC_WEB_EDGE_INVITE (or config `web_edge_invite`) — operator-issued invite code
+//!                            gating POST /api/edge/enroll; unset = enrollment disabled.
+//!   PHILOTIC_WEB_ROSTER      (or config `web_roster`)      — JSON mesh roster fallback for
+//!                            GET /api/mesh/roster when the aiua GetMeshRoster IPC is
+//!                            unreachable; also supplies philotic-web base URLs per node.
+//!
+//! When the bind is non-loopback, every /api route and /ws require a valid operator
+//! session (cookie or bearer session token) or the edge bearer token. GET /health stays
+//! unauthenticated on every tier (client latency probes).
+//!
 //! REST endpoints:
+//!   GET  /health   (unauthenticated — node_id + version for latency probes)
+//!   POST /api/edge/enroll   (invite-code gated — edge device enrollment)
+//!   GET  /api/edge/ws       (edge bearer token — edge-protocol WebSocket, see serve/edge.rs)
+//!   GET  /api/mesh/roster
 //!   GET  /api/auth/status
 //!   POST /api/auth/bootstrap
 //!   POST /api/auth/challenges
@@ -67,6 +87,10 @@
 //! WebSocket:
 //!   GET  /ws  — live push of guest/session state changes
 //!              auth via same-origin cookie
+//!   GET  /api/edge/ws — edge-mesh protocol termination (philotic-edge-protocol
+//!              JSON envelopes; per-device bearer auth; see serve/edge.rs)
+
+pub(crate) mod edge;
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
@@ -80,21 +104,24 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        ConnectInfo, Path, Query, Request, State,
     },
-    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use perimeter_core::{classify_bind_addr, ExposureTier};
 use rand::Rng;
 use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -102,7 +129,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use philotic_client::{
     ComponentInventoryEntryView, ComponentManifest, CronJob, CronJobSource,
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView, GuestIdentity,
-    IpcRequest, IpcResponse, LeaseEnvelope, OperatorTargetAgentInventoryView,
+    IpcRequest, IpcResponse, LeaseEnvelope, MeshRosterEntryView, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
     OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
     OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
@@ -125,14 +152,22 @@ const HEADER_CORP: &str = "cross-origin-resource-policy";
 // ── State shared across request handlers ─────────────────────────────────────
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     bootstrap_token: Arc<String>,
     db_path: PathBuf,
+    /// Mesh config path — consulted for `web_roster` / `web_edge_token` fallbacks
+    config_path: Arc<PathBuf>,
     hotel: Arc<String>,
     /// IPC socket path for the connected hotel
     socket: Arc<String>,
     /// Broadcast channel for WebSocket push events
     tx: broadcast::Sender<String>,
+    /// Bearer token for device/edge clients (PHILOTIC_WEB_EDGE_TOKEN / config `web_edge_token`)
+    edge_token: Option<Arc<String>>,
+    /// Exposure tier of the listener bind address (perimeter-core classification)
+    exposure_tier: ExposureTier,
+    /// Edge-tier state: enrolled-device registry + per-node outbound rings
+    edge: edge::EdgeState,
 }
 
 #[derive(Clone)]
@@ -554,6 +589,35 @@ pub async fn run(
         None => PathBuf::from("mesh-config.json"),
     });
     let hotel = read_hotel_name(&config_path);
+    let config_json = read_config_json(&config_path);
+    let bind_host = resolve_web_bind(
+        env_trimmed("PHILOTIC_WEB_BIND").as_deref(),
+        config_json
+            .as_ref()
+            .and_then(|v| v.get("web_bind"))
+            .and_then(Value::as_str),
+    )?;
+    // Conservative classification: we do not probe for a public IP here, so an
+    // unspecified bind (0.0.0.0) classifies as Lan with a logged warning.
+    let bind_classification = classify_bind_addr(bind_host, false);
+    let exposure_tier = bind_classification.tier();
+    let edge_token = resolve_edge_token(
+        env_trimmed("PHILOTIC_WEB_EDGE_TOKEN"),
+        config_json
+            .as_ref()
+            .and_then(|v| v.get("web_edge_token"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    );
+    let edge_token_configured = edge_token.is_some();
+    let edge_invite = resolve_edge_invite(
+        env_trimmed("PHILOTIC_WEB_EDGE_INVITE"),
+        config_json
+            .as_ref()
+            .and_then(|v| v.get("web_edge_invite"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    );
     let socket = crate::start::socket_path(&hotel);
     let lease_key = desktop_membrane_lease_key(&hotel);
     let lease_handle = acquire_desktop_membrane_lease(&socket, &lease_key, port).await?;
@@ -567,21 +631,42 @@ pub async fn run(
     // Broadcast channel for WebSocket events (capacity 256)
     let (tx, _) = broadcast::channel::<String>(256);
 
+    // Edge device registry lives next to the hotel context DB.
+    let edge_state =
+        edge::EdgeState::load(db_path.with_file_name("edge-devices.json"), edge_invite);
+    let edge_enrollment_enabled = edge_state.enrollment_enabled();
+    let edge_device_count = edge_state.device_count();
+
     let state = AppState {
         bootstrap_token: Arc::new(bootstrap_token.clone()),
         db_path,
+        config_path: Arc::new(config_path.clone()),
         hotel: Arc::new(hotel),
         socket: Arc::new(socket),
         tx,
+        edge_token: edge_token.map(Arc::new),
+        exposure_tier,
+        edge: edge_state,
     };
 
     ensure_operator_auth_tables(&state.db_path, &state.hotel)?;
+
+    // Process-wide edge retention: keeps replay rings fed for enrolled edge
+    // nodes even while they have no live WS session (see serve/edge.rs docs).
+    let _edge_retainer = edge::spawn_edge_retainer(state.edge.clone(), state.tx.clone());
 
     // CORS — localhost only; UI is embedded and served from the same origin
     let cors = build_cors(allow_origins.as_deref());
 
     let app = Router::new()
+        // Unauthenticated lightweight probe endpoint — allowed on every tier
+        .route("/health", get(handle_health))
+        // Edge-mesh tier (see serve/edge.rs): invite-code-gated enrollment plus
+        // the bearer-authenticated edge-protocol WebSocket termination
+        .route("/api/edge/enroll", post(edge::handle_edge_enroll))
+        .route("/api/edge/ws", get(edge::handle_edge_ws))
         // API routes
+        .route("/api/mesh/roster", get(handle_mesh_roster))
         .route("/api/auth/status", get(handle_auth_status))
         .route(
             "/api/auth/user",
@@ -759,36 +844,68 @@ pub async fn run(
         .route("/", get(handle_index))
         .fallback(get(handle_static))
         .layer(cors)
+        // Outermost: perimeter fence for non-loopback binds (runs before CORS)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            edge_fence_middleware,
+        ))
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr = SocketAddr::new(bind_host, port);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind philotic-web listener on {addr}"))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let renew_handle = tokio::spawn(run_desktop_membrane_lease_renewal(
         lease_handle.clone(),
         shutdown_tx.clone(),
     ));
 
+    let display_host = display_host_for(bind_host);
     println!("philotic-web serve");
     println!("──────────────────────────────────────────");
-    println!("  http://127.0.0.1:{port}");
+    println!("  bind: {addr} (exposure tier: {exposure_tier:?})");
+    if let Some(warning) = bind_classification.warning() {
+        println!("  bind warning: {warning}");
+    }
+    if exposure_tier != ExposureTier::Local {
+        if edge_token_configured {
+            println!("  non-loopback bind: /api and /ws require an operator session; edge bearer tokens (PHILOTIC_WEB_EDGE_TOKEN / enrollment tokens) open /api/edge/* only");
+        } else {
+            println!("  non-loopback bind: /api and /ws require an operator session — no PHILOTIC_WEB_EDGE_TOKEN configured, only enrolled device tokens can open /api/edge/*");
+        }
+    }
+    if edge_enrollment_enabled {
+        println!(
+            "  edge enrollment: enabled (POST /api/edge/enroll, {edge_device_count} device(s) enrolled)"
+        );
+    } else {
+        println!("  edge enrollment: disabled (set PHILOTIC_WEB_EDGE_INVITE to enable)");
+    }
+    println!("  http://{display_host}:{port}");
     println!();
     println!("  Bootstrap token: {bootstrap_token}");
     println!();
     println!("  Press Ctrl-C to stop.");
 
     let open_path = normalized_open_path(open_path.as_deref());
-    let browser_url = format!("http://127.0.0.1:{port}{open_path}");
+    let browser_url = format!("http://{display_host}:{port}{open_path}");
 
-    // Auto-open the embedded desktop in the default browser
-    let _ = tokio::process::Command::new("open")
-        .arg(&browser_url)
-        .spawn();
+    // Auto-open the embedded desktop in the default browser — only when the
+    // listener is actually reachable over loopback.
+    if bind_host.is_loopback() || bind_host.is_unspecified() {
+        let _ = tokio::process::Command::new("open")
+            .arg(&browser_url)
+            .spawn();
+    }
 
     let shutdown_reason = wait_for_shutdown(shutdown_rx);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_reason)
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_reason)
+    .await?;
 
     let _ = shutdown_tx.send(true);
     let _ = renew_handle.await;
@@ -1817,8 +1934,160 @@ async fn handle_auth_logout(headers: HeaderMap, State(state): State<AppState>) -
     response
 }
 
+/// Operator-session gate for the admin API surface. Edge bearer tokens are
+/// deliberately NOT accepted here: an edge device holds a low-trust,
+/// chat-scoped credential (see the trust-tier notes in
+/// `philotic-edge-protocol`), so it must never unlock secrets/config/vault
+/// mutation or the operator /ws firehose. Edge bearers are honoured only on
+/// the `/api/edge/*` surface (see [`edge_fence_allows`] and
+/// `edge::handle_edge_ws`).
 fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
     current_operator_session(headers, state).is_some()
+}
+
+/// True when the request carries a valid edge bearer token: either the shared
+/// PHILOTIC_WEB_EDGE_TOKEN / config `web_edge_token`, or a per-device token
+/// issued at enrollment (POST /api/edge/enroll). Constant-time comparisons.
+/// Grants access to the `/api/edge/*` surface only — never the operator API.
+fn edge_bearer_authorized(headers: &HeaderMap, state: &AppState) -> bool {
+    edge::edge_bearer_identity(headers, state).is_some()
+}
+
+/// Constant-time byte comparison. Only the length is allowed to leak via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+// ── Perimeter fence (non-loopback binds) ──────────────────────────────────────
+
+async fn edge_fence_middleware(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if edge_fence_allows(
+        &state,
+        request.method(),
+        request.uri().path(),
+        request.headers(),
+        peer.ip(),
+    ) {
+        next.run(request).await
+    } else {
+        unauthorized()
+    }
+}
+
+/// Gate for non-loopback binds.
+///
+/// Tier classification comes from `perimeter_core::classify_bind_addr`. The route
+/// policy is intentionally stricter than `perimeter_core::fence::check_ingress`
+/// (which is a structural pre-gate and allows Lan unauthenticated): philotic-web
+/// is an operator surface, so any non-Local bind requires a *valid* operator
+/// session (cookie or bearer session token) on every /api route and /ws. Edge
+/// bearer tokens are scoped to `/api/edge/*` only — a device credential must
+/// never open the operator admin surface. Two behaviours mirror the perimeter
+/// fence: loopback peers bypass the gate up to Mesh tier (loopback callers are
+/// local hotel tooling), and Internet tier gets no loopback bypass.
+///
+/// Non-API surfaces (static UI shell, /health latency probe, the OIDC browser
+/// callback) stay reachable; they carry no sensitive data without a session.
+fn edge_fence_allows(
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    peer: IpAddr,
+) -> bool {
+    if state.exposure_tier == ExposureTier::Local {
+        return true;
+    }
+    if method == Method::OPTIONS {
+        // CORS preflight requests carry no credentials by design
+        return true;
+    }
+    if path == "/api/edge/enroll" {
+        // Enrollment carries its own credential: the operator-issued invite
+        // code, validated (and throttled) by the handler (serve/edge.rs).
+        // Devices enrolling for the first time cannot yet hold any session
+        // or bearer token — but a static invite is not strong enough for a
+        // public-facing bind, so Internet tier keeps it fenced.
+        return state.exposure_tier <= ExposureTier::Mesh;
+    }
+    if path.starts_with("/api/edge/") {
+        // The edge surface (currently /api/edge/ws) accepts the edge bearer
+        // or an operator session; the WS handler re-validates bearer-only.
+        return edge_bearer_authorized(headers, state) || check_auth(headers, state);
+    }
+    if !(path.starts_with("/api/") || path == "/ws") {
+        return true;
+    }
+    if peer.is_loopback() && state.exposure_tier <= ExposureTier::Mesh {
+        return true;
+    }
+    check_auth(headers, state)
+}
+
+// ── Bind resolution ───────────────────────────────────────────────────────────
+
+const DEFAULT_WEB_BIND: &str = "127.0.0.1";
+
+/// Resolve the listener bind host: PHILOTIC_WEB_BIND env wins, then the config
+/// file `web_bind` key, then loopback.
+fn resolve_web_bind(env_value: Option<&str>, config_value: Option<&str>) -> Result<IpAddr> {
+    let chosen = env_value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| config_value.map(str::trim).filter(|v| !v.is_empty()))
+        .unwrap_or(DEFAULT_WEB_BIND);
+    parse_bind_host(chosen)
+}
+
+fn parse_bind_host(raw: &str) -> Result<IpAddr> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("bind host is empty");
+    }
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+    trimmed.parse::<IpAddr>().with_context(|| {
+        format!(
+            "invalid PHILOTIC_WEB_BIND host {trimmed:?} — expected an IP address \
+             such as 127.0.0.1, 0.0.0.0, or a Tailscale interface IP"
+        )
+    })
+}
+
+/// Host suitable for printed URLs: unspecified binds are reachable via loopback,
+/// IPv6 hosts need brackets.
+fn display_host_for(bind: IpAddr) -> String {
+    if bind.is_unspecified() {
+        return DEFAULT_WEB_BIND.to_string();
+    }
+    match bind {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
+/// Resolve the edge bearer token: PHILOTIC_WEB_EDGE_TOKEN env wins, then the
+/// config file `web_edge_token` key.
+fn resolve_edge_token(env_value: Option<String>, config_value: Option<String>) -> Option<String> {
+    normalize_non_empty_option(env_value).or_else(|| normalize_non_empty_option(config_value))
+}
+
+/// Resolve the edge enrollment invite code: PHILOTIC_WEB_EDGE_INVITE env wins,
+/// then the config file `web_edge_invite` key. `None` disables enrollment.
+fn resolve_edge_invite(env_value: Option<String>, config_value: Option<String>) -> Option<String> {
+    normalize_non_empty_option(env_value).or_else(|| normalize_non_empty_option(config_value))
 }
 
 fn header_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -2562,46 +2831,77 @@ async fn handle_mesh_target_agent_chat(
     let operator_session_id = body
         .operator_session_id
         .unwrap_or_else(|| "desktop-membrane".into());
+    let conversation_id = body
+        .conversation_id
+        .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{agent_id}"));
 
-    let targets = match ipc_desktop_membrane_targets(&state.socket).await {
-        Ok(targets) => targets,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
-        }
-    };
+    match submit_operator_chat_turn(
+        &state,
+        &target_node_id,
+        &agent_id,
+        &operator_session_id,
+        conversation_id,
+        body.content,
+    )
+    .await
+    {
+        Ok(accepted) => (StatusCode::ACCEPTED, Json(json!(accepted))).into_response(),
+        Err(err) => (err.status, Json(json!({"error": err.message}))).into_response(),
+    }
+}
+
+/// Error surfaced by [`submit_operator_chat_turn`] — carries the HTTP status
+/// the REST handler maps it to (the edge WS path renders it as a TurnEvent).
+struct OperatorChatSubmitError {
+    status: StatusCode,
+    message: String,
+}
+
+/// Shared submission path for operator chat turns: validates the mesh target,
+/// then spawns [`stream_operator_chat_turn`] which drives the hotel IPC leg
+/// (SubscribeInbox reply role + EmitTask to the target agent) and fans the
+/// resulting turn events out on the broadcast bus. Used by the REST chat
+/// handler and the edge WebSocket mux (serve/edge.rs).
+async fn submit_operator_chat_turn(
+    state: &AppState,
+    target_node_id: &str,
+    agent_id: &str,
+    operator_session_id: &str,
+    conversation_id: String,
+    content: String,
+) -> Result<OperatorChatAcceptedView, OperatorChatSubmitError> {
+    let targets = ipc_desktop_membrane_targets(&state.socket)
+        .await
+        .map_err(|err| OperatorChatSubmitError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: err.to_string(),
+        })?;
     let Some(target) = targets
         .iter()
         .find(|target| target.target_node_id == target_node_id)
     else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("mesh target [{target_node_id}] is not currently active in the registry")})),
-        )
-            .into_response();
+        return Err(OperatorChatSubmitError {
+            status: StatusCode::NOT_FOUND,
+            message: format!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            ),
+        });
     };
     let Some(local_target) = targets.iter().find(|target| target.is_local) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "local operator target is unavailable"})),
-        )
-            .into_response();
+        return Err(OperatorChatSubmitError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "local operator target is unavailable".into(),
+        });
     };
     let local_node_id = local_target.target_node_id.clone();
 
-    let conversation_id = body
-        .conversation_id
-        .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{agent_id}"));
     let session_id = conversation_id.clone();
     let turn_id = new_operator_chat_id("operator-chat-turn");
     let accepted = OperatorChatAcceptedView {
         accepted: true,
-        target_node_id: target_node_id.clone(),
-        target_agent_id: agent_id.clone(),
-        operator_session_id: operator_session_id.clone(),
+        target_node_id: target_node_id.to_string(),
+        target_agent_id: agent_id.to_string(),
+        operator_session_id: operator_session_id.to_string(),
         conversation_id: conversation_id.clone(),
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
@@ -2615,6 +2915,9 @@ async fn handle_mesh_target_agent_chat(
     let tx = state.tx.clone();
     let socket = state.socket.as_ref().clone();
     let accepted_for_error = accepted.clone();
+    let target_node_id = target_node_id.to_string();
+    let agent_id = agent_id.to_string();
+    let operator_session_id = operator_session_id.to_string();
     tokio::spawn(async move {
         if let Err(err) = stream_operator_chat_turn(
             socket,
@@ -2626,7 +2929,7 @@ async fn handle_mesh_target_agent_chat(
             conversation_id,
             session_id,
             turn_id,
-            body.content,
+            content,
         )
         .await
         {
@@ -2648,7 +2951,7 @@ async fn handle_mesh_target_agent_chat(
         }
     });
 
-    (StatusCode::ACCEPTED, Json(json!(accepted))).into_response()
+    Ok(accepted)
 }
 
 // ── GET /api/event-log ────────────────────────────────────────────────────────
@@ -6371,6 +6674,143 @@ async fn connect_client_with_identity(
         .map_err(Into::into)
 }
 
+// ── GET /health ───────────────────────────────────────────────────────────────
+
+/// Unauthenticated lightweight probe used by edge clients for latency racing.
+/// Returns node identity + version only — no sensitive data, allowed on any tier.
+async fn handle_health(State(state): State<AppState>) -> Response {
+    Json(json!({
+        "node_id": state.hotel.as_str(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
+}
+
+// ── GET /api/mesh/roster ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct MeshRosterHotelView {
+    node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    /// philotic-web base URLs for this hotel (e.g. "http://100.79.239.64:7700"),
+    /// raced client-side for the lowest-latency reachable endpoint.
+    #[serde(default)]
+    endpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct MeshRosterView {
+    hotels: Vec<MeshRosterHotelView>,
+    /// Full-fidelity mesh roster entries from the aiua GetMeshRoster IPC
+    /// (roles, exposure ceiling, typed listener endpoints). Present only when
+    /// `source` is "hotel-ipc".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    nodes: Vec<MeshRosterEntryView>,
+    /// Where the roster came from: "hotel-ipc", "env", "config", or "unconfigured"
+    source: String,
+}
+
+async fn handle_mesh_roster(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    Json(load_mesh_roster(&state).await).into_response()
+}
+
+/// Single seam for roster sourcing — `handle_mesh_roster` only ever calls this.
+///
+/// Primary source is the aiua `GetMeshRoster` IPC (live self + registry peers).
+/// The mesh does not yet advertise philotic-web base URLs in its perimeter
+/// listeners, so per-hotel `endpoints` (raced client-side) are still overlaid
+/// from the configured roster (PHILOTIC_WEB_ROSTER env / config `web_roster`)
+/// by node_id; the typed listener endpoints ride along in `nodes`.
+/// When the hotel IPC is unreachable the configured roster is served as-is.
+async fn load_mesh_roster(state: &AppState) -> MeshRosterView {
+    let (configured, configured_source) = configured_roster_hotels(state);
+    match fetch_mesh_roster_ipc(&state.socket).await {
+        Ok(entries) => {
+            let mut hotels: Vec<MeshRosterHotelView> = entries
+                .iter()
+                .map(|entry| MeshRosterHotelView {
+                    node_id: entry.node_id.clone(),
+                    display_name: entry.display_name.clone(),
+                    endpoints: configured
+                        .iter()
+                        .find(|hotel| hotel.node_id == entry.node_id)
+                        .map(|hotel| hotel.endpoints.clone())
+                        .unwrap_or_default(),
+                })
+                .collect();
+            // Configured hotels the live registry has not (yet) seen stay listed.
+            for hotel in &configured {
+                if !hotels.iter().any(|known| known.node_id == hotel.node_id) {
+                    hotels.push(hotel.clone());
+                }
+            }
+            MeshRosterView {
+                hotels,
+                nodes: entries,
+                source: "hotel-ipc".into(),
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "philotic-web: GetMeshRoster IPC unavailable ({err:#}); serving {configured_source} roster"
+            );
+            MeshRosterView {
+                hotels: configured,
+                nodes: vec![],
+                source: configured_source.into(),
+            }
+        }
+    }
+}
+
+/// Live roster over the hotel IPC socket (aiua `GetMeshRoster`).
+async fn fetch_mesh_roster_ipc(socket: &str) -> Result<Vec<MeshRosterEntryView>> {
+    let mut client =
+        connect_management_client(socket, &new_operator_chat_id("philotic-web-roster")).await?;
+    match client.send_request(IpcRequest::GetMeshRoster).await? {
+        IpcResponse::MeshRosterView { mesh_roster } => Ok(mesh_roster),
+        other => bail!("unexpected mesh roster response: {other:?}"),
+    }
+}
+
+/// The env/config-sourced roster chain (fallback + endpoint overlay source).
+fn configured_roster_hotels(state: &AppState) -> (Vec<MeshRosterHotelView>, &'static str) {
+    if let Some(raw) = env_trimmed("PHILOTIC_WEB_ROSTER") {
+        match parse_mesh_roster_json(&raw) {
+            Ok(hotels) => return (hotels, "env"),
+            Err(err) => eprintln!("philotic-web: ignoring invalid PHILOTIC_WEB_ROSTER: {err:#}"),
+        }
+    }
+    if let Some(value) =
+        read_config_json(&state.config_path).and_then(|v| v.get("web_roster").cloned())
+    {
+        match parse_mesh_roster_value(&value) {
+            Ok(hotels) => return (hotels, "config"),
+            Err(err) => eprintln!("philotic-web: ignoring invalid config web_roster: {err:#}"),
+        }
+    }
+    (vec![], "unconfigured")
+}
+
+fn parse_mesh_roster_json(raw: &str) -> Result<Vec<MeshRosterHotelView>> {
+    let value: Value = serde_json::from_str(raw).context("mesh roster is not valid JSON")?;
+    parse_mesh_roster_value(&value)
+}
+
+/// Accepts either a bare array of entries or an object wrapping it:
+/// `[{"node_id": "...", "endpoints": [...]}]` or `{"hotels": [...]}`.
+fn parse_mesh_roster_value(value: &Value) -> Result<Vec<MeshRosterHotelView>> {
+    let entries = value.get("hotels").unwrap_or(value);
+    serde_json::from_value(entries.clone()).context(
+        "mesh roster must be a JSON array of {node_id, display_name?, endpoints[]} entries \
+         (optionally wrapped in {\"hotels\": [...]})",
+    )
+}
+
 // ── WebSocket /ws ─────────────────────────────────────────────────────────────
 
 async fn handle_ws(
@@ -6378,7 +6818,7 @@ async fn handle_ws(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    if current_operator_session(&headers, &state).is_none() {
+    if !check_auth(&headers, &state) {
         return unauthorized();
     }
 
@@ -6437,15 +6877,19 @@ fn build_cors(allow_origins: Option<&str>) -> CorsLayer {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn read_hotel_name(config_path: &PathBuf) -> String {
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    read_config_json(config_path)
         .and_then(|v| {
             v.get("hotels")
                 .and_then(|h| h.as_object())
                 .and_then(|m| m.keys().next().cloned())
         })
         .unwrap_or_else(|| "default".to_string())
+}
+
+fn read_config_json(config_path: &PathBuf) -> Option<Value> {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
 }
 
 fn current_operator_session(
@@ -8632,5 +9076,459 @@ mod tests {
         assert!(resolved.is_none());
 
         let _ = fs::remove_file(&context_path);
+    }
+
+    // ── Bind resolution ─────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_web_bind_defaults_to_loopback() {
+        let addr = resolve_web_bind(None, None).unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn resolve_web_bind_env_wins_over_config() {
+        let addr = resolve_web_bind(Some("100.79.239.64"), Some("192.168.1.10")).unwrap();
+        assert_eq!(addr, "100.79.239.64".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_web_bind_falls_back_to_config() {
+        let addr = resolve_web_bind(None, Some("192.168.1.10")).unwrap();
+        assert_eq!(addr, "192.168.1.10".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_web_bind_blank_env_falls_through() {
+        let addr = resolve_web_bind(Some("   "), None).unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn parse_bind_host_accepts_ipv6_and_localhost_and_trims() {
+        assert_eq!(
+            parse_bind_host(" ::1 ").unwrap(),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_bind_host("LOCALHOST").unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            parse_bind_host("0.0.0.0").unwrap(),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_bind_host_rejects_garbage() {
+        assert!(parse_bind_host("not-an-ip").is_err());
+        assert!(parse_bind_host("127.0.0.1:7700").is_err());
+        assert!(parse_bind_host("").is_err());
+    }
+
+    #[test]
+    fn display_host_for_unspecified_and_ipv6() {
+        assert_eq!(display_host_for("0.0.0.0".parse().unwrap()), "127.0.0.1");
+        assert_eq!(display_host_for("::1".parse().unwrap()), "[::1]");
+        assert_eq!(
+            display_host_for("100.79.239.64".parse().unwrap()),
+            "100.79.239.64"
+        );
+    }
+
+    // ── Edge bearer token ───────────────────────────────────────────────────
+
+    #[test]
+    fn constant_time_eq_semantics() {
+        assert!(constant_time_eq(b"abc123", b"abc123"));
+        assert!(!constant_time_eq(b"abc123", b"abc124"));
+        assert!(!constant_time_eq(b"abc123", b"abc12"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn resolve_edge_token_precedence() {
+        assert_eq!(
+            resolve_edge_token(Some("env-tok".into()), Some("cfg-tok".into())).as_deref(),
+            Some("env-tok")
+        );
+        assert_eq!(
+            resolve_edge_token(None, Some("cfg-tok".into())).as_deref(),
+            Some("cfg-tok")
+        );
+        assert_eq!(resolve_edge_token(Some("  ".into()), None), None);
+        assert_eq!(resolve_edge_token(None, None), None);
+    }
+
+    fn test_state(edge_token: Option<&str>, tier: ExposureTier) -> AppState {
+        let (tx, _) = broadcast::channel::<String>(4);
+        AppState {
+            bootstrap_token: Arc::new("philotic-test".into()),
+            db_path: temp_db_path("fence"),
+            config_path: Arc::new(PathBuf::from("/nonexistent/mesh-config.json")),
+            hotel: Arc::new("mac-jane".into()),
+            socket: Arc::new(format!("/tmp/philotic-test-{}.sock", uuid::Uuid::new_v4())),
+            tx,
+            edge_token: edge_token.map(|t| Arc::new(t.to_string())),
+            exposure_tier: tier,
+            edge: edge::EdgeState::load(
+                std::env::temp_dir().join(format!(
+                    "philotic-web-test-edge-devices-{}.json",
+                    uuid::Uuid::new_v4()
+                )),
+                Some("INV-TEST".into()),
+            ),
+        }
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn edge_bearer_authorized_matches_configured_token() {
+        let state = test_state(Some("edge-secret"), ExposureTier::Mesh);
+        assert!(edge_bearer_authorized(
+            &bearer_headers("edge-secret"),
+            &state
+        ));
+        assert!(!edge_bearer_authorized(&bearer_headers("wrong"), &state));
+        assert!(!edge_bearer_authorized(&HeaderMap::new(), &state));
+
+        let no_token = test_state(None, ExposureTier::Mesh);
+        assert!(!edge_bearer_authorized(
+            &bearer_headers("edge-secret"),
+            &no_token
+        ));
+    }
+
+    #[test]
+    fn edge_bearer_accepts_enrolled_device_tokens() {
+        let state = test_state(Some("edge-secret"), ExposureTier::Mesh);
+        let enrolled = state
+            .edge
+            .enroll(&philotic_edge_protocol::EnrollmentRequest {
+                invite_code: "INV-TEST".into(),
+                device_pubkey_b64: "cHVia2V5".into(),
+                device_name: "Jared's iPhone".into(),
+                platform: "ios".into(),
+            })
+            .unwrap();
+
+        // Device token authorizes the bearer path and resolves to its node.
+        assert!(edge_bearer_authorized(
+            &bearer_headers(&enrolled.edge_token),
+            &state
+        ));
+        assert_eq!(
+            edge::edge_bearer_identity(&bearer_headers(&enrolled.edge_token), &state),
+            Some(edge::EdgeBearerIdentity::Device(enrolled.node_id.clone()))
+        );
+        // The shared token resolves to the shared identity.
+        assert_eq!(
+            edge::edge_bearer_identity(&bearer_headers("edge-secret"), &state),
+            Some(edge::EdgeBearerIdentity::Shared)
+        );
+        // Bad tokens still fail.
+        assert_eq!(
+            edge::edge_bearer_identity(&bearer_headers("edge-tok-forged"), &state),
+            None
+        );
+    }
+
+    #[test]
+    fn fence_leaves_edge_enrollment_reachable_without_credentials() {
+        let state = test_state(None, ExposureTier::Mesh);
+        let peer: IpAddr = "100.64.1.9".parse().unwrap();
+        assert!(edge_fence_allows(
+            &state,
+            &Method::POST,
+            "/api/edge/enroll",
+            &HeaderMap::new(),
+            peer
+        ));
+        // The edge WS stays behind the fence.
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/edge/ws",
+            &HeaderMap::new(),
+            peer
+        ));
+    }
+
+    #[test]
+    fn fence_blocks_edge_enrollment_on_internet_tier() {
+        // A static invite code is not a strong enough credential for a
+        // public-facing bind — enrollment must not be reachable there.
+        let state = test_state(None, ExposureTier::Internet);
+        let peer: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::POST,
+            "/api/edge/enroll",
+            &HeaderMap::new(),
+            peer
+        ));
+    }
+
+    // ── Perimeter fence ─────────────────────────────────────────────────────
+
+    #[test]
+    fn fence_local_tier_allows_everything() {
+        let state = test_state(None, ExposureTier::Local);
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            peer
+        ));
+    }
+
+    #[test]
+    fn fence_mesh_tier_blocks_api_without_credentials() {
+        let state = test_state(Some("edge-secret"), ExposureTier::Mesh);
+        let peer: IpAddr = "100.64.1.9".parse().unwrap();
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            peer
+        ));
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/ws",
+            &HeaderMap::new(),
+            peer
+        ));
+        // wrong bearer stays blocked
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/status",
+            &bearer_headers("wrong"),
+            peer
+        ));
+    }
+
+    #[test]
+    fn edge_bearer_is_scoped_to_the_edge_surface() {
+        let state = test_state(Some("edge-secret"), ExposureTier::Mesh);
+        let peer: IpAddr = "100.64.1.9".parse().unwrap();
+
+        // The edge bearer opens the edge WS...
+        assert!(edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/edge/ws",
+            &bearer_headers("edge-secret"),
+            peer
+        ));
+
+        // ...but never the operator API or the operator /ws firehose: a
+        // device credential must not read secrets, mutate config, or watch
+        // every session.
+        for path in [
+            "/api/mesh/roster",
+            "/api/secrets",
+            "/api/secrets/rotate",
+            "/api/vault",
+            "/api/config/some-key",
+            "/api/event-log",
+            "/ws",
+        ] {
+            assert!(
+                !edge_fence_allows(
+                    &state,
+                    &Method::GET,
+                    path,
+                    &bearer_headers("edge-secret"),
+                    peer
+                ),
+                "edge bearer must not open {path}"
+            );
+        }
+
+        // An enrolled per-device token is equally scoped.
+        let enrolled = state
+            .edge
+            .enroll(&philotic_edge_protocol::EnrollmentRequest {
+                invite_code: "INV-TEST".into(),
+                device_pubkey_b64: "cHVia2V5LWZlbmNl".into(),
+                device_name: "Jared's iPhone".into(),
+                platform: "ios".into(),
+            })
+            .unwrap();
+        assert!(edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/edge/ws",
+            &bearer_headers(&enrolled.edge_token),
+            peer
+        ));
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/secrets",
+            &bearer_headers(&enrolled.edge_token),
+            peer
+        ));
+
+        // check_auth itself never honours an edge bearer.
+        assert!(!check_auth(&bearer_headers("edge-secret"), &state));
+        assert!(!check_auth(&bearer_headers(&enrolled.edge_token), &state));
+    }
+
+    #[test]
+    fn fence_leaves_non_api_surfaces_and_preflight_open() {
+        let state = test_state(None, ExposureTier::Mesh);
+        let peer: IpAddr = "100.64.1.9".parse().unwrap();
+        // /health, static UI, and OIDC callback are outside the gate
+        for path in [
+            "/health",
+            "/",
+            "/assets/app.js",
+            "/auth/oidc/github/callback",
+        ] {
+            assert!(
+                edge_fence_allows(&state, &Method::GET, path, &HeaderMap::new(), peer),
+                "expected {path} to stay reachable"
+            );
+        }
+        // CORS preflight carries no credentials
+        assert!(edge_fence_allows(
+            &state,
+            &Method::OPTIONS,
+            "/api/status",
+            &HeaderMap::new(),
+            peer
+        ));
+    }
+
+    #[test]
+    fn fence_loopback_bypass_up_to_mesh_but_not_internet() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let mesh_state = test_state(None, ExposureTier::Mesh);
+        assert!(edge_fence_allows(
+            &mesh_state,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            loopback
+        ));
+
+        let internet_state = test_state(None, ExposureTier::Internet);
+        assert!(!edge_fence_allows(
+            &internet_state,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            loopback
+        ));
+    }
+
+    // ── Mesh roster ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_mesh_roster_accepts_bare_array_and_wrapped_object() {
+        let raw = r#"[{"node_id":"mbp-jane","endpoints":["http://100.79.239.64:7700"]}]"#;
+        let hotels = parse_mesh_roster_json(raw).unwrap();
+        assert_eq!(hotels.len(), 1);
+        assert_eq!(hotels[0].node_id, "mbp-jane");
+        assert_eq!(hotels[0].endpoints, vec!["http://100.79.239.64:7700"]);
+        assert_eq!(hotels[0].display_name, None);
+
+        let wrapped =
+            r#"{"hotels":[{"node_id":"vps-jane","display_name":"VPS Jane","endpoints":[]}]}"#;
+        let hotels = parse_mesh_roster_json(wrapped).unwrap();
+        assert_eq!(hotels.len(), 1);
+        assert_eq!(hotels[0].node_id, "vps-jane");
+        assert_eq!(hotels[0].display_name.as_deref(), Some("VPS Jane"));
+        assert!(hotels[0].endpoints.is_empty());
+    }
+
+    #[test]
+    fn parse_mesh_roster_endpoints_default_to_empty() {
+        let raw = r#"[{"node_id":"mac-jane"}]"#;
+        let hotels = parse_mesh_roster_json(raw).unwrap();
+        assert!(hotels[0].endpoints.is_empty());
+    }
+
+    #[test]
+    fn parse_mesh_roster_rejects_invalid_shapes() {
+        assert!(parse_mesh_roster_json("not json").is_err());
+        assert!(parse_mesh_roster_json(r#"{"node_id":"missing-array-wrapper"}"#).is_err());
+        assert!(
+            parse_mesh_roster_json(r#"[{"endpoints":[]}]"#).is_err(),
+            "node_id is required"
+        );
+    }
+
+    #[test]
+    fn mesh_roster_view_serializes_for_clients() {
+        let view = MeshRosterView {
+            hotels: vec![MeshRosterHotelView {
+                node_id: "mbp-jane".into(),
+                display_name: None,
+                endpoints: vec!["http://100.79.239.64:7700".into()],
+            }],
+            nodes: vec![],
+            source: "env".into(),
+        };
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "hotels": [{
+                    "node_id": "mbp-jane",
+                    "endpoints": ["http://100.79.239.64:7700"],
+                }],
+                "source": "env",
+            })
+        );
+    }
+
+    #[test]
+    fn load_mesh_roster_reads_config_web_roster() {
+        let config_path = std::env::temp_dir().join(format!(
+            "philotic-web-roster-config-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &config_path,
+            r#"{"web_roster":[{"node_id":"vps-jane","endpoints":["http://100.64.212.8:7700"]}]}"#,
+        )
+        .unwrap();
+        let mut state = test_state(None, ExposureTier::Local);
+        state.config_path = Arc::new(config_path.clone());
+
+        let view = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(load_mesh_roster(&state));
+        assert_eq!(view.source, "config");
+        assert_eq!(view.hotels.len(), 1);
+        assert_eq!(view.hotels[0].node_id, "vps-jane");
+
+        let _ = fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn load_mesh_roster_unconfigured_is_empty() {
+        let state = test_state(None, ExposureTier::Local);
+        let view = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(load_mesh_roster(&state));
+        assert_eq!(view.source, "unconfigured");
+        assert!(view.hotels.is_empty());
     }
 }

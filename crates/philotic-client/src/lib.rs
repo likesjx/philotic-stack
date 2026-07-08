@@ -1053,6 +1053,33 @@ pub enum IpcRequest {
         conversation_id: Option<String>,
         content: String,
     },
+    /// List conversation sessions recorded in this hotel's context graph
+    /// (operator session history), most recent activity first.
+    /// Responds with [`IpcResponse::OperatorSessionList`].
+    ListOperatorSessions {
+        /// When set, only sessions whose primary agent matches are returned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_agent_id: Option<String>,
+        /// Maximum number of sessions to return (default 50, capped at 500).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// List the turns of one session as operator/agent messages, oldest first.
+    /// Responds with [`IpcResponse::SessionTurnList`].
+    ListSessionTurns {
+        session_id: String,
+        /// Maximum number of underlying turn records to expand (default 50, capped at 500).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        /// Pagination cursor: only turns strictly older than this turn_id are
+        /// returned. An unknown cursor yields an empty page (end of history).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_turn_id: Option<String>,
+    },
+    /// Read-only roster of the local node plus every fresh mesh peer known to
+    /// the node registry, including reachable listener endpoints and exposure
+    /// profile where advertised. Responds with [`IpcResponse::MeshRosterView`].
+    GetMeshRoster,
     ListDesktopMembraneGuests,
     ListDesktopMembraneTargetGuests {
         target_node_id: String,
@@ -2061,6 +2088,80 @@ pub struct MemoryConfigPayload {
     pub config_json: Option<String>,
 }
 
+/// One session summary returned by [`IpcResponse::OperatorSessionList`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperatorSessionView {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Channel/transport the session arrived on (e.g. "operator_chat", "telegram").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Session status as stored ("active", "paused", ...).
+    pub status: String,
+    /// Unix epoch seconds of the last recorded activity on the session.
+    pub last_activity_at: u64,
+    /// Channel session key (e.g. chat id) when one is recorded — a cheap title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Short excerpt of the most recent turn content, when derivable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// One operator/agent message expanded from a session turn record, returned by
+/// [`IpcResponse::SessionTurnList`]. A single stored turn record can expand to
+/// two items sharing the same `turn_id`: the operator message and the agent reply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionTurnView {
+    pub turn_id: String,
+    /// "operator" for the inbound user message, "agent" for the reply.
+    pub role: String,
+    pub content: String,
+    /// Unix epoch seconds; started_at for operator items, completed_at for agent items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    /// Turn processing status ("queued", "running", "completed", "failed").
+    pub status: String,
+}
+
+/// One reachable endpoint advertised by a mesh node, returned inside
+/// [`MeshRosterEntryView`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeshEndpointView {
+    /// Logical purpose: "gateway", "beacon", "execution", "blob", "membrane-mcp", "ipc".
+    pub purpose: String,
+    pub host: String,
+    pub port: u16,
+    /// Exposure tier of the listener ("local", "lan", "mesh", "internet"), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Wire protocol for execution reachability entries (e.g. "tcp").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+/// One node (self or peer) returned by [`IpcResponse::MeshRosterView`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeshRosterEntryView {
+    pub node_id: String,
+    pub is_self: bool,
+    /// Hotel name for the node when known (from the local graph for self,
+    /// from HotelStateSync for peers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Mesh roles advertised in the node's capabilities manifest.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// The node's effective exposure ceiling ("local", "lan", "mesh", "internet"),
+    /// when a perimeter snapshot has been advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_ceiling: Option<String>,
+    /// Reachable listener endpoints (perimeter listeners + execution reachability).
+    #[serde(default)]
+    pub endpoints: Vec<MeshEndpointView>,
+}
+
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -2439,6 +2540,33 @@ pub enum IpcResponse {
         /// Unix epoch seconds of the query.
         generated_at: u64,
     },
+    /// Response to [`IpcRequest::ListOperatorSessions`].
+    ///
+    /// Untagged-serde safety: the required, uniquely-named `operator_sessions`
+    /// field keeps this variant from swallowing `Standard` acks or being
+    /// swallowed by earlier variants.
+    OperatorSessionList {
+        operator_sessions: Vec<OperatorSessionView>,
+    },
+    /// Response to [`IpcRequest::ListSessionTurns`].
+    ///
+    /// Untagged-serde safety: both fields are required; `turns_session_id` is
+    /// deliberately not named `session_id` so no earlier variant shape matches.
+    SessionTurnList {
+        turns_session_id: String,
+        session_turns: Vec<SessionTurnView>,
+    },
+    /// Response to [`IpcRequest::GetMeshRoster`].
+    ///
+    /// Untagged-serde safety: the required, uniquely-named `mesh_roster` field
+    /// makes this variant structurally unambiguous.
+    MeshRosterView {
+        mesh_roster: Vec<MeshRosterEntryView>,
+    },
+    // CRITICAL: `MemoryConfig` (all-optional payload) must remain the LAST
+    // variant of this untagged enum — see `project_cron_scheduler.md` /
+    // `bug_ipcresponse_untagged_ordering.md`. Add new variants ABOVE this line
+    // and give them at least one required, uniquely-named field.
     MemoryConfig(MemoryConfigPayload),
 }
 
@@ -2859,6 +2987,154 @@ mod tests {
                 assert_eq!(lease.metadata["agent_id"], "agent-jane-01");
             }
             other => panic!("unexpected decoded response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_history_responses_roundtrip_to_their_own_variants() {
+        // OperatorSessionList round-trip (including the empty-list edge).
+        for sessions in [
+            vec![OperatorSessionView {
+                session_id: "operator-chat:sess-1:agent-jane-01".into(),
+                agent_id: Some("agent-jane-01".into()),
+                transport: Some("operator_chat".into()),
+                status: "active".into(),
+                last_activity_at: 1_750_000_000,
+                title: Some("chat-1".into()),
+                preview: Some("hello there".into()),
+            }],
+            Vec::new(),
+        ] {
+            let bytes = serde_json::to_vec(&IpcResponse::OperatorSessionList {
+                operator_sessions: sessions.clone(),
+            })
+            .expect("serialize operator session list");
+            match serde_json::from_slice::<IpcResponse>(&bytes)
+                .expect("deserialize operator session list")
+            {
+                IpcResponse::OperatorSessionList { operator_sessions } => {
+                    assert_eq!(operator_sessions, sessions);
+                }
+                other => panic!("operator session list decoded as wrong variant: {other:?}"),
+            }
+        }
+
+        // SessionTurnList round-trip.
+        let turns = vec![
+            SessionTurnView {
+                turn_id: "turn-1".into(),
+                role: "operator".into(),
+                content: "ping".into(),
+                created_at: Some(1),
+                status: "completed".into(),
+            },
+            SessionTurnView {
+                turn_id: "turn-1".into(),
+                role: "agent".into(),
+                content: "pong".into(),
+                created_at: Some(2),
+                status: "completed".into(),
+            },
+        ];
+        let bytes = serde_json::to_vec(&IpcResponse::SessionTurnList {
+            turns_session_id: "operator-chat:sess-1:agent-jane-01".into(),
+            session_turns: turns.clone(),
+        })
+        .expect("serialize session turn list");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize session turn list")
+        {
+            IpcResponse::SessionTurnList {
+                turns_session_id,
+                session_turns,
+            } => {
+                assert_eq!(turns_session_id, "operator-chat:sess-1:agent-jane-01");
+                assert_eq!(session_turns, turns);
+            }
+            other => panic!("session turn list decoded as wrong variant: {other:?}"),
+        }
+
+        // MeshRosterView round-trip.
+        let roster = vec![MeshRosterEntryView {
+            node_id: "local-aiua-01".into(),
+            is_self: true,
+            display_name: Some("mac-jane".into()),
+            roles: vec!["ansible-node".into()],
+            exposure_ceiling: Some("mesh".into()),
+            endpoints: vec![MeshEndpointView {
+                purpose: "execution".into(),
+                host: "100.64.1.2".into(),
+                port: 16371,
+                tier: None,
+                protocol: Some("tcp".into()),
+            }],
+        }];
+        let bytes = serde_json::to_vec(&IpcResponse::MeshRosterView {
+            mesh_roster: roster.clone(),
+        })
+        .expect("serialize mesh roster");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize mesh roster") {
+            IpcResponse::MeshRosterView { mesh_roster } => assert_eq!(mesh_roster, roster),
+            other => panic!("mesh roster decoded as wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn existing_responses_still_decode_to_their_variants_after_session_history_variants() {
+        // Regression guard for the untagged-enum ordering hazard: adding the
+        // session-history/mesh-roster variants must not change how any existing
+        // response shape deserializes.
+
+        // Standard ack.
+        let bytes =
+            serde_json::to_vec(&IpcResponse::success("corr-1", None)).expect("serialize standard");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize standard") {
+            IpcResponse::Standard { ok: true, code, .. } => assert_eq!(code, "OK"),
+            other => panic!("standard ack decoded as wrong variant: {other:?}"),
+        }
+
+        // Ack.
+        let bytes = serde_json::to_vec(&IpcResponse::Ack {
+            req_id: "req-1".into(),
+        })
+        .expect("serialize ack");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize ack") {
+            IpcResponse::Ack { req_id } => assert_eq!(req_id, "req-1"),
+            other => panic!("ack decoded as wrong variant: {other:?}"),
+        }
+
+        // Error.
+        let bytes = serde_json::to_vec(&IpcResponse::Error("boom".into())).expect("serialize err");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize err") {
+            IpcResponse::Error(msg) => assert_eq!(msg, "boom"),
+            other => panic!("error decoded as wrong variant: {other:?}"),
+        }
+
+        // MemoryConfig (the all-optional payload that must stay last).
+        let bytes = serde_json::to_vec(&IpcResponse::MemoryConfig(MemoryConfigPayload {
+            config_json: None,
+        }))
+        .expect("serialize memory config");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize memory config") {
+            IpcResponse::MemoryConfig(_) => {}
+            other => panic!("memory config decoded as wrong variant: {other:?}"),
+        }
+
+        // UserProfileData (deny_unknown_fields payload).
+        let bytes = serde_json::to_vec(&IpcResponse::UserProfileData(UserProfileDataPayload {
+            timezone: Some("America/New_York".into()),
+            display_name: None,
+            principal_id: None,
+            preferred_name: None,
+            primary_email: None,
+            home_hotel: None,
+            linked_providers: vec![],
+        }))
+        .expect("serialize user profile");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize user profile") {
+            IpcResponse::UserProfileData(p) => {
+                assert_eq!(p.timezone.as_deref(), Some("America/New_York"));
+            }
+            other => panic!("user profile decoded as wrong variant: {other:?}"),
         }
     }
 

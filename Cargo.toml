@@ -10,6 +10,7 @@ members = [
     "crates/onnx-runner",
     "crates/tool-runner",
     "crates/philotic-client",
+    "crates/philotic-edge-protocol",
     "crates/ansible-mesh-core",
     "crates/memory-core",
     "crates/philotic-web",

@@ -3385,6 +3385,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "philotic-edge-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "philotic-graph"
 version = "0.1.0"
 dependencies = [
@@ -3446,11 +3454,14 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "futures-util",
  "glob",
  "graph-intelligence",
  "hex",
  "inquire",
+ "perimeter-core",
  "philotic-client",
+ "philotic-edge-protocol",
  "philotic-graph",
  "rand 0.8.5",
  "reqwest",
