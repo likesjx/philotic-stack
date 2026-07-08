@@ -161,8 +161,24 @@ async fn process_row(
     intel_graph_url: Option<&str>,
     row: &HealQueueRow,
 ) {
+    // Rows from the hotel's turn-failure intake (FailTask classification,
+    // philote PushHealEvent) arrive pre-triaged: pattern_tag + severity were
+    // assigned at insert. Honour them — the tag keys A3 recurrence
+    // aggregation, and re-classifying could split the same pattern across
+    // two tags. Only the heal action is derived here.
     let (severity, pattern_tag, heal_action) =
-        classify(http, ollama_url, ollama_model, &row.guest_id, &row.raw_text).await;
+        match row.pattern_tag.as_deref().filter(|tag| !tag.is_empty()) {
+            Some(tag) => (
+                if row.severity.is_empty() || row.severity == "unknown" {
+                    "medium".to_string()
+                } else {
+                    row.severity.clone()
+                },
+                tag.to_string(),
+                ansible_mesh_core::heal_queue::heal_action_for_pattern_tag(tag).to_string(),
+            ),
+            None => classify(http, ollama_url, ollama_model, &row.guest_id, &row.raw_text).await,
+        };
 
     // Write triage back.
     if let Err(e) = ipc
@@ -403,6 +419,16 @@ async fn classify(
 }
 
 fn rule_classify(text: &str) -> Option<(String, String, String)> {
+    // Turn-level failures (provider errors, model empty responses) use the
+    // classifier shared with the hotel's FailTask intake so both sides always
+    // produce the same pattern_tag (provider_4xx:{provider},
+    // provider_timeout:{provider}, model_empty_response, …) and the A3
+    // recurrence counter aggregates them correctly. provider_4xx maps to
+    // escalate (→ work-item path), never restart_guest — a 400 is not fixed
+    // by restarting.
+    if let Some(class) = ansible_mesh_core::heal_queue::classify_turn_failure(text) {
+        return Some((class.severity, class.pattern_tag, class.heal_action));
+    }
     let t = text.to_lowercase();
     // MuninnDB outage — hotel pushes this exact phrase; handle before generic connection_refused.
     if t.contains("muninndb unreachable") {
@@ -575,5 +601,90 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
             "escalated".into()
         }
         _ => "noop".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rule_classify;
+
+    /// Turn-failure tags must classify identically to the hotel's FailTask
+    /// intake (shared classifier), and provider_4xx must escalate — never
+    /// restart_guest.
+    #[test]
+    fn rule_classify_recognizes_turn_failure_tags() {
+        let (severity, tag, action) = rule_classify(
+            "[MODEL_EMPTY_RESPONSE] Model failed: 400 Bad Request \
+             | kind=provider_failure | component=model-router | provider=gemini",
+        )
+        .expect("classified");
+        assert_eq!(severity, "medium");
+        assert_eq!(tag, "provider_4xx:gemini");
+        assert_eq!(action, "escalate", "a 400 is not fixed by restarting");
+
+        let (_, tag, action) =
+            rule_classify("request timed out | kind=provider_failure | provider=anthropic")
+                .expect("classified");
+        assert_eq!(tag, "provider_timeout:anthropic");
+        assert_eq!(action, "noop");
+
+        let (_, tag, action) =
+            rule_classify("[MODEL_EMPTY_RESPONSE] no usable output").expect("classified");
+        assert_eq!(tag, "model_empty_response");
+        assert_eq!(action, "escalate");
+    }
+
+    /// The turn-failure fast path must not shadow the existing rule table:
+    /// non-provider lines keep their legacy tags and actions.
+    #[test]
+    fn rule_classify_legacy_rules_unaffected() {
+        let (severity, tag, action) = rule_classify("connection refused").expect("classified");
+        assert_eq!(
+            (severity.as_str(), tag.as_str(), action.as_str()),
+            ("high", "connection_refused", "restart_guest")
+        );
+
+        let (_, tag, action) = rule_classify("muninndb unreachable").expect("classified");
+        assert_eq!(tag, "muninn_unreachable");
+        assert_eq!(action, "refresh_memory_config");
+
+        // A provider-marked 401 now aggregates per-provider as a 4xx (still
+        // escalate); a bare 401 keeps the legacy auth_failure tag.
+        let (_, tag, action) =
+            rule_classify("401 Unauthorized | kind=provider_failure | provider=gemini")
+                .expect("classified");
+        assert_eq!(tag, "provider_4xx:gemini");
+        assert_eq!(action, "escalate");
+        let (_, tag, _) = rule_classify("401 unauthorized").expect("classified");
+        assert_eq!(tag, "auth_failure");
+
+        assert!(rule_classify("something entirely novel").is_none());
+    }
+
+    /// Pre-triaged tags (hotel intake / philote PushHealEvent) map to the
+    /// dispatcher actions via the shared mapping.
+    #[test]
+    fn pre_triaged_tag_action_mapping() {
+        use ansible_mesh_core::heal_queue::heal_action_for_pattern_tag;
+        assert_eq!(
+            heal_action_for_pattern_tag("stuck_turn_evicted:WaitingTool"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("fallback_exhausted:gemini"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("paracrine_budget_exhausted"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("provider_4xx:gemini"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("provider_timeout:gemini"),
+            "noop"
+        );
     }
 }

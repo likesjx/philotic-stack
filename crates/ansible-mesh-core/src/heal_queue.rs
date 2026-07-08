@@ -92,8 +92,211 @@ pub fn cap_evidence_lines(lines: &[String]) -> Vec<String> {
     kept
 }
 
+// ── Turn-level failure intake (self-heal) ─────────────────────────────────────
+
+/// Flood-control window: a second heal entry with the same
+/// `(guest_id, pattern_tag)` arriving within this many seconds of the previous
+/// one is collapsed instead of inserted (see
+/// [`HealQueueStorage::push_classified`]). Keeps a burst of identical turn
+/// failures from flooding the queue while still letting the heal-dispatcher's
+/// A3 recurrence counter (threshold measured over a 30-minute window) see the
+/// pattern recur.
+pub const HEAL_FLOOD_WINDOW_SECS: u64 = 60;
+
+/// Maximum bytes of raw failure text stored per turn-failure heal entry.
+pub const MAX_TURN_FAILURE_RAW_BYTES: usize = 2048;
+
+/// Cap a turn-failure raw line to [`MAX_TURN_FAILURE_RAW_BYTES`], truncating
+/// on a char boundary with a truncation marker.
+pub fn cap_turn_failure_text(line: &str) -> String {
+    const MARKER: &str = "… [truncated]";
+    if line.len() <= MAX_TURN_FAILURE_RAW_BYTES {
+        return line.to_string();
+    }
+    let mut cut = MAX_TURN_FAILURE_RAW_BYTES - MARKER.len();
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = line[..cut].to_string();
+    out.push_str(MARKER);
+    out
+}
+
+/// Classification of a turn-level failure line (provider errors, model
+/// empty responses) into the heal-queue triage triple. Shared between the
+/// hotel's FailTask intake (which pre-triages entries at insert) and the
+/// heal-dispatcher's `rule_classify` (so both sides always agree on the
+/// `pattern_tag` that keys A3 recurrence aggregation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFailureClass {
+    pub severity: String,
+    pub pattern_tag: String,
+    pub heal_action: String,
+    /// Provider parsed from a `provider=<name>` marker, when present.
+    pub provider: Option<String>,
+}
+
+/// Extract the value of a `key=value` marker (as emitted by
+/// `TaskErrorPayload::display_message`, ` | `-separated) from a failure line.
+fn marker_value(text: &str, key: &str) -> Option<String> {
+    let start = text.find(key)? + key.len();
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '|')
+        .unwrap_or(rest.len());
+    let value = rest[..end].trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// True when the text contains a standalone 3-digit token within `lo..=hi`
+/// (an HTTP status code). Tokens glued to letters/digits/dots (`400s`,
+/// `v1.400`, `gemini400`) do not match.
+fn has_standalone_status(text: &str, lo: u32, hi: u32) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let prev_glued = start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric()
+                    || bytes[start - 1] == b'.'
+                    || bytes[start - 1] == b'_');
+            let next_glued =
+                i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.');
+            if i - start == 3 && !prev_glued && !next_glued {
+                if let Ok(n) = text[start..i].parse::<u32>() {
+                    if (lo..=hi).contains(&n) {
+                        return true;
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Classify a turn-level failure line into `(severity, pattern_tag,
+/// heal_action, provider)`. Returns `None` for lines that are not
+/// provider/model failures — including the failure classes philote reports
+/// explicitly via `PushHealEvent` (watchdog evictions, fallback-ladder
+/// exhaustion, paracrine budget breaches), so hotel-side FailTask intake never
+/// double-reports them.
+///
+/// Tags produced (all keyed for A3 recurrence aggregation):
+/// - `provider_4xx:{provider}` — HTTP 4xx from a provider (escalate — a 400
+///   is a request/config problem; restarting the guest cannot fix it)
+/// - `provider_5xx:{provider}` — HTTP 5xx from a provider (escalate)
+/// - `provider_timeout:{provider}` — provider timed out (noop; recurrence
+///   still counts toward a work-item filing)
+/// - `provider_error:{provider}` — any other provider failure (escalate)
+/// - `model_empty_response` — model returned nothing usable (escalate)
+pub fn classify_turn_failure(line: &str) -> Option<TurnFailureClass> {
+    let lower = line.to_lowercase();
+
+    // Failure classes philote pushes explicitly (with richer tags) via
+    // PushHealEvent — skip so FailTask intake doesn't double-report them.
+    if lower.contains("all model providers failed")
+        || lower.contains("delegation chain exceeded")
+        || lower.contains("turn_watchdog_timeout")
+        || lower.contains("turn watchdog evicted")
+    {
+        return None;
+    }
+
+    let provider = marker_value(line, "provider=").filter(|p| p != "unknown");
+    let is_provider_failure = lower.contains("kind=provider_failure")
+        || lower.contains("component=model-router")
+        || lower.contains("component=model_router");
+
+    if !is_provider_failure {
+        // philote's fail_active_turn error code for "model produced no
+        // usable output" — intake even without provider markers.
+        if lower.contains("model_empty_response") {
+            return Some(TurnFailureClass {
+                severity: "medium".into(),
+                pattern_tag: "model_empty_response".into(),
+                heal_action: "escalate".into(),
+                provider,
+            });
+        }
+        return None;
+    }
+
+    // NOTE: philote's fail_active_turn stamps `[MODEL_EMPTY_RESPONSE]` on
+    // every failed turn, so inside a provider-marked line only the actual
+    // empty-response *wording* selects the model_empty_response tag.
+    let provider_label = provider.as_deref().unwrap_or("unknown");
+    let (pattern_tag, heal_action) =
+        if lower.contains("empty response") || lower.contains("empty candidate") {
+            ("model_empty_response".to_string(), "escalate")
+        } else if has_standalone_status(&lower, 400, 499) {
+            (format!("provider_4xx:{provider_label}"), "escalate")
+        } else if has_standalone_status(&lower, 500, 599) {
+            (format!("provider_5xx:{provider_label}"), "escalate")
+        } else if lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("deadline exceeded")
+        {
+            (format!("provider_timeout:{provider_label}"), "noop")
+        } else {
+            (format!("provider_error:{provider_label}"), "escalate")
+        };
+
+    Some(TurnFailureClass {
+        severity: "medium".into(),
+        pattern_tag,
+        heal_action: heal_action.into(),
+        provider,
+    })
+}
+
+/// Map a pre-assigned turn-failure `pattern_tag` (base, before any `:` suffix)
+/// to the heal action the dispatcher should take. Used for heal-queue rows
+/// that arrive pre-triaged (hotel FailTask intake, philote `PushHealEvent`).
+///
+/// `provider_4xx` deliberately maps to `escalate` (→ A3 work-item path), NOT
+/// `restart_guest` — a 400 is not fixed by restarting the guest.
+pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
+    let base = tag.split(':').next().unwrap_or(tag);
+    match base {
+        "provider_4xx"
+        | "provider_5xx"
+        | "provider_error"
+        | "model_empty_response"
+        | "stuck_turn_evicted"
+        | "fallback_exhausted"
+        | "paracrine_budget_exhausted" => "escalate",
+        "provider_timeout" => "noop",
+        _ => "noop",
+    }
+}
+
 pub trait HealQueueStorage: Send + Sync {
     fn push_error(&self, guest_id: &str, raw_text: &str) -> Result<String>;
+    /// Push an entry that is already classified (severity + pattern_tag known
+    /// at insert), with flood control: a second entry with the same
+    /// `(guest_id, pattern_tag)` within [`HEAL_FLOOD_WINDOW_SECS`] collapses
+    /// and returns `Ok(None)`.
+    ///
+    /// The default implementation falls back to [`push_error`]
+    /// (no dedup, severity/pattern dropped) so existing trait mocks keep
+    /// compiling; real stores should override it.
+    ///
+    /// [`push_error`]: HealQueueStorage::push_error
+    fn push_classified(
+        &self,
+        guest_id: &str,
+        raw_text: &str,
+        _severity: &str,
+        _pattern_tag: &str,
+    ) -> Result<Option<String>> {
+        self.push_error(guest_id, raw_text).map(Some)
+    }
     fn pending_errors(&self, limit: usize) -> Result<Vec<HealQueueRow>>;
     fn update_triage(
         &self,
@@ -120,6 +323,38 @@ impl SqliteHealQueueStorage {
         };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// [`HealQueueStorage::push_classified`] with an explicit clock, for
+    /// deterministic flood-window tests.
+    fn push_classified_at(
+        &self,
+        guest_id: &str,
+        raw_text: &str,
+        severity: &str,
+        pattern_tag: &str,
+        now: i64,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = now - HEAL_FLOOD_WINDOW_SECS as i64;
+        // Flood control: collapse into any same-(guest, tag) entry seen inside
+        // the window, regardless of its triage status.
+        let recent: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM heal_queue
+             WHERE guest_id = ?1 AND pattern_tag = ?2 AND timestamp >= ?3",
+            params![guest_id, pattern_tag, cutoff],
+            |row| row.get(0),
+        )?;
+        if recent > 0 {
+            return Ok(None);
+        }
+        let id = ulid::Ulid::new().to_string();
+        conn.execute(
+            "INSERT INTO heal_queue (id, guest_id, timestamp, raw_text, severity, pattern_tag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, guest_id, now, raw_text, severity, pattern_tag],
+        )?;
+        Ok(Some(id))
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -167,6 +402,20 @@ impl HealQueueStorage for SqliteHealQueueStorage {
             params![id, guest_id, now, raw_text],
         )?;
         Ok(id)
+    }
+
+    fn push_classified(
+        &self,
+        guest_id: &str,
+        raw_text: &str,
+        severity: &str,
+        pattern_tag: &str,
+    ) -> Result<Option<String>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.push_classified_at(guest_id, raw_text, severity, pattern_tag, now)
     }
 
     fn pending_errors(&self, limit: usize) -> Result<Vec<HealQueueRow>> {
@@ -269,6 +518,257 @@ mod tests {
         assert_eq!(capped.len(), 1);
         assert!(capped[0].len() <= MAX_HEAL_EVIDENCE_BYTES);
         assert!(capped[0].ends_with("[truncated]"));
+    }
+
+    // ── Turn-failure classifier matrix ────────────────────────────────────────
+
+    fn tag_of(line: &str) -> Option<String> {
+        classify_turn_failure(line).map(|c| c.pattern_tag)
+    }
+
+    #[test]
+    fn classify_turn_failure_provider_matrix() {
+        // 4xx with provider marker → provider_4xx:{provider}, escalate.
+        let c = classify_turn_failure(
+            "[MODEL_EMPTY_RESPONSE] Model failed: Gemini API error 400 Bad Request \
+             | kind=provider_failure | component=model-router | provider=gemini \
+             | capability=text.generate",
+        )
+        .expect("classified");
+        assert_eq!(c.pattern_tag, "provider_4xx:gemini");
+        assert_eq!(c.heal_action, "escalate", "a 400 is never fixed by restart");
+        assert_eq!(c.severity, "medium");
+        assert_eq!(c.provider.as_deref(), Some("gemini"));
+
+        // 429 rate limit is a 4xx.
+        assert_eq!(
+            tag_of("http 429 too many requests | kind=provider_failure | provider=anthropic")
+                .as_deref(),
+            Some("provider_4xx:anthropic")
+        );
+
+        // 5xx → provider_5xx.
+        assert_eq!(
+            tag_of("HTTP 503 service unavailable | kind=provider_failure | provider=gemini")
+                .as_deref(),
+            Some("provider_5xx:gemini")
+        );
+
+        // Timeout without a status code → provider_timeout, noop.
+        let c = classify_turn_failure(
+            "streaming request timed out after 120s | kind=provider_failure | provider=gemini",
+        )
+        .expect("classified");
+        assert_eq!(c.pattern_tag, "provider_timeout:gemini");
+        assert_eq!(c.heal_action, "noop");
+
+        // Other provider failure → provider_error.
+        assert_eq!(
+            tag_of("tls handshake broke | component=model-router | provider=elevenlabs").as_deref(),
+            Some("provider_error:elevenlabs")
+        );
+
+        // Missing/unknown provider marker → :unknown label, provider None.
+        let c = classify_turn_failure("something odd | kind=provider_failure").expect("classified");
+        assert_eq!(c.pattern_tag, "provider_error:unknown");
+        assert_eq!(c.provider, None);
+    }
+
+    #[test]
+    fn classify_turn_failure_model_empty_response() {
+        // Bare MODEL_EMPTY_RESPONSE (no provider markers) still classifies.
+        let c = classify_turn_failure("[MODEL_EMPTY_RESPONSE] The model returned nothing.")
+            .expect("classified");
+        assert_eq!(c.pattern_tag, "model_empty_response");
+        assert_eq!(c.heal_action, "escalate");
+
+        // Empty-response wording inside a provider failure wins over 4xx/timeout.
+        assert_eq!(
+            tag_of("provider returned empty response | kind=provider_failure | provider=gemini")
+                .as_deref(),
+            Some("model_empty_response")
+        );
+    }
+
+    #[test]
+    fn classify_turn_failure_skips_non_turn_failures_and_philote_reported_classes() {
+        // Not a provider/model failure at all.
+        assert_eq!(tag_of("[APPROVAL_CANCELLED] operator cancelled"), None);
+        assert_eq!(tag_of("connection refused"), None);
+        // Classes philote reports explicitly via PushHealEvent.
+        assert_eq!(
+            tag_of("[MODEL_EMPTY_RESPONSE] All model providers failed. Please try again later."),
+            None
+        );
+        assert_eq!(
+            tag_of("[TURN_WATCHDOG_TIMEOUT] Turn watchdog evicted stuck turn after 91s in WaitingTool."),
+            None
+        );
+        assert_eq!(
+            tag_of("[MODEL_EMPTY_RESPONSE] This delegation chain exceeded its budget of 4 hops"),
+            None
+        );
+    }
+
+    #[test]
+    fn standalone_status_detection_ignores_glued_tokens() {
+        assert!(has_standalone_status("error 400 bad request", 400, 499));
+        assert!(!has_standalone_status("evicted after 400s", 400, 499));
+        assert!(!has_standalone_status("gemini400 alerts", 400, 499));
+        assert!(!has_standalone_status("v1.400 build", 400, 499));
+        assert!(!has_standalone_status("code 4000", 400, 499));
+    }
+
+    #[test]
+    fn heal_action_for_pattern_tag_matrix() {
+        assert_eq!(
+            heal_action_for_pattern_tag("provider_4xx:gemini"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("provider_5xx:gemini"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("provider_timeout:gemini"),
+            "noop"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("provider_error:onnx"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("model_empty_response"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("stuck_turn_evicted:WaitingTool"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("fallback_exhausted:gemini"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("paracrine_budget_exhausted"),
+            "escalate"
+        );
+        assert_eq!(heal_action_for_pattern_tag("something_else"), "noop");
+    }
+
+    #[test]
+    fn cap_turn_failure_text_truncates_on_char_boundary() {
+        let short = "short line";
+        assert_eq!(cap_turn_failure_text(short), short);
+        let huge = "é".repeat(MAX_TURN_FAILURE_RAW_BYTES);
+        let capped = cap_turn_failure_text(&huge);
+        assert!(capped.len() <= MAX_TURN_FAILURE_RAW_BYTES);
+        assert!(capped.ends_with("[truncated]"));
+    }
+
+    // ── Flood control ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn push_classified_collapses_same_tag_and_guest_within_window() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        const T0: i64 = 1_750_000_000;
+
+        let first = store
+            .push_classified_at(
+                "model-controller-gemini",
+                "400 A",
+                "medium",
+                "provider_4xx:gemini",
+                T0,
+            )
+            .expect("push");
+        assert!(first.is_some(), "first entry inserts");
+
+        // Same (guest, tag) inside the window: collapsed.
+        let burst = store
+            .push_classified_at(
+                "model-controller-gemini",
+                "400 B",
+                "medium",
+                "provider_4xx:gemini",
+                T0 + 30,
+            )
+            .expect("push");
+        assert!(
+            burst.is_none(),
+            "burst inside {HEAL_FLOOD_WINDOW_SECS}s collapses"
+        );
+
+        // Different tag, same guest: inserts.
+        assert!(store
+            .push_classified_at(
+                "model-controller-gemini",
+                "t/o",
+                "medium",
+                "provider_timeout:gemini",
+                T0 + 30
+            )
+            .expect("push")
+            .is_some());
+
+        // Same tag, different guest: inserts.
+        assert!(store
+            .push_classified_at(
+                "model-controller-openai",
+                "400 C",
+                "medium",
+                "provider_4xx:openai",
+                T0 + 30
+            )
+            .expect("push")
+            .is_some());
+
+        // Same (guest, tag) after the window: inserts again.
+        assert!(store
+            .push_classified_at(
+                "model-controller-gemini",
+                "400 D",
+                "medium",
+                "provider_4xx:gemini",
+                T0 + HEAL_FLOOD_WINDOW_SECS as i64 + 1,
+            )
+            .expect("push")
+            .is_some());
+
+        // Collapse still applies after the earlier entry is triaged (status
+        // change must not reopen the window).
+        let rows = store.pending_errors(10).expect("pending");
+        let timeout_row = rows
+            .iter()
+            .find(|r| r.pattern_tag.as_deref() == Some("provider_timeout:gemini"))
+            .expect("timeout row present");
+        store
+            .update_triage(&timeout_row.id, "medium", "provider_timeout:gemini", "noop")
+            .expect("triage");
+        assert!(store
+            .push_classified_at(
+                "model-controller-gemini",
+                "t/o 2",
+                "medium",
+                "provider_timeout:gemini",
+                T0 + 59
+            )
+            .expect("push")
+            .is_none());
+    }
+
+    #[test]
+    fn push_classified_rows_surface_pre_triaged_fields() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        store
+            .push_classified("g-1", "boom 400", "medium", "provider_4xx:gemini")
+            .expect("push")
+            .expect("inserted");
+        let rows = store.pending_errors(10).expect("pending");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].severity, "medium");
+        assert_eq!(rows[0].pattern_tag.as_deref(), Some("provider_4xx:gemini"));
+        assert_eq!(rows[0].status, "pending");
     }
 
     #[test]

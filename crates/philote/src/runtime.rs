@@ -5534,6 +5534,30 @@ impl AgentRuntime {
             .await?;
         Ok(())
     }
+
+    /// Best-effort push of a turn-level failure event into the hotel's
+    /// self-heal queue (turn-failure heal intake). Used for failures only the
+    /// agent loop can see: watchdog evictions (`stuck_turn_evicted:{phase}`),
+    /// fallback-ladder exhaustion (`fallback_exhausted:{last_provider}`), and
+    /// paracrine budget breaches (`paracrine_budget_exhausted`).
+    ///
+    /// Never fails the caller — heal intake is diagnostics, not control flow.
+    /// An older hotel that does not know `PushHealEvent` answers with an
+    /// error (or drops the frame); both are swallowed here.
+    pub(crate) async fn push_heal_event(&mut self, pattern_tag: &str, detail: &str) {
+        let request = IpcRequest::PushHealEvent {
+            guest_id: self.agent_id.clone(),
+            severity: "medium".into(),
+            pattern_tag: pattern_tag.to_string(),
+            detail: detail.to_string(),
+        };
+        if let Err(e) = self.ipc_client.send_request(request).await {
+            warn!(
+                pattern_tag = %pattern_tag,
+                "heal event push failed (best-effort): {e}"
+            );
+        }
+    }
 }
 
 fn local_hotel_name() -> Option<String> {
@@ -6752,6 +6776,22 @@ mod tests {
                     }));
                     serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
                 }
+                philotic_client::IpcRequest::PushHealEvent {
+                    guest_id,
+                    severity,
+                    pattern_tag,
+                    detail,
+                } => {
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "heal_event": {
+                            "guest_id": guest_id,
+                            "severity": severity,
+                            "pattern_tag": pattern_tag,
+                            "detail": detail,
+                        },
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
                 _ => {
                     serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
                 }
@@ -6926,6 +6966,190 @@ mod tests {
         assert_eq!(reply["target_node"], "membrane-node-01");
         assert_eq!(reply["target_role"], "membrane");
         assert_eq!(reply["target_guest_id"], "membrane-seat-1");
+    }
+
+    // ── Turn-failure heal intake (self-heal) ─────────────────────────────────
+
+    /// A watchdog eviction must push a `stuck_turn_evicted:{phase}` heal
+    /// event to the hotel (turn-failure heal intake) in addition to failing
+    /// the task and unblocking the session.
+    #[tokio::test]
+    async fn watchdog_eviction_pushes_stuck_turn_heal_event() {
+        let socket_path = format!("/tmp/philote-healevict-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-heal-evict".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-heal-evict");
+
+        let session_id = "sess-heal-evict";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Seed an active turn stuck waiting on a tool.
+        let turn = def004_working_turn("turn-heal-evict", "hotel.status");
+        let signature = format!(
+            "active:{}:{:?}:{}:{}",
+            turn.turn_id, turn.phase, turn.iteration, "hotel.status"
+        );
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Backdate the watchdog bookkeeping past the WaitingTool deadline,
+        // with the matching wait signature so reconcile keeps the timestamp.
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .expect("backdate instant");
+        runtime
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), past);
+        runtime
+            .stuck_turn_signature
+            .insert(session_id.to_string(), signature);
+
+        runtime.evict_timed_out_turns().await;
+
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "eviction must clear the active turn"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| !e["heal_event"].is_null())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "exactly one heal event must be pushed: {:#?}",
+            *emitted
+        );
+        let heal = &heal_events[0]["heal_event"];
+        assert_eq!(heal["guest_id"], "agent-heal-evict");
+        assert_eq!(heal["severity"], "medium");
+        assert_eq!(heal["pattern_tag"], "stuck_turn_evicted:WaitingTool");
+        assert!(
+            heal["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("watchdog evicted stuck turn"),
+            "detail must carry the eviction reason: {heal:#?}"
+        );
+
+        // The unblock notice still reaches the user.
+        assert!(
+            emitted.iter().any(|e| e["task"]["action"] == "send_reply"),
+            "eviction must still emit the unblock send_reply: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Fallback-ladder + oracle exhaustion must push a
+    /// `fallback_exhausted:{last_provider}` heal event before failing the turn.
+    #[tokio::test]
+    async fn fallback_exhaustion_pushes_heal_event() {
+        let socket_path = format!("/tmp/philote-healfb-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-heal-fb".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-heal-fb");
+
+        let session_id = "sess-heal-fb";
+        let turn_id = "turn-heal-fb";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Seed a WaitingModel turn already past every static tier AND past
+        // the oracle extra-tier budget, so exhaustion is immediate (no
+        // QueryModelRoute round trip).
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.turn_id = turn_id.into();
+        turn.fallback_tier = u8::MAX - 1;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::ProviderFailure,
+                Some("gemini".into()),
+            )
+            .await
+            .expect("advance");
+
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "exhaustion must fail (clear) the active turn"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| !e["heal_event"].is_null())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "exactly one heal event must be pushed: {:#?}",
+            *emitted
+        );
+        let heal = &heal_events[0]["heal_event"];
+        assert_eq!(heal["pattern_tag"], "fallback_exhausted:gemini");
+        assert_eq!(heal["severity"], "medium");
+        assert!(
+            heal["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("All model providers failed"),
+            "detail must describe the exhaustion: {heal:#?}"
+        );
     }
 
     /// Wiring guard: a role whose `TurnLoopConfig` carries paracrine-budget

@@ -341,6 +341,12 @@ impl AgentRuntime {
                 warn!("Turn watchdog: failed to mark task failed: {}", e);
             }
 
+            // Turn-failure heal intake: watchdog evictions flow into the
+            // self-heal queue so recurring stuck turns surface as A3 work
+            // items instead of only being discovered by the operator.
+            self.push_heal_event(&format!("stuck_turn_evicted:{phase}"), &reason)
+                .await;
+
             // Notify the user that the session is unblocked.
             let notify_req = IpcRequest::EmitTask {
                 target_node: reply_to,
@@ -1714,6 +1720,18 @@ impl AgentRuntime {
         if oracle_role.is_none()
             && decide_no_response_action(class, tiers_remaining) == NoResponseAction::EvictTurn
         {
+            // Turn-failure heal intake: ladder + oracle exhaustion flows into
+            // the self-heal queue so recurring provider outages surface as A3
+            // work items instead of only being discovered by the operator.
+            let last_provider = failed_provider.as_deref().unwrap_or("unknown");
+            self.push_heal_event(
+                &format!("fallback_exhausted:{last_provider}"),
+                &format!(
+                    "All model providers failed for session {session_id} turn {turn_id} \
+                     (tier {current_tier}/{max_tier}, class {class:?}, last provider {last_provider})."
+                ),
+            )
+            .await;
             return self
                 .fail_active_turn(
                     session_id,

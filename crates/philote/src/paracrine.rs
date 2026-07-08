@@ -515,6 +515,11 @@ impl AgentRuntime {
                             paracrine_id = %pid,
                             "paracrine delegation chain exceeded its budget; failing turn"
                         );
+                        // Turn-failure heal intake: budget breaches flow into
+                        // the self-heal queue so recurring delegation loops
+                        // surface as A3 work items.
+                        self.push_heal_event("paracrine_budget_exhausted", &notice)
+                            .await;
                         return self.fail_active_turn(sid.clone(), turn_id, notice).await;
                     }
 
