@@ -22,10 +22,11 @@ SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=
 remote_file_exists() {
   local path="$1" attempt rc
   for attempt in 1 2; do
-    if ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "test -f '${path}'"; then
+    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "test -f '${path}'"
+    rc=$?
+    if [[ ${rc} -eq 0 ]]; then
       return 0
     fi
-    rc=$?
     if [[ ${rc} -eq 1 ]]; then
       return 1  # connection fine, file genuinely absent
     fi
