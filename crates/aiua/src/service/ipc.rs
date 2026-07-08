@@ -54,7 +54,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub(super) const OPERATOR_SURFACE_QUERY_TIMEOUT_SECS: u64 = 5;
@@ -7774,6 +7774,30 @@ impl IpcServer {
                 ),
             },
 
+            IpcRequest::FileHealWorkItem {
+                pattern_tag,
+                guest_id,
+                occurrence_count,
+                window_secs,
+                evidence_lines,
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Self::handle_file_heal_work_item(
+                    graph,
+                    heal_queue.as_deref(),
+                    &pattern_tag,
+                    &guest_id,
+                    occurrence_count,
+                    window_secs,
+                    &evidence_lines,
+                    now,
+                    &|key| std::env::var(key).ok(),
+                )
+            }
+
             IpcRequest::AgentMigrateToHotel {
                 agent_id,
                 dest_hotel,
@@ -7813,6 +7837,186 @@ impl IpcServer {
                 }
             }
         }
+    }
+
+    /// Handle [`IpcRequest::FileHealWorkItem`] — Autopoiesis Slice A3, lane
+    /// `fleet.heal_slices` (ProposalOnly posture: filing IS the action).
+    ///
+    /// Pipeline: lane kill switch → open-item dedup (bump count/last_seen) →
+    /// grant budget (`try_consume_daily_action`) → write `autonomy_audit` +
+    /// `heal_work_item` nodes → resolved `work_item_filed` heal-queue info
+    /// entry for operator visibility.
+    ///
+    /// Clock (`now`) and env reader are injected so tests run without
+    /// wall-clock time or process environment.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_file_heal_work_item(
+        graph: &GraphDomain,
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        pattern_tag: &str,
+        guest_id: &str,
+        occurrence_count: u32,
+        window_secs: u64,
+        evidence_lines: &[String],
+        now: u64,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> IpcResponse {
+        use ansible_mesh_core::autonomy::{
+            AutonomyAuditRecord, AutonomyLane, LANE_FLEET_HEAL_SLICES, lane_enabled,
+            try_consume_daily_action,
+        };
+        use ansible_mesh_core::heal_queue::{
+            HEAL_WORK_ITEM_STATUS_OPEN, HealWorkItemRecord, cap_evidence_lines,
+        };
+
+        const CORR: &str = "file_heal_work_item";
+        let lane = AutonomyLane::new(LANE_FLEET_HEAL_SLICES);
+
+        // 1. Kill switch overrides everything, always (Autonomy Contract rule 3).
+        if !lane_enabled(&lane, env) {
+            debug!(
+                pattern_tag,
+                guest_id, "heal work item filing skipped: lane kill switch set"
+            );
+            return IpcResponse::success(
+                CORR,
+                Some(serde_json::json!({
+                    "filed": false, "deduped": false, "reason": "lane_disabled"
+                })),
+            );
+        }
+
+        // 2. Dedup: one OPEN work item per (pattern_tag, guest_id). A re-breach
+        // while open bumps count + last_seen — no budget consumed, no new audit.
+        match graph.find_open_heal_work_item(pattern_tag, guest_id) {
+            Ok(Some(mut item)) => {
+                item.count = item.count.saturating_add(occurrence_count);
+                item.last_seen = now;
+                if let Err(e) = graph.upsert_heal_work_item(&item) {
+                    return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
+                }
+                info!(
+                    pattern_tag,
+                    guest_id,
+                    work_item_id = %item.work_item_id,
+                    count = item.count,
+                    "heal work item re-breach: bumped open item"
+                );
+                return IpcResponse::success(
+                    CORR,
+                    Some(serde_json::json!({
+                        "filed": false, "deduped": true,
+                        "work_item_id": item.work_item_id,
+                    })),
+                );
+            }
+            Ok(None) => {}
+            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
+        }
+
+        // 3. Grant + budget: frozen lanes and exhausted daily budgets refuse.
+        let mut grant = match graph.get_or_create_autonomy_grant(LANE_FLEET_HEAL_SLICES, now) {
+            Ok(grant) => grant,
+            Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
+        };
+        if !try_consume_daily_action(&mut grant, now) {
+            let reason = if grant.frozen_until_operator_review {
+                "lane_frozen"
+            } else {
+                "daily_budget_exhausted"
+            };
+            debug!(
+                pattern_tag,
+                guest_id, reason, "heal work item filing refused by autonomy grant"
+            );
+            return IpcResponse::success(
+                CORR,
+                Some(serde_json::json!({
+                    "filed": false, "deduped": false, "reason": reason
+                })),
+            );
+        }
+        if let Err(e) = graph.upsert_autonomy_grant(&grant) {
+            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
+        }
+
+        // 4. File: audit record first (the ledger), then the work item node.
+        let evidence = cap_evidence_lines(evidence_lines);
+        let work_item_id = Uuid::new_v4().to_string();
+        let audit_id = format!("heal_filing:{work_item_id}");
+        let audit = AutonomyAuditRecord::new(
+            audit_id.clone(),
+            lane,
+            format!(
+                "filed heal work item {work_item_id}: pattern '{pattern_tag}' on guest \
+                 '{guest_id}' recurred {occurrence_count}x within {window_secs}s"
+            ),
+            &evidence.join("\n"),
+            "close the work item (GraphDomain::close_heal_work_item)",
+            grant.posture,
+            now,
+        );
+        if let Err(e) = graph.record_autonomy_audit(&audit) {
+            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
+        }
+        let item = HealWorkItemRecord {
+            work_item_id: work_item_id.clone(),
+            pattern_tag: pattern_tag.to_string(),
+            guest_id: guest_id.to_string(),
+            count: occurrence_count,
+            window_secs,
+            evidence,
+            status: HEAL_WORK_ITEM_STATUS_OPEN.to_string(),
+            filed_by: "heal-dispatcher".to_string(),
+            audit_id: Some(audit_id.clone()),
+            created_at: now,
+            last_seen: now,
+        };
+        if let Err(e) = graph.upsert_heal_work_item(&item) {
+            return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
+        }
+
+        // 5. Operator visibility: one resolved info entry in the heal queue so
+        // the filing surfaces in existing monitoring. Best-effort — the graph
+        // nodes above are the durable record.
+        if let Some(hq) = heal_queue {
+            match hq.push_error(
+                guest_id,
+                &format!(
+                    "work_item_filed: recurring pattern '{pattern_tag}' on {guest_id} \
+                     ({occurrence_count}x/{window_secs}s) -> heal_work_item {work_item_id}"
+                ),
+            ) {
+                Ok(entry_id) => {
+                    if let Err(e) =
+                        hq.update_triage(&entry_id, "info", pattern_tag, "work_item_filed")
+                    {
+                        warn!("heal work item info entry triage failed: {e:#}");
+                    }
+                    if let Err(e) = hq.resolve(&entry_id, "work_item_filed") {
+                        warn!("heal work item info entry resolve failed: {e:#}");
+                    }
+                }
+                Err(e) => warn!("heal work item info entry push failed: {e:#}"),
+            }
+        }
+
+        info!(
+            pattern_tag,
+            guest_id,
+            work_item_id = %work_item_id,
+            occurrence_count,
+            window_secs,
+            "heal work item filed via fleet.heal_slices lane"
+        );
+        IpcResponse::success(
+            CORR,
+            Some(serde_json::json!({
+                "filed": true, "deduped": false,
+                "work_item_id": work_item_id,
+                "audit_id": audit_id,
+            })),
+        )
     }
 
     /// Broadcast a `CronJobSync` upsert envelope for a job definition change.
@@ -11614,6 +11818,193 @@ pub(crate) mod tests {
     fn register_skill_test_graph() -> GraphDomain {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         GraphDomain::new(Arc::new(graph_store.adapter()))
+    }
+
+    // ── FileHealWorkItem handler (Autopoiesis Slice A3) ───────────────────────
+
+    mod file_heal_work_item {
+        use super::*;
+        use ansible_mesh_core::autonomy::LANE_FLEET_HEAL_SLICES;
+        use ansible_mesh_core::heal_queue::{
+            HEAL_WORK_ITEM_STATUS_OPEN, HealQueueStorage, MAX_HEAL_EVIDENCE_BYTES,
+            MAX_HEAL_EVIDENCE_LINES, SqliteHealQueueStorage,
+        };
+
+        const T0: u64 = 1_750_000_000;
+        const NO_ENV: &dyn Fn(&str) -> Option<String> = &|_| None;
+
+        fn graph() -> GraphDomain {
+            register_skill_test_graph()
+        }
+
+        fn call(
+            graph: &GraphDomain,
+            hq: Option<&dyn HealQueueStorage>,
+            now: u64,
+            env: &dyn Fn(&str) -> Option<String>,
+        ) -> serde_json::Value {
+            let resp = IpcServer::handle_file_heal_work_item(
+                graph,
+                hq,
+                "connection_refused",
+                "membrane-telegram-01",
+                5,
+                1800,
+                &vec!["connection refused".to_string(); 5],
+                now,
+                env,
+            );
+            match resp {
+                IpcResponse::Standard {
+                    ok: true,
+                    data: Some(data),
+                    ..
+                } => data,
+                other => panic!("expected ok Standard with data, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn breach_files_exactly_once_while_open_then_dedups() {
+            let graph = graph();
+            let hq = SqliteHealQueueStorage::open(":memory:").expect("heal queue");
+
+            // First breach files the work item, the audit record, and the
+            // resolved work_item_filed info entry.
+            let data = call(&graph, Some(&hq), T0, NO_ENV);
+            assert_eq!(data["filed"], true);
+            assert_eq!(data["deduped"], false);
+            let work_item_id = data["work_item_id"].as_str().expect("id").to_string();
+            let audit_id = data["audit_id"].as_str().expect("audit id").to_string();
+
+            let items = graph.list_heal_work_items().expect("list");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].status, HEAL_WORK_ITEM_STATUS_OPEN);
+            assert_eq!(items[0].count, 5);
+            assert_eq!(items[0].filed_by, "heal-dispatcher");
+            assert_eq!(items[0].audit_id.as_deref(), Some(audit_id.as_str()));
+            let audit = graph
+                .get_autonomy_audit(&audit_id)
+                .expect("get audit")
+                .expect("audit exists");
+            assert_eq!(audit.lane.as_str(), LANE_FLEET_HEAL_SLICES);
+            assert!(audit.reversal_hint.contains("close the work item"));
+            // Budget consumed exactly once.
+            let grant = graph
+                .get_autonomy_grant(LANE_FLEET_HEAL_SLICES)
+                .expect("grant")
+                .expect("grant exists");
+            assert_eq!(grant.actions_today, 1);
+            // The info entry is triaged+resolved — never left pending, so the
+            // dispatcher will not re-classify it.
+            assert!(hq.pending_errors(10).expect("pending").is_empty());
+
+            // Second breach while open: bump, no second item, no budget spend.
+            let data = call(&graph, Some(&hq), T0 + 60, NO_ENV);
+            assert_eq!(data["filed"], false);
+            assert_eq!(data["deduped"], true);
+            assert_eq!(data["work_item_id"], work_item_id.as_str());
+            let items = graph.list_heal_work_items().expect("list");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].count, 10, "re-breach bumps count");
+            assert_eq!(items[0].last_seen, T0 + 60, "re-breach bumps last_seen");
+            let grant = graph
+                .get_autonomy_grant(LANE_FLEET_HEAL_SLICES)
+                .expect("grant")
+                .expect("grant exists");
+            assert_eq!(grant.actions_today, 1, "dedup must not consume budget");
+
+            // After operator closure the dedup slot frees and a new breach
+            // files a fresh work item.
+            assert!(
+                graph
+                    .close_heal_work_item(&work_item_id, T0 + 120)
+                    .expect("close")
+            );
+            let data = call(&graph, Some(&hq), T0 + 180, NO_ENV);
+            assert_eq!(data["filed"], true);
+            assert_eq!(graph.list_heal_work_items().expect("list").len(), 2);
+        }
+
+        #[test]
+        fn frozen_grant_refuses_filing_with_no_side_effects() {
+            let graph = graph();
+            let mut grant = graph
+                .get_or_create_autonomy_grant(LANE_FLEET_HEAL_SLICES, T0)
+                .expect("grant");
+            grant.frozen_until_operator_review = true;
+            graph.upsert_autonomy_grant(&grant).expect("upsert grant");
+
+            let data = call(&graph, None, T0 + 1, NO_ENV);
+            assert_eq!(data["filed"], false);
+            assert_eq!(data["reason"], "lane_frozen");
+            assert!(graph.list_heal_work_items().expect("list").is_empty());
+        }
+
+        #[test]
+        fn exhausted_daily_budget_refuses_filing() {
+            let graph = graph();
+            let mut grant = graph
+                .get_or_create_autonomy_grant(LANE_FLEET_HEAL_SLICES, T0)
+                .expect("grant");
+            grant.budget.max_actions_per_day = 0;
+            graph.upsert_autonomy_grant(&grant).expect("upsert grant");
+
+            let data = call(&graph, None, T0 + 1, NO_ENV);
+            assert_eq!(data["filed"], false);
+            assert_eq!(data["reason"], "daily_budget_exhausted");
+            assert!(graph.list_heal_work_items().expect("list").is_empty());
+        }
+
+        #[test]
+        fn kill_switch_disables_lane_entirely() {
+            let graph = graph();
+            let env = |key: &str| {
+                (key == "PHILOTIC_AUTONOMY_DISABLE_FLEET_HEAL_SLICES").then(|| "1".to_string())
+            };
+            let data = call(&graph, None, T0, &env);
+            assert_eq!(data["filed"], false);
+            assert_eq!(data["reason"], "lane_disabled");
+            assert!(graph.list_heal_work_items().expect("list").is_empty());
+            // Kill switch short-circuits before the grant is even created.
+            assert!(
+                graph
+                    .get_autonomy_grant(LANE_FLEET_HEAL_SLICES)
+                    .expect("grant lookup")
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn evidence_is_capped_on_the_stored_work_item() {
+            let graph = graph();
+            let lines: Vec<String> = (0..40).map(|i| format!("{i:0>300}")).collect();
+            let resp = IpcServer::handle_file_heal_work_item(
+                &graph,
+                None,
+                "panic",
+                "philote-01",
+                40,
+                900,
+                &lines,
+                T0,
+                NO_ENV,
+            );
+            let IpcResponse::Standard { ok: true, .. } = resp else {
+                panic!("expected ok Standard, got {resp:?}");
+            };
+            let items = graph.list_heal_work_items().expect("list");
+            assert_eq!(items.len(), 1);
+            assert!(items[0].evidence.len() <= MAX_HEAL_EVIDENCE_LINES);
+            assert!(
+                items[0].evidence.iter().map(|l| l.len()).sum::<usize>() <= MAX_HEAL_EVIDENCE_BYTES
+            );
+            // Newest lines survive the cap.
+            assert_eq!(
+                items[0].evidence.last().expect("last line"),
+                &format!("{:0>300}", 39)
+            );
+        }
     }
 
     fn expect_register_error(response: IpcResponse) -> (String, String) {

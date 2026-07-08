@@ -42,3 +42,7 @@ pub const NODE_KIND_MODEL_PROFILE: &str = "model_profile";
 pub const NODE_KIND_AUTONOMY_GRANT: &str = "autonomy_grant";
 /// Append-only decision record for autonomous actions (what/why/evidence/undo).
 pub const NODE_KIND_AUTONOMY_AUDIT: &str = "autonomy_audit";
+
+// Autopoiesis Slice A3 (doc:AUTOPOIESIS_PROPOSAL)
+/// Fix request filed by the heal-dispatcher for a recurring failure pattern.
+pub const NODE_KIND_HEAL_WORK_ITEM: &str = "heal_work_item";

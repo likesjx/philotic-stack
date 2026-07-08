@@ -24,6 +24,9 @@ use crate::graph::{
     RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, SkillRegistrationAuditRecord,
     ToolsetProfileRecord, WorkflowSkillRecord,
 };
+use crate::heal_queue::{
+    HealWorkItemRecord, HEAL_WORK_ITEM_STATUS_CLOSED, HEAL_WORK_ITEM_STATUS_OPEN,
+};
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
     ProjectedUserIdentityRecord, SecretRecord, SessionEventRecord, SessionParticipantRecord,
@@ -1805,6 +1808,80 @@ impl GraphDomain {
         self.record_autonomy_audit(&record)?;
         Ok(true)
     }
+
+    // ── Heal work items (Autopoiesis Slice A3) ────────────────────────────────
+
+    fn heal_work_item_key(work_item_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_HEAL_WORK_ITEM, work_item_id)
+    }
+
+    /// Upsert a heal work item as a graph node.
+    pub fn upsert_heal_work_item(&self, item: &HealWorkItemRecord) -> Result<()> {
+        let data = serde_json::to_value(item)
+            .context("GraphDomain::upsert_heal_work_item: serialize HealWorkItemRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::heal_work_item_key(&item.work_item_id),
+            kind: NODE_KIND_HEAL_WORK_ITEM.to_string(),
+            label: Some(format!("{}@{}", item.pattern_tag, item.guest_id)),
+            data,
+        })
+    }
+
+    /// Load one heal work item by id.
+    pub fn get_heal_work_item(&self, work_item_id: &str) -> Result<Option<HealWorkItemRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::heal_work_item_key(work_item_id))?
+        {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_heal_work_item: deserialize HealWorkItemRecord",
+            )?)),
+        }
+    }
+
+    /// List all heal work items, oldest first.
+    pub fn list_heal_work_items(&self) -> Result<Vec<HealWorkItemRecord>> {
+        let mut out: Vec<HealWorkItemRecord> = self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_HEAL_WORK_ITEM)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_heal_work_items: deserialize HealWorkItemRecord")
+            })
+            .collect::<Result<_>>()?;
+        out.sort_by_key(|item| item.created_at);
+        Ok(out)
+    }
+
+    /// Find the OPEN heal work item for `(pattern_tag, guest_id)`, if any.
+    ///
+    /// This is the dedup lookup: the filing path bumps the open item instead
+    /// of creating a second one for the same recurring pattern.
+    pub fn find_open_heal_work_item(
+        &self,
+        pattern_tag: &str,
+        guest_id: &str,
+    ) -> Result<Option<HealWorkItemRecord>> {
+        Ok(self.list_heal_work_items()?.into_iter().find(|item| {
+            item.status == HEAL_WORK_ITEM_STATUS_OPEN
+                && item.pattern_tag == pattern_tag
+                && item.guest_id == guest_id
+        }))
+    }
+
+    /// Close a heal work item (the reversal path named in the filing's audit
+    /// record). Returns `false` when the item does not exist.
+    pub fn close_heal_work_item(&self, work_item_id: &str, now: u64) -> Result<bool> {
+        let Some(mut item) = self.get_heal_work_item(work_item_id)? else {
+            return Ok(false);
+        };
+        item.status = HEAL_WORK_ITEM_STATUS_CLOSED.to_string();
+        item.last_seen = now;
+        self.upsert_heal_work_item(&item)?;
+        Ok(true)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2987,5 +3064,89 @@ mod tests {
     fn get_user_task_returns_none_when_absent() {
         let d = make_domain();
         assert!(d.get_user_task("nonexistent").unwrap().is_none());
+    }
+
+    fn work_item(id: &str, pattern: &str, guest: &str, status: &str) -> HealWorkItemRecord {
+        HealWorkItemRecord {
+            work_item_id: id.to_string(),
+            pattern_tag: pattern.to_string(),
+            guest_id: guest.to_string(),
+            count: 5,
+            window_secs: 1800,
+            evidence: vec!["connection refused".to_string()],
+            status: status.to_string(),
+            filed_by: "heal-dispatcher".to_string(),
+            audit_id: Some(format!("heal_filing:{id}")),
+            created_at: 1_000,
+            last_seen: 1_000,
+        }
+    }
+
+    #[test]
+    fn heal_work_item_round_trip_and_open_lookup() {
+        let d = make_domain();
+        assert!(d.get_heal_work_item("wi-1").expect("get").is_none());
+        assert!(d
+            .find_open_heal_work_item("connection_refused", "membrane-01")
+            .expect("find")
+            .is_none());
+
+        d.upsert_heal_work_item(&work_item(
+            "wi-1",
+            "connection_refused",
+            "membrane-01",
+            HEAL_WORK_ITEM_STATUS_OPEN,
+        ))
+        .expect("upsert");
+        // Closed items and different keys never match the open lookup.
+        d.upsert_heal_work_item(&work_item(
+            "wi-2",
+            "connection_refused",
+            "membrane-01",
+            HEAL_WORK_ITEM_STATUS_CLOSED,
+        ))
+        .expect("upsert closed");
+        d.upsert_heal_work_item(&work_item(
+            "wi-3",
+            "panic",
+            "membrane-01",
+            HEAL_WORK_ITEM_STATUS_OPEN,
+        ))
+        .expect("upsert other pattern");
+
+        let found = d
+            .find_open_heal_work_item("connection_refused", "membrane-01")
+            .expect("find")
+            .expect("open item");
+        assert_eq!(found.work_item_id, "wi-1");
+        assert!(d
+            .find_open_heal_work_item("connection_refused", "other-guest")
+            .expect("find")
+            .is_none());
+        assert_eq!(d.list_heal_work_items().expect("list").len(), 3);
+    }
+
+    #[test]
+    fn close_heal_work_item_flips_status_and_frees_dedup_slot() {
+        let d = make_domain();
+        d.upsert_heal_work_item(&work_item(
+            "wi-1",
+            "oom",
+            "philote-01",
+            HEAL_WORK_ITEM_STATUS_OPEN,
+        ))
+        .expect("upsert");
+
+        assert!(d.close_heal_work_item("wi-1", 2_000).expect("close"));
+        let item = d.get_heal_work_item("wi-1").expect("get").expect("present");
+        assert_eq!(item.status, HEAL_WORK_ITEM_STATUS_CLOSED);
+        assert_eq!(item.last_seen, 2_000);
+        // Dedup slot is free again after closure.
+        assert!(d
+            .find_open_heal_work_item("oom", "philote-01")
+            .expect("find")
+            .is_none());
+        // Closing a missing item reports false.
+        assert!(!d.close_heal_work_item("missing", 2_001).expect("close"));
     }
 }
