@@ -3115,6 +3115,65 @@ mod tests {
         assert_eq!(spoken.as_deref(), Some("Hello"));
     }
 
+    /// Invariant: a Gemini request payload must NEVER combine controlled
+    /// generation (generationConfig.responseMimeType / responseSchema) with
+    /// function calling (tools.functionDeclarations / toolConfig). Gemini
+    /// rejects the combination with an empty-detail 400 INVALID_ARGUMENT —
+    /// this is what killed every live tool-bearing turn (2026-07-08).
+    fn assert_no_controlled_generation_with_tools(payload: &serde_json::Value, label: &str) {
+        let has_tools = payload.get("tools").is_some() || payload.get("toolConfig").is_some();
+        if !has_tools {
+            return;
+        }
+        let Some(config) = payload
+            .get("generationConfig")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return;
+        };
+        assert!(
+            !config.contains_key("responseSchema"),
+            "[{label}] combines tools with generationConfig.responseSchema — Gemini 400s this"
+        );
+        assert!(
+            !config.contains_key("responseMimeType"),
+            "[{label}] combines tools with generationConfig.responseMimeType — Gemini 400s this"
+        );
+    }
+
+    #[test]
+    fn gemini_payloads_never_combine_controlled_generation_with_tools() {
+        for wants_concept in [false, true] {
+            for wants_plan in [false, true] {
+                let tool_aware = GeminiProvider::tool_aware_request_payload(
+                    "hello",
+                    &[sample_echo_tool()],
+                    wants_concept,
+                    wants_plan,
+                );
+                assert_no_controlled_generation_with_tools(
+                    &tool_aware,
+                    &format!("tool_aware(concept={wants_concept},plan={wants_plan})"),
+                );
+
+                // Tool-less payload shapes hold the invariant vacuously —
+                // asserted anyway so any future addition of tools to these
+                // builders trips the guard immediately.
+                let structured = GeminiProvider::structured_text_request_payload(
+                    "hello",
+                    wants_concept,
+                    wants_plan,
+                );
+                assert_no_controlled_generation_with_tools(
+                    &structured,
+                    &format!("structured_text(concept={wants_concept},plan={wants_plan})"),
+                );
+            }
+        }
+        let basic = GeminiProvider::request_payload("hello");
+        assert_no_controlled_generation_with_tools(&basic, "request_payload");
+    }
+
     /// Recursively assert a function-declaration parameter schema only uses
     /// keywords Gemini accepts, and that `required` names declared properties.
     fn assert_gemini_valid_schema(schema: &serde_json::Value, path: &str) {
