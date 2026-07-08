@@ -21,7 +21,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Seconds without a byte chunk from the SSE stream before we abort and escalate.
 const STREAMING_IDLE_SECS: u64 = 8;
@@ -695,64 +695,33 @@ impl GeminiProvider {
         };
 
         let plan_instruction = if wants_plan {
-            " When starting a multi-step task, describe your plan briefly in natural language before or after tool use when helpful."
+            " When working a multi-step task, also include \"active_plan\" in that JSON object: \
+             {\"goal\": string, \"status\": string, \"steps\": [{\"id\": integer, \"description\": string, \
+             \"tool_name\": string, \"status\": string}]}. Omit active_plan for single-step exchanges."
         } else {
             ""
         };
 
+        // IMPORTANT: this payload must NEVER combine controlled generation
+        // (generationConfig.responseMimeType/responseSchema) with
+        // tools.functionDeclarations. Gemini documents the two features as
+        // mutually exclusive, and combining them is exactly what 400'd every
+        // tool-bearing turn live (tool-less turns on the same model — which
+        // send responseSchema without tools — succeeded). Function-calling
+        // mode wins: tools stay native, and the structured-output contract
+        // moves into the system instruction. Downstream parsing already
+        // tolerates plain-JSON-in-text via parse_structured_response /
+        // parse_tool_call_candidate fallbacks.
         let system_text = format!(
             "You are an agent with tools. When a tool is needed, call one of the declared functions \
              instead of writing a JSON tool_call object by hand. Use function parameters exactly as \
-             declared and include every required field.{}{}\n\
-             When no tool is needed, output a JSON object with \"display_text\" (your reply, markdown fine) \
-             and \"spoken_text\" (conversational version for voice, no markdown).\n\n\
+             declared and include every required field.\n\
+             When no tool is needed, reply with ONLY a raw JSON object — no markdown code fences, \
+             no text outside the JSON — containing \"display_text\" (your reply, markdown fine) \
+             and \"spoken_text\" (conversational version for voice, no markdown).{}{}\n\n\
              Available tools:\n{}",
             memory_instruction, plan_instruction, tool_list,
         );
-
-        let mut properties = json!({
-            "display_text": { "type": "STRING" },
-            "spoken_text": { "type": "STRING" }
-        });
-        let required = vec!["display_text", "spoken_text"];
-
-        if wants_concept {
-            properties["memory_candidate"] = json!({
-                "type": "OBJECT",
-                "nullable": true,
-                "properties": {
-                    "concept": { "type": "STRING" },
-                    "content": { "type": "STRING" },
-                    "tags": {
-                        "type": "ARRAY",
-                        "items": { "type": "STRING" }
-                    }
-                },
-                "required": ["concept", "content"]
-            });
-            // Not pushed to required — model omits it when there's nothing worth saving.
-        }
-        if wants_plan {
-            properties["active_plan"] = json!({
-                "type": "OBJECT",
-                "properties": {
-                    "goal": { "type": "STRING" },
-                    "status": { "type": "STRING" },
-                    "steps": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "id": { "type": "INTEGER" },
-                                "description": { "type": "STRING" },
-                                "tool_name": { "type": "STRING" },
-                                "status": { "type": "STRING" }
-                            }
-                        }
-                    }
-                }
-            });
-        }
 
         json!({
             "system_instruction": {
@@ -760,12 +729,6 @@ impl GeminiProvider {
             },
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": {
-                    "type": "OBJECT",
-                    "properties": properties,
-                    "required": required
-                },
                 "thinkingConfig": { "thinkingBudget": gemini_thinking_budget() }
             },
             "tools": [
@@ -864,6 +827,23 @@ impl GeminiProvider {
         })
     }
 
+    /// Strip a surrounding markdown code fence (```json ... ``` or ``` ... ```)
+    /// from a model reply. Tool-bearing turns no longer use controlled
+    /// generation (responseSchema), so the JSON contract is enforced only by
+    /// the system instruction — models occasionally fence the object anyway.
+    fn strip_json_code_fences(raw: &str) -> &str {
+        let trimmed = raw.trim();
+        let Some(rest) = trimmed.strip_prefix("```") else {
+            return trimmed;
+        };
+        // Drop an optional language tag (e.g. `json`) up to the first newline.
+        let body = match rest.find('\n') {
+            Some(idx) => &rest[idx + 1..],
+            None => rest,
+        };
+        body.trim_end().strip_suffix("```").unwrap_or(body).trim()
+    }
+
     /// Parse a structured JSON response from Gemini.
     /// Returns `(display_text, spoken_text, memory_concept, memory_candidate, active_plan)`.
     fn parse_structured_response(
@@ -877,7 +857,9 @@ impl GeminiProvider {
         Option<Value>,
     ) {
         let raw = Self::parse_response_text(status, body);
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+        if let Ok(parsed) =
+            serde_json::from_str::<serde_json::Value>(Self::strip_json_code_fences(&raw))
+        {
             let display = parsed
                 .get("display_text")
                 .and_then(Value::as_str)
@@ -1015,6 +997,40 @@ impl GeminiProvider {
             rendered.push_str(&format!(" details={details_text}"));
         }
         rendered
+    }
+
+    /// Cap (in bytes) on the request-payload dump attached to HTTP-failure
+    /// evidence logs. Payloads carry no secrets (auth rides headers/query),
+    /// so nothing is redacted — only truncated for log hygiene.
+    const HTTP_FAILURE_PAYLOAD_LOG_CAP: usize = 16 * 1024;
+
+    /// Definitive-evidence log for any non-2xx Gemini response.
+    ///
+    /// Emitted unconditionally at ERROR level from both `invoke` and
+    /// `invoke_streaming` so a live 400 can never again escape with only
+    /// "Request contains an invalid argument.": the FULL error body (no
+    /// detail cap, unlike `api_error_detail`'s 600-char user-facing render)
+    /// plus the exact request payload (capped at 16KB) land in the log.
+    fn log_http_failure(site: &str, status: reqwest::StatusCode, body: &Value, payload: &Value) {
+        let body_text = body.to_string();
+        let mut payload_text = serde_json::to_string(payload)
+            .unwrap_or_else(|err| format!("<payload serialization failed: {err}>"));
+        let payload_bytes = payload_text.len();
+        if payload_text.len() > Self::HTTP_FAILURE_PAYLOAD_LOG_CAP {
+            let mut cut = Self::HTTP_FAILURE_PAYLOAD_LOG_CAP;
+            while !payload_text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            payload_text.truncate(cut);
+            payload_text.push_str("…<truncated>");
+        }
+        error!(
+            "gemini {site} HTTP {} — full error body: {} — request payload ({}B): {}",
+            status.as_u16(),
+            body_text,
+            payload_bytes,
+            payload_text,
+        );
     }
 
     fn parse_response_text(status: reqwest::StatusCode, body: Value) -> String {
@@ -1775,6 +1791,7 @@ impl ModelProvider for GeminiProvider {
         let body = response.json::<Value>().await?;
 
         if !status.is_success() {
+            Self::log_http_failure("invoke", status, &body, &payload);
             bail!(
                 "Gemini API error ({}): {}",
                 status.as_u16(),
@@ -1792,7 +1809,9 @@ impl ModelProvider for GeminiProvider {
             let (content, spoken_text, memory_concept, memory_candidate, active_plan) =
                 Self::parse_structured_response(status, body.clone());
 
-            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+            if let Ok(parsed) =
+                serde_json::from_str::<Value>(Self::strip_json_code_fences(&content))
+            {
                 if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
                     return Ok(tool_call);
                 }
@@ -1871,6 +1890,30 @@ impl ModelProvider for GeminiProvider {
             }
         };
 
+        if Self::debug_model_requests_enabled() {
+            let prompt = task
+                .composed_prompt_text()
+                .unwrap_or_else(|| "<missing prompt>".into());
+            info!(
+                "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming composed prompt provider={} model={:?}:\n{}",
+                ModelProvider::id(self),
+                task.model,
+                prompt
+            );
+            match serde_json::to_string_pretty(&payload) {
+                Ok(json) => info!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming provider payload provider={} model={:?}:\n{}",
+                    ModelProvider::id(self),
+                    task.model,
+                    json
+                ),
+                Err(err) => info!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming payload serialization failed: {}",
+                    err
+                ),
+            }
+        }
+
         let payload_bytes = serde_json::to_vec(&payload).map(|v| v.len()).unwrap_or(0);
         let url = self.streaming_endpoint_url(Some(self.request_model(task)))?;
         tracing::debug!(
@@ -1900,6 +1943,7 @@ impl ModelProvider for GeminiProvider {
             // On HTTP error, read the full body and propagate as a failure so
             // the philote tier-escalation logic can route to a fallback provider.
             let body = response.json::<Value>().await.unwrap_or_default();
+            Self::log_http_failure("invoke_streaming", status, &body, &payload);
             bail!(
                 "Gemini API error ({}): {}",
                 status.as_u16(),
@@ -2060,7 +2104,9 @@ impl ModelProvider for GeminiProvider {
             }
             let (content, spoken_text, memory_concept, memory_candidate, active_plan) =
                 Self::parse_structured_response(reqwest::StatusCode::OK, body.clone());
-            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+            if let Ok(parsed) =
+                serde_json::from_str::<Value>(Self::strip_json_code_fences(&content))
+            {
                 if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
                     return Ok(tool_call);
                 }
@@ -2959,6 +3005,173 @@ mod tests {
             declaration["parameters"]["properties"]["text"]["type"],
             serde_json::json!("string")
         );
+    }
+
+    fn sample_echo_tool() -> serde_json::Value {
+        serde_json::json!({
+            "tool_name": "echo",
+            "description": "Echo text",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            }
+        })
+    }
+
+    #[test]
+    fn tool_aware_payload_omits_controlled_generation() {
+        // Regression for the live tool-turn 400s (2026-07-08): combining
+        // generationConfig.responseMimeType/responseSchema with
+        // tools.functionDeclarations is unsupported by Gemini — every
+        // tool-bearing turn 400'd while tool-less turns (schema, no tools)
+        // succeeded on the same model. Function-calling mode wins.
+        let payload =
+            GeminiProvider::tool_aware_request_payload("hello", &[sample_echo_tool()], true, true);
+
+        let generation_config = payload["generationConfig"]
+            .as_object()
+            .expect("generationConfig must be present");
+        assert!(
+            !generation_config.contains_key("responseMimeType"),
+            "tool-bearing payload must not set responseMimeType"
+        );
+        assert!(
+            !generation_config.contains_key("responseSchema"),
+            "tool-bearing payload must not set responseSchema"
+        );
+        // thinkingConfig rides successful tool-less requests too — it stays.
+        assert!(generation_config.contains_key("thinkingConfig"));
+        // Native function calling remains fully wired.
+        assert!(payload["tools"][0]["functionDeclarations"].is_array());
+        assert_eq!(
+            payload["toolConfig"]["functionCallingConfig"]["mode"],
+            serde_json::json!("AUTO")
+        );
+        // The structured-output contract moved into the system instruction.
+        let system_text = payload["system_instruction"]["parts"][0]["text"]
+            .as_str()
+            .expect("system instruction text");
+        assert!(system_text.contains("display_text"));
+        assert!(system_text.contains("spoken_text"));
+        assert!(system_text.contains("memory_candidate"));
+        assert!(system_text.contains("active_plan"));
+    }
+
+    #[test]
+    fn structured_text_payload_keeps_response_schema() {
+        // Tool-less structured turns keep controlled generation exactly as before.
+        let payload = GeminiProvider::structured_text_request_payload("hello", true, true);
+
+        let generation_config = payload["generationConfig"]
+            .as_object()
+            .expect("generationConfig must be present");
+        assert_eq!(
+            generation_config["responseMimeType"],
+            serde_json::json!("application/json")
+        );
+        assert!(generation_config["responseSchema"].is_object());
+        assert!(generation_config.contains_key("thinkingConfig"));
+        assert!(payload.get("tools").is_none());
+        assert!(payload.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn strip_json_code_fences_handles_fenced_and_plain_json() {
+        let fenced = "```json\n{\"display_text\": \"hi\", \"spoken_text\": \"hi\"}\n```";
+        assert_eq!(
+            GeminiProvider::strip_json_code_fences(fenced),
+            "{\"display_text\": \"hi\", \"spoken_text\": \"hi\"}"
+        );
+        let bare_fence = "```\n{\"a\":1}\n```";
+        assert_eq!(
+            GeminiProvider::strip_json_code_fences(bare_fence),
+            "{\"a\":1}"
+        );
+        let plain = "{\"a\":1}";
+        assert_eq!(GeminiProvider::strip_json_code_fences(plain), "{\"a\":1}");
+        let prose = "just a normal reply";
+        assert_eq!(GeminiProvider::strip_json_code_fences(prose), prose);
+    }
+
+    #[test]
+    fn parse_structured_response_tolerates_fenced_json_reply() {
+        // Without responseSchema the JSON contract is instruction-enforced,
+        // so a model may fence the object despite being told not to.
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "```json\n{\"display_text\": \"Hello there\", \"spoken_text\": \"Hello\"}\n```"
+                    }]
+                }
+            }]
+        });
+        let (display, spoken, _, _, _) =
+            GeminiProvider::parse_structured_response(reqwest::StatusCode::OK, body);
+        assert_eq!(display, "Hello there");
+        assert_eq!(spoken.as_deref(), Some("Hello"));
+    }
+
+    /// Invariant: a Gemini request payload must NEVER combine controlled
+    /// generation (generationConfig.responseMimeType / responseSchema) with
+    /// function calling (tools.functionDeclarations / toolConfig). Gemini
+    /// rejects the combination with an empty-detail 400 INVALID_ARGUMENT —
+    /// this is what killed every live tool-bearing turn (2026-07-08).
+    fn assert_no_controlled_generation_with_tools(payload: &serde_json::Value, label: &str) {
+        let has_tools = payload.get("tools").is_some() || payload.get("toolConfig").is_some();
+        if !has_tools {
+            return;
+        }
+        let Some(config) = payload
+            .get("generationConfig")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return;
+        };
+        assert!(
+            !config.contains_key("responseSchema"),
+            "[{label}] combines tools with generationConfig.responseSchema — Gemini 400s this"
+        );
+        assert!(
+            !config.contains_key("responseMimeType"),
+            "[{label}] combines tools with generationConfig.responseMimeType — Gemini 400s this"
+        );
+    }
+
+    #[test]
+    fn gemini_payloads_never_combine_controlled_generation_with_tools() {
+        for wants_concept in [false, true] {
+            for wants_plan in [false, true] {
+                let tool_aware = GeminiProvider::tool_aware_request_payload(
+                    "hello",
+                    &[sample_echo_tool()],
+                    wants_concept,
+                    wants_plan,
+                );
+                assert_no_controlled_generation_with_tools(
+                    &tool_aware,
+                    &format!("tool_aware(concept={wants_concept},plan={wants_plan})"),
+                );
+
+                // Tool-less payload shapes hold the invariant vacuously —
+                // asserted anyway so any future addition of tools to these
+                // builders trips the guard immediately.
+                let structured = GeminiProvider::structured_text_request_payload(
+                    "hello",
+                    wants_concept,
+                    wants_plan,
+                );
+                assert_no_controlled_generation_with_tools(
+                    &structured,
+                    &format!("structured_text(concept={wants_concept},plan={wants_plan})"),
+                );
+            }
+        }
+        let basic = GeminiProvider::request_payload("hello");
+        assert_no_controlled_generation_with_tools(&basic, "request_payload");
     }
 
     /// Recursively assert a function-declaration parameter schema only uses
