@@ -557,8 +557,16 @@ mod tests {
         // Same agent, same type, again — must not double-count.
         let o2 = reg.register_request(req("a1", ResourceType::ModelRouter));
         assert!(matches!(o2, RegistryOutcome::Materializing(_)));
-        assert_eq!(reg.tenant_count(&instance_id), 1, "duplicate must not add a second tenant");
-        assert_eq!(reg.grants_for_agent("a1").len(), 1, "agent holds exactly one grant");
+        assert_eq!(
+            reg.tenant_count(&instance_id),
+            1,
+            "duplicate must not add a second tenant"
+        );
+        assert_eq!(
+            reg.grants_for_agent("a1").len(),
+            1,
+            "agent holds exactly one grant"
+        );
     }
 
     #[test]
@@ -615,9 +623,10 @@ mod tests {
             reg.tenants_for_resource_type(&ResourceType::ToolRunner),
             vec!["a1".to_string()]
         );
-        assert!(reg
-            .tenants_for_resource_type(&ResourceType::AgentGraph)
-            .is_empty());
+        assert!(
+            reg.tenants_for_resource_type(&ResourceType::AgentGraph)
+                .is_empty()
+        );
 
         // agent → resources (types)
         let mut a1_types = reg.resource_types_for_agent("a1");

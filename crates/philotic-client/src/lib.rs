@@ -1886,6 +1886,33 @@ pub enum IpcRequest {
         audit_id: String,
         outcome: String,
     },
+    /// Agent → hotel: ask the routing oracle for the best live model
+    /// controllers for a task, ranked. Consulted by philote when a turn's
+    /// configured `fallback_tiers` ladder is empty or exhausted — the oracle
+    /// is the dynamic safety net *beneath* operator-configured ladders,
+    /// never a replacement for them.
+    ///
+    /// `exclude_providers` names providers that already failed this turn so
+    /// the reply never routes straight back into the failure. All other
+    /// fields describe what the task needs (see core `RouteNeed`).
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{ranked: [{role, provider, model_ref, score}], disabled: bool}`.
+    /// Ranked entries are limited to controller roles with a live guest on
+    /// the local hotel. MUST remain the last variant-shape concern for
+    /// back-compat: new variants append after this one.
+    QueryModelRoute {
+        request_class: String,
+        needs_tools: bool,
+        needs_structured: bool,
+        approx_context_tokens: u32,
+        /// "interactive" | "background"
+        latency_class: String,
+        /// "local_trusted" | "local_experimental" | "remote_cloud"
+        trust_ceiling: String,
+        #[serde(default)]
+        exclude_providers: Vec<String>,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
