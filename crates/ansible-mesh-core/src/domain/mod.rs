@@ -524,6 +524,24 @@ impl GraphDomain {
         }
     }
 
+    /// List all session records. Malformed rows are skipped with a warning
+    /// instead of failing the whole listing (same hardening as
+    /// [`Self::list_session_turns`]).
+    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
+        let mut out: Vec<SessionRecord> = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION)? {
+            match serde_json::from_value::<SessionRecord>(node.data) {
+                Ok(record) => out.push(record),
+                Err(e) => warn!(
+                    node_key = %node.node_key,
+                    error = %e,
+                    "list_sessions: skipping malformed record"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     // ── Session participant methods ────────────────────────────────────────────
 
     fn session_participant_key(session_id: &str, component_id: &str) -> String {

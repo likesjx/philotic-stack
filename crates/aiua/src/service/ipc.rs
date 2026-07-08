@@ -28,7 +28,9 @@ use ansible_mesh_core::membership::{
 use ansible_mesh_core::registry::{
     CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
 };
-use ansible_mesh_core::storage::{ComponentManifest, GuestRecord, HotelRecord, SessionRecord};
+use ansible_mesh_core::storage::{
+    ComponentManifest, GuestRecord, HotelRecord, SessionRecord, SessionTurnRecord,
+};
 use ansible_mesh_core::validation::{
     SkillDraft, apply_validation_to_record, validate_skill_layer1,
 };
@@ -1678,6 +1680,289 @@ impl IpcServer {
             observed_partial_replies,
             content: reply_content,
         })
+    }
+
+    // ── Session history reads (edge/operator clients) ─────────────────────────
+
+    /// Handle [`IpcRequest::ListOperatorSessions`]: list session records from
+    /// the context graph, most recent activity first.
+    fn handle_list_operator_sessions(
+        graph: &GraphDomain,
+        target_agent_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> IpcResponse {
+        const DEFAULT_SESSION_LIMIT: usize = 50;
+        const MAX_SESSION_LIMIT: usize = 500;
+        let limit = limit
+            .map(|l| l as usize)
+            .unwrap_or(DEFAULT_SESSION_LIMIT)
+            .clamp(1, MAX_SESSION_LIMIT);
+
+        let mut sessions = match graph.list_sessions() {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                return IpcResponse::error(
+                    "list_operator_sessions",
+                    "STORAGE_ERROR",
+                    e.to_string(),
+                );
+            }
+        };
+        if let Some(agent_id) = target_agent_id {
+            sessions.retain(|s| s.primary_agent_id.as_deref() == Some(agent_id));
+        }
+        sessions.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        sessions.truncate(limit);
+
+        let operator_sessions = sessions
+            .into_iter()
+            .map(|session| {
+                let preview = Self::derive_session_preview(graph, &session.session_id);
+                philotic_client::OperatorSessionView {
+                    session_id: session.session_id,
+                    agent_id: session.primary_agent_id,
+                    transport: session.channel_kind,
+                    status: session.status,
+                    last_activity_at: session.updated_at,
+                    title: session.channel_session_key,
+                    preview,
+                }
+            })
+            .collect();
+        IpcResponse::OperatorSessionList { operator_sessions }
+    }
+
+    /// Short excerpt of the most recent turn's content for a session, if any.
+    fn derive_session_preview(graph: &GraphDomain, session_id: &str) -> Option<String> {
+        let mut turns = graph.list_session_turns(session_id, 0).unwrap_or_else(|e| {
+            warn!("derive_session_preview: turn listing failed for [{session_id}]: {e}");
+            Vec::new()
+        });
+        turns.sort_by(|a, b| {
+            a.started_at
+                .unwrap_or(0)
+                .cmp(&b.started_at.unwrap_or(0))
+                .then_with(|| a.turn_id.cmp(&b.turn_id))
+        });
+        let last = turns.pop()?;
+        let content = last
+            .response_json
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                last.user_message_json
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+            })?;
+        const PREVIEW_MAX_CHARS: usize = 160;
+        let trimmed = content.trim();
+        let preview: String = trimmed.chars().take(PREVIEW_MAX_CHARS).collect();
+        if preview.chars().count() < trimmed.chars().count() {
+            Some(format!("{preview}…"))
+        } else {
+            Some(preview)
+        }
+    }
+
+    /// Handle [`IpcRequest::ListSessionTurns`]: list one session's turns as
+    /// operator/agent messages, oldest first. Malformed stored records are
+    /// skipped with a warning by the underlying `list_session_turns`.
+    fn handle_list_session_turns(
+        graph: &GraphDomain,
+        session_id: &str,
+        limit: Option<u32>,
+        before_turn_id: Option<&str>,
+    ) -> IpcResponse {
+        const DEFAULT_TURN_LIMIT: usize = 50;
+        const MAX_TURN_LIMIT: usize = 500;
+        let limit = limit
+            .map(|l| l as usize)
+            .unwrap_or(DEFAULT_TURN_LIMIT)
+            .clamp(1, MAX_TURN_LIMIT);
+
+        // limit=0 means "all records"; ordering and pagination happen here
+        // because stored node-key order (random turn-id UUIDs) is not time order.
+        let mut records = match graph.list_session_turns(session_id, 0) {
+            Ok(records) => records,
+            Err(e) => {
+                return IpcResponse::error("list_session_turns", "STORAGE_ERROR", e.to_string());
+            }
+        };
+        records.sort_by(|a, b| {
+            a.started_at
+                .unwrap_or(0)
+                .cmp(&b.started_at.unwrap_or(0))
+                .then_with(|| a.turn_id.cmp(&b.turn_id))
+        });
+        if let Some(before) = before_turn_id {
+            match records.iter().position(|r| r.turn_id == before) {
+                Some(idx) => records.truncate(idx),
+                // Unknown cursor: return an empty page so paginating clients
+                // terminate instead of looping on a bad cursor.
+                None => records.clear(),
+            }
+        }
+        if records.len() > limit {
+            records.drain(..records.len() - limit);
+        }
+
+        let mut session_turns = Vec::with_capacity(records.len() * 2);
+        for record in &records {
+            Self::expand_session_turn_views(record, &mut session_turns);
+        }
+        IpcResponse::SessionTurnList {
+            turns_session_id: session_id.to_string(),
+            session_turns,
+        }
+    }
+
+    /// Expand one stored turn record into operator/agent message views.
+    /// The operator message is always emitted (it carries the turn status even
+    /// when content is empty); the agent reply only when it has content.
+    fn expand_session_turn_views(
+        record: &SessionTurnRecord,
+        out: &mut Vec<philotic_client::SessionTurnView>,
+    ) {
+        let operator_content = record
+            .user_message_json
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        out.push(philotic_client::SessionTurnView {
+            turn_id: record.turn_id.clone(),
+            role: "operator".into(),
+            content: operator_content.to_string(),
+            created_at: record.started_at,
+            status: record.status.clone(),
+        });
+        if let Some(reply_content) = record
+            .response_json
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            out.push(philotic_client::SessionTurnView {
+                turn_id: record.turn_id.clone(),
+                role: "agent".into(),
+                content: reply_content.to_string(),
+                created_at: record.completed_at.or(record.started_at),
+                status: record.status.clone(),
+            });
+        }
+    }
+
+    // ── Mesh roster read ───────────────────────────────────────────────────────
+
+    /// Handle [`IpcRequest::GetMeshRoster`]: read-only roster of self plus every
+    /// fresh peer in the node registry, with advertised endpoints/exposure.
+    async fn handle_get_mesh_roster(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+    ) -> IpcResponse {
+        let reg = registry.read().await;
+        let display_names: HashMap<String, String> = reg
+            .remote_hotel_states()
+            .map(|state| (state.node_id.clone(), state.hotel_name.clone()))
+            .collect();
+
+        let mut peers: Vec<philotic_client::MeshRosterEntryView> = reg
+            .active_nodes()
+            .filter(|status| status.capabilities.node_id != local_node_id)
+            .map(|status| {
+                Self::mesh_roster_entry(
+                    status,
+                    display_names.get(&status.capabilities.node_id).cloned(),
+                    false,
+                )
+            })
+            .collect();
+        peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+        let self_display_name = Self::local_hotel_name(graph, local_node_id);
+        let self_entry = match reg.get_node(local_node_id) {
+            Some(status) => Self::mesh_roster_entry(status, self_display_name, true),
+            None => philotic_client::MeshRosterEntryView {
+                node_id: local_node_id.to_string(),
+                is_self: true,
+                display_name: self_display_name,
+                roles: Vec::new(),
+                exposure_ceiling: None,
+                endpoints: Vec::new(),
+            },
+        };
+        drop(reg);
+
+        let mut mesh_roster = Vec::with_capacity(peers.len() + 1);
+        mesh_roster.push(self_entry);
+        mesh_roster.extend(peers);
+        IpcResponse::MeshRosterView { mesh_roster }
+    }
+
+    fn mesh_roster_entry(
+        status: &NodeStatus,
+        display_name: Option<String>,
+        is_self: bool,
+    ) -> philotic_client::MeshRosterEntryView {
+        fn snake_case_name<T: serde::Serialize + std::fmt::Debug>(value: &T) -> String {
+            match serde_json::to_value(value) {
+                Ok(serde_json::Value::String(s)) => s,
+                _ => format!("{value:?}"),
+            }
+        }
+
+        let roles = status
+            .capabilities
+            .roles
+            .iter()
+            .map(snake_case_name)
+            .collect();
+
+        let perimeter = status
+            .node_health
+            .as_ref()
+            .and_then(|health| health.perimeter.as_ref());
+        let exposure_ceiling = perimeter.map(|p| snake_case_name(&p.ceiling));
+        let mut endpoints: Vec<philotic_client::MeshEndpointView> = perimeter
+            .map(|p| {
+                p.listeners
+                    .iter()
+                    .map(|listener| philotic_client::MeshEndpointView {
+                        purpose: listener.purpose.clone(),
+                        host: listener.bind_addr.to_string(),
+                        port: listener.port,
+                        tier: Some(snake_case_name(&listener.tier)),
+                        protocol: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(reach) = status.execution_reachability.as_ref() {
+            endpoints.push(philotic_client::MeshEndpointView {
+                purpose: "execution".into(),
+                host: reach.host.clone(),
+                port: reach.port,
+                tier: None,
+                protocol: Some(reach.protocol.clone()),
+            });
+        }
+
+        philotic_client::MeshRosterEntryView {
+            node_id: status.capabilities.node_id.clone(),
+            is_self,
+            display_name,
+            roles,
+            exposure_ceiling,
+            endpoints,
+        }
     }
 
     fn desktop_membrane_guest_view(guest: GuestRecord) -> DesktopMembraneGuestView {
@@ -4190,6 +4475,23 @@ impl IpcServer {
                         IpcResponse::error("operator_chat", "OPERATOR_CHAT_ERROR", err.to_string())
                     }
                 }
+            }
+            IpcRequest::ListOperatorSessions {
+                target_agent_id,
+                limit,
+            } => Self::handle_list_operator_sessions(graph, target_agent_id.as_deref(), limit),
+            IpcRequest::ListSessionTurns {
+                session_id,
+                limit,
+                before_turn_id,
+            } => Self::handle_list_session_turns(
+                graph,
+                &session_id,
+                limit,
+                before_turn_id.as_deref(),
+            ),
+            IpcRequest::GetMeshRoster => {
+                Self::handle_get_mesh_roster(registry, graph, local_node_id).await
             }
             IpcRequest::ListDesktopMembraneAgents => {
                 match Self::desktop_membrane_agent_views(graph, local_node_id) {
@@ -16881,6 +17183,348 @@ pub(crate) mod tests {
             .list_session_events("telegram:123:agent-jane-01", 10)
             .expect("event listing should work");
         assert!(!events.is_empty(), "session events should be recorded");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    fn session_history_session(
+        session_id: &str,
+        agent_id: &str,
+        channel_kind: &str,
+        channel_session_key: &str,
+        updated_at: u64,
+    ) -> SessionRecord {
+        SessionRecord {
+            session_id: session_id.into(),
+            session_kind: "conversation".into(),
+            primary_agent_id: Some(agent_id.into()),
+            active_incarnation_id: None,
+            channel_kind: Some(channel_kind.into()),
+            channel_session_key: Some(channel_session_key.into()),
+            status: "active".into(),
+            lease_owner_component_id: None,
+            lease_expires_at: None,
+            summary_json: serde_json::json!({}),
+            created_at: 1,
+            updated_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_operator_sessions_and_session_turns_return_session_history() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        let session_a = "operator-chat:sess-a:agent-jane-01";
+        graph
+            .upsert_session(&session_history_session(
+                session_a,
+                "agent-jane-01",
+                "operator_chat",
+                "chat-a",
+                200,
+            ))
+            .expect("seed session a");
+        graph
+            .upsert_session(&session_history_session(
+                "telegram:42:agent-astrid-01",
+                "agent-astrid-01",
+                "telegram",
+                "42",
+                300,
+            ))
+            .expect("seed session b");
+
+        graph
+            .upsert_session_turn(&SessionTurnRecord {
+                turn_id: "turn-1".into(),
+                session_id: session_a.into(),
+                request_event_id: None,
+                user_message_json: serde_json::json!({ "content": "first question" }),
+                status: "completed".into(),
+                response_json: Some(serde_json::json!({ "content": "first answer" })),
+                error_json: None,
+                started_at: Some(10),
+                completed_at: Some(11),
+            })
+            .expect("seed turn-1");
+        graph
+            .upsert_session_turn(&SessionTurnRecord {
+                turn_id: "turn-2".into(),
+                session_id: session_a.into(),
+                request_event_id: None,
+                user_message_json: serde_json::json!({ "content": "second question" }),
+                status: "running".into(),
+                response_json: None,
+                error_json: None,
+                started_at: Some(20),
+                completed_at: None,
+            })
+            .expect("seed turn-2");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "edge-client".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        // All sessions, most recent activity first.
+        let response = client
+            .send_request(IpcRequest::ListOperatorSessions {
+                target_agent_id: None,
+                limit: None,
+            })
+            .await
+            .expect("list operator sessions");
+        let sessions = match response {
+            IpcResponse::OperatorSessionList { operator_sessions } => operator_sessions,
+            other => panic!("unexpected list sessions response: {other:?}"),
+        };
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "telegram:42:agent-astrid-01");
+        assert_eq!(sessions[0].transport.as_deref(), Some("telegram"));
+        assert_eq!(sessions[0].last_activity_at, 300);
+        assert_eq!(
+            sessions[0].preview, None,
+            "session without turns has no preview"
+        );
+        assert_eq!(sessions[1].session_id, session_a);
+        assert_eq!(sessions[1].agent_id.as_deref(), Some("agent-jane-01"));
+        assert_eq!(
+            sessions[1].preview.as_deref(),
+            Some("second question"),
+            "preview comes from the most recent turn"
+        );
+
+        // Filtered by agent.
+        let response = client
+            .send_request(IpcRequest::ListOperatorSessions {
+                target_agent_id: Some("agent-jane-01".into()),
+                limit: None,
+            })
+            .await
+            .expect("list filtered sessions");
+        match response {
+            IpcResponse::OperatorSessionList { operator_sessions } => {
+                assert_eq!(operator_sessions.len(), 1);
+                assert_eq!(operator_sessions[0].session_id, session_a);
+            }
+            other => panic!("unexpected filtered sessions response: {other:?}"),
+        }
+
+        // Full turn history, oldest first, agent replies expanded.
+        let response = client
+            .send_request(IpcRequest::ListSessionTurns {
+                session_id: session_a.into(),
+                limit: None,
+                before_turn_id: None,
+            })
+            .await
+            .expect("list session turns");
+        let turns = match response {
+            IpcResponse::SessionTurnList {
+                turns_session_id,
+                session_turns,
+            } => {
+                assert_eq!(turns_session_id, session_a);
+                session_turns
+            }
+            other => panic!("unexpected list turns response: {other:?}"),
+        };
+        assert_eq!(turns.len(), 3);
+        assert_eq!(
+            (turns[0].turn_id.as_str(), turns[0].role.as_str()),
+            ("turn-1", "operator")
+        );
+        assert_eq!(turns[0].content, "first question");
+        assert_eq!(turns[0].created_at, Some(10));
+        assert_eq!(
+            (turns[1].turn_id.as_str(), turns[1].role.as_str()),
+            ("turn-1", "agent")
+        );
+        assert_eq!(turns[1].content, "first answer");
+        assert_eq!(turns[1].created_at, Some(11));
+        assert_eq!(
+            (turns[2].turn_id.as_str(), turns[2].role.as_str()),
+            ("turn-2", "operator")
+        );
+        assert_eq!(turns[2].status, "running");
+
+        // Pagination: turns strictly before turn-2.
+        let response = client
+            .send_request(IpcRequest::ListSessionTurns {
+                session_id: session_a.into(),
+                limit: None,
+                before_turn_id: Some("turn-2".into()),
+            })
+            .await
+            .expect("paginate session turns");
+        match response {
+            IpcResponse::SessionTurnList { session_turns, .. } => {
+                assert_eq!(session_turns.len(), 2);
+                assert!(session_turns.iter().all(|t| t.turn_id == "turn-1"));
+            }
+            other => panic!("unexpected paginated turns response: {other:?}"),
+        }
+
+        // limit=1 keeps only the most recent turn record.
+        let response = client
+            .send_request(IpcRequest::ListSessionTurns {
+                session_id: session_a.into(),
+                limit: Some(1),
+                before_turn_id: None,
+            })
+            .await
+            .expect("limited session turns");
+        match response {
+            IpcResponse::SessionTurnList { session_turns, .. } => {
+                assert_eq!(session_turns.len(), 1);
+                assert_eq!(session_turns[0].turn_id, "turn-2");
+            }
+            other => panic!("unexpected limited turns response: {other:?}"),
+        }
+
+        // Unknown cursor terminates pagination with an empty page.
+        let response = client
+            .send_request(IpcRequest::ListSessionTurns {
+                session_id: session_a.into(),
+                limit: None,
+                before_turn_id: Some("no-such-turn".into()),
+            })
+            .await
+            .expect("unknown cursor session turns");
+        match response {
+            IpcResponse::SessionTurnList { session_turns, .. } => {
+                assert!(session_turns.is_empty());
+            }
+            other => panic!("unexpected unknown-cursor response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_mesh_roster_lists_self_and_seeded_peer() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "edge-client".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        match client
+            .send_request(IpcRequest::SeedRemoteIncarnation {
+                node_id: "remote-node-9".into(),
+                hotel_id: "remote-hotel".into(),
+                incarnation_id: "inc-1".into(),
+                target_role: "agent".into(),
+                socket_path: None,
+            })
+            .await
+            .expect("seed remote incarnation")
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => panic!("unexpected seed response: {other:?}"),
+        }
+
+        let response = client
+            .send_request(IpcRequest::GetMeshRoster)
+            .await
+            .expect("get mesh roster");
+        let roster = match response {
+            IpcResponse::MeshRosterView { mesh_roster } => mesh_roster,
+            other => panic!("unexpected mesh roster response: {other:?}"),
+        };
+        assert_eq!(roster.len(), 2, "self + one seeded peer: {roster:?}");
+
+        let self_entry = &roster[0];
+        assert!(self_entry.is_self, "self entry must come first: {roster:?}");
+        assert_eq!(self_entry.node_id, "local-aiua-01");
+        assert_eq!(self_entry.display_name.as_deref(), Some("local-hotel"));
+
+        let peer = roster
+            .iter()
+            .find(|entry| entry.node_id == "remote-node-9")
+            .expect("seeded peer present in roster");
+        assert!(!peer.is_self);
+        assert_eq!(peer.roles, vec!["ansible-node".to_string()]);
+        assert!(
+            peer.endpoints.is_empty(),
+            "seeded peer advertises no perimeter/execution endpoints"
+        );
+        assert_eq!(peer.exposure_ceiling, None);
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
