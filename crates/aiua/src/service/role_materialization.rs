@@ -543,6 +543,7 @@ impl IpcServer {
         approval_policy: Option<String>,
         model_profile: Option<String>,
         context_window_policy: Option<String>,
+        fallback_tiers: Option<Vec<String>>,
     ) -> IpcResponse {
         let Some(identity) = current_identity else {
             return IpcResponse::error(
@@ -597,6 +598,33 @@ impl IpcServer {
             .ok()
             .flatten();
         let is_new_role = previous.is_none();
+
+        // Ladder resolution: `None` PRESERVES the existing record's ladder — this is
+        // the fix for the bug where every ConfigureRole call unconditionally wiped
+        // `fallback_tiers` to empty, silently erasing DB-edited ladders on every
+        // reconfigure (there is no IPC path to set one, so the wipe was permanent).
+        // `Some(tiers)` sets the ladder explicitly, validated for shape (non-empty
+        // list of non-empty tier names). A brand-new role with `None` gets
+        // `DEFAULT_FALLBACK_TIERS` rather than empty.
+        let resolved_fallback_tiers = match fallback_tiers {
+            Some(tiers) => {
+                if tiers.is_empty() || tiers.iter().any(|t| t.trim().is_empty()) {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_INVALID_FALLBACK_TIERS",
+                        "fallback_tiers must be a non-empty list of non-empty tier role names",
+                    );
+                }
+                tiers
+            }
+            None => match previous.as_ref() {
+                Some(prev) => prev.turn_loop_config.fallback_tiers.clone(),
+                None => ansible_mesh_core::model_routing::DEFAULT_FALLBACK_TIERS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            },
+        };
         // For a new role, check if the base agent is currently live. Single-process philote
         // registers as the base agent_id and handles all roles internally, so any new role
         // it creates is immediately routable via the base guest.
@@ -633,7 +661,7 @@ impl IpcServer {
                 model_profile,
                 context_window_policy,
                 loop_script: None,
-                fallback_tiers: Vec::new(),
+                fallback_tiers: resolved_fallback_tiers,
                 paracrine_hop_budget: None,
                 paracrine_chain_budget_secs: None,
                 context_window: None,
@@ -2897,6 +2925,7 @@ mod tests {
                 approval_policy: Some("auto".into()),
                 model_profile: Some("fast".into()),
                 context_window_policy: Some("standard".into()),
+                fallback_tiers: None,
             })
             .await
             .expect("configure request");
@@ -2904,6 +2933,408 @@ mod tests {
         match resp {
             IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
             other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Regression test for the config-eating bug: a brand-new role configured
+    /// with `fallback_tiers: None` must get `DEFAULT_FALLBACK_TIERS`, not an
+    /// empty ladder.
+    #[tokio::test]
+    async fn configure_role_new_role_defaults_fallback_tiers() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane-01:developer".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: None,
+            })
+            .await
+            .expect("configure request");
+        match resp {
+            IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
+            other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "developer")
+            .expect("role lookup")
+            .expect("role exists");
+        let expected: Vec<String> = ansible_mesh_core::model_routing::DEFAULT_FALLBACK_TIERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(role.turn_loop_config.fallback_tiers, expected);
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Regression test for the config-eating bug: `Some(tiers)` explicitly
+    /// sets the ladder.
+    #[tokio::test]
+    async fn configure_role_sets_fallback_tiers_when_some() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let custom_tiers = vec![
+            "model".to_string(),
+            "model.openrouter".to_string(),
+            "model.custom".to_string(),
+        ];
+        let resp = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane-01:developer".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: Some(custom_tiers.clone()),
+            })
+            .await
+            .expect("configure request");
+        match resp {
+            IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
+            other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "developer")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(role.turn_loop_config.fallback_tiers, custom_tiers);
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// The actual regression: a second ConfigureRole call with `fallback_tiers:
+    /// None` must PRESERVE the custom ladder set by an earlier call, not wipe
+    /// it to empty (the bug: mac-jane's orchestrator ladder lost its
+    /// model.openrouter tier on every reconfigure).
+    #[tokio::test]
+    async fn configure_role_preserves_existing_fallback_tiers_when_none() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let custom_tiers = vec!["model".to_string(), "model.openrouter".to_string()];
+
+        // First call: set a custom ladder.
+        let resp1 = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane-01:developer".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: Some(custom_tiers.clone()),
+            })
+            .await
+            .expect("first configure request");
+        assert!(matches!(resp1, IpcResponse::ConfigureRoleOk { .. }));
+
+        // Second call: an unrelated reconfigure (e.g. changing iteration_cap)
+        // that does NOT touch fallback_tiers — must preserve the ladder.
+        let resp2 = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane-01:developer".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: Some("updated addendum".into()),
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: Some(25),
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: None,
+            })
+            .await
+            .expect("second configure request");
+        assert!(matches!(resp2, IpcResponse::ConfigureRoleOk { .. }));
+
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "developer")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(
+            role.turn_loop_config.fallback_tiers, custom_tiers,
+            "fallback_tiers must survive a reconfigure that passes None"
+        );
+        assert_eq!(role.turn_loop_config.iteration_cap, Some(25));
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Shape validation: `Some(vec![])` and tiers containing empty/whitespace
+    /// strings must be rejected rather than silently accepted as a wipe.
+    #[tokio::test]
+    async fn configure_role_rejects_invalid_fallback_tiers_shape() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        for bad_tiers in [Vec::<String>::new(), vec!["  ".to_string()]] {
+            let resp = orchestrator
+                .send_request(IpcRequest::ConfigureRole {
+                    agent_id: "agent-jane-01".into(),
+                    role_name: "developer".into(),
+                    guest_id: "agent-jane-01:developer".into(),
+                    calling_role: "orchestrator".into(),
+                    toolset_profile: "developer".into(),
+                    role_identity_addendum: None,
+                    role_manifest: None,
+                    is_admin: false,
+                    inactive_ttl_seconds: None,
+                    iteration_cap: None,
+                    approval_policy: None,
+                    model_profile: None,
+                    context_window_policy: None,
+                    fallback_tiers: Some(bad_tiers),
+                })
+                .await
+                .expect("configure request");
+            match resp {
+                IpcResponse::Standard { ok, code, .. } => {
+                    assert!(!ok);
+                    assert_eq!(code, "CONFIGURE_INVALID_FALLBACK_TIERS");
+                }
+                other => panic!("expected rejection, got {:?}", other),
+            }
         }
 
         unsafe {
@@ -3012,6 +3443,99 @@ mod tests {
         }
     }
 
+    /// The `role.create_or_update` workflow surface must plumb an explicit
+    /// `fallback_tiers` argument array through to the persisted record, same
+    /// as the direct ConfigureRole IPC path.
+    #[tokio::test]
+    async fn execute_role_create_workflow_sets_fallback_tiers() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ExecuteWorkflow {
+                workflow_name: "role.create_or_update".into(),
+                agent_id: "agent-jane-01".into(),
+                calling_role: "orchestrator".into(),
+                arguments: serde_json::json!({
+                    "role_name": "developer",
+                    "toolset_profile": "developer",
+                    "fallback_tiers": ["model", "model.openrouter"],
+                    "reasoning": {
+                        "purpose": "Focused implementation role.",
+                        "toolset_rationale": "Use developer posture.",
+                        "handoff_posture_and_limits": "Return when done."
+                    }
+                }),
+            })
+            .await
+            .expect("workflow request");
+        assert!(matches!(resp, IpcResponse::WorkflowExecutionOk { .. }));
+
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "developer")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(
+            role.turn_loop_config.fallback_tiers,
+            vec!["model".to_string(), "model.openrouter".to_string()]
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
     #[tokio::test]
     async fn configure_role_eagerly_materializes_new_role_worker() {
         let _env_guard = ipc_env_guard();
@@ -3078,6 +3602,7 @@ mod tests {
                 approval_policy: Some("auto".into()),
                 model_profile: Some("fast".into()),
                 context_window_policy: Some("standard".into()),
+                fallback_tiers: None,
             })
             .await
             .expect("configure request");
@@ -3150,6 +3675,7 @@ mod tests {
                 approval_policy: None,
                 model_profile: None,
                 context_window_policy: None,
+                fallback_tiers: None,
             })
             .await
             .expect("configure request");

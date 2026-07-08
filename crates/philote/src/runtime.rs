@@ -7024,6 +7024,22 @@ mod tests {
                     }));
                     serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
                 }
+                philotic_client::IpcRequest::ConfigureRole {
+                    role_name,
+                    fallback_tiers,
+                    ..
+                } => {
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "configure_role": {
+                            "role_name": role_name,
+                            "fallback_tiers": fallback_tiers,
+                        },
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::ConfigureRoleOk {
+                        role_name: role_name.clone(),
+                    })
+                    .unwrap()
+                }
                 _ => {
                     serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
                 }

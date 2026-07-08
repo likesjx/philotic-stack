@@ -10,6 +10,19 @@
 
 use super::*;
 
+/// Parse the optional `fallback_tiers` tool argument (a JSON array of tier
+/// role-name strings) into the `Option<Vec<String>>` the hotel's ConfigureRole
+/// IPC expects. Returns `None` when the argument is absent/not an array —
+/// callers treat that as "preserve whatever ladder is already configured",
+/// never as "wipe it".
+pub(super) fn parse_fallback_tiers_arg(value: &serde_json::Value) -> Option<Vec<String>> {
+    value.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect::<Vec<String>>()
+    })
+}
+
 impl AgentRuntime {
     /// Classify a tool call against the set of gates that ALWAYS require live
     /// operator approval and can never be preapproved or bypassed by policy
@@ -1848,6 +1861,9 @@ impl AgentRuntime {
                     .get("context_window_policy")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
+                let fallback_tiers = args
+                    .get("fallback_tiers")
+                    .and_then(parse_fallback_tiers_arg);
 
                 // Read the active persona role from session state to pass as calling authority.
                 // Falls back to "orchestrator" when no role is active (default persona).
@@ -1872,10 +1888,22 @@ impl AgentRuntime {
                     approval_policy,
                     model_profile,
                     context_window_policy,
+                    fallback_tiers: fallback_tiers.clone(),
                 };
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
                     Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
+                        // Mirror the hotel's preserve-on-None semantics locally: when
+                        // this call didn't set an explicit ladder, keep whatever this
+                        // process already had cached for the role rather than
+                        // collapsing it to empty (which would desync the cache from
+                        // the DB until the next restart/reconfigure).
+                        let effective_fallback_tiers = fallback_tiers.unwrap_or_else(|| {
+                            self.configured_roles
+                                .get(&name)
+                                .map(|c| c.turn_loop_config.fallback_tiers.clone())
+                                .unwrap_or_default()
+                        });
                         self.configured_roles.insert(
                             name.clone(),
                             CachedRoleConfig {
@@ -1908,7 +1936,14 @@ impl AgentRuntime {
                                         >(v.clone())
                                         .ok()
                                     })
-                                    .unwrap_or_default(),
+                                    .map(|mut tlc| {
+                                        tlc.fallback_tiers = effective_fallback_tiers.clone();
+                                        tlc
+                                    })
+                                    .unwrap_or(ansible_mesh_core::graph::TurnLoopConfig {
+                                        fallback_tiers: effective_fallback_tiers,
+                                        ..Default::default()
+                                    }),
                             },
                         );
                         // Refresh the delegation roster so new/updated roles appear
@@ -2047,6 +2082,9 @@ impl AgentRuntime {
                     .get("context_window_policy")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
+                let fallback_tiers = args
+                    .get("fallback_tiers")
+                    .and_then(parse_fallback_tiers_arg);
 
                 let calling_role = self
                     .sessions
@@ -2069,10 +2107,19 @@ impl AgentRuntime {
                     approval_policy,
                     model_profile,
                     context_window_policy,
+                    fallback_tiers: fallback_tiers.clone(),
                 };
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
                     Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
+                        // See role.configure above: mirror the hotel's preserve-on-None
+                        // semantics in the local cache so it doesn't desync from the DB.
+                        let effective_fallback_tiers = fallback_tiers.unwrap_or_else(|| {
+                            self.configured_roles
+                                .get(&name)
+                                .map(|c| c.turn_loop_config.fallback_tiers.clone())
+                                .unwrap_or_default()
+                        });
                         self.configured_roles.insert(
                             name.clone(),
                             CachedRoleConfig {
@@ -2105,7 +2152,14 @@ impl AgentRuntime {
                                         >(v.clone())
                                         .ok()
                                     })
-                                    .unwrap_or_default(),
+                                    .map(|mut tlc| {
+                                        tlc.fallback_tiers = effective_fallback_tiers.clone();
+                                        tlc
+                                    })
+                                    .unwrap_or(ansible_mesh_core::graph::TurnLoopConfig {
+                                        fallback_tiers: effective_fallback_tiers,
+                                        ..Default::default()
+                                    }),
                             },
                         );
                         self.fetch_role_names().await;
@@ -5982,5 +6036,222 @@ mod tests {
         )
         .expect("local agent tools should not require an external runner");
         assert_eq!(route.execution_mode, "local_agent");
+    }
+
+    #[test]
+    fn parse_fallback_tiers_arg_reads_string_array() {
+        assert_eq!(
+            super::parse_fallback_tiers_arg(&serde_json::json!(["model", "model.openrouter"])),
+            Some(vec!["model".to_string(), "model.openrouter".to_string()])
+        );
+        assert_eq!(
+            super::parse_fallback_tiers_arg(&serde_json::json!(null)),
+            None
+        );
+        assert_eq!(
+            super::parse_fallback_tiers_arg(&serde_json::json!("not-an-array")),
+            None
+        );
+    }
+
+    fn fallback_tiers_test_payload(arguments: serde_json::Value) -> ToolExecutionPayload {
+        ToolExecutionPayload {
+            action: "execute_tool",
+            session_id: "sess-fallback".into(),
+            turn_id: "turn-fallback".into(),
+            chat_id: "555".into(),
+            tool_name: "role.configure".into(),
+            arguments,
+            execution_mode: "local_agent".into(),
+            agent_id: "agent-fallback-tiers".into(),
+            user_id: None,
+            runner_id: None,
+            incarnation_id: None,
+            hotel_id: None,
+            environment_id: None,
+            task_runner_kind: None,
+            task_runner_config: None,
+            selection_reason: None,
+            workspace_ref: None,
+            task_runner_overlay: None,
+            return_route: None,
+            reply_to: "node-1".into(),
+            reply_role: "agent".into(),
+            reply_guest_id: None,
+            final_reply_to: "membrane-node-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: Some("membrane-seat-1".into()),
+        }
+    }
+
+    /// `execute_local_agent_tool` is one large hand-written match over every
+    /// tool name; its generated async state machine is big enough that
+    /// running it under `#[tokio::test]`'s default test-thread stack
+    /// overflows even for a single call. Run these tests on a dedicated
+    /// thread with a generous stack instead of touching the production
+    /// function's shape just to make it test-friendly.
+    fn run_with_big_stack<F, Fut>(f: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build current-thread runtime")
+                    .block_on(f());
+            })
+            .expect("spawn big-stack test thread")
+            .join()
+            .expect("big-stack test thread panicked");
+    }
+
+    /// Philote passthrough: `role.configure` with an explicit `fallback_tiers`
+    /// argument must reach the hotel's ConfigureRole IPC and land in the
+    /// locally cached `TurnLoopConfig`.
+    #[test]
+    fn role_configure_passthrough_sets_fallback_tiers() {
+        run_with_big_stack(|| async {
+            use super::super::tests::run_recording_hotel;
+
+            let socket_path = format!(
+                "/tmp/philote-fallback-tiers-set-{}.sock",
+                Uuid::new_v4().simple()
+            );
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+            let emitted =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+            let identity = philotic_client::GuestIdentity {
+                guest_id: "agent-fallback-tiers".into(),
+                role: "agent".into(),
+                supported_tools: Vec::new(),
+            };
+            let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+                .await
+                .expect("connect to stub hotel");
+            let mut runtime = AgentRuntime::new(client, "agent-fallback-tiers");
+
+            let payload = fallback_tiers_test_payload(serde_json::json!({
+                "role_name": "developer",
+                "toolset_profile": "developer",
+                "fallback_tiers": ["model", "model.openrouter"],
+                "reasoning": {
+                    "purpose": "p",
+                    "toolset_rationale": "r",
+                    "handoff_posture_and_limits": "h",
+                },
+            }));
+            runtime
+                .execute_local_agent_tool(payload)
+                .await
+                .expect("role.configure executes");
+
+            let cached = runtime
+                .configured_roles
+                .get("developer")
+                .expect("role cached after call");
+            assert_eq!(
+                cached.turn_loop_config.fallback_tiers,
+                vec!["model".to_string(), "model.openrouter".to_string()]
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+
+            let emitted = emitted.lock().unwrap();
+            assert_eq!(emitted.len(), 1);
+            assert_eq!(
+                emitted[0]["configure_role"]["fallback_tiers"],
+                serde_json::json!(["model", "model.openrouter"])
+            );
+        });
+    }
+
+    /// The other half of the passthrough contract: a `role.configure` call
+    /// that OMITS `fallback_tiers` must send `None` over IPC and must PRESERVE
+    /// whatever ladder is already cached locally, mirroring the hotel-side
+    /// preserve-on-None fix so the DB and in-process caches can't desync.
+    #[test]
+    fn role_configure_passthrough_preserves_cached_fallback_tiers_when_omitted() {
+        run_with_big_stack(|| async {
+            use super::super::tests::run_recording_hotel;
+
+            let socket_path = format!(
+                "/tmp/philote-fallback-tiers-preserve-{}.sock",
+                Uuid::new_v4().simple()
+            );
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+            let emitted =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+            let identity = philotic_client::GuestIdentity {
+                guest_id: "agent-fallback-tiers".into(),
+                role: "agent".into(),
+                supported_tools: Vec::new(),
+            };
+            let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+                .await
+                .expect("connect to stub hotel");
+            let mut runtime = AgentRuntime::new(client, "agent-fallback-tiers");
+
+            // Pre-seed the cache as if an earlier call had set a custom ladder.
+            runtime.configured_roles.insert(
+                "developer".to_string(),
+                CachedRoleConfig {
+                    toolset_profile: "developer".into(),
+                    role_identity_addendum: None,
+                    role_manifest: None,
+                    iteration_cap: None,
+                    approval_policy: None,
+                    turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
+                        fallback_tiers: vec!["model".to_string(), "model.openrouter".to_string()],
+                        ..Default::default()
+                    },
+                },
+            );
+
+            let payload = fallback_tiers_test_payload(serde_json::json!({
+                "role_name": "developer",
+                "toolset_profile": "developer",
+                "iteration_cap": 7,
+                "reasoning": {
+                    "purpose": "p",
+                    "toolset_rationale": "r",
+                    "handoff_posture_and_limits": "h",
+                },
+            }));
+            runtime
+                .execute_local_agent_tool(payload)
+                .await
+                .expect("role.configure executes");
+
+            let cached_after = runtime
+                .configured_roles
+                .get("developer")
+                .expect("role still cached after call");
+            assert_eq!(
+                cached_after.turn_loop_config.fallback_tiers,
+                vec!["model".to_string(), "model.openrouter".to_string()],
+                "omitting fallback_tiers must preserve the previously cached ladder"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+
+            let emitted = emitted.lock().unwrap();
+            assert_eq!(emitted.len(), 1);
+            assert_eq!(
+                emitted[0]["configure_role"]["fallback_tiers"],
+                serde_json::Value::Null
+            );
+        });
     }
 }
