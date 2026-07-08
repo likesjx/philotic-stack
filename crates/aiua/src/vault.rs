@@ -9,7 +9,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
 use uuid::Uuid;
 
 const VAULT_ENV_KEY: &str = "PHILOTIC_VAULT_MASTER_KEY";
@@ -150,30 +149,30 @@ fn cipher() -> Result<Aes256Gcm> {
     Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes)))
 }
 
+/// Resolve the vault root key deterministically: explicit env var first, then the
+/// operator-provisioned key file, and only then the macOS Keychain.
+///
+/// The Keychain must NOT take precedence over env/file: the keychain item is stored
+/// with an empty trusted-app ACL, so headless contexts (launchd, ssh) cannot read it
+/// ("User interaction is not allowed" -> treated as absent) while GUI shells can.
+/// With keychain-first, a hand-run hotel and a launchd-supervised hotel on the same
+/// machine silently resolve DIFFERENT keys, making secrets encrypted by one
+/// undecryptable by the other (mbp-jane provider-secret incidents, 2026-07-04 and
+/// 2026-07-08). Env -> file resolves identically in every execution context, so an
+/// operator-provisioned key always wins. The Keychain remains the zero-config
+/// bootstrap path when no explicit key exists.
 fn load_or_create_root_key() -> Result<Vec<u8>> {
+    if let Ok(from_env) = load_env_root_key() {
+        return Ok(from_env);
+    }
+
+    if let Ok(from_file) = load_env_file_root_key() {
+        return Ok(from_file);
+    }
+
     if cfg!(target_os = "macos") {
         if let Some(existing) = load_keychain_root_key()? {
             return Ok(existing);
-        }
-
-        if let Ok(from_env) = load_env_root_key() {
-            if let Err(err) = store_keychain_root_key(&from_env) {
-                warn!(
-                    error = %err,
-                    "Failed to seed the macOS Keychain with the explicit Philotic vault root key; continuing with the env-provided key for this process"
-                );
-            }
-            return Ok(from_env);
-        }
-
-        if let Ok(from_file) = load_env_file_root_key() {
-            if let Err(err) = store_keychain_root_key(&from_file) {
-                warn!(
-                    error = %err,
-                    "Failed to seed the macOS Keychain with the Philotic vault root key file; continuing with the file-provided key for this process"
-                );
-            }
-            return Ok(from_file);
         }
 
         let generated = random_root_key();
@@ -181,12 +180,10 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
         return Ok(generated);
     }
 
-    load_env_root_key().or_else(|_| load_env_file_root_key()).with_context(|| {
-        format!(
-            "{} must be set to a base64-encoded 32-byte key, or ~/.philotic/vault-master-key.env must exist, before using the hotel vault on this platform",
-            VAULT_ENV_KEY
-        )
-    })
+    bail!(
+        "{} must be set to a base64-encoded 32-byte key, or ~/.philotic/vault-master-key.env must exist, before using the hotel vault on this platform",
+        VAULT_ENV_KEY
+    )
 }
 
 fn load_env_root_key() -> Result<Vec<u8>> {
@@ -327,7 +324,8 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SecretAccess, SecretInput, decode_root_key, resolve_secret, store_secret, vault_key_account,
+        SecretAccess, SecretInput, decode_root_key, load_or_create_root_key, resolve_secret,
+        store_secret, vault_key_account,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -371,6 +369,43 @@ mod tests {
         assert_eq!(secret.as_deref(), Some("shh"));
     }
 
+    /// The explicit env key must win over the key file (and, implicitly, over the
+    /// macOS Keychain, which is only consulted after both explicit sources): key-source
+    /// resolution has to be identical for GUI shells and launchd/ssh contexts, or
+    /// secrets encrypted in one context become undecryptable in the other.
+    #[test]
+    fn env_key_wins_over_file_key() {
+        set_test_key();
+
+        let dir = std::env::temp_dir().join(format!(
+            "philotic-vault-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let philotic_dir = dir.join(".philotic");
+        std::fs::create_dir_all(&philotic_dir).unwrap();
+        let file_key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        std::fs::write(
+            philotic_dir.join("vault-master-key.env"),
+            format!("PHILOTIC_VAULT_MASTER_KEY={file_key}\n"),
+        )
+        .unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+        let resolved = load_or_create_root_key();
+        unsafe {
+            match &old_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(resolved.unwrap(), vec![7u8; 32]);
+    }
+
     #[test]
     fn decode_root_key_accepts_32_byte_base64() {
         let encoded = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
@@ -385,8 +420,16 @@ mod tests {
         assert!(err.contains("exactly 32 bytes"));
     }
 
+    /// Serializes tests that mutate PHILOTIC_VAULT_KEY_ID; without this the two
+    /// vault_key_account tests race each other under the parallel test runner.
+    fn key_id_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
     #[test]
     fn vault_key_account_defaults_when_unset() {
+        let _guard = key_id_env_lock();
         unsafe {
             std::env::remove_var("PHILOTIC_VAULT_KEY_ID");
         }
@@ -395,6 +438,7 @@ mod tests {
 
     #[test]
     fn vault_key_account_uses_override_when_present() {
+        let _guard = key_id_env_lock();
         unsafe {
             std::env::set_var("PHILOTIC_VAULT_KEY_ID", "hotel-alpha");
         }
