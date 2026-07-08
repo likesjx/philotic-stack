@@ -791,6 +791,17 @@ fn attach_delivery_context(
     serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
 }
 
+/// Guest-record roles that can never consume `role="agent"` deliveries. Used to reject
+/// poisoned placement-provenance hints (see `guest_can_fill_agent_placement`): tool and
+/// datasource runners such as `life-graph-runner` are dispatch TARGETS of an agent's
+/// tool invokes, never a placement for the agent's own turn traffic.
+pub(super) fn is_non_agent_infra_role(role: &str) -> bool {
+    matches!(
+        role,
+        "tool" | "datasource" | "gateway" | "membrane" | "model" | "proxy"
+    ) || role.ends_with("-runner")
+}
+
 fn is_response_like_agent_action(action: &str) -> bool {
     matches!(
         action,
@@ -2996,6 +3007,35 @@ impl IpcServer {
             .list_guests(&local_hotel_name, false)
             .map(|guests| guests.into_iter().any(|guest| guest.guest_id == guest_id))
             .unwrap_or(false)
+    }
+
+    /// Whether `guest_id` can legitimately fill an agent placement for `role="agent"`
+    /// routing decisions (2026-07-06 parked-tool-result incident guard). Infrastructure
+    /// guests — tool runners, datasources, gateways, model routers, life-graph-runner —
+    /// never consume agent tasks, so a placement-provenance hint naming one is poison:
+    /// parking an agent's tool RESULT for the runner that produced it kills the turn at
+    /// the watchdog. Role-incarnation guests and guests whose hotel record carries the
+    /// "agent" role are agent placements; unknown guests are left to the existing
+    /// routing behavior (we only reject on a positively-known non-agent role).
+    pub(super) fn guest_can_fill_agent_placement(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        guest_id: &str,
+    ) -> bool {
+        if graph
+            .list_role_incarnations_by_guest_id(guest_id)
+            .map(|records| !records.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            return true;
+        };
+        match graph.get_guest(&local_hotel_name, guest_id) {
+            Ok(Some(guest)) => !is_non_agent_infra_role(&guest.role),
+            _ => true,
+        }
     }
 
     /// Resolve the node_id hosting a guest, with a fallback to `home_node` from the role
