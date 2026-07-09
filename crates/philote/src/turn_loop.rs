@@ -1499,9 +1499,11 @@ impl AgentRuntime {
                     .emit_turn_event(&session_id, "waiting_tool", None)
                     .await;
 
-                let response_contract = Some(
-                    serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-                );
+                let response_contract = Some(cognitive_response_contract(&[
+                    "spoken_text",
+                    "memory_candidate",
+                    "active_plan",
+                ]));
                 let response_route = Some(model_response_route(
                     self.sessions.get(&session_id),
                     response_contract.as_ref(),
@@ -1636,9 +1638,11 @@ impl AgentRuntime {
             .emit_turn_event(&session_id, "loop_recovering", None)
             .await;
 
-        let response_contract = Some(
-            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-        );
+        let response_contract = Some(cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+        ]));
         let response_route = Some(model_response_route(
             self.sessions.get(&session_id),
             response_contract.as_ref(),
@@ -1945,9 +1949,11 @@ impl AgentRuntime {
                 .await;
         }
 
-        let response_contract = Some(
-            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-        );
+        let response_contract = Some(cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+        ]));
         let response_route = Some(model_response_route(
             self.sessions.get(&session_id),
             response_contract.as_ref(),

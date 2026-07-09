@@ -166,6 +166,7 @@ Seam IDs: `memory-spacetime-frame`, `memory-shaping-context`, `memory-cultivatio
 - [x] Implement `MemorySpacetimeFrame` and `MemoryShapingContext` for Philote memory recall shaping.
 - [x] Project temporal scope, spatial scope, authority, validation level, and space anchors into recalled memory sections.
 - [x] Attach graph-derived anchors as Muninn entities/relationships during `memory.remember`.
+- [x] Add `memory_candidate_policy` to cognitive response contracts so model-router/provider prompts ask for only atomic durable memory candidates.
 - [x] Add the first low-risk `memory.cultivate` path for closeout and staleness review.
 - [x] Add graph-intelligence true-up finding records using existing node/mutation primitives before introducing new node kinds.
 - [x] Gate promotion from Muninn into AgentGraph/docs/code behind validation evidence or explicit operator approval.
