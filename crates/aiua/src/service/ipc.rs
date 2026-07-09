@@ -904,12 +904,15 @@ fn response_like_agent_action_for_task(
     is_response_like_agent_action(action).then(|| action.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_response_target_guest_id_for_agent_task(
     graph: &GraphDomain,
+    local_node_id: &str,
     target_role: &str,
     target_guest_id: Option<&str>,
     task_json: &str,
     live_agent_guests: &[String],
+    heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
 ) -> Option<String> {
     response_like_agent_action_for_task(target_role, target_guest_id, task_json)?;
     let payload = serde_json::from_str::<serde_json::Value>(task_json).ok()?;
@@ -928,6 +931,77 @@ fn infer_response_target_guest_id_for_agent_task(
     if let Some(active_guest_id) = session.active_incarnation_id.clone() {
         if is_registered(&active_guest_id) {
             return Some(active_guest_id);
+        }
+
+        // RC-2 (2026-07-09 stuck-turn forensic): the active incarnation can be a
+        // non-agent infra guest — a tool/datasource/gateway/model/*-runner such as
+        // vps-jane:life-graph-runner — when the session's last hop was a tool
+        // invoke rather than an agent turn. `is_registered` above correctly misses
+        // it (infra guests never subscribe under role="agent"), but the old
+        // fallback below treated *any* unregistered active incarnation as "just
+        // not live yet" and silently redirected the response to the local
+        // orchestrator — the same family of bug PR #174 fixed in
+        // `resolve_agent_route`/`guest_can_fill_agent_placement`, never mirrored
+        // here. That silently dropped cross-hotel tool RESULTs at the wrong
+        // guest and orphaned the delegated turn. Apply the same discipline: never
+        // treat a poisoned non-agent infra guest as a legitimate "not live yet"
+        // agent — resolve the real agent target instead (or reject loudly).
+        if !IpcServer::guest_can_fill_agent_placement(graph, local_node_id, &active_guest_id) {
+            // File the heal event on *detection*, not on the no-fallback branch:
+            // the poisoning is the A3-countable anomaly regardless of whether we
+            // recover it (redirect to the primary agent) or reject it. The RC-4
+            // requirement is that RC-2 stops filing ZERO heal rows — the common
+            // case has `primary_agent_id` set, so if we only filed on the reject
+            // path this would count nothing in production. `push_classified`
+            // flood-collapses on `(guest_id, pattern_tag)`, so emitting on every
+            // recovered tool-result is cheap; `active_guest_id` is stable across
+            // sessions so A3 aggregates the poisoned guest correctly.
+            let recovers_to = session.primary_agent_id.clone();
+            let message = match recovers_to.as_deref() {
+                Some(primary) => format!(
+                    "[cross_hotel_misroute] response-like action for session [{session_id}] \
+                     targeted non-agent infra guest [{active_guest_id}]; recovered by routing \
+                     to primary agent [{primary}]"
+                ),
+                None => format!(
+                    "[cross_hotel_misroute] response-like action for session [{session_id}] \
+                     targeted non-agent infra guest [{active_guest_id}] with no resolvable \
+                     agent fallback (primary_agent_id unset)"
+                ),
+            };
+            warn!(
+                guest_id = active_guest_id.as_str(),
+                session_id = session_id,
+                recovered = recovers_to.is_some(),
+                "infer_response_target_guest_id_for_agent_task detected poisoned non-agent infra response target"
+            );
+            if let Some(hq) = heal_queue {
+                match hq.push_classified(
+                    &active_guest_id,
+                    &message,
+                    "medium",
+                    "cross_hotel_misroute",
+                ) {
+                    Ok(Some(id)) => info!(
+                        id = %id,
+                        guest_id = active_guest_id.as_str(),
+                        "cross-hotel tool-response mis-route pushed to heal queue"
+                    ),
+                    Ok(None) => debug!(
+                        guest_id = active_guest_id.as_str(),
+                        "cross-hotel mis-route collapsed into recent heal entry (flood window)"
+                    ),
+                    Err(err) => warn!(
+                        error = %err,
+                        "failed to push cross-hotel mis-route to heal queue"
+                    ),
+                }
+            }
+
+            if let Some(primary_agent_id) = recovers_to {
+                return Some(primary_agent_id);
+            }
+            return None;
         }
 
         // Active incarnation isn't actually live right now (e.g. a single-process
@@ -4690,10 +4764,12 @@ impl IpcServer {
                     };
                     let inferred = infer_response_target_guest_id_for_agent_task(
                         graph,
+                        local_node_id,
                         &target_role,
                         None,
                         &task_json,
                         &live_agent_guests,
+                        heal_queue,
                     );
                     if let Some(ref guest_id) = inferred {
                         info!(
@@ -4709,7 +4785,7 @@ impl IpcServer {
                 if target_guest_id.is_none() {
                     if let Some(action) = response_like_agent_action {
                         let message = format!(
-                            "response-like action [{action}] targeted role [agent] without a concrete return guest"
+                            "[response_route_unresolved] response-like action [{action}] targeted role [agent] without a concrete return guest"
                         );
                         warn!(
                             action = action.as_str(),
@@ -4717,13 +4793,22 @@ impl IpcServer {
                             target_node = target_node.as_str(),
                             "EmitTask rejected unresolved response return route"
                         );
+                        // RC-4 (2026-07-09 stuck-turn forensic): classify+tag so this
+                        // becomes A3-countable instead of filing zero heal rows.
                         if let Some(hq) = heal_queue {
-                            if let Err(err) = hq.push_error("aiua.response_return_route", &message)
-                            {
-                                warn!(
-                                    error = %err,
-                                    "Failed to push unresolved response route to heal queue"
-                                );
+                            match hq.push_classified(
+                                "aiua.response_return_route",
+                                &message,
+                                "medium",
+                                "response_route_unresolved",
+                            ) {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    warn!(
+                                        error = %err,
+                                        "Failed to push unresolved response route to heal queue"
+                                    );
+                                }
                             }
                         }
                         return IpcResponse::error(
@@ -14230,10 +14315,12 @@ pub(crate) mod tests {
 
         let resolved = infer_response_target_guest_id_for_agent_task(
             &graph,
+            "local-aiua-01",
             "agent",
             None,
             &response_task_json("sess-beacon-stuck"),
             &live_agent_guests,
+            None,
         );
 
         assert_eq!(resolved, Some("agent-beacon".to_string()));
@@ -14264,10 +14351,12 @@ pub(crate) mod tests {
 
         let resolved = infer_response_target_guest_id_for_agent_task(
             &graph,
+            "local-aiua-01",
             "agent",
             None,
             &response_task_json("sess-active-live"),
             &live_agent_guests,
+            None,
         );
 
         assert_eq!(resolved, Some("agent-beacon:orchestrator".to_string()));
@@ -14307,13 +14396,231 @@ pub(crate) mod tests {
 
         let resolved = infer_response_target_guest_id_for_agent_task(
             &graph,
+            "local-aiua-01",
             "agent",
             None,
             &task_json,
             &live_agent_guests,
+            None,
         );
 
         assert_eq!(resolved, Some("agent-beacon:developer".to_string()));
+    }
+
+    /// Minimal [`ansible_mesh_core::heal_queue::HealQueueStorage`] test double that
+    /// records `push_classified` calls: `(guest_id, raw_text, severity, pattern_tag)`.
+    #[derive(Default)]
+    struct RecordingHealQueue {
+        pushed: StdMutex<Vec<(String, String, String, String)>>,
+    }
+
+    impl ansible_mesh_core::heal_queue::HealQueueStorage for RecordingHealQueue {
+        fn push_error(&self, guest_id: &str, raw_text: &str) -> anyhow::Result<String> {
+            self.pushed.lock().unwrap().push((
+                guest_id.to_string(),
+                raw_text.to_string(),
+                String::new(),
+                String::new(),
+            ));
+            Ok("hq-1".to_string())
+        }
+        fn push_classified(
+            &self,
+            guest_id: &str,
+            raw_text: &str,
+            severity: &str,
+            pattern_tag: &str,
+        ) -> anyhow::Result<Option<String>> {
+            self.pushed.lock().unwrap().push((
+                guest_id.to_string(),
+                raw_text.to_string(),
+                severity.to_string(),
+                pattern_tag.to_string(),
+            ));
+            Ok(Some("hq-1".to_string()))
+        }
+        fn pending_errors(
+            &self,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::heal_queue::HealQueueRow>> {
+            Ok(vec![])
+        }
+        fn update_triage(
+            &self,
+            _id: &str,
+            _severity: &str,
+            _pattern_tag: &str,
+            _heal_action: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn resolve(&self, _id: &str, _outcome: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn vacuum_old(&self, _older_than_secs: u64) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    fn seed_local_hotel_with_infra_guest(graph: &GraphDomain) {
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/test.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: "vps-jane:life-graph-runner".into(),
+                role: "life-graph-runner".into(),
+                config_json: "{}".into(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            })
+            .expect("seed infra guest");
+    }
+
+    // RC-2 (2026-07-09 stuck-turn forensic): when a session's active incarnation is a
+    // non-agent infra guest (e.g. vps-jane:life-graph-runner, the tool/datasource
+    // runner that produced the tool RESULT now flowing back), the response must never
+    // be routed to that guest, and must never be silently redirected to the
+    // orchestrator either — it belongs to the session's primary agent. This is the
+    // same poisoning family PR #174 guarded in `resolve_agent_route` /
+    // `guest_can_fill_agent_placement`, mirrored here for the outbound response path.
+    #[test]
+    fn infer_response_target_redirects_from_poisoned_infra_guest_to_primary_agent() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_local_hotel_with_infra_guest(&graph);
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-poisoned-response".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("vps-jane:life-graph-runner".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        // Nothing is registered live under role="agent" — reproducing the forensic:
+        // only the tool runner shows up as the (wrong) active incarnation.
+        let live_agent_guests: Vec<String> = vec![];
+        let task_json = serde_json::json!({
+            "session_id": "sess-poisoned-response",
+            "action": "tool_result",
+            "content": "life.observe result returning to the agent"
+        })
+        .to_string();
+        let hq = RecordingHealQueue::default();
+
+        let resolved = infer_response_target_guest_id_for_agent_task(
+            &graph,
+            "local-aiua-01",
+            "agent",
+            None,
+            &task_json,
+            &live_agent_guests,
+            Some(&hq),
+        );
+
+        assert_ne!(
+            resolved,
+            Some("vps-jane:life-graph-runner".to_string()),
+            "tool RESULT must never be routed back to the runner that produced it"
+        );
+        assert_eq!(
+            resolved,
+            Some("agent-beacon".to_string()),
+            "must resolve to the session's real agent, not an orchestrator guest-of-convenience"
+        );
+
+        // RC-4: the mis-route must be A3-countable even though routing recovered
+        // (this is the common case — primary_agent_id is set — that the earlier
+        // reject-only heal push missed entirely).
+        let pushed = hq.pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 1);
+        let (guest_id, _raw, severity, tag) = &pushed[0];
+        assert_eq!(guest_id, "vps-jane:life-graph-runner");
+        assert_eq!(severity, "medium");
+        assert_eq!(tag, "cross_hotel_misroute");
+    }
+
+    // RC-2/RC-4: when the poisoned infra guest can't be resolved to a real agent
+    // either (no primary_agent_id on the session), the response must be rejected —
+    // not silently dropped — and a heal event filed so the mis-route becomes
+    // A3-countable instead of invisible (2026-07-09 forensic: "file ZERO heal rows").
+    #[test]
+    fn infer_response_target_rejects_poisoned_infra_guest_and_files_heal_event() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_local_hotel_with_infra_guest(&graph);
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-poisoned-no-fallback".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: None,
+                active_incarnation_id: Some("vps-jane:life-graph-runner".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let live_agent_guests: Vec<String> = vec![];
+        let task_json = serde_json::json!({
+            "session_id": "sess-poisoned-no-fallback",
+            "action": "tool_result",
+            "content": "life.observe result with nowhere to go"
+        })
+        .to_string();
+        let hq = RecordingHealQueue::default();
+
+        let resolved = infer_response_target_guest_id_for_agent_task(
+            &graph,
+            "local-aiua-01",
+            "agent",
+            None,
+            &task_json,
+            &live_agent_guests,
+            Some(&hq),
+        );
+
+        assert_eq!(
+            resolved, None,
+            "unresolvable poisoned target must reject, not park silently"
+        );
+        let pushed = hq.pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 1);
+        let (guest_id, _raw, severity, tag) = &pushed[0];
+        assert_eq!(guest_id, "vps-jane:life-graph-runner");
+        assert_eq!(severity, "medium");
+        assert_eq!(tag, "cross_hotel_misroute");
     }
 
     #[tokio::test]

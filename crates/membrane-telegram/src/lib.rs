@@ -853,6 +853,94 @@ impl UpdateDedupe {
     }
 }
 
+// RC-3 (2026-07-09 stuck-turn forensic): `draft_already_final` only dedupes a
+// *second EDIT* against an existing draft. When a concurrent terminal task for
+// the same turn finds `active_turns` already cleared (e.g. eviction fan-out
+// firing multiple terminal EmitTasks for one evicted turn), `draft_message_id`
+// is `None` and the old code unconditionally POSTed a fresh `sendMessage` —
+// a duplicate reply to the user. `FinalizationDedupe` is a short-TTL,
+// session-scoped idempotency guard at the dispatch level: the first
+// finalization for a session marks it; any finalization dispatch that arrives
+// while that mark is still warm and finds no active turn of its own is a
+// duplicate and gets dropped instead of sent. TTL is intentionally short (see
+// [`TELEGRAM_FINALIZATION_DEDUPE_TTL_SECS`]) — long enough to absorb a
+// fan-out burst, short enough to never suppress a genuinely new turn on a
+// long-lived session.
+const TELEGRAM_FINALIZATION_DEDUPE_TTL_SECS: u64 = 30;
+const TELEGRAM_FINALIZATION_DEDUPE_MAX: usize = 256;
+
+/// Bounded TTL set of session_ids whose finalization dispatch was already sent.
+/// Same shape as [`UpdateDedupe`] but keyed by `session_id` (`String`) instead
+/// of Telegram `update_id` (`i64`) — see that type's docs for the eviction
+/// mechanics.
+struct FinalizationDedupe {
+    entries: VecDeque<(String, Instant)>,
+    seen: HashSet<String>,
+    ttl: Duration,
+    max: usize,
+}
+
+impl FinalizationDedupe {
+    fn new(ttl: Duration, max: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            seen: HashSet::new(),
+            ttl,
+            max,
+        }
+    }
+
+    /// Returns `true` if `session_id` was already marked finalized within the
+    /// TTL window (caller should drop this dispatch as a duplicate); `false`
+    /// on first sighting (now recorded, so a later duplicate is caught too).
+    fn check(&mut self, session_id: &str) -> bool {
+        self.prune();
+        if !self.seen.insert(session_id.to_string()) {
+            return true;
+        }
+        self.entries
+            .push_back((session_id.to_string(), Instant::now()));
+        while self.entries.len() > self.max {
+            if let Some((evicted, _)) = self.entries.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        false
+    }
+
+    fn prune(&mut self) {
+        while let Some((_, inserted_at)) = self.entries.front() {
+            if inserted_at.elapsed() > self.ttl {
+                if let Some((evicted, _)) = self.entries.pop_front() {
+                    self.seen.remove(&evicted);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+type FinalizationDedupeHandle = Arc<StdMutex<FinalizationDedupe>>;
+
+/// A turn-level heal-queue event queued from synchronous, non-async code
+/// (e.g. the duplicate-finalization drop path) for best-effort delivery on
+/// the next lease renew tick, which is the only point `TelegramSeatGuest`
+/// holds a live `PhiloticClient` (RC-4, 2026-07-09 stuck-turn forensic —
+/// membrane guests have no persistent IPC connection of their own, unlike
+/// philote's `ipc_client`).
+struct PendingHealEvent {
+    guest_id: String,
+    severity: &'static str,
+    pattern_tag: &'static str,
+    detail: String,
+}
+
+/// Caps how many heal events can queue up between renew ticks (~20s apart) so
+/// a pathological burst can't grow this unbounded; oldest entries are dropped
+/// first (best-effort diagnostics, never load-bearing).
+const PENDING_HEAL_EVENT_MAX: usize = 64;
+
 /// Start a `sendChatAction(typing)` heartbeat that refreshes every 4 seconds until cancelled.
 fn spawn_typing_heartbeat(
     http_client: reqwest::Client,
@@ -2463,6 +2551,14 @@ struct TelegramSeatGuest {
     /// long-lived guest, cloned (not recreated) into each new poll task's
     /// [`SeatPollContext`].
     update_dedupe: UpdateDedupeHandle,
+    /// RC-3 (2026-07-09 stuck-turn forensic) idempotency guard: marks a
+    /// session's finalization dispatch so a concurrent duplicate that finds
+    /// `active_turns` already cleared is dropped instead of double-sent.
+    finalization_dedupe: FinalizationDedupeHandle,
+    /// Heal-queue events queued from sync code, flushed on the next `renew()`
+    /// tick (the only point a live `PhiloticClient` is available). See
+    /// [`PendingHealEvent`].
+    pending_heal_events: Arc<StdMutex<VecDeque<PendingHealEvent>>>,
     lease_driver: LeaseDriver,
     lease_key: Option<String>,
     tg_base: Option<String>,
@@ -2503,6 +2599,11 @@ impl TelegramSeatGuest {
                 Duration::from_secs(TELEGRAM_UPDATE_DEDUPE_TTL_SECS),
                 TELEGRAM_UPDATE_DEDUPE_MAX,
             ))),
+            finalization_dedupe: Arc::new(StdMutex::new(FinalizationDedupe::new(
+                Duration::from_secs(TELEGRAM_FINALIZATION_DEDUPE_TTL_SECS),
+                TELEGRAM_FINALIZATION_DEDUPE_MAX,
+            ))),
+            pending_heal_events: Arc::new(StdMutex::new(VecDeque::new())),
             lease_driver: LeaseDriver::new(LeaseDriverConfig::default()),
             lease_key: None,
             tg_base: None,
@@ -2523,6 +2624,53 @@ impl TelegramSeatGuest {
         };
         for turn in drained {
             turn.cancel();
+        }
+    }
+
+    /// Queue a heal-queue event for best-effort delivery on the next `renew()`
+    /// tick (see [`PendingHealEvent`]). Synchronous, never blocks — safe to
+    /// call from non-async dispatch code such as the duplicate-finalization
+    /// drop path (RC-3/RC-4, 2026-07-09 stuck-turn forensic).
+    fn queue_heal_event(
+        &self,
+        guest_id: String,
+        severity: &'static str,
+        pattern_tag: &'static str,
+        detail: String,
+    ) {
+        let mut queue = self.pending_heal_events.lock().unwrap();
+        if queue.len() >= PENDING_HEAL_EVENT_MAX {
+            queue.pop_front();
+        }
+        queue.push_back(PendingHealEvent {
+            guest_id,
+            severity,
+            pattern_tag,
+            detail,
+        });
+    }
+
+    /// Flush any heal events queued since the last renew tick. Best-effort:
+    /// heal intake is diagnostics, not control flow, so a failed push is
+    /// logged and dropped rather than retried indefinitely.
+    async fn flush_pending_heal_events(&self, client: &mut PhiloticClient) {
+        let drained: Vec<PendingHealEvent> = {
+            let mut queue = self.pending_heal_events.lock().unwrap();
+            queue.drain(..).collect()
+        };
+        for event in drained {
+            let request = IpcRequest::PushHealEvent {
+                guest_id: event.guest_id.clone(),
+                severity: event.severity.to_string(),
+                pattern_tag: event.pattern_tag.to_string(),
+                detail: event.detail.clone(),
+            };
+            if let Err(e) = client.send_request(request).await {
+                warn!(
+                    pattern_tag = event.pattern_tag,
+                    "heal event push failed (best-effort): {e}"
+                );
+            }
         }
     }
 
@@ -2735,6 +2883,12 @@ impl MembraneGuest for TelegramSeatGuest {
     }
 
     async fn renew(&mut self, client: &mut PhiloticClient) -> Result<LeaseRenewResult> {
+        // Flush any heal events queued since the last tick — this is the only
+        // point `TelegramSeatGuest` holds a live `PhiloticClient` (RC-4,
+        // 2026-07-09 stuck-turn forensic). Runs even for a yielded seat / one
+        // with no lease key yet, so nothing queued during setup is lost.
+        self.flush_pending_heal_events(client).await;
+
         if self.yielded {
             return Ok(LeaseRenewResult::Ok { epoch: 0 });
         }
@@ -2883,6 +3037,20 @@ impl TelegramSeatGuest {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // RC-3 (2026-07-09 stuck-turn forensic): dedup finalization on the
+        // turn correlation id, which `FinalReplyPayload` always carries. This
+        // is what the forensic asked for and is strictly safer than keying on
+        // session_id: the eviction fan-out fires several terminal EmitTasks for
+        // ONE evicted turn (same turn_id → they collapse), while two genuinely
+        // distinct turn-less sends on the same long-lived session keep distinct
+        // turn_ids and are NOT false-dropped. Fall back to session_id only when
+        // a payload carries no turn_id (legacy / non-turn sends).
+        let dedupe_key = task
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| session_id.clone());
         let chat_id = task
             .get("chat_id")
             .and_then(|id| id.as_str())
@@ -3042,24 +3210,69 @@ impl TelegramSeatGuest {
         } else {
             // send_reply (or any unrecognised action): deliver to Telegram and
             // cancel the typing heartbeat for this session.
-            let (draft_message_id, draft_text, status_message_id, active_thread_id) = {
-                let removed = self.active_turns.lock().unwrap().remove(&session_id);
-                if let Some(active) = removed {
-                    let draft_message_id = active.draft_message_id;
-                    let draft_text = active.draft_text.clone();
-                    let status_message_id = active.status_message_id;
-                    let active_thread_id = active.thread_id.clone();
-                    active.cancel();
-                    (
-                        draft_message_id,
-                        draft_text,
-                        status_message_id,
-                        active_thread_id,
-                    )
-                } else {
-                    (None, String::new(), None, None)
+            //
+            // RC-3 (2026-07-09 stuck-turn forensic): the `remove` below is the
+            // serialization point for concurrent terminal dispatches of the
+            // *same* turn (eviction fan-out can fire several terminal
+            // EmitTasks for one evicted turn). Whichever caller wins the
+            // remove (`Some`) owns the finalization and immediately marks
+            // `finalization_dedupe` for this turn *before* releasing the
+            // `active_turns` lock — nesting the two lock acquisitions makes
+            // that mark visible-before-release, so any other caller that
+            // then finds `active_turns` already empty (`None`) is guaranteed
+            // to see the mark and can tell a genuine duplicate (drop it) from
+            // a legitimately turn-less send (proceed, unaffected — `check`
+            // only just marked it, so it returns `false` and this call
+            // becomes the owner instead). Keyed on `dedupe_key` (turn_id when
+            // present) so distinct turns on one session never false-collapse.
+            let (draft_message_id, draft_text, status_message_id, active_thread_id, is_duplicate) = {
+                let mut turns = self.active_turns.lock().unwrap();
+                let removed = turns.remove(&session_id);
+                match removed {
+                    Some(active) => {
+                        if !dedupe_key.is_empty() {
+                            self.finalization_dedupe.lock().unwrap().check(&dedupe_key);
+                        }
+                        let draft_message_id = active.draft_message_id;
+                        let draft_text = active.draft_text.clone();
+                        let status_message_id = active.status_message_id;
+                        let active_thread_id = active.thread_id.clone();
+                        active.cancel();
+                        (
+                            draft_message_id,
+                            draft_text,
+                            status_message_id,
+                            active_thread_id,
+                            false,
+                        )
+                    }
+                    None => {
+                        let duplicate = !dedupe_key.is_empty()
+                            && self.finalization_dedupe.lock().unwrap().check(&dedupe_key);
+                        (None, String::new(), None, None, duplicate)
+                    }
                 }
             };
+
+            if is_duplicate {
+                warn!(
+                    session_id = session_id.as_str(),
+                    dedupe_key = dedupe_key.as_str(),
+                    "[duplicate_finalization] Dropping duplicate finalization dispatch; final response already sent."
+                );
+                // Heal guest_id keyed on the seat (stable across sessions) so
+                // A3 aggregates the recurrence of this bug instead of scattering
+                // one low-count row per session (RC-4).
+                self.queue_heal_event(
+                    format!("membrane-telegram:{}", self.seat_guest_id),
+                    "medium",
+                    "duplicate_finalization",
+                    format!(
+                        "dropped duplicate terminal send for turn [{dedupe_key}] (session [{session_id}]); final response already sent (2026-07-09 stuck-turn forensic RC-3)"
+                    ),
+                );
+                return;
+            }
 
             let raw_content = task
                 .get("content")
@@ -3366,14 +3579,16 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::{
         TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand, TelegramFileRef,
-        UpdateDedupe, approval_callback_content, build_combined_telegram_commands,
-        build_telegram_menu_commands, default_attachment_name, enrich_attachment_with_transport,
-        next_error_backoff_secs, normalize_telegram_menu_command_name, telegram_command,
-        telegram_format_text, telegram_help_text, telegram_inbound_envelope,
+        TelegramSeatGuest, UpdateDedupe, approval_callback_content,
+        build_combined_telegram_commands, build_telegram_menu_commands, default_attachment_name,
+        enrich_attachment_with_transport, next_error_backoff_secs,
+        normalize_telegram_menu_command_name, telegram_command, telegram_format_text,
+        telegram_help_text, telegram_inbound_envelope,
     };
     use philotic_client::CommandManifestEntry;
     use serde_json::{Value, json};
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     #[test]
     fn telegram_text_envelope_normalizes_threaded_message() {
@@ -4274,6 +4489,227 @@ mod tests {
             callback_id,
             Some("cbq-1"),
             "duplicate callback updates must still expose the callback id for answerCallbackQuery"
+        );
+    }
+
+    // --- FinalizationDedupe (RC-3: 2026-07-09 stuck-turn forensic) ---
+
+    #[test]
+    fn finalization_dedupe_suppresses_repeat_session_id() {
+        let mut dedupe = super::FinalizationDedupe::new(Duration::from_secs(300), 256);
+        assert!(
+            !dedupe.check("sess-1"),
+            "first finalization for a session must not be flagged duplicate"
+        );
+        assert!(
+            dedupe.check("sess-1"),
+            "second finalization dispatch for the same session within the TTL must be flagged duplicate"
+        );
+        assert!(
+            dedupe.check("sess-1"),
+            "third dispatch must also be flagged duplicate"
+        );
+    }
+
+    #[test]
+    fn finalization_dedupe_treats_distinct_sessions_independently() {
+        let mut dedupe = super::FinalizationDedupe::new(Duration::from_secs(300), 256);
+        assert!(!dedupe.check("sess-a"));
+        assert!(!dedupe.check("sess-b"));
+        assert!(dedupe.check("sess-a"));
+        assert!(dedupe.check("sess-b"));
+    }
+
+    #[test]
+    fn finalization_dedupe_expires_entries_after_ttl() {
+        // A later, genuinely new turn on a long-lived session must not be
+        // suppressed forever — only a duplicate arriving inside the short
+        // fan-out window is dropped.
+        let mut dedupe = super::FinalizationDedupe::new(Duration::from_millis(20), 256);
+        assert!(!dedupe.check("sess-1"));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !dedupe.check("sess-1"),
+            "a finalization long after the TTL window must be treated as a new turn, not a duplicate"
+        );
+    }
+
+    #[test]
+    fn finalization_dedupe_evicts_oldest_beyond_max() {
+        let mut dedupe = super::FinalizationDedupe::new(Duration::from_secs(300), 2);
+        assert!(!dedupe.check("sess-1"));
+        assert!(!dedupe.check("sess-2"));
+        assert!(
+            !dedupe.check("sess-3"),
+            "third distinct session evicts the oldest"
+        );
+        assert!(
+            !dedupe.check("sess-1"),
+            "sess-1 was evicted for capacity and must be treated as a fresh finalization"
+        );
+    }
+
+    fn new_test_seat_guest() -> TelegramSeatGuest {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        TelegramSeatGuest::new(
+            "seat-test".into(),
+            "telegram_bot_token_test".into(),
+            "agent-jane".into(),
+            reqwest::Client::new(),
+            "https://api.telegram.org".into(),
+            "https://api.telegram.org".into(),
+            "http://127.0.0.1:0".into(),
+            inbound_tx,
+        )
+    }
+
+    // RC-3 regression (2026-07-09 stuck-turn forensic): reproduces the harder
+    // "eviction fan-out" case explicitly called out in the forensic — multiple
+    // terminal EmitTasks for one evicted turn, arriving after `active_turns`
+    // has already been cleared (here: never populated at all, the deployed
+    // incident's end state). Before the fix, every one of them unconditionally
+    // POSTed a fresh `sendMessage`; only the first must survive.
+    #[tokio::test]
+    async fn duplicate_finalization_dispatch_after_active_turn_cleared_is_dropped() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+
+        // Real eviction fan-out carries a shared turn_id across the duplicate
+        // terminal EmitTasks — the dedup keys on it.
+        let task_json = json!({
+            "session_id": "sess-evicted-1",
+            "turn_id": "telegram-update-42",
+            "action": "send_reply",
+            "chat_id": "123",
+            "content": "final answer"
+        })
+        .to_string();
+
+        // First terminal dispatch: active_turns has nothing tracked (matches
+        // the deployed incident), so this call becomes the owner and proceeds.
+        guest.handle_inbound_task(&task_json).await;
+        // Second terminal dispatch for the SAME turn (eviction fan-out):
+        // active_turns is still empty, but the first call marked
+        // finalization_dedupe, so this one must be dropped.
+        guest.handle_inbound_task(&task_json).await;
+
+        // The surviving send happens inside a spawned task; give it a beat.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let sent = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "sendMessage")
+            .count();
+        assert_eq!(
+            sent, 1,
+            "duplicate finalization dispatch must not produce a second sendMessage"
+        );
+
+        // RC-4: the drop must be visible to A3 via a queued heal event, keyed on
+        // the seat guest (stable across sessions) so recurrence aggregates.
+        let pending = guest.pending_heal_events.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].pattern_tag, "duplicate_finalization");
+        assert_eq!(pending[0].severity, "medium");
+        assert_eq!(pending[0].guest_id, "membrane-telegram:seat-test");
+    }
+
+    // RC-3 false-drop guard (Finding B): two GENUINELY distinct turns on the
+    // same session, both arriving turn-less (active_turns already cleared) and
+    // inside the dedupe TTL window, must BOTH be delivered — session_id keying
+    // would have collapsed the second one; turn_id keying does not.
+    #[tokio::test]
+    async fn distinct_turns_on_same_session_are_both_delivered_within_ttl() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+
+        let task_turn_a = json!({
+            "session_id": "sess-shared",
+            "turn_id": "telegram-update-1",
+            "action": "send_reply",
+            "chat_id": "123",
+            "content": "answer to turn A"
+        })
+        .to_string();
+        let task_turn_b = json!({
+            "session_id": "sess-shared",
+            "turn_id": "telegram-update-2",
+            "action": "send_reply",
+            "chat_id": "123",
+            "content": "answer to turn B"
+        })
+        .to_string();
+
+        // Both dispatched back-to-back, well inside the 30s TTL.
+        guest.handle_inbound_task(&task_turn_a).await;
+        guest.handle_inbound_task(&task_turn_b).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let sent = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "sendMessage")
+            .count();
+        assert_eq!(
+            sent, 2,
+            "distinct turn_ids on one session must not be treated as duplicates"
+        );
+        assert!(
+            guest.pending_heal_events.lock().unwrap().is_empty(),
+            "no duplicate_finalization heal event should be filed for distinct turns"
+        );
+    }
+
+    // A genuinely new turn on the same session, arriving well after the
+    // dedupe TTL window, must NOT be treated as a duplicate.
+    #[tokio::test]
+    async fn finalization_dispatch_after_dedupe_ttl_is_not_dropped() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+        // Shrink the TTL directly so the test doesn't need to sleep for the
+        // production 30s window.
+        guest.finalization_dedupe = std::sync::Arc::new(std::sync::Mutex::new(
+            super::FinalizationDedupe::new(Duration::from_millis(20), 256),
+        ));
+
+        let task_json = json!({
+            "session_id": "sess-long-lived",
+            "action": "send_reply",
+            "chat_id": "123",
+            "content": "first reply"
+        })
+        .to_string();
+        guest.handle_inbound_task(&task_json).await;
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let task_json_2 = json!({
+            "session_id": "sess-long-lived",
+            "action": "send_reply",
+            "chat_id": "123",
+            "content": "second, later reply"
+        })
+        .to_string();
+        guest.handle_inbound_task(&task_json_2).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let sent = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "sendMessage")
+            .count();
+        assert_eq!(
+            sent, 2,
+            "a genuinely new turn arriving after the dedupe TTL must still be delivered"
         );
     }
 }
