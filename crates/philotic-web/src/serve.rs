@@ -3595,6 +3595,8 @@ struct CreateCronBody {
     guaranteed: bool,
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    silent_ok: bool,
 }
 
 async fn handle_cron_create(
@@ -3621,7 +3623,7 @@ async fn handle_cron_create(
         next_fire_at: now_ms,
         created_at: now_ms,
         created_by: CronJobSource::Operator,
-        silent_ok: false,
+        silent_ok: body.silent_ok,
         // Newly registered jobs always want isolated cron sessions; the
         // `RegisterCronJob` IPC handler re-asserts this regardless, but
         // setting it here too keeps the constructed value honest.
@@ -8458,6 +8460,29 @@ mod tests {
         assert_eq!(
             summarize_router_event("text.generate", "gemini", "failure", Some("RATE_LIMIT")),
             "text.generate via gemini failed (RATE_LIMIT)"
+        );
+    }
+
+    #[test]
+    fn create_cron_body_reads_explicit_silent_ok_and_defaults_to_false() {
+        let with_silent: CreateCronBody = serde_json::from_value(serde_json::json!({
+            "schedule": "0 0 7 * * * *",
+            "target_role": "orchestrator",
+            "payload": "{}",
+            "silent_ok": true
+        }))
+        .expect("body with silent_ok should deserialize");
+        assert!(with_silent.silent_ok);
+
+        let without_silent: CreateCronBody = serde_json::from_value(serde_json::json!({
+            "schedule": "0 0 7 * * * *",
+            "target_role": "orchestrator",
+            "payload": "{}"
+        }))
+        .expect("body without silent_ok should deserialize");
+        assert!(
+            !without_silent.silent_ok,
+            "omitted silent_ok must default to false, preserving today's always-delivered behavior"
         );
     }
 

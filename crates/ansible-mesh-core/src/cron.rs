@@ -139,9 +139,12 @@ pub struct CronJob {
     pub created_by: CronJobSource,
 
     /// Silent-ack policy: when true, a reply matching the Hermes `[SILENT]`
-    /// convention (see [`is_silent_cron_reply`]) is suppressed — ledgered,
-    /// never delivered to the operator channel. Defaults false so existing
-    /// jobs and rows without this field keep delivering every fire.
+    /// convention (see [`is_silent_cron_reply`]) is suppressed — never
+    /// delivered to the operator channel. Defaults false so existing jobs
+    /// and rows without this field keep delivering every fire. Wired into
+    /// `aiua`'s `EmitTask` handler (`silent_cron_reply_suppressed`), which
+    /// checks this flag against the isolated `cron:<job_id>` session's
+    /// `send_reply` content before it reaches any subscriber.
     #[serde(default)]
     pub silent_ok: bool,
 

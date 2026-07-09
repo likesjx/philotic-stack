@@ -3831,6 +3831,10 @@ impl AgentRuntime {
                     .get("guaranteed")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let silent_ok = args
+                    .get("silent_ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3862,7 +3866,7 @@ impl AgentRuntime {
                     next_fire_at: next_fire,
                     created_at: now_ms,
                     created_by: CronJobSource::Guest(self.agent_id.clone()),
-                    silent_ok: false,
+                    silent_ok,
                     // Newly registered jobs always want isolated cron sessions;
                     // the `RegisterCronJob` IPC handler re-asserts this
                     // regardless, but setting it here too keeps the
