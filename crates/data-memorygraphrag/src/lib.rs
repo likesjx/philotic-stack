@@ -1535,6 +1535,74 @@ impl LifePatchApplyInput {
     }
 }
 
+/// Read-only input for `life.patch.list` — the operator/steward patch-review
+/// surface. Lists governed patch proposals with their risk tier, lifecycle
+/// status, and provenance so a steward can review what the growth loop has
+/// generated. This tool never mutates the graph.
+///
+/// Like `life.patch.apply`, this is a dispatch-only tool: it is intentionally
+/// kept out of `life_graph_tool_catalog` (it is an operator/steward review
+/// surface, not an agent-turn cognitive tool).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LifePatchListInput {
+    /// Lifecycle statuses to include. Empty = the default pending review set
+    /// (`proposed` + `awaiting_confirmation`). Unknown tokens are dropped.
+    #[serde(default)]
+    pub status_filter: Vec<String>,
+    /// Max rows to return. Clamped to `1..=MAX_LIMIT`; defaults to
+    /// `DEFAULT_LIMIT` when unset.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl LifePatchListInput {
+    pub const DEFAULT_LIMIT: usize = 50;
+    pub const MAX_LIMIT: usize = 200;
+
+    /// Known patch lifecycle statuses a review query may target.
+    fn known_statuses() -> [&'static str; 4] {
+        [
+            crate::cypher::PATCH_STATUS_PROPOSED,
+            crate::cypher::PATCH_STATUS_AWAITING_CONFIRMATION,
+            crate::cypher::PATCH_STATUS_APPLIED,
+            crate::cypher::PATCH_STATUS_REJECTED,
+        ]
+    }
+
+    fn pending_statuses() -> Vec<String> {
+        vec![
+            crate::cypher::PATCH_STATUS_PROPOSED.to_string(),
+            crate::cypher::PATCH_STATUS_AWAITING_CONFIRMATION.to_string(),
+        ]
+    }
+
+    /// Validated status set to query. Unknown tokens are dropped; an empty or
+    /// fully-invalid filter falls back to the pending review set so the
+    /// surface always returns something useful.
+    pub fn effective_statuses(&self) -> Vec<String> {
+        if self.status_filter.is_empty() {
+            return Self::pending_statuses();
+        }
+        let known = Self::known_statuses();
+        let mut out: Vec<String> = Vec::new();
+        for status in &self.status_filter {
+            if known.contains(&status.as_str()) && !out.contains(status) {
+                out.push(status.clone());
+            }
+        }
+        if out.is_empty() {
+            return Self::pending_statuses();
+        }
+        out
+    }
+
+    pub fn effective_limit(&self) -> usize {
+        self.limit
+            .unwrap_or(Self::DEFAULT_LIMIT)
+            .clamp(1, Self::MAX_LIMIT)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", content = "input", rename_all = "snake_case")]
 pub enum LifeGraphToolRequest {
@@ -2956,5 +3024,38 @@ mod tests {
             operator_approved: true,
         };
         assert!(blank.validate().is_err());
+    }
+
+    #[test]
+    fn life_patch_list_input_defaults_and_validates() {
+        // Empty input → pending review set, default limit.
+        let default = LifePatchListInput::default();
+        assert_eq!(
+            default.effective_statuses(),
+            vec![
+                crate::cypher::PATCH_STATUS_PROPOSED.to_string(),
+                crate::cypher::PATCH_STATUS_AWAITING_CONFIRMATION.to_string(),
+            ]
+        );
+        assert_eq!(default.effective_limit(), LifePatchListInput::DEFAULT_LIMIT);
+
+        // Unknown statuses dropped; explicit known status kept + deduped.
+        let filtered = LifePatchListInput {
+            status_filter: vec!["applied".into(), "applied".into(), "bogus".into()],
+            limit: Some(9999),
+        };
+        assert_eq!(filtered.effective_statuses(), vec!["applied".to_string()]);
+        assert_eq!(filtered.effective_limit(), LifePatchListInput::MAX_LIMIT);
+
+        // All-invalid filter falls back to pending set.
+        let invalid = LifePatchListInput {
+            status_filter: vec!["nope".into()],
+            limit: Some(0),
+        };
+        assert_eq!(
+            invalid.effective_statuses(),
+            LifePatchListInput::pending_statuses()
+        );
+        assert_eq!(invalid.effective_limit(), 1);
     }
 }

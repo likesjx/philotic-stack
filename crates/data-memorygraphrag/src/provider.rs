@@ -8,10 +8,11 @@ use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
     GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchApplyInput,
-    LifePatchProposalInput, LifeResolveInput, MemoryGraphRagRunner, PatchApplyDecision, PatchGate,
-    PatchKind, PatchRisk, PolicyFilter, RankingWeights, ReliabilityBasis, RetrievalFeedbackInput,
-    RetrievalFeedbackRating, RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget,
-    SemanticSpace, SourceKind, SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
+    LifePatchListInput, LifePatchProposalInput, LifeResolveInput, MemoryGraphRagRunner,
+    PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter, RankingWeights,
+    ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery,
+    RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef,
+    SourceReliability, ValidationState, feedback_edge_specs,
 };
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
 use neo4rs::{
@@ -422,6 +423,7 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.conflict" | "life.conflict.handle" => self.handle_conflict(task).await,
             "life.patch.propose" => self.handle_patch_propose(task).await,
             "life.patch.apply" => self.handle_patch_apply(task).await,
+            "life.patch.list" => self.handle_patch_list(task).await,
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -1457,6 +1459,54 @@ impl LifeGraphProvider {
         })))
     }
 
+    /// Handle `life.patch.list` — the READ-ONLY patch review surface.
+    ///
+    /// Lists governed patch proposals (default: the pending set) with their
+    /// risk tier, gate, lifecycle status, audit anchor, and a compact
+    /// provenance summary drawn from the stored `patch_json`. This handler
+    /// issues only a single read query and never mutates the graph.
+    async fn handle_patch_list(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifePatchListInput =
+            serde_json::from_value(task.parameters.clone()).unwrap_or_default();
+        let statuses = input.effective_statuses();
+        let limit = input.effective_limit();
+        let cypher = cypher::patch_list_query(&statuses, limit);
+
+        let graph = self.connect().await?;
+        let mut rows = graph.execute(query(&cypher)).await?;
+        let mut patches = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let risk: String = row.get("risk").unwrap_or_default();
+            let gate = serde_json::from_value::<PatchRisk>(json!(risk))
+                .ok()
+                .map(|r| r.gate());
+            let patch_json: String = row.get("patch_json").unwrap_or_default();
+            let provenance = patch_provenance_summary(&patch_json);
+            patches.push(json!({
+                "patch_id": opt_str(row.get("patch_id").unwrap_or_default()),
+                "patch_kind": opt_str(row.get("patch_kind").unwrap_or_default()),
+                "risk": opt_str(risk),
+                "gate": gate,
+                "status": opt_str(row.get("status").unwrap_or_default()),
+                "summary": opt_str(row.get("summary").unwrap_or_default()),
+                "rationale": opt_str(row.get("rationale").unwrap_or_default()),
+                "proposed_at": opt_str(row.get("proposed_at").unwrap_or_default()),
+                "status_updated_at": opt_str(row.get("status_updated_at").unwrap_or_default()),
+                "autonomy_audit_id": opt_str(row.get("autonomy_audit_id").unwrap_or_default()),
+                "provenance": provenance,
+            }));
+        }
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "read_only": true,
+            "statuses": statuses,
+            "limit": limit,
+            "count": patches.len(),
+            "patches": patches,
+        })))
+    }
+
     async fn execute_conflict_cypher(&self, compiled: &cypher::ConflictCypher) -> Result<()> {
         let graph = self.connect().await?;
         let mut q = query(&compiled.query)
@@ -2005,6 +2055,67 @@ fn commitments_approaching_cypher(deadline: &str) -> String {
         ),
         deadline = deadline
     )
+}
+
+/// Map an empty string (a missing Memgraph property read as `""`) to JSON
+/// null so the read-only patch listing does not fabricate empty values.
+fn opt_str(s: String) -> Value {
+    if s.is_empty() {
+        Value::Null
+    } else {
+        Value::String(s)
+    }
+}
+
+/// Compact, bounded provenance summary derived from a patch node's stored
+/// `patch_json`. Surfaces evidence count, contributing sources, operator
+/// approval, and embedded edge-spec count for the review surface without
+/// dumping the full patch payload.
+fn patch_provenance_summary(patch_json: &str) -> Value {
+    let Ok(value) = serde_json::from_str::<Value>(patch_json) else {
+        return json!({ "parse_error": true });
+    };
+    let packets = value.get("evidence_packets").and_then(Value::as_array);
+    let evidence_count = packets.map(|p| p.len()).unwrap_or(0);
+    let mut sources = Vec::new();
+    if let Some(packets) = packets {
+        for packet in packets {
+            if let Some(refs) = packet.get("source_refs").and_then(Value::as_array) {
+                for source in refs {
+                    let source_id = source
+                        .get("source_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if source_id.is_empty() {
+                        continue;
+                    }
+                    sources.push(json!({
+                        "source_id": source_id,
+                        "source_kind": source.get("source_kind").and_then(Value::as_str),
+                    }));
+                    if sources.len() >= 8 {
+                        break;
+                    }
+                }
+            }
+            if sources.len() >= 8 {
+                break;
+            }
+        }
+    }
+    json!({
+        "evidence_count": evidence_count,
+        "sources": sources,
+        "operator_approved": value
+            .get("operator_approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "edge_spec_count": value
+            .get("edge_specs")
+            .and_then(Value::as_array)
+            .map(|specs| specs.len())
+            .unwrap_or(0),
+    })
 }
 
 fn recall_feedback_patch_proposal(
@@ -2584,6 +2695,41 @@ mod tests {
         assert_eq!(patch.patch_kind, PatchKind::AttentionPatch);
         assert_eq!(patch.risk, PatchRisk::Medium);
         assert!(patch.rationale.contains("operator confirmation"));
+    }
+
+    #[test]
+    fn patch_provenance_summary_extracts_sources_and_counts() {
+        let patch_json = json!({
+            "patch_id": "patch:recall-feedback:f1",
+            "operator_approved": false,
+            "edge_specs": [],
+            "evidence_packets": [{
+                "source_refs": [
+                    {"source_id": "agent:memorygraphrag", "source_kind": "runtime_observation"},
+                    {"source_id": "", "source_kind": "ignored_empty"}
+                ]
+            }]
+        })
+        .to_string();
+        let summary = patch_provenance_summary(&patch_json);
+        assert_eq!(summary["evidence_count"], 1);
+        assert_eq!(summary["operator_approved"], false);
+        assert_eq!(summary["edge_spec_count"], 0);
+        let sources = summary["sources"].as_array().expect("sources array");
+        assert_eq!(sources.len(), 1, "empty source_id must be dropped");
+        assert_eq!(sources[0]["source_id"], "agent:memorygraphrag");
+    }
+
+    #[test]
+    fn patch_provenance_summary_flags_unparseable_json() {
+        let summary = patch_provenance_summary("not json");
+        assert_eq!(summary["parse_error"], true);
+    }
+
+    #[test]
+    fn opt_str_maps_empty_to_null() {
+        assert_eq!(opt_str(String::new()), Value::Null);
+        assert_eq!(opt_str("x".into()), Value::String("x".into()));
     }
 
     #[test]
