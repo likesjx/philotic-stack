@@ -7363,6 +7363,45 @@ mod tests {
     }
 
     #[test]
+    fn done_and_confirm_turn_projects_life_commit() {
+        // Regression for the "done means done" bug: Beacon's real production turn
+        // "Confirm for both. Finished my YPT." matched none of life.steward's
+        // pre-fix keywords (no "life.", "openloop", "commitment", etc.), so the
+        // whole life.steward tool group — including life.commit and life.resolve
+        // — was silently suppressed. The model then had no way to promote the
+        // matching proposed node to confirmed or close the loop, and fell back to
+        // re-stating stale recalled content as if it were current. See
+        // catalog::skill_is_relevant_for_turn's loop-lifecycle-verb keywords.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon-01".into(), "telegram".into());
+        for tool in [
+            "life.observe",
+            "life.recall",
+            "life.recall.feedback",
+            "life.commit",
+            "life.resolve",
+        ] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+
+        let projected = state.project_tools_for_turn("Confirm for both. Finished my YPT. \n\nLet's ask aria why you sent me so many messages");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            projected_names.contains("life.commit"),
+            "expected life.commit to survive tool projection, got {projected_names:?}"
+        );
+        assert!(
+            projected_names.contains("life.resolve"),
+            "expected life.resolve to survive tool projection, got {projected_names:?}"
+        );
+    }
+
+    #[test]
     fn incarnation_assembly_preserves_local_agent_routes() {
         // Regression: binding a remote LifeGraph runner must not make local-agent tools
         // visible without routes. Beacon hit this as: "Tool role.list has no assembled

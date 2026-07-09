@@ -93,6 +93,10 @@ pub struct CommitCypher {
     pub confidence: f64,
     pub claim_summary: String,
     pub confirmed_at: String,
+    /// Empty string sentinel means "leave lifecycle status unchanged" — see
+    /// the CASE-empty-string-preserve pattern in `compile_commit`.
+    pub loop_status: String,
+    pub resolution_note: String,
 }
 
 #[derive(Debug)]
@@ -306,6 +310,10 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
         return Err(format!("unknown Life Graph label: {label}"));
     }
 
+    // loop_status/resolution_note use the same CASE-empty-string-preserve
+    // pattern as observed_role/origin_engram_id in compile_observe: an empty
+    // string parameter means "leave the existing property untouched" rather
+    // than overwriting it with null.
     let query = format!(
         concat!(
             "MERGE (n:{label} {{id: $id}}) ",
@@ -313,8 +321,11 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
             "n.last_confirmed_at = $confirmed_at, ",
             "n.confidence = $confidence, ",
             "n.claim_summary = $claim_summary, ",
-            "n.packet_id = $packet_id ",
-            "RETURN n.id AS id, n.validation_state AS validation_state",
+            "n.packet_id = $packet_id, ",
+            "n.status = CASE $loop_status WHEN '' THEN n.status ELSE $loop_status END, ",
+            "n.resolved_at = CASE $loop_status WHEN '' THEN n.resolved_at ELSE $confirmed_at END, ",
+            "n.resolution_note = CASE $resolution_note WHEN '' THEN n.resolution_note ELSE $resolution_note END ",
+            "RETURN n.id AS id, n.validation_state AS validation_state, n.status AS status",
         ),
         label = label
     );
@@ -327,6 +338,8 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
         confidence: input.evidence.confidence as f64,
         claim_summary: input.evidence.claim_summary.clone(),
         confirmed_at: now_iso.to_string(),
+        loop_status: input.loop_status.clone().unwrap_or_default(),
+        resolution_note: input.resolution_note.clone().unwrap_or_default(),
     })
 }
 
@@ -954,6 +967,8 @@ mod tests {
             &crate::LifeCommitInput {
                 evidence,
                 operator_approved: false,
+                loop_status: None,
+                resolution_note: None,
             },
             "2026-06-05T09:00:00Z",
         )
@@ -963,6 +978,48 @@ mod tests {
         assert_eq!(compiled.confirmed_at, "2026-06-05T09:00:00Z");
         assert!(compiled.query.contains("MERGE (n:OpenLoop {id: $id})"));
         assert!(compiled.query.contains("n.validation_state = 'confirmed'"));
+        // No loop_status supplied — the sentinel is empty, so the query must
+        // preserve the existing n.status rather than clobbering it with null.
+        assert_eq!(compiled.loop_status, "");
+        assert!(
+            compiled
+                .query
+                .contains("CASE $loop_status WHEN '' THEN n.status")
+        );
+    }
+
+    #[test]
+    fn compile_commit_with_loop_status_closes_the_loop() {
+        // This is the "Confirm for both. Finished my YPT." case: the operator
+        // reports the underlying loop done in the same breath as confirming
+        // it, so life.commit must be able to close it, not just promote
+        // validation_state. See bug: Beacon re-recorded stale "paused"
+        // content instead of resolving the loop because no tool set status.
+        let mut evidence = minimal_observe_input("OpenLoop").evidence;
+        evidence.validation_state = ValidationState::Confirmed;
+        evidence.claim_summary = "Completed YPT (Youth Protection Training).".to_string();
+        let compiled = compile_commit(
+            &crate::LifeCommitInput {
+                evidence,
+                operator_approved: true,
+                loop_status: Some("resolved".to_string()),
+                resolution_note: Some("operator reported complete 2026-07-09".to_string()),
+            },
+            "2026-07-09T11:08:00Z",
+        )
+        .unwrap();
+
+        assert_eq!(compiled.loop_status, "resolved");
+        assert_eq!(
+            compiled.resolution_note,
+            "operator reported complete 2026-07-09"
+        );
+        assert!(compiled.query.contains("n.resolved_at = CASE $loop_status"));
+        assert!(
+            compiled
+                .query
+                .contains("n.resolution_note = CASE $resolution_note")
+        );
     }
 
     #[test]

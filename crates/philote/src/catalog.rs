@@ -408,6 +408,25 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("note this")
                 || t.contains("remember this")
                 || t.contains("log this")
+                // Loop-lifecycle verbs: the words an operator actually types when
+                // closing something out or ratifying a proposed item. Without these,
+                // "Confirm for both. Finished my YPT." projects zero life.* tools —
+                // the model has no way to call life.commit even though the
+                // life.steward charter explicitly instructs it to close/confirm
+                // loops when the operator reports them done.
+                || t.contains("confirm")
+                || t.contains("confirmed")
+                || t.contains("done")
+                || t.contains("finished")
+                || t.contains("complete")
+                || t.contains("completed")
+                || t.contains("resolved")
+                || t.contains("close the loop")
+                || t.contains("close it out")
+                || t.contains("mark done")
+                || t.contains("mark complete")
+                || t.contains("mark it done")
+                || t.contains("cross the finish line")
         }
         "lifegraph.truth_summarizer" => {
             t.contains("lifegraph")
@@ -3087,7 +3106,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         ToolDefinition {
             tool_name: "life.commit".into(),
             description: "Promote a validated Life Graph evidence node to confirmed truth. \
-                          Requires either confirmed evidence or explicit operator approval."
+                          Requires either confirmed evidence or explicit operator approval. \
+                          This is also the tool for closing a loop: when the operator says a \
+                          previously-observed OpenLoop/Commitment/Goal is done, life.recall it \
+                          first to get its exact node id, then call life.commit on that id with \
+                          loop_status set to \"resolved\" and an up-to-date claim_summary — do \
+                          NOT leave stale recalled content (e.g. yesterday's \"paused/halfway\" \
+                          note) standing as the record once the operator has reported it done. \
+                          life.resolve is a SEPARATE tool for governed conflict handoffs only — \
+                          it cannot close an ordinary loop."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -3097,6 +3124,20 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "operator_approved": {
                         "type": "boolean",
                         "description": "True if operator has explicitly approved this commit."
+                    },
+                    "loop_status": {
+                        "type": "string",
+                        "description": "Optional. Set to \"resolved\" when the operator has \
+                            reported this node's underlying loop/commitment/goal as done — \
+                            marks it closed (distinct from validation_state, which tracks \
+                            evidence trust, not lifecycle). Omit to leave lifecycle status \
+                            unchanged."
+                    },
+                    "resolution_note": {
+                        "type": "string",
+                        "description": "Optional. Short note on how/why this closed, in the \
+                            operator's own words where possible (e.g. \"operator reported \
+                            complete 2026-07-09\"). Only meaningful alongside loop_status."
                     }
                 }
             }),
@@ -3128,9 +3169,12 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "life.resolve".into(),
         ToolDefinition {
             tool_name: "life.resolve".into(),
-            description: "Resolve a Life Graph conflict handoff after review. This is a \
+            description: "Resolve a Life Graph CONFLICT HANDOFF after review — operates only \
+                          on ConflictHandoff nodes opened via life.conflict. This is a \
                           governance tool: high-risk or operator-required handoffs need \
-                          explicit operator approval before resolution."
+                          explicit operator approval before resolution. It does NOT close an \
+                          ordinary OpenLoop/Commitment/Goal — for \"the operator says this is \
+                          done\", use life.commit with loop_status=\"resolved\" instead."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -3328,6 +3372,30 @@ mod tests {
             "lifegraph.truth_summarizer",
             "what's on the live graph"
         ));
+    }
+
+    #[test]
+    fn life_steward_relevant_for_loop_lifecycle_verbs() {
+        // Regression for the "done means done" bug: an operator turn like
+        // "Confirm for both. Finished my YPT." contains none of the older
+        // domain-noun keywords (no "life.", "openloop", "commitment", etc.),
+        // so life.steward's whole tool group — including life.commit — was
+        // silently suppressed and the model had no way to close the loop.
+        // Callers normalize turn text to lowercase (see normalized_turn_text
+        // in session/mod.rs) before reaching this function.
+        for turn in [
+            "confirm for both. finished my ypt.",
+            "done with the taxes",
+            "i finished that",
+            "mark it done",
+            "that's complete now",
+            "yep, resolved",
+        ] {
+            assert!(
+                skill_is_relevant_for_turn("life.steward", turn),
+                "expected life.steward to be relevant for {turn:?}"
+            );
+        }
     }
 
     #[test]

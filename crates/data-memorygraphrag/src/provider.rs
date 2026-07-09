@@ -978,7 +978,9 @@ impl LifeGraphProvider {
                     .param("confirmed_at", compiled.confirmed_at.as_str())
                     .param("confidence", compiled.confidence)
                     .param("claim_summary", compiled.claim_summary.as_str())
-                    .param("packet_id", compiled.packet_id.as_str()),
+                    .param("packet_id", compiled.packet_id.as_str())
+                    .param("loop_status", compiled.loop_status.as_str())
+                    .param("resolution_note", compiled.resolution_note.as_str()),
             )
             .await?;
         let first_row = rows.next().await?;
@@ -986,6 +988,9 @@ impl LifeGraphProvider {
             .as_ref()
             .and_then(|r| r.get::<String>("id").ok())
             .unwrap_or_else(|| compiled.node_id.clone());
+        let loop_status = first_row
+            .as_ref()
+            .and_then(|r| r.get::<String>("status").ok());
 
         Ok(ProviderOutput::ResultSet(json!({
             "status": "committed",
@@ -993,6 +998,7 @@ impl LifeGraphProvider {
             "label": compiled.label,
             "packet_id": compiled.packet_id,
             "validation_state": "confirmed",
+            "loop_status": loop_status,
         })))
     }
 
