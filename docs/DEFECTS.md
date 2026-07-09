@@ -1,7 +1,7 @@
 ---
 doc_type: defect-tracker
 status: active
-last_updated: 2026-07-03
+last_updated: 2026-07-08
 ---
 
 # Defects and Technical Debt
@@ -49,6 +49,8 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 | DEF-032 | `HotelStateSync` UDP broadcast EMSGSIZE every 30s (real ceiling: macOS maxdgram 9216 + 4x int-array wire inflation) | medium | fixed | 3 | 2026-07-03 | PRs #104/#107/#109 + fleet flip `PHILOTIC_BEACON_PAYLOAD_B64=1` (2026-07-04, watched-live-green: 0 EMSGSIZE post-flip; vps receives mac roster) |
 | DEF-033 | `FailTask` never updates persisted `session_turn` status (record-keeping gap) | low | open | 1 | 2026-06-22 | — |
 | DEF-034 | router-listener crashes on startup — missing `router_listener.config` DB key | medium | open | 1 | 2026-06-04 | — |
+| DEF-035 | `push-homebrew-remote.sh` hand-starts launchd-managed hotels, orphaning them from supervision (stale `active_pid` rows then block re-bootstrap) | medium | fixed | 1 | 2026-07-06 | codex/deploy-launchd-logs (launchd-aware restart: detect label by pattern, clear `hotels.active_pid`, kickstart/bootstrap; hand-start only when no service) |
+| DEF-036 | `aiua.log`/`aiua.err.log` unbounded growth — launchd `StandardOutPath` never rotates (61MB on 2026-07-06; 952MB historic on mbp-jane) | medium | fixed | 1 | 2026-07-06 | codex/deploy-launchd-logs (`scripts/install-log-rotation.sh`: newsyslog drop-in, 50MB/keep 5/compressed, run per-push, graceful without sudo; Linux hotels use journald — untouched) |
 
 ---
 
