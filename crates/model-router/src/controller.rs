@@ -1526,6 +1526,112 @@ impl ProviderConfigs {
             .await?),
         })
     }
+
+    /// Overwrite one provider's resolved API key (credential-pool rotation).
+    /// Only pool-enabled providers have an arm; others are a no-op.
+    pub fn set_provider_api_key(&mut self, provider: &str, key: String) {
+        if provider == "gemini" {
+            self.gemini_api_key = Some(key);
+        }
+    }
+}
+
+/// Refresh a provider's credential pool from env + config + vault, then point
+/// the resolved config key at the pool's active member (Layer 1 of the Model
+/// Failover Layers proposal; gemini-only in slice 0).
+///
+/// Member ring order matches the pre-pool precedence so single-key setups
+/// behave identically: env break-glass (`PHILOTIC_GEMINI_API_KEY`) first, then
+/// the scalar `gemini_api_key_ref`, then each `gemini_api_key_pool` entry.
+/// A member whose vault resolution fails (decrypt error under a mismatched
+/// master key, ACL denial) enters an auth cooldown instead of sinking the
+/// provider — the surviving members carry it.
+pub async fn refresh_gemini_credential_pool(
+    ipc_client: &mut PhiloticClient,
+    pool: &mut crate::credential_pool::CredentialPool,
+    configs: &mut ProviderConfigs,
+) -> Result<()> {
+    use crate::credential_pool::MemberSource;
+
+    let spec = provider_key_spec("gemini").context("gemini provider key spec missing")?;
+    let mut resolved: Vec<(String, MemberSource, Option<String>)> = Vec::new();
+    let mut failed_labels: Vec<String> = Vec::new();
+
+    if let Some(key) = env_override(spec.env_api_key) {
+        resolved.push((
+            "env".to_string(),
+            MemberSource::Env(spec.env_api_key.to_string()),
+            Some(key),
+        ));
+    }
+
+    let primary_ref = match env_override(spec.env_api_key_ref) {
+        Some(secret_ref) => Some(secret_ref),
+        None => fetch_config_string(ipc_client, spec.api_key_ref_key).await?,
+    };
+    if let Some(secret_ref) = primary_ref {
+        let plaintext = match fetch_provider_secret_soft_on_denial(
+            ipc_client,
+            &secret_ref,
+            spec.provider,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(
+                    provider = spec.provider,
+                    member = "primary",
+                    error = %err,
+                    "Credential pool member failed to resolve; cooling it and continuing on siblings"
+                );
+                failed_labels.push("primary".to_string());
+                None
+            }
+        };
+        resolved.push((
+            "primary".to_string(),
+            MemberSource::SecretRef(secret_ref),
+            plaintext,
+        ));
+    }
+
+    let pool_refs: Vec<String> = fetch_config_string(ipc_client, "gemini_api_key_pool")
+        .await?
+        .map(|raw| parse_model_list(&raw))
+        .unwrap_or_default();
+    for (i, secret_ref) in pool_refs.into_iter().enumerate() {
+        let label = format!("pool[{i}]");
+        let plaintext = match fetch_provider_secret_soft_on_denial(
+            ipc_client,
+            &secret_ref,
+            spec.provider,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(
+                    provider = spec.provider,
+                    member = %label,
+                    error = %err,
+                    "Credential pool member failed to resolve; cooling it and continuing on siblings"
+                );
+                failed_labels.push(label.clone());
+                None
+            }
+        };
+        resolved.push((label, MemberSource::SecretRef(secret_ref), plaintext));
+    }
+
+    pool.reconcile(resolved);
+    for label in &failed_labels {
+        pool.mark_resolution_failed(label);
+    }
+
+    // The pool is now the single source of truth for the gemini key.
+    configs.gemini_api_key = pool.active_member().map(|(_, key)| key.to_string());
+    Ok(())
 }
 
 fn parse_model_list(raw: &str) -> Vec<String> {
