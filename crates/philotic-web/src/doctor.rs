@@ -1456,7 +1456,20 @@ mod tests {
             let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
             drop(listener); // leaves the socket special file behind, unlinked by nobody
         }
-        assert_eq!(probe_socket(path.to_str().unwrap()), SocketProbe::Stale);
+        // Closing the listener does not make connect() refuse *instantly* — the
+        // kernel can briefly satisfy a connect from the listen backlog before it
+        // tears the socket down, so a single probe occasionally still sees Alive.
+        // Poll until the leftover file settles to Stale (bounded ~500ms).
+        let ps = path.to_str().unwrap();
+        let mut probe = probe_socket(ps);
+        for _ in 0..50 {
+            if probe == SocketProbe::Stale {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            probe = probe_socket(ps);
+        }
+        assert_eq!(probe, SocketProbe::Stale);
     }
 
     #[test]
