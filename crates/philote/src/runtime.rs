@@ -2492,6 +2492,17 @@ impl AgentRuntime {
             let tools_for_model = state.project_tools_for_turn(&content);
             let (model_prompt, model_context, context_projection) =
                 state.model_request_payloads(&content, &tools_for_model);
+            // First live producer of ReflexEvent::ContextPressure (reflex.rs:309/460
+            // has handled it, unfired, since the reflex engine was introduced).
+            // used_pct is already clamped to 100 at assembly time (session/mod.rs).
+            if let Some(used_pct) = context_projection
+                .get("context_pressure_pct")
+                .and_then(Value::as_u64)
+            {
+                state.fire_reflex_event(ReflexEvent::ContextPressure {
+                    used_pct: used_pct.min(100) as u8,
+                });
+            }
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),

@@ -136,6 +136,54 @@ fn json_escape_for_projection(value: &str) -> String {
         .to_string()
 }
 
+/// Applies a hard `InjectionBudget` cap to one budgeted prompt source and
+/// records the outcome in `ledger`. Empty input is passed through untouched
+/// (preserves the existing `if !layer.is_empty()` skip-the-layer behavior).
+///
+/// Truncation is never silent: a capped block gets a usage header — Hermes
+/// format, `[SOURCE pct% — used/cap chars]` — and, if it overflowed, a
+/// trailing `[...truncated ...]` marker. The header's percentage is the true
+/// usage, deliberately not clamped to 100 — see `BudgetEntry::pct`.
+fn apply_injection_budget(
+    ledger: &mut BudgetLedger,
+    source: &str,
+    content: String,
+    cap_chars: usize,
+) -> String {
+    if content.is_empty() {
+        return content;
+    }
+
+    let used_chars = content.chars().count();
+    let truncated = used_chars > cap_chars;
+    let body = if truncated {
+        let mut kept: String = content.chars().take(cap_chars).collect();
+        kept.push_str(&format!(
+            "\n[…truncated at {cap_chars} chars — run /context for the breakdown]"
+        ));
+        kept
+    } else {
+        content
+    };
+
+    let entry = BudgetEntry {
+        source: source.to_string(),
+        used_chars,
+        cap_chars,
+        truncated,
+    };
+    let header = format!(
+        "[{} {}% — {}/{} chars]",
+        source.to_uppercase().replace('_', " "),
+        entry.pct(),
+        used_chars,
+        cap_chars,
+    );
+    ledger.entries.push(entry);
+
+    format!("{header}\n{body}")
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
@@ -1847,6 +1895,34 @@ impl SessionState {
             lines.push("tool_history   (empty — initial turn or no tools called yet)".into());
         }
 
+        // Injection budget ledger — reuses the real assembly path so the numbers
+        // shown here are exactly what the next turn would render, not a re-derived
+        // estimate. This is the visibility half of the InjectionBudget contract:
+        // truncation must never be silent (proposal §3.3).
+        let budget_user_content = self
+            .active_turn
+            .as_ref()
+            .map(|t| t.user_content.as_str())
+            .unwrap_or("");
+        let projection = self.build_context_projection(budget_user_content);
+        lines.push(String::new());
+        lines.push("Injection budget ledger:".to_string());
+        for entry in &projection.budget_ledger.entries {
+            let marker = if entry.truncated { " [TRUNCATED]" } else { "" };
+            lines.push(format!(
+                "  {:<15} {}% — {}/{} chars{}",
+                entry.source,
+                entry.pct(),
+                entry.used_chars,
+                entry.cap_chars,
+                marker
+            ));
+        }
+        lines.push(format!(
+            "  context_pressure_pct: {}%",
+            projection.context_pressure_pct
+        ));
+
         format!("Context envelope breakdown:\n{}", lines.join("\n"))
     }
 
@@ -2081,13 +2157,30 @@ impl SessionState {
             started_at: None,
         });
 
-        let identity = self.project_agent_self();
+        let mut budget_ledger = BudgetLedger::default();
+        let injection_budget = &self.settings.injection_budget;
+        let identity = apply_injection_budget(
+            &mut budget_ledger,
+            "identity",
+            self.project_agent_self(),
+            injection_budget.persona_chars,
+        );
         let relationship = self.project_user(user_content);
         let knowledge = self.project_knowledge(user_content, projected_tools);
-        let recalled_memory = self.project_recalled_memory();
+        let recalled_memory = apply_injection_budget(
+            &mut budget_ledger,
+            "recalled_memory",
+            self.project_recalled_memory(),
+            injection_budget.recalled_memory_chars,
+        );
         let working = self.project_working_state();
         let session = self.project_session_context(projected_tools);
-        let rules = self.project_rules();
+        let rules = apply_injection_budget(
+            &mut budget_ledger,
+            "rules",
+            self.project_rules(),
+            injection_budget.rules_chars,
+        );
 
         let mut layers = Vec::new();
         let mut contributions = Vec::new();
@@ -2204,6 +2297,33 @@ impl SessionState {
             );
         }
 
+        // Whole-envelope ceiling: sum every rendered layer that lands in the
+        // prompt (render_prompt_from_projection concatenates exactly `layers`).
+        // This is the dormant reflex signal's first live producer — see
+        // reflex.rs:309/460 and the fire_reflex_event call at the runtime.rs
+        // turn-assembly call site.
+        let total_used: usize = layers
+            .iter()
+            .map(|layer| layer.rendered_content.chars().count())
+            .sum();
+        let total_envelope_chars = injection_budget.total_envelope_chars;
+        budget_ledger.entries.push(BudgetEntry {
+            source: "total_envelope".into(),
+            used_chars: total_used,
+            cap_chars: total_envelope_chars,
+            truncated: false,
+        });
+        // u128 intermediate avoids overflow on pathological inputs; clamped to
+        // 100 because ReflexEvent::ContextPressure.used_pct is a u8 and the
+        // reflex handler only distinguishes ">80%", not the exact overage.
+        let context_pressure_pct =
+            ((total_used as u128 * 100) / total_envelope_chars.max(1) as u128).min(100) as u8;
+        let trimmed_sections = budget_ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.truncated)
+            .count();
+
         ContextProjection {
             conversation_turn: ConversationTurnScope {
                 conversation_turn_id: turn_id,
@@ -2223,8 +2343,10 @@ impl SessionState {
             current_user_message: user_content.to_string(),
             budget: ContextBudget {
                 included_sections: layers.len(),
-                trimmed_sections: 0,
+                trimmed_sections,
             },
+            budget_ledger,
+            context_pressure_pct,
             refresh_plan: vec![
                 "checkpoint.before_model".into(),
                 "checkpoint.after_model".into(),
@@ -5026,6 +5148,7 @@ mod tests {
         merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+    use crate::reflex::ReflexEvent;
     use uuid::Uuid;
 
     fn test_working_turn(active_plan: Option<ActivePlan>) -> WorkingTurn {
@@ -8954,5 +9077,250 @@ mod tests {
         state.restore_base_context_window();
         assert_eq!(state.settings.context_window, baseline);
         assert!(state.base_context_window.is_none());
+    }
+
+    // ── InjectionBudget / BudgetLedger (slice 0) ─────────────────────────────
+
+    #[test]
+    fn injection_budget_truncates_persona_and_records_ledger_entry() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.agent_profile.identity_text = Some("x".repeat(50));
+        state.settings.injection_budget.persona_chars = 10;
+
+        let projection = state.build_context_projection("hello");
+
+        let entry = projection
+            .budget_ledger
+            .entries
+            .iter()
+            .find(|e| e.source == "identity")
+            .expect("identity ledger entry present");
+        assert!(entry.truncated);
+        assert_eq!(entry.cap_chars, 10);
+        assert_eq!(entry.used_chars, 50);
+
+        let layer = projection
+            .layers
+            .iter()
+            .find(|l| l.layer_id == ContextLayerId::Identity)
+            .expect("identity layer present");
+        assert!(layer.rendered_content.starts_with("[IDENTITY"));
+        assert!(layer.rendered_content.contains("truncated at 10 chars"));
+    }
+
+    #[test]
+    fn injection_budget_truncates_recalled_memory_and_records_ledger_entry() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.settings.injection_budget.recalled_memory_chars = 20;
+        let mut turn = test_working_turn(None);
+        turn.recalled_memories = vec![RecalledMemoryRecord {
+            concept: "test-concept".into(),
+            content: "x".repeat(200),
+            ..Default::default()
+        }];
+        state.start_turn(turn);
+
+        let projection = state.build_context_projection("hello");
+
+        let entry = projection
+            .budget_ledger
+            .entries
+            .iter()
+            .find(|e| e.source == "recalled_memory")
+            .expect("recalled_memory ledger entry present");
+        assert!(entry.truncated);
+        assert_eq!(entry.cap_chars, 20);
+
+        let layer = projection
+            .layers
+            .iter()
+            .find(|l| l.layer_id == ContextLayerId::RecalledMemory)
+            .expect("recalled_memory layer present");
+        assert!(layer.rendered_content.contains("truncated at 20 chars"));
+    }
+
+    #[test]
+    fn injection_budget_truncates_rules_and_records_ledger_entry() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.settings.injection_budget.rules_chars = 15;
+        state.agent_profile.agent_role_names =
+            vec!["role-one".into(), "role-two".into(), "role-three".into()];
+
+        let projection = state.build_context_projection("hello");
+
+        let entry = projection
+            .budget_ledger
+            .entries
+            .iter()
+            .find(|e| e.source == "rules")
+            .expect("rules ledger entry present");
+        assert!(entry.truncated);
+        assert_eq!(entry.cap_chars, 15);
+
+        let layer = projection
+            .layers
+            .iter()
+            .find(|l| l.layer_id == ContextLayerId::Rules)
+            .expect("rules layer present");
+        assert!(layer.rendered_content.contains("truncated at 15 chars"));
+    }
+
+    #[test]
+    fn injection_budget_default_caps_do_not_truncate_short_content() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.agent_profile.identity_text = Some("Short persona.".into());
+
+        let projection = state.build_context_projection("hello");
+
+        let entry = projection
+            .budget_ledger
+            .entries
+            .iter()
+            .find(|e| e.source == "identity")
+            .expect("identity ledger entry present");
+        assert!(!entry.truncated);
+        assert_eq!(entry.used_chars, "Short persona.".len());
+
+        let layer = projection
+            .layers
+            .iter()
+            .find(|l| l.layer_id == ContextLayerId::Identity)
+            .expect("identity layer present");
+        assert!(layer.rendered_content.starts_with("[IDENTITY"));
+        assert!(!layer.rendered_content.contains("truncated"));
+    }
+
+    #[test]
+    fn context_breakdown_text_surfaces_injection_budget_ledger() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.agent_profile.identity_text = Some("Persona text.".into());
+
+        let breakdown = state.context_breakdown_text();
+        assert!(breakdown.contains("Injection budget ledger:"));
+        assert!(breakdown.contains("identity"));
+        assert!(breakdown.contains("context_pressure_pct:"));
+    }
+
+    #[test]
+    fn context_pressure_stays_low_under_default_budget_for_short_turn() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let projection = state.build_context_projection("hello");
+        assert!(
+            projection.context_pressure_pct < 80,
+            "expected low pressure for a short turn under default budget, got {}",
+            projection.context_pressure_pct
+        );
+    }
+
+    #[test]
+    fn context_pressure_over_80_pct_fires_reflex_and_strips_media_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        // Start from an explicit "off" so the assertion below proves the reflex
+        // event actually flipped it, not that it was already the default.
+        state
+            .agent_profile
+            .media_routing_policy
+            .strip_tools_on_media = false;
+        // A near-zero envelope cap guarantees any rendered content blows past
+        // it, driving used_pct to (a clamped) 100 without depending on exact
+        // persona/rules string lengths.
+        state.settings.injection_budget.total_envelope_chars = 1;
+
+        let projection = state.build_context_projection("hello");
+        assert!(projection.context_pressure_pct > 80);
+        assert_eq!(
+            projection.context_pressure_pct, 100,
+            "used_pct must be clamped to 100 before the ContextPressure event is built"
+        );
+
+        state.fire_reflex_event(ReflexEvent::ContextPressure {
+            used_pct: projection.context_pressure_pct,
+        });
+        assert!(
+            state
+                .agent_profile
+                .media_routing_policy
+                .strip_tools_on_media,
+            "budget assembly should be the live producer that trips the existing \
+             reflex.rs:460 media-strip handler"
+        );
+    }
+
+    #[test]
+    fn model_request_payloads_exposes_context_pressure_pct_for_runtime_emission() {
+        // runtime.rs:4149 reads `context_projection["context_pressure_pct"]` out of
+        // the serialized Value returned here to fire ReflexEvent::ContextPressure —
+        // that JSON key is the live wire between assembly and the reflex engine, so
+        // it gets its own regression test independent of the struct-level
+        // assertions above (which would not catch a serde rename of the field).
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.settings.injection_budget.total_envelope_chars = 1;
+
+        let (_, _, projection_json) = state.model_request_payloads("hello", &[]);
+        let pct = projection_json
+            .get("context_pressure_pct")
+            .and_then(serde_json::Value::as_u64)
+            .expect("runtime.rs reads this exact field to fire ContextPressure");
+        assert_eq!(pct, 100);
+    }
+
+    #[test]
+    fn budget_ledger_bounds_total_envelope_across_a_ten_turn_session() {
+        // Approximates proposal §4 slice-0 verification item 3 ("measurable —
+        // log prompt char/token counts per section before/after on a scripted
+        // 10-turn session and assert bounded totals"). `scripted_loop.rs` is a
+        // tool-call-sequence executor, not a multi-turn conversation harness, so
+        // this drives the same ten-turn shape directly through `SessionState`.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.agent_profile.identity_text = Some("Stable persona text for every turn.".into());
+        state.settings.injection_budget.total_envelope_chars = 2_000;
+
+        let mut prior_used = 0usize;
+        for i in 0..10 {
+            let user_content = format!("turn {i}: {}", "x".repeat(50));
+            state.start_turn(WorkingTurn {
+                turn_id: format!("turn-{i}"),
+                user_content: user_content.clone(),
+                recalled_memories: vec![RecalledMemoryRecord {
+                    concept: format!("concept-{i}"),
+                    content: "y".repeat(80),
+                    ..Default::default()
+                }],
+                ..test_working_turn(None)
+            });
+
+            let projection = state.build_context_projection(&user_content);
+            let total_entry = projection
+                .budget_ledger
+                .entries
+                .iter()
+                .find(|e| e.source == "total_envelope")
+                .expect("total_envelope entry present every turn");
+
+            // Bounded: pct never exceeds 100 and the cap never drifts mid-session,
+            // even as dialogue history and recalled memory accumulate turn over turn.
+            assert!(projection.context_pressure_pct <= 100);
+            assert_eq!(total_entry.cap_chars, 2_000);
+            assert!(
+                total_entry.used_chars >= prior_used,
+                "turn {i}: envelope usage should not shrink as history grows"
+            );
+            prior_used = total_entry.used_chars;
+
+            state.complete_active_turn(format!("reply {i}"));
+        }
+
+        assert!(
+            prior_used > 0,
+            "ten turns of persona + recalled memory should produce nonzero envelope usage"
+        );
     }
 }
