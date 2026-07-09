@@ -3463,6 +3463,7 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "exec-guard",
  "futures-util",
  "glob",
  "graph-intelligence",
