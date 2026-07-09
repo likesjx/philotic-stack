@@ -36,6 +36,7 @@ philotic-graph = { path = "../philotic-graph" }
 graph-intelligence = { path = "../graph-intelligence" }
 ansible-mesh-core = { path = "../ansible-mesh-core" }
 perimeter-core = { path = "../perimeter-core" }
+exec-guard = { path = "../exec-guard" }
 inquire = "0.7"
 
 [dev-dependencies]

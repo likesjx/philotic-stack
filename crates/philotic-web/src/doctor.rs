@@ -1,12 +1,23 @@
-//! `phil doctor` — read-only self-diagnosis (slice 0).
+//! `phil doctor` — self-diagnosis, with an optional repair engine (slice 1).
 //!
 //! Named, versioned checks against the hotel's context DB (and, for a
 //! handful of checks, `launchctl`/`pgrep`/filesystem probes) that reproduce
 //! real philotic incidents in seconds instead of ad-hoc SQL + `launchctl
-//! print`. Slice 0 is detection only — there is no `--fix` and no check may
-//! write to the context DB (opened `SQLITE_OPEN_READ_ONLY`) or mutate any
-//! system state. See `PHIL_DOCTOR_EXPLAIN_PROPOSAL.md` for the full design;
-//! this module implements only the five slice-0 checks it names.
+//! print`. No check's `detect()` may write to the context DB (opened
+//! `SQLITE_OPEN_READ_ONLY`) or mutate any system state — detection stays
+//! read-only in every slice.
+//!
+//! Slice 1 adds an opt-in repair engine on top of the slice-0 checks:
+//! `Check::repair()` evaluates (dry-run) or executes (`--fix`) a fix for one
+//! finding. Only `logs.rotation-missing` and `ipc.stale-socket` are ever
+//! auto-applied; `ports.hotel-record-drift` and `proc.orphan-instances`
+//! always require explicit operator confirmation
+//! (`RepairOutcome::NeedsConfirm`); `vault.key-source-divergence` is never
+//! repaired by doctor at all (`RepairOutcome::NotRepairable`) — key material
+//! is only ever touched through the RotateSecret IPC path. Anything a repair
+//! "removes" is quarantined (renamed aside), never deleted. See
+//! `PHIL_DOCTOR_EXPLAIN_PROPOSAL.md` for the full design; this module
+//! implements the five slice-0 checks plus their slice-1 repair coverage.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -75,7 +86,34 @@ pub struct Finding {
     pub auto_repairable: bool,
 }
 
-/// A named, versioned diagnostic. Slice 0 is detect-only: no `repair()`.
+/// Outcome of evaluating (dry-run) or executing (`apply`) a check's repair
+/// for one [`Finding`].
+///
+/// `Planned`/`NeedsConfirm`/`NotRepairable` are the only outcomes a
+/// `apply = false` (dry-run) call may return — dry-run never mutates
+/// anything. `Applied` is only returned once a repair has actually
+/// executed under `apply = true`; `NeedsConfirm` is returned unchanged in
+/// both modes for checks that always require an explicit operator decision.
+/// `Skipped` covers an `apply = true` attempt that could not complete (e.g.
+/// missing sudo) without treating that as a hard error.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RepairOutcome {
+    /// Dry-run: what `--fix` would do, described but not executed.
+    Planned { description: String },
+    /// `--fix` executed the repair.
+    Applied { description: String },
+    /// This check's repair always requires an explicit operator decision —
+    /// never auto-applied, in either dry-run or `--fix` mode.
+    NeedsConfirm { description: String, risk: String },
+    /// `--fix` attempted the repair but could not complete it (e.g. no
+    /// non-interactive sudo); `reason` includes the manual fallback.
+    Skipped { reason: String },
+    /// No repair engine coverage for this check at all (guided-fix only).
+    NotRepairable,
+}
+
+/// A named, versioned diagnostic.
 pub trait Check {
     /// Namespaced, stable id (e.g. "ports.hotel-record-drift"). Stable
     /// across releases — CI `--only`/`--skip` and suppressions key on it.
@@ -89,6 +127,18 @@ pub trait Check {
     /// `ctx.conn` is opened read-only, so an accidental write errors rather
     /// than silently mutating the DB.
     fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>>;
+
+    /// Evaluate (`apply = false`) or execute (`apply = true`) this check's
+    /// repair for one finding it produced. Default: no repair coverage.
+    ///
+    /// Routing is per-check, not driven by `Finding::auto_repairable` — that
+    /// slice-0 flag documents which checks the (then-future) repair engine
+    /// was *expected* to cover, and its true/false values do not line up
+    /// with slice-1 apply-vs-confirm semantics (e.g. logs is `false` but
+    /// auto-repairs; ports/orphans are `true` but require confirmation).
+    fn repair(&self, _ctx: &DoctorCtx, _finding: &Finding, _apply: bool) -> Result<RepairOutcome> {
+        Ok(RepairOutcome::NotRepairable)
+    }
 }
 
 // ── DoctorCtx ────────────────────────────────────────────────────────────
@@ -128,6 +178,73 @@ impl DoctorCtx {
             conn,
         })
     }
+}
+
+// ── Repair journal ───────────────────────────────────────────────────────
+//
+// Append-only, one JSON object per line, one line per successfully applied
+// repair. Anything a repair "removes" must be quarantined (renamed aside)
+// rather than deleted — the journal records `before`/`after` so a quarantine
+// (or any other applied repair) can always be traced back.
+
+fn repair_journal_path(profile_dir: &std::path::Path) -> PathBuf {
+    profile_dir.join("doctor-repair-journal.jsonl")
+}
+
+fn repair_journal_next_id(path: &std::path::Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(1);
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read repair journal {}", path.display()))?;
+    Ok(content.lines().filter(|l| !l.trim().is_empty()).count() as u64 + 1)
+}
+
+/// Append one `Applied` repair to `<profile_dir>/doctor-repair-journal.jsonl`.
+/// Only called from an `apply = true` repair path — dry-run never calls this.
+fn append_repair_journal(
+    profile_dir: &std::path::Path,
+    check_id: &str,
+    action: &str,
+    before: serde_json::Value,
+    after: serde_json::Value,
+) -> Result<()> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(profile_dir)
+        .with_context(|| format!("create profile dir {}", profile_dir.display()))?;
+    let path = repair_journal_path(profile_dir);
+    let id = repair_journal_next_id(&path)?;
+    let entry = json!({
+        "id": id,
+        "check_id": check_id,
+        "action": action,
+        "before": before,
+        "after": after,
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open repair journal {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(&entry)?)
+        .with_context(|| format!("append repair journal {}", path.display()))?;
+    Ok(())
+}
+
+/// Search ancestors of the current working directory for `scripts/<name>`,
+/// the same pattern `mcp::find_uat_script` uses — robust to being invoked
+/// from any subdirectory of the repo checkout, `None` (not an error) when
+/// the binary is running detached from a repo checkout at all.
+fn find_repo_script(name: &str) -> Option<PathBuf> {
+    let current = std::env::current_dir().ok()?;
+    for dir in current.ancestors() {
+        let candidate = dir.join("scripts").join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // ── Catalog ──────────────────────────────────────────────────────────────
@@ -244,6 +361,35 @@ impl Check for PortsHotelRecordDrift {
             )
             .optional()?;
         Ok(evaluate_ports_drift(self.id(), &ctx.hotel, row))
+    }
+
+    /// Restoring the canonical ports requires writing `hotels.mesh_port` /
+    /// `blob_port` / `execution_port` and restarting the hotel — always
+    /// `NeedsConfirm`, in both dry-run and `--fix` mode; never auto-applied.
+    fn repair(&self, _ctx: &DoctorCtx, finding: &Finding, _apply: bool) -> Result<RepairOutcome> {
+        if let Some(expected) = finding.evidence.get("expected_default") {
+            Ok(RepairOutcome::NeedsConfirm {
+                description: format!(
+                    "restore hotels.mesh_port/blob_port/execution_port to the canonical \
+                     default {}/{}/{} and restart the hotel",
+                    expected["mesh_port"], expected["blob_port"], expected["execution_port"]
+                ),
+                risk: "writes the hotels row and requires a hotel restart; the canonical \
+                       ports may already be in use by something else — operator must confirm \
+                       before applying"
+                    .to_string(),
+            })
+        } else {
+            Ok(RepairOutcome::NeedsConfirm {
+                description:
+                    "run `phil load` then `phil start --hotel <name>` to create the hotels \
+                     row, or verify the --hotel spelling"
+                        .to_string(),
+                risk: "no destructive action, but creates new hotel state — operator must \
+                       confirm the hotel identity first"
+                    .to_string(),
+            })
+        }
     }
 }
 
@@ -393,6 +539,25 @@ impl Check for ProcOrphanInstances {
         let running = running_aiua_pids(&ctx.hotel);
         Ok(evaluate_orphans(self.id(), launchd, active, &running))
     }
+
+    /// SIGTERMing the orphan pid(s) is destructive if the pid list is ever
+    /// wrong — always `NeedsConfirm`, in both dry-run and `--fix` mode;
+    /// never auto-killed.
+    fn repair(&self, _ctx: &DoctorCtx, finding: &Finding, _apply: bool) -> Result<RepairOutcome> {
+        let orphans = finding
+            .evidence
+            .get("orphan_pids")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        Ok(RepairOutcome::NeedsConfirm {
+            description: format!(
+                "SIGTERM the orphan pid(s) only, never the launchd-owned pid: {orphans}"
+            ),
+            risk: "signaling the wrong pid could take down the supervised hotel process — \
+                   operator must confirm the exact pid list before signaling"
+                .to_string(),
+        })
+    }
 }
 
 // ── ipc.stale-socket ─────────────────────────────────────────────────────
@@ -450,6 +615,42 @@ impl Check for IpcStaleSocket {
         let path = crate::start::socket_path(&ctx.hotel);
         let probe = probe_socket(&path);
         Ok(evaluate_stale_socket(self.id(), &path, probe))
+    }
+
+    /// Quarantines the confirmed-dead socket by renaming it to `<path>.stale`
+    /// — never `rm`s it, so a wrong "stale" call is always recoverable.
+    fn repair(&self, ctx: &DoctorCtx, finding: &Finding, apply: bool) -> Result<RepairOutcome> {
+        let path = finding
+            .evidence
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let stale_path = format!("{path}.stale");
+        let description =
+            format!("quarantine stale socket {path} by renaming it to {stale_path} (never delete)");
+
+        if !apply {
+            return Ok(RepairOutcome::Planned { description });
+        }
+
+        match std::fs::rename(&path, &stale_path) {
+            Ok(()) => {
+                append_repair_journal(
+                    &ctx.profile_dir,
+                    self.id(),
+                    "quarantine-socket",
+                    json!({"path": path}),
+                    json!({"path": stale_path}),
+                )?;
+                Ok(RepairOutcome::Applied { description })
+            }
+            Err(e) => Ok(RepairOutcome::Skipped {
+                reason: format!(
+                    "failed to rename {path} to {stale_path}: {e}; manual: mv {path} {stale_path}"
+                ),
+            }),
+        }
     }
 }
 
@@ -654,6 +855,14 @@ impl Check for VaultKeySourceDivergence {
         let sources = resolve_vault_sources();
         Ok(evaluate_vault_divergence(self.id(), &sources, &secrets))
     }
+
+    /// Guided-only, forever: doctor never touches key material. Explicit
+    /// override of the trait default so this is a documented decision, not
+    /// an oversight — the fix path is the RotateSecret IPC call, run by an
+    /// operator, not by this repair engine.
+    fn repair(&self, _ctx: &DoctorCtx, _finding: &Finding, _apply: bool) -> Result<RepairOutcome> {
+        Ok(RepairOutcome::NotRepairable)
+    }
 }
 
 fn vault_secrets_from_db(conn: &Connection) -> Result<Vec<(String, String)>> {
@@ -737,6 +946,104 @@ impl Check for LogsRotationMissing {
             drop_in_exists,
         ))
     }
+
+    /// Auto-repairable: runs `scripts/install-log-rotation.sh` (idempotent —
+    /// see the script's own header). Falls back to writing the drop-in
+    /// directly if the script can't be found (e.g. running detached from a
+    /// repo checkout). The drop-in lives under `/etc` and typically needs
+    /// sudo; a permission failure is reported as `Skipped` with the manual
+    /// command, never a hard error or a panic.
+    fn repair(&self, ctx: &DoctorCtx, _finding: &Finding, apply: bool) -> Result<RepairOutcome> {
+        let description = "install newsyslog drop-in via scripts/install-log-rotation.sh (or \
+                            write /etc/newsyslog.d/philotic.conf directly)"
+            .to_string();
+        if !apply {
+            return Ok(RepairOutcome::Planned { description });
+        }
+
+        let dropin = newsyslog_dropin_path();
+        let before = json!({"dropin_exists": dropin.exists()});
+        let manual_hint = format!(
+            "manual: sudo tee {} <<'CONF'\n{}\nCONF",
+            dropin.display(),
+            newsyslog_dropin_content()
+        );
+
+        let outcome: std::result::Result<(), String> =
+            match find_repo_script("install-log-rotation.sh") {
+                Some(script) => match std::process::Command::new("bash").arg(&script).output() {
+                    Ok(out) if out.status.success() => {
+                        if dropin.exists() {
+                            Ok(())
+                        } else {
+                            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            Err(format!(
+                            "install-log-rotation.sh ran but {} still doesn't exist (likely no \
+                             non-interactive sudo available). {manual_hint}\nscript said: {stdout}",
+                            dropin.display()
+                        ))
+                        }
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        Err(format!(
+                            "install-log-rotation.sh exited {}: {stderr}. {manual_hint}",
+                            out.status
+                        ))
+                    }
+                    Err(e) => Err(format!(
+                        "failed to execute install-log-rotation.sh: {e}. {manual_hint}"
+                    )),
+                },
+                None => write_newsyslog_dropin_directly(&dropin).map_err(|e| {
+                    format!(
+                    "scripts/install-log-rotation.sh not found and direct write failed: {e:#}. \
+                     {manual_hint}"
+                )
+                }),
+            };
+
+        match outcome {
+            Ok(()) => {
+                let after = json!({"dropin_exists": dropin.exists()});
+                append_repair_journal(
+                    &ctx.profile_dir,
+                    self.id(),
+                    "install-log-rotation",
+                    before,
+                    after,
+                )?;
+                Ok(RepairOutcome::Applied { description })
+            }
+            Err(reason) => Ok(RepairOutcome::Skipped { reason }),
+        }
+    }
+}
+
+/// The exact drop-in body `scripts/install-log-rotation.sh` writes — kept in
+/// sync manually since the fallback path (no script found) must produce the
+/// same content the script would.
+fn newsyslog_dropin_content() -> String {
+    let owner = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    format!(
+        "# Philotic hotel log rotation (managed by scripts/install-log-rotation.sh)\n\
+         # logfilename                              [owner:group]        mode count size when  flags\n\
+         {home}/.philotic/*/aiua*.log    {owner}:staff    644  5     51200 *     GJ"
+    )
+}
+
+/// Direct fallback when `scripts/install-log-rotation.sh` cannot be found
+/// (e.g. the binary is running detached from a repo checkout). Writing under
+/// `/etc` will fail with a permissions error on any non-root invocation —
+/// that's expected and surfaced by the caller as `Skipped`, not a panic.
+fn write_newsyslog_dropin_directly(dropin: &std::path::Path) -> Result<()> {
+    if let Some(parent) = dropin.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(dropin, newsyslog_dropin_content())
+        .with_context(|| format!("write {}", dropin.display()))?;
+    Ok(())
 }
 
 // ── CLI entry ────────────────────────────────────────────────────────────
@@ -747,6 +1054,18 @@ struct DoctorReport {
     hotel: String,
     checks_run: usize,
     findings: Vec<Finding>,
+    /// One entry per finding, in the same order, correlated by `check_id`.
+    /// Populated whether or not `--fix` was passed: without `--fix` these
+    /// are dry-run plans (`Planned`/`NeedsConfirm`/`NotRepairable`); with
+    /// `--fix`, auto-repairable checks report `Applied`/`Skipped` while
+    /// `NeedsConfirm`/`NotRepairable` checks are unchanged either way.
+    repairs: Vec<RepairEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairEntry {
+    check_id: String,
+    outcome: RepairOutcome,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -757,6 +1076,7 @@ pub fn run(
     only: Vec<String>,
     skip: Vec<String>,
     list_checks: bool,
+    fix: bool,
 ) -> Result<()> {
     let checks = catalog();
 
@@ -791,29 +1111,54 @@ pub fn run(
         .collect();
     let selected_ids: Vec<&'static str> = selected.iter().map(|c| c.id()).collect();
 
-    let mut all_findings = Vec::new();
+    // `apply` mirrors `--fix` into every repair() call below: dry-run
+    // (apply=false) computes plans only and never writes; `--fix`
+    // (apply=true) executes auto-repairable checks. Either way this loop is
+    // the only place `repair()` is called, so it stays paired with the
+    // exact finding that produced it — no re-detecting or guessing which
+    // check a finding came from.
+    let mut finding_repairs: Vec<(Finding, RepairOutcome)> = Vec::new();
     for check in &selected {
-        match check.detect(&ctx) {
-            Ok(findings) => all_findings.extend(findings),
+        let findings = match check.detect(&ctx) {
+            Ok(findings) => findings,
             Err(e) => {
                 eprintln!("phil doctor: check '{}' failed: {e:#}", check.id());
                 std::process::exit(2);
             }
+        };
+        for finding in findings {
+            let outcome = match check.repair(&ctx, &finding, fix) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("phil doctor: repair for '{}' failed: {e:#}", check.id());
+                    std::process::exit(2);
+                }
+            };
+            finding_repairs.push((finding, outcome));
         }
     }
 
-    let above_threshold = all_findings
+    let above_threshold = finding_repairs
         .iter()
-        .filter(|f| f.severity >= threshold)
+        .filter(|(f, _)| f.severity >= threshold)
         .count();
     let ok = above_threshold == 0;
 
     if json {
+        let findings: Vec<Finding> = finding_repairs.iter().map(|(f, _)| f.clone()).collect();
+        let repairs: Vec<RepairEntry> = finding_repairs
+            .iter()
+            .map(|(f, o)| RepairEntry {
+                check_id: f.check_id.clone(),
+                outcome: o.clone(),
+            })
+            .collect();
         let report = DoctorReport {
             ok,
             hotel: hotel.clone(),
             checks_run: selected.len(),
-            findings: all_findings,
+            findings,
+            repairs,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -822,12 +1167,30 @@ pub fn run(
             &ctx.db_path,
             selected.len(),
             &selected_ids,
-            &all_findings,
+            &finding_repairs,
             threshold,
+            fix,
         );
     }
 
     std::process::exit(if ok { 0 } else { 1 });
+}
+
+fn format_repair_outcome(outcome: &RepairOutcome, fix: bool) -> String {
+    match outcome {
+        RepairOutcome::Planned { description } => {
+            format!("would {description} (dry-run; pass --fix to apply)")
+        }
+        RepairOutcome::Applied { description } => format!("applied — {description}"),
+        RepairOutcome::NeedsConfirm { description, risk } => format!(
+            "needs operator confirmation — {description} (risk: {risk}); never auto-applied{}",
+            if fix { " by --fix" } else { "" }
+        ),
+        RepairOutcome::Skipped { reason } => format!("skipped — {reason}"),
+        RepairOutcome::NotRepairable => {
+            "not repairable by doctor — guided fix only, see 'fix' above".to_string()
+        }
+    }
 }
 
 fn print_human(
@@ -835,20 +1198,24 @@ fn print_human(
     db_path: &std::path::Path,
     checks_run: usize,
     check_ids: &[&'static str],
-    findings: &[Finding],
+    finding_repairs: &[(Finding, RepairOutcome)],
     threshold: Severity,
+    fix: bool,
 ) {
     println!(
         "phil doctor — hotel {hotel} ({}), offline, {checks_run} checks\n",
         db_path.display()
     );
     for id in check_ids {
-        let for_check: Vec<&Finding> = findings.iter().filter(|f| f.check_id == *id).collect();
+        let for_check: Vec<&(Finding, RepairOutcome)> = finding_repairs
+            .iter()
+            .filter(|(f, _)| f.check_id == *id)
+            .collect();
         if for_check.is_empty() {
             println!("  \u{2713} {id}");
             continue;
         }
-        for f in for_check {
+        for (f, outcome) in for_check {
             let marker = if f.severity >= threshold {
                 "\u{2717}"
             } else {
@@ -858,9 +1225,13 @@ fn print_human(
             if !f.fix_hint.is_empty() {
                 println!("      fix: {}", f.fix_hint);
             }
+            println!("      repair: {}", format_repair_outcome(outcome, fix));
         }
     }
-    let above = findings.iter().filter(|f| f.severity >= threshold).count();
+    let above = finding_repairs
+        .iter()
+        .filter(|(f, _)| f.severity >= threshold)
+        .count();
     println!(
         "\n{above} finding(s) at/above {threshold} threshold \u{00b7} exit {}",
         if above == 0 { 0 } else { 1 }
@@ -1307,6 +1678,12 @@ mod tests {
                 fix_hint: "install rotation".to_string(),
                 auto_repairable: false,
             }],
+            repairs: vec![RepairEntry {
+                check_id: "logs.rotation-missing".to_string(),
+                outcome: RepairOutcome::Planned {
+                    description: "install newsyslog drop-in".to_string(),
+                },
+            }],
         };
         let value = serde_json::to_value(&report).expect("serialize");
         assert_eq!(value["ok"], json!(false));
@@ -1318,5 +1695,252 @@ mod tests {
         );
         assert_eq!(value["findings"][0]["severity"], json!("warning"));
         assert_eq!(value["findings"][0]["auto_repairable"], json!(false));
+        assert_eq!(
+            value["repairs"][0]["check_id"],
+            json!("logs.rotation-missing")
+        );
+        assert_eq!(value["repairs"][0]["outcome"]["outcome"], json!("planned"));
+    }
+
+    // ── repair() ─────────────────────────────────────────────────────────
+
+    fn dummy_finding(check_id: &str, evidence: serde_json::Value) -> Finding {
+        Finding {
+            check_id: check_id.to_string(),
+            severity: Severity::Error,
+            message: "test finding".to_string(),
+            evidence,
+            fix_hint: "test fix hint".to_string(),
+            auto_repairable: true,
+        }
+    }
+
+    fn ctx_with_profile_dir(hotel: &str, db_path: PathBuf, profile_dir: PathBuf) -> DoctorCtx {
+        let mut ctx = DoctorCtx::open_at(hotel, db_path).expect("open ctx");
+        ctx.profile_dir = profile_dir;
+        ctx
+    }
+
+    #[test]
+    fn ports_drift_repair_is_always_needs_confirm() {
+        let (_dir, path) = fixture_db();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let finding = dummy_finding(
+            "ports.hotel-record-drift",
+            json!({"expected_default": {"mesh_port": 100, "blob_port": 101, "execution_port": 102}}),
+        );
+        for apply in [false, true] {
+            let outcome = PortsHotelRecordDrift
+                .repair(&ctx, &finding, apply)
+                .expect("repair");
+            assert!(matches!(outcome, RepairOutcome::NeedsConfirm { .. }));
+        }
+    }
+
+    #[test]
+    fn orphans_repair_is_always_needs_confirm() {
+        let (_dir, path) = fixture_db();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let finding = dummy_finding("proc.orphan-instances", json!({"orphan_pids": [999]}));
+        for apply in [false, true] {
+            let outcome = ProcOrphanInstances
+                .repair(&ctx, &finding, apply)
+                .expect("repair");
+            assert!(matches!(outcome, RepairOutcome::NeedsConfirm { .. }));
+        }
+    }
+
+    #[test]
+    fn vault_repair_is_always_not_repairable_and_never_touches_key_material() {
+        let (_dir, path) = fixture_db();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let finding = dummy_finding("vault.key-source-divergence", json!({}));
+        for apply in [false, true] {
+            let outcome = VaultKeySourceDivergence
+                .repair(&ctx, &finding, apply)
+                .expect("repair");
+            assert!(matches!(outcome, RepairOutcome::NotRepairable));
+        }
+    }
+
+    #[test]
+    fn ipc_stale_socket_repair_dry_run_is_planned_and_does_not_touch_disk() {
+        let (dir, db_path) = fixture_db();
+        let sock_dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = sock_dir.path().join("stale.sock");
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind");
+            drop(listener);
+        }
+        let ctx = ctx_with_profile_dir("jane", db_path, dir.path().to_path_buf());
+        let finding = dummy_finding(
+            "ipc.stale-socket",
+            json!({"path": sock_path.to_string_lossy()}),
+        );
+
+        let outcome = IpcStaleSocket
+            .repair(&ctx, &finding, false)
+            .expect("repair");
+        assert!(matches!(outcome, RepairOutcome::Planned { .. }));
+        assert!(sock_path.exists(), "dry-run must not touch the socket");
+        assert!(!dir.path().join("doctor-repair-journal.jsonl").exists());
+    }
+
+    #[test]
+    fn ipc_stale_socket_repair_apply_quarantines_never_deletes() {
+        let (dir, db_path) = fixture_db();
+        let sock_dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = sock_dir.path().join("stale.sock");
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind");
+            drop(listener);
+        }
+        let ctx = ctx_with_profile_dir("jane", db_path, dir.path().to_path_buf());
+        let finding = dummy_finding(
+            "ipc.stale-socket",
+            json!({"path": sock_path.to_string_lossy()}),
+        );
+
+        let outcome = IpcStaleSocket.repair(&ctx, &finding, true).expect("repair");
+        assert!(matches!(outcome, RepairOutcome::Applied { .. }));
+
+        // Original path is gone, but only because it was renamed, not rm'd —
+        // the quarantined copy must exist right next to it.
+        assert!(!sock_path.exists(), "original stale socket must be gone");
+        let expected_stale =
+            std::path::PathBuf::from(format!("{}.stale", sock_path.to_string_lossy()));
+        assert!(
+            expected_stale.exists(),
+            "quarantined socket must exist at {}",
+            expected_stale.display()
+        );
+
+        let journal_path = dir.path().join("doctor-repair-journal.jsonl");
+        assert!(journal_path.exists(), "journal line must be written");
+        let content = std::fs::read_to_string(&journal_path).expect("read journal");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let entry: serde_json::Value = serde_json::from_str(lines[0]).expect("parse journal line");
+        assert_eq!(entry["id"], json!(1));
+        assert_eq!(entry["check_id"], json!("ipc.stale-socket"));
+        assert_eq!(entry["action"], json!("quarantine-socket"));
+    }
+
+    #[test]
+    fn ipc_stale_socket_repair_apply_is_idempotent_on_second_run() {
+        let (dir, db_path) = fixture_db();
+        let sock_dir = tempfile::tempdir().expect("tempdir");
+        let sock_path = sock_dir.path().join("stale.sock");
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind");
+            drop(listener);
+        }
+        let ctx = ctx_with_profile_dir("jane", db_path, dir.path().to_path_buf());
+        let finding = dummy_finding(
+            "ipc.stale-socket",
+            json!({"path": sock_path.to_string_lossy()}),
+        );
+
+        let first = IpcStaleSocket
+            .repair(&ctx, &finding, true)
+            .expect("repair 1");
+        assert!(matches!(first, RepairOutcome::Applied { .. }));
+
+        // Running again against the same (now-missing) original path must
+        // not panic — it should report Skipped, since there is nothing left
+        // to quarantine.
+        let second = IpcStaleSocket
+            .repair(&ctx, &finding, true)
+            .expect("repair 2");
+        assert!(matches!(second, RepairOutcome::Skipped { .. }));
+
+        let journal_path = dir.path().join("doctor-repair-journal.jsonl");
+        let content = std::fs::read_to_string(&journal_path).expect("read journal");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "second (skipped) attempt must not journal");
+    }
+
+    #[test]
+    fn logs_rotation_repair_dry_run_is_planned() {
+        let (dir, db_path) = fixture_db();
+        let ctx = ctx_with_profile_dir("jane", db_path, dir.path().to_path_buf());
+        let finding = dummy_finding("logs.rotation-missing", json!({"log_path": "/x"}));
+
+        let outcome = LogsRotationMissing
+            .repair(&ctx, &finding, false)
+            .expect("repair");
+        match outcome {
+            RepairOutcome::Planned { description } => {
+                assert!(description.contains("install-log-rotation.sh"));
+            }
+            other => panic!("expected Planned, got {other:?}"),
+        }
+        assert!(!dir.path().join("doctor-repair-journal.jsonl").exists());
+    }
+
+    #[test]
+    fn logs_rotation_repair_apply_never_panics_and_resolves_gracefully() {
+        // This is the one repair whose real target lives under /etc and
+        // needs sudo — a live `doctor --fix` is deliberately not run in
+        // this test suite. It must still either apply (extremely unlikely
+        // without a passwordless sudoer on the test machine) or report a
+        // graceful Skipped with a manual fallback command; it must never
+        // panic or return a hard Err.
+        let (dir, db_path) = fixture_db();
+        let ctx = ctx_with_profile_dir("jane", db_path, dir.path().to_path_buf());
+        let finding = dummy_finding("logs.rotation-missing", json!({"log_path": "/x"}));
+
+        let outcome = LogsRotationMissing
+            .repair(&ctx, &finding, true)
+            .expect("repair must not hard-error");
+        match outcome {
+            RepairOutcome::Applied { .. } => {
+                // Only plausible with passwordless sudo on this machine —
+                // still valid, just journal it.
+                let journal_path = dir.path().join("doctor-repair-journal.jsonl");
+                assert!(journal_path.exists());
+            }
+            RepairOutcome::Skipped { reason } => {
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected Applied or Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_never_mutates_fixture_db_with_fix_flag_on_non_writable_checks() {
+        // repair() calls for ports/orphans/vault must never touch the
+        // read-only context DB even when apply=true.
+        let (_dir, path) = fixture_db();
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            insert_hotel(&conn, "jane", 1, 2, 3, Some("42"));
+        }
+        let before = std::fs::read(&path).expect("read before");
+
+        let ctx = DoctorCtx::open_at("jane", path.clone()).expect("open ctx");
+        let ports_finding = dummy_finding(
+            "ports.hotel-record-drift",
+            json!({"expected_default": {"mesh_port": 1, "blob_port": 2, "execution_port": 3}}),
+        );
+        let _ = PortsHotelRecordDrift
+            .repair(&ctx, &ports_finding, true)
+            .expect("repair");
+        let orphan_finding = dummy_finding("proc.orphan-instances", json!({"orphan_pids": [1]}));
+        let _ = ProcOrphanInstances
+            .repair(&ctx, &orphan_finding, true)
+            .expect("repair");
+        let vault_finding = dummy_finding("vault.key-source-divergence", json!({}));
+        let _ = VaultKeySourceDivergence
+            .repair(&ctx, &vault_finding, true)
+            .expect("repair");
+        drop(ctx);
+
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(
+            before, after,
+            "NeedsConfirm/NotRepairable must not mutate the DB"
+        );
     }
 }

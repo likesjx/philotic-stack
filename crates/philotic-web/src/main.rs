@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod component;
 mod doctor;
+mod explain;
 mod flush;
 mod footprint;
 mod harness;
@@ -87,10 +88,14 @@ enum Command {
         hotel: String,
     },
 
-    /// Read-only self-diagnosis: detect known failure patterns without repairing them
+    /// Self-diagnosis: detect known failure patterns, optionally repairing them
     ///
-    /// Slice 0: no `--fix` exists yet. Opens the context DB read-only and probes
-    /// launchd/sockets/vault/logs; never writes.
+    /// Without --fix this is read-only: prints each finding's repair plan
+    /// (Planned/NeedsConfirm/NotRepairable) but never writes. With --fix,
+    /// auto-repairable checks (logs rotation, stale IPC sockets) are applied;
+    /// checks that need an operator decision (port drift, orphan processes)
+    /// still only print NeedsConfirm — they are never auto-applied. The
+    /// context DB itself is always opened read-only.
     Doctor {
         /// Hotel name to inspect (default: default)
         #[arg(long, default_value = "default")]
@@ -115,6 +120,19 @@ enum Command {
         /// Print the check catalog (id + severity) and exit without running anything
         #[arg(long)]
         list_checks: bool,
+
+        /// Apply auto-repairable fixes (logs rotation, stale IPC sockets).
+        /// Checks that need operator confirmation (ports, orphan processes)
+        /// are never auto-applied even with this flag; vault divergence is
+        /// never touched by doctor at all.
+        #[arg(long)]
+        fix: bool,
+    },
+
+    /// Explain the decision chain behind an agent-facing action
+    Explain {
+        #[command(subcommand)]
+        action: explain::ExplainAction,
     },
 
     /// List configured agents
@@ -459,7 +477,9 @@ async fn main() -> Result<()> {
             only,
             skip,
             list_checks,
-        } => doctor::run(hotel, json, severity_min, only, skip, list_checks),
+            fix,
+        } => doctor::run(hotel, json, severity_min, only, skip, list_checks, fix),
+        Command::Explain { action } => explain::run(action),
         Command::Agents { config } => status::run_agents(config).await,
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
         Command::Service { action } => match action {
