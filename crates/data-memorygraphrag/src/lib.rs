@@ -1455,6 +1455,17 @@ pub struct LifeObserveInput {
 pub struct LifeCommitInput {
     pub evidence: EvidencePacket,
     pub operator_approved: bool,
+    /// Optional lifecycle close alongside the evidence-trust promotion. Set to
+    /// `"resolved"` when the operator has reported this node's underlying
+    /// loop/commitment/goal as done. Distinct from `validation_state` (which
+    /// tracks whether the evidence is trusted, not whether the loop is open).
+    /// `None` leaves lifecycle status untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_status: Option<String>,
+    /// Optional short note on how/why the loop closed. Only meaningful
+    /// alongside `loop_status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2549,6 +2560,8 @@ mod tests {
             .plan(LifeGraphToolRequest::LifeCommit(LifeCommitInput {
                 evidence: evidence_packet(),
                 operator_approved: false,
+                loop_status: None,
+                resolution_note: None,
             }))
             .expect("commit should produce blocked plan");
 
@@ -2572,6 +2585,8 @@ mod tests {
             .plan(LifeGraphToolRequest::LifeCommit(LifeCommitInput {
                 evidence,
                 operator_approved: false,
+                loop_status: None,
+                resolution_note: None,
             }))
             .expect("confirmed evidence should plan");
 
