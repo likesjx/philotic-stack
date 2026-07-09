@@ -1818,6 +1818,7 @@ impl AgentRuntime {
                 streamed_content: String::new(),
                 paracrine_hop_count: 0,
                 paracrine_chain_started_at: None,
+                selection_source: SelectionSource::default(),
             });
             Some((
                 state.checkpoint_memory_type(),
@@ -2385,7 +2386,11 @@ mod tests {
     fn life_autorecall_strategies_include_current_prompt_semantic() {
         assert_eq!(
             LIFE_AUTORECALL_STRATEGIES,
-            ["re_entry_context", "open_loops_by_context", "current_prompt_semantic"],
+            [
+                "re_entry_context",
+                "open_loops_by_context",
+                "current_prompt_semantic"
+            ],
             "third strategy must ride the same prefetch loop as the two fixed recipes"
         );
     }

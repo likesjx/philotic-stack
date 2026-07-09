@@ -14,9 +14,9 @@ use crate::session::{
     HANDOFF_CONTEXT_EXCERPT_MAX_CHARS, LifeRecallCacheEntry, MediaRoutingPolicy, MemoryAuthority,
     MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind,
     MemoryValidationLevel, PARACRINE_MERGE_CONTENT_MAX_CHARS, PARACRINE_WHISPER_PROMPT_MAX_CHARS,
-    ParacrineBudgetOutcome, ParacrineThreadStatus, RecalledMemoryRecord, SessionState,
-    ToolDefinition, ToolExecutionRoute, ToolRunnerIncarnationBinding, TtsMode, VoiceResponsePolicy,
-    WorkingTurn, charge_paracrine_hop, merge_session_index, truncate_for_wire,
+    ParacrineBudgetOutcome, ParacrineThreadStatus, RecalledMemoryRecord, SelectionSource,
+    SessionState, ToolDefinition, ToolExecutionRoute, ToolRunnerIncarnationBinding, TtsMode,
+    VoiceResponsePolicy, WorkingTurn, charge_paracrine_hop, merge_session_index, truncate_for_wire,
 };
 use anyhow::Result;
 use memory_core::{
@@ -784,6 +784,17 @@ fn resolve_model_execution_target(
     capability: &str,
     fallback_role: &str,
 ) -> (String, String, Option<String>) {
+    // Operator pin (`/model <tier>`) wins over everything else for text
+    // generation dispatch — it is the single choke point every initial model
+    // dispatch funnels through, so slotting the pin in here (rather than at
+    // each of the 8+ call sites) is enough to make it actually route, not
+    // just gate fallback in advance_turn_to_next_fallback_tier.
+    if matches!(capability, "text.generate" | "response.generate") {
+        if let Some(pinned) = state.and_then(|state| state.pinned_tier_role.as_deref()) {
+            return (local_node_id(), pinned.to_string(), None);
+        }
+    }
+
     if let Some(route) = state.and_then(|state| state.resolve_component_execution_route(capability))
     {
         return (
@@ -1988,6 +1999,7 @@ impl AgentRuntime {
                 | SlashCommand::ApprovalReset => {}
                 SlashCommand::Tts { .. } => {}
                 SlashCommand::Voice { .. } => {}
+                SlashCommand::Model { .. } => {}
                 SlashCommand::Abandon { .. } => {}
                 SlashCommand::Plan { drop } => {
                     // Resolved without starting a turn so it works mid-turn too.
@@ -2367,6 +2379,17 @@ impl AgentRuntime {
                 (None, false)
             };
 
+            // Cron-triggered turns get CronPrimary (the honest marker is
+            // `cron_job_id`, not corr_id/source string-sniffing); an operator
+            // pin on the session takes precedence over the configured default.
+            let selection_source = if task.cron_job_id.is_some() {
+                SelectionSource::CronPrimary
+            } else if state.pinned_tier_role.is_some() {
+                SelectionSource::OperatorExplicit
+            } else {
+                SelectionSource::ConfiguredDefault
+            };
+
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -2404,6 +2427,7 @@ impl AgentRuntime {
                 streamed_content: String::new(),
                 paracrine_hop_count: 0,
                 paracrine_chain_started_at: None,
+                selection_source,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -2589,7 +2613,9 @@ impl AgentRuntime {
                 SlashCommand::Correct { .. } => Ok(()),
                 // Plan always returns from the pre-turn gate above; unreachable here.
                 SlashCommand::Plan { .. } => Ok(()),
-                SlashCommand::Tts { .. } | SlashCommand::Voice { .. } => {
+                SlashCommand::Tts { .. }
+                | SlashCommand::Voice { .. }
+                | SlashCommand::Model { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
                     )
@@ -4806,6 +4832,47 @@ impl AgentRuntime {
                 .await;
         }
 
+        // Handle /model — pins this session to a model tier role, or with no
+        // argument reports (and clears) the current pin. A pin tags new turns
+        // OperatorExplicit (see handle_user_message), which disables automatic
+        // fallback escalation in advance_turn_to_next_fallback_tier, and is
+        // routed at the resolve_model_execution_target choke point.
+        if let SlashCommand::Model { ref tier } = command {
+            let reply = if let Some(state) = self.sessions.get_mut(&session_id) {
+                match tier.as_deref() {
+                    Some(t) => {
+                        state.pinned_tier_role = Some(t.to_string());
+                        format!(
+                            "Pinned this session to model tier `{t}`. Fallback escalation is disabled until you clear the pin with a bare `/model`."
+                        )
+                    }
+                    None => match state.pinned_tier_role.take() {
+                        Some(previous) => {
+                            format!("Cleared model tier pin (was `{previous}`).")
+                        }
+                        None => "No model tier pin is set for this session.".to_string(),
+                    },
+                }
+            } else {
+                "No active session.".to_string()
+            };
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: "session_policy_updated".into(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                })
+                .await?;
+            return self
+                .complete_local_command(session_id, command_turn_id, reply)
+                .await;
+        }
+
         let (
             reply_content,
             update_state,
@@ -5043,6 +5110,7 @@ impl AgentRuntime {
                 SlashCommand::Ping
                 | SlashCommand::Tts { .. }
                 | SlashCommand::Voice { .. }
+                | SlashCommand::Model { .. }
                 | SlashCommand::Role { .. }
                 | SlashCommand::Roles
                 | SlashCommand::Back
@@ -5937,8 +6005,8 @@ mod tests {
     use crate::reflex::ReflexEvent;
     use crate::session::{
         ActivePlan, ApprovalPolicy, CarryoverPlan, ComponentExecutionRoute, ComponentRouteAssembly,
-        ComponentRouteBinding, PlanStep, ResponseRouteMode, RoleActivation, SessionState,
-        WorkingTurn,
+        ComponentRouteBinding, PlanStep, ResponseRouteMode, RoleActivation, SelectionSource,
+        SessionState, WorkingTurn,
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
@@ -6092,6 +6160,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         }
     }
 
@@ -6480,6 +6549,41 @@ mod tests {
         );
     }
 
+    /// The headline Slice 1 routing behavior: `/model <tier>` must not just
+    /// gate fallback escalation, it must actually dispatch there. Verifies
+    /// the `resolve_model_execution_target` choke point directly rather than
+    /// only indirectly through a full turn.
+    #[test]
+    fn operator_pin_routes_text_generation_to_pinned_tier() {
+        let mut state = SessionState::new("s".into(), "a".into(), "telegram".into());
+        state.pinned_tier_role = Some("model.ollama".into());
+
+        let (node, role, incarnation) =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(node, LOCAL_NODE);
+        assert_eq!(role, "model.ollama");
+        assert!(incarnation.is_none());
+
+        let (_, role, _) = resolve_model_execution_target(
+            Some(&state),
+            "response.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+        assert_eq!(
+            role, "model.ollama",
+            "Gemini Live dispatch honors the pin too"
+        );
+
+        // Scoping guard: a model pin must not hijack unrelated capabilities.
+        state.agent_profile.voice_response_policy.provider = Some("elevenlabs".into());
+        let (_, voice_role, _) =
+            resolve_model_execution_target(Some(&state), "voice.synthesize", "model.local");
+        assert_ne!(
+            voice_role, "model.ollama",
+            "a model tier pin must not affect voice provider routing"
+        );
+    }
+
     #[test]
     fn merge_snapshot_bindings_updates_component_route_assembly() {
         let mut state =
@@ -6729,6 +6833,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));
@@ -7802,6 +7907,7 @@ mod tests {
                 turn_id.to_string(),
                 NoResponseClass::ProviderFailure,
                 Some("gemini".into()),
+                "provider failed".into(),
             )
             .await
             .expect("advance");
@@ -7840,6 +7946,89 @@ mod tests {
                 .expect("detail")
                 .contains("All model providers failed"),
             "detail must describe the exhaustion: {heal:#?}"
+        );
+    }
+
+    /// An operator-pinned session (`SelectionSource::OperatorExplicit`) must
+    /// never silently escalate to the next fallback tier — that would violate
+    /// the operator's explicit `/model <tier>` intent. Instead the turn fails
+    /// fast with the real trigger message, and `fallback_tier` is left
+    /// untouched (no ladder/oracle consultation, no heal event).
+    #[tokio::test]
+    async fn operator_pinned_turn_fails_fast_instead_of_escalating() {
+        let socket_path = format!("/tmp/philote-pinfail-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-pin-fail".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-pin-fail");
+
+        let session_id = "sess-pin-fail";
+        let turn_id = "turn-pin-fail";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.turn_id = turn_id.into();
+        turn.fallback_tier = 0;
+        turn.selection_source = SelectionSource::OperatorExplicit;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .pinned_tier_role = Some("model.ollama".into());
+
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::ProviderFailure,
+                Some("gemini".into()),
+                "the pinned provider did not respond".into(),
+            )
+            .await
+            .expect("advance");
+
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "an operator-pinned session must fail fast, not stay parked mid-escalation"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            !emitted.iter().any(|e| !e["heal_event"].is_null()),
+            "operator-pinned fail-fast must not push a fallback_exhausted heal event: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().any(|e| e["task"]["action"] == "send_reply"
+                && e["task"]["content"] == "the pinned provider did not respond"),
+            "must fail with the real trigger message, not a generic exhaustion notice: {:#?}",
+            *emitted
         );
     }
 
@@ -8172,6 +8361,7 @@ mod tests {
                 turn_id.to_string(),
                 NoResponseClass::WatchdogTimeout,
                 None,
+                "watchdog timeout".into(),
             )
             .await
             .expect("first escalation");
@@ -8193,6 +8383,7 @@ mod tests {
                 turn_id.to_string(),
                 NoResponseClass::WatchdogTimeout,
                 None,
+                "watchdog timeout".into(),
             )
             .await
             .expect("second escalation");
@@ -9169,6 +9360,86 @@ mod tests {
                 .is_none(),
             "orphaned continuation must not start a turn"
         );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A session with an operator pin (`/model <tier>`) must tag new turns
+    /// `OperatorExplicit` — this is what makes `advance_turn_to_next_fallback_tier`
+    /// refuse to auto-escalate a pinned session.
+    #[tokio::test]
+    async fn pinned_session_new_turn_gets_operator_explicit_selection_source() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("pinselect").await;
+        let session_id = "sess-pinselect";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .pinned_tier_role = Some("model.ollama".into());
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("hello".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        let turn = runtime
+            .session(session_id)
+            .expect("session")
+            .active_turn
+            .as_ref()
+            .expect("turn started");
+        assert_eq!(turn.selection_source, SelectionSource::OperatorExplicit);
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A task delivered by the aiua CronTicker (`cron_job_id` set) must tag
+    /// its turn `CronPrimary` — the honest marker per `InboundTaskPayload`,
+    /// not string-sniffing corr_id/source.
+    #[tokio::test]
+    async fn cron_task_new_turn_gets_cron_primary_selection_source() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronselect").await;
+        let session_id = "sess-cronselect";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("scheduled heartbeat".into()),
+                    cron_job_id: Some("job-1".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        let turn = runtime
+            .session(session_id)
+            .expect("session")
+            .active_turn
+            .as_ref()
+            .expect("turn started");
+        assert_eq!(turn.selection_source, SelectionSource::CronPrimary);
 
         drop(runtime);
         let _ = server.await;

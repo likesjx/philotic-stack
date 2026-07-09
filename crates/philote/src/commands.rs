@@ -67,6 +67,11 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
             usage_hint: Some("/voice [kokoro|elevenlabs|openai] [voice_id]".into()),
         },
         CommandManifestEntry {
+            command: "model".into(),
+            description: "Pin this session to a model tier, or show/clear the current pin.".into(),
+            usage_hint: Some("/model [gemini|ollama|local|mlx]".into()),
+        },
+        CommandManifestEntry {
             command: "preapprove".into(),
             description: "Pre-approve a tool or class for this session.".into(),
             usage_hint: Some("/preapprove <tool|class> | this-session".into()),
@@ -141,6 +146,11 @@ pub enum SlashCommand {
         provider: Option<String>,
         voice_id: Option<String>,
     },
+    /// Pin this session to a model tier role (e.g. `model.ollama`), or with no
+    /// argument show the current pin and clear it.
+    Model {
+        tier: Option<String>,
+    },
     /// Submit a corrected transcript for a Whisper turn — feeds the training flywheel.
     Correct {
         turn_id: String,
@@ -179,6 +189,7 @@ impl SlashCommand {
             | Self::ApprovalClear { .. } => None,
             Self::Tts { .. } => None,
             Self::Voice { .. } => None,
+            Self::Model { .. } => None,
             Self::Correct { .. } => None,
             Self::Plan { .. } => None,
         }
@@ -257,6 +268,10 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             provider: Some(normalize_voice_provider(provider)),
             voice_id: Some((*voice_id).to_string()),
         }),
+        ["/model"] => Some(SlashCommand::Model { tier: None }),
+        ["/model", tier, ..] => Some(SlashCommand::Model {
+            tier: Some(normalize_model_tier(tier)),
+        }),
         ["/correct", turn_id, rest @ ..] if !rest.is_empty() => Some(SlashCommand::Correct {
             turn_id: (*turn_id).to_string(),
             text: rest.join(" "),
@@ -274,6 +289,23 @@ fn normalize_voice_provider(raw: &str) -> String {
         "elevenlabs" | "eleven" | "11labs" => "elevenlabs".into(),
         "openai" | "tts" => "openai".into(),
         other => other.to_string(),
+    }
+}
+
+/// Normalize a bare model tier name (or provider alias) into its `model.*`
+/// tier-role form. Anything already prefixed `model.` passes through
+/// unchanged so the tier-role naming convention stays the single source of
+/// truth (mirrors `normalize_voice_provider`).
+fn normalize_model_tier(raw: &str) -> String {
+    if raw.starts_with("model.") {
+        return raw.to_string();
+    }
+    match raw.to_lowercase().as_str() {
+        "gemini" | "cloud" | "model" => "model".into(),
+        "ollama" => "model.ollama".into(),
+        "local" | "onnx" | "kokoro" => "model.local".into(),
+        "mlx" => "model.mlx".into(),
+        other => format!("model.{other}"),
     }
 }
 
@@ -430,6 +462,44 @@ mod tests {
             Some(SlashCommand::Voice {
                 provider: Some("onnx".into()),
                 voice_id: Some("af_heart".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_model_command() {
+        assert_eq!(
+            parse_slash_command("/model"),
+            Some(SlashCommand::Model { tier: None })
+        );
+        assert_eq!(
+            parse_slash_command("/model gemini"),
+            Some(SlashCommand::Model {
+                tier: Some("model".into()),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/model ollama"),
+            Some(SlashCommand::Model {
+                tier: Some("model.ollama".into()),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/model local"),
+            Some(SlashCommand::Model {
+                tier: Some("model.local".into()),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/model mlx"),
+            Some(SlashCommand::Model {
+                tier: Some("model.mlx".into()),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/model model.ollama"),
+            Some(SlashCommand::Model {
+                tier: Some("model.ollama".into()),
             })
         );
     }
