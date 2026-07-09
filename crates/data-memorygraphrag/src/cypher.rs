@@ -521,6 +521,48 @@ pub fn patch_status_update_query() -> &'static str {
      RETURN p.id AS id, p.status AS status"
 }
 
+/// Read-only listing query for `life.patch.list` — the patch review surface.
+/// Returns governed patch proposals with risk tier, lifecycle status,
+/// provenance (`patch_json`), and audit anchor, newest first.
+///
+/// Safety: this query performs no writes. `statuses` are validated against the
+/// known lifecycle vocabulary and any unknown token is dropped before the
+/// literal list is built, so the inlined values can never carry arbitrary
+/// text. `limit` is clamped to `1..=200` and inlined as an integer.
+pub fn patch_list_query(statuses: &[String], limit: usize) -> String {
+    let known = [
+        PATCH_STATUS_PROPOSED,
+        PATCH_STATUS_AWAITING_CONFIRMATION,
+        PATCH_STATUS_APPLIED,
+        PATCH_STATUS_REJECTED,
+    ];
+    let mut tokens: Vec<&str> = Vec::new();
+    for status in statuses {
+        if let Some(known) = known.iter().copied().find(|k| *k == status.as_str()) {
+            if !tokens.contains(&known) {
+                tokens.push(known);
+            }
+        }
+    }
+    if tokens.is_empty() {
+        tokens = vec![PATCH_STATUS_PROPOSED, PATCH_STATUS_AWAITING_CONFIRMATION];
+    }
+    let status_list = tokens
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let limit = limit.clamp(1, 200);
+    format!(
+        "MATCH (p) WHERE p.patch_json IS NOT NULL AND p.status IN [{status_list}] \
+         RETURN p.id AS patch_id, p.patch_kind AS patch_kind, p.risk AS risk, \
+         p.status AS status, p.summary AS summary, p.rationale AS rationale, \
+         p.proposed_at AS proposed_at, p.status_updated_at AS status_updated_at, \
+         p.autonomy_audit_id AS autonomy_audit_id, p.patch_json AS patch_json \
+         ORDER BY p.proposed_at DESC LIMIT {limit}"
+    )
+}
+
 pub fn compile_recall_feedback(
     input: &RetrievalFeedbackInput,
     growth_evaluation: &serde_json::Value,
@@ -1204,5 +1246,41 @@ mod tests {
         assert!(patch_lookup_query().contains("$patch_id"));
         assert!(patch_status_update_query().contains("SET p.status = $status"));
         assert!(patch_status_update_query().contains("p.status_updated_at = $updated_at"));
+    }
+
+    #[test]
+    fn patch_list_query_is_read_only_and_bounded() {
+        let q = patch_list_query(
+            &[PATCH_STATUS_PROPOSED.to_string()],
+            crate::LifePatchListInput::DEFAULT_LIMIT,
+        );
+        // Read-only: no mutation verbs.
+        for verb in ["MERGE", "CREATE", "SET ", "DELETE", "REMOVE"] {
+            assert!(
+                !q.contains(verb),
+                "patch_list_query must not contain {verb}: {q}"
+            );
+        }
+        assert!(q.contains("p.patch_json IS NOT NULL"));
+        assert!(q.contains("p.risk AS risk"));
+        assert!(q.contains("p.status AS status"));
+        assert!(q.contains("ORDER BY p.proposed_at DESC"));
+        assert!(q.contains("LIMIT 50"));
+        assert!(q.contains("'proposed'"));
+    }
+
+    #[test]
+    fn patch_list_query_drops_unknown_statuses_and_clamps_limit() {
+        // Unknown token dropped; empty result falls back to pending set.
+        let q = patch_list_query(&["'; DROP".to_string(), "bogus".to_string()], 9999);
+        assert!(q.contains("'proposed'"));
+        assert!(q.contains("'awaiting_confirmation'"));
+        assert!(!q.contains("DROP"));
+        assert!(q.contains("LIMIT 200"), "limit must clamp to 200: {q}");
+
+        // Zero clamps up to 1.
+        let q0 = patch_list_query(&[PATCH_STATUS_APPLIED.to_string()], 0);
+        assert!(q0.contains("LIMIT 1"));
+        assert!(q0.contains("'applied'"));
     }
 }

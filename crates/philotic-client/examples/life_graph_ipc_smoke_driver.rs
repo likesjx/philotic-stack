@@ -116,7 +116,47 @@ async fn main() -> Result<()> {
     )
     .await?;
     assert_success_capability(&feedback_payload, "life.recall.feedback")?;
-    println!("life.recall.feedback IPC ok  context_id={context_id}");
+    let feedback_data = &feedback_payload["result"]["data"];
+    println!(
+        "life.recall.feedback IPC ok  context_id={context_id} status={} generated_patch={}",
+        feedback_data["status"].as_str().unwrap_or("?"),
+        feedback_data["generated_patch"],
+    );
+
+    // Read-only patch review surface (opt-in): proves `life.patch.list` is
+    // served by the runner and returns the governed patch proposals with risk
+    // tier + provenance. Requires a runner build that implements the tool.
+    if std::env::var("LIFE_GRAPH_SMOKE_PATCH_LIST").as_deref() == Ok("1") {
+        let list_payload = execute_life_tool(
+            &mut client,
+            &target_node,
+            &reply_node,
+            "life.patch.list",
+            patch_list_input(),
+        )
+        .await?;
+        assert_success_capability(&list_payload, "life.patch.list")?;
+        let list_data = &list_payload["result"]["data"];
+        if list_data["status"].as_str() != Some("ok") {
+            bail!("life.patch.list expected status=ok, got {list_payload}");
+        }
+        if list_data["read_only"].as_bool() != Some(true) {
+            bail!("life.patch.list expected read_only=true, got {list_payload}");
+        }
+        if !list_data["patches"].is_array() {
+            bail!("life.patch.list returned malformed patches array: {list_payload}");
+        }
+        println!(
+            "life.patch.list IPC ok  count={} statuses={} first={}",
+            list_data["count"],
+            list_data["statuses"],
+            list_data["patches"]
+                .as_array()
+                .and_then(|p| p.first())
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
 
     println!("life graph IPC smoke passed");
     Ok(())
@@ -316,16 +356,33 @@ fn recall_input() -> Value {
 }
 
 fn feedback_input(context_id: &str) -> Value {
+    // Rating is env-selectable so the live smoke can exercise governed patch
+    // generation and gate routing:
+    //   useful        → no patch (baseline)
+    //   disconnected  → Low  / SystemPatch    (SafeAutoUpdate; prose-only with empty refs)
+    //   missing/noisy/stale → Low / SystemPatch
+    //   overconfident → Medium / AttentionPatch (ConfirmFirst)
+    // Refs are left empty on purpose so Low-risk feedback stays prose-only and
+    // does NOT write bridge edges into the live graph.
+    let rating =
+        std::env::var("LIFE_GRAPH_FEEDBACK_RATING").unwrap_or_else(|_| "useful".to_string());
     json!({
         "feedback_id": format!("smoke-feedback-{}", Uuid::new_v4().simple()),
         "packet_id": context_id,
-        "rating": "useful",
+        "rating": rating,
         "candidate_count": 1,
         "connected_candidate_count": 1,
         "missing_context_refs": [],
         "noisy_node_refs": [],
         "stale_node_refs": [],
         "evidence_packets": []
+    })
+}
+
+fn patch_list_input() -> Value {
+    json!({
+        "status_filter": [],
+        "limit": 20
     })
 }
 
