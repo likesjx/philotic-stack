@@ -797,6 +797,49 @@ impl LifeGraphProvider {
                     .handle_cross_domain_recall(task, &query_val, &embedding, &now_iso)
                     .await;
             }
+            NamedRecallStrategy::CurrentPromptSemantic => {
+                // Plain whole-graph semantic search: no caller-supplied
+                // semantic_pivots required (unlike SemanticPivot). Sweeps the
+                // primary lived-fact labels across all four semantic spaces so
+                // a fresh per-prompt query_text gets ranked against the whole
+                // LifeGraph, not one named recipe's fixed label subset.
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::LifeEventSemantic,
+                    &["Event", "OpenLoop"],
+                    top_k,
+                    min_similarity,
+                    &embedding,
+                )
+                .await?;
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::GoalSystemSemantic,
+                    &["Goal", "Habit"],
+                    top_k,
+                    min_similarity,
+                    &embedding,
+                )
+                .await?;
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::MemoryBridgeSemantic,
+                    &["Commitment", "Decision"],
+                    top_k,
+                    min_similarity,
+                    &embedding,
+                )
+                .await?;
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::RolePersonSemantic,
+                    &["Aspiration"],
+                    top_k,
+                    min_similarity,
+                    &embedding,
+                )
+                .await?;
+            }
             NamedRecallStrategy::SemanticPivot => {
                 for pivot in &query_val.semantic_pivots {
                     for label in projection::labels_for_space(&pivot.space) {
@@ -1796,6 +1839,12 @@ enum NamedRecallStrategy {
     CommitmentsApproaching,
     ReEntryContext,
     CrossDomainEntanglement,
+    /// General whole-graph semantic search seeded with the operator's raw
+    /// current-prompt `query_text` — no caller-supplied `semantic_pivots`
+    /// required. Used by the philote per-prompt LifeGraph auto-recall lane
+    /// (`current_prompt_semantic`) alongside `re_entry_context` and
+    /// `open_loops_by_context`.
+    CurrentPromptSemantic,
 }
 
 impl NamedRecallStrategy {
@@ -1809,6 +1858,7 @@ impl NamedRecallStrategy {
             "commitments_approaching" => Some(Self::CommitmentsApproaching),
             "re_entry_context" => Some(Self::ReEntryContext),
             "cross_domain_entanglement" => Some(Self::CrossDomainEntanglement),
+            "current_prompt_semantic" => Some(Self::CurrentPromptSemantic),
             _ => None,
         }
     }
@@ -1831,7 +1881,8 @@ impl NamedRecallStrategy {
                         "life.recall: unknown named_strategy; expected one of \
                          semantic_pivot, open_loops_by_context, goals_and_next_actions, \
                          commitments_approaching, re_entry_context, \
-                         cross_domain_entanglement; falling back to semantic_pivot"
+                         cross_domain_entanglement, current_prompt_semantic; \
+                         falling back to semantic_pivot"
                     );
                     Self::SemanticPivot
                 }
@@ -1908,6 +1959,15 @@ impl NamedRecallStrategy {
             Self::CommitmentsApproaching => vec!["Commitment"],
             Self::ReEntryContext => vec!["OpenLoop", "Goal", "Habit", "System", "Role"],
             Self::CrossDomainEntanglement => vec!["Signal", "Goal"],
+            Self::CurrentPromptSemantic => vec![
+                "OpenLoop",
+                "Commitment",
+                "Goal",
+                "Habit",
+                "Event",
+                "Decision",
+                "Aspiration",
+            ],
         }
     }
 
@@ -1919,6 +1979,7 @@ impl NamedRecallStrategy {
             Self::CommitmentsApproaching => "commitments_approaching",
             Self::ReEntryContext => "re_entry_context",
             Self::CrossDomainEntanglement => "cross_domain_entanglement",
+            Self::CurrentPromptSemantic => "current_prompt_semantic",
         }
     }
 }
@@ -2253,6 +2314,10 @@ mod tests {
                 "cross_domain_entanglement",
                 NamedRecallStrategy::CrossDomainEntanglement,
             ),
+            (
+                "current_prompt_semantic",
+                NamedRecallStrategy::CurrentPromptSemantic,
+            ),
         ];
 
         for (name, expected) in cases {
@@ -2289,8 +2354,58 @@ mod tests {
             NamedRecallStrategy::parse("semantic_pivot"),
             Some(NamedRecallStrategy::SemanticPivot)
         );
+        assert_eq!(
+            NamedRecallStrategy::parse("current_prompt_semantic"),
+            Some(NamedRecallStrategy::CurrentPromptSemantic)
+        );
         assert_eq!(NamedRecallStrategy::parse("surprise_me"), None);
         assert_eq!(NamedRecallStrategy::parse(""), None);
+    }
+
+    #[test]
+    fn current_prompt_semantic_sweeps_primary_lived_fact_labels() {
+        // No caller-supplied semantic_pivots required (unlike SemanticPivot) —
+        // the fallback/blend label set must cover the primary lived-fact
+        // labels across all four semantic spaces so a fresh per-prompt query
+        // still ranks against the whole graph even when the vector pass
+        // under-fills max_context_packets.
+        let task = task_with_params(json!({ "named_strategy": "current_prompt_semantic" }));
+        let strategy = NamedRecallStrategy::from_task(&task);
+        assert_eq!(strategy, NamedRecallStrategy::CurrentPromptSemantic);
+        assert_eq!(strategy.as_str(), "current_prompt_semantic");
+
+        let query_val: RetrievalQuery = serde_json::from_value(json!({
+            "query_id": "q1",
+            "query_text": "current prompt text",
+        }))
+        .unwrap();
+        let labels = strategy.fallback_labels(&query_val);
+        for expected in [
+            "OpenLoop",
+            "Commitment",
+            "Goal",
+            "Habit",
+            "Event",
+            "Decision",
+            "Aspiration",
+        ] {
+            assert!(
+                labels.contains(&expected),
+                "missing lived-fact label: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_prompt_semantic_agrees_with_memory_aware_graph_rank() {
+        assert!(
+            NamedRecallStrategy::CurrentPromptSemantic
+                .agrees_with(&RetrievalStrategy::MemoryAwareGraphRank)
+        );
+        assert!(
+            !NamedRecallStrategy::CurrentPromptSemantic
+                .agrees_with(&RetrievalStrategy::SemanticPivot)
+        );
     }
 
     #[test]

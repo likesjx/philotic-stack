@@ -1516,6 +1516,14 @@ impl SessionState {
     /// Muninn lane already recalled), and total injected content is capped at
     /// `char_budget` chars with a truncation marker. Returns the number of
     /// records injected.
+    ///
+    /// Fairness: candidates are round-robin interleaved across strategies
+    /// (one record per strategy per round) before the char budget is applied,
+    /// so a strategy added later to the auto-recall lane's strategy list —
+    /// e.g. `current_prompt_semantic` — isn't starved by two strategies'
+    /// worth of records filling the budget first. Dedup precedence (first
+    /// strategy in cache order wins a shared node id) is decided before
+    /// interleaving, so it is unaffected by the round-robin ordering.
     pub fn inject_cached_life_context(
         &mut self,
         max_age_secs: u64,
@@ -1535,18 +1543,39 @@ impl SessionState {
             .filter_map(|memory| memory.id.clone())
             .collect();
 
-        let mut candidates: Vec<RecalledMemoryRecord> = Vec::new();
+        let mut lanes: Vec<std::collections::VecDeque<RecalledMemoryRecord>> = Vec::new();
         for entry in &self.life_recall_cache {
             if entry.fetched_at.saturating_add(max_age_secs) < now {
                 continue; // stale — skip; the out-of-band prefetch will refresh it
             }
+            let mut lane = std::collections::VecDeque::new();
             for record in &entry.records {
                 if let Some(id) = record.id.as_deref() {
                     if !seen_ids.insert(id.to_string()) {
                         continue;
                     }
                 }
-                candidates.push(record.clone());
+                lane.push_back(record.clone());
+            }
+            if !lane.is_empty() {
+                lanes.push(lane);
+            }
+        }
+
+        // Round-robin: one record per lane per round, so every strategy gets
+        // a fair shot at the char budget before any strategy's lower-ranked
+        // records are considered.
+        let mut candidates: Vec<RecalledMemoryRecord> = Vec::new();
+        loop {
+            let mut progressed = false;
+            for lane in lanes.iter_mut() {
+                if let Some(record) = lane.pop_front() {
+                    candidates.push(record);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
             }
         }
 
@@ -8982,6 +9011,117 @@ mod tests {
         });
 
         assert_eq!(state.inject_cached_life_context(1_800, now, 2_500), 0);
+    }
+
+    #[test]
+    fn life_recall_cache_round_trips_three_strategies_through_checkpoint() {
+        // #152/#160 covered the two fixed strategies; this locks in that
+        // current_prompt_semantic rides the same cache + checkpoint path
+        // rather than a parallel pipeline.
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        for (strategy, id) in [
+            ("re_entry_context", "life:re-entry:1"),
+            ("open_loops_by_context", "life:open-loop:1"),
+            ("current_prompt_semantic", "life:semantic:1"),
+        ] {
+            state.upsert_life_recall_cache(LifeRecallCacheEntry {
+                strategy: strategy.into(),
+                fetched_at: 1_750_000_000,
+                query_text: "did I follow up with the vet about Fig".into(),
+                records: vec![life_record(id, "content")],
+            });
+        }
+        assert_eq!(state.life_recall_cache.len(), 3);
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert_eq!(restored.life_recall_cache, state.life_recall_cache);
+        assert!(
+            restored
+                .life_recall_cache
+                .iter()
+                .any(|entry| entry.strategy == "current_prompt_semantic")
+        );
+    }
+
+    #[test]
+    fn inject_cached_life_context_dedupes_across_all_three_strategies() {
+        let now = 10_000u64;
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        state.start_turn(make_plain_turn());
+        // Same node id surfaced by all three strategies — inject once.
+        for strategy in ["re_entry_context", "open_loops_by_context", "current_prompt_semantic"] {
+            state.upsert_life_recall_cache(LifeRecallCacheEntry {
+                strategy: strategy.into(),
+                fetched_at: now - 10,
+                query_text: String::new(),
+                records: vec![life_record("life:shared", "renew passport before August trip")],
+            });
+        }
+
+        let injected = state.inject_cached_life_context(1_800, now, 2_500);
+        assert_eq!(injected, 1, "shared node id must be injected exactly once");
+        let memories = &state.active_turn.as_ref().unwrap().recalled_memories;
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].id.as_deref(), Some("life:shared"));
+    }
+
+    #[test]
+    fn inject_cached_life_context_gives_current_prompt_semantic_fair_share_under_cap() {
+        // Regression guard for round-robin fairness: re_entry_context and
+        // open_loops_by_context alone have enough large records to exhaust
+        // the char budget. current_prompt_semantic — added last to the cache
+        // — must still land at least one record instead of being pushed past
+        // the budget by the two fixed strategies.
+        let now = 10_000u64;
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        state.start_turn(make_plain_turn());
+
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "re_entry_context".into(),
+            fetched_at: now - 10,
+            query_text: String::new(),
+            records: vec![
+                life_record("life:re-entry:1", &"a".repeat(1_000)),
+                life_record("life:re-entry:2", &"a".repeat(1_000)),
+            ],
+        });
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "open_loops_by_context".into(),
+            fetched_at: now - 10,
+            query_text: String::new(),
+            records: vec![
+                life_record("life:open-loop:1", &"b".repeat(1_000)),
+                life_record("life:open-loop:2", &"b".repeat(1_000)),
+            ],
+        });
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "current_prompt_semantic".into(),
+            fetched_at: now - 10,
+            query_text: String::new(),
+            records: vec![life_record("life:semantic:1", "fresh per-prompt hit")],
+        });
+
+        let injected = state.inject_cached_life_context(1_800, now, 2_500);
+        let memories = &state.active_turn.as_ref().unwrap().recalled_memories;
+        assert_eq!(injected, memories.len());
+        assert!(
+            memories.iter().any(|m| m.id.as_deref() == Some("life:semantic:1")),
+            "current_prompt_semantic must get a fair share of the char budget, not be starved: {:?}",
+            memories.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

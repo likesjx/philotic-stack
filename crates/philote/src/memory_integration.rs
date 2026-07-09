@@ -131,8 +131,19 @@ pub(super) const LIFE_AUTORECALL_PREFETCH_TURN_ID: &str = "life-autorecall-prefe
 pub(super) const LIFE_AUTORECALL_CHAR_BUDGET: usize = 2500;
 
 /// Named recall strategies prefetched for every session/turn.
-pub(super) const LIFE_AUTORECALL_STRATEGIES: [&str; 2] =
-    ["re_entry_context", "open_loops_by_context"];
+///
+/// `re_entry_context` and `open_loops_by_context` are fixed named recipes
+/// (constrained label sets, recency/commitment-weighted ranking).
+/// `current_prompt_semantic` is a general whole-graph semantic vector search
+/// (no caller-supplied `semantic_pivots` required) that ranks the same
+/// per-turn `query_text` against the broader set of primary lived-fact
+/// labels — breadth, not extra freshness: all three strategies share the
+/// same one-turn-stale prefetch trigger and the same current-message seed.
+pub(super) const LIFE_AUTORECALL_STRATEGIES: [&str; 3] = [
+    "re_entry_context",
+    "open_loops_by_context",
+    "current_prompt_semantic",
+];
 
 /// Max context packets requested per prefetch strategy — kept small so the
 /// injected context stays lean.
@@ -2368,6 +2379,45 @@ mod tests {
         query.validate().expect("query passes contract validation");
         assert_eq!(query.active_role.as_deref(), Some("chief_of_staff"));
         assert_eq!(query.max_context_packets, LIFE_AUTORECALL_MAX_PACKETS);
+    }
+
+    #[test]
+    fn life_autorecall_strategies_include_current_prompt_semantic() {
+        assert_eq!(
+            LIFE_AUTORECALL_STRATEGIES,
+            ["re_entry_context", "open_loops_by_context", "current_prompt_semantic"],
+            "third strategy must ride the same prefetch loop as the two fixed recipes"
+        );
+    }
+
+    #[test]
+    fn current_prompt_semantic_task_json_seeds_with_current_message() {
+        // The lane's whole design is "vector-search THIS prompt": the query_text
+        // must be the operator's actual current-turn message, not a summary or
+        // placeholder — same seeding path the other two strategies already use.
+        let current_message = "Did I ever follow up with the vet about Fig's checkup?";
+        let task = life_recall_prefetch_task_json(
+            "agent-jane-01",
+            "sess-42",
+            "mbp-jane-aiua-01",
+            "current_prompt_semantic",
+            current_message,
+        );
+
+        assert_eq!(task["tool_name"], "life.recall");
+        assert_eq!(task["turn_id"], LIFE_AUTORECALL_PREFETCH_TURN_ID);
+        let args = &task["arguments"];
+        assert_eq!(args["named_strategy"], "current_prompt_semantic");
+        assert_eq!(args["query_text"], current_message);
+        assert_eq!(args["active_role"], "companion");
+        assert_eq!(
+            args["max_context_packets"],
+            LIFE_AUTORECALL_MAX_PACKETS as u64
+        );
+
+        let query: data_memorygraphrag::RetrievalQuery =
+            serde_json::from_value(args.clone()).expect("arguments parse as RetrievalQuery");
+        query.validate().expect("query passes contract validation");
     }
 
     #[test]
