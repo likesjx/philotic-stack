@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DRY_RUN=0
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY_RUN=1
+  shift
+fi
+
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "usage: $0 <ssh-host> <hotel-name> [expected-hostname]"
+  echo "usage: $0 [--dry-run] <ssh-host> <hotel-name> [expected-hostname]"
+  echo "  --dry-run: read-only — probe the remote, print the restart plan, change nothing"
   exit 1
 fi
 
@@ -37,6 +44,37 @@ remote_file_exists() {
   exit 1
 }
 
+# Find the launchd LaunchAgent label managing this hotel on the remote, whether
+# currently loaded or just installed as a plist. Labels follow
+# com.philotic.aiua.<hotel> (mac-jane → com.philotic.aiua.mac-jane, mbp-jane →
+# com.philotic.aiua.mbp-jane) or the profile-prefixed
+# com.philotic.aiua.<profile>.<hotel> written by `phil service install` — so we
+# match by pattern, never a hardcoded label. Prints the label, or nothing when
+# the hotel is not launchd-managed (hand-start mode).
+detect_launchd_label() {
+  local label
+  # Prefer a currently-loaded service (launchctl list column 3 is the label).
+  label="$(ssh -n "${SSH_OPTS[@]}" "${REMOTE}" \
+    "launchctl list 2>/dev/null | awk '{print \$3}' | grep '^com\\.philotic\\.aiua\\.' || true" \
+    | grep -E "(^|\.)${HOTEL_NAME}\$" | head -n 1 || true)"
+  if [[ -n "${label}" ]]; then
+    printf '%s\n' "${label}"
+    return 0
+  fi
+  # Fall back to an installed-but-unloaded LaunchAgent plist.
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" \
+    "ls \$HOME/Library/LaunchAgents/com.philotic.aiua.*.plist 2>/dev/null || true" \
+    | sed -e 's#.*/##' -e 's#\.plist$##' \
+    | grep -E "(^|\.)${HOTEL_NAME}\$" | head -n 1 || true
+}
+
+# Is the given launchd service currently loaded in the remote gui domain?
+remote_launchd_loaded() {
+  local label="$1"
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" \
+    "launchctl print gui/\$(id -u)/${label} >/dev/null 2>&1"
+}
+
 REMOTE_HOME="$(ssh "${SSH_OPTS[@]}" "${REMOTE}" 'echo $HOME')"
 if [[ -n "${PHILOTIC_REMOTE_PROFILE:-}" ]]; then
   REMOTE_PROFILE="${PHILOTIC_REMOTE_PROFILE}"
@@ -60,6 +98,42 @@ if [[ -n "${EXPECTED_HOSTNAME}" ]]; then
     echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected '${EXPECTED_HOSTNAME}'."
     exit 1
   fi
+fi
+
+# Detect launchd management up front: the stop step must bootout the right
+# label (KeepAlive would otherwise respawn mid-install), and the restart step
+# must go back through launchd — hand-starting a launchd-managed hotel orphans
+# it from supervision and forces a manual bootout/bootstrap dance on the next
+# deploy (bit us 3+ times on 2026-07-06).
+echo "▶ Probing launchd service for '${HOTEL_NAME}' on ${REMOTE}..."
+LAUNCHD_LABEL="$(detect_launchd_label)"
+if [[ -n "${LAUNCHD_LABEL}" ]]; then
+  echo "  ✓ launchd-managed: ${LAUNCHD_LABEL}"
+else
+  echo "  – no launchd service found; will hand-start after install"
+fi
+
+if [[ ${DRY_RUN} -eq 1 ]]; then
+  echo "▶ Dry run — no changes will be made."
+  AIUA_CELLAR="$(ssh "${SSH_OPTS[@]}" "${REMOTE}" "ls -d /opt/homebrew/Cellar/aiua/*/bin 2>/dev/null | head -1")"
+  echo "  remote cellar:      ${AIUA_CELLAR:-<not found>}"
+  echo "  remote profile:     ${REMOTE_PROFILE}"
+  if [[ -n "${LAUNCHD_LABEL}" ]]; then
+    if remote_launchd_loaded "${LAUNCHD_LABEL}"; then
+      loaded_now="loaded"
+    else
+      loaded_now="installed but not loaded"
+    fi
+    echo "  launchd service:    ${LAUNCHD_LABEL} (${loaded_now})"
+    echo "  restart plan:       clear hotels.active_pid in ~/.philotic/${REMOTE_PROFILE}/context.db,"
+    echo "                      then launchctl kickstart -k (or bootstrap if unloaded)"
+  else
+    echo "  launchd service:    none"
+    echo "  restart plan:       hand-start via nohup (legacy path)"
+  fi
+  echo "  log rotation:       would run scripts/install-log-rotation.sh on ${REMOTE}"
+  echo "✅ Dry run complete."
+  exit 0
 fi
 
 echo "▶ Building release runtime binaries (local)..."
@@ -89,7 +163,8 @@ if [[ -z "${AIUA_CELLAR}" ]]; then
 fi
 
 echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
-ssh "${SSH_OPTS[@]}" "${REMOTE}" "uid=\$(id -u); launchctl bootout gui/\${uid}/com.philotic.aiua.${HOTEL_NAME} 2>/dev/null || true; pkill -f '[a]iua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f '[a]iua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
+BOOTOUT_LABEL="${LAUNCHD_LABEL:-com.philotic.aiua.${HOTEL_NAME}}"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "uid=\$(id -u); launchctl bootout gui/\${uid}/${BOOTOUT_LABEL} 2>/dev/null || true; pkill -f '[a]iua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f '[a]iua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
 
 echo "▶ Signing and verifying local binaries before push..."
 UNSIGNED=()
@@ -171,7 +246,35 @@ fi
 echo "▶ Applying mesh-config on ${REMOTE}..."
 ssh "${SSH_OPTS[@]}" "${REMOTE}" "env PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' /opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel ${HOTEL_NAME}"
 
-echo "▶ Starting hotel '${HOTEL_NAME}' on ${REMOTE} with Rust cutover flags..."
-ssh "${SSH_OPTS[@]}" "${REMOTE}" "ulimit -n 65536; nohup env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel ${HOTEL_NAME} >> ~/.philotic/${REMOTE_PROFILE}/aiua.log 2>&1 & echo \$! > ~/.philotic/${REMOTE_PROFILE}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${REMOTE_PROFILE}/aiua.pid)"
+if [[ -n "${LAUNCHD_LABEL}" ]]; then
+  echo "▶ Restarting hotel '${HOTEL_NAME}' via launchd (${LAUNCHD_LABEL})..."
+  # Clear the stale active_pid row first: aiua refuses to boot when the row
+  # points at a PID that still exists (or got reused), and a launchd respawn
+  # can race the old row. Same profile→db derivation the rest of this script
+  # uses: ~/.philotic/<profile>/context.db.
+  if ! ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "sqlite3 \$HOME/.philotic/${REMOTE_PROFILE}/context.db \"UPDATE hotels SET active_pid = NULL WHERE hotel_name = '${HOTEL_NAME}';\""; then
+    echo "⚠ Could not clear hotels.active_pid (continuing — aiua may refuse to start if a stale live PID matches)"
+  fi
+  if remote_launchd_loaded "${LAUNCHD_LABEL}"; then
+    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "launchctl kickstart -k gui/\$(id -u)/${LAUNCHD_LABEL}"
+  else
+    # The stop step booted the service out; bring it back under launchd
+    # (RunAtLoad starts it). Never hand-start a launchd-managed hotel.
+    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "launchctl bootstrap gui/\$(id -u) \$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+  fi
+  echo "  ✓ ${LAUNCHD_LABEL} restarted under launchd supervision"
+else
+  echo "▶ No launchd service — hand-starting hotel '${HOTEL_NAME}' on ${REMOTE} with Rust cutover flags..."
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "ulimit -n 65536; nohup env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel ${HOTEL_NAME} >> ~/.philotic/${REMOTE_PROFILE}/aiua.log 2>&1 & echo \$! > ~/.philotic/${REMOTE_PROFILE}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${REMOTE_PROFILE}/aiua.pid)"
+fi
+
+echo "▶ Ensuring log rotation on ${REMOTE}..."
+# Streams the installer over ssh — no repo checkout needed on the remote.
+# The installer is macOS-only (Linux hotels log to journald, which
+# self-rotates) and never exits non-zero over missing sudo; a transport
+# failure here must not fail an otherwise-complete push.
+if ! ssh "${SSH_OPTS[@]}" "${REMOTE}" 'bash -s' < "${ROOT_DIR}/scripts/install-log-rotation.sh"; then
+  echo "⚠ Log-rotation install failed on ${REMOTE} (non-fatal). Run scripts/install-log-rotation.sh there manually."
+fi
 
 echo "✅ ${REMOTE}:${HOTEL_NAME} updated and restarted."
