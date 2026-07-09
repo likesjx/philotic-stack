@@ -144,6 +144,14 @@ pub struct ContextProjection {
     pub contributions: Vec<LayerContribution>,
     #[serde(default)]
     pub budget: ContextBudget,
+    /// Per-source injection budget usage for this assembly. See `InjectionBudget`.
+    #[serde(default)]
+    pub budget_ledger: BudgetLedger,
+    /// `total_used / InjectionBudget.total_envelope_chars`, clamped to 100.
+    /// Fires `ReflexEvent::ContextPressure { used_pct: context_pressure_pct }`
+    /// at the live turn-assembly call site (see `runtime.rs`).
+    #[serde(default)]
+    pub context_pressure_pct: u8,
     #[serde(default)]
     pub refresh_plan: Vec<String>,
     #[serde(default)]
@@ -1061,6 +1069,86 @@ impl ContextWindowPolicy {
     }
 }
 
+/// Hard per-source character caps for prompt-injected content, with visible
+/// usage. Model-independent (chars, not tokens), same shape as Hermes'
+/// `memory_char_limit` / `user_char_limit`. `dialogue_window_chars` stays
+/// owned by `ContextWindowPolicy` — it is not duplicated here.
+///
+/// Slice 0 applies `persona_chars`, `rules_chars`, and `recalled_memory_chars`
+/// to the layers that exist today (`project_agent_self`, `project_rules`,
+/// `project_recalled_memory`). `memory_snapshot_chars`, `skills_chars`, and
+/// `reflex_snapshot_chars` are reserved for the frozen `MemorySnapshot` and
+/// tiered skill/reflex projections landing in later slices — no renderer
+/// consumes them yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InjectionBudget {
+    /// Cap for the Identity layer (identity_text + soul_text + role governance).
+    pub persona_chars: usize,
+    /// Reserved for the slice-2 frozen `MemorySnapshot` block. Unused today.
+    pub memory_snapshot_chars: usize,
+    /// Cap for the per-turn RecalledMemory layer (`project_recalled_memory`).
+    pub recalled_memory_chars: usize,
+    /// Reserved for a future skills/role-manifest index projection. Unused today.
+    pub skills_chars: usize,
+    /// Reserved for a future reflex-state projection. Unused today.
+    pub reflex_snapshot_chars: usize,
+    /// Cap for the Rules layer (`project_rules`).
+    pub rules_chars: usize,
+    /// Whole-envelope ceiling (sum of all rendered layer chars). Drives
+    /// `ReflexEvent::ContextPressure` emission — see `BudgetLedger`.
+    pub total_envelope_chars: usize,
+}
+
+impl Default for InjectionBudget {
+    fn default() -> Self {
+        Self {
+            persona_chars: 6_000,
+            memory_snapshot_chars: 4_000,
+            recalled_memory_chars: 3_000,
+            skills_chars: 2_500,
+            reflex_snapshot_chars: 1_000,
+            rules_chars: 2_000,
+            total_envelope_chars: 60_000,
+        }
+    }
+}
+
+/// One budgeted source's usage against its cap for a single assembled turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetEntry {
+    pub source: String,
+    pub used_chars: usize,
+    pub cap_chars: usize,
+    pub truncated: bool,
+}
+
+impl BudgetEntry {
+    /// Usage percentage against the cap. Deliberately not clamped to 100 —
+    /// this is the diagnostic value shown in `/context`, where an honest
+    /// over-100% reading is more useful than a capped one. Uses u128
+    /// intermediate math so pathological caps/usage cannot overflow.
+    pub fn pct(&self) -> u32 {
+        if self.cap_chars == 0 {
+            return 100;
+        }
+        ((self.used_chars as u128 * 100) / self.cap_chars as u128).min(u32::MAX as u128) as u32
+    }
+}
+
+/// Per-turn usage ledger for every budgeted context source, in assembly order.
+/// Surfaced by `/context` (`context_breakdown_text`) so the agent and operator
+/// can see how close any section is to its cap before it silently truncates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BudgetLedger {
+    pub entries: Vec<BudgetEntry>,
+}
+
+impl BudgetLedger {
+    pub fn any_truncated(&self) -> bool {
+        self.entries.iter().any(|e| e.truncated)
+    }
+}
+
 /// Configures the two-axis memory strategy: local rolling window + on-demand recall.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryPolicy {
@@ -1253,6 +1341,8 @@ pub struct AgentSettings {
     pub memory: MemoryPolicy,
     #[serde(default)]
     pub execution: ExecutionPolicy,
+    #[serde(default)]
+    pub injection_budget: InjectionBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1862,5 +1952,64 @@ mod paracrine_budget_tests {
         let exec: ExecutionPolicy = serde_json::from_value(json).expect("deserialize old policy");
         assert_eq!(exec.paracrine_hop_budget, 5);
         assert_eq!(exec.paracrine_chain_budget_secs, 900);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_entry_pct_reports_true_usage_uncapped() {
+        let entry = BudgetEntry {
+            source: "x".into(),
+            used_chars: 150,
+            cap_chars: 100,
+            truncated: true,
+        };
+        assert_eq!(entry.pct(), 150);
+    }
+
+    #[test]
+    fn budget_entry_pct_zero_cap_reports_100() {
+        let entry = BudgetEntry {
+            source: "x".into(),
+            used_chars: 5,
+            cap_chars: 0,
+            truncated: false,
+        };
+        assert_eq!(entry.pct(), 100);
+    }
+
+    #[test]
+    fn injection_budget_default_matches_proposal_defaults() {
+        let budget = InjectionBudget::default();
+        assert_eq!(budget.persona_chars, 6_000);
+        assert_eq!(budget.memory_snapshot_chars, 4_000);
+        assert_eq!(budget.recalled_memory_chars, 3_000);
+        assert_eq!(budget.skills_chars, 2_500);
+        assert_eq!(budget.reflex_snapshot_chars, 1_000);
+        assert_eq!(budget.rules_chars, 2_000);
+        assert_eq!(budget.total_envelope_chars, 60_000);
+    }
+
+    #[test]
+    fn budget_ledger_any_truncated_reflects_entries() {
+        let mut ledger = BudgetLedger::default();
+        assert!(!ledger.any_truncated());
+        ledger.entries.push(BudgetEntry {
+            source: "x".into(),
+            used_chars: 1,
+            cap_chars: 1,
+            truncated: false,
+        });
+        assert!(!ledger.any_truncated());
+        ledger.entries.push(BudgetEntry {
+            source: "y".into(),
+            used_chars: 5,
+            cap_chars: 1,
+            truncated: true,
+        });
+        assert!(ledger.any_truncated());
     }
 }

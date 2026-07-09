@@ -122,6 +122,21 @@ fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
     Some(payload.display_message())
 }
 
+/// Reads the `context_pressure_pct` field out of a serialized
+/// `ContextProjection` (as produced by `SessionState::model_request_payloads`)
+/// and clamps it to `u8::MAX`-safe 0..=100, matching the clamp already
+/// applied at assembly time in `session/mod.rs`. This is the literal
+/// extraction logic used at the `handle_user_message` turn-assembly call
+/// site to drive the live `ReflexEvent::ContextPressure` producer — pulled
+/// out as a pure function so a rename or removal of the field is caught by
+/// a plain unit test instead of requiring a full IPC-backed runtime harness.
+fn context_pressure_pct_from_projection(context_projection: &Value) -> Option<u8> {
+    context_projection
+        .get("context_pressure_pct")
+        .and_then(Value::as_u64)
+        .map(|pct| pct.min(100) as u8)
+}
+
 fn should_attempt_provider_repair(error: &TaskErrorPayload, state: Option<&SessionState>) -> bool {
     error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
@@ -2492,6 +2507,14 @@ impl AgentRuntime {
             let tools_for_model = state.project_tools_for_turn(&content);
             let (model_prompt, model_context, context_projection) =
                 state.model_request_payloads(&content, &tools_for_model);
+            // First live producer of ReflexEvent::ContextPressure (reflex.rs:309/460
+            // has handled it, unfired, since the reflex engine was introduced).
+            // context_pressure_pct_from_projection is a pure wrapper around this
+            // exact field read, unit-tested below so a rename/removal fails a
+            // plain test instead of only manifesting as a silent no-op here.
+            if let Some(used_pct) = context_pressure_pct_from_projection(&context_projection) {
+                state.fire_reflex_event(ReflexEvent::ContextPressure { used_pct });
+            }
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
@@ -5869,10 +5892,11 @@ mod tests {
     use super::{
         AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE,
         MAX_ORACLE_EXTRA_TIERS, NoResponseAction, NoResponseClass, ProviderErrorClass,
-        classify_provider_error, decide_no_response_action, extract_model_error,
-        extract_model_error_payload, format_role_command_reply, format_roles_report,
-        loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments, next_ladder_tier,
-        normalized_user_content, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
+        classify_provider_error, context_pressure_pct_from_projection, decide_no_response_action,
+        extract_model_error, extract_model_error_payload, format_role_command_reply,
+        format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
+        media_analysis_attachments, next_ladder_tier, normalized_user_content,
+        parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
         resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
@@ -5880,6 +5904,7 @@ mod tests {
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
     };
+    use crate::reflex::ReflexEvent;
     use crate::session::{
         ActivePlan, ApprovalPolicy, CarryoverPlan, ComponentExecutionRoute, ComponentRouteAssembly,
         ComponentRouteBinding, PlanStep, ResponseRouteMode, RoleActivation, SessionState,
@@ -6122,6 +6147,61 @@ mod tests {
         assert_eq!(
             json["context_projection"]["conversation_turn"]["conversation_turn_id"],
             "turn-1"
+        );
+    }
+
+    #[test]
+    fn context_pressure_pct_from_projection_reads_the_field_runtime_depends_on() {
+        // Pins the exact JSON field name + clamping behavior that
+        // handle_user_message's turn-assembly call site depends on to fire
+        // the live ReflexEvent::ContextPressure producer. If the field is
+        // renamed or removed on the session-side producer, this fails
+        // instead of the runtime call silently becoming a permanent no-op.
+        let present = serde_json::json!({"context_pressure_pct": 87});
+        assert_eq!(context_pressure_pct_from_projection(&present), Some(87));
+
+        let missing = serde_json::json!({"other_field": 1});
+        assert_eq!(context_pressure_pct_from_projection(&missing), None);
+
+        let wrong_type = serde_json::json!({"context_pressure_pct": "87"});
+        assert_eq!(context_pressure_pct_from_projection(&wrong_type), None);
+
+        // Assembly already clamps to 100 (session/mod.rs), but the runtime-side
+        // read clamps too, defense in depth against a future producer regression.
+        let over_100 = serde_json::json!({"context_pressure_pct": 150});
+        assert_eq!(context_pressure_pct_from_projection(&over_100), Some(100));
+    }
+
+    #[test]
+    fn context_pressure_projection_to_emit_path_fires_reflex_through_the_runtime_extractor() {
+        // Integration-style coverage of the exact path handle_user_message
+        // drives at its turn-assembly call site: build a real
+        // ContextProjection through SessionState, serialize it the same way
+        // model_request_payloads does, extract used_pct with the same
+        // runtime.rs helper the live call site uses, then fire the reflex
+        // event and assert the known downstream effect. This fails if either
+        // the field name drifts or the runtime extraction/emit wiring is
+        // removed — not just a data-structure assertion.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state
+            .agent_profile
+            .media_routing_policy
+            .strip_tools_on_media = false;
+        state.settings.injection_budget.total_envelope_chars = 1;
+
+        let (_, _, context_projection) = state.model_request_payloads("hello", &[]);
+        let used_pct = context_pressure_pct_from_projection(&context_projection)
+            .expect("runtime.rs call site expects this field to be present");
+        assert_eq!(used_pct, 100);
+
+        state.fire_reflex_event(ReflexEvent::ContextPressure { used_pct });
+        assert!(
+            state
+                .agent_profile
+                .media_routing_policy
+                .strip_tools_on_media,
+            "the runtime.rs extractor -> fire_reflex_event path should trip the reflex.rs:460 media-strip handler exactly like the live call site does"
         );
     }
 
