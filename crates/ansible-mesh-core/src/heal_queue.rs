@@ -195,6 +195,16 @@ fn has_standalone_status(text: &str, lo: u32, hi: u32) -> bool {
 ///   still counts toward a work-item filing)
 /// - `provider_error:{provider}` — any other provider failure (escalate)
 /// - `model_empty_response` — model returned nothing usable (escalate)
+/// - `response_route_unresolved` — an outbound response-like payload (tool
+///   result / model response / …) couldn't be resolved to any concrete
+///   return guest (escalate; 2026-07-09 stuck-turn forensic RC-4)
+/// - `cross_hotel_misroute` — a session's active incarnation was a poisoned
+///   non-agent infra guest (tool/datasource/gateway/model/*-runner) and no
+///   agent fallback could be resolved either (escalate; RC-2/RC-4)
+/// - `duplicate_finalization` — a second terminal send was dropped for a turn
+///   whose final response was already delivered (escalate; RC-3/RC-4)
+/// - `orphaned_tool_result` — a tool/datasource result was left with no live
+///   consumer to deliver to (escalate; RC-2/RC-4)
 pub fn classify_turn_failure(line: &str) -> Option<TurnFailureClass> {
     let lower = line.to_lowercase();
 
@@ -206,6 +216,44 @@ pub fn classify_turn_failure(line: &str) -> Option<TurnFailureClass> {
         || lower.contains("turn watchdog evicted")
     {
         return None;
+    }
+
+    // 2026-07-09 stuck-turn forensic (RC-2/RC-3/RC-4): routing mis-routes and
+    // duplicate-finalization drops previously filed zero heal rows because
+    // nothing classified them. Recognize the stable bracket markers the RC-2
+    // reject path, the RC-3 dispatch-dedup drop path, and any orphaned
+    // tool-result signature stamp on their raw text.
+    if lower.contains("response_route_unresolved") {
+        return Some(TurnFailureClass {
+            severity: "medium".into(),
+            pattern_tag: "response_route_unresolved".into(),
+            heal_action: "escalate".into(),
+            provider: None,
+        });
+    }
+    if lower.contains("cross_hotel_misroute") {
+        return Some(TurnFailureClass {
+            severity: "medium".into(),
+            pattern_tag: "cross_hotel_misroute".into(),
+            heal_action: "escalate".into(),
+            provider: None,
+        });
+    }
+    if lower.contains("duplicate_finalization") {
+        return Some(TurnFailureClass {
+            severity: "medium".into(),
+            pattern_tag: "duplicate_finalization".into(),
+            heal_action: "escalate".into(),
+            provider: None,
+        });
+    }
+    if lower.contains("orphaned_tool_result") {
+        return Some(TurnFailureClass {
+            severity: "medium".into(),
+            pattern_tag: "orphaned_tool_result".into(),
+            heal_action: "escalate".into(),
+            provider: None,
+        });
     }
 
     let provider = marker_value(line, "provider=").filter(|p| p != "unknown");
@@ -270,7 +318,11 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         | "model_empty_response"
         | "stuck_turn_evicted"
         | "fallback_exhausted"
-        | "paracrine_budget_exhausted" => "escalate",
+        | "paracrine_budget_exhausted"
+        | "response_route_unresolved"
+        | "cross_hotel_misroute"
+        | "duplicate_finalization"
+        | "orphaned_tool_result" => "escalate",
         "provider_timeout" => "noop",
         _ => "noop",
     }
@@ -590,6 +642,44 @@ mod tests {
         );
     }
 
+    // RC-4 (2026-07-09 stuck-turn forensic): the new RC-2/RC-3 emit points stamp
+    // stable bracket markers on their raw text; the classifier must recognize all
+    // four so these failure classes stop filing zero heal rows.
+    #[test]
+    fn classify_turn_failure_recognizes_2026_07_09_forensic_markers() {
+        let c = classify_turn_failure(
+            "[response_route_unresolved] response-like action [tool_result] targeted role [agent] without a concrete return guest",
+        )
+        .expect("classified");
+        assert_eq!(c.pattern_tag, "response_route_unresolved");
+        assert_eq!(c.severity, "medium");
+        assert_eq!(c.heal_action, "escalate");
+
+        let c = classify_turn_failure(
+            "[cross_hotel_misroute] response-like action for session [sess-1] targeted non-agent infra guest [vps-jane:life-graph-runner] with no resolvable agent fallback",
+        )
+        .expect("classified");
+        assert_eq!(c.pattern_tag, "cross_hotel_misroute");
+        assert_eq!(c.severity, "medium");
+        assert_eq!(c.heal_action, "escalate");
+
+        let c = classify_turn_failure(
+            "[duplicate_finalization] dropped second terminal send for turn [turn-1]; final response already sent",
+        )
+        .expect("classified");
+        assert_eq!(c.pattern_tag, "duplicate_finalization");
+        assert_eq!(c.severity, "medium");
+        assert_eq!(c.heal_action, "escalate");
+
+        let c = classify_turn_failure(
+            "[orphaned_tool_result] tool result for turn [turn-1] has no live consumer to deliver to",
+        )
+        .expect("classified");
+        assert_eq!(c.pattern_tag, "orphaned_tool_result");
+        assert_eq!(c.severity, "medium");
+        assert_eq!(c.heal_action, "escalate");
+    }
+
     #[test]
     fn classify_turn_failure_skips_non_turn_failures_and_philote_reported_classes() {
         // Not a provider/model failure at all.
@@ -654,6 +744,24 @@ mod tests {
             "escalate"
         );
         assert_eq!(heal_action_for_pattern_tag("something_else"), "noop");
+
+        // RC-4 (2026-07-09 stuck-turn forensic) additions.
+        assert_eq!(
+            heal_action_for_pattern_tag("response_route_unresolved"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("cross_hotel_misroute"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("duplicate_finalization"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("orphaned_tool_result"),
+            "escalate"
+        );
     }
 
     #[test]
