@@ -15,9 +15,9 @@ use pulldown_cmark::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -27,11 +27,24 @@ pub mod webhook_secret;
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
 const MEMBRANE_ERROR_BACKOFF_INITIAL_SECS: u64 = 1;
 const MEMBRANE_ERROR_BACKOFF_MAX_SECS: u64 = 600;
+// Redeliveries burst after a poll-lease re-acquire resets `offset` to 0 (every
+// unconfirmed update comes back). 300s comfortably outlives a WiFi-flap
+// re-acquire cycle; 2048 bounds memory for a busy seat between sweeps.
+const TELEGRAM_UPDATE_DEDUPE_TTL_SECS: u64 = 300;
+const TELEGRAM_UPDATE_DEDUPE_MAX: usize = 2048;
 
 /// Shared map of in-flight turns, keyed by session_id. Written by the seat's
 /// poll task (turn start) and by `handle_push` (turn lifecycle + final reply).
 /// Guarded by a std mutex — never held across an await.
 type ActiveTurns = Arc<StdMutex<HashMap<String, ActiveTurn>>>;
+
+/// Shared handle to a seat's [`UpdateDedupe`] cache. Held by `TelegramSeatGuest`
+/// and cloned into each [`SeatPollContext`] so the cache survives a seat restart
+/// (IPC reconnect / lease loss triggers a fresh `setup()` call, which spawns a
+/// brand-new `seat_poll_loop` task) instead of being recreated empty at the exact
+/// moment the redelivery burst it exists to suppress arrives. Guarded by a std
+/// mutex — never held across an await.
+type UpdateDedupeHandle = Arc<StdMutex<UpdateDedupe>>;
 
 fn next_error_backoff_secs(current_secs: u64) -> u64 {
     current_secs.saturating_mul(2).clamp(
@@ -778,6 +791,66 @@ fn streaming_edit_due(last_edit: Option<tokio::time::Instant>, now: tokio::time:
 /// philote's cumulative `partial_reply` pushes converge on the full final text.
 fn draft_already_final(draft_text: &str, final_text: &str) -> bool {
     !draft_text.is_empty() && draft_text == final_text
+}
+
+/// Bounded TTL set of recently dispatched Telegram `update_id`s, scoped to a single
+/// seat's poll loop. A poll-lease re-acquire resets `offset` back to 0 (see the
+/// poll loop below), so Telegram redelivers every update it never saw an ack for —
+/// this suppresses re-dispatch within the seat's lifetime. Cross-restart duplicates
+/// (the seat process itself dying) are out of scope for slice 0; that needs a
+/// persisted ledger (slice 1).
+///
+/// Port of openclaw's `src/infra/dedupe.ts` `createDedupeCache`: `check()` records
+/// on miss and is a no-op on hit; entries age out by TTL and the set is capped so a
+/// runaway redelivery storm can't grow it unbounded between prunes.
+struct UpdateDedupe {
+    /// Oldest-to-newest insertion order, for TTL/cap eviction from the front.
+    entries: VecDeque<(i64, Instant)>,
+    seen: HashSet<i64>,
+    ttl: Duration,
+    max: usize,
+}
+
+impl UpdateDedupe {
+    fn new(ttl: Duration, max: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            seen: HashSet::new(),
+            ttl,
+            max,
+        }
+    }
+
+    /// Returns `true` if `update_id` was already dispatched within the TTL window
+    /// (caller should skip dispatch); `false` on first sighting (now recorded).
+    fn check(&mut self, update_id: i64) -> bool {
+        self.prune();
+        if !self.seen.insert(update_id) {
+            return true;
+        }
+        self.entries.push_back((update_id, Instant::now()));
+        while self.entries.len() > self.max {
+            if let Some((evicted_id, _)) = self.entries.pop_front() {
+                self.seen.remove(&evicted_id);
+            }
+        }
+        false
+    }
+
+    /// Drops entries older than `ttl`. `entries` is insertion-ordered and all
+    /// insertions carry `Instant::now()`, so it is also age-ordered — pruning from
+    /// the front stops at the first entry still within the window.
+    fn prune(&mut self) {
+        while let Some(&(_, inserted_at)) = self.entries.front() {
+            if inserted_at.elapsed() > self.ttl {
+                if let Some((evicted_id, _)) = self.entries.pop_front() {
+                    self.seen.remove(&evicted_id);
+                }
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// Start a `sendChatAction(typing)` heartbeat that refreshes every 4 seconds until cancelled.
@@ -2029,6 +2102,9 @@ struct SeatPollContext {
     /// approval callbacks in group chats. Empty set disables the gate.
     operator_usernames: HashSet<String>,
     active_turns: ActiveTurns,
+    /// Suppresses re-dispatch of a redelivered update_id within this seat's
+    /// lifetime; survives seat restarts (see [`UpdateDedupeHandle`]).
+    update_dedupe: UpdateDedupeHandle,
     inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// NetworkState from the hotel: polling is suppressed while `false`.
     online_rx: watch::Receiver<bool>,
@@ -2195,6 +2271,24 @@ async fn seat_process_update(
     else {
         return true;
     };
+
+    if ctx.update_dedupe.lock().unwrap().check(update_id) {
+        // Redelivered update (e.g. after a poll-lease re-acquire reset `offset`
+        // to 0). Still ack any callback query so Telegram clears the tap
+        // spinner, but skip the rest of the pipeline — dispatching again would
+        // replay the command.
+        answer_callback_query(
+            &ctx.http_client,
+            &ctx.tg_base,
+            &envelope.raw_transport_event,
+        )
+        .await;
+        info!(
+            "Skipping duplicate Telegram update_id [{}] (already dispatched this seat lifetime).",
+            update_id
+        );
+        return true;
+    }
 
     if !envelope.attachments.is_empty() {
         envelope.attachments = hydrate_telegram_attachments(
@@ -2364,6 +2458,11 @@ struct TelegramSeatGuest {
     online_tx: watch::Sender<bool>,
     online_rx: watch::Receiver<bool>,
     active_turns: ActiveTurns,
+    /// Suppresses re-dispatch of a redelivered update_id; survives seat
+    /// restarts (IPC reconnect / lease loss) because it is a field on this
+    /// long-lived guest, cloned (not recreated) into each new poll task's
+    /// [`SeatPollContext`].
+    update_dedupe: UpdateDedupeHandle,
     lease_driver: LeaseDriver,
     lease_key: Option<String>,
     tg_base: Option<String>,
@@ -2400,6 +2499,10 @@ impl TelegramSeatGuest {
             online_tx,
             online_rx,
             active_turns: Arc::new(StdMutex::new(HashMap::new())),
+            update_dedupe: Arc::new(StdMutex::new(UpdateDedupe::new(
+                Duration::from_secs(TELEGRAM_UPDATE_DEDUPE_TTL_SECS),
+                TELEGRAM_UPDATE_DEDUPE_MAX,
+            ))),
             lease_driver: LeaseDriver::new(LeaseDriverConfig::default()),
             lease_key: None,
             tg_base: None,
@@ -2622,6 +2725,7 @@ impl MembraneGuest for TelegramSeatGuest {
             agent_cmds,
             operator_usernames,
             active_turns: self.active_turns.clone(),
+            update_dedupe: self.update_dedupe.clone(),
             inbound_tx: self.inbound_tx.clone(),
             online_rx: self.online_rx.clone(),
         };
@@ -3262,13 +3366,14 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::{
         TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand, TelegramFileRef,
-        approval_callback_content, build_combined_telegram_commands, build_telegram_menu_commands,
-        default_attachment_name, enrich_attachment_with_transport, next_error_backoff_secs,
-        normalize_telegram_menu_command_name, telegram_command, telegram_format_text,
-        telegram_help_text, telegram_inbound_envelope,
+        UpdateDedupe, approval_callback_content, build_combined_telegram_commands,
+        build_telegram_menu_commands, default_attachment_name, enrich_attachment_with_transport,
+        next_error_backoff_secs, normalize_telegram_menu_command_name, telegram_command,
+        telegram_format_text, telegram_help_text, telegram_inbound_envelope,
     };
     use philotic_client::CommandManifestEntry;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::time::Duration;
 
     #[test]
     fn telegram_text_envelope_normalizes_threaded_message() {
@@ -4021,5 +4126,99 @@ mod tests {
         assert!(!draft_already_final("", "final text"));
         // Draft holds partial content: must edit.
         assert!(!draft_already_final("final", "final text"));
+    }
+
+    // --- UpdateDedupe (Slice 0: membrane-local update_id redelivery suppression) ---
+
+    #[test]
+    fn update_dedupe_suppresses_repeat_update_id() {
+        let mut dedupe = UpdateDedupe::new(Duration::from_secs(300), 2048);
+        // First sighting dispatches (feed the same update_id twice; assert exactly
+        // one dispatch would occur — the caller skips dispatch whenever check()
+        // returns true).
+        assert!(
+            !dedupe.check(42),
+            "first sighting must not be flagged duplicate"
+        );
+        assert!(
+            dedupe.check(42),
+            "redelivered update_id must be flagged duplicate"
+        );
+        assert!(
+            dedupe.check(42),
+            "third delivery of the same update_id must also be flagged duplicate"
+        );
+    }
+
+    #[test]
+    fn update_dedupe_treats_distinct_update_ids_independently() {
+        let mut dedupe = UpdateDedupe::new(Duration::from_secs(300), 2048);
+        assert!(!dedupe.check(1));
+        assert!(!dedupe.check(2));
+        assert!(dedupe.check(1));
+        assert!(dedupe.check(2));
+    }
+
+    #[test]
+    fn update_dedupe_expires_entries_after_ttl() {
+        let mut dedupe = UpdateDedupe::new(Duration::from_millis(20), 2048);
+        assert!(!dedupe.check(7));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !dedupe.check(7),
+            "entry older than the TTL should be pruned and treated as a new delivery"
+        );
+    }
+
+    #[test]
+    fn update_dedupe_evicts_oldest_beyond_max() {
+        let mut dedupe = UpdateDedupe::new(Duration::from_secs(300), 2);
+        assert!(!dedupe.check(1));
+        assert!(!dedupe.check(2));
+        assert!(!dedupe.check(3), "third distinct id evicts the oldest (1)");
+        assert!(
+            !dedupe.check(1),
+            "id 1 was evicted for capacity and must be treated as a fresh delivery"
+        );
+    }
+
+    #[test]
+    fn duplicate_callback_update_still_exposes_callback_id_for_ack() {
+        // Slice 0 skips dispatch on a duplicate but must still answerCallbackQuery
+        // so Telegram clears the tap spinner. Verify the envelope built from a
+        // redelivered callback update still carries the callback id the poll loop
+        // needs to send that ack, independent of the dedupe verdict.
+        let update = json!({
+            "update_id": 200,
+            "callback_query": {
+                "id": "cbq-1",
+                "data": "approve:turn-1",
+                "from": { "id": 888, "username": "jared" },
+                "message": {
+                    "chat": { "id": 12345 },
+                    "message_thread_id": 9
+                }
+            }
+        });
+
+        let mut dedupe = UpdateDedupe::new(Duration::from_secs(300), 2048);
+        assert!(!dedupe.check(200), "first delivery dispatches");
+        assert!(
+            dedupe.check(200),
+            "redelivery of the same update_id is a duplicate"
+        );
+
+        let envelope = telegram_inbound_envelope(&update, 200, "agent-jane-01")
+            .expect("callback query should normalize even when the update is a duplicate");
+        let callback_id = envelope
+            .raw_transport_event
+            .get("callback_query")
+            .and_then(|q| q.get("id"))
+            .and_then(Value::as_str);
+        assert_eq!(
+            callback_id,
+            Some("cbq-1"),
+            "duplicate callback updates must still expose the callback id for answerCallbackQuery"
+        );
     }
 }
