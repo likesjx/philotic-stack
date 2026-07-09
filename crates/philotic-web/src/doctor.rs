@@ -1069,8 +1069,18 @@ impl Check for VaultKeySourceDivergence {
     }
 
     fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
-        if let Some(findings) = missing_table_finding(ctx, self.id(), "vault_secrets")? {
-            return Ok(findings);
+        // The legacy `vault_secrets` table missing doesn't necessarily mean
+        // there's nothing to check: the hotel's live, canonical secret store
+        // is `graph_nodes` `secret:*` rows (see `graph_node_secrets_from_db`).
+        // Only report "table not found, skipped" when *both* stores are
+        // empty — never let the presence check on one legacy table swallow
+        // secrets that live exclusively in the other, current store.
+        if !table_exists(&ctx.conn, "vault_secrets")?
+            && graph_node_secrets_from_db(&ctx.conn)?.is_empty()
+        {
+            if let Some(findings) = missing_table_finding(ctx, self.id(), "vault_secrets")? {
+                return Ok(findings);
+            }
         }
         let secrets = collect_vault_secrets(&ctx.conn)?;
         let sources = resolve_vault_sources();
@@ -1099,7 +1109,16 @@ struct RawSecret {
 /// `phil doctor` checked exclusively before slice 3. On the live bjork
 /// hotel this table holds exactly one row: an orphan referenced by no
 /// config/graph node, encrypted under a pre-re-key master key.
+///
+/// Returns an empty vec (rather than erroring) when the table itself is
+/// absent, mirroring `graph_node_secrets_from_db`'s handling of a missing
+/// `graph_nodes` table — `collect_vault_secrets` calls both unconditionally
+/// and relies on each degrading gracefully so a DB with only one of the two
+/// stores still gets a full, correct scan of whichever store it does have.
 fn vault_secrets_from_db(conn: &Connection) -> Result<Vec<RawSecret>> {
+    if !table_exists(conn, "vault_secrets")? {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn
         .prepare("SELECT secret_ref, secret_kind, ciphertext_b64, nonce_b64 FROM vault_secrets")?;
     let secrets = stmt
@@ -1189,6 +1208,22 @@ fn all_graph_node_data_jsons(conn: &Connection) -> Result<Vec<(String, String)>>
 /// True when `secret_ref` appears in any `node_config.value_json` row, or in
 /// any `graph_nodes.data_json` row other than `exclude_node_key` (the
 /// secret's own node, when it has one — table-only secrets pass `None`).
+///
+/// Deliberately a raw substring scan, *not* a quoted/exact-field match: live
+/// wiring sites serialize the ref at varying JSON-nesting depths — a plain
+/// `"secret_ref"` JSON string, a `{"secret_ref": "..."}` field, or (as seen
+/// on the live bjork hotel, e.g. `config:oidc_github_client_secret_ref`) a
+/// *double*-JSON-encoded `{"value":"\"secret_ref\""}` string where the ref
+/// is wrapped in escaped `\"` rather than a bare `"`. Requiring a literal
+/// `"secret_ref"` quoted match was tried and reverted: it silently
+/// misclassified real, live-referenced secrets (mesh-hotel keys, vault
+/// tokens) as unreferenced orphans against the live bjork DB, downgrading a
+/// Critical divergence finding to Warning — exactly the referenced/orphan
+/// misclassification this check exists to catch. A bare substring match is
+/// the only encoding-agnostic option; the false-positive risk it carries
+/// (one secret_ref being a textual substring of another) is effectively
+/// nil in practice since refs are UUID-suffixed
+/// (`secret://hotel/default/<kind>/<32-hex>`).
 fn secret_ref_is_referenced(
     node_config_values: &[String],
     graph_data_jsons: &[(String, String)],
@@ -2416,6 +2451,32 @@ mod tests {
         );
     }
 
+    /// Regression guard for the live-bjork wiring shape: a `config:*_ref`
+    /// graph node whose `data_json` double-JSON-encodes the ref as
+    /// `{"value":"\"secret://...\""}` (escaped `\"`, not a bare `"`) must
+    /// still be recognized as a reference. A stricter "must be
+    /// bare-quoted" matcher was tried during review and silently broke
+    /// this exact shape, downgrading a live Critical divergence finding to
+    /// Warning — see the doc comment on `secret_ref_is_referenced`.
+    #[test]
+    fn secret_ref_is_referenced_matches_double_json_encoded_value_field() {
+        let node_config_values: Vec<String> = vec![];
+        let graph_data_jsons = vec![(
+            "config:oidc_github_client_secret_ref".to_string(),
+            // Mirrors the exact bytes observed on the live bjork context.db.
+            "{\"value\":\"\\\"secret://hotel/default/vault-token/92bda314c29e42f991b808c195c21c45\\\"\"}".to_string(),
+        )];
+        assert!(
+            secret_ref_is_referenced(
+                &node_config_values,
+                &graph_data_jsons,
+                "secret://hotel/default/vault-token/92bda314c29e42f991b808c195c21c45",
+                None,
+            ),
+            "double-JSON-encoded (escaped-quote) wiring must still count as referenced"
+        );
+    }
+
     #[test]
     fn collect_vault_secrets_dedups_by_secret_ref_preferring_graph_node() {
         let (_dir, path) = fixture_db();
@@ -2857,6 +2918,45 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(findings[0].message.contains("vault_secrets"));
+    }
+
+    /// The legacy `vault_secrets` table missing must not swallow secrets
+    /// that live exclusively in `graph_nodes` `secret:*` rows — the check
+    /// must fall through and evaluate those, not report "table not found,
+    /// skipped" while a real, referenced secret goes unchecked.
+    #[test]
+    fn vault_check_falls_through_to_graph_nodes_when_vault_secrets_table_absent() {
+        let (_dir, path) = fixture_db();
+        let key = [11u8; 32];
+        let (ct, nonce) = encrypt_for_test(&key, "graph-only-secret");
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            insert_graph_secret(&conn, "secret://graph-only", "api_key", &ct, &nonce);
+            insert_node_config_ref(&conn, "config:api_key_ref", "secret://graph-only");
+            conn.execute("DROP TABLE vault_secrets", [])
+                .expect("drop legacy table");
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        assert!(!table_exists(&ctx.conn, "vault_secrets").expect("query"));
+
+        // Sanity: collect_vault_secrets (what detect() delegates to once it
+        // decides not to skip) does see the graph-node secret.
+        let secrets = collect_vault_secrets(&ctx.conn).expect("collect");
+        assert_eq!(secrets.len(), 1);
+        assert!(secrets[0].referenced);
+
+        let findings = VaultKeySourceDivergence
+            .detect(&ctx)
+            .expect("detect must not hard-error with vault_secrets absent");
+        // Whatever this evaluates to (key-source resolution is
+        // environment-dependent in a unit test), it must never be the
+        // "table not present" skip warning — a live, non-empty secret
+        // store (graph_nodes) was available.
+        assert!(
+            findings.iter().all(|f| !f.message.contains("not present")),
+            "must not report vault_secrets as missing when graph_nodes secrets exist: {findings:?}"
+        );
     }
 
     #[test]
