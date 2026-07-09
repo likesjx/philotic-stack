@@ -3454,6 +3454,7 @@ dependencies = [
 name = "philotic-web"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ansible-mesh-core",
  "anyhow",
  "axum 0.7.9",
@@ -3478,6 +3479,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tower-http 0.5.2",
