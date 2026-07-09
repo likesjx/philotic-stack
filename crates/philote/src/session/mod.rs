@@ -140,10 +140,15 @@ fn json_escape_for_projection(value: &str) -> String {
 /// records the outcome in `ledger`. Empty input is passed through untouched
 /// (preserves the existing `if !layer.is_empty()` skip-the-layer behavior).
 ///
-/// Truncation is never silent: a capped block gets a usage header — Hermes
-/// format, `[SOURCE pct% — used/cap chars]` — and, if it overflowed, a
-/// trailing `[...truncated ...]` marker. The header's percentage is the true
-/// usage, deliberately not clamped to 100 — see `BudgetEntry::pct`.
+/// The returned string is model-facing content ONLY — no usage header. Usage
+/// (`[SOURCE pct% — used/cap chars]`) is an operator-facing /context
+/// visibility mechanism and is surfaced exclusively via `ledger` /
+/// `context_breakdown_text`, never spliced into the literal model prompt
+/// (see CONTEXT_ASSEMBLY_DISCIPLINE — the budget system exists to reduce
+/// context pressure, so it must not itself add unconditional per-turn
+/// tokens). Truncation is never silent, though: a capped block still gets a
+/// trailing `[...truncated ...]` marker so the model knows the content was
+/// cut, even without the header.
 fn apply_injection_budget(
     ledger: &mut BudgetLedger,
     source: &str,
@@ -166,22 +171,14 @@ fn apply_injection_budget(
         content
     };
 
-    let entry = BudgetEntry {
+    ledger.entries.push(BudgetEntry {
         source: source.to_string(),
         used_chars,
         cap_chars,
         truncated,
-    };
-    let header = format!(
-        "[{} {}% — {}/{} chars]",
-        source.to_uppercase().replace('_', " "),
-        entry.pct(),
-        used_chars,
-        cap_chars,
-    );
-    ledger.entries.push(entry);
+    });
 
-    format!("{header}\n{body}")
+    body
 }
 
 #[derive(Debug, Clone)]
@@ -9105,8 +9102,16 @@ mod tests {
             .iter()
             .find(|l| l.layer_id == ContextLayerId::Identity)
             .expect("identity layer present");
-        assert!(layer.rendered_content.starts_with("[IDENTITY"));
+        // Usage header is operator-facing (/context) only — it must never
+        // leak into the literal model prompt content.
+        assert!(!layer.rendered_content.contains("[IDENTITY"));
         assert!(layer.rendered_content.contains("truncated at 10 chars"));
+
+        // The same numbers are visible to the operator via /context instead.
+        let breakdown = state.context_breakdown_text();
+        assert!(breakdown.contains("identity"));
+        assert!(breakdown.contains("500%"));
+        assert!(breakdown.contains("50/10 chars"));
     }
 
     #[test]
@@ -9138,6 +9143,7 @@ mod tests {
             .iter()
             .find(|l| l.layer_id == ContextLayerId::RecalledMemory)
             .expect("recalled_memory layer present");
+        assert!(!layer.rendered_content.contains("[RECALLED MEMORY"));
         assert!(layer.rendered_content.contains("truncated at 20 chars"));
     }
 
@@ -9165,6 +9171,7 @@ mod tests {
             .iter()
             .find(|l| l.layer_id == ContextLayerId::Rules)
             .expect("rules layer present");
+        assert!(!layer.rendered_content.contains("[RULES"));
         assert!(layer.rendered_content.contains("truncated at 15 chars"));
     }
 
@@ -9190,8 +9197,14 @@ mod tests {
             .iter()
             .find(|l| l.layer_id == ContextLayerId::Identity)
             .expect("identity layer present");
-        assert!(layer.rendered_content.starts_with("[IDENTITY"));
+        // Inverse of the old assertion: the usage header must NOT be present
+        // in model-facing content — it is operator-facing only, surfaced via
+        // BudgetLedger / context_breakdown_text (/context), never spliced
+        // into the literal prompt. Untruncated content is passed through
+        // byte-for-byte with no added header overhead.
+        assert!(!layer.rendered_content.contains("[IDENTITY"));
         assert!(!layer.rendered_content.contains("truncated"));
+        assert_eq!(layer.rendered_content, state.project_agent_self());
     }
 
     #[test]
@@ -9204,6 +9217,51 @@ mod tests {
         assert!(breakdown.contains("Injection budget ledger:"));
         assert!(breakdown.contains("identity"));
         assert!(breakdown.contains("context_pressure_pct:"));
+    }
+
+    #[test]
+    fn injection_budget_usage_header_never_reaches_the_literal_model_prompt() {
+        // Regression for CONTEXT_ASSEMBLY_DISCIPLINE: the `[SOURCE pct% —
+        // used/cap chars]` usage header is an operator-facing /context
+        // visibility mechanism, not model-prompt content. It must never be
+        // spliced into render_prompt_from_projection or
+        // model_context_from_projection — doing so would permanently add
+        // tokens per budgeted layer every turn, working against the whole
+        // point of the budget system.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.agent_profile.identity_text = Some("x".repeat(50));
+        state.settings.injection_budget.persona_chars = 10;
+        state.agent_profile.agent_role_names = vec!["role-one".into()];
+        state.settings.injection_budget.rules_chars = 5;
+
+        let projection = state.build_context_projection("hello");
+
+        let prompt = state.render_prompt_from_projection(&projection);
+        // Section titles like "[Agent self projection]" are expected — only
+        // the per-source usage header (`[IDENTITY ...]`, `[RULES ...]`) must
+        // be absent.
+        assert!(
+            !prompt.contains("[IDENTITY") && !prompt.contains("[RULES"),
+            "usage-header bracket syntax leaked into the literal model prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("…truncated at 10 chars"),
+            "truncation marker must still reach the model prompt even without the header"
+        );
+
+        let model_context = state.model_context_from_projection(&projection);
+        let context_str = model_context.to_string();
+        assert!(
+            !context_str.contains("IDENTITY") && !context_str.contains("RULES"),
+            "usage header source names must not leak into the model_context JSON: {context_str}"
+        );
+
+        // But the same numbers are still fully visible to the operator.
+        let breakdown = state.context_breakdown_text();
+        assert!(breakdown.contains("identity"));
+        assert!(breakdown.contains("500%"));
+        assert!(breakdown.contains("rules"));
     }
 
     #[test]
