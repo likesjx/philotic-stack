@@ -97,7 +97,8 @@ enum Command {
     /// still only print NeedsConfirm — they are never auto-applied. The
     /// context DB itself is always opened read-only.
     Doctor {
-        /// Hotel name to inspect (default: default)
+        /// Hotel name to inspect (default: default). Display/label only —
+        /// does not select which context DB is opened; see --profile/--db.
         #[arg(long, default_value = "default")]
         hotel: String,
 
@@ -127,6 +128,16 @@ enum Command {
         /// never touched by doctor at all.
         #[arg(long)]
         fix: bool,
+
+        /// Target this profile's context DB (~/.philotic/<name>/context.db),
+        /// independent of the PHILOTIC_PROFILE env var. Overridden by --db.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Open this exact context DB path, bypassing --profile and
+        /// PHILOTIC_PROFILE entirely. Highest-precedence targeting option.
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
 
     /// Explain the decision chain behind an agent-facing action
@@ -478,7 +489,19 @@ async fn main() -> Result<()> {
             skip,
             list_checks,
             fix,
-        } => doctor::run(hotel, json, severity_min, only, skip, list_checks, fix),
+            profile,
+            db,
+        } => doctor::run(
+            hotel,
+            json,
+            severity_min,
+            only,
+            skip,
+            list_checks,
+            fix,
+            profile,
+            db,
+        ),
         Command::Explain { action } => explain::run(action),
         Command::Agents { config } => status::run_agents(config).await,
         Command::Reset { keep_identity } => reset::run(keep_identity).await,

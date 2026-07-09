@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::init::{active_profile, profile_dir};
+use crate::init::{active_profile, philotic_dir, profile_dir};
 
 // ── Severity ─────────────────────────────────────────────────────────────
 
@@ -150,18 +150,50 @@ pub struct DoctorCtx {
     pub conn: Connection,
 }
 
+/// Filename of the hotel's primary context DB — must stay in sync with
+/// `startup_test_db_path()` in `crates/aiua/src/main.rs`, which resolves the
+/// real hotel's primary store as `profile_dir().join("context.db")`. This is
+/// deliberately **not** `aiua_context.db`: for at least the `bjork` profile
+/// that file holds only operator-auth tables (no `vault_secrets`,
+/// `graph_nodes`, `hotels`, ...), so opening it made doctor's vault/ports
+/// checks either false-positive or hard-error with "no such table".
+const CONTEXT_DB_FILENAME: &str = "context.db";
+
 impl DoctorCtx {
-    pub fn open(hotel: &str) -> Result<Self> {
-        let db_path = match active_profile() {
-            Some(_) => profile_dir().join("aiua_context.db"),
-            None => PathBuf::from("aiua_context.db"),
-        };
-        Self::open_at(hotel, db_path)
+    /// Resolve and open the hotel's context DB.
+    ///
+    /// Precedence: `db_override` (`--db`) > `profile_override` (`--profile`)
+    /// > `PHILOTIC_PROFILE` env. There is deliberately **no** current-working-
+    /// directory fallback — grading a stray `context.db`/`aiua_context.db`
+    /// that happens to sit in the CWD produced a real false-positive
+    /// "critical" vault finding in the field. When none of the three sources
+    /// resolve, `open()` refuses with a clear, actionable error instead of
+    /// silently picking a file.
+    pub fn open(
+        hotel: &str,
+        db_override: Option<PathBuf>,
+        profile_override: Option<String>,
+    ) -> Result<Self> {
+        let (db_path, resolved_profile_dir) =
+            resolve_db_target(db_override, profile_override.as_deref())?;
+        Self::open_at_with_profile_dir(hotel, db_path, resolved_profile_dir)
     }
 
-    /// Open against an explicit DB path (used by `open()` for the real
-    /// profile DB, and directly by tests against a fixture DB).
+    /// Open against an explicit DB path, defaulting `profile_dir` to the
+    /// env-derived `init::profile_dir()` (used directly by tests against a
+    /// fixture DB, where the profile dir rarely matters). Production code
+    /// goes through [`DoctorCtx::open`] instead, so this is effectively a
+    /// test-only entry point despite being `pub`.
+    #[allow(dead_code)]
     pub fn open_at(hotel: &str, db_path: PathBuf) -> Result<Self> {
+        Self::open_at_with_profile_dir(hotel, db_path, profile_dir())
+    }
+
+    fn open_at_with_profile_dir(
+        hotel: &str,
+        db_path: PathBuf,
+        resolved_profile_dir: PathBuf,
+    ) -> Result<Self> {
         if !db_path.exists() {
             anyhow::bail!(
                 "context DB not found at {} — has this hotel ever booted?",
@@ -173,11 +205,85 @@ impl DoctorCtx {
         conn.busy_timeout(std::time::Duration::from_millis(2000))?;
         Ok(Self {
             hotel: hotel.to_string(),
-            profile_dir: profile_dir(),
+            profile_dir: resolved_profile_dir,
             db_path,
             conn,
         })
     }
+}
+
+/// Resolve which context DB `open()` should target, and the profile
+/// directory used for profile-relative artifacts (`aiua.log`, the repair
+/// journal). See [`DoctorCtx::open`] for precedence and the no-CWD-fallback
+/// rationale.
+fn resolve_db_target(
+    db_override: Option<PathBuf>,
+    profile_override: Option<&str>,
+) -> Result<(PathBuf, PathBuf)> {
+    if let Some(path) = db_override {
+        let dir = path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        return Ok((path, dir));
+    }
+    if let Some(name) = profile_override {
+        let dir = philotic_dir().join(name);
+        return Ok((dir.join(CONTEXT_DB_FILENAME), dir));
+    }
+    match active_profile() {
+        Some(name) => {
+            let dir = philotic_dir().join(name);
+            Ok((dir.join(CONTEXT_DB_FILENAME), dir))
+        }
+        None => anyhow::bail!(
+            "no hotel targeted — set PHILOTIC_PROFILE=<profile>, or pass --profile <name> or --db <path>"
+        ),
+    }
+}
+
+/// True when `table` exists in `conn`'s schema. Used by checks whose
+/// `detect()` reads a table (`hotels`, `vault_secrets`, ...) that a
+/// wrong-DB or pre-migration store may not have, so a missing table can be
+/// reported as a clear, check-scoped finding instead of a raw SQL error that
+/// aborts the whole run.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![table],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// If `table` is missing from `ctx`'s DB, returns `Some` with a single
+/// warning-severity finding explaining the check was skipped and inviting
+/// the operator to double-check `--db`/`--profile`; returns `None` when the
+/// table exists so the caller's normal detection logic proceeds. Never
+/// itself a hard error unless the `sqlite_master` lookup fails.
+fn missing_table_finding(
+    ctx: &DoctorCtx,
+    check_id: &'static str,
+    table: &str,
+) -> Result<Option<Vec<Finding>>> {
+    if table_exists(&ctx.conn, table)? {
+        return Ok(None);
+    }
+    Ok(Some(vec![Finding {
+        check_id: check_id.to_string(),
+        severity: Severity::Warning,
+        message: format!(
+            "expected table '{table}' not present in {} — is this the right hotel DB?",
+            ctx.db_path.display()
+        ),
+        evidence: json!({"table": table, "db_path": ctx.db_path.to_string_lossy()}),
+        fix_hint: format!(
+            "this store has no '{table}' table — verify --db/--profile (or PHILOTIC_PROFILE) \
+             targets the hotel's primary {CONTEXT_DB_FILENAME}, not a stale or auth-only DB; \
+             check skipped, not run"
+        ),
+        auto_repairable: false,
+    }]))
 }
 
 // ── Repair journal ───────────────────────────────────────────────────────
@@ -352,6 +458,9 @@ impl Check for PortsHotelRecordDrift {
     }
 
     fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "hotels")? {
+            return Ok(findings);
+        }
         let row: Option<(u16, u16, u16)> = ctx
             .conn
             .query_row(
@@ -534,6 +643,9 @@ impl Check for ProcOrphanInstances {
     }
 
     fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "hotels")? {
+            return Ok(findings);
+        }
         let launchd = launchd_pid(&ctx.hotel);
         let active = hotel_active_pid(&ctx.conn, &ctx.hotel)?;
         let running = running_aiua_pids(&ctx.hotel);
@@ -851,6 +963,9 @@ impl Check for VaultKeySourceDivergence {
     }
 
     fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "vault_secrets")? {
+            return Ok(findings);
+        }
         let secrets = vault_secrets_from_db(&ctx.conn)?;
         let sources = resolve_vault_sources();
         Ok(evaluate_vault_divergence(self.id(), &sources, &secrets))
@@ -1052,6 +1167,10 @@ fn write_newsyslog_dropin_directly(dropin: &std::path::Path) -> Result<()> {
 struct DoctorReport {
     ok: bool,
     hotel: String,
+    /// Resolved context DB path actually opened — surfaced so a wrong-DB
+    /// false positive (or a graceful "expected table not present" finding)
+    /// is obvious at a glance rather than requiring a re-run with `-v`.
+    db_path: String,
     checks_run: usize,
     findings: Vec<Finding>,
     /// One entry per finding, in the same order, correlated by `check_id`.
@@ -1077,6 +1196,8 @@ pub fn run(
     skip: Vec<String>,
     list_checks: bool,
     fix: bool,
+    profile: Option<String>,
+    db: Option<PathBuf>,
 ) -> Result<()> {
     let checks = catalog();
 
@@ -1096,7 +1217,7 @@ pub fn run(
         }
     };
 
-    let ctx = match DoctorCtx::open(&hotel) {
+    let ctx = match DoctorCtx::open(&hotel, db, profile) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("phil doctor: {e:#}");
@@ -1126,7 +1247,14 @@ pub fn run(
                 std::process::exit(2);
             }
         };
-        for finding in findings {
+        for mut finding in findings {
+            // Stamp the resolved DB path into every finding's evidence so a
+            // wrong-DB false positive (or a "table not present" skip) is
+            // visible right on the finding, not just in the header/report.
+            if let serde_json::Value::Object(ref mut map) = finding.evidence {
+                map.entry("db_path".to_string())
+                    .or_insert_with(|| json!(ctx.db_path.to_string_lossy()));
+            }
             let outcome = match check.repair(&ctx, &finding, fix) {
                 Ok(o) => o,
                 Err(e) => {
@@ -1156,6 +1284,7 @@ pub fn run(
         let report = DoctorReport {
             ok,
             hotel: hotel.clone(),
+            db_path: ctx.db_path.to_string_lossy().into_owned(),
             checks_run: selected.len(),
             findings,
             repairs,
@@ -1203,7 +1332,7 @@ fn print_human(
     fix: bool,
 ) {
     println!(
-        "phil doctor — hotel {hotel} ({}), offline, {checks_run} checks\n",
+        "phil doctor — hotel {hotel} (db: {}), offline, {checks_run} checks\n",
         db_path.display()
     );
     for id in check_ids {
@@ -1682,6 +1811,7 @@ mod tests {
         let report = DoctorReport {
             ok: false,
             hotel: "jane".to_string(),
+            db_path: "/x/context.db".to_string(),
             checks_run: 1,
             findings: vec![Finding {
                 check_id: "logs.rotation-missing".to_string(),
@@ -1701,6 +1831,7 @@ mod tests {
         let value = serde_json::to_value(&report).expect("serialize");
         assert_eq!(value["ok"], json!(false));
         assert_eq!(value["hotel"], json!("jane"));
+        assert_eq!(value["db_path"], json!("/x/context.db"));
         assert_eq!(value["checks_run"], json!(1));
         assert_eq!(
             value["findings"][0]["check_id"],
@@ -1713,6 +1844,132 @@ mod tests {
             json!("logs.rotation-missing")
         );
         assert_eq!(value["repairs"][0]["outcome"]["outcome"], json!("planned"));
+    }
+
+    // ── DB targeting resolution (slice 2) ─────────────────────────────────
+
+    #[test]
+    fn resolve_db_target_db_override_wins_over_everything() {
+        let explicit = PathBuf::from("/tmp/some/explicit/context.db");
+        let (path, dir) =
+            resolve_db_target(Some(explicit.clone()), Some("other-profile")).expect("resolve");
+        assert_eq!(path, explicit);
+        assert_eq!(dir, PathBuf::from("/tmp/some/explicit"));
+    }
+
+    #[test]
+    fn resolve_db_target_profile_override_resolves_context_db_not_aiua_context_db() {
+        let (path, dir) = resolve_db_target(None, Some("bjork")).expect("resolve");
+        assert!(
+            path.ends_with("bjork/context.db"),
+            "path was {}",
+            path.display()
+        );
+        assert!(!path.to_string_lossy().contains("aiua_context.db"));
+        assert_eq!(dir, philotic_dir().join("bjork"));
+    }
+
+    // Env-var-dependent tests share one mutex — PHILOTIC_PROFILE is process
+    // global, and cargo runs tests in the same binary concurrently.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_db_target_refuses_with_no_override_and_no_env() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var("PHILOTIC_PROFILE").ok();
+        std::env::remove_var("PHILOTIC_PROFILE");
+        let result = resolve_db_target(None, None);
+        match saved {
+            Some(v) => std::env::set_var("PHILOTIC_PROFILE", v),
+            None => std::env::remove_var("PHILOTIC_PROFILE"),
+        }
+        let err = result.expect_err("must refuse without any target — no CWD fallback");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no hotel targeted"), "message was: {msg}");
+        assert!(msg.contains("--profile"));
+        assert!(msg.contains("--db"));
+    }
+
+    #[test]
+    fn resolve_db_target_falls_back_to_env_profile_when_no_explicit_override() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let saved = std::env::var("PHILOTIC_PROFILE").ok();
+        std::env::set_var("PHILOTIC_PROFILE", "env-test-profile");
+        let result = resolve_db_target(None, None);
+        match saved {
+            Some(v) => std::env::set_var("PHILOTIC_PROFILE", v),
+            None => std::env::remove_var("PHILOTIC_PROFILE"),
+        }
+        let (path, _dir) = result.expect("resolve");
+        assert!(
+            path.ends_with("env-test-profile/context.db"),
+            "path was {}",
+            path.display()
+        );
+    }
+
+    // ── graceful missing-store (slice 2) ────────────────────────────────
+    //
+    // Regression coverage for the wrong-DB incident: opening a store that
+    // lacks an expected table (e.g. the auth-only `aiua_context.db`) must
+    // produce a clear, check-scoped finding, never a raw SQL error that
+    // aborts the whole run.
+
+    /// A minimal on-disk sqlite DB with an unrelated table only — mirrors
+    /// the shape of the auth-only `aiua_context.db` that lacks `hotels` and
+    /// `vault_secrets` entirely.
+    fn bare_db_missing_expected_tables() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("aiua_context.db");
+        let conn = Connection::open(&path).expect("open bare db");
+        conn.execute("CREATE TABLE operator_auth (id INTEGER PRIMARY KEY)", [])
+            .expect("create unrelated table");
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn table_exists_true_for_present_and_false_for_absent() {
+        let (_dir, path) = fixture_db();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        assert!(table_exists(&ctx.conn, "vault_secrets").expect("query"));
+        assert!(!table_exists(&ctx.conn, "not_a_real_table").expect("query"));
+    }
+
+    #[test]
+    fn vault_check_on_db_missing_vault_secrets_table_skips_gracefully() {
+        let (_dir, path) = bare_db_missing_expected_tables();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let findings = VaultKeySourceDivergence
+            .detect(&ctx)
+            .expect("detect must not hard-error on a missing table");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].message.contains("vault_secrets"));
+    }
+
+    #[test]
+    fn ports_check_on_db_missing_hotels_table_skips_gracefully() {
+        let (_dir, path) = bare_db_missing_expected_tables();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let findings = PortsHotelRecordDrift
+            .detect(&ctx)
+            .expect("detect must not hard-error on a missing table");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].message.contains("hotels"));
+    }
+
+    #[test]
+    fn orphans_check_on_db_missing_hotels_table_skips_gracefully() {
+        let (_dir, path) = bare_db_missing_expected_tables();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let findings = ProcOrphanInstances
+            .detect(&ctx)
+            .expect("detect must not hard-error on a missing table");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].message.contains("hotels"));
     }
 
     // ── repair() ─────────────────────────────────────────────────────────
