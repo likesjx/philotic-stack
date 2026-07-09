@@ -1802,6 +1802,7 @@ impl AgentRuntime {
                 plan_confirmed: false,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
+                ladder_tier0_dispatched: false,
                 streaming_retry_attempts: 0,
                 streamed_content: String::new(),
                 paracrine_hop_count: 0,

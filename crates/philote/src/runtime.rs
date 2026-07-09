@@ -273,7 +273,16 @@ pub(crate) fn decide_no_response_action(
     }
 }
 
-/// The next ladder tier to dispatch after `current_tier` fails.
+/// The next ladder tier to dispatch after the currently active dispatch fails.
+///
+/// `last_ladder_tier` is the index of the last ladder tier that was actually
+/// *dispatched* — `None` when the ladder hasn't been consulted yet (the
+/// primary dispatch used a hotel route, an explicit binding, or the plain
+/// default role instead of `configured_tiers[0]`; see
+/// `primary_dispatch_used_ladder`). This is the off-by-one fix: without it, a
+/// turn whose primary dispatch bypassed the ladder would jump straight to
+/// tier 1 on failure and a single-tier ladder would never be tried at all.
+/// `Some(tier)` walks forward from `tier + 1` as before.
 ///
 /// On a contract failure (`skip_failed_provider = true` with a known failed
 /// provider) tiers whose role dispatches to that same provider are skipped —
@@ -282,12 +291,12 @@ pub(crate) fn decide_no_response_action(
 /// is unit-testable without IPC.
 fn next_ladder_tier(
     configured_tiers: &[String],
-    current_tier: u8,
+    last_ladder_tier: Option<u8>,
     max_tier: u8,
     failed_provider: Option<&str>,
     skip_failed_provider: bool,
 ) -> u8 {
-    let mut next = current_tier.saturating_add(1);
+    let mut next = last_ladder_tier.map_or(0, |tier| tier.saturating_add(1));
     if skip_failed_provider {
         if let Some(failed) = failed_provider {
             while next <= max_tier
@@ -444,22 +453,32 @@ fn loop_stop_fallback_reply(
     )
 }
 
+/// Maps an `effective_model_controller` / component-route `implementation`
+/// string to the model-router role that dispatches it. Mirrors the hotel-side
+/// `component_implementation_to_role` (`crates/aiua/src/service/ipc.rs`):
+/// already-role-shaped values (`"model.openrouter"`) pass through unchanged,
+/// `"gemini"` maps to the default `"model"` role, and every other known
+/// provider (`"openrouter"`, `"openai"`, `"ollama"`, `"mlx"`, ...) gets its
+/// own dedicated `"model.<provider>"` role instead of collapsing onto the
+/// gemini default. `"onnx"` / `"kokoro"` / `"local"` remain a special case
+/// mapping to the shared local-backend role.
 fn implementation_to_model_role(implementation: &str) -> String {
-    let normalized = implementation
+    let normalized = implementation.trim().to_ascii_lowercase();
+
+    if normalized.starts_with("model.") {
+        return normalized;
+    }
+
+    let segment = normalized
         .split(['.', '-', '@', '/'])
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
 
-    if normalized == "elevenlabs" {
-        "model.elevenlabs".into()
-    } else if matches!(normalized, "onnx" | "kokoro" | "local") {
-        "model.local".into()
-    } else if normalized == "ollama" {
-        "model.ollama".into()
-    } else if normalized == "mlx" {
-        "model.mlx".into()
-    } else {
-        "model".into()
+    match segment {
+        "gemini" => "model".into(),
+        "elevenlabs" => "model.elevenlabs".into(),
+        "onnx" | "kokoro" | "local" => "model.local".into(),
+        other => format!("model.{other}"),
     }
 }
 
@@ -707,6 +726,24 @@ fn extract_audio_artifact(model_result: Option<&Value>) -> Option<String> {
     None
 }
 
+/// Resolves the model-router dispatch target for `capability`.
+///
+/// Precedence (highest wins):
+///   1. The hotel-computed execution route (`resolve_component_execution_route`)
+///      — explicit hotel/mesh routing intent (cross-hotel park, a reflex-set
+///      `target_capability`, etc). Always wins; never overridden by the ladder.
+///   2. An explicit component binding (`preferred_component_implementation`,
+///      e.g. `bindings.effective_model_controller`) — an operator/session-level
+///      pin to a specific implementation. More specific than a role-wide
+///      default, so it outranks the ladder too.
+///   3. The active role's configured fallback ladder primary
+///      (`role_activation.turn_loop_config.fallback_tiers[0]`) — only consulted
+///      for text-generation dispatch (`fallback_role == DEFAULT_TEXT_MODEL_ROLE`)
+///      and only when neither of the above is set. This is what lets a
+///      configured ladder (e.g. `["model.openrouter", "model.ollama"]`) govern
+///      the *initial* dispatch, not just failure escalation.
+///   4. `fallback_role` (`DEFAULT_TEXT_MODEL_ROLE` for text turns) — the last
+///      resort when nothing else is configured.
 fn resolve_model_execution_target(
     state: Option<&SessionState>,
     capability: &str,
@@ -721,12 +758,67 @@ fn resolve_model_execution_target(
         );
     }
 
-    let target_role = state
-        .and_then(|state| state.preferred_component_implementation(capability))
-        .map(implementation_to_model_role)
-        .unwrap_or_else(|| fallback_role.into());
+    if let Some(implementation) =
+        state.and_then(|state| state.preferred_component_implementation(capability))
+    {
+        return (
+            local_node_id(),
+            implementation_to_model_role(implementation),
+            None,
+        );
+    }
+
+    let target_role =
+        ladder_primary_role(state, fallback_role).unwrap_or_else(|| fallback_role.into());
 
     (local_node_id(), target_role, None)
+}
+
+/// The active role's configured fallback ladder (`turn_loop_config.fallback_tiers`),
+/// when the session has a role active with a non-empty custom ladder. `None`
+/// when no role is active, the role has no `turn_loop_config`, or its ladder is
+/// empty (the `DEFAULT_FALLBACK_TIERS` constant governs those cases elsewhere).
+fn role_ladder_tiers(state: Option<&SessionState>) -> Option<&[String]> {
+    state
+        .and_then(|state| state.role_activation.as_ref())
+        .and_then(|ra| ra.turn_loop_config.as_ref())
+        .map(|tlc| tlc.fallback_tiers.as_slice())
+        .filter(|tiers| !tiers.is_empty())
+}
+
+/// `role_ladder_tiers(state)[0]`, gated to text-generation dispatch. The
+/// ladder is a text-model routing construct (`"model"`, `"model.openrouter"`,
+/// ...); non-text capabilities (voice synthesis, media analysis, ...) pass a
+/// different `fallback_role` and never consult it.
+fn ladder_primary_role(state: Option<&SessionState>, fallback_role: &str) -> Option<String> {
+    if fallback_role != DEFAULT_TEXT_MODEL_ROLE {
+        return None;
+    }
+    role_ladder_tiers(state).and_then(|tiers| tiers.first().cloned())
+}
+
+/// True when, given the current session state, the *primary* dispatch for
+/// text generation would resolve to the role ladder's `tiers[0]` (per
+/// [`resolve_model_execution_target`]'s precedence) rather than an explicit
+/// hotel route or component binding. Lets
+/// [`turn_loop::advance_turn_to_next_fallback_tier`] tell whether ladder tier
+/// 0 was already attempted as the primary dispatch (skip it) or never
+/// attempted (try it before advancing further) — see DEF: off-by-one on
+/// single-tier ladders.
+fn primary_dispatch_used_ladder(state: Option<&SessionState>, capability: &str) -> bool {
+    if state
+        .and_then(|state| state.resolve_component_execution_route(capability))
+        .is_some()
+    {
+        return false;
+    }
+    if state
+        .and_then(|state| state.preferred_component_implementation(capability))
+        .is_some()
+    {
+        return false;
+    }
+    role_ladder_tiers(state).is_some()
 }
 
 /// Returns `(action, effective_capability)` for model dispatch.
@@ -2270,6 +2362,7 @@ impl AgentRuntime {
                 plan_confirmed: seeded_plan_confirmed,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
+                ladder_tier0_dispatched: false,
                 streaming_retry_attempts: 0,
                 streamed_content: String::new(),
                 paracrine_hop_count: 0,
@@ -5766,8 +5859,8 @@ mod tests {
         classify_provider_error, decide_no_response_action, extract_model_error,
         extract_model_error_payload, format_role_command_reply, format_roles_report,
         loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments, next_ladder_tier,
-        normalized_user_content, pick_oracle_role, provider_for_role, resolve_media_routing,
-        resolve_model_execution_target, should_attempt_provider_repair,
+        normalized_user_content, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
+        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -5776,7 +5869,8 @@ mod tests {
     };
     use crate::session::{
         ActivePlan, ApprovalPolicy, CarryoverPlan, ComponentExecutionRoute, ComponentRouteAssembly,
-        ComponentRouteBinding, PlanStep, ResponseRouteMode, SessionState, WorkingTurn,
+        ComponentRouteBinding, PlanStep, ResponseRouteMode, RoleActivation, SessionState,
+        WorkingTurn,
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
@@ -5909,6 +6003,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            ladder_tier0_dispatched: false,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
             paracrine_hop_count: 0,
@@ -6055,6 +6150,144 @@ mod tests {
             "model.mlx"
         );
         assert_eq!(super::implementation_to_model_role("onnx"), "model.local");
+    }
+
+    /// Implementation-mapping matrix (defect 3): openrouter (and other
+    /// non-enumerated providers) must get their own dedicated role instead of
+    /// collapsing onto the gemini default — mirrors the hotel-side
+    /// `component_implementation_to_role` (ipc.rs).
+    #[test]
+    fn implementation_mapping_matrix_covers_openrouter_and_passthrough() {
+        assert_eq!(
+            super::implementation_to_model_role("openrouter"),
+            "model.openrouter"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("openrouter/anthropic/claude-3"),
+            "model.openrouter"
+        );
+        // Already role-shaped values pass through unchanged (case-insensitively).
+        assert_eq!(
+            super::implementation_to_model_role("model.openrouter"),
+            "model.openrouter"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("MODEL.OpenRouter"),
+            "model.openrouter"
+        );
+        // Any other known provider name also gets a dedicated role.
+        assert_eq!(
+            super::implementation_to_model_role("openai"),
+            "model.openai"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("anthropic"),
+            "model.anthropic"
+        );
+        // gemini still maps to the plain default role.
+        assert_eq!(super::implementation_to_model_role("gemini"), "model");
+    }
+
+    // ── Ladder-primary precedence matrix (defect 1) ──────────────────────────
+
+    fn role_activation_with_ladder(tiers: &[&str]) -> RoleActivation {
+        RoleActivation {
+            role_name: "researcher".into(),
+            activation_reason: "test".into(),
+            turn_loop_config: Some(ansible_mesh_core::graph::TurnLoopConfig {
+                fallback_tiers: tiers.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Explicit hotel execution route always wins, even with a ladder
+    /// configured.
+    #[test]
+    fn ladder_precedence_hotel_route_wins_over_ladder() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: "aria-node".into(),
+                    target_role: "model".into(),
+                    incarnation_id: None,
+                    hotel_id: Some("aria-architect-hotel".into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("remote_latency_capacity".into()),
+                    target_capability: None,
+                },
+            )]),
+        };
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.0, "aria-node");
+        assert_eq!(target.1, "model");
+    }
+
+    /// An explicit `effective_model_controller` binding wins over the ladder.
+    #[test]
+    fn ladder_precedence_explicit_binding_wins_over_ladder() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        state.bindings.effective_model_controller = Some("elevenlabs".into());
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.0, LOCAL_NODE.to_string());
+        assert_eq!(target.1, "model.elevenlabs");
+    }
+
+    /// With no hotel route and no explicit binding, the role ladder's
+    /// `tiers[0]` governs the *primary* dispatch.
+    #[test]
+    fn ladder_precedence_tiers_zero_used_when_set() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&[
+            "model.openrouter",
+            "model.ollama",
+        ]));
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.1, "model.openrouter");
+
+        assert!(primary_dispatch_used_ladder(Some(&state), "text.generate"));
+    }
+
+    /// With no hotel route, no explicit binding, and no configured ladder,
+    /// the plain default text-model role is used.
+    #[test]
+    fn ladder_precedence_default_when_nothing_configured() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.1, DEFAULT_TEXT_MODEL_ROLE);
+        assert!(!primary_dispatch_used_ladder(Some(&state), "text.generate"));
+    }
+
+    /// The ladder is a text-generation construct: a non-text `fallback_role`
+    /// (e.g. voice synthesis) must never consult it, even when one is
+    /// configured.
+    #[test]
+    fn ladder_precedence_does_not_apply_to_non_text_capability() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+
+        let target =
+            resolve_model_execution_target(Some(&state), "voice.synthesize", "model.elevenlabs");
+        assert_eq!(target.1, "model.elevenlabs");
     }
 
     #[test]
@@ -6352,6 +6585,7 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            ladder_tier0_dispatched: false,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
             paracrine_hop_count: 0,
@@ -6495,18 +6729,41 @@ mod tests {
         ];
 
         // Contract failure on gemini at tier 0 → tier 2 (model.ollama).
-        assert_eq!(next_ladder_tier(&ladder, 0, 2, Some("gemini"), true), 2);
+        assert_eq!(
+            next_ladder_tier(&ladder, Some(0), 2, Some("gemini"), true),
+            2
+        );
         // Transient failure keeps the plain +1 walk (no skip).
-        assert_eq!(next_ladder_tier(&ladder, 0, 2, Some("gemini"), false), 1);
+        assert_eq!(
+            next_ladder_tier(&ladder, Some(0), 2, Some("gemini"), false),
+            1
+        );
         // Skip can exhaust the ladder: gemini fails at tier 0 of an all-gemini tail.
         let gemini_only: Vec<String> = vec!["model".into(), "model.gemini".into()];
         assert_eq!(
-            next_ladder_tier(&gemini_only, 0, 1, Some("gemini"), true),
+            next_ladder_tier(&gemini_only, Some(0), 1, Some("gemini"), true),
             2,
             "skipping past the end signals exhaustion (oracle next)"
         );
         // Unknown failed provider → no skip.
-        assert_eq!(next_ladder_tier(&ladder, 0, 2, None, true), 1);
+        assert_eq!(next_ladder_tier(&ladder, Some(0), 2, None, true), 1);
+    }
+
+    /// The off-by-one fix: `last_ladder_tier = None` means the ladder hasn't
+    /// been consulted yet (primary dispatch bypassed it), so the walk must
+    /// start at tier 0 — not tier 1.
+    #[test]
+    fn next_ladder_tier_starts_at_zero_when_ladder_not_yet_engaged() {
+        let ladder: Vec<String> = vec!["model.openrouter".into()];
+        assert_eq!(
+            next_ladder_tier(&ladder, None, 0, None, false),
+            0,
+            "a single-tier ladder must be reachable when the primary dispatch \
+             didn't come from the ladder"
+        );
+
+        // Once engaged (Some(tier)), the walk resumes as a plain +1 as before.
+        assert_eq!(next_ladder_tier(&ladder, Some(0), 0, None, false), 1);
     }
 
     #[test]
@@ -7554,6 +7811,329 @@ mod tests {
         assert!(
             emitted.iter().all(|e| e["heal_event"].is_null()),
             "a successful mid-turn switch must not push heal events: {:#?}",
+            *emitted
+        );
+    }
+
+    // ── Single-tier ladder reachability (defect 2: off-by-one) ───────────────
+
+    /// Regression for the off-by-one: a role with a single-tier ladder whose
+    /// *primary* dispatch bypassed the ladder (an explicit
+    /// `effective_model_controller` binding won precedence — see
+    /// `resolve_model_execution_target`) must still get a shot at that one
+    /// ladder tier on failure. Before the fix, `fallback_tier` started at 0
+    /// unconditionally and the walk jumped straight to tier 1, which
+    /// immediately exceeded a single-tier ladder's `max_tier` (0) and skipped
+    /// the ladder entirely.
+    #[tokio::test]
+    async fn single_tier_ladder_reachable_when_primary_bypassed_it() {
+        let socket_path = format!("/tmp/philote-1tier-bypass-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-1tier-bypass".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-1tier-bypass");
+
+        let session_id = "sess-1tier-bypass";
+        let turn_id = "turn-1tier-bypass";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // A 1-tier ladder is configured, but an explicit binding (higher
+        // precedence than the ladder) is what actually drove the primary
+        // dispatch to gemini — the "default-primary role with a 1-tier
+        // ladder" case.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+            state.bindings.effective_model_controller = Some("gemini".into());
+        }
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        turn.fallback_tier = 0;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "Gemini API error (400): Request contains an invalid argument.".into(),
+                    component: Some("model-router".into()),
+                    provider: Some("gemini".into()),
+                    capability: Some("text.generate".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("400 must not error the loop");
+
+        // The turn survives and the single ladder tier gets tried, not skipped.
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state
+                .active_turn
+                .as_ref()
+                .expect("the single ladder tier must be reachable, not skipped to exhaustion");
+            assert_eq!(turn.phase, TurnPhase::WaitingModel);
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let redispatches: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert_eq!(
+            redispatches.len(),
+            1,
+            "exactly one fallback re-dispatch: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            redispatches[0]["target_role"], "model.openrouter",
+            "the single configured ladder tier must be tried on failure: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().all(|e| e["heal_event"].is_null()),
+            "the ladder must not be exhausted after only one failure: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Deeper regression on the same bypass case: `primary_dispatch_used_ladder`
+    /// is re-derived from *static* session config on every call, so on its own
+    /// it can't distinguish "virgin primary" from "tier 0 already dispatched
+    /// via this same bypass path" — both look identical (`current_tier == 0`,
+    /// primary still bypasses the ladder per session config). Without a
+    /// per-turn marker, a second failure would re-derive the same "None"
+    /// verdict and redispatch tier 0 forever, leaking every later tier
+    /// (`model.ollama` here) and the routing oracle. `WatchdogTimeout` is used
+    /// deliberately — it carries no `failed_provider`, so the contract-failure
+    /// skip (which happens to rescue the single-tier case) cannot mask this.
+    #[tokio::test]
+    async fn multi_tier_bypassed_ladder_walks_forward_across_repeated_failures() {
+        let socket_path = format!("/tmp/philote-2tier-bypass-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-2tier-bypass".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-2tier-bypass");
+
+        let session_id = "sess-2tier-bypass";
+        let turn_id = "turn-2tier-bypass";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Two-tier ladder configured, but an explicit binding wins precedence
+        // for the primary dispatch (bypasses the ladder entirely).
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&[
+                "model.openrouter",
+                "model.ollama",
+            ]));
+            state.bindings.effective_model_controller = Some("gemini".into());
+        }
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        turn.fallback_tier = 0;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // First WatchdogTimeout: the bypassed ladder's tiers[0] must be tried.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+            )
+            .await
+            .expect("first escalation");
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn survives tier 0");
+            assert_eq!(turn.fallback_tier, 0, "lands on ladder tier 0");
+            assert!(
+                turn.ladder_tier0_dispatched,
+                "the ladder-engaged marker must flip once tier 0 is dispatched"
+            );
+        }
+
+        // Second WatchdogTimeout: must advance to tiers[1] ("model.ollama"),
+        // not redispatch tiers[0] again.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+            )
+            .await
+            .expect("second escalation");
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn survives tier 1");
+            assert_eq!(
+                turn.fallback_tier, 1,
+                "must advance past tier 0, not redispatch it"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let redispatches: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .map(|e| e["target_role"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            redispatches,
+            vec!["model.openrouter".to_string(), "model.ollama".to_string()],
+            "the walk must cover each ladder entry exactly once, in order: {:#?}",
+            redispatches
+        );
+    }
+
+    /// Counterpart: when the primary dispatch *did* come from the ladder
+    /// (tiers[0], per defect-1's fixed precedence), a single-tier ladder is
+    /// correctly exhausted on the next failure — there is nothing left to
+    /// retry, so the turn falls through to the routing oracle (which the stub
+    /// hotel answers with no ranked data) and fails cleanly instead of
+    /// looping back onto the tier it already tried.
+    #[tokio::test]
+    async fn single_tier_ladder_engaged_as_primary_exhausts_cleanly_on_failure() {
+        let socket_path = format!(
+            "/tmp/philote-1tier-engaged-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-1tier-engaged".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-1tier-engaged");
+
+        let session_id = "sess-1tier-engaged";
+        let turn_id = "turn-1tier-engaged";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // No hotel route, no explicit binding: per resolve_model_execution_target's
+        // precedence the 1-tier ladder's tiers[0] ("model.openrouter") IS the
+        // primary dispatch.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        }
+        assert!(
+            primary_dispatch_used_ladder(runtime.sessions.get(session_id), "text.generate"),
+            "sanity: the ladder must be the primary source in this fixture"
+        );
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        turn.fallback_tier = 0;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "OpenRouter API error (500): upstream unavailable.".into(),
+                    component: Some("model-router".into()),
+                    provider: Some("openrouter".into()),
+                    capability: Some("text.generate".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("failure must not error the loop");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        // No second ladder dispatch — the single tier already served as
+        // primary, so there was nothing left in the ladder to retry.
+        let redispatches: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert!(
+            redispatches.is_empty(),
+            "no ladder tier remains to redispatch to: {:#?}",
+            *emitted
+        );
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| !e["heal_event"].is_null())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "exhaustion must push exactly one heal event: {:#?}",
             *emitted
         );
     }
