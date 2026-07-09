@@ -1,7 +1,9 @@
 use crate::controller::{
     BackoffStrategy, ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
     NativeLiveRegistry, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
+    refresh_gemini_credential_pool,
 };
+use crate::credential_pool::{CredentialPool, RotationTrigger};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::router_trace::{
     RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
@@ -122,6 +124,12 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
         config.role
     );
 
+    // Credential pool state persists across tasks (cooldowns, pinned member)
+    // even though provider configs and providers are rebuilt per task.
+    // Gemini-only in slice 0 of the Model Failover Layers proposal.
+    let mut gemini_pool = CredentialPool::new("gemini");
+    let gemini_pool_enabled = matches!(config.role, "model" | "model.gemini");
+
     loop {
         match tokio::time::timeout(Duration::from_secs(5), ipc_client.recv_task()).await {
             Ok(Ok(IpcResponse::InboundTask {
@@ -167,7 +175,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     }
                 };
 
-                let provider_configs = match ProviderConfigs::load(&mut ipc_client).await {
+                let mut provider_configs = match ProviderConfigs::load(&mut ipc_client).await {
                     Ok(configs) => configs,
                     Err(err) => {
                         emit_failure(
@@ -185,6 +193,18 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         continue;
                     }
                 };
+                if gemini_pool_enabled {
+                    if let Err(err) = refresh_gemini_credential_pool(
+                        &mut ipc_client,
+                        &mut gemini_pool,
+                        &mut provider_configs,
+                    )
+                    .await
+                    {
+                        warn!("gemini credential pool refresh failed: {err}");
+                    }
+                }
+                let gemini_active_member = gemini_pool.active_member().map(|(idx, _)| idx);
                 let providers = ProviderRegistry::new((config.providers)(
                     http_client.clone(),
                     &provider_configs,
@@ -337,7 +357,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     // health, walk the full supporting-provider list and substitute
                     // the first healthy alternative. Only applies when there is no
                     // explicit provider_hint — hints are honoured unconditionally.
-                    let provider = if controller_task.provider_hint().is_none() {
+                    let mut provider = if controller_task.provider_hint().is_none() {
                         let primary_degraded = graph_domain
                             .as_ref()
                             .and_then(|gd| {
@@ -416,8 +436,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         let attempt_secs = provider.attempt_policy().total_secs;
                         let mut last_err = anyhow::anyhow!("dispatch: no attempts completed");
                         let mut result: Option<Result<ProviderOutput>> = None;
+                        let mut attempt: u8 = 0;
+                        // Layer 1 (credential pools): on auth/rate-limit failures the
+                        // pool rotates to a sibling key and the rotated member gets
+                        // exactly one fresh attempt. Bounded so worst-case wall clock
+                        // (attempts + rotations) stays under the philote watchdog.
+                        let mut active_pool_member = gemini_active_member;
+                        let mut rotations_left: u8 = 2;
 
-                        for attempt in 0u8..retry.max_attempts {
+                        while attempt < retry.max_attempts {
                             if attempt > 0 {
                                 warn!(
                                     "Provider [{}] retrying (attempt {}/{})",
@@ -530,6 +557,11 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                             match attempt_result {
                                 Ok(output) => {
+                                    if provider.id() == "gemini" {
+                                        if let Some(idx) = active_pool_member {
+                                            gemini_pool.note_success(idx);
+                                        }
+                                    }
                                     result = Some(Ok(output));
                                     break;
                                 }
@@ -539,6 +571,45 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         Some(provider.id()),
                                         &e.to_string(),
                                     );
+                                    // Layer 1: rotate to a sibling API key on auth/rate-limit
+                                    // failures before the error surfaces as tier-worthy.
+                                    let rotation = RotationTrigger::from_sub_kind(
+                                        classified.sub_kind.as_deref(),
+                                    )
+                                    .filter(|_| provider.id() == "gemini" && rotations_left > 0)
+                                    .and_then(|trigger| {
+                                        let idx = active_pool_member?;
+                                        gemini_pool
+                                            .rotate_on_failure(idx, trigger)
+                                            .map(|next| (trigger, idx, next))
+                                    });
+                                    if let Some((trigger, failed_idx, (next_idx, next_key))) =
+                                        rotation
+                                    {
+                                        provider_configs.set_provider_api_key("gemini", next_key);
+                                        let rebuilt = ProviderRegistry::new((config.providers)(
+                                            http_client.clone(),
+                                            &provider_configs,
+                                        ));
+                                        if let Some(next_provider) = rebuilt
+                                            .all_supporting(&controller_task)
+                                            .into_iter()
+                                            .find(|p| p.id() == "gemini")
+                                        {
+                                            warn!(
+                                                "Gemini credential pool: member {} failed ({:?}); rotating to member {}",
+                                                failed_idx, trigger, next_idx
+                                            );
+                                            rotations_left -= 1;
+                                            active_pool_member = Some(next_idx);
+                                            provider = next_provider;
+                                            last_err = e;
+                                            attempt = retry.max_attempts.saturating_sub(1);
+                                            continue;
+                                        }
+                                        // Rebuild lost the provider (should not happen) —
+                                        // fall through to normal failure handling.
+                                    }
                                     let retryable = classified.retryable.unwrap_or(false);
                                     let has_more = attempt + 1 < retry.max_attempts;
                                     if retryable && has_more {
@@ -555,6 +626,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     }
                                 }
                             }
+                            attempt += 1;
                         }
 
                         result.unwrap_or(Err(last_err))
