@@ -267,18 +267,57 @@ fn launchd_pid(hotel: &str) -> Option<u32> {
     None
 }
 
+/// True when `cmdline` (a process's full argv joined with whitespace)
+/// contains a literal `--hotel <hotel>` token pair — i.e. `hotel` is an
+/// exact argument, not merely a substring of some other hotel's name.
+///
+/// `pgrep -f` does unanchored substring matching, so a naive
+/// `"aiua --hotel {hotel}"` pattern for hotel `jane` would also match a
+/// real `aiua --hotel jane2 --foo` process. Parsing argv tokens instead of
+/// pattern-matching raw text avoids that prefix collision entirely.
+fn command_line_has_exact_hotel_arg(cmdline: &str, hotel: &str) -> bool {
+    let tokens: Vec<&str> = cmdline.split_whitespace().collect();
+    tokens
+        .windows(2)
+        .any(|pair| pair[0] == "--hotel" && pair[1] == hotel)
+}
+
+fn pid_command_line(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn running_aiua_pids(hotel: &str) -> Vec<u32> {
-    let pattern = format!("aiua --hotel {hotel}");
+    // Broad substring match to find candidate `aiua --hotel ...`
+    // processes, then verify each candidate's actual argv contains an
+    // exact `--hotel <hotel>` pair. This avoids `pgrep -f`'s unanchored
+    // substring matching flagging e.g. hotel `jane` against a real
+    // `aiua --hotel jane2` process.
     let output = std::process::Command::new("pgrep")
-        .args(["-f", &pattern])
+        .args(["-f", "aiua --hotel"])
         .output();
-    match output {
+    let candidates: Vec<u32> = match output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .filter_map(|l| l.trim().parse::<u32>().ok())
             .collect(),
-        _ => Vec::new(),
-    }
+        _ => return Vec::new(),
+    };
+
+    candidates
+        .into_iter()
+        .filter(|&pid| {
+            pid_command_line(pid)
+                .map(|cmdline| command_line_has_exact_hotel_arg(&cmdline, hotel))
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 fn hotel_active_pid(conn: &Connection, hotel: &str) -> Result<Option<u32>> {
@@ -953,6 +992,72 @@ mod tests {
     fn orphans_no_running_processes_is_clean() {
         let findings = evaluate_orphans("proc.orphan-instances", None, None, &[]);
         assert!(findings.is_empty());
+    }
+
+    // ── proc.orphan-instances (hotel-arg prefix-collision matching) ───────
+    //
+    // Regression coverage for the `pgrep -f` unanchored-substring bug: a
+    // naive "aiua --hotel jane" pattern would also match a real
+    // `aiua --hotel jane2` process, which could tell an operator to SIGTERM
+    // a healthy jane2 hotel. `command_line_has_exact_hotel_arg` is the
+    // pattern-matching logic `running_aiua_pids` uses to filter pgrep's
+    // broad candidate list down to exact `--hotel <hotel>` argv pairs.
+
+    #[test]
+    fn hotel_arg_match_rejects_prefix_collision_jane_vs_jane2() {
+        // The exact scenario from the finding: hotel "jane" must not match
+        // a real "jane2" hotel process.
+        assert!(!command_line_has_exact_hotel_arg(
+            "/usr/local/bin/aiua --hotel jane2 --foo",
+            "jane",
+        ));
+        // And the reverse must also hold: "jane2" must not match a "jane"
+        // process either.
+        assert!(!command_line_has_exact_hotel_arg(
+            "/usr/local/bin/aiua --hotel jane --foo",
+            "jane2",
+        ));
+    }
+
+    #[test]
+    fn hotel_arg_match_accepts_exact_argument() {
+        assert!(command_line_has_exact_hotel_arg(
+            "/usr/local/bin/aiua --hotel jane --foo bar",
+            "jane",
+        ));
+        // Exact match still holds when --hotel is the last token pair.
+        assert!(command_line_has_exact_hotel_arg(
+            "/usr/local/bin/aiua --hotel jane",
+            "jane",
+        ));
+    }
+
+    #[test]
+    fn hotel_arg_match_rejects_unrelated_hotel() {
+        assert!(!command_line_has_exact_hotel_arg(
+            "/usr/local/bin/aiua --hotel bjork --foo",
+            "jane",
+        ));
+    }
+
+    #[test]
+    fn running_aiua_pids_filters_prefix_collision_candidates() {
+        // End-to-end (minus the real `pgrep`/`ps` shellouts) exercise of the
+        // filtering logic `running_aiua_pids` applies: given pgrep's broad
+        // "aiua --hotel" candidates, only pids whose full argv contains an
+        // exact `--hotel jane` pair should survive — a `jane2` process must
+        // be filtered out even though it shares the same pgrep hit.
+        let candidate_cmdlines = [
+            (100u32, "/usr/local/bin/aiua --hotel jane"),
+            (200u32, "/usr/local/bin/aiua --hotel jane2 --foo"),
+            (300u32, "/usr/local/bin/aiua --hotel jane --verbose"),
+        ];
+        let surviving: Vec<u32> = candidate_cmdlines
+            .iter()
+            .filter(|(_, cmdline)| command_line_has_exact_hotel_arg(cmdline, "jane"))
+            .map(|(pid, _)| *pid)
+            .collect();
+        assert_eq!(surviving, vec![100, 300]);
     }
 
     // ── ipc.stale-socket ─────────────────────────────────────────────────
