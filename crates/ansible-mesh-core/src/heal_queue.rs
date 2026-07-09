@@ -626,6 +626,41 @@ mod tests {
         assert_eq!(c.provider, None);
     }
 
+    // RC-1 (2026-07-09 stuck-turn forensic): the model-router dispatch-cap
+    // breach (pre-dispatch config-load stall, or the whole attempt/rotation
+    // sequence never producing output) must reach the heal queue tagged
+    // provider_timeout:{provider} exactly like the existing streaming-idle
+    // timeout does — this is a generic classifier match (message contains
+    // "timeout" + provider_failure markers), so no dedicated branch is
+    // needed, but the exact message shapes emitted by the new dispatch-cap
+    // code paths are pinned here so a future wording change can't silently
+    // fall out of the timeout bucket.
+    #[test]
+    fn classify_turn_failure_provider_timeout_dispatch_cap_messages() {
+        let c = classify_turn_failure(
+            "[MODEL_EMPTY_RESPONSE] Model failed: Provider invocation failed: \
+             provider_timeout: overall dispatch exceeded 55s across attempt/rotation cycles \
+             | kind=provider_failure | component=model-router | provider=gemini \
+             | capability=text.generate",
+        )
+        .expect("classified");
+        assert_eq!(c.pattern_tag, "provider_timeout:gemini");
+        assert_eq!(c.heal_action, "noop");
+        assert_eq!(c.provider.as_deref(), Some("gemini"));
+
+        // The pre-dispatch config-load timeout fires before any provider is
+        // resolved, so it carries no provider marker.
+        assert_eq!(
+            tag_of(
+                "Model controller failed to refresh provider config: provider_timeout: \
+                 config load exceeded 55s (pre-dispatch stall, no provider resolved yet) \
+                 | kind=provider_failure | component=model-router"
+            )
+            .as_deref(),
+            Some("provider_timeout:unknown")
+        );
+    }
+
     #[test]
     fn classify_turn_failure_model_empty_response() {
         // Bare MODEL_EMPTY_RESPONSE (no provider markers) still classifies.
