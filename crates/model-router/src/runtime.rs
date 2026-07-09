@@ -24,6 +24,36 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+/// Default overall per-task provider-dispatch cap, in seconds.
+///
+/// Covers ANY await between receiving a task and obtaining a provider result —
+/// not just the provider's own HTTP round trip. Before this cap existed, the
+/// pre-dispatch IPC round trips in `ProviderConfigs::load` / credential-pool
+/// refresh (roughly a dozen sequential `send_request` calls with no per-call
+/// timeout) and the provider attempt+retry loop were each theoretically
+/// bounded on their own, but nothing capped the SUM — a single stuck IPC round
+/// trip before the provider was ever dispatched left the turn silent with the
+/// provider's own streaming caps (STREAMING_CONNECT/IDLE/TOTAL_SECS in
+/// gemini.rs) never engaging, riding philote's coarse 300s WaitingModel
+/// watchdog instead of failing fast onto the next fallback tier.
+/// (2026-07-09 stuck-turn forensic RC-1.)
+///
+/// Sized well under the 300s watchdog so a breach always leaves room for the
+/// FailTask → ladder-escalation round trip. Env-tunable via
+/// `PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS` for operators running against a
+/// known-slow vault/config backend without a rebuild.
+const MODEL_DISPATCH_TIMEOUT_SECS_DEFAULT: u64 = 55;
+
+fn model_dispatch_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(MODEL_DISPATCH_TIMEOUT_SECS_DEFAULT),
+    )
+}
+
 type ProviderFactory =
     dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn ModelProvider>> + Send + Sync;
 type NativeLiveProviderFactory =
@@ -175,9 +205,19 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     }
                 };
 
-                let mut provider_configs = match ProviderConfigs::load(&mut ipc_client).await {
-                    Ok(configs) => configs,
-                    Err(err) => {
+                // Pre-dispatch config load: ~a dozen sequential IPC round trips
+                // (GetConfig / secret fetch), none individually timeout-bound.
+                // Wrap the whole load in the dispatch cap so a single stuck
+                // hotel/vault round trip can't silently burn the WaitingModel
+                // window before a provider is ever dispatched (RC-1).
+                let mut provider_configs = match tokio::time::timeout(
+                    model_dispatch_timeout(),
+                    ProviderConfigs::load(&mut ipc_client),
+                )
+                .await
+                {
+                    Ok(Ok(configs)) => configs,
+                    Ok(Err(err)) => {
                         emit_failure(
                             &mut ipc_client,
                             &reply,
@@ -192,16 +232,43 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         .await?;
                         continue;
                     }
+                    Err(_) => {
+                        emit_failure(
+                            &mut ipc_client,
+                            &reply,
+                            Some(controller_task.kind.as_str()),
+                            None,
+                            config.guest_id,
+                            format!(
+                                "provider_timeout: config load exceeded {}s (pre-dispatch stall, no provider resolved yet)",
+                                model_dispatch_timeout().as_secs()
+                            ),
+                        )
+                        .await?;
+                        continue;
+                    }
                 };
                 if gemini_pool_enabled {
-                    if let Err(err) = refresh_gemini_credential_pool(
-                        &mut ipc_client,
-                        &mut gemini_pool,
-                        &mut provider_configs,
+                    match tokio::time::timeout(
+                        model_dispatch_timeout(),
+                        refresh_gemini_credential_pool(
+                            &mut ipc_client,
+                            &mut gemini_pool,
+                            &mut provider_configs,
+                        ),
                     )
                     .await
                     {
-                        warn!("gemini credential pool refresh failed: {err}");
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            warn!("gemini credential pool refresh failed: {err}");
+                        }
+                        Err(_) => {
+                            warn!(
+                                "gemini credential pool refresh exceeded {}s (pre-dispatch stall); continuing with existing pool state",
+                                model_dispatch_timeout().as_secs()
+                            );
+                        }
                     }
                 }
                 let gemini_active_member = gemini_pool.active_member().map(|(idx, _)| idx);
@@ -431,7 +498,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     // (philote WaitingModel watchdog). If the controller resolves within budget,
                     // philote escalates via its own retry path; if the IPC connection drops
                     // silently, the watchdog fires and escalates to the next fallback tier.
-                    let provider_result = {
+                    //
+                    // The per-attempt `attempt_secs` timeout below bounds a single HTTP
+                    // round trip, but credential-pool key rotation (Layer 1) can chain
+                    // several attempt cycles back to back on auth/rate-limit failures.
+                    // `model_dispatch_timeout()` is an outer hard ceiling on the WHOLE
+                    // attempt+rotation sequence so a single degraded provider (even one
+                    // that keeps "making progress" by rotating keys) cannot alone consume
+                    // the full WaitingModel window before the ladder engages (RC-1).
+                    let provider_result = match tokio::time::timeout(model_dispatch_timeout(), async {
                         let retry = provider.retry_policy();
                         let attempt_secs = provider.attempt_policy().total_secs;
                         let mut last_err = anyhow::anyhow!("dispatch: no attempts completed");
@@ -630,6 +705,14 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         }
 
                         result.unwrap_or(Err(last_err))
+                    })
+                    .await
+                    {
+                        Ok(inner) => inner,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "provider_timeout: overall dispatch exceeded {}s across attempt/rotation cycles",
+                            model_dispatch_timeout().as_secs()
+                        )),
                     };
 
                     match provider_result {
@@ -1305,6 +1388,23 @@ fn classify_provider_failure(
         return payload;
     }
 
+    // Overall dispatch / time-to-first-token cap breached — the provider made
+    // no usable progress across the WHOLE budget (pre-dispatch config/credential
+    // IPC load, or the full attempt+retry sequence never producing output).
+    // Unlike a mid-stream `streaming_timeout` (which had already started moving
+    // bytes and gets one same-tier retry), a dispatch-cap breach means this
+    // provider tier is stuck from the start — go straight to the next fallback
+    // tier instead of burning another full attempt cycle on the same provider.
+    // (2026-07-09 stuck-turn forensic RC-1: a single slow/stuck provider must
+    // not be allowed to consume the entire philote WaitingModel window before
+    // the ladder engages.)
+    if message.contains("provider_timeout") {
+        payload.sub_kind = Some("provider_timeout".into());
+        payload.retryable = Some(true);
+        payload.error_class = Some("switch_provider".into());
+        return payload;
+    }
+
     // Streaming idle timeout — emitted by providers when the SSE stream stalls.
     if message.contains("streaming_timeout") {
         payload.sub_kind = Some("streaming_timeout".into());
@@ -1465,7 +1565,102 @@ impl ReplyRoute {
 
 #[cfg(test)]
 mod failure_tests {
-    use super::{classify_provider_failure, extract_http_status};
+    use super::{classify_provider_failure, extract_http_status, model_dispatch_timeout};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Serializes tests that mutate `PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS` —
+    /// cargo runs tests in this module on separate threads within one
+    /// process, and env vars are process-global.
+    static DISPATCH_TIMEOUT_ENV_GUARD: Mutex<()> = Mutex::new(());
+    fn dispatch_timeout_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        DISPATCH_TIMEOUT_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RC-1 (2026-07-09 stuck-turn forensic): an overall dispatch-cap breach
+    /// (pre-dispatch config load, or the whole attempt+rotation sequence)
+    /// must classify as `switch_provider` immediately — NOT the softer
+    /// `retry_same_provider` bucket `streaming_timeout` gets, and NOT a
+    /// silent unclassified MODEL_EMPTY_RESPONSE-shaped envelope. A provider
+    /// that made zero progress across its entire budget should not get
+    /// another same-tier cycle; the ladder should engage right away.
+    #[test]
+    fn classify_provider_failure_marks_provider_timeout_switch_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "provider_timeout: overall dispatch exceeded 55s across attempt/rotation cycles",
+        );
+
+        assert_eq!(payload.kind, "provider_failure");
+        assert_eq!(payload.sub_kind.as_deref(), Some("provider_timeout"));
+        assert_eq!(payload.retryable, Some(true));
+        assert_eq!(payload.error_class.as_deref(), Some("switch_provider"));
+        // Not the mid-stream idle bucket, and not a MODEL_EMPTY_RESPONSE-style
+        // unclassified code.
+        assert_ne!(payload.sub_kind.as_deref(), Some("streaming_timeout"));
+        assert_eq!(payload.code, None);
+    }
+
+    #[test]
+    fn classify_provider_failure_config_load_timeout_message_matches_provider_timeout() {
+        // Exact message shape emitted when ProviderConfigs::load times out —
+        // no provider has been resolved yet at that point in dispatch.
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            None,
+            "provider_timeout: config load exceeded 55s (pre-dispatch stall, no provider resolved yet)",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("provider_timeout"));
+        assert_eq!(payload.error_class.as_deref(), Some("switch_provider"));
+    }
+
+    /// A genuine mid-stream idle stall (bytes had already started moving, or
+    /// the provider's own inner SSE cap fired) keeps its existing gentler
+    /// same-tier-once-then-escalate treatment — this fix must not regress it.
+    #[test]
+    fn classify_provider_failure_streaming_timeout_still_retry_same_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "streaming_timeout: Gemini SSE stream produced no data for 8s",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("streaming_timeout"));
+        assert_eq!(payload.error_class.as_deref(), Some("retry_same_provider"));
+    }
+
+    #[test]
+    fn model_dispatch_timeout_defaults_and_honors_env_override() {
+        let _guard = dispatch_timeout_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS");
+        }
+        assert_eq!(model_dispatch_timeout(), Duration::from_secs(55));
+
+        unsafe {
+            std::env::set_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS", "20");
+        }
+        assert_eq!(model_dispatch_timeout(), Duration::from_secs(20));
+
+        // Invalid / zero values fall back to the default rather than
+        // producing a zero-duration timeout that would fail every dispatch.
+        unsafe {
+            std::env::set_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS", "0");
+        }
+        assert_eq!(model_dispatch_timeout(), Duration::from_secs(55));
+        unsafe {
+            std::env::set_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS", "not-a-number");
+        }
+        assert_eq!(model_dispatch_timeout(), Duration::from_secs(55));
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS");
+        }
+    }
 
     #[test]
     fn classify_provider_failure_marks_malformed_tool_calls_retryable() {
