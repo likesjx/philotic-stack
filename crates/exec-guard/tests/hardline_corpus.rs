@@ -82,6 +82,22 @@ fn protected_system_directories() {
 }
 
 #[test]
+fn protected_system_directories_trailing_slash() {
+    // Shell tab-completion appends a trailing slash (`rm -rf /etc<TAB>` ->
+    // `rm -rf /etc/`) — the floor must still trip on that form, not just the
+    // bare name or the explicit `/*` glob.
+    for dir in [
+        "/home", "/root", "/etc", "/usr", "/var", "/bin", "/sbin", "/boot", "/lib",
+    ] {
+        let cmd = format!("rm -rf {dir}/");
+        assert!(
+            detect_hardline(&cmd).is_some(),
+            "expected hardline match for protected dir with trailing slash: {cmd:?}"
+        );
+    }
+}
+
+#[test]
 fn tilde_home_delete() {
     assert!(detect_hardline("rm -rf ~").is_some());
     assert!(detect_hardline("rm -rf ~/").is_some());
@@ -124,6 +140,26 @@ fn sudo_env_exec_wrappers_do_not_hide_the_command() {
     assert!(detect_hardline("sudo shutdown -h now").is_some());
     assert!(detect_hardline("env FOO=bar reboot").is_some());
     assert!(detect_hardline("exec rm -rf /").is_some());
+}
+
+#[test]
+fn sudo_separate_token_value_flags_still_realign_on_the_command() {
+    // `-u root`, `--user root`, etc. take their value as a *separate* shell
+    // word (not `-uroot`/`--user=root`). Ordinary, non-obfuscated sudo
+    // invocations inside the stated threat model must still trip the floor.
+    assert!(detect_hardline("sudo -u root rm -rf /").is_some());
+    assert!(detect_hardline("sudo --user root reboot").is_some());
+    assert!(detect_hardline("sudo -g wheel rm -rf /").is_some());
+    assert!(detect_hardline("sudo --group wheel rm -rf /").is_some());
+    assert!(detect_hardline("sudo -U root rm -rf /").is_some());
+    assert!(detect_hardline("sudo -p prompt: rm -rf /").is_some());
+    assert!(detect_hardline("sudo -C 3 rm -rf /").is_some());
+    assert!(detect_hardline("sudo -h remotehost rm -rf /").is_some());
+    assert!(detect_hardline("sudo -D /tmp rm -rf /").is_some());
+    assert!(detect_hardline("sudo --chdir /tmp rm -rf /").is_some());
+    // Mixed with a value-less flag before/after the value-taking one.
+    assert!(detect_hardline("sudo -E -u root rm -rf /").is_some());
+    assert!(detect_hardline("sudo -u root -E rm -rf /").is_some());
 }
 
 #[test]

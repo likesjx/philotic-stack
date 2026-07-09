@@ -26,19 +26,35 @@
 /// followed by `sudo [flags]`, `env VAR=VAL...`, and/or `exec`/`nohup`/
 /// `setsid`/`time` wrapper words, so `sudo rm -rf /*` and
 /// `env FOO=bar exec reboot` are still caught at the real command.
+///
+/// The `sudo` flag consumer must handle two flag shapes: value-less flags
+/// (`-E`, `-n`, attached-value flags like `-uroot` or `--user=root`) which a
+/// bare `-[^\s]+\s+` token match covers, and flags that take their value as
+/// a *separate* token (`-u root`, `--user root`) — `-u`/`-g`/`-U`/`-p`/`-C`/
+/// `-h`/`-D` and their `--user`/`--group`/`--other-user`/`--prompt`/
+/// `--close-from`/`--host`/`--chdir` long forms. Without a dedicated
+/// alternative for the separate-token shape, the value token (`root`) isn't
+/// consumed by either branch and the match never realigns onto the real
+/// command word, so `sudo -u root rm -rf /` would silently bypass the floor.
 const CMDPOS: &str = concat!(
     r"(?:^|[;&|\n`]|\$\()",
     r"\s*",
-    r"(?:sudo\s+(?:-[^\s]+\s+)*)?",
+    r"(?:sudo\s+(?:(?:-[ugUpChD]|--(?:user|group|other-user|prompt|close-from|host|chdir))\s+\S+\s+|-[^\s]+\s+)*)?",
     r"(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)?",
     r"(?:(?:exec|nohup|setsid|time)\s+)*",
     r"\s*",
 );
 
 /// Protected system roots whose recursive deletion has no recovery path.
+///
+/// Each name accepts an optional trailing `/` or a trailing `/*` glob. The
+/// bare trailing slash matters in practice: shell tab-completion appends one
+/// (`rm -rf /etc<TAB>` becomes `rm -rf /etc/`), and without it here the `/`
+/// satisfies neither the bare-name branch nor [`hardline_rm_path`]'s `TAIL`
+/// terminator, letting `rm -rf /etc/` slip past the floor entirely.
 const HARDLINE_SYSTEM_DIRS: &str = concat!(
-    r"/home|/home/\*|/root|/root/\*|/etc|/etc/\*|/usr|/usr/\*|",
-    r"/var|/var/\*|/bin|/bin/\*|/sbin|/sbin/\*|/boot|/boot/\*|/lib|/lib/\*",
+    r"/home(?:/\*|/)?|/root(?:/\*|/)?|/etc(?:/\*|/)?|/usr(?:/\*|/)?|",
+    r"/var(?:/\*|/)?|/bin(?:/\*|/)?|/sbin(?:/\*|/)?|/boot(?:/\*|/)?|/lib(?:/\*|/)?",
 );
 
 /// Any root-anchored path whose components collapse back to `/` in the
