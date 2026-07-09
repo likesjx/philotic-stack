@@ -290,6 +290,7 @@ impl AgentRuntime {
                         turn_id,
                         NoResponseClass::WatchdogTimeout,
                         None,
+                        "The model did not respond before the turn timeout.".into(),
                     )
                     .await;
                 continue;
@@ -795,6 +796,7 @@ impl AgentRuntime {
                             turn_id,
                             NoResponseClass::ProviderFailure,
                             error_payload.provider.clone(),
+                            error_payload.message.clone(),
                         )
                         .await;
                 }
@@ -816,6 +818,7 @@ impl AgentRuntime {
                             turn_id,
                             NoResponseClass::ProviderContractFailure,
                             error_payload.provider.clone(),
+                            error_payload.message.clone(),
                         )
                         .await;
                 }
@@ -1724,13 +1727,35 @@ impl AgentRuntime {
     /// [`MAX_ORACLE_EXTRA_TIERS`] extra dispatches and disabled entirely by
     /// `PHILOTIC_DISABLE_ROUTING_ORACLE=1`. On `EvictTurn` (all tiers and
     /// oracle options exhausted) the turn is failed with a user-visible error.
+    ///
+    /// When the turn's `selection_source` is `OperatorExplicit` (session
+    /// pinned via `/model <tier>`), automatic escalation is refused entirely
+    /// — silently switching tiers would violate the operator's explicit
+    /// intent — and the turn fails fast via `fail_active_turn` with
+    /// `trigger_message` as the user-visible error. Unlike ladder/oracle
+    /// exhaustion, this path does not push a heal event: the pinned tier
+    /// failing is expected operator-directed behavior, not an outage worth
+    /// flagging for the self-heal queue.
     pub(super) async fn advance_turn_to_next_fallback_tier(
         &mut self,
         session_id: String,
         turn_id: String,
         class: NoResponseClass,
         failed_provider: Option<String>,
+        trigger_message: String,
     ) -> Result<()> {
+        let selection_source = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.selection_source)
+            .unwrap_or_default();
+        if selection_source == SelectionSource::OperatorExplicit {
+            return self
+                .fail_active_turn(session_id, turn_id, trigger_message)
+                .await;
+        }
+
         // Extract configured tiers before any mutable session borrow.
         let active_role_name: Option<String> = self
             .sessions
@@ -1880,6 +1905,7 @@ impl AgentRuntime {
                 }
                 turn.phase = TurnPhase::WaitingModel;
                 turn.iteration += 1;
+                turn.selection_source = SelectionSource::AutoFallback;
             }
 
             match state.build_reentry_context_envelope() {

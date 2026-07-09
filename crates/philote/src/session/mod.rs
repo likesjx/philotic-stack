@@ -284,6 +284,12 @@ pub struct SessionState {
     /// specialist's tightened/loosened budgets. Live-only — not persisted in the
     /// checkpoint, since settings are re-derived from `role_activation` on load.
     pub base_context_window: Option<ContextWindowPolicy>,
+    /// Operator-pinned model tier role (e.g. `"model.ollama"`), set via
+    /// `/model <tier>` and cleared via bare `/model`. When set, new turns are
+    /// tagged `SelectionSource::OperatorExplicit` (disabling automatic
+    /// fallback escalation) and dispatch is routed to this tier role at the
+    /// `resolve_model_execution_target` choke point.
+    pub pinned_tier_role: Option<String>,
 }
 
 impl SessionState {
@@ -326,6 +332,7 @@ impl SessionState {
             life_autorecall_degraded_logged: false,
             active_user_task_id: None,
             base_context_window: None,
+            pinned_tier_role: None,
         }
     }
 
@@ -3666,6 +3673,7 @@ impl SessionState {
                 "provider_repair_note": turn.provider_repair_note,
                 "provider_repair_attempts": turn.provider_repair_attempts,
                 "fallback_tier": turn.fallback_tier,
+                "selection_source": turn.selection_source,
                 "streaming_retry_attempts": turn.streaming_retry_attempts,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
@@ -3711,6 +3719,7 @@ impl SessionState {
             "parked_plan_turn": parked_plan_turn,
             "carryover_plan": self.carryover_plan,
             "active_user_task_id": self.active_user_task_id,
+            "pinned_tier_role": self.pinned_tier_role,
             "life_recall_cache": self.life_recall_cache,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
@@ -4048,6 +4057,10 @@ impl SessionState {
                 paracrine_chain_started_at: turn
                     .get("paracrine_chain_started_at")
                     .and_then(serde_json::Value::as_u64),
+                selection_source: turn
+                    .get("selection_source")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default(),
             })
         });
 
@@ -4130,6 +4143,10 @@ impl SessionState {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
             base_context_window: None,
+            pinned_tier_role: checkpoint
+                .get("pinned_tier_role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         })
     }
 }
@@ -5208,10 +5225,10 @@ mod tests {
         LifeRecallCacheEntry, MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope,
         MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, PlanStep,
         PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation,
-        SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, TurnRecord, VoiceDeliveryMode, VoiceResponsePolicy,
-        WorkingTurn, apply_life_recall_char_budget, default_tool_assembly_for_bindings,
-        merge_session_index, session_checkpoint_memory_type,
+        SelectionSource, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, TurnRecord,
+        VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn, apply_life_recall_char_budget,
+        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use crate::reflex::ReflexEvent;
@@ -5255,6 +5272,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         }
     }
 
@@ -5313,6 +5331,56 @@ mod tests {
 
         let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
         assert!(restored.carryover_plan.is_none());
+    }
+
+    #[test]
+    fn pinned_tier_role_round_trips_through_checkpoint() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.pinned_tier_role = Some("model.ollama".into());
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+
+        assert_eq!(restored.pinned_tier_role.as_deref(), Some("model.ollama"));
+    }
+
+    #[test]
+    fn checkpoint_without_pinned_tier_role_restores_none() {
+        // Simulate a checkpoint written before Slice 1: no pinned_tier_role key.
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut checkpoint = state.checkpoint_json();
+        checkpoint
+            .as_object_mut()
+            .expect("checkpoint is an object")
+            .remove("pinned_tier_role");
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert!(restored.pinned_tier_role.is_none());
+    }
+
+    #[test]
+    fn from_checkpoint_manual_active_turn_reconstruction_defaults_missing_selection_source() {
+        // The manual field-by-field WorkingTurn reconstruction in
+        // `from_checkpoint` (distinct from the derive-based
+        // `serde_json::from_value::<WorkingTurn>` path used for parked turns)
+        // must default a missing `selection_source` key to `ConfiguredDefault`
+        // rather than failing the whole checkpoint restore.
+        let checkpoint = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-jane-01",
+            "source": "telegram",
+            "active_turn": {
+                "turn_id": "turn-1",
+                "phase": "waiting_tool",
+            },
+        });
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        let turn = restored
+            .active_turn
+            .expect("active turn survives WaitingTool filter");
+        assert_eq!(turn.selection_source, SelectionSource::ConfiguredDefault);
     }
 
     #[test]
@@ -5382,6 +5450,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         let checkpoint = state.checkpoint_json();
@@ -5644,6 +5713,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         state.complete_active_turn("hi".into());
@@ -5697,6 +5767,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -6568,6 +6639,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         let projection = state.build_context_projection("status");
@@ -6664,6 +6736,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         let prompt = state.build_prompt("status");
@@ -6867,6 +6940,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -6954,6 +7028,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         let delegation = state.build_subagent_delegation(
@@ -7995,6 +8070,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -8055,6 +8131,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         state.push_tool_history(
@@ -8130,6 +8207,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         state.push_tool_history(
@@ -8206,6 +8284,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         let reentry = state
@@ -8497,6 +8576,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         let projection = state.build_context_projection("continue the memory work");
@@ -8837,6 +8917,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         }
     }
 
@@ -9058,12 +9139,19 @@ mod tests {
         );
         state.start_turn(make_plain_turn());
         // Same node id surfaced by all three strategies — inject once.
-        for strategy in ["re_entry_context", "open_loops_by_context", "current_prompt_semantic"] {
+        for strategy in [
+            "re_entry_context",
+            "open_loops_by_context",
+            "current_prompt_semantic",
+        ] {
             state.upsert_life_recall_cache(LifeRecallCacheEntry {
                 strategy: strategy.into(),
                 fetched_at: now - 10,
                 query_text: String::new(),
-                records: vec![life_record("life:shared", "renew passport before August trip")],
+                records: vec![life_record(
+                    "life:shared",
+                    "renew passport before August trip",
+                )],
             });
         }
 
@@ -9118,7 +9206,9 @@ mod tests {
         let memories = &state.active_turn.as_ref().unwrap().recalled_memories;
         assert_eq!(injected, memories.len());
         assert!(
-            memories.iter().any(|m| m.id.as_deref() == Some("life:semantic:1")),
+            memories
+                .iter()
+                .any(|m| m.id.as_deref() == Some("life:semantic:1")),
             "current_prompt_semantic must get a fair share of the char budget, not be starved: {:?}",
             memories.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
         );
@@ -9275,6 +9365,7 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         };
         state.start_turn(turn);
         state.push_tool_history(

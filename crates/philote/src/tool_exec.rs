@@ -855,6 +855,7 @@ impl AgentRuntime {
                 | SlashCommand::Abandon { .. }
                 | SlashCommand::Tts { .. }
                 | SlashCommand::Voice { .. }
+                | SlashCommand::Model { .. }
                 | SlashCommand::Correct { .. }
                 | SlashCommand::Plan { .. } => {}
             }
@@ -1081,6 +1082,7 @@ impl AgentRuntime {
             | SlashCommand::Abandon { .. }
             | SlashCommand::Tts { .. }
             | SlashCommand::Voice { .. }
+            | SlashCommand::Model { .. }
             | SlashCommand::Correct { .. }
             | SlashCommand::Plan { .. } => {}
         }

@@ -608,6 +608,27 @@ pub struct ParacrineThread {
     pub close_reason: Option<String>,
 }
 
+/// Where a turn's model tier/provider selection originated. Drives whether a
+/// no-response failure is allowed to escalate to the next fallback tier or
+/// must fail fast instead: an operator-pinned session (`/model <tier>`) means
+/// silent auto-fallback would violate the operator's explicit intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionSource {
+    /// The operator explicitly pinned this turn to a tier via `/model <tier>`.
+    /// Fallback escalation is disabled — a no-response failure fails the turn.
+    OperatorExplicit,
+    /// No pin or special routing in effect; the session's configured default
+    /// tier/provider was used.
+    #[default]
+    ConfiguredDefault,
+    /// The turn was triggered by a cron job (`InboundTaskPayload.cron_job_id`).
+    CronPrimary,
+    /// The turn's provider was chosen by automatic fallback escalation after
+    /// a prior tier failed.
+    AutoFallback,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
@@ -702,6 +723,11 @@ pub struct WorkingTurn {
     /// mid-`WaitingModel`).
     #[serde(default)]
     pub ladder_tier0_dispatched: bool,
+    /// Where this turn's tier/provider selection came from. `OperatorExplicit`
+    /// (session pinned via `/model <tier>`) disables automatic fallback
+    /// escalation on a no-response failure — see `advance_turn_to_next_fallback_tier`.
+    #[serde(default)]
+    pub selection_source: SelectionSource,
     /// Number of same-tier retries attempted for streaming_timeout errors.
     /// Allows one automatic retry before escalating to the next fallback tier.
     #[serde(default)]
@@ -1778,6 +1804,7 @@ mod paracrine_budget_tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         }
     }
 
@@ -1938,6 +1965,24 @@ mod paracrine_budget_tests {
             serde_json::from_value(json).expect("deserialize old checkpoint");
         assert_eq!(restored.paracrine_hop_count, 0);
         assert_eq!(restored.paracrine_chain_started_at, None);
+    }
+
+    #[test]
+    fn old_checkpoint_without_selection_source_deserializes_to_configured_default() {
+        // A checkpoint written before Slice 1 has no `selection_source` key at
+        // all; it must deserialize to `ConfiguredDefault`, not fail or panic.
+        let turn = sample_turn();
+        let mut json = serde_json::to_value(&turn).expect("serialize");
+        let obj = json.as_object_mut().expect("object");
+        obj.remove("selection_source");
+        assert!(!obj.contains_key("selection_source"));
+
+        let restored: WorkingTurn =
+            serde_json::from_value(json).expect("deserialize old checkpoint");
+        assert_eq!(
+            restored.selection_source,
+            SelectionSource::ConfiguredDefault
+        );
     }
 
     #[test]
