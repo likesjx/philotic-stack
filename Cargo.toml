@@ -29,5 +29,6 @@ members = [
     "crates/media-codec",
     "crates/perimeter-core",
     "crates/heal-dispatcher",
+    "crates/exec-guard",
 ]
 resolver = "2"
