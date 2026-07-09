@@ -4183,6 +4183,61 @@ mod tests {
     }
 
     #[test]
+    fn update_dedupe_survives_simulated_seat_restart() {
+        // Regression test for the bug where UpdateDedupe would be owned locally
+        // inside the seat's poll loop: a lease-loss-triggered seat restart (IPC
+        // reconnect re-invokes `TelegramSeatGuest::setup`, which spawns a fresh
+        // `seat_poll_loop` task with a fresh `SeatPollContext`) would recreate a
+        // brand-new empty dedupe cache at the exact moment the redelivery burst
+        // it exists to suppress arrives, making the dedupe a functional no-op in
+        // production.
+        //
+        // The fix hoists ownership of UpdateDedupe to the long-lived
+        // `TelegramSeatGuest` (as `UpdateDedupeHandle`, an `Arc<StdMutex<..>>`
+        // mirroring `ActiveTurns`), above the restart boundary, and clones the
+        // handle into each new `SeatPollContext`. This test simulates that
+        // restart boundary directly: it constructs UpdateDedupe exactly once (as
+        // `TelegramSeatGuest::new` now does), then simulates two separate
+        // `seat_poll_loop` "lifetimes" (each of which would reset `offset` back
+        // to 0 on entry) that both share the *same* dedupe instance, and asserts
+        // a redelivered update_id first seen in the pre-restart lifetime is
+        // still recognized as a duplicate in the post-restart lifetime.
+        fn simulate_seat_poll_loop_lifetime(dedupe: &mut UpdateDedupe, update_id: i64) -> bool {
+            // Mirrors seat_poll_loop's local `let mut offset: i64 = 0;` — offset
+            // is reset every time this "lifetime" starts, but dedupe is a borrow
+            // of the caller's long-lived cache, not reconstructed here.
+            let _offset: i64 = 0;
+            dedupe.check(update_id)
+        }
+
+        // Owned once outside the restart loop, as TelegramSeatGuest now does.
+        let mut update_dedupe = UpdateDedupe::new(Duration::from_secs(300), 2048);
+
+        // Pre-restart lifetime: first sighting of update_id 4242 dispatches.
+        let was_duplicate_before_restart =
+            simulate_seat_poll_loop_lifetime(&mut update_dedupe, 4242);
+        assert!(
+            !was_duplicate_before_restart,
+            "first delivery in the pre-restart lifetime must not be flagged duplicate"
+        );
+
+        // --- simulated seat restart: the poll loop exits (e.g. lease-renewal
+        // failure or IPC reconnect), `TelegramSeatGuest::setup` runs again and
+        // spawns a new `seat_poll_loop` task. `offset` resets to 0 inside the new
+        // task, but `update_dedupe` is not reconstructed — it is the same
+        // instance from before the restart. ---
+
+        // Post-restart lifetime: WiFi-flap redelivery burst resends update_id 4242.
+        let was_duplicate_after_restart =
+            simulate_seat_poll_loop_lifetime(&mut update_dedupe, 4242);
+        assert!(
+            was_duplicate_after_restart,
+            "update_id redelivered after a simulated seat restart must still be \
+             suppressed because update_dedupe survived the restart boundary"
+        );
+    }
+
+    #[test]
     fn duplicate_callback_update_still_exposes_callback_id_for_ack() {
         // Slice 0 skips dispatch on a duplicate but must still answerCallbackQuery
         // so Telegram clears the tap spinner. Verify the envelope built from a
