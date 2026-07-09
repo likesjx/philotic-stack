@@ -137,36 +137,53 @@ fn init_logging() {
     let retention_days =
         resolve_retention_days(std::env::var("PHILOTIC_LOG_RETENTION_DAYS").ok().as_deref());
 
-    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    // A logging-setup failure must NEVER crash the hotel. If the rolling file
+    // appender can't be built (e.g. a read-only or unwritable log dir under a
+    // hardened systemd unit), fall back to stdout logging and keep running.
+    match tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("aiua")
         .filename_suffix("log")
         .max_log_files(retention_days)
         .build(&log_dir)
-        .expect("failed to build rolling log appender");
+    {
+        Ok(appender) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+            // The WorkerGuard must live for the whole process or the background
+            // writer stops flushing. Leak it intentionally.
+            Box::leak(Box::new(guard));
 
-    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-    // The WorkerGuard must live for the whole process or the background writer
-    // stops flushing. Leak it intentionally.
-    Box::leak(Box::new(guard));
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(non_blocking),
+                )
+                .init();
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            tracing::info!(
+                log_dir = %log_dir.display(),
+                retention_days,
+                "aiua logging initialized (daily rolling file appender)"
+            );
+        }
+        Err(err) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer())
+                .init();
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(non_blocking),
-        )
-        .init();
-
-    tracing::info!(
-        log_dir = %log_dir.display(),
-        retention_days,
-        "aiua logging initialized (daily rolling file appender)"
-    );
+            tracing::warn!(
+                log_dir = %log_dir.display(),
+                error = %err,
+                "rolling log appender unavailable; falling back to stdout logging (set PHILOTIC_LOG_DIR to a writable path to restore file logs)"
+            );
+        }
+    }
 }
 
 fn agent_graph_db_path(agent_id: &str) -> Option<String> {
