@@ -1762,13 +1762,45 @@ impl AgentRuntime {
             DEFAULT_FALLBACK_TIERS.len().saturating_sub(1) as u8
         };
 
+        // Off-by-one fix: `fallback_tier` starts at 0 for every turn regardless
+        // of whether the *primary* dispatch actually came from the configured
+        // ladder (see `resolve_model_execution_target`'s precedence — a hotel
+        // route or explicit binding can win over the ladder). If tier 0 was
+        // never dispatched from the ladder, the walk must start at tiers[0] on
+        // failure, not tiers[1] — otherwise a single-tier ladder is never
+        // reachable at all. `None` here means "the ladder hasn't been
+        // consulted yet"; `next_ladder_tier` then starts the walk at 0.
+        //
+        // `primary_dispatch_used_ladder` is a stateless re-derivation from
+        // session config — it can't tell "virgin primary" apart from "tier 0
+        // was already (re-)dispatched via this same bypass path on a prior
+        // failure" (both look like `current_tier == 0` with the primary
+        // bypassing the ladder). `ladder_tier0_dispatched` is the per-turn
+        // memory that breaks that tie, so a second/third/... failure on the
+        // same turn advances past tier 0 instead of re-dispatching it forever.
+        let ladder_tier0_already_dispatched = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.ladder_tier0_dispatched)
+            .unwrap_or(false);
+        let last_ladder_tier: Option<u8> = if !configured_tiers.is_empty()
+            && current_tier == 0
+            && !ladder_tier0_already_dispatched
+            && !primary_dispatch_used_ladder(self.sessions.get(&session_id), "text.generate")
+        {
+            None
+        } else {
+            Some(current_tier)
+        };
+
         // On a contract failure the failed provider's remaining ladder tiers
         // are skipped — the same request fails identically there. The skip can
         // exhaust the ladder early, which then falls to the oracle as usual.
         let skip_failed_provider = class == NoResponseClass::ProviderContractFailure;
         let ladder_next = next_ladder_tier(
             &configured_tiers,
-            current_tier,
+            last_ladder_tier,
             max_tier,
             failed_provider.as_deref(),
             skip_failed_provider,
@@ -1817,7 +1849,8 @@ impl AgentRuntime {
         // Oracle dispatches count tiers linearly (current + 1) so the
         // MAX_ORACLE_EXTRA_TIERS budget stays exact; ladder dispatches land on
         // the (possibly skip-advanced) next live tier.
-        let next_tier = if oracle_role.is_some() {
+        let is_oracle_dispatch = oracle_role.is_some();
+        let next_tier = if is_oracle_dispatch {
             current_tier.saturating_add(1)
         } else {
             ladder_next
@@ -1833,6 +1866,14 @@ impl AgentRuntime {
 
             if let Some(turn) = state.active_turn.as_mut() {
                 turn.fallback_tier = next_tier;
+                // Mark the ladder as engaged whenever a real ladder tier (not
+                // an oracle role) was dispatched, so a later failure on this
+                // same turn advances the walk instead of re-deriving the same
+                // "bypassed" verdict from static session config and getting
+                // stuck re-dispatching tier 0.
+                if !is_oracle_dispatch {
+                    turn.ladder_tier0_dispatched = true;
+                }
                 turn.phase = TurnPhase::WaitingModel;
                 turn.iteration += 1;
             }

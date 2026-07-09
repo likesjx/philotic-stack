@@ -681,6 +681,19 @@ pub struct WorkingTurn {
     /// Incremented each time the loop escalates to a lower-tier provider.
     #[serde(default)]
     pub fallback_tier: u8,
+    /// True once a configured role ladder tier has actually been *dispatched*
+    /// as a fallback escalation (as opposed to `fallback_tier == 0` meaning
+    /// "primary dispatch, ladder never consulted"). `fallback_tier == 0` is
+    /// ambiguous on its own — it means both "virgin primary" and "ladder
+    /// tier 0 was just (re-)dispatched after the primary bypassed the
+    /// ladder" (see `resolve_model_execution_target`'s precedence). This flag
+    /// disambiguates the two so `advance_turn_to_next_fallback_tier`'s walk
+    /// advances past tier 0 instead of re-dispatching it forever. Always
+    /// `false` for a fresh turn; never restored across a restart (only
+    /// `WaitingTool` turns survive checkpoint restore, and this only matters
+    /// mid-`WaitingModel`).
+    #[serde(default)]
+    pub ladder_tier0_dispatched: bool,
     /// Number of same-tier retries attempted for streaming_timeout errors.
     /// Allows one automatic retry before escalating to the next fallback tier.
     #[serde(default)]
@@ -1670,6 +1683,7 @@ mod paracrine_budget_tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            ladder_tier0_dispatched: false,
             streaming_retry_attempts: 0,
             streamed_content: String::new(),
             paracrine_hop_count: 0,
