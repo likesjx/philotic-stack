@@ -3862,6 +3862,12 @@ impl AgentRuntime {
                     next_fire_at: next_fire,
                     created_at: now_ms,
                     created_by: CronJobSource::Guest(self.agent_id.clone()),
+                    silent_ok: false,
+                    // Newly registered jobs always want isolated cron sessions;
+                    // the `RegisterCronJob` IPC handler re-asserts this
+                    // regardless, but setting it here too keeps the
+                    // constructed value honest.
+                    session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
                 };
                 let job_id = job.id.clone();
 

@@ -3621,6 +3621,11 @@ async fn handle_cron_create(
         next_fire_at: now_ms,
         created_at: now_ms,
         created_by: CronJobSource::Operator,
+        silent_ok: false,
+        // Newly registered jobs always want isolated cron sessions; the
+        // `RegisterCronJob` IPC handler re-asserts this regardless, but
+        // setting it here too keeps the constructed value honest.
+        session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
     };
     match ipc_register_cron_job(&state.socket, job.clone()).await {
         Ok(()) => {

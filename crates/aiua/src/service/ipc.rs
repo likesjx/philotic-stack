@@ -6931,6 +6931,14 @@ impl IpcServer {
             // ── Cron scheduler ──────────────────────────────────────────────
             IpcRequest::RegisterCronJob { mut job } => {
                 Self::normalize_cron_target_role(graph, &mut job);
+                // New job registrations always get an isolated `cron:<job_id>`
+                // session — `session_target` only defaults to `Main` via serde
+                // when deserializing legacy rows straight from storage
+                // (`default_session_target_legacy`). Registration is the only
+                // path that mints brand-new jobs, so it is safe to force
+                // `Isolated` here unconditionally; existing rows loaded from
+                // the graph never pass through this handler again.
+                job.session_target = ansible_mesh_core::cron::CronSessionTarget::Isolated;
                 info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
                 match graph.upsert_cron_job(&job) {
                     Ok(_) => {

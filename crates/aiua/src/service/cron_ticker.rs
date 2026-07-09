@@ -473,6 +473,22 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Overrides `task["session_id"]` for `CronSessionTarget::Isolated` jobs so
+/// the fire lands in its own `cron:<job_id>` session instead of whatever
+/// (if anything) the payload named. Philote checkpoints its rolling turn
+/// window under `short_session:{session_id}`, so a shared session id would
+/// let a cron fire evict real conversational turns — the Beacon Chronos
+/// context-pollution incident (2026-07-02) this proposal closes. `Main`
+/// jobs (the legacy marker) leave any payload-supplied `session_id`
+/// untouched, preserving today's behavior.
+fn apply_cron_session_routing(mut task: serde_json::Value, job: &CronJob) -> serde_json::Value {
+    if job.session_target == ansible_mesh_core::cron::CronSessionTarget::Isolated {
+        task["session_id"] =
+            serde_json::Value::String(ansible_mesh_core::cron::cron_session_id(&job.id));
+    }
+    task
+}
+
 fn build_cron_task_json(
     job: &CronJob,
     fire_epoch: u64,
@@ -480,13 +496,13 @@ fn build_cron_task_json(
     payload_data: String,
 ) -> String {
     let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(&payload_data) else {
-        return serde_json::json!({
+        let task = serde_json::json!({
             "cron_job_id": job.id,
             "target_role": job.target_role,
             "fire_epoch": fire_epoch,
             "payload": payload_data,
-        })
-        .to_string();
+        });
+        return apply_cron_session_routing(task, job).to_string();
     };
 
     let Some(signal_seed) = payload_json.get("paracrine_signal") else {
@@ -512,7 +528,7 @@ fn build_cron_task_json(
                 obj[key] = v.clone();
             }
         }
-        return obj.to_string();
+        return apply_cron_session_routing(obj, job).to_string();
     };
 
     let mut signal = signal_seed
@@ -553,7 +569,7 @@ fn build_cron_task_json(
         .entry("subject_refs")
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
 
-    serde_json::json!({
+    let task = serde_json::json!({
         "action": "paracrine_signal",
         "source": "cron-ticker",
         "transport": "cron",
@@ -562,8 +578,8 @@ fn build_cron_task_json(
         "fire_epoch": fire_epoch,
         "payload": payload_json,
         "paracrine_signal": serde_json::Value::Object(signal),
-    })
-    .to_string()
+    });
+    apply_cron_session_routing(task, job).to_string()
 }
 
 #[cfg(test)]
@@ -584,6 +600,8 @@ mod tests {
             next_fire_at: 1_000,
             created_at: 900,
             created_by: CronJobSource::Operator,
+            silent_ok: false,
+            session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
         }
     }
 
@@ -666,6 +684,90 @@ mod tests {
         assert_eq!(value["paracrine_signal"]["cadence"], "0 */15 * * * * *");
         assert_eq!(value["paracrine_signal"]["observed_at"], 1_234);
         assert_eq!(value["paracrine_signal"]["policy_tags"][0], "observe_only");
+    }
+
+    fn isolated_job() -> CronJob {
+        let mut job = test_job();
+        job.session_target = ansible_mesh_core::cron::CronSessionTarget::Isolated;
+        job
+    }
+
+    #[test]
+    fn isolated_session_target_overrides_payload_session_id_on_legacy_branch() {
+        let task = build_cron_task_json(
+            &isolated_job(),
+            1_234,
+            "vps-jane-aiua-01",
+            r#"{"message":"Good evening — time for your check-in","source":"telegram","chat_id":7898847424,"session_id":"telegram:7898847424:agent-beacon"}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+
+        assert_eq!(
+            value["session_id"], "cron:job-1",
+            "Isolated jobs must never inherit a payload-supplied session_id"
+        );
+        // Everything else about the legacy branch is unchanged.
+        assert_eq!(value["content"], "Good evening — time for your check-in");
+        assert_eq!(value["source"], "telegram");
+    }
+
+    #[test]
+    fn isolated_session_target_sets_session_id_when_payload_has_none() {
+        let task = build_cron_task_json(
+            &isolated_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{"hello":"world"}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+        assert_eq!(value["session_id"], "cron:job-1");
+    }
+
+    #[test]
+    fn isolated_session_target_sets_session_id_on_paracrine_branch() {
+        let task = build_cron_task_json(
+            &isolated_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{
+                "paracrine_signal": {
+                    "signal_type": "life_graph.attention_scan",
+                    "scope": "life_graph",
+                    "policy_tags": ["observe_only"]
+                },
+                "payload_summary": "scan open loops"
+            }"#
+            .into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+        assert_eq!(value["session_id"], "cron:job-1");
+    }
+
+    #[test]
+    fn isolated_session_target_sets_session_id_on_malformed_payload_branch() {
+        let task = build_cron_task_json(
+            &isolated_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            "not json".into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+        assert_eq!(value["session_id"], "cron:job-1");
+    }
+
+    #[test]
+    fn main_session_target_never_injects_session_id_when_payload_has_none() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "mac-jane-aiua-01",
+            r#"{"hello":"world"}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+        assert!(
+            value.get("session_id").is_none(),
+            "Main jobs must not gain a session_id that wasn't in the payload"
+        );
     }
 
     #[tokio::test]
