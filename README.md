@@ -40,7 +40,7 @@ Binaries are built to `target/release/`. A full release build emits ~24 binaries
 | `membrane-mcp` | MCP gateway |
 | `membrane` | MembraneRuntime SDK library (no binary; consumed by the gateway guests) |
 | `model-router` | LLM inference routing |
-| `model-controller-*` | Per-provider model controllers (gemini, elevenlabs, openai, openrouter, mlx, ollama, onnx, parakeet, vision) |
+| `model-controller-*` | Per-provider model controllers (gemini, elevenlabs, openai, openrouter, anthropic, mlx, ollama, onnx, parakeet, vision) |
 | `tool-runner` | Sandboxed tool execution |
 | `graph-datasource` / `table-datasource` / `agent-datasource` | Graph and table datasource guests |
 | `life-graph-runner` | LifeGraph / MemGraphRAG runner (from `data-memorygraphrag`) |
@@ -82,7 +82,7 @@ aiua --load-config mesh-config.json
 
 ## Crates
 
-30 crates live under [`crates/`](crates/): 28 workspace members, `philotic-primitives-mesh` (consumed by `ansible-mesh-core` as a path dependency; the other five primitives stubs were empty scaffolds and were folded back and deleted 2026-07-06, alongside the retired `graph-runner` crate), and `agent-graph-runner` (superseded by `agent-datasource`, directory deletion pending).
+31 crates live under [`crates/`](crates/): 29 workspace members, `philotic-primitives-mesh` (not an explicit workspace member but pulled into the build as a path dependency of `ansible-mesh-core` — 30 buildable packages total; the other five primitives stubs were empty scaffolds and were folded back and deleted 2026-07-06, alongside the retired `graph-runner` crate), and `agent-graph-runner` (dead — no `Cargo.toml`, not part of the build; superseded by `agent-datasource`, directory deletion pending).
 
 ### Binaries
 
@@ -110,6 +110,7 @@ aiua --load-config mesh-config.json
 | [`ansible-mesh-core`](crates/ansible-mesh-core/) | Shared core library — storage traits, `GraphDomain`, mesh types (only mesh primitives were extracted; the wider primitives split was folded back 2026-07-06) |
 | [`philotic-primitives-mesh`](crates/philotic-primitives-mesh/) | Mesh primitives (EventEnvelope, BeaconMessage, etc.) — the only primitives crate; the six-crate split was folded back (2026-07-06) |
 | [`philotic-client`](crates/philotic-client/) | Guest SDK — IPC client for hotel communication |
+| [`philotic-edge-protocol`](crates/philotic-edge-protocol/) | Wire types for the edge-mesh client-server protocol (edge clients, e.g. the Apple app, <-> hotel termination) |
 | [`memory-core`](crates/memory-core/) | MemoryEngine trait, CognitiveEngine, Muninn integration |
 | [`philotic-graph`](crates/philotic-graph/) | Core graph intelligence and SVE tooling |
 | [`datasource`](crates/datasource/) | SQLite partition and datasource management |

@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-05
+last_updated: 2026-07-08
 tags:
 - source-of-truth
 - current-state
@@ -44,7 +44,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-07-05
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-07-08
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -62,7 +62,7 @@ This is not the place for full design arguments. For those, follow the linked pr
 
 - `Implemented` means there is code and test evidence in the repo today.
 - `Transitional` means the shape is real enough to rely on for the current slice, but it is not presented as final architecture.
-- `Active` means the seam is currently hot based on [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md), active proposals, and the observed worktree on 2026-03-12.
+- `Active` means the seam is currently hot based on [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md), active proposals, and the observed worktree on 2026-07-08.
 - `Graph canonical` means the authoritative state now lives in the SQLite graph; update the graph first and let writeback refresh this file.
 - when convenience docs disagree on concrete transport details, current code and [docs/README.md](/Users/jaredlikes/code/philotic-stack/docs/README.md) win over stale crate-level prose.
 
@@ -74,7 +74,7 @@ Philotic currently operates as a hotel-centered runtime:
 - `membrane-telegram`, `philote`, `model-router`, and `tool-runner` are separate guest-facing binaries with explicit runtime boundaries.
 - local guest-to-hotel IPC currently runs over Unix domain sockets, driven by `PHILOTIC_HOTEL_SOCKET`; default paths include `/tmp/philotic-aiua.sock` for generic local clients and hotel-specific socket paths such as `/tmp/philotic-<hotel>.sock` when `aiua` materializes a named hotel.
 - canonical session state now lives in the context graph, while apartment-style checkpoints remain derived recovery projections rather than a competing source of truth.
-- Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception; `membrane-telegram` is a first-class provider binary driven by the shared MembraneRuntime SDK and LeaseDriver (PR #119) — no longer a wrapper-extraction situation — while the bare `membrane` binary lingers only as a transitional compatibility entry point over the same runtime.
+- Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception; `membrane-telegram` is a first-class provider binary driven by the shared MembraneRuntime SDK and LeaseDriver (PR #119) — no longer a wrapper-extraction situation; the `membrane` binary itself is retired (PR #136, `codex/membrane-binary-retire`) and `crates/membrane` is now lib-only, consumed as the shared SDK by `membrane-telegram`/`membrane-discord`/`membrane-mcp` rather than shipping its own compatibility entry point.
 - local and remote execution routing both exist, but several placement, delegation, and admin/control-plane seams are still under active development.
 - `phil` now owns the launchd service lifecycle surface for `aiua` on macOS through `phil service install`, `start`, `stop`, `restart`, `uninstall`, and `status`; interactive onboarding can optionally hand off to service install immediately after config generation and now captures the agent workspace/import path plus initial skillset for runner setup.
 - the primitives split was folded back (decision 2026-07-06): `philotic-primitives-mesh` is the only primitives crate, consumed by `ansible-mesh-core` as a path dependency. The other five crates (`philotic-primitives-agent`, `-data`, `-hotel`, `-model`, `-tool`) were empty `cargo new` scaffolds with zero reverse dependencies and were deleted from the tree; the six-crate extraction described in earlier proposals is no longer the plan of record. `ansible-mesh-core` remains the real shared library, not a compatibility shim. `model-router` does own the `model_manager` runtime wiring.
@@ -84,6 +84,10 @@ Philotic currently operates as a hotel-centered runtime:
 - the long-running desktop server direction is now explicit: `vps-jane` may host a durable operator ingress, and the first hotel-auth bootstrap/session slice is now real in `philotic-web`: startup bootstrap token, persisted operator session record, desktop-shell-first delivery, System Settings-owned bootstrap UX, explicit logout, a first shell-level lock gate that blocks non-settings workspace apps until the hotel issues an operator session, a real `root_user_key_refs` projection seeded from the current hotel-local vault key source with non-secret fingerprint metadata, a first persisted `operator_auth_challenges` seam for hotel-owned single-use auth ceremony records, a first OIDC start/callback path that issues hotel-owned operator sessions on successful provider login, the first hotel-config-backed OIDC settings path (public base URL + provider client IDs in config; provider secrets via vault-backed `*_secret_ref` config entries, with env fallback still transitional), an explicit policy that request-header-derived loopback membranes should use bootstrap/back-door auth by default instead of silent localhost OIDC, the first persisted `external_identity_links` seam keyed by provider subject so the hotel starts retaining a real local user graph instead of only a provider-shaped display name, the first graph-backed `ProjectedUserIdentityRecord` seam so that provider-backed logins produce a stable mesh-facing `principal_id` instead of a hotel-only root-user shape, the first explicit cross-hotel propagation path for that ghost mirror through durable `ProjectedUserIdentitySync` mesh events rather than pretending the whole graph already seeps around automatically, the first local-first resolution step that lets onboarding/OIDC adopt an already-propagated principal by exact provider subject or unique verified email alias instead of making every hotel rediscover the same human from scratch, a first bounded `GET/PATCH /api/auth/user` read/write surface for local-first operator identity enrichment, a first wired desktop `User Settings` panel inside `System Settings > Aiua Membrane` that now authors the canonical hotel-owned user record instead of leaving that seam trapped behind backend-only correctness, and now a first bounded philote-visible user context projection over IPC so cognition gets timezone plus stable operator identity summary without touching sessions, challenges, or vault-backed secret state directly. The canonical public OIDC ingress for `vps-jane` should be `brain.jaredlikes.com`, not the older `desktop.jaredlikes.com` placeholder.
 - operator auth bootstrap strategy is now explicit: OIDC is the preferred primary login path, membrane-assisted single-use challenges are the preferred step-up/recovery path, and passkeys are the next stronger factor rather than the first escape hatch from bootstrap-token adolescence.
 - the desktop workspace substrate is now explicitly documented: `System Settings` is the home for environment/auth/bootstrap surfaces, while Aiua/mesh/agent/component/catalog windows are workspace apps, coordinated through the desktop event bus and managers rather than ad hoc DOM glue.
+- Autopoiesis (`AUTOPOIESIS_PROPOSAL.md`) has a first concrete substrate: the graph-backed `AutonomyGrant` per-lane posture/budget/audit primitive (Slice A1, PR #156) is real, and three lanes are wired on top of it — `graph.bridge_edges` turns retrieval-feedback `SafeAutoUpdate` patches into applied Memgraph edges (Slice A2, PR #163), `fleet.heal_slices` files an intel-graph proposal when heal-dispatcher sees a recurring failure pattern breach threshold (Slice A3, PR #161), and `steward.active_checkins` gates the attention steward's active check-ins behind a confirmed-SIL-entry counter (Slice A5, PR #165). Slice A4 (`aria-architect-charter`) and A6 (`scheduled-slice-executor`) have not been started; A7 (`skills.register_learned`) and A8 (`team.evolve`) exist only as proposal-doc additions (PR #181, docs-only) with no lane code yet — do not read "autopoiesis A1-A8" as shipped.
+- LifeGraph now has a live read+write loop rather than write-only ingestion: `philote` auto-recalls cached LifeGraph context into turn prefetch (PR #152), auto-captures turn outcomes back into the graph (PR #168), retrieval carries Muninn-sourced provenance edges (PR #149) and cross-domain/role-ranked/read-expanded retrieval (PRs #153, #154, #157, #159) with a calibrated recall-confidence threshold (PR #160).
+- Model routing gained a health-aware oracle beneath the static fallback ladders (`model_oracle`, PR #167) and the model-controller fleet now includes a native `model-controller-anthropic` guest and `AnthropicProvider` (PR #166, "full model suite") alongside the existing gemini/elevenlabs/openai/openrouter/mlx/ollama/onnx/parakeet/vision controllers; provider key configuration for Anthropic is wired through the same vault-backed `provider_keys` path as the others but is not yet populated on any deployed hotel.
+- Turn-level failures (provider errors, watchdog evictions, fallback-ladder exhaustion) now flow into the self-heal queue instead of terminating silently (PR #173), and repeated 4xx responses from a provider now escalate to the next fallback tier instead of retrying the same dead provider (PR #176).
 
 ## Implemented Foundations
 
@@ -118,7 +122,7 @@ Primary references:
 - slash commands are short-circuited before the normal model path
 - Telegram poll leases are hotel-owned, renewed, fenced, explicitly released on graceful shutdown, and can be delegated to named remote hotels as a transitional contract
 - poll authority is anchored to the agent's home hotel rather than the current routed role
-- `membrane-telegram` is the Telegram provider binary and runs on the shared MembraneRuntime SDK + LeaseDriver (PR #119); `crates/membrane` now serves primarily as that SDK library, with its own binary kept only for transitional compatibility
+- `membrane-telegram` is the Telegram provider binary and runs on the shared MembraneRuntime SDK + LeaseDriver (PR #119); `crates/membrane` is lib-only (its own binary was retired in PR #136) and serves solely as the shared SDK consumed by `membrane-telegram`, `membrane-discord`, and `membrane-mcp`
 
 Primary references:
 - [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md)
@@ -204,7 +208,7 @@ These are accepted proposals not yet in implementation:
 
 ## Active Work Right Now
 
-These are the most clearly active seams as of 2026-03-13:
+These are the most clearly active seams as of 2026-07-08:
 
 | Seam | Current truth | Next pressure |
 | --- | --- | --- |
@@ -218,6 +222,8 @@ These are the most clearly active seams as of 2026-03-13:
 | Mesh-visible state placement | current local authorities mostly live in hotel runtime state, SQLite, or file-backed records; shared criteria for what becomes mesh-visible are now being defined explicitly | classify current state families and stop solving each cross-hotel visibility seam with a bespoke projection ritual |
 | Role incarnation model | `RoleIncarnationRecord`, `TurnLoopConfig`, `ConfigureRole` IPC action, session `active_incarnation_id`, inbound agent-task routing to the active incarnation, orchestrator fallback for missing active guests, a first parked-delivery/on-demand materialization path for configured inbound roles, basic `HandoffToRole` / `HandoffBack` IPC, `/role <name>` + `/back` + `/roles` operator surfaces, first `abstract_skill` graph scaffolding, a compatibility-first typed `role_activation` object through hotel snapshot -> `philote` session state -> context projection, a first richer same-identity handoff packet through the existing `HandoffBundle` path, and a compatibility-first `SubagentDelegation` / `SpawnSubagent` wire contract with explicit not-yet-implemented hotel rejection now exist; current design direction prefers shared-self role context shifts by default and delegated subagents for parallel labor, while worker lifecycle, role governance, and skill-layer behavior remain incomplete | expand `RoleActivation`, formalize workflow-owned handoff/delegation assembly rules, implement real `SpawnSubagent` execution and result routing, and only then decide where concurrent role materialization is genuinely warranted |
 | Tool execution envelope | catalog-backed tools and approval policy exist | extend structured error behavior across more routed components instead of falling back to ad hoc strings |
+| Autopoiesis / earned autonomy | the `AutonomyGrant` per-lane posture/budget/audit substrate is real (Slice A1, PR #156), with three lanes wired on top: `graph.bridge_edges` (A2, PR #163), `fleet.heal_slices` (A3, PR #161), and `steward.active_checkins` (A5, PR #165) | A4 `aria-architect-charter` and A6 `scheduled-slice-executor` are unstarted; A7/A8 exist only as proposal-doc slices (PR #181) with no lane implementation yet |
+| LifeGraph retrieval and self-heal loops | read+write loop is live end to end: auto-recall into turn prefetch (PR #152), auto-capture of turn outcomes (PR #168), Muninn provenance edges (PR #149), cross-domain/role-ranked/read-expanded retrieval (PRs #153/#154/#157/#159) with a calibrated recall threshold (PR #160); turn-level failures now feed the self-heal queue (PR #173) and repeated provider 4xx escalates fallback tiers (PR #176); routing now has a health-aware oracle beneath the static ladders (PR #167) and a native Anthropic model controller (PR #166, key not yet provisioned) | prove live feedback smoke beyond test-green, and provision the Anthropic provider key on at least one deployed hotel |
 | Perimeter egress control | proposal exists and the lack of a unified egress plane is explicitly called out | define the first policy object and classify current egress exceptions |
 | Deployment hardening | VPS boundary and peer rendering contract are defined | remove plaintext secret assumptions and prove real VPS smokes |
 
