@@ -18,6 +18,84 @@ pub enum CronJobSource {
     Guest(String),
 }
 
+/// Session routing for a cron job's fires.
+///
+/// This type deliberately has **no** derived `Default`. A single shared
+/// default would have to serve two different callers with opposite needs:
+/// rows deserialized from storage (which must default to `Main` so existing
+/// live jobs — Chronos, gemini-400-watch — keep today's routing) and
+/// brand-new registrations (which want `Isolated`). See
+/// `default_session_target_legacy` and `CronJob::session_target`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CronSessionTarget {
+    /// Legacy behavior: honor whatever `session_id` (if any) is present in
+    /// the job's `payload`, same as before `session_target` existed. This is
+    /// the migration marker for rows stored before this field was added.
+    Main,
+    /// Force delivery into a dedicated `cron:<job_id>` session so a cron
+    /// fire's turns never share — and therefore never evict — a
+    /// conversational apartment's rolling turn window (Beacon Chronos
+    /// context-pollution incident, 2026-07-02). Newly registered jobs get
+    /// this explicitly at the `RegisterCronJob` IPC handler, not via a type
+    /// default.
+    Isolated,
+}
+
+/// `#[serde(default = ...)]` for `CronJob::session_target`. Rows stored
+/// before this field existed must deserialize to `Main`, not `Isolated`, or
+/// a live job would silently flip session routing on the next hotel
+/// restart — exactly the migration hazard this field exists to prevent.
+fn default_session_target_legacy() -> CronSessionTarget {
+    CronSessionTarget::Main
+}
+
+/// The `cron:<job_id>` session id used for `CronSessionTarget::Isolated`
+/// fires. Philote checkpoints its rolling turn window under
+/// `short_session:{session_id}`, so this gives every isolated cron job its
+/// own bounded apartment window, separate from any conversational session.
+pub fn cron_session_id(job_id: &str) -> String {
+    format!("cron:{job_id}")
+}
+
+/// Tokens recognized by [`is_silent_cron_reply`], mirroring Hermes'
+/// `_CRON_SILENCE_TOKENS`. Bracketless variants are tolerated because models
+/// sometimes drop the brackets.
+const SILENT_TOKENS: [&str; 4] = ["[SILENT]", "SILENT", "[NO_REPLY]", "NO_REPLY"];
+
+/// True when `reply` is a silence ack per the Hermes `[SILENT]` convention:
+/// the token occupies the whole response, or stands alone on the first or
+/// last non-empty line (case-insensitive, surrounding whitespace ignored).
+/// A token that only appears mid-prose does NOT count as an ack — the reply
+/// must still be delivered.
+///
+/// This only matches the token shape; callers are responsible for checking
+/// the firing job's `silent_ok` flag before suppressing delivery.
+pub fn is_silent_cron_reply(reply: &str) -> bool {
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let is_token = |line: &str| {
+        let line = line.trim();
+        SILENT_TOKENS.iter().any(|t| line.eq_ignore_ascii_case(t))
+    };
+    if is_token(trimmed) {
+        return true;
+    }
+    if let Some(first) = trimmed.lines().find(|l| !l.trim().is_empty()) {
+        if is_token(first) {
+            return true;
+        }
+    }
+    if let Some(last) = trimmed.lines().rev().find(|l| !l.trim().is_empty()) {
+        if is_token(last) {
+            return true;
+        }
+    }
+    false
+}
+
 /// A scheduled envelope record stored in the hotel's Context Graph.
 ///
 /// When `next_fire_at + cron_offset_ms <= now`, the `CronTicker` materialises
@@ -59,6 +137,23 @@ pub struct CronJob {
 
     /// Who registered this job.
     pub created_by: CronJobSource,
+
+    /// Silent-ack policy: when true, a reply matching the Hermes `[SILENT]`
+    /// convention (see [`is_silent_cron_reply`]) is suppressed — never
+    /// delivered to the operator channel. Defaults false so existing jobs
+    /// and rows without this field keep delivering every fire. Wired into
+    /// `aiua`'s `EmitTask` handler (`silent_cron_reply_suppressed`), which
+    /// checks this flag against the isolated `cron:<job_id>` session's
+    /// `send_reply` content before it reaches any subscriber.
+    #[serde(default)]
+    pub silent_ok: bool,
+
+    /// Session routing for this job's fires. Defaults to `Main` on
+    /// deserialize — see `default_session_target_legacy` for why this must
+    /// NOT default to `Isolated`. New job registrations get `Isolated`
+    /// explicitly at `IpcRequest::RegisterCronJob`, not via this default.
+    #[serde(default = "default_session_target_legacy")]
+    pub session_target: CronSessionTarget,
 }
 
 /// Variables available for payload template interpolation at fire time.
@@ -302,5 +397,90 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("signal_type is required"));
+    }
+
+    fn base_job_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "job-1",
+            "schedule": "0 */15 * * * * *",
+            "target_role": "attention-steward",
+            "target_node_id": null,
+            "payload": "{}",
+            "guaranteed": false,
+            "enabled": true,
+            "last_fired_epoch": null,
+            "next_fire_at": 1_000,
+            "created_at": 900,
+            "created_by": "operator",
+        })
+    }
+
+    #[test]
+    fn legacy_row_without_session_target_field_deserializes_to_main() {
+        // Rows written before `session_target` existed have no such key.
+        // They MUST default to `Main`, not `Isolated`, or a live job (e.g.
+        // Beacon's daily Chronos heartbeat) would silently flip session
+        // routing on the next hotel restart.
+        let job: CronJob = serde_json::from_value(base_job_json()).unwrap();
+        assert_eq!(job.session_target, CronSessionTarget::Main);
+        assert!(!job.silent_ok);
+    }
+
+    #[test]
+    fn row_with_explicit_isolated_session_target_round_trips() {
+        let mut json = base_job_json();
+        json["session_target"] = serde_json::json!("isolated");
+        json["silent_ok"] = serde_json::json!(true);
+        let job: CronJob = serde_json::from_value(json).unwrap();
+        assert_eq!(job.session_target, CronSessionTarget::Isolated);
+        assert!(job.silent_ok);
+    }
+
+    #[test]
+    fn cron_session_id_is_namespaced_by_job_id() {
+        assert_eq!(cron_session_id("job-1"), "cron:job-1");
+    }
+
+    #[test]
+    fn is_silent_cron_reply_matches_whole_response() {
+        assert!(is_silent_cron_reply("[SILENT]"));
+        assert!(is_silent_cron_reply("  [silent]  "));
+    }
+
+    #[test]
+    fn is_silent_cron_reply_matches_bracketless_variants() {
+        assert!(is_silent_cron_reply("SILENT"));
+        assert!(is_silent_cron_reply("NO_REPLY"));
+        assert!(is_silent_cron_reply("no_reply"));
+    }
+
+    #[test]
+    fn is_silent_cron_reply_matches_first_line() {
+        assert!(is_silent_cron_reply(
+            "[SILENT]\nEverything looked fine, nothing to report."
+        ));
+    }
+
+    #[test]
+    fn is_silent_cron_reply_matches_last_line() {
+        assert!(is_silent_cron_reply(
+            "Checked the queue — nothing changed.\n[SILENT]"
+        ));
+    }
+
+    #[test]
+    fn is_silent_cron_reply_ignores_mid_prose_mention() {
+        // A `[SILENT]` mentioned mid-sentence is not an ack — the reply must
+        // still be delivered (Hermes rule).
+        assert!(!is_silent_cron_reply(
+            "Just noting the [SILENT] convention exists, but here's an update."
+        ));
+    }
+
+    #[test]
+    fn is_silent_cron_reply_rejects_empty_and_unrelated_text() {
+        assert!(!is_silent_cron_reply(""));
+        assert!(!is_silent_cron_reply("   "));
+        assert!(!is_silent_cron_reply("Something changed, please look."));
     }
 }

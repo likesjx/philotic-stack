@@ -1279,6 +1279,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "guaranteed": {
                         "type": "boolean",
                         "description": "Mesh-coordinated delivery flag. Optional; defaults to false."
+                    },
+                    "silent_ok": {
+                        "type": "boolean",
+                        "description": "When true, a fire's reply is suppressed (never delivered to the operator channel) if it matches the Hermes [SILENT]/NO_REPLY convention (whole response, or standing alone on the first/last line). Optional; defaults to false."
                     }
                 },
                 "required": ["schedule", "target_role", "payload"]

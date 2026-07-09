@@ -1426,6 +1426,8 @@ mod tests {
             next_fire_at: 0,
             created_at: 0,
             created_by: CronJobSource::Guest(agent_id.into()),
+            silent_ok: false,
+            session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
         }
     }
 

@@ -848,6 +848,49 @@ fn explicit_response_guest_from_payload(payload: &serde_json::Value) -> Option<S
         .map(str::to_string)
 }
 
+/// True when `task_json` is a `send_reply` (`FinalReplyPayload`) whose
+/// `session_id` names an isolated cron session (`cron:<job_id>`, see
+/// [`ansible_mesh_core::cron::cron_session_id`]) for a job with
+/// `silent_ok = true`, and whose `content` matches the Hermes `[SILENT]`
+/// convention ([`ansible_mesh_core::cron::is_silent_cron_reply`]).
+///
+/// This is the single chokepoint gating cron-reply suppression: every
+/// `send_reply` a philote turn emits — regardless of which tool/branch
+/// produced it — passes through `IpcRequest::EmitTask`, so checking here
+/// once covers the whole delivery path without touching the many unrelated
+/// `deliver_inbound_task` call sites. Only `action == "send_reply"` is
+/// gated; the cron *fire* itself (the prompt `CronTicker::fire` delivers to
+/// the target role) never reaches this arm; it goes straight to
+/// `deliver_inbound_task`/park from the ticker, not through `EmitTask`.
+///
+/// Fails open (returns `false`) whenever the job can't be resolved — an
+/// unknown/removed job, a non-cron session, or a malformed payload never
+/// suppresses delivery.
+fn silent_cron_reply_suppressed(graph: &GraphDomain, task_json: &str) -> bool {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+        return false;
+    };
+    if payload.get("action").and_then(serde_json::Value::as_str) != Some("send_reply") {
+        return false;
+    }
+    let Some(session_id) = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(job_id) = session_id.strip_prefix("cron:") else {
+        return false;
+    };
+    let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Ok(Some(job)) = graph.get_cron_job(job_id) else {
+        return false;
+    };
+    job.silent_ok && ansible_mesh_core::cron::is_silent_cron_reply(content)
+}
+
 fn response_like_agent_action_for_task(
     target_role: &str,
     target_guest_id: Option<&str>,
@@ -4619,6 +4662,17 @@ impl IpcServer {
                 target_guest_id,
                 task_json,
             } => {
+                // Silent-ack suppression (Hermes `[SILENT]` convention): a
+                // `send_reply` from an isolated `silent_ok` cron session whose
+                // content is a silence token is never delivered to the
+                // operator channel — see `silent_cron_reply_suppressed`.
+                if silent_cron_reply_suppressed(graph, &task_json) {
+                    info!(
+                        target_role = target_role.as_str(),
+                        "EmitTask: suppressing silent cron reply (silent_ok job, [SILENT] token)"
+                    );
+                    return IpcResponse::success("emit", None);
+                }
                 let response_like_agent_action = response_like_agent_action_for_task(
                     &target_role,
                     target_guest_id.as_deref(),
@@ -6931,6 +6985,14 @@ impl IpcServer {
             // ── Cron scheduler ──────────────────────────────────────────────
             IpcRequest::RegisterCronJob { mut job } => {
                 Self::normalize_cron_target_role(graph, &mut job);
+                // New job registrations always get an isolated `cron:<job_id>`
+                // session — `session_target` only defaults to `Main` via serde
+                // when deserializing legacy rows straight from storage
+                // (`default_session_target_legacy`). Registration is the only
+                // path that mints brand-new jobs, so it is safe to force
+                // `Isolated` here unconditionally; existing rows loaded from
+                // the graph never pass through this handler again.
+                job.session_target = ansible_mesh_core::cron::CronSessionTarget::Isolated;
                 info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
                 match graph.upsert_cron_job(&job) {
                     Ok(_) => {
@@ -19443,7 +19505,11 @@ pub(crate) mod tests {
                     snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_role"],
                     "model"
                 );
-                assert!(snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["incarnation_id"].is_null());
+                assert!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]
+                        ["incarnation_id"]
+                        .is_null()
+                );
                 assert_eq!(
                     snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["selection_reason"],
                     "local_active_guest_fallback"
@@ -21586,6 +21652,147 @@ pub(crate) mod tests {
             stored.evaluations[1].source_tool.as_deref(),
             Some("philotic-web")
         );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Wires `is_silent_cron_reply` end-to-end through the actual production
+    /// entry point (`IpcRequest::EmitTask`), the single chokepoint every
+    /// philote `send_reply` passes through — see `silent_cron_reply_suppressed`.
+    /// A `silent_ok` job's `[SILENT]` reply must never reach the membrane
+    /// subscriber; a non-`silent_ok` job's identical `[SILENT]` reply must
+    /// still be delivered, proving `silent_ok` — not the token match alone —
+    /// gates suppression.
+    #[tokio::test]
+    async fn emit_task_suppresses_silent_reply_only_for_silent_ok_cron_job() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+
+        let now_ms = 1_000_000u64;
+        let base_job = |id: &str, silent_ok: bool| ansible_mesh_core::cron::CronJob {
+            id: id.into(),
+            schedule: "0 */15 * * * * *".into(),
+            target_role: "attention-steward".into(),
+            target_node_id: None,
+            payload: "{}".into(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at: now_ms,
+            created_at: now_ms,
+            created_by: ansible_mesh_core::cron::CronJobSource::Operator,
+            silent_ok,
+            session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+        };
+        graph
+            .upsert_cron_job(&base_job("silent-job", true))
+            .expect("seed silent_ok job");
+        graph
+            .upsert_cron_job(&base_job("loud-job", false))
+            .expect("seed non-silent job");
+
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        // silent_ok job + [SILENT] reply → suppressed, membrane gets nothing.
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "membrane".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "send_reply",
+                    "session_id": ansible_mesh_core::cron::cron_session_id("silent-job"),
+                    "turn_id": "turn-1",
+                    "chat_id": "",
+                    "content": "[SILENT]"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit silent reply");
+
+        let suppressed = tokio::time::timeout(
+            tokio::time::Duration::from_millis(300),
+            membrane.recv_task(),
+        )
+        .await;
+        assert!(
+            suppressed.is_err(),
+            "silent_ok job's [SILENT] reply must never reach membrane, got {suppressed:?}"
+        );
+
+        // Same [SILENT] token, but silent_ok=false → must still be delivered.
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "membrane".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "send_reply",
+                    "session_id": ansible_mesh_core::cron::cron_session_id("loud-job"),
+                    "turn_id": "turn-2",
+                    "chat_id": "",
+                    "content": "[SILENT]"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit non-silent-ok reply");
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), membrane.recv_task())
+                .await
+                .expect("membrane should receive the reply from the non-silent_ok job")
+                .expect("membrane recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "[SILENT]");
+                assert_eq!(
+                    payload["session_id"],
+                    ansible_mesh_core::cron::cron_session_id("loud-job")
+                );
+            }
+            other => panic!("unexpected final response to membrane: {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
