@@ -559,6 +559,23 @@ jane-start:
 jane-status:
     @just remote-homebrew-status mbp-jane mbp-jane
 
+# ── Logs (in-app daily rolling appender) ────────────────────────────────────
+# aiua now owns rotation: detailed logs live in ~/.philotic/<profile>/logs/
+# aiua.<date>.log (see crates/aiua/README.md). These recipes tail the newest
+# dated file. Retention: PHILOTIC_LOG_RETENTION_DAYS (default 14 days).
+
+# Tail the newest dated aiua log for a local profile (default: bjork).
+logs profile="bjork":
+    tail -f "$(ls -t ~/.philotic/{{profile}}/logs/aiua.*.log 2>/dev/null | head -1)"
+
+# Tail the newest dated aiua log on mbp-jane (jane profile).
+jane-logs:
+    ssh mbp-jane 'tail -f "$(ls -t ~/.philotic/jane/logs/aiua.*.log 2>/dev/null | head -1)"'
+
+# Tail the newest dated aiua log on vps-jane (default profile).
+vps-logs:
+    ssh deploy@jane-vps 'tail -f "$(ls -t ~/.philotic/default/logs/aiua.*.log 2>/dev/null | head -1)"'
+
 # ── VPS deploy (vps-jane / Linux x86_64 via Ansible) ────────────────────────
 # Strategy: rsync source to VPS → build there (VPS has rustup) → ansible
 # deploys binaries from the VPS build output and restarts the systemd service.

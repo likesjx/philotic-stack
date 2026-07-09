@@ -77,6 +77,98 @@ fn profile_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".philotic").join(profile))
 }
 
+// ── Logging ─────────────────────────────────────────────────────────────────
+
+/// Resolve the number of dated log files the daily rolling appender keeps.
+///
+/// Rules (see `PHILOTIC_LOG_RETENTION_DAYS`):
+/// - unset / unparseable garbage -> default of 14
+/// - a valid number -> that number, clamped to a floor of 1 (so `"0"` -> 1)
+fn resolve_retention_days(env_val: Option<&str>) -> usize {
+    const DEFAULT_RETENTION_DAYS: usize = 14;
+    match env_val.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => n.max(1),
+        None => DEFAULT_RETENTION_DAYS,
+    }
+}
+
+/// Initialize tracing with a daily-rolling, size-bounded file appender that the
+/// hotel daemon owns end-to-end (no external newsyslog/logrotate dependency).
+///
+/// Detailed logs land in `${PHILOTIC_LOG_DIR}` (if set) else
+/// `~/.philotic/<profile>/logs/aiua.<date>.log`, where `<profile>` is
+/// `$PHILOTIC_PROFILE` (default `"default"`). Old dated files past
+/// `PHILOTIC_LOG_RETENTION_DAYS` (default 14) are pruned automatically.
+///
+/// No stdout/stderr tracing layer is installed on purpose: the launchd
+/// `StandardOutPath` (`aiua.log`) then only ever captures the tiny pre-init
+/// output and rare Rust panics, so it stops growing with zero plist/launch
+/// changes. Panics still reach stderr naturally.
+fn init_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let profile = std::env::var("PHILOTIC_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
+    let log_dir = match std::env::var("PHILOTIC_LOG_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home)
+                .join(".philotic")
+                .join(&profile)
+                .join("logs")
+        }
+    };
+
+    if let Err(err) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "aiua: failed to create log dir {}: {err}",
+            log_dir.display()
+        );
+    }
+
+    let retention_days =
+        resolve_retention_days(std::env::var("PHILOTIC_LOG_RETENTION_DAYS").ok().as_deref());
+
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("aiua")
+        .filename_suffix("log")
+        .max_log_files(retention_days)
+        .build(&log_dir)
+        .expect("failed to build rolling log appender");
+
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+    // The WorkerGuard must live for the whole process or the background writer
+    // stops flushing. Leak it intentionally.
+    Box::leak(Box::new(guard));
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(non_blocking),
+        )
+        .init();
+
+    tracing::info!(
+        log_dir = %log_dir.display(),
+        retention_days,
+        "aiua logging initialized (daily rolling file appender)"
+    );
+}
+
 fn agent_graph_db_path(agent_id: &str) -> Option<String> {
     if let Ok(dir) = std::env::var("PHILOTIC_AGENT_GRAPH_DATABASE_DIR") {
         if !dir.trim().is_empty() {
@@ -7089,7 +7181,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_logging();
     let args = Args::parse();
 
     if std::env::var_os("PHILOTIC_BIN_DIR").is_none() {
@@ -8098,6 +8190,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_retention_days;
     use super::{
         AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest, agent_graph_guest_record,
         agent_graph_runner_guest, agent_identity_record_for_profile, agent_profile_from_config,
@@ -8111,6 +8204,30 @@ mod tests {
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
         seed_toolset_profiles, startup_test_gemini_base_url,
     };
+
+    #[test]
+    fn retention_days_defaults_to_14_when_unset() {
+        assert_eq!(resolve_retention_days(None), 14);
+    }
+
+    #[test]
+    fn retention_days_parses_valid_value() {
+        assert_eq!(resolve_retention_days(Some("7")), 7);
+        assert_eq!(resolve_retention_days(Some(" 30 ")), 30);
+    }
+
+    #[test]
+    fn retention_days_floors_zero_to_one() {
+        assert_eq!(resolve_retention_days(Some("0")), 1);
+    }
+
+    #[test]
+    fn retention_days_falls_back_on_garbage() {
+        assert_eq!(resolve_retention_days(Some("garbage")), 14);
+        assert_eq!(resolve_retention_days(Some("")), 14);
+        assert_eq!(resolve_retention_days(Some("-3")), 14);
+    }
+
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::registry::ExecutionReachability;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;

@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # Install a newsyslog drop-in that rotates Philotic hotel logs on macOS.
 #
-# Why: launchd's StandardOutPath never rotates — aiua.log hit 61MB on
-# 2026-07-06 and once reached 952MB on mbp-jane. This writes
+# PRIMARY rotation now lives in-app: aiua owns a daily rolling file appender
+# (tracing-appender) that writes ~/.philotic/<profile>/logs/aiua.<date>.log and
+# prunes old dated files past PHILOTIC_LOG_RETENTION_DAYS (default 14). See
+# crates/aiua/README.md. Because no stdout tracing layer is installed, the
+# launchd StandardOutPath aiua.log/aiua.err.log now only capture tiny pre-init
+# output and rare panics, so they stay small.
+#
+# This newsyslog size-cap is therefore belt-and-suspenders for those now-tiny
+# aiua.log / aiua.err.log files (and any legacy giant aiua.log left over from
+# before the in-app appender landed).
+#
+# Why it still exists: launchd's StandardOutPath never rotates — aiua.log hit
+# 61MB on 2026-07-06 and once reached 952MB on mbp-jane. This writes
 # /etc/newsyslog.d/philotic.conf rotating ~/.philotic/*/aiua*.log
 # (aiua.log + aiua.err.log, every profile) at 50MB, keeping 5 compressed
 # archives.
