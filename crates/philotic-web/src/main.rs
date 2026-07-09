@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod component;
+mod doctor;
 mod flush;
 mod footprint;
 mod harness;
@@ -84,6 +85,36 @@ enum Command {
         /// Hotel name to inspect (default: default)
         #[arg(long, default_value = "default")]
         hotel: String,
+    },
+
+    /// Read-only self-diagnosis: detect known failure patterns without repairing them
+    ///
+    /// Slice 0: no `--fix` exists yet. Opens the context DB read-only and probes
+    /// launchd/sockets/vault/logs; never writes.
+    Doctor {
+        /// Hotel name to inspect (default: default)
+        #[arg(long, default_value = "default")]
+        hotel: String,
+
+        /// Emit machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+
+        /// Minimum severity to report and gate the exit code on
+        #[arg(long, default_value = "warning")]
+        severity_min: String,
+
+        /// Run only these check IDs (repeatable)
+        #[arg(long = "only")]
+        only: Vec<String>,
+
+        /// Skip these check IDs (repeatable)
+        #[arg(long = "skip")]
+        skip: Vec<String>,
+
+        /// Print the check catalog (id + severity) and exit without running anything
+        #[arg(long)]
+        list_checks: bool,
     },
 
     /// List configured agents
@@ -421,6 +452,14 @@ async fn main() -> Result<()> {
         Command::Start { hotel, detach } => start::run(hotel, detach).await,
         Command::Stop => stop::run().await,
         Command::Status { config, hotel } => status::run(config, hotel).await,
+        Command::Doctor {
+            hotel,
+            json,
+            severity_min,
+            only,
+            skip,
+            list_checks,
+        } => doctor::run(hotel, json, severity_min, only, skip, list_checks),
         Command::Agents { config } => status::run_agents(config).await,
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
         Command::Service { action } => match action {

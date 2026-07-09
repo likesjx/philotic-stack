@@ -27,7 +27,7 @@ fn launchd_domain() -> String {
     format!("gui/{uid}")
 }
 
-fn service_target(hotel: &str) -> String {
+pub(crate) fn service_target(hotel: &str) -> String {
     format!("{}/{}", launchd_domain(), plist_label(hotel))
 }
 
