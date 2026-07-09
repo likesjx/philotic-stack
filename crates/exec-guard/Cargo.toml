@@ -1,0 +1,10 @@
+[package]
+name = "exec-guard"
+version = "0.1.0"
+edition = "2024"
+description = "Compiled-in, non-configurable execution safety floor (L0 hardline blocklist) shared by every raw shell dispatch point"
+
+[dependencies]
+regex = "1.12"
+
+[dev-dependencies]

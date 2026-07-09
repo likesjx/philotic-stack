@@ -5820,6 +5820,19 @@ async fn run_bash_command(
     use tokio::process::Command;
     use tokio::time::{Duration, timeout};
 
+    // L0 execution safety floor: compiled-in, non-configurable, evaluated
+    // before any approval/session state is consulted and before the shell
+    // is ever spawned. No policy record or `auto_approve_all` can reach
+    // this — see crates/exec-guard for the blocklist and rationale.
+    if let Some(hardline) = exec_guard::detect_hardline(&command) {
+        return Ok(serde_json::json!({
+            "stdout": "",
+            "stderr": hardline.denial_message(),
+            "exit_code": 126,
+            "success": false,
+        }));
+    }
+
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(&command);
     cmd.stdout(std::process::Stdio::piped());
@@ -7208,6 +7221,53 @@ mod tests {
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── L0 execution safety floor (exec-guard) ─────────────────────────────
+    //
+    // The floor is checked at the top of `run_bash_command` itself — the
+    // function that a parked-turn `/approve` (or `auto_approve_all`)
+    // ultimately calls to spawn `sh -c`. There is no approval/session
+    // parameter this function accepts that could route around the check,
+    // so a passing test here demonstrates the floor sits below approvals:
+    // no caller of this function, however it got here, can avoid it.
+
+    #[tokio::test]
+    async fn bash_exec_hardline_blocks_root_delete_without_spawning() {
+        let result = super::run_bash_command("rm -rf /".into(), None, 10)
+            .await
+            .expect("denial is a tool result, not an Err");
+        assert!(!result["success"].as_bool().unwrap());
+        assert_eq!(result["stdout"].as_str().unwrap(), "");
+        let stderr = result["stderr"].as_str().unwrap();
+        assert!(
+            stderr.contains("Do not retry"),
+            "unexpected stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("recursive delete of root filesystem"),
+            "unexpected stderr: {stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exec_hardline_blocks_even_when_command_would_otherwise_run() {
+        // A hardline shutdown command must be denied rather than executed —
+        // if the floor were bypassed this would attempt to power off the
+        // test host, which is exactly what must never happen.
+        let result = super::run_bash_command("shutdown -h now".into(), None, 10)
+            .await
+            .expect("denial is a tool result, not an Err");
+        assert!(!result["success"].as_bool().unwrap());
+        assert_eq!(result["exit_code"].as_i64().unwrap(), 126);
+    }
+
+    #[tokio::test]
+    async fn bash_exec_hardline_does_not_block_ordinary_commands() {
+        let result = super::run_bash_command("echo hello".into(), None, 10)
+            .await
+            .expect("should succeed");
+        assert!(result["success"].as_bool().unwrap());
     }
 
     // ── DEF-004 regression: multi-tool re-entry must surface the final reply ──
