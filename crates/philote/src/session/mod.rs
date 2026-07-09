@@ -2941,7 +2941,11 @@ impl SessionState {
                  re-entry, follow-through, goals, habits, commitments, open loops, or the \
                  operator's LifeGraph. After the recalled packet proves useful, stale, missing, \
                  noisy, overconfident, or disconnected, record life.recall.feedback so the graph \
-                 can improve bridge/ranking/attention behavior without silently confirming new truth."
+                 can improve bridge/ranking/attention behavior without silently confirming new truth. \
+                 If the operator's current turn reports a recalled loop/commitment/goal as done, \
+                 confirmed, or resolved, trust the turn over the recall: call life.commit with \
+                 loop_status=\"resolved\" to close it — do not restate the recalled node's stale \
+                 status (e.g. \"paused\"/\"halfway\") back to the operator."
                     .to_string(),
             );
         }
@@ -2979,6 +2983,16 @@ impl SessionState {
 
         let mut out = String::from(
             "[Recalled memory]\n\
+             Precedence: everything below describes PAST state and is advisory context, not \
+             current fact. The CURRENT TURN is ground truth for current state. If this turn \
+             contradicts a recalled item — e.g. a LifeGraph loop recalled as \"paused\" or \
+             \"in progress\" when the operator now reports it done — trust the turn, not the \
+             recall, and update the store instead of repeating the stale version: call \
+             life.commit with loop_status=\"resolved\" for a LifeGraph loop/commitment/goal, or \
+             memory.remember for a Muninn fact that changed.\n\
+             Origin: each item below is tagged origin=life-graph (structured LifeGraph node, \
+             provenance-tracked) or origin=muninn (continuity engram) — weight trust \
+             accordingly; life-graph items are the ones life.commit/life.resolve can close.\n\
              Note: if a memory describes an event (something that happened), \
              it must include a timestamp in its content. \
              When writing new memories of this kind, always include an ISO 8601 timestamp \
@@ -2989,6 +3003,7 @@ impl SessionState {
             if let Some(id) = memory.id.as_deref() {
                 provenance.push(format!("id={id}"));
             }
+            provenance.push(format!("origin={}", recalled_memory_origin(memory)));
             if let Some(vault) = memory.vault_id.as_deref() {
                 provenance.push(format!("vault={vault}"));
             }
@@ -3176,7 +3191,14 @@ impl SessionState {
         if !entity_lines.is_empty() || !relation_lines.is_empty() {
             let mut overlay = String::from("[Muninn entity overlay]\n");
             overlay.push_str(
-                "Advisory continuity hints from recalled memories. Current graph/code truth wins on conflict.\n",
+                "Advisory entity/relationship hints extracted from recalled memories (Muninn \
+                 and LifeGraph alike) — supplementary structure, not standalone fact. \"Graph/code \
+                 truth\" here means this agent's own graph partition above (`[Agent graph]`) and \
+                 the live codebase/config, which take precedence over these extracted hints on \
+                 structural conflicts. It does NOT mean a recalled node outranks the current \
+                 turn: for anything the operator states directly in this turn, the turn is ground \
+                 truth over any recalled memory or entity/relationship hint, per [Recalled \
+                 memory] precedence above.\n",
             );
             overlay.push_str(&entity_lines.join("\n"));
             if !entity_lines.is_empty() && !relation_lines.is_empty() {
@@ -4943,6 +4965,24 @@ fn projection_item(text: &str, source_ref: &str, projection_kind: &str) -> Value
         "source_ref": source_ref,
         "projection_kind": projection_kind,
     })
+}
+
+/// Distinguish LifeGraph-sourced recall records from Muninn engrams so the
+/// rendered `[Recalled memory]` block lets the model weight trust per the
+/// projection precedence rule (turn is ground truth; life-graph items are
+/// the ones life.commit/life.resolve can close, muninn items are continuity
+/// engrams). `life_recall_records_from_result` (memory_integration.rs) tags
+/// LifeGraph records with `vault_id = "life-graph"` and `source =
+/// "life-graph"`; Muninn engrams carry the real vault name from
+/// `recalled_memory_from_engram`.
+fn recalled_memory_origin(memory: &RecalledMemoryRecord) -> &'static str {
+    let is_life_graph = memory.vault_id.as_deref() == Some("life-graph")
+        || memory.source.as_deref() == Some("life-graph");
+    if is_life_graph {
+        "life-graph"
+    } else {
+        "muninn"
+    }
 }
 
 fn format_memory_timestamp(value: u64) -> String {
@@ -7251,6 +7291,10 @@ mod tests {
         assert!(prompt.contains("[LifeGraph stewardship]"));
         assert!(prompt.contains("Use life.recall before answering"));
         assert!(prompt.contains("life.recall.feedback"));
+        // Precedence reinforcement for chartered life.steward turns: trust the
+        // turn over a stale recalled loop status (YPT conjunction-bug fix).
+        assert!(prompt.contains("trust the turn over the recall"));
+        assert!(prompt.contains("loop_status=\"resolved\""));
     }
 
     #[test]
@@ -8401,9 +8445,73 @@ mod tests {
         assert!(text.contains("memory-architecture"));
         assert!(text.contains("id=01MEMORY"));
         assert!(text.contains("vault=user_chat-memory"));
+        assert!(text.contains("origin=muninn"));
         assert!(text.contains("confidence=0.91"));
         assert!(text.contains("trust=verified"));
         assert!(text.contains("entities: 1"));
+        // Reconciliation instruction: turn is ground truth, recall is advisory.
+        assert!(text.contains("Precedence"));
+        assert!(text.contains("CURRENT TURN is ground truth"));
+        assert!(text.contains("life.commit"));
+        assert!(text.contains("memory.remember"));
+    }
+
+    #[test]
+    fn recalled_memory_distinguishes_life_graph_from_muninn_origin() {
+        // Regression for the YPT conjunction bug: LifeGraph recall said
+        // "halfway/paused" while the fresh turn said "finished," and the model
+        // trusted the stale graph over the turn. Both lanes land in the same
+        // `recalled_memories` vec (Muninn auto-recall, then LifeGraph cache
+        // injection — see memory_integration.rs maybe_auto_recall_turn_memory /
+        // maybe_inject_life_graph_context), so the rendered text must let the
+        // model tell them apart and know which one life.commit can close.
+        let mut state = SessionState::new(
+            "sess-origin".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = test_working_turn(None);
+        turn.recalled_memories = vec![
+            RecalledMemoryRecord {
+                id: Some("muninn:1".into()),
+                vault_id: Some("user_chat-memory".into()),
+                concept: "preference".into(),
+                content: "Muninn continuity engram.".into(),
+                ..Default::default()
+            },
+            RecalledMemoryRecord {
+                id: Some("life:ypt".into()),
+                vault_id: Some("life-graph".into()),
+                source: Some("life-graph".into()),
+                concept: "OpenLoop".into(),
+                content: "YPT halfway, paused.".into(),
+                ..Default::default()
+            },
+        ];
+        state.start_turn(turn);
+
+        let projection = state.build_context_projection("Confirm for both. Finished my YPT.");
+        let layer = projection
+            .layers
+            .iter()
+            .find(|l| l.layer_id == ContextLayerId::RecalledMemory)
+            .expect("recalled_memory layer present");
+
+        assert_eq!(layer.authority, ContextAuthority::Advisory);
+        assert!(layer.rendered_content.contains("origin=muninn"));
+        assert!(layer.rendered_content.contains("origin=life-graph"));
+        assert!(layer.rendered_content.contains("Precedence"));
+        assert!(layer.rendered_content.contains("loop_status=\"resolved\""));
+
+        // The reconciliation instruction must reach the model through both the
+        // flat prompt and the structured envelope, not just one path.
+        let prompt = state.build_prompt("Confirm for both. Finished my YPT.");
+        assert!(prompt.contains("CURRENT TURN is ground truth"));
+        let context = state.model_context_from_projection(&projection);
+        let recalled_text = context["recalled_memory"][0]["text"]
+            .as_str()
+            .expect("recalled_memory entry should render text");
+        assert!(recalled_text.contains("CURRENT TURN is ground truth"));
     }
 
     #[test]
