@@ -4970,6 +4970,7 @@ async fn ipc_patch_role(
             // "preserve" server-side (see ConfigureRole fix), so the patch no
             // longer silently wipes a DB-edited fallback ladder.
             fallback_tiers: None,
+            content_policy: None,
         })
         .await?
     {

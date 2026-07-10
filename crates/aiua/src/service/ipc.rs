@@ -5695,6 +5695,7 @@ impl IpcServer {
                 model_profile,
                 context_window_policy,
                 fallback_tiers,
+                content_policy,
             } => {
                 Self::configure_role_record(
                     graph,
@@ -5716,6 +5717,7 @@ impl IpcServer {
                     model_profile,
                     context_window_policy,
                     fallback_tiers,
+                    content_policy,
                 )
                 .await
             }
@@ -5809,6 +5811,10 @@ impl IpcServer {
                                     .collect::<Vec<String>>()
                             })
                         }),
+                        arguments
+                            .get("content_policy")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
                     )
                     .await;
                     match response {
@@ -15044,6 +15050,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 
@@ -16193,6 +16200,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
         graph
@@ -16312,6 +16320,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
         graph
@@ -16450,6 +16459,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
         graph
@@ -16881,6 +16891,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
         graph
@@ -17032,6 +17043,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
         graph
@@ -18232,6 +18244,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("developer role should seed");
 
@@ -18809,6 +18822,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("role incarnation");
 
@@ -21466,6 +21480,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("role incarnation should seed");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -22887,6 +22902,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed orchestrator role");
         let server = IpcServer::new(
@@ -24387,6 +24403,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 
@@ -24485,6 +24502,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 
@@ -24587,6 +24605,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 
@@ -24676,6 +24695,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 
@@ -24779,6 +24799,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 
@@ -24865,6 +24886,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 

@@ -361,6 +361,16 @@ pub struct RoleIncarnationRecord {
     /// approval constraints so the agent can reason about its own capabilities and limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_manifest: Option<String>,
+    /// Content-filtering posture for this role incarnation. `"unrestricted"` disables
+    /// provider-level safety filtering where the provider exposes a toggle (Gemini
+    /// `safetySettings` at `BLOCK_NONE`) and adds a permissive system-instruction line
+    /// so providers without a toggle don't second-guess it with over-cautious refusals.
+    /// `"strict"` tightens filtering (Gemini `BLOCK_MEDIUM_AND_ABOVE`). `"standard"`
+    /// (the default) preserves prior behavior exactly — no safetySettings are sent,
+    /// providers use their own defaults. This is a private, single-operator system;
+    /// the policy is set explicitly per role by the operator via role.configure.
+    #[serde(default = "default_content_policy")]
+    pub content_policy: String,
     /// Admin roles may update operator-owned records such as the orchestrator role manifest.
     /// Only the hotel seed or an existing admin role may create a role with is_admin: true.
     #[serde(default)]
@@ -378,10 +388,49 @@ pub struct RoleIncarnationRecord {
     pub home_node: Option<String>,
 }
 
+impl Default for RoleIncarnationRecord {
+    /// Manual (not derived) so `content_policy` defaults to `"standard"` — the
+    /// same default `#[serde(default = "default_content_policy")]` uses — rather
+    /// than the empty string a derived `Default` would give a `String` field.
+    /// Test fixtures across the workspace use `..Default::default()` to pick up
+    /// this field without listing it explicitly at every call site.
+    fn default() -> Self {
+        Self {
+            agent_id: String::new(),
+            role_name: String::new(),
+            guest_id: String::new(),
+            toolset_profile: String::new(),
+            role_identity_addendum: None,
+            role_manifest: None,
+            content_policy: default_content_policy(),
+            is_admin: false,
+            readiness_state: RoleReadinessState::default(),
+            inactive_ttl_seconds: None,
+            turn_loop_config: TurnLoopConfig::default(),
+            home_node: None,
+        }
+    }
+}
+
 impl RoleIncarnationRecord {
     pub fn routing_role(&self) -> String {
         format!("role:{}:{}", self.agent_id, self.role_name)
     }
+}
+
+/// Serde default for [`RoleIncarnationRecord::content_policy`] and the mirrored
+/// session-side fields — `"standard"` preserves current (pre-feature) behavior
+/// exactly for every role that hasn't explicitly set a content policy.
+pub fn default_content_policy() -> String {
+    "standard".to_string()
+}
+
+/// The three valid `content_policy` values. Anything else is rejected at the
+/// `ConfigureRole` IPC boundary rather than silently stored.
+pub const CONTENT_POLICY_VALUES: [&str; 3] = ["unrestricted", "standard", "strict"];
+
+pub fn is_valid_content_policy(value: &str) -> bool {
+    CONTENT_POLICY_VALUES.contains(&value)
 }
 
 /// Lifecycle state for an externally polled membrane transport home.
@@ -681,4 +730,57 @@ fn default_model_status() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod content_policy_tests {
+    use super::*;
+
+    /// A `RoleIncarnationRecord` JSON blob that predates `content_policy` (as
+    /// every real DB row does today) must deserialize with `content_policy ==
+    /// "standard"` — the serde default that preserves current behavior for
+    /// every already-configured role.
+    #[test]
+    fn content_policy_serde_defaults_to_standard_when_absent() {
+        let json = serde_json::json!({
+            "agent_id": "agent-jane",
+            "role_name": "orchestrator",
+            "guest_id": "agent-jane:orchestrator",
+            "toolset_profile": "orchestrator",
+        });
+        let record: RoleIncarnationRecord =
+            serde_json::from_value(json).expect("legacy record without content_policy decodes");
+        assert_eq!(record.content_policy, "standard");
+    }
+
+    #[test]
+    fn content_policy_round_trips_explicit_value() {
+        let record = RoleIncarnationRecord {
+            agent_id: "agent-jane".into(),
+            role_name: "orchestrator".into(),
+            guest_id: "agent-jane:orchestrator".into(),
+            toolset_profile: "orchestrator".into(),
+            content_policy: "unrestricted".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&record).expect("serialize");
+        let decoded: RoleIncarnationRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(decoded.content_policy, "unrestricted");
+    }
+
+    #[test]
+    fn default_impl_uses_standard_content_policy() {
+        assert_eq!(RoleIncarnationRecord::default().content_policy, "standard");
+        assert_eq!(default_content_policy(), "standard");
+    }
+
+    #[test]
+    fn content_policy_validation_accepts_only_known_values() {
+        assert!(is_valid_content_policy("unrestricted"));
+        assert!(is_valid_content_policy("standard"));
+        assert!(is_valid_content_policy("strict"));
+        assert!(!is_valid_content_policy("permissive"));
+        assert!(!is_valid_content_policy(""));
+        assert!(!is_valid_content_policy("UNRESTRICTED"));
+    }
 }

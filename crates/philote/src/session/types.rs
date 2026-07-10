@@ -247,6 +247,13 @@ pub struct RoleActivation {
     /// philote runs the scripted step tree instead of the standard loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_loop_config: Option<ansible_mesh_core::graph::TurnLoopConfig>,
+    /// Content-filtering posture for this role — `"unrestricted"` | `"standard"`
+    /// | `"strict"`. `None` here means "not loaded" (e.g. a test fixture or a
+    /// role fetched before this field existed); [`SessionState::effective_content_policy`]
+    /// treats that the same as `"standard"`. Populated from the role incarnation
+    /// record's `content_policy` at activation time (see `roles.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_policy: Option<String>,
 }
 
 /// A single step inside an `ActivePlan`. Tracks the description, optional bound
@@ -1439,6 +1446,14 @@ pub struct AgentProfile {
     /// Not serialized — refreshed each time the philote process starts.
     #[serde(default, skip_serializing)]
     pub agent_role_names: Vec<String>,
+    /// Agent-level content-filtering posture fallback — `"unrestricted"` |
+    /// `"standard"` | `"strict"`. Consulted by
+    /// [`SessionState::effective_content_policy`] when the active role hasn't
+    /// set an explicit (non-`"standard"`) policy of its own, so a single-role
+    /// agent (the common case) only needs one place to set this. `None`
+    /// (the default) is equivalent to `"standard"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

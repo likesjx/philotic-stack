@@ -180,6 +180,15 @@ pub(crate) enum ProviderErrorClass {
     /// until an operator intervenes — surface to the user fast (plus a heal
     /// event so the outage becomes an A3 work item).
     Fatal,
+    /// The provider's own content/safety filter blocked the response (Gemini
+    /// `finishReason=SAFETY` / `promptFeedback.blockReason`, etc.) — a
+    /// deliberately DISTINCT outcome from `SwitchProvider`. Switching to a
+    /// different-behaving model mid-conversation is the jarring failover this
+    /// class exists to prevent (2026-07-09 operator report); for an
+    /// `unrestricted` agent this should essentially never fire since
+    /// `safetySettings` disables the filter, but if it does, fail the turn
+    /// cleanly with a clear message rather than silently hopping providers.
+    ContentBlocked,
     /// Not a model-provider escalation signal (tool/transport/voice errors):
     /// fall through to the generic fail path.
     Unclassified,
@@ -198,6 +207,7 @@ pub(crate) fn classify_provider_error(error: &TaskErrorPayload) -> ProviderError
     // 1. Machine-readable class from the controller wins.
     match error.error_class.as_deref() {
         Some("fatal") => return ProviderErrorClass::Fatal,
+        Some("content_blocked") => return ProviderErrorClass::ContentBlocked,
         Some("switch_provider") => return ProviderErrorClass::SwitchProvider,
         Some("retry_same_provider") => return ProviderErrorClass::RetrySameProvider,
         _ => {}
@@ -206,6 +216,7 @@ pub(crate) fn classify_provider_error(error: &TaskErrorPayload) -> ProviderError
     // 2. sub_kind fallback (older controllers).
     match error.sub_kind.as_deref() {
         Some("provider_auth") => return ProviderErrorClass::Fatal,
+        Some("content_policy_block") => return ProviderErrorClass::ContentBlocked,
         Some("network_error") | Some("streaming_timeout") | Some("provider_error") => {
             return ProviderErrorClass::RetrySameProvider;
         }
@@ -535,6 +546,37 @@ fn voice_response_provider_options(policy: &VoiceResponsePolicy) -> Map<String, 
     }
 
     options
+}
+
+/// Threads the turn's effective content-filtering posture into the
+/// `provider_options` bag the same way `voice_response_provider_options`
+/// threads voice settings — the model-router's `ControllerTask::provider_options`
+/// is the existing generic per-turn knob channel (see `response_modalities`,
+/// `voice_id`, `model` above). `"standard"` omits the key entirely so the
+/// wire payload — and downstream provider behavior — is byte-for-byte
+/// unchanged for every agent that hasn't opted into this feature.
+fn content_policy_provider_options(effective_content_policy: &str) -> Map<String, Value> {
+    let mut options = Map::new();
+    if effective_content_policy != "standard" {
+        options.insert(
+            "content_policy".into(),
+            json!(effective_content_policy),
+        );
+    }
+    options
+}
+
+/// Session-lookup wrapper matching the `Option<&SessionState>` convention used
+/// by `model_response_route` / `planning_ligand` / `model_affordances` below —
+/// call sites already have `self.sessions.get(&session_id)` in scope for those,
+/// so this drops in alongside them at every `action: "generate_text"`
+/// `ModelRequestPayload` construction. A missing session (shouldn't happen on
+/// this path, but mirrors the other helpers' fail-open behavior) resolves to
+/// `"standard"` — i.e. no `provider_options` change, current behavior.
+pub(crate) fn resolve_content_policy_provider_options(
+    state: Option<&SessionState>,
+) -> Map<String, Value> {
+    content_policy_provider_options(state.map(|s| s.effective_content_policy()).unwrap_or("standard"))
 }
 
 fn voice_response_contract(policy: &VoiceResponsePolicy) -> Value {
@@ -1336,6 +1378,11 @@ struct CachedRoleConfig {
     iteration_cap: Option<u32>,
     approval_policy: Option<String>,
     turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig,
+    /// Content-filtering posture for this role — `"unrestricted"` | `"standard"`
+    /// | `"strict"`. Defaults to `"standard"` (current behavior) so caches built
+    /// before this field existed, or roles that never set it, behave exactly as
+    /// before.
+    content_policy: String,
 }
 
 pub struct AgentRuntime {
@@ -2177,7 +2224,9 @@ impl AgentRuntime {
                     response_contract,
                     response_route,
                     ligand,
-                    provider_options: serde_json::Map::new(),
+                    provider_options: resolve_content_policy_provider_options(
+                        self.sessions.get(&session_id),
+                    ),
                     chat_id: restored_chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
@@ -2729,7 +2778,7 @@ impl AgentRuntime {
                 dispatch_cap,
             )
         };
-        let (response_contract, provider_options) = voice_delivery_envelope(
+        let (response_contract, mut provider_options) = voice_delivery_envelope(
             self.sessions.get(&session_id),
             Some(cognitive_response_contract(&[
                 "spoken_text",
@@ -2738,6 +2787,16 @@ impl AgentRuntime {
                 "memory_concept",
             ])),
         );
+        // Thread the turn's effective content-filtering posture into the same
+        // generic provider_options bag voice settings already use — this is the
+        // primary turn-dispatch path (handles most user messages), so it must
+        // not be skipped even though it shares an envelope with voice/transform
+        // capabilities that don't need it.
+        if matches!(capability.as_str(), "text.generate" | "response.generate") {
+            provider_options.extend(resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ));
+        }
         let (target_node, target_role, target_guest_id) = {
             let (node, role, guest_id) = resolve_model_execution_target(
                 self.sessions.get(&session_id),
@@ -3301,7 +3360,9 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
-            provider_options: serde_json::Map::new(),
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -3977,7 +4038,9 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
-            provider_options: Map::new(),
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -4583,7 +4646,9 @@ impl AgentRuntime {
             response_contract: None,
             response_route,
             ligand,
-            provider_options: Map::new(),
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -6947,6 +7012,27 @@ mod tests {
             ProviderErrorClass::Fatal
         );
 
+        // Content/safety block (the second fix): a DISTINCT outcome from
+        // SwitchProvider — the whole point is that a blocked turn does NOT
+        // silently hop to a different-behaving provider mid-conversation.
+        let mut content_blocked_annotated = provider_error(Some("content_policy_block"), None);
+        content_blocked_annotated.error_class = Some("content_blocked".into());
+        assert_eq!(
+            classify_provider_error(&content_blocked_annotated),
+            ProviderErrorClass::ContentBlocked
+        );
+        assert_ne!(
+            classify_provider_error(&content_blocked_annotated),
+            ProviderErrorClass::SwitchProvider
+        );
+        // sub_kind fallback (older/un-annotated controller envelope) must also
+        // classify as ContentBlocked, not fall through to the un-annotated
+        // provider_failure → SwitchProvider default.
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("content_policy_block"), None)),
+            ProviderErrorClass::ContentBlocked
+        );
+
         // Non-text capabilities and non-provider kinds fall through to the
         // generic fail path.
         let mut voice = provider_error(None, None);
@@ -9097,6 +9183,7 @@ mod tests {
                     paracrine_chain_budget_secs: Some(120),
                     ..Default::default()
                 },
+                content_policy: "standard".into(),
             },
         );
 
@@ -9181,6 +9268,7 @@ mod tests {
                     }),
                     ..Default::default()
                 },
+                content_policy: "standard".into(),
             },
         );
 

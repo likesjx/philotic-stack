@@ -856,6 +856,52 @@ impl AgentRuntime {
                         )
                         .await;
                 }
+                // Provider-side content/safety block: a DISTINCT, non-escalating
+                // outcome from SwitchProvider. Switching to a different-behaving
+                // model mid-conversation is exactly the jarring failover this
+                // class exists to avoid — fail the turn cleanly with a message
+                // that names what happened, and flag the heal queue as its own
+                // `content_blocked` tag (escalate-not-restart: no guest restart
+                // or provider swap fixes a safety-filtered prompt).
+                ProviderErrorClass::ContentBlocked => {
+                    let provider = error_payload
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| "unknown".into());
+                    warn!(
+                        session_id = %session_id,
+                        sub_kind = %sub_kind,
+                        provider = %provider,
+                        "Provider content/safety block — failing turn cleanly (no provider switch)"
+                    );
+                    self.push_heal_event(
+                        &format!("content_blocked:{provider}"),
+                        &format!(
+                            "Provider {provider} blocked the response on content/safety \
+                             grounds for session {session_id} turn {turn_id}: {}",
+                            error_payload.message
+                        ),
+                    )
+                    .await;
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            turn_id,
+                            // "content_blocked" marker: `classify_turn_failure`
+                            // (ansible-mesh-core) skips lines carrying it so the
+                            // FailTask intake path (which otherwise always sees
+                            // fail_active_turn's hardcoded MODEL_EMPTY_RESPONSE
+                            // error_code) doesn't double-report this as a
+                            // second, differently-tagged heal-queue entry.
+                            format!(
+                                "content_blocked: The model provider ({provider}) declined to \
+                                 respond due to its content/safety filter. No fallback provider \
+                                 was tried — ask again, or rephrase, or check the agent's \
+                                 content_policy setting."
+                            ),
+                        )
+                        .await;
+                }
                 // Not a model-provider escalation signal — fall through to the
                 // generic fail path below.
                 ProviderErrorClass::Unclassified => {}
@@ -1609,7 +1655,9 @@ impl AgentRuntime {
                     response_contract,
                     response_route,
                     ligand,
-                    provider_options: Map::new(),
+                    provider_options: resolve_content_policy_provider_options(
+                        self.sessions.get(&session_id),
+                    ),
                     chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
@@ -1747,7 +1795,9 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
-            provider_options: serde_json::Map::new(),
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2081,7 +2131,9 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
-            provider_options: serde_json::Map::new(),
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),

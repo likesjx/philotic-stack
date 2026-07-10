@@ -253,10 +253,20 @@ pub fn classify_turn_failure(line: &str) -> Option<TurnFailureClass> {
 
     // Failure classes philote pushes explicitly (with richer tags) via
     // PushHealEvent — skip so FailTask intake doesn't double-report them.
+    //
+    // `content_blocked` in particular: `fail_active_turn` always stamps
+    // FailTask's `error_code` as the hardcoded `MODEL_EMPTY_RESPONSE`
+    // regardless of *why* the turn failed, so without this skip a
+    // ContentBlocked turn would ALSO match the `model_empty_response`
+    // fallback branch below (via the bare error_code text) and get a second,
+    // differently-tagged heal-queue row — the philote turn-loop's own
+    // `content_blocked:{provider}` PushHealEvent (see turn_loop.rs) is the
+    // single source of truth for this failure class.
     if lower.contains("all model providers failed")
         || lower.contains("delegation chain exceeded")
         || lower.contains("turn_watchdog_timeout")
         || lower.contains("turn watchdog evicted")
+        || lower.contains("content_blocked")
     {
         return None;
     }
@@ -366,7 +376,11 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         | "cross_hotel_misroute"
         | "duplicate_finalization"
         | "orphaned_tool_result"
-        | "life_observe_parse_failed" => "escalate",
+        | "life_observe_parse_failed"
+        // A content/safety block is a request/config-shape problem (like
+        // provider_4xx), not a guest-health problem — no restart or provider
+        // swap fixes it, so this is escalate-not-restart, same as provider_4xx.
+        | "content_blocked" => "escalate",
         "provider_timeout" => "noop",
         _ => "noop",
     }
@@ -886,6 +900,38 @@ mod tests {
         assert_eq!(
             tag_of("[MODEL_EMPTY_RESPONSE] This delegation chain exceeded its budget of 4 hops"),
             None
+        );
+        // content_blocked (the safety-block fix): fail_active_turn always
+        // stamps FailTask's error_code as the hardcoded MODEL_EMPTY_RESPONSE,
+        // so without this skip a ContentBlocked turn's FailTask intake would
+        // ALSO match the bare "model_empty_response" fallback branch below and
+        // get a second, differently-tagged heal-queue row — philote's own
+        // `content_blocked:{provider}` PushHealEvent (turn_loop.rs) is the
+        // single source of truth for this failure class.
+        assert_eq!(
+            tag_of(
+                "[MODEL_EMPTY_RESPONSE] content_blocked: The model provider (gemini) declined \
+                 to respond due to its content/safety filter."
+            ),
+            None,
+            "content_blocked FailTask intake must be skipped — philote already pushed its own tag"
+        );
+    }
+
+    /// The heal classifier's own tag for a content/safety block: escalate,
+    /// not restart_guest — no guest restart or provider swap fixes a request
+    /// the provider's safety filter rejected.
+    #[test]
+    fn heal_action_for_content_blocked_pattern_tag_is_escalate_not_restart() {
+        assert_eq!(heal_action_for_pattern_tag("content_blocked"), "escalate");
+        assert_eq!(
+            heal_action_for_pattern_tag("content_blocked:gemini"),
+            "escalate",
+            "provider-suffixed tag must resolve via the base (pre-':') segment"
+        );
+        assert_ne!(
+            heal_action_for_pattern_tag("content_blocked:gemini"),
+            "restart_guest"
         );
     }
 
