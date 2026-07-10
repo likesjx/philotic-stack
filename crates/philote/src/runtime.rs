@@ -53,6 +53,10 @@ use memory_integration::*;
 mod life_capture;
 use life_capture::*;
 
+#[path = "voice_stream.rs"]
+mod voice_stream;
+use voice_stream::*;
+
 pub const DEFAULT_AGENT_ID: &str = "agent-bjork-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
@@ -1468,6 +1472,11 @@ pub struct AgentRuntime {
     /// Live-only — never checkpointed. A probe lost across a restart is not a
     /// correctness issue: the next eligible tick simply sends a fresh one.
     pending_fallback_probes: HashMap<String, String>,
+    /// Per-session sentence-pipelined TTS state for operator-chat voice turns.
+    /// Live-only (never checkpointed): armed at turn start when the transport
+    /// is `operator_chat` and the voice policy allows streaming, dropped when
+    /// the turn completes/fails/evicts. See `voice_stream.rs`.
+    voice_chunk_pipelines: HashMap<String, VoiceChunkPipeline>,
 }
 
 impl AgentRuntime {
@@ -1489,6 +1498,7 @@ impl AgentRuntime {
             role_name: None,
             life_capture_ledger: LifeCaptureLedger::default(),
             pending_fallback_probes: HashMap::new(),
+            voice_chunk_pipelines: HashMap::new(),
         }
     }
 
@@ -2524,6 +2534,25 @@ impl AgentRuntime {
                 selection_source,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
+
+            // Sentence-pipelined streaming TTS (operator_chat only): arm the
+            // per-turn voice chunk pipeline so streamed tokens are synthesized
+            // per sentence while generation continues. Any pipeline left over
+            // from a previous turn in this session is stale either way.
+            if streaming_voice_eligible(
+                task.transport.as_deref(),
+                task.source.as_deref(),
+                &state.agent_profile.voice_response_policy,
+                had_voice_input,
+            ) {
+                // NOTE: direct field insert (not a helper method) — `state`
+                // still mutably borrows `self.sessions` in this scope, so only
+                // a disjoint field access compiles here.
+                self.voice_chunk_pipelines
+                    .insert(session_id.clone(), VoiceChunkPipeline::new(turn_id.clone()));
+            } else {
+                self.voice_chunk_pipelines.remove(&session_id);
+            }
 
             // Paracrine context: inject delegate.merge into execution_routes so the specialist
             // can call it without needing it in her toolset profile. The tool is already injected
@@ -4232,6 +4261,16 @@ impl AgentRuntime {
                 task_json,
             })
             .await?;
+
+        // Sentence-pipelined TTS: feed the voice chunk pipeline (no-op unless
+        // one is armed for this turn). Synthesis trouble never fails the
+        // streaming path — text delivery always wins.
+        if let Err(err) = self.ingest_streaming_tokens_for_voice(&session_id).await {
+            warn!(
+                session_id = %session_id,
+                "voice chunk pipeline ingest failed (non-fatal): {err}"
+            );
+        }
 
         Ok(())
     }
