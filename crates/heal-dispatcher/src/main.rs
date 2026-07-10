@@ -1,7 +1,9 @@
+mod notify;
 mod recurrence;
 
 use ansible_mesh_core::heal_queue::HealQueueRow;
 use anyhow::Result;
+use notify::EscalationNotifier;
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, RestartReason, is_ipc_disconnect,
 };
@@ -119,6 +121,150 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Local hotel node id for addressing EmitTask, mirroring philote's convention
+/// (`PHILOTIC_NODE_ID`, falling back to the single-hotel default). Guests are
+/// spawned with the hotel's configured env block, so this is set in a real
+/// deployment; the fallback keeps a bare-socket dev run functional.
+fn local_node_id() -> String {
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
+}
+
+// ── Operator notification push seam (F4) ───────────────────────────────────────
+
+/// Throttled operator-notification sender. Owned by `main` (like the recurrence
+/// tracker and Ollama breaker) so state survives IPC reconnects.
+///
+/// The push reuses the existing operator gateway: an `EmitTask` to the
+/// operator-facing role, which the hotel routes to that role's inbox (and, when
+/// that role has a live operator session, onward to Telegram/Beacon). The push
+/// is **strictly best-effort** — every error, including a disconnect, is logged
+/// and swallowed. A failed notification must never break the dispatch loop or a
+/// filing; the next poll cycle's normal IPC traffic drives any reconnect.
+struct OperatorNotifier {
+    throttle: EscalationNotifier,
+    node_id: String,
+    role: String,
+}
+
+/// The operator ping the throttle decided to send: the human-readable
+/// `content` plus the structured routing fields. Kept as a value (not pushed
+/// inline) so the decision is sync and unit-testable without a live IPC client
+/// — the caller conditionally hands it to [`OperatorNotifier::push`].
+struct OperatorPing {
+    pattern_tag: String,
+    guest_id: String,
+    content: String,
+}
+
+impl OperatorNotifier {
+    fn from_env() -> Self {
+        Self {
+            throttle: EscalationNotifier::from_env(|k| std::env::var(k).ok()),
+            node_id: local_node_id(),
+            role: EscalationNotifier::escalation_role(|k| std::env::var(k).ok()),
+        }
+    }
+
+    /// Fresh work-item filing (F4a): `Some(ping)` at most once per filing,
+    /// throttled per tag; `None` when the cooldown suppresses it.
+    fn on_filing(
+        &mut self,
+        pattern_tag: &str,
+        guest_id: &str,
+        work_item_id: &str,
+        count: u32,
+        window_secs: u64,
+        now: u64,
+    ) -> Option<OperatorPing> {
+        if !self.throttle.should_notify_filing(pattern_tag, now) {
+            return None;
+        }
+        Some(OperatorPing {
+            pattern_tag: pattern_tag.to_string(),
+            guest_id: guest_id.to_string(),
+            content: format!(
+                "[self-heal] filed work item {work_item_id}: pattern '{pattern_tag}' on guest \
+                 '{guest_id}' recurred {count}x within {window_secs}s. Close with `phil heal \
+                 close {work_item_id}` once repaired."
+            ),
+        })
+    }
+
+    /// Repeated single-occurrence escalate (F4b): `Some(ping)` only once the
+    /// same tag has escalated past the repeat threshold, throttled per tag.
+    fn on_escalate(
+        &mut self,
+        pattern_tag: &str,
+        guest_id: &str,
+        now: u64,
+    ) -> Option<OperatorPing> {
+        if !self.throttle.should_notify_escalate(pattern_tag, now) {
+            return None;
+        }
+        Some(OperatorPing {
+            pattern_tag: pattern_tag.to_string(),
+            guest_id: guest_id.to_string(),
+            content: format!(
+                "[self-heal] recurring escalation: pattern '{pattern_tag}' on guest '{guest_id}' \
+                 keeps classifying to escalate (operator attention required — no automatic \
+                 remediation applies)."
+            ),
+        })
+    }
+
+    /// Best-effort EmitTask to the operator-facing role. Swallows ALL errors
+    /// (including a disconnect — this is pure side output; the next cycle's
+    /// normal IPC traffic drives any reconnect). Never returns an error, so it
+    /// can never break the dispatch loop or a filing.
+    async fn push(&self, ipc: &mut PhiloticClient, ping: OperatorPing) {
+        // `content` is what the operator-facing role's cognitive loop consumes;
+        // the structured fields keep the ping auditable.
+        let task = serde_json::json!({
+            "action": "heal_escalation",
+            "source": "heal-dispatcher",
+            "transport": "heal",
+            "pattern_tag": ping.pattern_tag,
+            "guest_id": ping.guest_id,
+            "content": ping.content,
+        });
+        let task_json = match serde_json::to_string(&task) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("heal escalation: task serialize failed (best-effort, ignoring): {e}");
+                return;
+            }
+        };
+        match send_request_timeout(
+            ipc,
+            IpcRequest::EmitTask {
+                target_node: self.node_id.clone(),
+                target_role: self.role.clone(),
+                target_guest_id: None,
+                task_json,
+            },
+            IPC_TIMEOUT,
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(
+                    pattern_tag = %ping.pattern_tag,
+                    guest_id = %ping.guest_id,
+                    role = %self.role,
+                    "heal escalation: operator notification emitted"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    pattern_tag = %ping.pattern_tag,
+                    guest_id = %ping.guest_id,
+                    "heal escalation: operator notification failed (best-effort, ignoring): {e}"
+                );
+            }
+        }
+    }
+}
+
 // ── Ollama circuit breaker (F5) ────────────────────────────────────────────────
 
 /// Tracks consecutive Ollama classification failures and, once a threshold is
@@ -167,13 +313,23 @@ async fn main() -> Result<()> {
     // Circuit-breaker state is likewise owned by main so an IPC reconnect does
     // not forget that Ollama is currently down.
     let mut breaker = OllamaBreaker::new();
+    // Operator-notification throttle (F4). Owned by main so per-tag cooldowns
+    // survive IPC reconnects — a reconnect must not re-open the spam gate.
+    let mut notifier = OperatorNotifier::from_env();
     let intel_graph_url = std::env::var("PHILOTIC_INTEL_GRAPH_URL")
         .ok()
         .map(|url| url.trim_end_matches('/').to_string())
         .filter(|url| !url.is_empty());
 
     loop {
-        match run(&mut tracker, &mut breaker, intel_graph_url.as_deref()).await {
+        match run(
+            &mut tracker,
+            &mut breaker,
+            &mut notifier,
+            intel_graph_url.as_deref(),
+        )
+        .await
+        {
             Ok(()) => {
                 info!("heal-dispatcher exiting cleanly");
                 break;
@@ -194,6 +350,7 @@ async fn main() -> Result<()> {
 async fn run(
     tracker: &mut RecurrenceTracker,
     breaker: &mut OllamaBreaker,
+    notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
 ) -> Result<()> {
     let identity = GuestIdentity {
@@ -223,6 +380,7 @@ async fn run(
             &ollama_model,
             tracker,
             breaker,
+            notifier,
             intel_graph_url,
         )
         .await
@@ -243,6 +401,7 @@ async fn dispatch_cycle(
     ollama_model: &str,
     tracker: &mut RecurrenceTracker,
     breaker: &mut OllamaBreaker,
+    notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
 ) -> Result<()> {
     // Proactively repair session turns stuck in "running" for more than 5 minutes.
@@ -311,6 +470,7 @@ async fn dispatch_cycle(
             ollama_model,
             tracker,
             breaker,
+            notifier,
             intel_graph_url,
             &row,
         )
@@ -327,6 +487,7 @@ async fn process_row(
     ollama_model: &str,
     tracker: &mut RecurrenceTracker,
     breaker: &mut OllamaBreaker,
+    notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
     row: &HealQueueRow,
 ) -> Result<()> {
@@ -379,20 +540,23 @@ async fn process_row(
         return Ok(());
     }
 
+    let now = unix_now();
+
     // Recurrence tracking (Autopoiesis Slice A3): a (pattern_tag, guest_id)
     // pair breaching the sliding-window threshold files a heal work item on
     // the hotel through the fleet.heal_slices autonomy lane.
     if !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX) {
-        let now = unix_now();
         if let Some(breach) = tracker.record(&pattern_tag, &row.guest_id, now, &row.raw_text) {
             file_heal_work_item(
                 ipc,
                 http,
+                notifier,
                 intel_graph_url,
                 &pattern_tag,
                 &row.guest_id,
                 breach,
                 tracker.window_secs(),
+                now,
             )
             .await?;
         }
@@ -424,6 +588,19 @@ async fn process_row(
         outcome = %outcome,
         "heal-dispatcher: entry resolved"
     );
+
+    // Repeated single-occurrence escalate (F4b): a pattern that keeps
+    // classifying to `escalate` but never reaches the filing threshold still
+    // needs operator eyes. Placed AFTER the resolve write so a best-effort
+    // notification failure (swallowed inside) can't disturb row resolution.
+    // Skip our own work_item_filed echo rows — they never carry the escalate
+    // action, but guard anyway.
+    if heal_action == "escalate" && !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX) {
+        if let Some(ping) = notifier.on_escalate(&pattern_tag, &row.guest_id, now) {
+            notifier.push(ipc, ping).await;
+        }
+    }
+
     Ok(())
 }
 
@@ -439,14 +616,17 @@ async fn process_row(
 ///
 /// Returns `Err` only on a disconnect/timeout (so the cycle reconnects); any
 /// other IPC or shape error is logged and swallowed.
+#[allow(clippy::too_many_arguments)]
 async fn file_heal_work_item(
     ipc: &mut PhiloticClient,
     http: &reqwest::Client,
+    notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
     pattern_tag: &str,
     guest_id: &str,
     breach: Breach,
     window_secs: u64,
+    now: u64,
 ) -> Result<()> {
     let response = send_request_timeout(
         ipc,
@@ -520,6 +700,14 @@ async fn file_heal_work_item(
                 &work_item_id,
             )
             .await;
+        }
+        // Push ONE throttled operator notification for the fresh filing (F4a).
+        // Best-effort: push swallows every error, so it can never fail the
+        // filing or the cycle.
+        if let Some(ping) =
+            notifier.on_filing(pattern_tag, guest_id, &work_item_id, breach.count, window_secs, now)
+        {
+            notifier.push(ipc, ping).await;
         }
     } else if deduped {
         info!(
@@ -867,10 +1055,95 @@ async fn execute_action(
 mod tests {
     use super::{
         HEARTBEAT_KEY, OLLAMA_BREAKER_COOLDOWN, OLLAMA_BREAKER_THRESHOLD, OllamaBreaker,
-        gate_llm_action, heartbeat_request, ipc_timeout_error, rule_classify, with_ipc_timeout,
+        OperatorNotifier, gate_llm_action, heartbeat_request, ipc_timeout_error, rule_classify,
+        with_ipc_timeout,
     };
+    use crate::notify::EscalationNotifier;
     use philotic_client::{IpcRequest, IpcResponse, is_ipc_disconnect};
     use std::time::{Duration, Instant};
+
+    /// Build an OperatorNotifier with an explicit throttle for deterministic
+    /// tests (no env, no wall clock).
+    fn test_notifier(cooldown: u64, window: u64, repeat_threshold: u32) -> OperatorNotifier {
+        OperatorNotifier {
+            throttle: EscalationNotifier::new(cooldown, window, repeat_threshold),
+            node_id: "test-node".into(),
+            role: "orchestrator".into(),
+        }
+    }
+
+    const TN: u64 = 1_750_000_000;
+
+    // F4a: a fresh work-item filing yields exactly ONE operator ping; a repeat
+    // filing of the same tag inside the cooldown yields None. This is the
+    // decision the `push` glue guards on — a Some means push is invoked, a None
+    // means it is not, so this proves "invoked once per filing, throttled on
+    // repeat" without a live IPC client.
+    #[test]
+    fn filing_notification_fires_once_then_is_throttled() {
+        let mut n = test_notifier(3600, 1800, 2);
+        let first =
+            n.on_filing("connection_refused", "membrane-01", "wi-1", 5, 1800, TN);
+        let ping = first.expect("first filing must produce an operator ping");
+        assert_eq!(ping.pattern_tag, "connection_refused");
+        assert!(ping.content.contains("wi-1"), "content: {}", ping.content);
+        assert!(
+            ping.content.contains("phil heal close wi-1"),
+            "filing ping tells the operator how to close it: {}",
+            ping.content
+        );
+
+        // Repeat filing of the same tag inside the cooldown: no second ping.
+        assert!(
+            n.on_filing("connection_refused", "membrane-01", "wi-2", 6, 1800, TN + 60)
+                .is_none(),
+            "a repeat filing inside the cooldown must be throttled"
+        );
+        // A different tag is unaffected by the first tag's cooldown.
+        assert!(
+            n.on_filing("api_key_expired", "model-router-01", "wi-3", 5, 1800, TN + 61)
+                .is_some(),
+            "distinct tags must not throttle each other"
+        );
+    }
+
+    // F4b: one escalate is noise; a repeated escalate of the same tag within the
+    // window produces exactly ONE ping, and further escalates inside the
+    // cooldown are throttled.
+    #[test]
+    fn repeated_escalate_notifies_once_and_throttles() {
+        let mut n = test_notifier(3600, 1800, 2);
+        assert!(
+            n.on_escalate("auth_failure", "membrane-01", TN).is_none(),
+            "a single escalate must not ping the operator"
+        );
+        let ping = n
+            .on_escalate("auth_failure", "membrane-01", TN + 30)
+            .expect("the repeated escalate must ping once");
+        assert_eq!(ping.pattern_tag, "auth_failure");
+        assert!(
+            ping.content.contains("recurring escalation"),
+            "content: {}",
+            ping.content
+        );
+        // Further escalates inside the cooldown are suppressed — no spam.
+        assert!(n.on_escalate("auth_failure", "membrane-01", TN + 90).is_none());
+        assert!(n.on_escalate("auth_failure", "membrane-01", TN + 600).is_none());
+    }
+
+    // The filing and escalate paths share ONE per-tag cooldown, so a filing
+    // right after a repeated escalate for the same tag does not double-notify.
+    #[test]
+    fn filing_and_escalate_share_the_cooldown() {
+        let mut n = test_notifier(3600, 1800, 2);
+        assert!(n.on_escalate("missing_file", "philote-01", TN).is_none());
+        assert!(n.on_escalate("missing_file", "philote-01", TN + 10).is_some());
+        assert!(
+            n.on_filing("missing_file", "philote-01", "wi-9", 5, 1800, TN + 20)
+                .is_none(),
+            "a filing for a tag just escalated must not double-notify"
+        );
+    }
 
     // F7: an LLM-suggested restart_guest on a low/unknown-severity novel error is
     // not trustworthy enough to bounce a process — it is downgraded to escalate.

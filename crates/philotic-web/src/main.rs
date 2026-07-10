@@ -8,6 +8,7 @@ mod explain;
 mod flush;
 mod footprint;
 mod harness;
+mod heal;
 mod init;
 mod keys;
 mod load;
@@ -216,6 +217,12 @@ enum Command {
     Keys {
         #[command(subcommand)]
         action: keys::KeysAction,
+    },
+
+    /// Inspect and close self-heal circuit work items (Autopoiesis Slice A3)
+    Heal {
+        #[command(subcommand)]
+        action: heal::HealAction,
     },
 
     /// Project intelligence graph — scan, query, and serve the codebase graph
@@ -530,6 +537,7 @@ async fn main() -> Result<()> {
         },
         Command::Mcp { action } => mcp::run(action).await,
         Command::Keys { action } => keys::run(action).await,
+        Command::Heal { action } => heal::run(action).await,
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};
             use philotic_graph::PhiloticGraphConfig;

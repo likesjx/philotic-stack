@@ -3162,6 +3162,14 @@ mod tests {
             .find_open_heal_work_item("oom", "philote-01")
             .expect("find")
             .is_none());
+
+        // Idempotent (F8): closing an already-closed item still reports true and
+        // leaves it closed — the autonomy-lane loop can retry a close safely.
+        assert!(d.close_heal_work_item("wi-1", 2_500).expect("re-close"));
+        let item = d.get_heal_work_item("wi-1").expect("get").expect("present");
+        assert_eq!(item.status, HEAL_WORK_ITEM_STATUS_CLOSED);
+        assert_eq!(item.last_seen, 2_500, "re-close still stamps last_seen");
+
         // Closing a missing item reports false.
         assert!(!d.close_heal_work_item("missing", 2_001).expect("close"));
     }
