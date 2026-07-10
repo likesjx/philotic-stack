@@ -2035,6 +2035,23 @@ pub enum IpcRequest {
         pattern_tag: String,
         detail: String,
     },
+    /// Close a heal work item (Autopoiesis Slice A3 closure path, finding F8).
+    ///
+    /// The hotel filed a `heal_work_item` node when a pattern recurred past the
+    /// window threshold; once the underlying fault is repaired the autonomy-lane
+    /// loop (or an operator via `phil heal close`) closes it so it stops showing
+    /// as open work. Wired straight to
+    /// [`ansible_mesh_core::domain::GraphDomain::close_heal_work_item`].
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{closed, work_item_id}`: `closed=true` when the item existed (open OR
+    /// already-closed → idempotent), `false` when no such id. No new
+    /// `IpcResponse` variant, so the untagged-ordering invariant (all-optional
+    /// variants like `MemoryConfig` stay last) is untouched. New `IpcRequest`
+    /// variants append after this one.
+    CloseHealWorkItem {
+        work_item_id: String,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
@@ -3783,6 +3800,42 @@ mod tests {
         assert_eq!(route.role, "membrane");
         assert_eq!(route.guest_id, None);
     }
+    #[test]
+    fn close_heal_work_item_request_serde_round_trip() {
+        // F8: appended at the END of IpcRequest, responds with Standard only —
+        // no new IpcResponse variant, so the untagged-ordering invariant holds.
+        let req = IpcRequest::CloseHealWorkItem {
+            work_item_id: "wi-42".into(),
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"close_heal_work_item\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::CloseHealWorkItem { work_item_id } => {
+                assert_eq!(work_item_id, "wi-42");
+            }
+            other => panic!("expected CloseHealWorkItem, got {other:?}"),
+        }
+
+        // The close response is a plain Standard ack carrying {closed, work_item_id}.
+        let resp = serde_json::json!({
+            "ok": true,
+            "code": "OK",
+            "message": "Success",
+            "corr_id": "close_heal_work_item",
+            "data": { "closed": true, "work_item_id": "wi-42" }
+        });
+        let back: IpcResponse = serde_json::from_value(resp).expect("response");
+        match back {
+            IpcResponse::Standard { ok: true, data, .. } => {
+                let data = data.expect("data");
+                assert_eq!(data["closed"], true);
+                assert_eq!(data["work_item_id"], "wi-42");
+            }
+            other => panic!("expected Standard, got {other:?}"),
+        }
+    }
+
     #[test]
     fn file_heal_work_item_request_serde_round_trip() {
         // New variant appended at the END of IpcRequest (externally-order-safe:

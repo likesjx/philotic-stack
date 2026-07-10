@@ -3803,6 +3803,15 @@ impl IpcServer {
                         value_json: Some(snapshot.to_string()),
                     };
                 }
+                // Read-only operator surface for the self-heal circuit's filed
+                // work items (finding F8, `phil heal list`). A serialization
+                // failure degrades to an empty list rather than erroring — this
+                // is a visibility read for the resilience system.
+                if key == "__heal_work_items__" {
+                    let items = graph.list_heal_work_items().unwrap_or_default();
+                    let value_json = serde_json::to_string(&items).ok();
+                    return IpcResponse::ConfigData { key, value_json };
+                }
                 // Returns a JSON array of memory_type strings for all session apartments
                 // belonging to the given agent — used by philote at startup for stale-turn sweep.
                 // Key format: `__session_apartments__:{agent_id}`
@@ -8324,6 +8333,32 @@ impl IpcServer {
                     now,
                     &|key| std::env::var(key).ok(),
                 )
+            }
+
+            IpcRequest::CloseHealWorkItem { work_item_id } => {
+                // Closure path for a filed heal work item (finding F8). Wired
+                // straight to the unit-tested domain method; closing a missing
+                // id returns closed=false, and closing an already-closed item
+                // returns closed=true (idempotent) so the autonomy-lane loop can
+                // retry safely.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match graph.close_heal_work_item(&work_item_id, now) {
+                    Ok(closed) => IpcResponse::success(
+                        "close_heal_work_item",
+                        Some(serde_json::json!({
+                            "closed": closed,
+                            "work_item_id": work_item_id,
+                        })),
+                    ),
+                    Err(e) => IpcResponse::error(
+                        "close_heal_work_item",
+                        "STORAGE_ERROR",
+                        format!("{e:#}"),
+                    ),
+                }
             }
 
             IpcRequest::ConsumeAutonomyAction {
