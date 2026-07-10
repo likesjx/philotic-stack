@@ -6151,6 +6151,9 @@ async fn ipc_restart_component(socket: &str, guest_id: &str) -> Result<()> {
     match client
         .send_request(IpcRequest::RestartComponent {
             guest_id: guest_id.to_string(),
+            // Operator-initiated restart from the desktop/web UI — deliberate, never
+            // budget-limited.
+            reason: philotic_client::RestartReason::Operator,
         })
         .await?
     {

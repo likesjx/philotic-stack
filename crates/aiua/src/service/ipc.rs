@@ -1,7 +1,7 @@
 use super::golgi::{GOLGI_SINK_ROLE, PendingPipelineRegistry};
 use super::lease_handlers::LoggingSubagentLeaseObserver;
 use crate::LedgerCommand;
-use crate::service::guest_manager::GuestMaterializationRequester;
+use crate::service::guest_manager::{GuestMaterializationRequester, HealRestartVerdict};
 use crate::service::lease::{LeaseProvider, RuntimeLeaseRegistry};
 use crate::vault::{
     SecretAccess, SecretInput, export_secret_plaintext, resolve_secret, store_secret,
@@ -47,7 +47,8 @@ use philotic_client::{
     OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView, OperatorChatTurnReply,
     OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, PhiloticClient, ResponseRoutePolicyView, VaultEntryExport,
+    OperatorTargetStatusView, PhiloticClient, ResponseRoutePolicyView, RestartReason,
+    VaultEntryExport,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -7020,12 +7021,13 @@ impl IpcServer {
                 )
                 .await
             }
-            IpcRequest::RestartComponent { guest_id } => {
+            IpcRequest::RestartComponent { guest_id, reason } => {
                 Self::handle_restart_component(
                     graph,
                     materialization_requester,
                     local_node_id,
                     &guest_id,
+                    reason,
                 )
                 .await
             }
@@ -10215,6 +10217,7 @@ impl IpcServer {
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         local_node_id: &str,
         guest_id: &str,
+        reason: RestartReason,
     ) -> IpcResponse {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
@@ -10246,6 +10249,30 @@ impl IpcServer {
                 "COMPONENT_INACTIVE",
                 format!("Component {guest_id} is marked inactive; enable it first"),
             );
+        }
+
+        // Flap protection for AUTOMATIC (heal-dispatcher) restarts only. Operator/CLI
+        // restarts are deliberate and never budget-limited. We consult the shared
+        // respawn budget BEFORE killing so a budget-exhausted guest is left running
+        // rather than terminated-with-no-respawn. A missing requester falls through to
+        // the NO_MATERIALIZER path below.
+        if reason == RestartReason::Heal {
+            if let Some(req) = materialization_requester {
+                if req.check_heal_restart_budget(guest_id).await == HealRestartVerdict::Denied {
+                    warn!(
+                        guest_id = %guest_id,
+                        "heal-restart skipped: guest exhausted its respawn budget"
+                    );
+                    return IpcResponse::error(
+                        "restart_component",
+                        "RESPAWN_BUDGET_EXHAUSTED",
+                        format!(
+                            "heal restart for {guest_id} skipped: respawn budget exhausted; \
+                             restarts paused until a clean window elapses"
+                        ),
+                    );
+                }
+            }
         }
 
         // Terminate running process.

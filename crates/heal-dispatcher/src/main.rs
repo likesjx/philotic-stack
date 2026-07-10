@@ -2,7 +2,9 @@ mod recurrence;
 
 use ansible_mesh_core::heal_queue::HealQueueRow;
 use anyhow::Result;
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, RestartReason, is_ipc_disconnect,
+};
 use recurrence::{Breach, RecurrenceTracker};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -410,12 +412,32 @@ async fn classify(
 
     // FunctionGemma: call Ollama for novel/unclassified patterns.
     match gemma_classify(http, ollama_url, ollama_model, guest_id, raw_text).await {
-        Ok(result) => result,
+        // F7: an LLM-suggested restart_guest on a novel error is only trustworthy
+        // when the model is also confident it is serious. Gate it — a restart on a
+        // low/unknown-severity novel error is downgraded to escalate (human/work-item
+        // path) rather than acted on. Rule-table restarts are NOT gated; only the
+        // LLM branch passes through here.
+        Ok((severity, pattern_tag, heal_action)) => {
+            let heal_action = gate_llm_action(&severity, &heal_action);
+            (severity, pattern_tag, heal_action)
+        }
         Err(e) => {
             warn!("gemma classify failed ({e}), falling back to noop");
             ("unknown".into(), "unclassified".into(), "noop".into())
         }
     }
+}
+
+/// Severity floor for an LLM-suggested `restart_guest`. A restart is a
+/// disruptive remediation; when the model itself rates the novel error as
+/// `low`/`unknown` severity we do not trust it enough to bounce a process —
+/// downgrade to `escalate` so a human/work-item decides. Any other action, or a
+/// restart at `medium`+ severity, passes through unchanged.
+fn gate_llm_action(severity: &str, heal_action: &str) -> String {
+    if heal_action == "restart_guest" && matches!(severity, "low" | "unknown" | "") {
+        return "escalate".into();
+    }
+    heal_action.to_string()
 }
 
 fn rule_classify(text: &str) -> Option<(String, String, String)> {
@@ -547,10 +569,19 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
             match ipc
                 .send_request(IpcRequest::RestartComponent {
                     guest_id: guest_id.to_string(),
+                    // Automatic remediation — subject to the hotel's shared respawn
+                    // budget so a crash-looping guest cannot be restarted every cycle.
+                    reason: RestartReason::Heal,
                 })
                 .await
             {
                 Ok(IpcResponse::Standard { ok: true, .. }) => "restarted".into(),
+                // The hotel refused because this guest exhausted its respawn budget.
+                // Record it distinctly so the loop does not read it as a failure to retry.
+                Ok(IpcResponse::Standard { code, .. }) if code == "RESPAWN_BUDGET_EXHAUSTED" => {
+                    warn!(guest_id, "restart skipped: respawn budget exhausted");
+                    "restart_skipped_budget_exhausted".into()
+                }
                 Ok(resp) => {
                     warn!(guest_id, ?resp, "restart response unexpected");
                     "restart_failed".into()

@@ -887,6 +887,24 @@ fn default_true() -> bool {
     true
 }
 
+/// Who requested a [`IpcRequest::RestartComponent`], which decides whether the
+/// hotel applies flap protection.
+///
+/// Operator-initiated restarts (desktop UI / CLI) are deliberate and MUST NOT be
+/// budget-limited. Heal-dispatcher-initiated restarts are automatic remediation
+/// and MUST go through the shared respawn budget so a crash-looping guest that
+/// keeps emitting a matching stderr line cannot be restarted every dispatch
+/// cycle forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartReason {
+    /// Deliberate operator/CLI restart — never budget-limited.
+    #[default]
+    Operator,
+    /// Automatic heal-dispatcher remediation — subject to the respawn budget.
+    Heal,
+}
+
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
@@ -1531,9 +1549,17 @@ pub enum IpcRequest {
     /// Restart a registered component: terminate the running process (if any) then
     /// immediately re-spawn it (requires `is_active=true` in the context graph).
     ///
+    /// `reason` decides whether flap protection applies: [`RestartReason::Heal`]
+    /// (automatic remediation) is routed through the shared respawn budget, while
+    /// [`RestartReason::Operator`] (the default) is never budget-limited. The field
+    /// defaults on the wire so an older heal-dispatcher talking to a newer hotel is
+    /// treated as an operator restart (fails open — no accidental budget denial).
+    ///
     /// Responds with [`IpcResponse::Standard`].
     RestartComponent {
         guest_id: String,
+        #[serde(default)]
+        reason: RestartReason,
     },
     /// Remove a registered component entirely.
     ///

@@ -260,6 +260,17 @@ pub(crate) const RESPAWN_BUDGET_MAX: usize = 5;
 /// the budget resets only after a clean window with no respawn attempts.
 pub(crate) const RESPAWN_BUDGET_WINDOW_SECS: u64 = 600;
 
+/// Verdict returned to a heal-triggered restart caller after consulting the
+/// shared respawn budget. `Denied` covers both a just-breached budget and one
+/// still in cool-down; only the *transition* to breach marks/alerts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealRestartVerdict {
+    /// Budget permits this restart; the attempt has been recorded.
+    Allowed,
+    /// Budget exhausted — the caller must SKIP the restart (no kill, no respawn).
+    Denied,
+}
+
 /// Outcome of asking the respawn budget whether a guest may be respawned now.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RespawnDecision {
@@ -341,6 +352,16 @@ pub struct GuestManager {
 #[async_trait]
 pub trait GuestMaterializationRequester: Send + Sync {
     async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool>;
+
+    /// Consult the shared respawn budget before a heal-dispatcher-triggered
+    /// restart. Records the attempt against the same budget the supervisor uses,
+    /// and on breach marks the guest exhausted (heal entry + graph marker) exactly
+    /// once. Returns [`HealRestartVerdict::Denied`] when the caller must skip the
+    /// restart. The default implementation permits everything (no budget) so test
+    /// doubles and non-supervising requesters stay unaffected.
+    async fn check_heal_restart_budget(&self, _guest_id: &str) -> HealRestartVerdict {
+        HealRestartVerdict::Allowed
+    }
 }
 
 impl GuestManager {
@@ -405,6 +426,41 @@ impl GuestManager {
                     guest_id, e
                 );
             }
+        }
+    }
+
+    /// Heal-restart flap protection, clock injected for tests.
+    ///
+    /// Consults the SAME [`RespawnBudget`] instance the supervisor reconcile loop
+    /// uses (this is one shared `Arc<GuestManager>`), so heal-triggered restarts
+    /// and supervisor respawns draw down a single budget. On the breaching call we
+    /// mark the guest exhausted once (graph marker + heal entry) and reuse the
+    /// existing cool-down/resume path; a still-exhausted budget is denied silently
+    /// so we do not re-push a heal entry every dispatch cycle.
+    pub(crate) fn check_heal_restart_budget_at(&self, guest_id: &str, now: u64) -> HealRestartVerdict {
+        match self.respawn_budget.check(guest_id, now) {
+            RespawnDecision::Allowed { resumed } => {
+                if resumed {
+                    info!(
+                        "Heal-restart: Guest [{}] respawn budget cooled down after a clean window. Resuming restarts.",
+                        guest_id
+                    );
+                    self.clear_respawn_budget_mark(guest_id);
+                }
+                HealRestartVerdict::Allowed
+            }
+            RespawnDecision::JustExhausted => {
+                error!(
+                    "Heal-restart: Guest [{}] exhausted its respawn budget ({} restarts in {}s). Skipping heal restart until a clean {}s window elapses.",
+                    guest_id,
+                    RESPAWN_BUDGET_MAX,
+                    RESPAWN_BUDGET_WINDOW_SECS,
+                    RESPAWN_BUDGET_WINDOW_SECS
+                );
+                self.mark_respawn_budget_exhausted(guest_id, now);
+                HealRestartVerdict::Denied
+            }
+            RespawnDecision::StillExhausted => HealRestartVerdict::Denied,
         }
     }
 
@@ -828,6 +884,10 @@ impl GuestManager {
 impl GuestMaterializationRequester for GuestManager {
     async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool> {
         Self::ensure_guest_active(self, guest_id).await
+    }
+
+    async fn check_heal_restart_budget(&self, guest_id: &str) -> HealRestartVerdict {
+        self.check_heal_restart_budget_at(guest_id, epoch_now())
     }
 }
 
