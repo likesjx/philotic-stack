@@ -15,7 +15,9 @@ use data_memorygraphrag::{
     RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef,
     SourceReliability, ValidationState, feedback_edge_specs,
 };
-use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
+use datasource::controller::{
+    CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput,
+};
 use neo4rs::{
     BoltList, BoltMap, BoltNode, BoltRelation, BoltType, BoltUnboundedRelation, ConfigBuilder,
     Graph, Row, query,
@@ -439,13 +441,24 @@ impl DatasourceProvider for LifeGraphProvider {
 
 impl LifeGraphProvider {
     async fn handle_observe(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        // Every failure branch below this point and above `self.connect()` is
+        // pre-write and originates from the caller's payload shape (bad JSON,
+        // a plan the model isn't allowed to run, an unknown edge rel_type) —
+        // not from infra. Tag them with CONTRACT_ERROR_MARKER so
+        // `datasource::runtime` can tell philote it's safe to grant the model
+        // one bounded retry with the cause surfaced, instead of treating this
+        // like a DB/transport failure.
         let input: LifeObserveInput = serde_json::from_value(task.parameters.clone())
-            .context("failed to parse life.observe parameters as LifeObserveInput")?;
+            .context(format!(
+                "{CONTRACT_ERROR_MARKER} failed to parse life.observe parameters as LifeObserveInput"
+            ))?;
 
         let plan = self
             .runner
             .plan(LifeGraphToolRequest::LifeObserve(input.clone()))
-            .map_err(|e| anyhow::anyhow!("life.observe plan validation failed: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("{CONTRACT_ERROR_MARKER} life.observe plan validation failed: {e}")
+            })?;
 
         if !plan.allowed() {
             return Ok(ProviderOutput::ResultSet(json!({
@@ -455,12 +468,14 @@ impl LifeGraphProvider {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let compiled = cypher::compile_observe(&input, &now)
-            .map_err(|e| anyhow::anyhow!("Cypher compilation failed: {e}"))?;
+        let compiled = cypher::compile_observe(&input, &now).map_err(|e| {
+            anyhow::anyhow!("{CONTRACT_ERROR_MARKER} Cypher compilation failed: {e}")
+        })?;
         // Compile edges up-front so an unknown rel_type rejects the request
         // before any node write happens.
-        let compiled_edges = cypher::compile_observe_edges(&input)
-            .map_err(|e| anyhow::anyhow!("edge Cypher compilation failed: {e}"))?;
+        let compiled_edges = cypher::compile_observe_edges(&input).map_err(|e| {
+            anyhow::anyhow!("{CONTRACT_ERROR_MARKER} edge Cypher compilation failed: {e}")
+        })?;
 
         let graph = self.connect().await?;
 
@@ -2408,6 +2423,7 @@ fn feedback_signal_evidence(input: &RetrievalFeedbackInput) -> EvidencePacket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_memorygraphrag::ObserveEdge;
     use datasource::controller::TaskKind;
 
     fn task_with_params(parameters: Value) -> DatasourceTask {
@@ -2452,6 +2468,161 @@ mod tests {
             let task = task_with_params(json!({ "named_strategy": name }));
             assert_eq!(NamedRecallStrategy::from_task(&task), expected);
         }
+    }
+
+    #[test]
+    fn life_observe_parse_failure_chain_names_the_missing_field() {
+        // Regression test for the 2026-07-10 LifeGraph forensic: a malformed
+        // life.observe payload (here, `evidence` missing the required
+        // `claim_summary` field) must produce an error whose *chain* Display
+        // ({:#}) names the offending field, not just the generic
+        // "failed to parse life.observe parameters" wrapper. This is the same
+        // parse path `LifeGraphProvider::handle_observe` runs at provider.rs:440-441.
+        let bad_payload = json!({
+            "observation_id": "obs-1",
+            "evidence": {
+                "packet_id": "pkt-1",
+                "claim_ref": { "id": "n-1", "label": "OpenLoop" },
+                // claim_summary intentionally omitted
+                "confidence": 0.8,
+                "validation_state": "proposed",
+                "source_reliability": 0.5,
+                "adjudication_status": "not_needed",
+            },
+        });
+
+        let err = serde_json::from_value::<LifeObserveInput>(bad_payload)
+            .context(format!(
+                "{CONTRACT_ERROR_MARKER} failed to parse life.observe parameters as LifeObserveInput"
+            ))
+            .expect_err("payload is missing a required field and must fail to parse");
+
+        let chained = format!("{err:#}");
+        assert!(
+            chained.contains("claim_summary"),
+            "chain Display must name the missing field, got: {chained}"
+        );
+        assert!(
+            chained.contains(CONTRACT_ERROR_MARKER),
+            "chain must carry the contract-error marker so runtime.rs can classify it, got: {chained}"
+        );
+
+        // The bare (non-chained) Display is what runtime.rs used to log before
+        // the fix — it only carries the outer context and hides the cause.
+        let bare = format!("{err}");
+        assert!(
+            !bare.contains("claim_summary"),
+            "bare Display unexpectedly carries the cause; chain fix may be redundant: {bare}"
+        );
+    }
+
+    fn minimal_observe_input_for_provider_tests(observation_id: &str) -> LifeObserveInput {
+        LifeObserveInput {
+            observation_id: observation_id.to_string(),
+            evidence: EvidencePacket {
+                packet_id: "pkt-001".to_string(),
+                claim_ref: GraphRecordRef {
+                    id: "signal-abc".to_string(),
+                    label: "OpenLoop".to_string(),
+                    datasource: None,
+                },
+                claim_summary: "test signal".to_string(),
+                source_refs: vec![SourceRef {
+                    source_id: "membrane:telegram".to_string(),
+                    source_kind: SourceKind::MembraneEvent,
+                    reliability: SourceReliability {
+                        score: 0.9,
+                        basis: ReliabilityBasis::DirectObservation,
+                    },
+                    uri: None,
+                    captured_at: None,
+                }],
+                passage_refs: vec![],
+                confidence: 0.8,
+                validation_state: ValidationState::Proposed,
+                observed_at: Some("2026-07-10T00:00:00Z".to_string()),
+                valid_time_range: None,
+                source_reliability: 0.9,
+                conflict_ids: vec![],
+                adjudication_status: AdjudicationStatus::NotNeeded,
+                metadata: serde_json::Value::Null,
+            },
+            proposed_graph_refs: vec![],
+            observed_by: None,
+            observed_role: None,
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn life_observe_plan_validation_failure_is_marked_contract_error() {
+        // Second pre-write contract-error site in handle_observe: the payload
+        // parses fine (serde is happy) but fails MemoryGraphRagRunner::plan's
+        // own validation — here, an empty observation_id. This is the same
+        // model-fixable-before-any-write class as the serde parse failure
+        // above and must carry the same CONTRACT_ERROR_MARKER so runtime.rs
+        // grants philote's retry the same way.
+        let input = minimal_observe_input_for_provider_tests("");
+        let runner = MemoryGraphRagRunner::default();
+
+        let err = runner
+            .plan(LifeGraphToolRequest::LifeObserve(input))
+            .map_err(|e| {
+                anyhow::anyhow!("{CONTRACT_ERROR_MARKER} life.observe plan validation failed: {e}")
+            })
+            .expect_err("empty observation_id must fail plan validation");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(CONTRACT_ERROR_MARKER),
+            "plan-validation failure must carry the contract-error marker, got: {msg}"
+        );
+        assert!(
+            msg.contains("observation_id"),
+            "plan-validation failure must name the offending field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn life_observe_edge_compile_failure_is_marked_contract_error() {
+        // Third pre-write contract-error site in handle_observe: an unknown
+        // edges[].rel_type rejected by cypher::compile_observe_edges.
+        let mut input = minimal_observe_input_for_provider_tests("obs-edge");
+        input.edges.push(ObserveEdge {
+            rel_type: "NOT_A_REAL_REL_TYPE".to_string(),
+            target_id: "node-123".to_string(),
+        });
+
+        let err = cypher::compile_observe_edges(&input)
+            .map_err(|e| {
+                anyhow::anyhow!("{CONTRACT_ERROR_MARKER} edge Cypher compilation failed: {e}")
+            })
+            .expect_err("unknown rel_type must fail edge compilation");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(CONTRACT_ERROR_MARKER),
+            "edge-compile failure must carry the contract-error marker, got: {msg}"
+        );
+        assert!(
+            msg.contains("NOT_A_REAL_REL_TYPE"),
+            "edge-compile failure must name the offending rel_type, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_contract_error_is_not_marked() {
+        // Sanity check: an ordinary anyhow error not routed through the
+        // CONTRACT_ERROR_MARKER helper sites (e.g. what an infra/DB failure
+        // in `self.connect().await?` would look like) must NOT contain the
+        // marker, so runtime.rs's classification stays precise and doesn't
+        // accidentally grant a retry for a non-model-fixable failure.
+        let err = anyhow::anyhow!("Memgraph connection failed: connection refused");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains(CONTRACT_ERROR_MARKER),
+            "infra-style error must not carry the contract-error marker, got: {msg}"
+        );
     }
 
     #[test]

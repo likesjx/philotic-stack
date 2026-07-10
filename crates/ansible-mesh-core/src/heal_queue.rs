@@ -365,7 +365,8 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         | "response_route_unresolved"
         | "cross_hotel_misroute"
         | "duplicate_finalization"
-        | "orphaned_tool_result" => "escalate",
+        | "orphaned_tool_result"
+        | "life_observe_parse_failed" => "escalate",
         "provider_timeout" => "noop",
         _ => "noop",
     }
@@ -948,6 +949,14 @@ mod tests {
         );
         assert_eq!(
             heal_action_for_pattern_tag("orphaned_tool_result"),
+            "escalate"
+        );
+
+        // 2026-07-10 LifeGraph forensic: a life.observe contract-error
+        // retry that also fails must escalate to an A3 heal work item, not
+        // sit as a silent noop.
+        assert_eq!(
+            heal_action_for_pattern_tag("life_observe_parse_failed"),
             "escalate"
         );
     }

@@ -1026,6 +1026,37 @@ pub(super) fn direct_life_observe_failure_reply(
     )
 }
 
+/// True when a `life.observe` tool_call's arguments carry the direct-command
+/// provenance marker stamped by [`direct_life_observe_input`] — i.e. the
+/// payload was assembled by philote's own text-command parser, not by the
+/// model. A retry that re-surfaces the failure cause only helps when a model
+/// is in the loop to read it and correct its own arguments; the direct-command
+/// parser has no such feedback loop, so a malformed payload on that path is a
+/// parser/code bug, not something worth a bounded self-correction retry.
+pub(super) fn is_direct_life_observe_origin(arguments: &Value) -> bool {
+    arguments
+        .pointer("/evidence/metadata/route")
+        .and_then(Value::as_str)
+        == Some("philote_direct_life_observe")
+}
+
+/// One-shot corrective note fed back to the model after a `life.observe` call
+/// failed with a pre-write contract/parameter error (datasource::runtime
+/// tags these `TaskErrorPayload.sub_kind == "invalid_request"` via
+/// `datasource::controller::CONTRACT_ERROR_MARKER` — see
+/// `LifeGraphProvider::handle_observe`). Surfaces the actual cause so the
+/// model can self-correct the malformed field on its one bounded retry,
+/// mirroring `runtime::provider_repair_note`'s corrective-injection pattern
+/// but naming the specific tool and cause instead of a generic reminder.
+pub(super) fn life_observe_repair_note(cause: &str) -> String {
+    let cause = cause.trim();
+    format!(
+        "Your life.observe call failed: {cause} — fix the parameters and retry. \
+This is your only automatic retry for this call; if it fails again the capture \
+will be surfaced to the operator instead of recorded."
+    )
+}
+
 pub(super) fn direct_life_observe_command_from_arguments(
     arguments: &Value,
 ) -> Option<DirectLifeObserveCommand> {
