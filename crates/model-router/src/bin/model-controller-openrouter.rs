@@ -1,6 +1,6 @@
 use anyhow::Result;
 use model_router::providers::OpenAIProvider;
-use model_router::runtime::{ControllerGuestConfig, run_model_controller};
+use model_router::runtime::{ControllerGuestConfig, DEFAULT_OPENROUTER_MODEL, run_model_controller};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
                 configs
                     .openrouter_default_model
                     .clone()
-                    .or_else(|| Some("openai/gpt-4.1-mini".to_string())),
+                    .or_else(|| Some(DEFAULT_OPENROUTER_MODEL.to_string())),
                 configs.openrouter_default_embedding_model.clone(),
                 configs.openrouter_fallback_models.clone(),
                 configs.openrouter_route.clone().or_else(|| {
