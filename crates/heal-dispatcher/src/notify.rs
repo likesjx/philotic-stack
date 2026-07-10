@@ -38,11 +38,26 @@ pub const ENV_NOTIFY_COOLDOWN_SECS: &str = "PHILOTIC_HEAL_NOTIFY_COOLDOWN_SECS";
 pub const ENV_ESCALATE_REPEAT_THRESHOLD: &str = "PHILOTIC_HEAL_ESCALATE_REPEAT_THRESHOLD";
 /// Env override for the repeated-escalate window.
 pub const ENV_ESCALATE_WINDOW_SECS: &str = "PHILOTIC_HEAL_ESCALATE_WINDOW_SECS";
-/// Env override for the operator-facing role EmitTask targets. Defaults to the
-/// cognitive operator role; if this hotel has no such subscriber the task lands
-/// ledger-only (best-effort) — see the PR note on transport limitations.
+/// Env override for the operator-facing role EmitTask targets.
+///
+/// The default (`orchestrator`) is deliberately a **fail-safe, no-subscriber**
+/// role: a persona/authority role that no guest subscribes to under its bare
+/// name and that is not a mesh-advertised `NodeRole` capability, so an unrouted
+/// ping stays ledger-only (durable, no side effects) rather than fanning out.
+/// Bare `agent` was rejected precisely because `deliver_inbound_task` with no
+/// guest_id fans a task to *every* persona subscriber — a turn-storm in the
+/// self-heal system.
+///
+/// For onward Telegram/Beacon delivery, set this to the deployment's actual
+/// operator-facing routing key — the `role:{agent_id}:{role_name}` form the
+/// hotel uses for role incarnations (e.g. `role:agent-beacon:orchestrator`).
+/// That inbox belongs to the cognitive agent that holds the operator's live
+/// session, so the ping reaches the operator the same way the Beacon heartbeat
+/// cron does. Guaranteeing a chat_id-bound push without an operator session is
+/// a separate follow-up (no global operator chat_id exists today).
 pub const ENV_ESCALATION_ROLE: &str = "PHILOTIC_HEAL_ESCALATION_ROLE";
-/// Default operator-facing role.
+/// Default operator-facing role — a fail-safe no-subscriber persona role (see
+/// [`ENV_ESCALATION_ROLE`]); real delivery is via the env override.
 pub const DEFAULT_ESCALATION_ROLE: &str = "orchestrator";
 
 #[derive(Default)]
