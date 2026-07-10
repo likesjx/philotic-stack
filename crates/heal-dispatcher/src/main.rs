@@ -2,7 +2,9 @@ mod recurrence;
 
 use ansible_mesh_core::heal_queue::HealQueueRow;
 use anyhow::Result;
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, RestartReason, is_ipc_disconnect,
+};
 use recurrence::{Breach, RecurrenceTracker};
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -616,9 +618,15 @@ async fn classify(
 
     // FunctionGemma: call Ollama for novel/unclassified patterns.
     match gemma_classify(http, ollama_url, ollama_model, guest_id, raw_text).await {
-        Ok(result) => {
+        // F7: an LLM-suggested restart_guest on a novel error is only trustworthy
+        // when the model is also confident it is serious. Gate it — a restart on a
+        // low/unknown-severity novel error is downgraded to escalate (human/work-item
+        // path) rather than acted on. Rule-table restarts are NOT gated; only the
+        // LLM branch passes through here.
+        Ok((severity, pattern_tag, heal_action)) => {
             breaker.record_success();
-            result
+            let heal_action = gate_llm_action(&severity, &heal_action);
+            (severity, pattern_tag, heal_action)
         }
         Err(e) => {
             breaker.record_failure(Instant::now());
@@ -630,6 +638,18 @@ async fn classify(
 
 fn noop_classification() -> (String, String, String) {
     ("unknown".into(), "unclassified".into(), "noop".into())
+}
+
+/// Severity floor for an LLM-suggested `restart_guest`. A restart is a
+/// disruptive remediation; when the model itself rates the novel error as
+/// `low`/`unknown` severity we do not trust it enough to bounce a process —
+/// downgrade to `escalate` so a human/work-item decides. Any other action, or a
+/// restart at `medium`+ severity, passes through unchanged.
+fn gate_llm_action(severity: &str, heal_action: &str) -> String {
+    if heal_action == "restart_guest" && matches!(severity, "low" | "unknown" | "") {
+        return "escalate".into();
+    }
+    heal_action.to_string()
 }
 
 fn rule_classify(text: &str) -> Option<(String, String, String)> {
@@ -769,12 +789,21 @@ async fn execute_action(
                 ipc,
                 IpcRequest::RestartComponent {
                     guest_id: guest_id.to_string(),
+                    // Automatic remediation — subject to the hotel's shared respawn
+                    // budget so a crash-looping guest cannot be restarted every cycle.
+                    reason: RestartReason::Heal,
                 },
                 IPC_TIMEOUT,
             )
             .await
             {
                 Ok(IpcResponse::Standard { ok: true, .. }) => Ok("restarted".into()),
+                // The hotel refused because this guest exhausted its respawn budget.
+                // Record it distinctly so the loop does not read it as a failure to retry.
+                Ok(IpcResponse::Standard { code, .. }) if code == "RESPAWN_BUDGET_EXHAUSTED" => {
+                    warn!(guest_id, "restart skipped: respawn budget exhausted");
+                    Ok("restart_skipped_budget_exhausted".into())
+                }
                 Ok(resp) => {
                     warn!(guest_id, ?resp, "restart response unexpected");
                     Ok("restart_failed".into())
@@ -838,10 +867,27 @@ async fn execute_action(
 mod tests {
     use super::{
         HEARTBEAT_KEY, OLLAMA_BREAKER_COOLDOWN, OLLAMA_BREAKER_THRESHOLD, OllamaBreaker,
-        heartbeat_request, ipc_timeout_error, rule_classify, with_ipc_timeout,
+        gate_llm_action, heartbeat_request, ipc_timeout_error, rule_classify, with_ipc_timeout,
     };
     use philotic_client::{IpcRequest, IpcResponse, is_ipc_disconnect};
     use std::time::{Duration, Instant};
+
+    // F7: an LLM-suggested restart_guest on a low/unknown-severity novel error is
+    // not trustworthy enough to bounce a process — it is downgraded to escalate.
+    // Higher severities and non-restart actions pass through unchanged.
+    #[test]
+    fn gate_llm_action_downgrades_low_confidence_restart() {
+        assert_eq!(gate_llm_action("unknown", "restart_guest"), "escalate");
+        assert_eq!(gate_llm_action("low", "restart_guest"), "escalate");
+        assert_eq!(gate_llm_action("", "restart_guest"), "escalate");
+        // Trusted severities keep the restart.
+        assert_eq!(gate_llm_action("critical", "restart_guest"), "restart_guest");
+        assert_eq!(gate_llm_action("high", "restart_guest"), "restart_guest");
+        assert_eq!(gate_llm_action("medium", "restart_guest"), "restart_guest");
+        // Non-restart actions are never touched.
+        assert_eq!(gate_llm_action("unknown", "escalate"), "escalate");
+        assert_eq!(gate_llm_action("low", "noop"), "noop");
+    }
 
     /// Turn-failure tags must classify identically to the hotel's FailTask
     /// intake (shared classifier), and provider_4xx must escalate — never

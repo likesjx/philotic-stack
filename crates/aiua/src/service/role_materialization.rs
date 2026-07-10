@@ -738,6 +738,9 @@ impl IpcServer {
                     materialization_requester,
                     local_node_id,
                     &record.guest_id,
+                    // Deliberate role reconfiguration (breaking change) — an operator
+                    // action, never budget-limited.
+                    philotic_client::RestartReason::Operator,
                 )
                 .await
                 {

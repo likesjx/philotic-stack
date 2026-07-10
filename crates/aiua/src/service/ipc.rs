@@ -1,7 +1,7 @@
 use super::golgi::{GOLGI_SINK_ROLE, PendingPipelineRegistry};
 use super::lease_handlers::LoggingSubagentLeaseObserver;
 use crate::LedgerCommand;
-use crate::service::guest_manager::GuestMaterializationRequester;
+use crate::service::guest_manager::{GuestMaterializationRequester, HealRestartVerdict};
 use crate::service::lease::{LeaseProvider, RuntimeLeaseRegistry};
 use crate::vault::{
     SecretAccess, SecretInput, export_secret_plaintext, resolve_secret, store_secret,
@@ -47,13 +47,13 @@ use philotic_client::{
     OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView, OperatorChatTurnReply,
     OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetComponentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, PhiloticClient, ResponseRoutePolicyView, VaultEntryExport,
+    OperatorTargetStatusView, PhiloticClient, ResponseRoutePolicyView, RestartReason,
+    VaultEntryExport,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -94,98 +94,6 @@ pub(crate) struct RoleSubscriber {
     supported_tools: Vec<String>,
     pub(crate) tx: mpsc::UnboundedSender<IpcResponse>,
 }
-
-/// Hotel-side ledger of terminal `send_reply` turn correlation ids that have
-/// already been forwarded to a downstream membrane subscriber. This is the
-/// HOTEL-level backstop from the 2026-07-10 orphaned-guest duplicate-message
-/// forensic: a zombie-watchdog restart can (transiently, or via a bug) leave
-/// two live instances of the same guest running, each holding an inbox
-/// subscription and each able to independently reach a terminal state for
-/// the SAME turn. `EmitTask`'s `send_reply` arm is the single chokepoint
-/// every philote turn's final reply passes through (see
-/// `silent_cron_reply_suppressed`), so gating here catches duplicates
-/// regardless of which philote process produced them — unlike
-/// membrane-telegram's own `finalization_dedupe`, which is process-local and
-/// can only catch duplicates that land on that one membrane process. Kept as
-/// defense in depth alongside the membrane-side guard, not a replacement.
-#[cfg(not(test))]
-const TURN_FINALIZATION_DEDUPE_TTL_SECS: u64 = 60;
-#[cfg(test)]
-const TURN_FINALIZATION_DEDUPE_TTL_SECS: u64 = 2;
-/// Bounds memory under pathological load; oldest entry is evicted first.
-const TURN_FINALIZATION_DEDUPE_MAX_ENTRIES: usize = 1024;
-
-pub(super) type TurnFinalizationRegistry = Arc<StdMutex<TurnFinalizationDedupe>>;
-
-#[derive(Default)]
-pub(super) struct TurnFinalizationDedupe {
-    seen: HashMap<String, std::time::Instant>,
-}
-
-impl TurnFinalizationDedupe {
-    /// Returns `true` when `key` was already finalized within the TTL window
-    /// (a duplicate — the caller should drop this terminal send). Otherwise
-    /// records `key` as finalized now and returns `false` (the caller owns
-    /// this finalization and should proceed with delivery).
-    pub(super) fn check_and_mark(&mut self, key: &str) -> bool {
-        let now = std::time::Instant::now();
-        self.seen
-            .retain(|_, at| now.duration_since(*at).as_secs() < TURN_FINALIZATION_DEDUPE_TTL_SECS);
-        if self.seen.contains_key(key) {
-            return true;
-        }
-        if self.seen.len() >= TURN_FINALIZATION_DEDUPE_MAX_ENTRIES {
-            if let Some(oldest) = self
-                .seen
-                .iter()
-                .min_by_key(|(_, at)| *at)
-                .map(|(k, _)| k.clone())
-            {
-                self.seen.remove(&oldest);
-            }
-        }
-        self.seen.insert(key.to_string(), now);
-        false
-    }
-}
-
-/// Extracts the turn correlation key from a `send_reply` (`FinalReplyPayload`)
-/// `task_json`, mirroring membrane-telegram's own `dedupe_key` derivation
-/// (`turn_id`, falling back to `session_id` when absent) so the hotel-level
-/// and membrane-level ledgers agree on what "the same turn" means. Returns
-/// `None` for any action other than `send_reply`, or when the payload
-/// carries neither `turn_id` nor `session_id` — callers must fail open
-/// (never suppress) in that case, matching `silent_cron_reply_suppressed`'s
-/// fail-open contract.
-fn terminal_send_reply_dedupe_key(task_json: &str) -> Option<String> {
-    let payload: serde_json::Value = serde_json::from_str(task_json).ok()?;
-    if payload.get("action").and_then(serde_json::Value::as_str) != Some("send_reply") {
-        return None;
-    }
-    let turn_id = payload
-        .get("turn_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|t| !t.is_empty());
-    let session_id = payload
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty());
-    turn_id.or(session_id).map(str::to_string)
-}
-
-/// Bounded wait for a SIGTERM'd guest PID to actually exit before
-/// `handle_restart_component` clears the PID / respawns (2026-07-10
-/// orphaned-guest forensic — see that function's doc comment). Shortened
-/// under test so the SIGKILL-escalation path doesn't need a real
-/// multi-second sleep to exercise.
-#[cfg(not(test))]
-const RESTART_TERMINATE_MAX_WAIT_MS: u64 = 5_000;
-#[cfg(test)]
-const RESTART_TERMINATE_MAX_WAIT_MS: u64 = 500;
-#[cfg(not(test))]
-const RESTART_TERMINATE_POLL_INTERVAL_MS: u64 = 200;
-#[cfg(test)]
-const RESTART_TERMINATE_POLL_INTERVAL_MS: u64 = 50;
 
 #[cfg(not(test))]
 const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 900;
@@ -1345,10 +1253,6 @@ pub struct IpcServer {
     /// GuestManager path. Seeded at boot via `boot_reconcile` and shared with
     /// the boot reconciler through the same `Arc`.
     resource_registry: Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
-    /// Hotel-level dedup ledger for terminal `send_reply` turn finalization —
-    /// see `TurnFinalizationDedupe`. Orphaned-guest duplicate-message
-    /// backstop (2026-07-10 forensic).
-    turn_finalization_dedupe: TurnFinalizationRegistry,
 }
 
 impl IpcServer {
@@ -2647,7 +2551,6 @@ impl IpcServer {
             resource_registry: Arc::new(Mutex::new(
                 crate::service::resource_registry::ResourceRegistry::new(),
             )),
-            turn_finalization_dedupe: Arc::new(StdMutex::new(TurnFinalizationDedupe::default())),
         }
     }
 
@@ -2819,7 +2722,6 @@ impl IpcServer {
                     let egress_gw = self.egress_gw.clone();
                     let hotel_state_dirty_tx = self.hotel_state_dirty_tx.clone();
                     let resource_registry = self.resource_registry.clone();
-                    let turn_finalization_dedupe = self.turn_finalization_dedupe.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -2852,7 +2754,6 @@ impl IpcServer {
                             egress_gw,
                             hotel_state_dirty_tx,
                             resource_registry,
-                            turn_finalization_dedupe,
                         )
                         .await
                         {
@@ -2905,7 +2806,6 @@ impl IpcServer {
         egress_gw: Option<Arc<crate::service::egress::HotelEgressGateway>>,
         hotel_state_dirty_tx: Option<mpsc::Sender<()>>,
         resource_registry: Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
-        turn_finalization_dedupe: TurnFinalizationRegistry,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -3255,7 +3155,6 @@ impl IpcServer {
                             &mut follow_up_responses,
                             operator_surface_tx.as_ref(),
                             &resource_registry,
-                            &turn_finalization_dedupe,
                         )
                         .await;
                         // New guest registered — broadcast updated roster to peers.
@@ -3302,40 +3201,6 @@ impl IpcServer {
     ) {
         let mut guard = inboxes.lock().await;
         let entry = guard.entry(role.to_string()).or_default();
-
-        // Supersede any prior subscription for the SAME guest_id under this
-        // role before adding the new one. 2026-07-10 orphaned-guest forensic:
-        // when a guest re-registers (e.g. materialized as a replacement after
-        // a zombie-watchdog restart), a stale-but-still-alive connection for
-        // the identical guest_id must stop receiving inbound tasks — otherwise
-        // both the old and new process keep getting fanned the same task and
-        // both finalize + send a duplicate reply. Only same-guest_id entries
-        // are evicted; distinct guest_ids sharing a role (e.g. several
-        // separate agent guests all subscribed to role="agent") are untouched.
-        // The placeholder guest_id "unknown" (used by SubscribeInbox before a
-        // guest has completed Register) is never superseded — several
-        // not-yet-identified connections may legitimately share it.
-        if guest_id != "unknown" && !guest_id.is_empty() {
-            let mut superseded = 0usize;
-            entry.retain(|subscriber| {
-                let is_stale_duplicate =
-                    subscriber.guest_id == guest_id && subscriber.conn_id != conn_id;
-                if is_stale_duplicate {
-                    superseded += 1;
-                }
-                !is_stale_duplicate
-            });
-            if superseded > 0 {
-                warn!(
-                    guest_id = guest_id,
-                    role = role,
-                    new_conn_id = %conn_id,
-                    superseded,
-                    "add_subscription: superseded stale inbox subscription(s) for guest_id on role (orphaned-guest dedup, 2026-07-10 forensic)"
-                );
-            }
-        }
-
         if !entry.iter().any(|subscriber| subscriber.conn_id == conn_id) {
             entry.push(RoleSubscriber {
                 conn_id,
@@ -3870,7 +3735,6 @@ impl IpcServer {
         follow_up_responses: &mut Vec<IpcResponse>,
         operator_surface_tx: Option<&mpsc::Sender<String>>,
         resource_registry: &Arc<Mutex<crate::service::resource_registry::ResourceRegistry>>,
-        turn_finalization_dedupe: &TurnFinalizationRegistry,
     ) -> IpcResponse {
         match req {
             IpcRequest::Register(identity) => {
@@ -4884,50 +4748,6 @@ impl IpcServer {
                     );
                     return IpcResponse::success("emit", None);
                 }
-
-                // Hotel-level terminal finalization dedup (2026-07-10
-                // orphaned-guest duplicate-message forensic). Every philote
-                // turn's final `send_reply` passes through this single
-                // chokepoint regardless of which (possibly duplicate) philote
-                // process produced it — see `TurnFinalizationDedupe`. Keyed
-                // the same way membrane-telegram keys its own process-local
-                // `finalization_dedupe`, so a second terminal send for a turn
-                // already finalized is dropped here before it ever reaches
-                // the membrane, closing the gap fixes #1/#2 narrow but can't
-                // fully close on their own (e.g. two processes racing before
-                // supersession lands, or a duplicate from a still-live
-                // legitimately-restarted guest).
-                if let Some(dedupe_key) = terminal_send_reply_dedupe_key(&task_json) {
-                    let is_duplicate = turn_finalization_dedupe
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .check_and_mark(&dedupe_key);
-                    if is_duplicate {
-                        warn!(
-                            turn_id = dedupe_key.as_str(),
-                            target_role = target_role.as_str(),
-                            "EmitTask: dropping duplicate terminal send_reply at hotel level (orphaned-guest dedup, 2026-07-10 forensic)"
-                        );
-                        if let Some(hq) = heal_queue {
-                            let message = format!(
-                                "dropped duplicate terminal send_reply for turn [{dedupe_key}] before it reached role [{target_role}] (2026-07-10 orphaned-guest duplicate-message forensic)"
-                            );
-                            if let Err(err) = hq.push_classified(
-                                "aiua.turn_finalization",
-                                &message,
-                                "medium",
-                                "duplicate_finalization",
-                            ) {
-                                warn!(
-                                    error = %err,
-                                    "Failed to push hotel-level duplicate finalization to heal queue"
-                                );
-                            }
-                        }
-                        return IpcResponse::success("emit", None);
-                    }
-                }
-
                 let response_like_agent_action = response_like_agent_action_for_task(
                     &target_role,
                     target_guest_id.as_deref(),
@@ -7201,12 +7021,13 @@ impl IpcServer {
                 )
                 .await
             }
-            IpcRequest::RestartComponent { guest_id } => {
+            IpcRequest::RestartComponent { guest_id, reason } => {
                 Self::handle_restart_component(
                     graph,
                     materialization_requester,
                     local_node_id,
                     &guest_id,
+                    reason,
                 )
                 .await
             }
@@ -10391,15 +10212,12 @@ impl IpcServer {
         )
     }
 
-    /// Bounded wait for a terminated PID to actually exit before RestartComponent
-    /// clears the PID / respawns — see `handle_restart_component`. Shortened
-    /// under test so the SIGTERM-ignored → SIGKILL escalation path doesn't need
-    /// a real multi-second sleep to exercise.
     pub(super) async fn handle_restart_component(
         graph: &GraphDomain,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         local_node_id: &str,
         guest_id: &str,
+        reason: RestartReason,
     ) -> IpcResponse {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
@@ -10433,74 +10251,43 @@ impl IpcServer {
             );
         }
 
-        // Terminate running process and CONFIRM it actually exited before
-        // respawning. 2026-07-10 orphaned-guest forensic: the old fire-and-
-        // forget `kill -15` here did not wait for the process to die, so
-        // `ensure_guest_active()` below could materialize a replacement
-        // while the old PID was still alive — two live instances of the
-        // same guest then both kept their inbox subscription and both
-        // finalized + sent the same reply (e.g. duplicate Telegram sends).
-        // Poll for exit with a bounded wait, escalate to SIGKILL if the
-        // process ignores SIGTERM, and only clear the PID / respawn once
-        // we've confirmed the old process is actually gone.
+        // Flap protection for AUTOMATIC (heal-dispatcher) restarts only. Operator/CLI
+        // restarts are deliberate and never budget-limited. We consult the shared
+        // respawn budget BEFORE killing so a budget-exhausted guest is left running
+        // rather than terminated-with-no-respawn. A missing requester falls through to
+        // the NO_MATERIALIZER path below.
+        if reason == RestartReason::Heal {
+            if let Some(req) = materialization_requester {
+                if req.check_heal_restart_budget(guest_id).await == HealRestartVerdict::Denied {
+                    warn!(
+                        guest_id = %guest_id,
+                        "heal-restart skipped: guest exhausted its respawn budget"
+                    );
+                    return IpcResponse::error(
+                        "restart_component",
+                        "RESPAWN_BUDGET_EXHAUSTED",
+                        format!(
+                            "heal restart for {guest_id} skipped: respawn budget exhausted; \
+                             restarts paused until a clean window elapses"
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Terminate running process.
         if let Some(ref pid_str) = guest.active_pid {
             if let Ok(pid) = pid_str.parse::<u32>() {
-                if Self::pid_exists(pid) {
-                    let _ = ProcessCommand::new("kill")
-                        .args(["-15", &pid.to_string()])
-                        .status();
-
-                    let mut waited_ms = 0u64;
-                    while waited_ms < RESTART_TERMINATE_MAX_WAIT_MS && Self::pid_exists(pid) {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(
-                            RESTART_TERMINATE_POLL_INTERVAL_MS,
-                        ))
-                        .await;
-                        waited_ms += RESTART_TERMINATE_POLL_INTERVAL_MS;
-                    }
-
-                    if Self::pid_exists(pid) {
-                        warn!(
-                            guest_id = %guest_id,
-                            pid,
-                            "RestartComponent: PID did not exit after SIGTERM within {}ms; escalating to SIGKILL",
-                            RESTART_TERMINATE_MAX_WAIT_MS
-                        );
-                        let _ = ProcessCommand::new("kill")
-                            .args(["-9", &pid.to_string()])
-                            .status();
-
-                        let mut waited_ms = 0u64;
-                        while waited_ms < RESTART_TERMINATE_MAX_WAIT_MS && Self::pid_exists(pid) {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(
-                                RESTART_TERMINATE_POLL_INTERVAL_MS,
-                            ))
-                            .await;
-                            waited_ms += RESTART_TERMINATE_POLL_INTERVAL_MS;
-                        }
-
-                        if Self::pid_exists(pid) {
-                            // Never respawn while the old PID is confirmed-alive: this
-                            // would recreate the exact orphaned-guest duplicate-message
-                            // condition the forensic identified.
-                            return IpcResponse::error(
-                                "restart_component",
-                                "TERMINATE_TIMEOUT",
-                                format!(
-                                    "PID {pid} for guest {guest_id} did not exit after SIGTERM+SIGKILL; refusing to respawn to avoid a duplicate live instance"
-                                ),
-                            );
-                        }
-                    }
-                }
+                let _ = ProcessCommand::new("kill")
+                    .args(["-15", &pid.to_string()])
+                    .status();
             }
         }
         if let Err(e) = graph.set_guest_pid(&hotel_name, guest_id, None) {
             warn!("RestartComponent: failed to clear PID for {guest_id}: {e}");
         }
 
-        // Respawn — only reachable once the old PID is confirmed dead (or was
-        // never alive to begin with).
+        // Respawn.
         if let Some(req) = materialization_requester {
             if let Err(e) = req.ensure_guest_active(guest_id).await {
                 return IpcResponse::error("restart_component", "SPAWN_FAILED", e.to_string());
@@ -14434,560 +14221,6 @@ pub(crate) mod tests {
         );
     }
 
-    // ── RestartComponent: confirm-exit-before-respawn (2026-07-10 orphaned-guest forensic) ──
-
-    mod restart_component_confirm_exit {
-        use super::*;
-
-        fn seed_hotel_and_guest_with_pid(graph: &GraphDomain, guest_id: &str, pid: u32) {
-            graph
-                .upsert_hotel(&HotelRecord {
-                    hotel_name: "local-hotel".into(),
-                    capabilities: NodeCapabilities {
-                        node_id: "local-aiua-01".into(),
-                        roles: vec![],
-                        models: vec![],
-                        tools: vec![],
-                        constraints: Default::default(),
-                    },
-                    mesh_port: 9000,
-                    blob_port: 9001,
-                    execution_port: 9002,
-                    ipc_socket_path: "/tmp/test.sock".into(),
-                    active_pid: None,
-                    mesh_host: None,
-                })
-                .expect("seed local hotel");
-            graph
-                .upsert_guest(&GuestRecord {
-                    hotel_name: "local-hotel".into(),
-                    guest_id: guest_id.into(),
-                    role: "agent".into(),
-                    config_json: serde_json::json!({
-                        "command": "true",
-                        "args": [],
-                        "env": {}
-                    })
-                    .to_string(),
-                    is_active: true,
-                    active_pid: Some(pid.to_string()),
-                    last_active_at: Some(123),
-                })
-                .expect("seed component guest");
-        }
-
-        /// Proves the "confirm exit before respawn" contract: a guest process
-        /// that briefly ignores SIGTERM (via a no-op trap) but exits on its
-        /// own shortly after must be waited-out by `handle_restart_component`
-        /// — respawn must not fire until the PID is confirmed dead. Elapsed
-        /// time is asserted as a lower bound so a regression back to the old
-        /// fire-and-forget `kill -15` (which would return near-instantly)
-        /// fails this test.
-        #[tokio::test]
-        async fn restart_component_waits_for_confirmed_exit_before_respawning() {
-            let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite store");
-            let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
-
-            let mut child = std::process::Command::new("sh")
-                .args(["-c", "trap : TERM; sleep 0.35"])
-                .spawn()
-                .expect("spawn slow-to-die guest stand-in");
-            let pid = child.id();
-            // Let the shell finish registering its `trap` before we start
-            // sending it signals — otherwise a SIGTERM that lands during
-            // bash's own startup can kill it via the default disposition
-            // before the trap is installed, which is a test-harness race,
-            // not the behavior under test.
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-            seed_hotel_and_guest_with_pid(&graph, "guest-slow-exit", pid);
-
-            let requester = MockMaterializationRequester::default();
-            let start = std::time::Instant::now();
-            let response = IpcServer::handle_restart_component(
-                &graph,
-                Some(&requester),
-                "local-aiua-01",
-                "guest-slow-exit",
-            )
-            .await;
-            let elapsed = start.elapsed();
-
-            match response {
-                IpcResponse::Standard { ok: true, .. } => {}
-                other => panic!("unexpected restart_component response: {other:?}"),
-            }
-            assert_eq!(
-                requester.calls.load(Ordering::SeqCst),
-                1,
-                "respawn must fire exactly once, after exit was confirmed"
-            );
-            assert!(
-                !IpcServer::pid_exists(pid),
-                "old PID must be confirmed dead before returning"
-            );
-            assert!(
-                elapsed >= std::time::Duration::from_millis(150),
-                "restart must poll/wait for exit rather than firing-and-forgetting the SIGTERM; elapsed={elapsed:?}"
-            );
-
-            let guest = graph
-                .get_guest("local-hotel", "guest-slow-exit")
-                .expect("load guest")
-                .expect("guest still registered");
-            assert_eq!(
-                guest.active_pid, None,
-                "PID must be cleared after confirmed exit"
-            );
-
-            let _ = child.wait();
-        }
-
-        /// Proves the SIGKILL-on-timeout escalation path: a guest process that
-        /// ignores SIGTERM entirely must be force-killed once the bounded wait
-        /// expires, and respawn must still only proceed after that kill is
-        /// confirmed.
-        #[tokio::test]
-        async fn restart_component_escalates_to_sigkill_when_sigterm_ignored() {
-            let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite store");
-            let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
-
-            let mut child = std::process::Command::new("sh")
-                .args(["-c", "trap '' TERM; sleep 5"])
-                .spawn()
-                .expect("spawn SIGTERM-ignoring guest stand-in");
-            let pid = child.id();
-            // Let the shell finish registering its `trap` before we start
-            // sending it signals — see the identical comment in
-            // `restart_component_waits_for_confirmed_exit_before_respawning`.
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-            seed_hotel_and_guest_with_pid(&graph, "guest-ignores-term", pid);
-
-            let requester = MockMaterializationRequester::default();
-            let start = std::time::Instant::now();
-            let response = IpcServer::handle_restart_component(
-                &graph,
-                Some(&requester),
-                "local-aiua-01",
-                "guest-ignores-term",
-            )
-            .await;
-            let elapsed = start.elapsed();
-
-            match response {
-                IpcResponse::Standard { ok: true, .. } => {}
-                other => panic!("unexpected restart_component response: {other:?}"),
-            }
-            assert_eq!(
-                requester.calls.load(Ordering::SeqCst),
-                1,
-                "respawn must fire exactly once, after the SIGKILL-confirmed exit"
-            );
-            assert!(
-                !IpcServer::pid_exists(pid),
-                "old PID must be confirmed dead (via SIGKILL) before returning"
-            );
-            assert!(
-                elapsed >= std::time::Duration::from_millis(RESTART_TERMINATE_MAX_WAIT_MS),
-                "must exhaust the SIGTERM wait window before escalating to SIGKILL; elapsed={elapsed:?}"
-            );
-
-            let _ = child.wait();
-        }
-    }
-
-    // ── add_subscription: same-guest_id supersession (2026-07-10 orphaned-guest forensic) ──
-
-    mod subscription_supersession {
-        use super::*;
-
-        fn new_subscriber_channel() -> (
-            mpsc::UnboundedSender<IpcResponse>,
-            mpsc::UnboundedReceiver<IpcResponse>,
-        ) {
-            mpsc::unbounded_channel()
-        }
-
-        /// A guest that re-registers under the SAME guest_id and role (e.g. a
-        /// replacement materialized after a zombie-watchdog restart) must
-        /// evict the prior connection's subscription — a stale-but-alive
-        /// connection must not keep receiving inbound tasks. Also proves the
-        /// evicted connection stops receiving deliveries end-to-end via
-        /// `deliver_inbound_task`.
-        #[tokio::test]
-        async fn same_guest_id_new_registration_evicts_old_connection() {
-            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
-
-            let old_conn = Uuid::new_v4();
-            let (old_tx, mut old_rx) = new_subscriber_channel();
-            let mut old_subscribed_roles = Vec::new();
-            IpcServer::add_subscription(
-                &inboxes,
-                "agent",
-                old_conn,
-                "aria",
-                &[],
-                &old_tx,
-                &mut old_subscribed_roles,
-            )
-            .await;
-
-            let new_conn = Uuid::new_v4();
-            let (new_tx, mut new_rx) = new_subscriber_channel();
-            let mut new_subscribed_roles = Vec::new();
-            IpcServer::add_subscription(
-                &inboxes,
-                "agent",
-                new_conn,
-                "aria",
-                &[],
-                &new_tx,
-                &mut new_subscribed_roles,
-            )
-            .await;
-
-            {
-                let guard = inboxes.lock().await;
-                let subscribers = guard.get("agent").expect("role entry exists");
-                assert_eq!(
-                    subscribers.len(),
-                    1,
-                    "old same-guest_id subscription must be superseded, not accumulated"
-                );
-                assert_eq!(subscribers[0].conn_id, new_conn);
-                assert_eq!(subscribers[0].guest_id, "aria");
-            }
-
-            IpcServer::deliver_inbound_task(
-                &inboxes,
-                "local-aiua-01",
-                "agent",
-                None,
-                Uuid::new_v4(),
-                "{}".to_string(),
-            )
-            .await;
-
-            assert!(
-                new_rx.try_recv().is_ok(),
-                "the new (superseding) connection must receive the delivery"
-            );
-            assert!(
-                old_rx.try_recv().is_err(),
-                "the superseded connection must NOT receive the delivery — this is exactly \
-                 how an orphaned duplicate process kept getting fanned the same task"
-            );
-        }
-
-        /// Distinct guest_ids sharing a role (e.g. several separate agent
-        /// guests all subscribed under role="agent") must NOT be superseded
-        /// by one another — only same-guest_id duplicates are evicted.
-        #[tokio::test]
-        async fn different_guest_ids_under_same_role_are_both_kept() {
-            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
-
-            let conn_a = Uuid::new_v4();
-            let (tx_a, _rx_a) = new_subscriber_channel();
-            let mut roles_a = Vec::new();
-            IpcServer::add_subscription(
-                &inboxes,
-                "agent",
-                conn_a,
-                "agent-A",
-                &[],
-                &tx_a,
-                &mut roles_a,
-            )
-            .await;
-
-            let conn_b = Uuid::new_v4();
-            let (tx_b, _rx_b) = new_subscriber_channel();
-            let mut roles_b = Vec::new();
-            IpcServer::add_subscription(
-                &inboxes,
-                "agent",
-                conn_b,
-                "agent-B",
-                &[],
-                &tx_b,
-                &mut roles_b,
-            )
-            .await;
-
-            let guard = inboxes.lock().await;
-            let subscribers = guard.get("agent").expect("role entry exists");
-            assert_eq!(
-                subscribers.len(),
-                2,
-                "distinct guest_ids sharing a role must both be kept"
-            );
-            assert!(subscribers.iter().any(|s| s.guest_id == "agent-A"));
-            assert!(subscribers.iter().any(|s| s.guest_id == "agent-B"));
-        }
-
-        /// The "unknown" placeholder guest_id (used by SubscribeInbox before a
-        /// guest has completed Register) must never be superseded — several
-        /// not-yet-identified connections may legitimately share it.
-        #[tokio::test]
-        async fn unknown_placeholder_guest_id_is_never_superseded() {
-            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
-
-            let conn_a = Uuid::new_v4();
-            let (tx_a, _rx_a) = new_subscriber_channel();
-            let mut roles_a = Vec::new();
-            IpcServer::add_subscription(
-                &inboxes,
-                "agent",
-                conn_a,
-                "unknown",
-                &[],
-                &tx_a,
-                &mut roles_a,
-            )
-            .await;
-
-            let conn_b = Uuid::new_v4();
-            let (tx_b, _rx_b) = new_subscriber_channel();
-            let mut roles_b = Vec::new();
-            IpcServer::add_subscription(
-                &inboxes,
-                "agent",
-                conn_b,
-                "unknown",
-                &[],
-                &tx_b,
-                &mut roles_b,
-            )
-            .await;
-
-            let guard = inboxes.lock().await;
-            let subscribers = guard.get("agent").expect("role entry exists");
-            assert_eq!(
-                subscribers.len(),
-                2,
-                "the unknown placeholder guest_id must never trigger supersession"
-            );
-        }
-    }
-
-    // ── Hotel-level terminal finalization dedup (2026-07-10 orphaned-guest forensic) ──
-
-    mod turn_finalization_dedupe_tests {
-        use super::*;
-
-        #[test]
-        fn terminal_send_reply_dedupe_key_prefers_turn_id_over_session_id() {
-            let task_json = serde_json::json!({
-                "action": "send_reply",
-                "session_id": "session-1",
-                "turn_id": "turn-1",
-                "content": "hi"
-            })
-            .to_string();
-            assert_eq!(
-                terminal_send_reply_dedupe_key(&task_json),
-                Some("turn-1".to_string())
-            );
-        }
-
-        #[test]
-        fn terminal_send_reply_dedupe_key_falls_back_to_session_id() {
-            let task_json = serde_json::json!({
-                "action": "send_reply",
-                "session_id": "session-1",
-                "content": "hi"
-            })
-            .to_string();
-            assert_eq!(
-                terminal_send_reply_dedupe_key(&task_json),
-                Some("session-1".to_string())
-            );
-        }
-
-        #[test]
-        fn terminal_send_reply_dedupe_key_ignores_non_terminal_actions() {
-            let task_json = serde_json::json!({
-                "action": "turn_event",
-                "session_id": "session-1",
-                "turn_id": "turn-1"
-            })
-            .to_string();
-            assert_eq!(terminal_send_reply_dedupe_key(&task_json), None);
-        }
-
-        #[test]
-        fn terminal_send_reply_dedupe_key_fails_open_when_no_correlation_id() {
-            let task_json =
-                serde_json::json!({ "action": "send_reply", "content": "hi" }).to_string();
-            assert_eq!(terminal_send_reply_dedupe_key(&task_json), None);
-        }
-
-        #[test]
-        fn check_and_mark_drops_second_call_for_same_key_within_ttl() {
-            let mut dedupe = TurnFinalizationDedupe::default();
-            assert!(
-                !dedupe.check_and_mark("turn-1"),
-                "first finalization owns the turn and must proceed"
-            );
-            assert!(
-                dedupe.check_and_mark("turn-1"),
-                "second finalization for the same turn within TTL must be dropped"
-            );
-        }
-
-        #[test]
-        fn check_and_mark_treats_distinct_keys_independently() {
-            let mut dedupe = TurnFinalizationDedupe::default();
-            assert!(!dedupe.check_and_mark("turn-1"));
-            assert!(
-                !dedupe.check_and_mark("turn-2"),
-                "a genuinely distinct turn must never be false-dropped"
-            );
-        }
-
-        #[test]
-        fn check_and_mark_allows_key_again_after_ttl_expiry() {
-            // TURN_FINALIZATION_DEDUPE_TTL_SECS is shortened to 2s under #[cfg(test)].
-            let mut dedupe = TurnFinalizationDedupe::default();
-            assert!(!dedupe.check_and_mark("turn-1"));
-            assert!(
-                dedupe.check_and_mark("turn-1"),
-                "duplicate within TTL must be dropped"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(
-                TURN_FINALIZATION_DEDUPE_TTL_SECS * 1000 + 250,
-            ));
-            assert!(
-                !dedupe.check_and_mark("turn-1"),
-                "after TTL expiry the key must be treated as a genuinely new turn"
-            );
-        }
-
-        /// End-to-end wiring proof through the actual production entry point
-        /// (`IpcRequest::EmitTask`), the single chokepoint every philote
-        /// `send_reply` passes through. Simulates the orphaned-guest scenario:
-        /// two terminal `send_reply` EmitTasks for the SAME turn_id (as two
-        /// live instances of the same guest would each independently emit)
-        /// must collapse to exactly one delivery to the membrane subscriber,
-        /// while a genuinely different turn_id is delivered normally.
-        #[tokio::test]
-        async fn emit_task_drops_duplicate_terminal_send_reply_for_same_turn_at_hotel_level() {
-            let _env_guard = ipc_env_guard();
-            let socket_path = test_socket_path();
-            let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
-            let graph_store =
-                SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-            let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-
-            let server = IpcServer::new(
-                socket_path.clone(),
-                "local-aiua-01",
-                dispatcher_tx,
-                graph.clone(),
-            );
-            let server_task = tokio::spawn(async move {
-                server.run().await.expect("ipc server should run");
-            });
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            unsafe {
-                std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
-            }
-
-            let mut membrane = PhiloticClient::connect(GuestIdentity {
-                guest_id: "membrane-local".into(),
-                role: "membrane".into(),
-                supported_tools: Vec::new(),
-            })
-            .await
-            .expect("membrane connect");
-            let mut agent = PhiloticClient::connect(GuestIdentity {
-                guest_id: "agent-local".into(),
-                role: "agent".into(),
-                supported_tools: Vec::new(),
-            })
-            .await
-            .expect("agent connect");
-
-            let emit = |turn_id: &'static str, content: &'static str| {
-                let task_json = serde_json::json!({
-                    "action": "send_reply",
-                    "session_id": "telegram:123:agent-local",
-                    "turn_id": turn_id,
-                    "chat_id": "123",
-                    "content": content
-                })
-                .to_string();
-                IpcRequest::EmitTask {
-                    target_node: "local-aiua-01".into(),
-                    target_role: "membrane".into(),
-                    target_guest_id: None,
-                    task_json,
-                }
-            };
-
-            let extract_task_json = |response: IpcResponse| -> String {
-                match response {
-                    IpcResponse::InboundTask { task_json, .. } => task_json,
-                    other => panic!("expected InboundTask, got {other:?}"),
-                }
-            };
-
-            // First terminal send for turn-1 — must be delivered.
-            agent
-                .send_request(emit("turn-1", "first reply"))
-                .await
-                .expect("emit first send_reply");
-            let first = tokio::time::timeout(
-                tokio::time::Duration::from_millis(500),
-                membrane.recv_task(),
-            )
-            .await
-            .expect("first send_reply should be delivered")
-            .expect("recv_task ok");
-            assert!(extract_task_json(first).contains("first reply"));
-
-            // Second terminal send for the SAME turn-1 (simulating an orphaned
-            // duplicate philote process) — must be dropped, not delivered.
-            agent
-                .send_request(emit("turn-1", "duplicate reply"))
-                .await
-                .expect("emit duplicate send_reply");
-            let duplicate = tokio::time::timeout(
-                tokio::time::Duration::from_millis(300),
-                membrane.recv_task(),
-            )
-            .await;
-            assert!(
-                duplicate.is_err(),
-                "duplicate terminal send_reply for the same turn must never reach membrane, got {duplicate:?}"
-            );
-
-            // A genuinely different turn must still be delivered normally.
-            agent
-                .send_request(emit("turn-2", "second turn reply"))
-                .await
-                .expect("emit distinct-turn send_reply");
-            let second = tokio::time::timeout(
-                tokio::time::Duration::from_millis(500),
-                membrane.recv_task(),
-            )
-            .await
-            .expect("distinct turn should be delivered")
-            .expect("recv_task ok");
-            assert!(extract_task_json(second).contains("second turn reply"));
-
-            unsafe {
-                std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
-            }
-            server_task.abort();
-            let _ = server_task.await;
-            if Path::new(&socket_path).exists() {
-                let _ = std::fs::remove_file(&socket_path);
-            }
-        }
-    }
-
     fn expect_operator_chat_reply(response: IpcResponse) -> OperatorChatTurnReply {
         match response {
             IpcResponse::OperatorChatTurnReply {
@@ -15038,6 +14271,10 @@ pub(crate) mod tests {
     pub(crate) struct MockMaterializationRequester {
         pub(crate) calls: AtomicUsize,
         pub(crate) last_guest_id: StdMutex<Option<String>>,
+        /// Number of times the heal-restart budget was consulted.
+        pub(crate) budget_checks: AtomicUsize,
+        /// When true, `check_heal_restart_budget` returns `Denied`.
+        pub(crate) deny_budget: bool,
     }
 
     #[async_trait::async_trait]
@@ -15050,6 +14287,15 @@ pub(crate) mod tests {
                 .unwrap_or_else(|poison| poison.into_inner());
             *guard = Some(guest_id.to_string());
             Ok(true)
+        }
+
+        async fn check_heal_restart_budget(&self, _guest_id: &str) -> HealRestartVerdict {
+            self.budget_checks.fetch_add(1, Ordering::SeqCst);
+            if self.deny_budget {
+                HealRestartVerdict::Denied
+            } else {
+                HealRestartVerdict::Allowed
+            }
         }
     }
 
@@ -15286,6 +14532,88 @@ pub(crate) mod tests {
                 last_active_at: None,
             })
             .expect("seed infra guest");
+    }
+
+    // F1: a heal-dispatcher-triggered restart whose guest has exhausted its
+    // respawn budget must be SKIPPED — the budget is consulted, ensure_guest_active
+    // is never called (no respawn), and the response carries the distinct
+    // RESPAWN_BUDGET_EXHAUSTED code so the dispatcher records it instead of looping.
+    #[tokio::test]
+    async fn handle_restart_component_heal_skips_when_budget_exhausted() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_local_hotel_with_infra_guest(&graph);
+
+        let requester = MockMaterializationRequester {
+            deny_budget: true,
+            ..Default::default()
+        };
+
+        let resp = IpcServer::handle_restart_component(
+            &graph,
+            Some(&requester),
+            "local-aiua-01",
+            "vps-jane:life-graph-runner",
+            RestartReason::Heal,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Standard { ok, code, .. } => {
+                assert!(!ok, "budget-exhausted heal restart must not report success");
+                assert_eq!(code, "RESPAWN_BUDGET_EXHAUSTED");
+            }
+            other => panic!("expected Standard error, got {other:?}"),
+        }
+        assert_eq!(
+            requester.budget_checks.load(Ordering::SeqCst),
+            1,
+            "heal restart must consult the respawn budget"
+        );
+        assert_eq!(
+            requester.calls.load(Ordering::SeqCst),
+            0,
+            "budget-exhausted heal restart must NOT respawn the guest"
+        );
+    }
+
+    // F1: an operator-initiated restart is deliberate and must NOT be budget-limited
+    // — the budget is never consulted even if it would deny, and the guest is respawned.
+    #[tokio::test]
+    async fn handle_restart_component_operator_bypasses_budget() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_local_hotel_with_infra_guest(&graph);
+
+        // deny_budget=true would deny IF consulted; the operator path must skip it.
+        let requester = MockMaterializationRequester {
+            deny_budget: true,
+            ..Default::default()
+        };
+
+        let resp = IpcServer::handle_restart_component(
+            &graph,
+            Some(&requester),
+            "local-aiua-01",
+            "vps-jane:life-graph-runner",
+            RestartReason::Operator,
+        )
+        .await;
+
+        assert!(
+            matches!(resp, IpcResponse::Standard { ok: true, .. }),
+            "operator restart should succeed, got {resp:?}"
+        );
+        assert_eq!(
+            requester.budget_checks.load(Ordering::SeqCst),
+            0,
+            "operator restart must NOT consult the respawn budget"
+        );
+        assert_eq!(
+            requester.calls.load(Ordering::SeqCst),
+            1,
+            "operator restart must respawn the guest"
+        );
     }
 
     // RC-2 (2026-07-09 stuck-turn forensic): when a session's active incarnation is a

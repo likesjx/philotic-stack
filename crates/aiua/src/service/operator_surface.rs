@@ -1347,6 +1347,9 @@ impl IpcServer {
                         materialization_requester,
                         local_node_id,
                         &guest_id,
+                        // Operator-triggered restart from the operator surface — never
+                        // budget-limited.
+                        philotic_client::RestartReason::Operator,
                     )
                     .await
                     {

@@ -260,6 +260,17 @@ pub(crate) const RESPAWN_BUDGET_MAX: usize = 5;
 /// the budget resets only after a clean window with no respawn attempts.
 pub(crate) const RESPAWN_BUDGET_WINDOW_SECS: u64 = 600;
 
+/// Verdict returned to a heal-triggered restart caller after consulting the
+/// shared respawn budget. `Denied` covers both a just-breached budget and one
+/// still in cool-down; only the *transition* to breach marks/alerts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealRestartVerdict {
+    /// Budget permits this restart; the attempt has been recorded.
+    Allowed,
+    /// Budget exhausted — the caller must SKIP the restart (no kill, no respawn).
+    Denied,
+}
+
 /// Outcome of asking the respawn budget whether a guest may be respawned now.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RespawnDecision {
@@ -341,6 +352,16 @@ pub struct GuestManager {
 #[async_trait]
 pub trait GuestMaterializationRequester: Send + Sync {
     async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool>;
+
+    /// Consult the shared respawn budget before a heal-dispatcher-triggered
+    /// restart. Records the attempt against the same budget the supervisor uses,
+    /// and on breach marks the guest exhausted (heal entry + graph marker) exactly
+    /// once. Returns [`HealRestartVerdict::Denied`] when the caller must skip the
+    /// restart. The default implementation permits everything (no budget) so test
+    /// doubles and non-supervising requesters stay unaffected.
+    async fn check_heal_restart_budget(&self, _guest_id: &str) -> HealRestartVerdict {
+        HealRestartVerdict::Allowed
+    }
 }
 
 impl GuestManager {
@@ -405,6 +426,41 @@ impl GuestManager {
                     guest_id, e
                 );
             }
+        }
+    }
+
+    /// Heal-restart flap protection, clock injected for tests.
+    ///
+    /// Consults the SAME [`RespawnBudget`] instance the supervisor reconcile loop
+    /// uses (this is one shared `Arc<GuestManager>`), so heal-triggered restarts
+    /// and supervisor respawns draw down a single budget. On the breaching call we
+    /// mark the guest exhausted once (graph marker + heal entry) and reuse the
+    /// existing cool-down/resume path; a still-exhausted budget is denied silently
+    /// so we do not re-push a heal entry every dispatch cycle.
+    pub(crate) fn check_heal_restart_budget_at(&self, guest_id: &str, now: u64) -> HealRestartVerdict {
+        match self.respawn_budget.check(guest_id, now) {
+            RespawnDecision::Allowed { resumed } => {
+                if resumed {
+                    info!(
+                        "Heal-restart: Guest [{}] respawn budget cooled down after a clean window. Resuming restarts.",
+                        guest_id
+                    );
+                    self.clear_respawn_budget_mark(guest_id);
+                }
+                HealRestartVerdict::Allowed
+            }
+            RespawnDecision::JustExhausted => {
+                error!(
+                    "Heal-restart: Guest [{}] exhausted its respawn budget ({} restarts in {}s). Skipping heal restart until a clean {}s window elapses.",
+                    guest_id,
+                    RESPAWN_BUDGET_MAX,
+                    RESPAWN_BUDGET_WINDOW_SECS,
+                    RESPAWN_BUDGET_WINDOW_SECS
+                );
+                self.mark_respawn_budget_exhausted(guest_id, now);
+                HealRestartVerdict::Denied
+            }
+            RespawnDecision::StillExhausted => HealRestartVerdict::Denied,
         }
     }
 
@@ -828,6 +884,10 @@ impl GuestManager {
 impl GuestMaterializationRequester for GuestManager {
     async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool> {
         Self::ensure_guest_active(self, guest_id).await
+    }
+
+    async fn check_heal_restart_budget(&self, guest_id: &str) -> HealRestartVerdict {
+        self.check_heal_restart_budget_at(guest_id, epoch_now())
     }
 }
 
@@ -1281,6 +1341,93 @@ mod tests {
         assert_eq!(pushes.len(), 1);
         assert_eq!(pushes[0].0, "flappy");
         assert!(pushes[0].1.contains("respawn budget"));
+    }
+
+    #[tokio::test]
+    async fn heal_restart_budget_skips_and_marks_after_sixth_in_window() {
+        // The heal-restart path shares the supervisor's RespawnBudget. Six
+        // heal-triggered restarts of the same guest inside one window: the first
+        // five are Allowed, the sixth is Denied (skipped), the graph is marked
+        // respawn_budget_exhausted, and exactly one heal-queue entry is pushed.
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: "flappy".into(),
+            role: "membrane".into(),
+            config_json: json!({ "command": "target/debug/membrane-telegram" }).to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        }]));
+        let heal = Arc::new(MockHealQueue::new());
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(MockMaterializer::new(HashMap::new())))
+            .with_heal_queue(heal.clone());
+
+        // Fake clock: all six attempts fall inside a single sliding window.
+        let base = 10_000u64;
+        for i in 0..RESPAWN_BUDGET_MAX {
+            assert_eq!(
+                manager.check_heal_restart_budget_at("flappy", base + i as u64),
+                HealRestartVerdict::Allowed,
+                "heal restart {i} should be allowed within budget"
+            );
+        }
+        // The sixth (RESPAWN_BUDGET_MAX + 1) breaches → skipped.
+        assert_eq!(
+            manager.check_heal_restart_budget_at("flappy", base + RESPAWN_BUDGET_MAX as u64),
+            HealRestartVerdict::Denied,
+            "the 6th heal restart in the window must be skipped"
+        );
+
+        // Breach is marked in the graph...
+        let state = graph
+            .get_config_value("supervision_state:test-hotel:flappy")
+            .expect("config read")
+            .expect("supervision_state should be set");
+        assert!(state.contains("respawn_budget_exhausted"));
+
+        // ...and surfaced to the heal queue exactly once (StillExhausted must not re-push).
+        let _ = manager.check_heal_restart_budget_at("flappy", base + RESPAWN_BUDGET_MAX as u64 + 1);
+        let pushes = heal.pushes.lock().unwrap();
+        assert_eq!(pushes.len(), 1, "only the breaching transition files a heal entry");
+        assert_eq!(pushes[0].0, "flappy");
+    }
+
+    #[tokio::test]
+    async fn heal_restart_budget_resumes_after_clean_window() {
+        // After a full clean window since the breach, the heal-restart budget
+        // cools down: the guest may be restarted again and the graph marker is cleared.
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: "flappy".into(),
+            role: "membrane".into(),
+            config_json: json!({ "command": "target/debug/membrane-telegram" }).to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        }]));
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(MockMaterializer::new(HashMap::new())));
+
+        let base = 10_000u64;
+        for i in 0..RESPAWN_BUDGET_MAX {
+            let _ = manager.check_heal_restart_budget_at("flappy", base + i as u64);
+        }
+        let breach_at = base + RESPAWN_BUDGET_MAX as u64;
+        assert_eq!(
+            manager.check_heal_restart_budget_at("flappy", breach_at),
+            HealRestartVerdict::Denied
+        );
+        // A full clean window later, restarts resume and the marker is cleared.
+        assert_eq!(
+            manager.check_heal_restart_budget_at("flappy", breach_at + RESPAWN_BUDGET_WINDOW_SECS),
+            HealRestartVerdict::Allowed
+        );
+        assert!(
+            graph
+                .get_config_value("supervision_state:test-hotel:flappy")
+                .expect("config read")
+                .is_none(),
+            "resumed restart must clear the exhausted marker"
+        );
     }
 
     #[tokio::test]
