@@ -14271,6 +14271,10 @@ pub(crate) mod tests {
     pub(crate) struct MockMaterializationRequester {
         pub(crate) calls: AtomicUsize,
         pub(crate) last_guest_id: StdMutex<Option<String>>,
+        /// Number of times the heal-restart budget was consulted.
+        pub(crate) budget_checks: AtomicUsize,
+        /// When true, `check_heal_restart_budget` returns `Denied`.
+        pub(crate) deny_budget: bool,
     }
 
     #[async_trait::async_trait]
@@ -14283,6 +14287,15 @@ pub(crate) mod tests {
                 .unwrap_or_else(|poison| poison.into_inner());
             *guard = Some(guest_id.to_string());
             Ok(true)
+        }
+
+        async fn check_heal_restart_budget(&self, _guest_id: &str) -> HealRestartVerdict {
+            self.budget_checks.fetch_add(1, Ordering::SeqCst);
+            if self.deny_budget {
+                HealRestartVerdict::Denied
+            } else {
+                HealRestartVerdict::Allowed
+            }
         }
     }
 
@@ -14519,6 +14532,88 @@ pub(crate) mod tests {
                 last_active_at: None,
             })
             .expect("seed infra guest");
+    }
+
+    // F1: a heal-dispatcher-triggered restart whose guest has exhausted its
+    // respawn budget must be SKIPPED — the budget is consulted, ensure_guest_active
+    // is never called (no respawn), and the response carries the distinct
+    // RESPAWN_BUDGET_EXHAUSTED code so the dispatcher records it instead of looping.
+    #[tokio::test]
+    async fn handle_restart_component_heal_skips_when_budget_exhausted() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_local_hotel_with_infra_guest(&graph);
+
+        let requester = MockMaterializationRequester {
+            deny_budget: true,
+            ..Default::default()
+        };
+
+        let resp = IpcServer::handle_restart_component(
+            &graph,
+            Some(&requester),
+            "local-aiua-01",
+            "vps-jane:life-graph-runner",
+            RestartReason::Heal,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Standard { ok, code, .. } => {
+                assert!(!ok, "budget-exhausted heal restart must not report success");
+                assert_eq!(code, "RESPAWN_BUDGET_EXHAUSTED");
+            }
+            other => panic!("expected Standard error, got {other:?}"),
+        }
+        assert_eq!(
+            requester.budget_checks.load(Ordering::SeqCst),
+            1,
+            "heal restart must consult the respawn budget"
+        );
+        assert_eq!(
+            requester.calls.load(Ordering::SeqCst),
+            0,
+            "budget-exhausted heal restart must NOT respawn the guest"
+        );
+    }
+
+    // F1: an operator-initiated restart is deliberate and must NOT be budget-limited
+    // — the budget is never consulted even if it would deny, and the guest is respawned.
+    #[tokio::test]
+    async fn handle_restart_component_operator_bypasses_budget() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_local_hotel_with_infra_guest(&graph);
+
+        // deny_budget=true would deny IF consulted; the operator path must skip it.
+        let requester = MockMaterializationRequester {
+            deny_budget: true,
+            ..Default::default()
+        };
+
+        let resp = IpcServer::handle_restart_component(
+            &graph,
+            Some(&requester),
+            "local-aiua-01",
+            "vps-jane:life-graph-runner",
+            RestartReason::Operator,
+        )
+        .await;
+
+        assert!(
+            matches!(resp, IpcResponse::Standard { ok: true, .. }),
+            "operator restart should succeed, got {resp:?}"
+        );
+        assert_eq!(
+            requester.budget_checks.load(Ordering::SeqCst),
+            0,
+            "operator restart must NOT consult the respawn budget"
+        );
+        assert_eq!(
+            requester.calls.load(Ordering::SeqCst),
+            1,
+            "operator restart must respawn the guest"
+        );
     }
 
     // RC-2 (2026-07-09 stuck-turn forensic): when a session's active incarnation is a

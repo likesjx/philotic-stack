@@ -637,7 +637,24 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
 
 #[cfg(test)]
 mod tests {
-    use super::rule_classify;
+    use super::{gate_llm_action, rule_classify};
+
+    // F7: an LLM-suggested restart_guest on a low/unknown-severity novel error is
+    // not trustworthy enough to bounce a process — it is downgraded to escalate.
+    // Higher severities and non-restart actions pass through unchanged.
+    #[test]
+    fn gate_llm_action_downgrades_low_confidence_restart() {
+        assert_eq!(gate_llm_action("unknown", "restart_guest"), "escalate");
+        assert_eq!(gate_llm_action("low", "restart_guest"), "escalate");
+        assert_eq!(gate_llm_action("", "restart_guest"), "escalate");
+        // Trusted severities keep the restart.
+        assert_eq!(gate_llm_action("critical", "restart_guest"), "restart_guest");
+        assert_eq!(gate_llm_action("high", "restart_guest"), "restart_guest");
+        assert_eq!(gate_llm_action("medium", "restart_guest"), "restart_guest");
+        // Non-restart actions are never touched.
+        assert_eq!(gate_llm_action("unknown", "escalate"), "escalate");
+        assert_eq!(gate_llm_action("low", "noop"), "noop");
+    }
 
     /// Turn-failure tags must classify identically to the hotel's FailTask
     /// intake (shared classifier), and provider_4xx must escalate — never
