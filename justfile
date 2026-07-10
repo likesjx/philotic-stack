@@ -299,6 +299,18 @@ worktree-remove slug delete_branch="":
 worktree-prune:
     ./scripts/codex-worktree.sh prune
 
+# Report which sibling worktrees are safe to garbage-collect (dry run — deletes nothing).
+worktree-gc:
+    ./scripts/worktree-gc.sh --dry-run
+
+# Garbage-collect merged+clean sibling worktrees to reclaim cargo target/ disk (real deletion).
+worktree-gc-apply:
+    ./scripts/worktree-gc.sh --apply
+
+# Install the launchd schedule that runs worktree-gc --apply every 2 hours (mac-jane / macOS).
+worktree-gc-schedule:
+    ./scripts/install-worktree-gc-schedule.sh
+
 # Run tests
 test:
     cargo test --workspace
