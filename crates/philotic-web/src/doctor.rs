@@ -362,6 +362,7 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
         Box::new(IpcStaleSocket),
         Box::new(VaultKeySourceDivergence),
         Box::new(LogsRotationMissing),
+        Box::new(SecretsStorePermissions),
     ]
 }
 
@@ -796,13 +797,6 @@ fn try_decrypt(key: &[u8], ciphertext_b64: &str, nonce_b64: &str) -> bool {
     cipher.decrypt(nonce, ciphertext.as_ref()).is_ok()
 }
 
-fn count_decrypt_failures(key: &[u8], secrets: &[(String, String)]) -> usize {
-    secrets
-        .iter()
-        .filter(|(ciphertext, nonce)| !try_decrypt(key, ciphertext, nonce))
-        .count()
-}
-
 fn decode_key(raw: &str) -> Option<Vec<u8>> {
     let bytes = BASE64_STANDARD.decode(raw.trim()).ok()?;
     if bytes.len() == 32 {
@@ -880,10 +874,37 @@ fn resolve_vault_sources() -> Vec<(&'static str, Option<Vec<u8>>)> {
     ]
 }
 
+/// One secret enumerated from either the legacy `vault_secrets` table or a
+/// `graph_nodes` row whose `node_key` starts with `secret:` — the two real
+/// secret stores in a hotel's context DB (see module docs at the top of the
+/// vault section). `referenced` is precomputed by [`collect_vault_secrets`]
+/// against `node_config` and every *other* `graph_nodes` row.
+#[derive(Debug, Clone)]
+struct VaultSecretProbe {
+    secret_ref: String,
+    secret_kind: String,
+    source: &'static str,
+    ciphertext_b64: String,
+    nonce_b64: String,
+    referenced: bool,
+}
+
+/// Evidence-only view of a [`VaultSecretProbe`] — deliberately excludes
+/// `ciphertext_b64`/`nonce_b64`. Findings must never carry plaintext or
+/// ciphertext material, only refs/kinds/booleans.
+#[derive(Debug, Clone, Serialize)]
+struct VaultSecretEvidence<'a> {
+    secret_ref: &'a str,
+    secret_kind: &'a str,
+    source: &'a str,
+    referenced: bool,
+    decrypts: bool,
+}
+
 fn evaluate_vault_divergence(
     check_id: &'static str,
     sources: &[(&'static str, Option<Vec<u8>>)],
-    secrets: &[(String, String)],
+    secrets: &[VaultSecretProbe],
 ) -> Vec<Finding> {
     let fingerprints: serde_json::Value = serde_json::to_value(
         sources
@@ -908,7 +929,8 @@ fn evaluate_vault_divergence(
             severity: Severity::Warning,
             message: format!(
                 "no vault key source resolvable offline (no {VAULT_ENV_KEY} env, key file, or \
-                 Keychain entry found) while {} vault_secrets row(s) exist",
+                 Keychain entry found) while {} secret row(s) exist across vault_secrets + \
+                 graph_nodes",
                 secrets.len()
             ),
             evidence: json!({"sources": fingerprints, "secret_count": secrets.len()}),
@@ -924,29 +946,113 @@ fn evaluate_vault_divergence(
         return Vec::new();
     }
 
-    let failed = count_decrypt_failures(key, secrets);
-    if failed == 0 {
+    // Decrypt-test every secret from both stores under the effective key,
+    // and classify referenced-vs-orphan failures separately — a referenced
+    // secret that fails to decrypt will break live wiring on restart; an
+    // orphan that fails to decrypt is legacy dead weight nothing depends on.
+    let mut evidence_secrets: Vec<VaultSecretEvidence> = Vec::with_capacity(secrets.len());
+    let mut referenced_failed: Vec<&VaultSecretProbe> = Vec::new();
+    let mut orphan_failed: Vec<&VaultSecretProbe> = Vec::new();
+    let mut decrypted_count = 0usize;
+
+    for secret in secrets {
+        let decrypts = try_decrypt(key, &secret.ciphertext_b64, &secret.nonce_b64);
+        if decrypts {
+            decrypted_count += 1;
+        } else if secret.referenced {
+            referenced_failed.push(secret);
+        } else {
+            orphan_failed.push(secret);
+        }
+        evidence_secrets.push(VaultSecretEvidence {
+            secret_ref: &secret.secret_ref,
+            secret_kind: &secret.secret_kind,
+            source: secret.source,
+            referenced: secret.referenced,
+            decrypts,
+        });
+    }
+
+    let total = secrets.len();
+    let referenced_failures = referenced_failed.len();
+    let orphan_failures = orphan_failed.len();
+
+    if referenced_failures == 0 && orphan_failures == 0 {
+        // Secrets that decrypt fine produce no finding.
         return Vec::new();
     }
 
+    let summary_suffix = format!(
+        "{decrypted_count}/{total} decrypt; {orphan_failures} orphan undecryptable; \
+         {referenced_failures} referenced failures"
+    );
+
+    let (severity, message, fix_hint) = if referenced_failures > 0 {
+        let message = if referenced_failures == 1 {
+            let s = referenced_failed[0];
+            format!(
+                "referenced secret {} ({}) does not decrypt under effective key '{source_name}' \
+                 — live wiring will break on restart ({summary_suffix})",
+                s.secret_ref, s.secret_kind
+            )
+        } else {
+            let refs: Vec<&str> = referenced_failed
+                .iter()
+                .map(|s| s.secret_ref.as_str())
+                .collect();
+            format!(
+                "{referenced_failures} referenced secrets do not decrypt under effective key \
+                 '{source_name}' — live wiring will break on restart: {} ({summary_suffix})",
+                refs.join(", ")
+            )
+        };
+        let fix_hint = "residual divergence after the env->file->keychain precedence fix \
+                         (b87b581) — re-encrypt the affected REFERENCED secret(s) via the \
+                         RotateSecret IPC path under the now-effective key before the next \
+                         restart; doctor never touches key material"
+            .to_string();
+        (Severity::Critical, message, fix_hint)
+    } else {
+        let message = if orphan_failures == 1 {
+            let s = orphan_failed[0];
+            format!(
+                "orphaned secret {} ({}) does not decrypt and is referenced by nothing — \
+                 legacy dead weight, safe to prune ({summary_suffix})",
+                s.secret_ref, s.secret_kind
+            )
+        } else {
+            let refs: Vec<&str> = orphan_failed
+                .iter()
+                .map(|s| s.secret_ref.as_str())
+                .collect();
+            format!(
+                "{orphan_failures} orphaned secrets do not decrypt and are referenced by \
+                 nothing — legacy dead weight, safe to prune: {} ({summary_suffix})",
+                refs.join(", ")
+            )
+        };
+        let fix_hint = "referenced by no config key or graph node — not a live-wiring risk; \
+                         safe to prune via the vault admin path once an operator confirms it's \
+                         truly dead; doctor never deletes vault rows itself"
+            .to_string();
+        (Severity::Warning, message, fix_hint)
+    };
+
     vec![Finding {
         check_id: check_id.to_string(),
-        severity: Severity::Critical,
-        message: format!(
-            "{failed}/{} vault secrets do not decrypt under the effective key source ('{source_name}')",
-            secrets.len()
-        ),
+        severity,
+        message,
         evidence: json!({
             "effective_source": source_name,
             "effective_fingerprint": fingerprint(key),
             "sources": fingerprints,
-            "failed": failed,
-            "total": secrets.len(),
+            "total": total,
+            "decrypted": decrypted_count,
+            "orphan_undecryptable": orphan_failures,
+            "referenced_failures": referenced_failures,
+            "secrets": evidence_secrets,
         }),
-        fix_hint: "residual divergence after the env->file->keychain precedence fix (b87b581) \
-                   — re-encrypt the affected secrets via the RotateSecret IPC path under the \
-                   now-effective key; doctor never touches key material"
-            .to_string(),
+        fix_hint,
         auto_repairable: false,
     }]
 }
@@ -963,10 +1069,20 @@ impl Check for VaultKeySourceDivergence {
     }
 
     fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
-        if let Some(findings) = missing_table_finding(ctx, self.id(), "vault_secrets")? {
-            return Ok(findings);
+        // The legacy `vault_secrets` table missing doesn't necessarily mean
+        // there's nothing to check: the hotel's live, canonical secret store
+        // is `graph_nodes` `secret:*` rows (see `graph_node_secrets_from_db`).
+        // Only report "table not found, skipped" when *both* stores are
+        // empty — never let the presence check on one legacy table swallow
+        // secrets that live exclusively in the other, current store.
+        if !table_exists(&ctx.conn, "vault_secrets")?
+            && graph_node_secrets_from_db(&ctx.conn)?.is_empty()
+        {
+            if let Some(findings) = missing_table_finding(ctx, self.id(), "vault_secrets")? {
+                return Ok(findings);
+            }
         }
-        let secrets = vault_secrets_from_db(&ctx.conn)?;
+        let secrets = collect_vault_secrets(&ctx.conn)?;
         let sources = resolve_vault_sources();
         Ok(evaluate_vault_divergence(self.id(), &sources, &secrets))
     }
@@ -980,13 +1096,205 @@ impl Check for VaultKeySourceDivergence {
     }
 }
 
-fn vault_secrets_from_db(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare("SELECT ciphertext_b64, nonce_b64 FROM vault_secrets")?;
+/// One row read straight off a store, before dedup/referenced classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawSecret {
+    secret_ref: String,
+    secret_kind: String,
+    ciphertext_b64: String,
+    nonce_b64: String,
+}
+
+/// Enumerate secrets from the legacy `vault_secrets` table — the store
+/// `phil doctor` checked exclusively before slice 3. On the live bjork
+/// hotel this table holds exactly one row: an orphan referenced by no
+/// config/graph node, encrypted under a pre-re-key master key.
+///
+/// Returns an empty vec (rather than erroring) when the table itself is
+/// absent, mirroring `graph_node_secrets_from_db`'s handling of a missing
+/// `graph_nodes` table — `collect_vault_secrets` calls both unconditionally
+/// and relies on each degrading gracefully so a DB with only one of the two
+/// stores still gets a full, correct scan of whichever store it does have.
+fn vault_secrets_from_db(conn: &Connection) -> Result<Vec<RawSecret>> {
+    if !table_exists(conn, "vault_secrets")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT secret_ref, secret_kind, ciphertext_b64, nonce_b64 FROM vault_secrets")?;
     let secrets = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map([], |row| {
+            Ok(RawSecret {
+                secret_ref: row.get(0)?,
+                secret_kind: row.get(1)?,
+                ciphertext_b64: row.get(2)?,
+                nonce_b64: row.get(3)?,
+            })
+        })?
         .filter_map(|r| r.ok())
         .collect();
     Ok(secrets)
+}
+
+/// Enumerate secrets from `graph_nodes` rows whose `node_key` starts with
+/// `secret:` — the hotel's real, live secret store (see `NODE_KIND_SECRET`
+/// / `GraphDomain::upsert_secret` in `ansible-mesh-core`). Each row's
+/// `data_json` is a serialized `SecretRecord`; a row that fails to parse as
+/// one is skipped rather than hard-erroring the whole check (defensive
+/// against a future schema change doctor doesn't know about yet).
+///
+/// Returns `(node_key, RawSecret)` pairs — the node_key is kept so the
+/// referenced-check can exclude a secret's *own* graph node when scanning
+/// `graph_nodes` for references to it (its own `data_json` trivially
+/// contains its own `secret_ref`, which would otherwise self-count as
+/// "referenced").
+fn graph_node_secrets_from_db(conn: &Connection) -> Result<Vec<(String, RawSecret)>> {
+    if !table_exists(conn, "graph_nodes")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt =
+        conn.prepare("SELECT node_key, data_json FROM graph_nodes WHERE node_key LIKE 'secret:%'")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for (node_key, data_json) in rows {
+        if let Ok(rec) =
+            serde_json::from_str::<ansible_mesh_core::storage::SecretRecord>(&data_json)
+        {
+            out.push((
+                node_key,
+                RawSecret {
+                    secret_ref: rec.secret_ref,
+                    secret_kind: rec.secret_kind,
+                    ciphertext_b64: rec.ciphertext_b64,
+                    nonce_b64: rec.nonce_b64,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// All `node_config.value_json` values — scanned in memory (rather than a
+/// SQL `LIKE`) to sidestep `%`/`_` LIKE-wildcard escaping on secret refs.
+fn node_config_values(conn: &Connection) -> Result<Vec<String>> {
+    if !table_exists(conn, "node_config")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT value_json FROM node_config")?;
+    let values = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(values)
+}
+
+/// All `(node_key, data_json)` pairs in `graph_nodes` (every kind, not just
+/// `secret:*`) — a secret can be referenced from a non-secret node too
+/// (e.g. a role or config node embedding the ref).
+fn all_graph_node_data_jsons(conn: &Connection) -> Result<Vec<(String, String)>> {
+    if !table_exists(conn, "graph_nodes")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT node_key, data_json FROM graph_nodes")?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// True when `secret_ref` appears in any `node_config.value_json` row, or in
+/// any `graph_nodes.data_json` row other than `exclude_node_key` (the
+/// secret's own node, when it has one — table-only secrets pass `None`).
+///
+/// Deliberately a raw substring scan, *not* a quoted/exact-field match: live
+/// wiring sites serialize the ref at varying JSON-nesting depths — a plain
+/// `"secret_ref"` JSON string, a `{"secret_ref": "..."}` field, or (as seen
+/// on the live bjork hotel, e.g. `config:oidc_github_client_secret_ref`) a
+/// *double*-JSON-encoded `{"value":"\"secret_ref\""}` string where the ref
+/// is wrapped in escaped `\"` rather than a bare `"`. Requiring a literal
+/// `"secret_ref"` quoted match was tried and reverted: it silently
+/// misclassified real, live-referenced secrets (mesh-hotel keys, vault
+/// tokens) as unreferenced orphans against the live bjork DB, downgrading a
+/// Critical divergence finding to Warning — exactly the referenced/orphan
+/// misclassification this check exists to catch. A bare substring match is
+/// the only encoding-agnostic option; the false-positive risk it carries
+/// (one secret_ref being a textual substring of another) is effectively
+/// nil in practice since refs are UUID-suffixed
+/// (`secret://hotel/default/<kind>/<32-hex>`).
+fn secret_ref_is_referenced(
+    node_config_values: &[String],
+    graph_data_jsons: &[(String, String)],
+    secret_ref: &str,
+    exclude_node_key: Option<&str>,
+) -> bool {
+    if node_config_values.iter().any(|v| v.contains(secret_ref)) {
+        return true;
+    }
+    graph_data_jsons.iter().any(|(node_key, data_json)| {
+        Some(node_key.as_str()) != exclude_node_key && data_json.contains(secret_ref)
+    })
+}
+
+/// Enumerate secrets from *both* stores (`vault_secrets` legacy table +
+/// `graph_nodes` `secret:*` rows), de-duping by `secret_ref` — the
+/// graph-node copy wins on conflict since that store is the hotel's live,
+/// canonical vault; `vault_secrets` is a pre-migration leftover. Each
+/// returned secret carries a precomputed `referenced` flag.
+fn collect_vault_secrets(conn: &Connection) -> Result<Vec<VaultSecretProbe>> {
+    let table_secrets = vault_secrets_from_db(conn)?;
+    let graph_secrets = graph_node_secrets_from_db(conn)?;
+    let node_config_values = node_config_values(conn)?;
+    let graph_data_jsons = all_graph_node_data_jsons(conn)?;
+
+    let mut by_ref: std::collections::BTreeMap<String, VaultSecretProbe> =
+        std::collections::BTreeMap::new();
+
+    for raw in table_secrets {
+        let referenced = secret_ref_is_referenced(
+            &node_config_values,
+            &graph_data_jsons,
+            &raw.secret_ref,
+            None,
+        );
+        by_ref.insert(
+            raw.secret_ref.clone(),
+            VaultSecretProbe {
+                secret_ref: raw.secret_ref,
+                secret_kind: raw.secret_kind,
+                source: "vault_secrets",
+                ciphertext_b64: raw.ciphertext_b64,
+                nonce_b64: raw.nonce_b64,
+                referenced,
+            },
+        );
+    }
+
+    // Inserted after the table pass so a ref present in both stores ends up
+    // classified as the graph-node copy (de-dup — see doc comment above).
+    for (node_key, raw) in graph_secrets {
+        let referenced = secret_ref_is_referenced(
+            &node_config_values,
+            &graph_data_jsons,
+            &raw.secret_ref,
+            Some(&node_key),
+        );
+        by_ref.insert(
+            raw.secret_ref.clone(),
+            VaultSecretProbe {
+                secret_ref: raw.secret_ref,
+                secret_kind: raw.secret_kind,
+                source: "graph_node",
+                ciphertext_b64: raw.ciphertext_b64,
+                nonce_b64: raw.nonce_b64,
+                referenced,
+            },
+        );
+    }
+
+    Ok(by_ref.into_values().collect())
 }
 
 // ── logs.rotation-missing ───────────────────────────────────────────────
@@ -1159,6 +1467,199 @@ fn write_newsyslog_dropin_directly(dropin: &std::path::Path) -> Result<()> {
     std::fs::write(dropin, newsyslog_dropin_content())
         .with_context(|| format!("write {}", dropin.display()))?;
     Ok(())
+}
+
+// ── secrets.store-permissions ───────────────────────────────────────────
+//
+// context.db carries both the legacy vault_secrets table and the live
+// graph_nodes `secret:*` rows — i.e. every ciphertext + nonce in the
+// hotel's vault. Encrypted-at-rest means a loose file mode isn't an
+// immediate plaintext leak (the master key is Keychain- or file-protected,
+// never stored alongside the DB), but a secret-bearing store should still
+// not be group/other-readable. Wants db=0600, dir=0700.
+
+#[cfg(unix)]
+mod unix_perms {
+    use std::fs;
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    /// Lower 9 permission bits (`rwxrwxrwx`) of `path`, or `None` if the
+    /// path can't be stat'd (e.g. already gone, or permission denied).
+    pub fn mode(path: &Path) -> Option<u32> {
+        fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
+    }
+
+    pub fn chmod(path: &Path, new_mode: u32) -> io::Result<()> {
+        fs::set_permissions(path, fs::Permissions::from_mode(new_mode))
+    }
+}
+
+const WANT_DB_MODE: u32 = 0o600;
+const WANT_DIR_MODE: u32 = 0o700;
+/// Any bit here set means group or other has some access at all.
+const GROUP_OTHER_ANY_BIT: u32 = 0o077;
+/// Group- or other-writable bits specifically — the escalated-severity case.
+const GROUP_OTHER_WRITE_BITS: u32 = 0o022;
+
+fn evaluate_store_permissions(
+    check_id: &'static str,
+    db_path: &str,
+    db_mode: Option<u32>,
+    dir_path: &str,
+    dir_mode: Option<u32>,
+) -> Vec<Finding> {
+    let db_loose = db_mode.is_some_and(|m| m & GROUP_OTHER_ANY_BIT != 0);
+    let dir_loose = dir_mode.is_some_and(|m| m & GROUP_OTHER_ANY_BIT != 0);
+
+    if !db_loose && !dir_loose {
+        return Vec::new();
+    }
+
+    let world_writable = db_mode.is_some_and(|m| m & GROUP_OTHER_WRITE_BITS != 0)
+        || dir_mode.is_some_and(|m| m & GROUP_OTHER_WRITE_BITS != 0);
+    let severity = if world_writable {
+        Severity::Error
+    } else {
+        Severity::Warning
+    };
+
+    let mut parts = Vec::new();
+    if db_loose {
+        parts.push(format!(
+            "{db_path} is {:04o} (want {WANT_DB_MODE:04o})",
+            db_mode.unwrap_or(0)
+        ));
+    }
+    if dir_loose {
+        parts.push(format!(
+            "{dir_path} is {:04o} (want {WANT_DIR_MODE:04o})",
+            dir_mode.unwrap_or(0)
+        ));
+    }
+
+    vec![Finding {
+        check_id: check_id.to_string(),
+        severity,
+        message: format!(
+            "secret-bearing context DB store is group/other-accessible: {} — encrypted at \
+             rest (master key is Keychain/file-protected, not stored alongside the DB) so this \
+             isn't an immediate plaintext leak, but a vault-adjacent store should not be \
+             world-readable",
+            parts.join("; ")
+        ),
+        evidence: json!({
+            "db_path": db_path,
+            "db_mode": db_mode.map(|m| format!("{m:04o}")),
+            "dir_path": dir_path,
+            "dir_mode": dir_mode.map(|m| format!("{m:04o}")),
+            "want_db_mode": format!("{WANT_DB_MODE:04o}"),
+            "want_dir_mode": format!("{WANT_DIR_MODE:04o}"),
+        }),
+        fix_hint: format!("chmod {WANT_DB_MODE:o} {db_path} && chmod {WANT_DIR_MODE:o} {dir_path}"),
+        auto_repairable: true,
+    }]
+}
+
+struct SecretsStorePermissions;
+
+impl Check for SecretsStorePermissions {
+    fn id(&self) -> &'static str {
+        "secrets.store-permissions"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        #[cfg(unix)]
+        {
+            let db_mode = unix_perms::mode(&ctx.db_path);
+            let dir_mode = unix_perms::mode(&ctx.profile_dir);
+            return Ok(evaluate_store_permissions(
+                self.id(),
+                &ctx.db_path.to_string_lossy(),
+                db_mode,
+                &ctx.profile_dir.to_string_lossy(),
+                dir_mode,
+            ));
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Auto-repairable: tightening the operator's OWN files to owner-only
+    /// is reversible and only ever narrows access, never widens it — unlike
+    /// every other repair here this doesn't need `NeedsConfirm`. Applied on
+    /// `--fix`, Planned on dry-run; before/after modes are journaled.
+    fn repair(&self, ctx: &DoctorCtx, finding: &Finding, apply: bool) -> Result<RepairOutcome> {
+        #[cfg(unix)]
+        {
+            let db_path = finding
+                .evidence
+                .get("db_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let dir_path = finding
+                .evidence
+                .get("dir_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let description =
+                format!("chmod {WANT_DB_MODE:o} {db_path} && chmod {WANT_DIR_MODE:o} {dir_path}");
+
+            if !apply {
+                return Ok(RepairOutcome::Planned { description });
+            }
+
+            let db_before = unix_perms::mode(std::path::Path::new(&db_path));
+            let dir_before = unix_perms::mode(std::path::Path::new(&dir_path));
+
+            let mut errors: Vec<String> = Vec::new();
+            if let Err(e) = unix_perms::chmod(std::path::Path::new(&db_path), WANT_DB_MODE) {
+                errors.push(format!("chmod {WANT_DB_MODE:o} {db_path}: {e}"));
+            }
+            if let Err(e) = unix_perms::chmod(std::path::Path::new(&dir_path), WANT_DIR_MODE) {
+                errors.push(format!("chmod {WANT_DIR_MODE:o} {dir_path}: {e}"));
+            }
+
+            if !errors.is_empty() {
+                return Ok(RepairOutcome::Skipped {
+                    reason: format!("{}; manual: {description}", errors.join("; ")),
+                });
+            }
+
+            let db_after = unix_perms::mode(std::path::Path::new(&db_path));
+            let dir_after = unix_perms::mode(std::path::Path::new(&dir_path));
+            append_repair_journal(
+                &ctx.profile_dir,
+                self.id(),
+                "chmod-store-permissions",
+                json!({
+                    "db_mode": db_before.map(|m| format!("{m:04o}")),
+                    "dir_mode": dir_before.map(|m| format!("{m:04o}")),
+                }),
+                json!({
+                    "db_mode": db_after.map(|m| format!("{m:04o}")),
+                    "dir_mode": dir_after.map(|m| format!("{m:04o}")),
+                }),
+            )?;
+            Ok(RepairOutcome::Applied { description })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (ctx, finding, apply);
+            Ok(RepairOutcome::NotRepairable)
+        }
+    }
 }
 
 // ── CLI entry ────────────────────────────────────────────────────────────
@@ -1411,6 +1912,65 @@ mod tests {
         .expect("insert secret");
     }
 
+    /// Insert a `graph_nodes` row shaped exactly like
+    /// `GraphDomain::upsert_secret` produces in production: `node_key =
+    /// "secret:<ref>"`, `data_json` = the serialized `SecretRecord`.
+    fn insert_graph_secret(
+        conn: &Connection,
+        secret_ref: &str,
+        secret_kind: &str,
+        ciphertext_b64: &str,
+        nonce_b64: &str,
+    ) {
+        let record = ansible_mesh_core::storage::SecretRecord {
+            secret_ref: secret_ref.to_string(),
+            secret_kind: secret_kind.to_string(),
+            scope: "hotel".to_string(),
+            allowed_roles: vec![],
+            allowed_guests: vec![],
+            ciphertext_b64: ciphertext_b64.to_string(),
+            nonce_b64: nonce_b64.to_string(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let node_key = format!("secret:{secret_ref}");
+        let data_json = serde_json::to_string(&record).expect("serialize SecretRecord");
+        conn.execute(
+            "INSERT INTO graph_nodes (node_key, kind, label, data_json, updated_at) VALUES (?1, 'secret', ?2, ?3, 0)",
+            params![node_key, secret_ref, data_json],
+        )
+        .expect("insert graph secret node");
+    }
+
+    /// Insert a `node_config` row referencing `value` (e.g. a `secret_ref`)
+    /// in its `value_json`, mirroring `config:<key>_ref -> secret_ref`
+    /// wiring in production.
+    fn insert_node_config_ref(conn: &Connection, key: &str, value: &str) {
+        conn.execute(
+            "INSERT INTO node_config (key, value_json) VALUES (?1, ?2)",
+            params![key, json!(value).to_string()],
+        )
+        .expect("insert node_config");
+    }
+
+    fn probe(
+        secret_ref: &str,
+        secret_kind: &str,
+        source: &'static str,
+        ciphertext_b64: String,
+        nonce_b64: String,
+        referenced: bool,
+    ) -> VaultSecretProbe {
+        VaultSecretProbe {
+            secret_ref: secret_ref.to_string(),
+            secret_kind: secret_kind.to_string(),
+            source,
+            ciphertext_b64,
+            nonce_b64,
+            referenced,
+        }
+    }
+
     fn encrypt_for_test(key: &[u8; 32], plaintext: &str) -> (String, String) {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
         let nonce_bytes = [7u8; 12];
@@ -1639,7 +2199,14 @@ mod tests {
             ("file", None),
             ("keychain", None),
         ];
-        let secrets = vec![(ct, nonce)];
+        let secrets = vec![probe(
+            "secret://x",
+            "api_key",
+            "vault_secrets",
+            ct,
+            nonce,
+            true,
+        )];
         let findings = evaluate_vault_divergence("vault.key-source-divergence", &sources, &secrets);
         assert!(
             findings.is_empty(),
@@ -1648,7 +2215,7 @@ mod tests {
     }
 
     #[test]
-    fn vault_evaluate_flags_divergence_when_effective_key_cannot_decrypt() {
+    fn vault_evaluate_referenced_failure_is_critical() {
         let real_key = [3u8; 32];
         let wrong_key = [4u8; 32];
         let (ct, nonce) = encrypt_for_test(&real_key, "hello");
@@ -1657,17 +2224,105 @@ mod tests {
             ("file", None),
             ("keychain", None),
         ];
-        let secrets = vec![(ct, nonce)];
+        let secrets = vec![probe(
+            "secret://referenced",
+            "openai_api_key",
+            "graph_node",
+            ct.clone(),
+            nonce,
+            true, // referenced
+        )];
         let findings = evaluate_vault_divergence("vault.key-source-divergence", &sources, &secrets);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
         assert!(!findings[0].auto_repairable);
+        assert!(findings[0].message.contains("secret://referenced"));
+        assert!(findings[0].message.contains("live wiring will break"));
+        assert_eq!(findings[0].evidence["referenced_failures"], json!(1));
+        assert_eq!(findings[0].evidence["orphan_undecryptable"], json!(0));
+        // Never leak ciphertext/nonce material into evidence.
+        let dump = findings[0].evidence.to_string();
+        assert!(!dump.contains(&ct), "must not leak ciphertext");
+    }
+
+    #[test]
+    fn vault_evaluate_orphan_failure_is_warning_not_critical() {
+        let real_key = [3u8; 32];
+        let wrong_key = [4u8; 32];
+        let (ct, nonce) = encrypt_for_test(&real_key, "hello");
+        let sources = vec![
+            ("env", Some(wrong_key.to_vec())),
+            ("file", None),
+            ("keychain", None),
+        ];
+        let secrets = vec![probe(
+            "secret://hotel/default/api_key/835c1f45",
+            "api_key",
+            "vault_secrets",
+            ct,
+            nonce,
+            false, // unreferenced — the exact orphan scenario from the field
+        )];
+        let findings = evaluate_vault_divergence("vault.key-source-divergence", &sources, &secrets);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].severity,
+            Severity::Warning,
+            "orphan must NOT be critical: {findings:?}"
+        );
+        assert!(findings[0].message.contains("orphaned secret"));
+        assert!(findings[0].message.contains("safe to prune"));
+        assert_eq!(findings[0].evidence["referenced_failures"], json!(0));
+        assert_eq!(findings[0].evidence["orphan_undecryptable"], json!(1));
+    }
+
+    #[test]
+    fn vault_evaluate_referenced_failure_wins_severity_over_coexisting_orphan_failure() {
+        let real_key = [3u8; 32];
+        let wrong_key = [4u8; 32];
+        let (ct1, nonce1) = encrypt_for_test(&real_key, "hello");
+        let (ct2, nonce2) = encrypt_for_test(&real_key, "world");
+        let sources = vec![
+            ("env", Some(wrong_key.to_vec())),
+            ("file", None),
+            ("keychain", None),
+        ];
+        let secrets = vec![
+            probe(
+                "secret://referenced",
+                "openai_api_key",
+                "graph_node",
+                ct1,
+                nonce1,
+                true,
+            ),
+            probe(
+                "secret://orphan",
+                "api_key",
+                "vault_secrets",
+                ct2,
+                nonce2,
+                false,
+            ),
+        ];
+        let findings = evaluate_vault_divergence("vault.key-source-divergence", &sources, &secrets);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].evidence["referenced_failures"], json!(1));
+        assert_eq!(findings[0].evidence["orphan_undecryptable"], json!(1));
     }
 
     #[test]
     fn vault_evaluate_no_source_but_secrets_exist_is_warning() {
         let sources = vec![("env", None), ("file", None), ("keychain", None)];
-        let secrets = vec![("ct".to_string(), "n".to_string())];
+        let secrets = vec![probe(
+            "secret://x",
+            "k",
+            "vault_secrets",
+            "ct".to_string(),
+            "n".to_string(),
+            false,
+        )];
         let findings = evaluate_vault_divergence("vault.key-source-divergence", &sources, &secrets);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
@@ -1690,31 +2345,208 @@ mod tests {
             let conn = storage.raw_conn().lock().unwrap();
             insert_secret(&conn, "secret://x", &ct, &nonce);
         }
-        // Read via the same read-only path detect() uses, but drive the
-        // pure evaluator with fabricated sources — this deliberately avoids
-        // calling resolve_vault_sources() (real env/file/Keychain), which
-        // would make the test depend on this machine's actual vault state.
         let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
         let secrets = vault_secrets_from_db(&ctx.conn).expect("read secrets");
-        assert_eq!(secrets, vec![(ct, nonce)]);
+        assert_eq!(
+            secrets,
+            vec![RawSecret {
+                secret_ref: "secret://x".to_string(),
+                secret_kind: "k".to_string(),
+                ciphertext_b64: ct,
+                nonce_b64: nonce,
+            }]
+        );
+    }
+
+    #[test]
+    fn graph_node_secrets_from_db_reads_secret_prefixed_nodes_only() {
+        let (_dir, path) = fixture_db();
+        let key = [6u8; 32];
+        let (ct, nonce) = encrypt_for_test(&key, "graph-secret");
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            insert_graph_secret(&conn, "secret://graph/one", "openai_api_key", &ct, &nonce);
+            // A non-secret graph node must never be picked up by the
+            // `secret:%` LIKE filter.
+            conn.execute(
+                "INSERT INTO graph_nodes (node_key, kind, label, data_json, updated_at) VALUES ('role:brain', 'role', 'brain', '{}', 0)",
+                [],
+            )
+            .expect("insert unrelated node");
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let secrets = graph_node_secrets_from_db(&ctx.conn).expect("read graph secrets");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].0, "secret:secret://graph/one");
+        assert_eq!(secrets[0].1.secret_ref, "secret://graph/one");
+        assert_eq!(secrets[0].1.secret_kind, "openai_api_key");
+    }
+
+    // ── collect_vault_secrets: full detect()-path referenced/orphan/dedup ──
+
+    #[test]
+    fn collect_vault_secrets_classifies_referenced_via_node_config() {
+        let (_dir, path) = fixture_db();
+        let key = [7u8; 32];
+        let (ct, nonce) = encrypt_for_test(&key, "s");
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            insert_graph_secret(&conn, "secret://ref-via-config", "vault-token", &ct, &nonce);
+            insert_node_config_ref(
+                &conn,
+                "config:gemini_api_key_ref",
+                "secret://ref-via-config",
+            );
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let secrets = collect_vault_secrets(&ctx.conn).expect("collect");
+        assert_eq!(secrets.len(), 1);
+        assert!(
+            secrets[0].referenced,
+            "expected node_config wiring to mark referenced"
+        );
+    }
+
+    #[test]
+    fn collect_vault_secrets_classifies_referenced_via_other_graph_node() {
+        let (_dir, path) = fixture_db();
+        let key = [7u8; 32];
+        let (ct, nonce) = encrypt_for_test(&key, "s");
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            insert_graph_secret(&conn, "secret://ref-via-node", "vault-token", &ct, &nonce);
+            conn.execute(
+                "INSERT INTO graph_nodes (node_key, kind, label, data_json, updated_at) VALUES ('role:brain', 'role', 'brain', ?1, 0)",
+                params![json!({"secret_ref": "secret://ref-via-node"}).to_string()],
+            )
+            .expect("insert referencing node");
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let secrets = collect_vault_secrets(&ctx.conn).expect("collect");
+        assert_eq!(secrets.len(), 1);
+        assert!(secrets[0].referenced);
+    }
+
+    #[test]
+    fn collect_vault_secrets_does_not_self_reference_own_graph_node() {
+        // A secret's own data_json trivially contains its own secret_ref —
+        // that must never count as "referenced by something else".
+        let (_dir, path) = fixture_db();
+        let key = [7u8; 32];
+        let (ct, nonce) = encrypt_for_test(&key, "s");
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            insert_graph_secret(&conn, "secret://lonely", "vault-token", &ct, &nonce);
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let secrets = collect_vault_secrets(&ctx.conn).expect("collect");
+        assert_eq!(secrets.len(), 1);
+        assert!(
+            !secrets[0].referenced,
+            "must not self-reference via its own node_key/data_json"
+        );
+    }
+
+    /// Regression guard for the live-bjork wiring shape: a `config:*_ref`
+    /// graph node whose `data_json` double-JSON-encodes the ref as
+    /// `{"value":"\"secret://...\""}` (escaped `\"`, not a bare `"`) must
+    /// still be recognized as a reference. A stricter "must be
+    /// bare-quoted" matcher was tried during review and silently broke
+    /// this exact shape, downgrading a live Critical divergence finding to
+    /// Warning — see the doc comment on `secret_ref_is_referenced`.
+    #[test]
+    fn secret_ref_is_referenced_matches_double_json_encoded_value_field() {
+        let node_config_values: Vec<String> = vec![];
+        let graph_data_jsons = vec![(
+            "config:oidc_github_client_secret_ref".to_string(),
+            // Mirrors the exact bytes observed on the live bjork context.db.
+            "{\"value\":\"\\\"secret://hotel/default/vault-token/92bda314c29e42f991b808c195c21c45\\\"\"}".to_string(),
+        )];
+        assert!(
+            secret_ref_is_referenced(
+                &node_config_values,
+                &graph_data_jsons,
+                "secret://hotel/default/vault-token/92bda314c29e42f991b808c195c21c45",
+                None,
+            ),
+            "double-JSON-encoded (escaped-quote) wiring must still count as referenced"
+        );
+    }
+
+    #[test]
+    fn collect_vault_secrets_dedups_by_secret_ref_preferring_graph_node() {
+        let (_dir, path) = fixture_db();
+        let table_key = [1u8; 32];
+        let graph_key = [2u8; 32];
+        let (table_ct, table_nonce) = encrypt_for_test(&table_key, "table-copy");
+        let (graph_ct, graph_nonce) = encrypt_for_test(&graph_key, "graph-copy");
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            insert_secret(&conn, "secret://dup", &table_ct, &table_nonce);
+            insert_graph_secret(&conn, "secret://dup", "api_key", &graph_ct, &graph_nonce);
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let secrets = collect_vault_secrets(&ctx.conn).expect("collect");
+        assert_eq!(
+            secrets.len(),
+            1,
+            "duplicate secret_ref across stores must be de-duped"
+        );
+        assert_eq!(secrets[0].source, "graph_node");
+        assert_eq!(secrets[0].ciphertext_b64, graph_ct);
+    }
+
+    /// End-to-end regression coverage for the exact field scenario: 15
+    /// live, referenced graph-node secrets that all decrypt fine, plus one
+    /// legacy `vault_secrets` orphan that does not decrypt under the
+    /// current key. Must classify as one Warning finding, never Critical.
+    #[test]
+    fn collect_vault_secrets_field_scenario_orphan_warning_not_critical() {
+        let (_dir, path) = fixture_db();
+        let live_key = [42u8; 32];
+        let stale_key = [99u8; 32]; // pre-re-key master key, no longer effective
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            for i in 0..15 {
+                let secret_ref = format!("secret://hotel/default/live/{i}");
+                let (ct, nonce) = encrypt_for_test(&live_key, "live-secret");
+                insert_graph_secret(&conn, &secret_ref, "openai_api_key", &ct, &nonce);
+                insert_node_config_ref(&conn, &format!("config:key_{i}_ref"), &secret_ref);
+            }
+            let (orphan_ct, orphan_nonce) = encrypt_for_test(&stale_key, "dead-weight");
+            insert_secret(
+                &conn,
+                "secret://hotel/default/api_key/835c1f45",
+                &orphan_ct,
+                &orphan_nonce,
+            );
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let secrets = collect_vault_secrets(&ctx.conn).expect("collect");
+        assert_eq!(secrets.len(), 16);
 
         let sources = vec![
-            ("env", Some(key.to_vec())),
+            ("env", Some(live_key.to_vec())),
             ("file", None),
             ("keychain", None),
         ];
-        let clean = evaluate_vault_divergence("vault.key-source-divergence", &sources, &secrets);
-        assert!(clean.is_empty());
-
-        let wrong_sources = vec![
-            ("env", Some([9u8; 32].to_vec())),
-            ("file", None),
-            ("keychain", None),
-        ];
-        let divergent =
-            evaluate_vault_divergence("vault.key-source-divergence", &wrong_sources, &secrets);
-        assert_eq!(divergent.len(), 1);
-        assert_eq!(divergent[0].severity, Severity::Critical);
+        let findings = evaluate_vault_divergence("vault.key-source-divergence", &sources, &secrets);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].severity,
+            Severity::Warning,
+            "field scenario must be Warning/orphan, not Critical: {findings:?}"
+        );
+        assert_eq!(findings[0].evidence["referenced_failures"], json!(0));
+        assert_eq!(findings[0].evidence["orphan_undecryptable"], json!(1));
+        assert_eq!(findings[0].evidence["decrypted"], json!(15));
+        assert_eq!(findings[0].evidence["total"], json!(16));
     }
 
     // ── logs.rotation-missing ───────────────────────────────────────────
@@ -1747,6 +2579,146 @@ mod tests {
     fn log_rotation_missing_file_still_flags_missing_dropin() {
         let findings = evaluate_log_rotation("logs.rotation-missing", "/x/aiua.log", None, false);
         assert_eq!(findings.len(), 1);
+    }
+
+    // ── secrets.store-permissions ────────────────────────────────────────
+
+    #[test]
+    fn store_permissions_clean_when_tight() {
+        let findings = evaluate_store_permissions(
+            "secrets.store-permissions",
+            "/x/context.db",
+            Some(0o600),
+            "/x",
+            Some(0o700),
+        );
+        assert!(findings.is_empty(), "expected clean, got {findings:?}");
+    }
+
+    #[test]
+    fn store_permissions_flags_world_readable_db() {
+        let findings = evaluate_store_permissions(
+            "secrets.store-permissions",
+            "/x/context.db",
+            Some(0o644),
+            "/x",
+            Some(0o700),
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].auto_repairable);
+        assert!(findings[0].fix_hint.contains("chmod 600"));
+        assert!(findings[0].fix_hint.contains("chmod 700"));
+    }
+
+    #[test]
+    fn store_permissions_flags_world_readable_dir() {
+        let findings = evaluate_store_permissions(
+            "secrets.store-permissions",
+            "/x/context.db",
+            Some(0o600),
+            "/x",
+            Some(0o755),
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn store_permissions_escalates_to_error_when_world_writable() {
+        let findings = evaluate_store_permissions(
+            "secrets.store-permissions",
+            "/x/context.db",
+            Some(0o666),
+            "/x",
+            Some(0o700),
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn store_permissions_unreadable_metadata_is_not_flagged() {
+        // A stat() failure (None) must not be treated as loose — there's no
+        // evidence either way, so don't manufacture a false positive.
+        let findings = evaluate_store_permissions(
+            "secrets.store-permissions",
+            "/x/context.db",
+            None,
+            "/x",
+            None,
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_permissions_check_detects_loose_fixture_db_and_repair_tightens_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, db_path) = fixture_db();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod fixture db to 0644");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fixture dir to 0755");
+
+        let ctx = ctx_with_profile_dir("jane", db_path.clone(), dir.path().to_path_buf());
+        let findings = SecretsStorePermissions.detect(&ctx).expect("detect");
+        assert_eq!(findings.len(), 1, "0644 db + 0755 dir must be flagged");
+        assert_eq!(findings[0].severity, Severity::Warning);
+
+        // Dry-run: planned, must not touch disk.
+        let planned = SecretsStorePermissions
+            .repair(&ctx, &findings[0], false)
+            .expect("repair dry-run");
+        assert!(matches!(planned, RepairOutcome::Planned { .. }));
+        assert_eq!(
+            unix_perms::mode(&db_path),
+            Some(0o644),
+            "dry-run must not chmod"
+        );
+
+        // Apply: tightens to 0600/0700 and journals before/after.
+        let applied = SecretsStorePermissions
+            .repair(&ctx, &findings[0], true)
+            .expect("repair apply");
+        assert!(matches!(applied, RepairOutcome::Applied { .. }));
+        assert_eq!(unix_perms::mode(&db_path), Some(0o600));
+        assert_eq!(unix_perms::mode(dir.path()), Some(0o700));
+
+        let journal_path = dir.path().join("doctor-repair-journal.jsonl");
+        assert!(journal_path.exists());
+        let content = std::fs::read_to_string(&journal_path).expect("read journal");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let entry: serde_json::Value = serde_json::from_str(lines[0]).expect("parse journal line");
+        assert_eq!(entry["check_id"], json!("secrets.store-permissions"));
+        assert_eq!(entry["action"], json!("chmod-store-permissions"));
+        assert_eq!(entry["before"]["db_mode"], json!("0644"));
+        assert_eq!(entry["after"]["db_mode"], json!("0600"));
+
+        // Re-running detect() now finds nothing — clean.
+        let clean = SecretsStorePermissions.detect(&ctx).expect("detect again");
+        assert!(
+            clean.is_empty(),
+            "expected clean after repair, got {clean:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_permissions_tight_fixture_db_has_no_finding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, db_path) = fixture_db();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod fixture db to 0600");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fixture dir to 0700");
+
+        let ctx = ctx_with_profile_dir("jane", db_path, dir.path().to_path_buf());
+        let findings = SecretsStorePermissions.detect(&ctx).expect("detect");
+        assert!(findings.is_empty(), "expected clean, got {findings:?}");
     }
 
     // ── Severity ordering / parsing ──────────────────────────────────────
@@ -1946,6 +2918,45 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(findings[0].message.contains("vault_secrets"));
+    }
+
+    /// The legacy `vault_secrets` table missing must not swallow secrets
+    /// that live exclusively in `graph_nodes` `secret:*` rows — the check
+    /// must fall through and evaluate those, not report "table not found,
+    /// skipped" while a real, referenced secret goes unchecked.
+    #[test]
+    fn vault_check_falls_through_to_graph_nodes_when_vault_secrets_table_absent() {
+        let (_dir, path) = fixture_db();
+        let key = [11u8; 32];
+        let (ct, nonce) = encrypt_for_test(&key, "graph-only-secret");
+        {
+            let storage = SqliteGraphStorage::open(&path).expect("open");
+            let conn = storage.raw_conn().lock().unwrap();
+            insert_graph_secret(&conn, "secret://graph-only", "api_key", &ct, &nonce);
+            insert_node_config_ref(&conn, "config:api_key_ref", "secret://graph-only");
+            conn.execute("DROP TABLE vault_secrets", [])
+                .expect("drop legacy table");
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        assert!(!table_exists(&ctx.conn, "vault_secrets").expect("query"));
+
+        // Sanity: collect_vault_secrets (what detect() delegates to once it
+        // decides not to skip) does see the graph-node secret.
+        let secrets = collect_vault_secrets(&ctx.conn).expect("collect");
+        assert_eq!(secrets.len(), 1);
+        assert!(secrets[0].referenced);
+
+        let findings = VaultKeySourceDivergence
+            .detect(&ctx)
+            .expect("detect must not hard-error with vault_secrets absent");
+        // Whatever this evaluates to (key-source resolution is
+        // environment-dependent in a unit test), it must never be the
+        // "table not present" skip warning — a live, non-empty secret
+        // store (graph_nodes) was available.
+        assert!(
+            findings.iter().all(|f| !f.message.contains("not present")),
+            "must not report vault_secrets as missing when graph_nodes secrets exist: {findings:?}"
+        );
     }
 
     #[test]
