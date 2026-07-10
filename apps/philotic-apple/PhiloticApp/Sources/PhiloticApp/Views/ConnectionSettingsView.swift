@@ -28,6 +28,11 @@ struct ConnectionSettingsView: View {
                 SecureField("Edge bearer token", text: $session.settings.edgeToken)
             }
 
+            Section("Voice") {
+                Toggle("Speak replies", isOn: $session.speakAllReplies)
+                Toggle("Transcribe on device", isOn: $session.transcribeOnDevice)
+            }
+
             Section("Enroll a new device") {
                 TextField("Invite code", text: $inviteCode)
                     .autocorrectionDisabled()

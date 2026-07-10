@@ -1,7 +1,7 @@
 // AgentPickerView.swift
-// Picks which mesh agent to chat with. v0 uses the hardcoded
-// `AgentTarget.builtIn` catalog — see the TODO on that type for the live
-// `GET /api/mesh/targets/:node/agents` fetch this should become.
+// Picks which mesh agent to chat with. Lists the live agent directory from
+// the hotel (session.agents, fetched via GET /api/edge/agents after connect);
+// the hardcoded catalog remains only as the pre-connect fallback.
 
 import SwiftUI
 
@@ -10,7 +10,7 @@ struct AgentPickerView: View {
     let onSelect: (AgentTarget) -> Void
 
     var body: some View {
-        List(AgentTarget.builtIn) { target in
+        List(session.agents) { target in
             Button {
                 session.currentAgent = target
                 onSelect(target)
