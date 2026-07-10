@@ -358,6 +358,10 @@ impl AgentRuntime {
                 state.apply_role_context_window(ov);
             }
             state.role_activation = Some(activation);
+            // A role change clears the persisted fallback override (Slice 2) —
+            // the new role may have an entirely different fallback ladder, so
+            // sticking to a tier chosen for the previous role would be wrong.
+            state.fallback_override = None;
             // Synthesise the handoff context: prefer working_summary if the sender provided one
             // (e.g. build_same_identity_handoff_bundle); otherwise fall back to goal + context_excerpt,
             // which is what handoff.to_role always populates.
@@ -432,6 +436,9 @@ impl AgentRuntime {
             // Revert any per-role context-window overrides applied at activation
             // back to the session baseline captured on the inbound handoff bundle.
             state.restore_base_context_window();
+            // Role change clears the persisted fallback override (Slice 2) — see
+            // the matching clear in `handle_handoff_bundle`.
+            state.fallback_override = None;
             prev
         };
 

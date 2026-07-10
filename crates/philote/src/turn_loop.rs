@@ -14,6 +14,15 @@ use crate::plan_eval::{
 };
 use crate::session::CarryoverPlan;
 
+/// Current wall-clock time as epoch milliseconds. Used by the Slice 2
+/// `FallbackOverride` bookkeeping (`since_epoch_ms`, `last_probe_epoch_ms`).
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl AgentRuntime {
     /// Scan all active sessions and evict (or escalate) any turn stuck in a waiting
     /// phase past its deadline. Deadlines:
@@ -384,6 +393,187 @@ impl AgentRuntime {
                 }
             }
         }
+
+        // Step 5: origin-tier probes for degraded sessions (Slice 2 fallback
+        // override auto-recovery). Piggybacked on this same tick so no second
+        // timer is needed.
+        self.probe_degraded_sessions().await;
+    }
+
+    /// Fire a minimal fire-and-forget probe at the origin tier for every
+    /// session that (a) has an active `FallbackOverride`, (b) has no active
+    /// turn (a probe must never compete with or block a real user turn), and
+    /// (c) hasn't been probed in the last `PROBE_INTERVAL_MS`. Success clears
+    /// the override (see the probe interception at the top of
+    /// `handle_model_response`); failure or no response just leaves the
+    /// session degraded — `last_probe_epoch_ms` is stamped at send time so a
+    /// dead origin tier isn't hammered every tick.
+    pub(super) async fn probe_degraded_sessions(&mut self) {
+        const PROBE_INTERVAL_MS: u64 = 300_000;
+        let now_ms = now_epoch_ms();
+
+        let eligible: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, state)| {
+                if state.active_turn.is_some() {
+                    return None;
+                }
+                if self.pending_fallback_probes.contains_key(session_id) {
+                    return None;
+                }
+                let ov = state.fallback_override.as_ref()?;
+                if now_ms.saturating_sub(ov.last_probe_epoch_ms) < PROBE_INTERVAL_MS {
+                    return None;
+                }
+                Some((session_id.clone(), ov.origin_tier_role.clone()))
+            })
+            .collect();
+
+        for (session_id, origin_role) in eligible {
+            if let Err(e) = self
+                .send_origin_probe(session_id.clone(), origin_role.clone(), now_ms)
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    origin_role = %origin_role,
+                    "Origin-tier probe dispatch failed: {}",
+                    e
+                );
+                // Dispatch never made it out — don't leave a phantom in-flight
+                // marker blocking the next eligible tick.
+                self.pending_fallback_probes.remove(&session_id);
+            }
+        }
+    }
+
+    /// Send one degenerate `generate_text` request ("ping") to `origin_role`
+    /// for `session_id`, correlated by a dedicated probe `turn_id` rather than
+    /// a real `WorkingTurn` — see the module-level report on why turn_id
+    /// correlation was chosen over a probe_turn_id field on `FallbackOverride`.
+    /// Does not create a `WorkingTurn`; the eventual response is intercepted
+    /// at the top of `handle_model_response` before the normal active-turn
+    /// machinery ever sees it.
+    async fn send_origin_probe(
+        &mut self,
+        session_id: String,
+        origin_role: String,
+        now_ms: u64,
+    ) -> Result<()> {
+        let probe_turn_id = format!("probe-{}", Uuid::new_v4());
+
+        // Stamp last_probe_epoch_ms and persist immediately (before dispatch)
+        // so a crash mid-probe can't tight-loop retries on the next restart.
+        let (mem_type, checkpoint) = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                return Ok(());
+            };
+            let Some(ov) = state.fallback_override.as_mut() else {
+                return Ok(());
+            };
+            ov.last_probe_epoch_ms = now_ms;
+            (state.checkpoint_memory_type(), state.checkpoint_json())
+        };
+        if let Err(e) = self
+            .ipc_client
+            .sync_apartment(&self.agent_id, &mem_type, checkpoint)
+            .await
+        {
+            warn!(session_id = %session_id, "Failed to persist probe checkpoint: {}", e);
+        }
+
+        self.pending_fallback_probes
+            .insert(session_id.clone(), probe_turn_id.clone());
+
+        let mut provider_options = serde_json::Map::new();
+        provider_options.insert("probe".to_string(), serde_json::Value::Bool(true));
+
+        let model_req = ModelRequestPayload {
+            action: "generate_text".to_string(),
+            // `request_class` is validated server-side against a fixed enum
+            // (cognitive/transform/synthesis/embedding) — "probe" would bail
+            // before ever reaching a provider. Use the same class a real
+            // minimal text turn would carry; `provider_options.probe` is the
+            // marker instead.
+            request_class: Some("cognitive".to_string()),
+            session_id: session_id.clone(),
+            turn_id: probe_turn_id,
+            prompt: "ping".to_string(),
+            user_content: "ping".to_string(),
+            context: None,
+            context_projection: None,
+            affordances: None,
+            attachments: Vec::new(),
+            tools_for_model: Vec::new(),
+            response_contract: None,
+            response_route: None,
+            ligand: None,
+            provider_options,
+            chat_id: String::new(),
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            final_reply_to: local_node_id(),
+            final_reply_role: "agent".into(),
+            final_reply_guest_id: None,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: local_node_id(),
+                target_role: origin_role,
+                target_guest_id: None,
+                task_json: serde_json::to_string(&model_req)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Handle a model response correlated to an outstanding origin-tier probe
+    /// (see `send_origin_probe`). Always clears the in-flight marker first —
+    /// the bound is "at most one probe in flight per session" regardless of
+    /// outcome. A successful (non-error) response means the origin tier is
+    /// healthy again: clear the session's `FallbackOverride` so the next turn
+    /// resolves back to it. An error response (or any other shape) leaves the
+    /// session degraded; `last_probe_epoch_ms` was already stamped at send
+    /// time in `send_origin_probe`, so the next tick simply waits out the
+    /// cadence again rather than retrying immediately.
+    async fn handle_fallback_probe_response(
+        &mut self,
+        session_id: String,
+        task: InboundTaskPayload,
+    ) -> Result<()> {
+        self.pending_fallback_probes.remove(&session_id);
+
+        if extract_model_error_payload(&task).is_some() {
+            return Ok(());
+        }
+
+        let cleared = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                return Ok(());
+            };
+            state.fallback_override.take()
+        };
+        if cleared.is_some() {
+            info!(
+                session_id = %session_id,
+                "Origin-tier probe succeeded — clearing fallback override"
+            );
+            if let Some(state) = self.sessions.get(&session_id) {
+                let mem_type = state.checkpoint_memory_type();
+                let checkpoint = state.checkpoint_json();
+                if let Err(e) = self
+                    .ipc_client
+                    .sync_apartment(&self.agent_id, &mem_type, checkpoint)
+                    .await
+                {
+                    warn!(session_id = %session_id, "Failed to persist checkpoint after clearing fallback override: {}", e);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -661,6 +851,16 @@ impl AgentRuntime {
             None => return Ok(()),
         };
         self.ensure_session_loaded(&session_id, "unknown").await?;
+
+        // Slice 2: intercept a response correlated to an outstanding
+        // origin-tier probe BEFORE the stale-turn drop logic below — a probe
+        // never has an active turn, so it would otherwise be silently
+        // dropped by the `None` arm of the match just below. Handled and
+        // returned here regardless of outcome; the normal turn machinery
+        // never sees it.
+        if self.pending_fallback_probes.get(&session_id) == Some(&turn_id) {
+            return self.handle_fallback_probe_response(session_id, task).await;
+        }
 
         // Guard: if the active turn's turn_id doesn't match the incoming response, drop it.
         // This prevents stale model or synthesis responses from corrupting a newer active turn
@@ -2032,6 +2232,33 @@ impl AgentRuntime {
                 turn.selection_source = SelectionSource::AutoFallback;
             }
 
+            // Slice 2: persist a narrow FallbackOverride so the NEXT turn (not
+            // just this one) starts on the tier that just took over, and so
+            // the periodic origin-tier probe (`probe_degraded_sessions`) knows
+            // what to health-check. Origin (the tier the session would use
+            // with no override) and `since_epoch_ms` are set once and held
+            // stable across repeated escalations on the same degraded session;
+            // only `active_tier_role`/`reason`/`last_probe_epoch_ms` track the
+            // most recent failure.
+            let reason = no_response_reason_str(class);
+            let now_ms = now_epoch_ms();
+            match state.fallback_override.as_mut() {
+                Some(existing) => {
+                    existing.active_tier_role = next_role.clone();
+                    existing.reason = reason.to_string();
+                }
+                None => {
+                    state.fallback_override = Some(FallbackOverride {
+                        origin_tier_role: role_for_tier(&configured_tiers, 0).to_string(),
+                        active_tier_role: next_role.clone(),
+                        reason: reason.to_string(),
+                        since_epoch_ms: now_ms,
+                        last_probe_epoch_ms: now_ms,
+                        notice_sent: false,
+                    });
+                }
+            }
+
             match state.build_reentry_context_envelope() {
                 Some((prompt, context, context_projection, tools_for_model)) => {
                     let active_turn = state.active_turn.as_ref().expect("turn exists");
@@ -2085,11 +2312,7 @@ impl AgentRuntime {
         {
             let switch_from = failed_provider.as_deref().unwrap_or("unknown");
             let switch_to = provider_for_role(&next_role).unwrap_or_else(|| next_role.clone());
-            let switch_reason = match class {
-                NoResponseClass::ProviderFailure => "provider_failure",
-                NoResponseClass::ProviderContractFailure => "provider_contract_failure",
-                NoResponseClass::WatchdogTimeout => "model_timeout",
-            };
+            let switch_reason = no_response_reason_str(class);
             let _ = self
                 .emit_turn_event(
                     &session_id,

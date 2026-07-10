@@ -10,7 +10,7 @@ use crate::protocol::{
 };
 use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
-    ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors,
+    ActivePlan, AgentProfile, ComponentRouteAssembly, FallbackOverride, GraphAnchors,
     HANDOFF_CONTEXT_EXCERPT_MAX_CHARS, LifeRecallCacheEntry, MediaRoutingPolicy, MemoryAuthority,
     MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind,
     MemoryValidationLevel, PARACRINE_MERGE_CONTENT_MAX_CHARS, PARACRINE_WHISPER_PROMPT_MAX_CHARS,
@@ -309,6 +309,17 @@ pub(crate) fn decide_no_response_action(
                 NoResponseAction::EvictTurn
             }
         }
+    }
+}
+
+/// Short cause string for a `NoResponseClass`, used both for the user-visible
+/// `provider_switch` turn event and as the `FallbackOverride.reason` recorded
+/// by `advance_turn_to_next_fallback_tier` on a successful escalation.
+pub(crate) fn no_response_reason_str(class: NoResponseClass) -> &'static str {
+    match class {
+        NoResponseClass::ProviderFailure => "provider_failure",
+        NoResponseClass::ProviderContractFailure => "provider_contract_failure",
+        NoResponseClass::WatchdogTimeout => "model_timeout",
     }
 }
 
@@ -806,20 +817,26 @@ fn extract_audio_artifact(model_result: Option<&Value>) -> Option<String> {
 /// Resolves the model-router dispatch target for `capability`.
 ///
 /// Precedence (highest wins):
-///   1. The hotel-computed execution route (`resolve_component_execution_route`)
+///   1. The operator pin (`/model <tier>`, `SessionState.pinned_tier_role`) —
+///      explicit operator intent for text-generation dispatch, wins over
+///      everything, including the fallback override below.
+///   2. The persisted fallback override (`SessionState.fallback_override`,
+///      Slice 2) — a session degraded by a prior escalation stays on the
+///      tier that last worked until the origin-tier probe clears it.
+///   3. The hotel-computed execution route (`resolve_component_execution_route`)
 ///      — explicit hotel/mesh routing intent (cross-hotel park, a reflex-set
-///      `target_capability`, etc). Always wins; never overridden by the ladder.
-///   2. An explicit component binding (`preferred_component_implementation`,
+///      `target_capability`, etc). Always wins over the ladder.
+///   4. An explicit component binding (`preferred_component_implementation`,
 ///      e.g. `bindings.effective_model_controller`) — an operator/session-level
 ///      pin to a specific implementation. More specific than a role-wide
 ///      default, so it outranks the ladder too.
-///   3. The active role's configured fallback ladder primary
+///   5. The active role's configured fallback ladder primary
 ///      (`role_activation.turn_loop_config.fallback_tiers[0]`) — only consulted
 ///      for text-generation dispatch (`fallback_role == DEFAULT_TEXT_MODEL_ROLE`)
 ///      and only when neither of the above is set. This is what lets a
 ///      configured ladder (e.g. `["model.openrouter", "model.ollama"]`) govern
 ///      the *initial* dispatch, not just failure escalation.
-///   4. `fallback_role` (`DEFAULT_TEXT_MODEL_ROLE` for text turns) — the last
+///   6. `fallback_role` (`DEFAULT_TEXT_MODEL_ROLE` for text turns) — the last
 ///      resort when nothing else is configured.
 fn resolve_model_execution_target(
     state: Option<&SessionState>,
@@ -834,6 +851,19 @@ fn resolve_model_execution_target(
     if matches!(capability, "text.generate" | "response.generate") {
         if let Some(pinned) = state.and_then(|state| state.pinned_tier_role.as_deref()) {
             return (local_node_id(), pinned.to_string(), None);
+        }
+
+        // Sticky fallback (Slice 2): a session degraded by a prior escalation
+        // stays on the tier that last worked until the periodic origin-tier
+        // probe (`turn_loop::probe_degraded_sessions`) clears the override —
+        // otherwise every new turn would re-probe a known-bad primary at full
+        // latency/failure cost. Beneath the operator pin, above everything
+        // else (hotel route, component binding, ladder primary).
+        if let Some(active) = state
+            .and_then(|state| state.fallback_override.as_ref())
+            .map(|ov| ov.active_tier_role.clone())
+        {
+            return (local_node_id(), active, None);
         }
     }
 
@@ -1431,6 +1461,13 @@ pub struct AgentRuntime {
     /// Dedup + budget ledger for the LifeGraph auto-capture lane (Slice E2).
     /// Live-only (never checkpointed), mirroring the prefetch-dispatched flag.
     life_capture_ledger: LifeCaptureLedger,
+    /// Correlation id of an in-flight origin-tier probe per session (Slice 2
+    /// fallback-override auto-recovery — see `turn_loop::probe_degraded_sessions`).
+    /// Bounds "at most one probe in flight per session": a session_id present
+    /// here has an outstanding probe and is skipped by the next eligible tick.
+    /// Live-only — never checkpointed. A probe lost across a restart is not a
+    /// correctness issue: the next eligible tick simply sends a fresh one.
+    pending_fallback_probes: HashMap<String, String>,
 }
 
 impl AgentRuntime {
@@ -1451,6 +1488,7 @@ impl AgentRuntime {
             network_offline: false,
             role_name: None,
             life_capture_ledger: LifeCaptureLedger::default(),
+            pending_fallback_probes: HashMap::new(),
         }
     }
 
@@ -2431,10 +2469,17 @@ impl AgentRuntime {
             // Cron-triggered turns get CronPrimary (the honest marker is
             // `cron_job_id`, not corr_id/source string-sniffing); an operator
             // pin on the session takes precedence over the configured default.
+            // A session with an active fallback override (Slice 2) is dispatched
+            // to `active_tier_role` at the `resolve_model_execution_target`
+            // choke point, so the turn is tagged AutoFallback to match — it is
+            // not the session's configured default, even though the operator
+            // never explicitly pinned it.
             let selection_source = if task.cron_job_id.is_some() {
                 SelectionSource::CronPrimary
             } else if state.pinned_tier_role.is_some() {
                 SelectionSource::OperatorExplicit
+            } else if state.fallback_override.is_some() {
+                SelectionSource::AutoFallback
             } else {
                 SelectionSource::ConfiguredDefault
             };
@@ -4904,6 +4949,11 @@ impl AgentRuntime {
         // routed at the resolve_model_execution_target choke point.
         if let SlashCommand::Model { ref tier } = command {
             let reply = if let Some(state) = self.sessions.get_mut(&session_id) {
+                // Any `/model` invocation (pin or clear) resets the persisted
+                // fallback override (Slice 2) — the operator is taking explicit
+                // control of tier selection, so a stale auto-fallback record
+                // from a prior escalation must not linger underneath it.
+                state.fallback_override = None;
                 match tier.as_deref() {
                     Some(t) => {
                         state.pinned_tier_role = Some(t.to_string());
@@ -6070,8 +6120,8 @@ mod tests {
     use crate::reflex::ReflexEvent;
     use crate::session::{
         ActivePlan, ApprovalPolicy, CarryoverPlan, ComponentExecutionRoute, ComponentRouteAssembly,
-        ComponentRouteBinding, PlanStep, ResponseRouteMode, RoleActivation, SelectionSource,
-        SessionState, WorkingTurn,
+        ComponentRouteBinding, FallbackOverride, PlanStep, ResponseRouteMode, RoleActivation,
+        SelectionSource, SessionState, WorkingTurn,
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
@@ -6646,6 +6696,81 @@ mod tests {
         assert_ne!(
             voice_role, "model.ollama",
             "a model tier pin must not affect voice provider routing"
+        );
+    }
+
+    fn test_fallback_override(origin: &str, active: &str) -> FallbackOverride {
+        FallbackOverride {
+            origin_tier_role: origin.into(),
+            active_tier_role: active.into(),
+            reason: "provider_failure".into(),
+            since_epoch_ms: 1_000,
+            last_probe_epoch_ms: 1_000,
+            notice_sent: false,
+        }
+    }
+
+    /// The headline Slice 2 routing behavior: a session degraded by a prior
+    /// escalation must start NEW turns on `active_tier_role`, not re-probe the
+    /// known-bad primary — and clearing the override restores the normal
+    /// resolution chain (ladder primary).
+    #[test]
+    fn fallback_override_routes_new_dispatch_to_active_tier() {
+        let mut state = SessionState::new("s".into(), "a".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model", "model.openrouter"]));
+        state.fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+
+        let (node, role, incarnation) =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(node, LOCAL_NODE);
+        assert_eq!(
+            role, "model.openrouter",
+            "sticky dispatch to the fallback tier"
+        );
+        assert!(incarnation.is_none());
+
+        let (_, role, _) = resolve_model_execution_target(
+            Some(&state),
+            "response.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+        assert_eq!(
+            role, "model.openrouter",
+            "Gemini Live dispatch honors the override too"
+        );
+
+        // Scoping guard: the override must not hijack unrelated capabilities.
+        let (_, voice_role, _) =
+            resolve_model_execution_target(Some(&state), "voice.synthesize", "model.local");
+        assert_ne!(
+            voice_role, "model.openrouter",
+            "a fallback override must not affect voice provider routing"
+        );
+
+        // Cleared override: the next turn resolves back to the origin (the
+        // ladder primary here) through the normal chain.
+        state.fallback_override = None;
+        let (_, role, _) =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(
+            role, "model",
+            "clearing the override restores primary resolution"
+        );
+    }
+
+    /// Precedence at the choke point: the operator pin (`/model <tier>`) is
+    /// explicit intent and must beat the automatic fallback override.
+    #[test]
+    fn operator_pin_beats_fallback_override_at_choke_point() {
+        let mut state = SessionState::new("s".into(), "a".into(), "telegram".into());
+        state.fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+        state.pinned_tier_role = Some("model.ollama".into());
+
+        let (_, role, _) =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(
+            role, "model.ollama",
+            "the operator pin outranks the fallback override"
         );
     }
 
@@ -8563,6 +8688,515 @@ mod tests {
             "must fail with the real trigger message, not a generic exhaustion notice: {:#?}",
             *emitted
         );
+    }
+
+    // ── Slice 2: persisted FallbackOverride + origin probe ───────────────────
+
+    /// A successful escalation must write the session's `FallbackOverride`
+    /// (origin = the ladder primary, active = the newly dispatched tier,
+    /// reason = the failure class); a SECOND escalation on the same degraded
+    /// session must update `active_tier_role`/`reason` only, keeping the
+    /// original `origin_tier_role` and `since_epoch_ms`.
+    #[tokio::test]
+    async fn escalation_writes_fallback_override_then_updates_active_only() {
+        let socket_path = format!("/tmp/philote-ovwrite-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-write".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-write");
+
+        let session_id = "sess-ov-write";
+        let turn_id = "turn-ov-write";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&[
+                "model",
+                "model.openrouter",
+                "model.ollama",
+            ]));
+        }
+
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.turn_id = turn_id.into();
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::ProviderFailure,
+                Some("gemini".into()),
+                "gemini did not respond".into(),
+            )
+            .await
+            .expect("first escalation");
+
+        let (first_since, first_probe_ms) = {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let ov = state
+                .fallback_override
+                .as_ref()
+                .expect("escalation must write the fallback override");
+            assert_eq!(ov.origin_tier_role, "model", "origin = ladder primary");
+            assert_eq!(
+                ov.active_tier_role, "model.openrouter",
+                "active = the newly dispatched tier"
+            );
+            assert_eq!(ov.reason, "provider_failure");
+            assert!(ov.since_epoch_ms > 0);
+            assert_eq!(ov.since_epoch_ms, ov.last_probe_epoch_ms);
+            assert!(!ov.notice_sent);
+            (ov.since_epoch_ms, ov.last_probe_epoch_ms)
+        };
+
+        // Second escalation on the same degraded session (tier 1 → tier 2).
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "openrouter timed out".into(),
+            )
+            .await
+            .expect("second escalation");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let ov = state
+                .fallback_override
+                .as_ref()
+                .expect("override survives the second escalation");
+            assert_eq!(
+                ov.origin_tier_role, "model",
+                "origin must stay the original primary"
+            );
+            assert_eq!(
+                ov.active_tier_role, "model.ollama",
+                "active tracks the newest dispatched tier"
+            );
+            assert_eq!(
+                ov.reason, "model_timeout",
+                "reason tracks the newest failure"
+            );
+            assert_eq!(
+                ov.since_epoch_ms, first_since,
+                "since must not reset on re-escalation"
+            );
+            assert_eq!(
+                ov.last_probe_epoch_ms, first_probe_ms,
+                "re-escalation must not consume the probe cadence"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Probe eligibility: `probe_degraded_sessions` fires only for a session
+    /// that has an override, no active turn, and a stale `last_probe_epoch_ms`
+    /// (>= 300s). A fresh override is not probed; a degraded session with an
+    /// active turn is not probed; a fired probe is a degenerate one-shot
+    /// `generate_text` ("ping") at the ORIGIN tier, and the in-flight marker
+    /// plus the send-time stamp prevent a second probe on the next tick.
+    #[tokio::test]
+    async fn probe_fires_only_past_cadence_and_with_no_active_turn() {
+        let socket_path = format!("/tmp/philote-ovprobe-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-probe".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-probe");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Session A: degraded, idle, fresh probe stamp — must NOT probe yet.
+        runtime
+            .ensure_session_loaded("sess-probe-a", "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut("sess-probe-a")
+            .expect("session")
+            .fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+        runtime
+            .sessions
+            .get_mut("sess-probe-a")
+            .expect("session")
+            .fallback_override
+            .as_mut()
+            .expect("override")
+            .last_probe_epoch_ms = now_ms;
+
+        // Session B: degraded, stale stamp, but an ACTIVE turn — must not probe.
+        runtime
+            .ensure_session_loaded("sess-probe-b", "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut("sess-probe-b").expect("session");
+            state.fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+            state.start_turn(test_working_turn(TurnPhase::WaitingModel));
+        }
+
+        runtime.probe_degraded_sessions().await;
+        assert!(
+            emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| e["task"]["action"] != "generate_text"),
+            "no probe may fire before the 300s cadence or while a turn is active: {:#?}",
+            *emitted.lock().unwrap()
+        );
+
+        // Age session A past the cadence — exactly one probe must fire.
+        runtime
+            .sessions
+            .get_mut("sess-probe-a")
+            .expect("session")
+            .fallback_override
+            .as_mut()
+            .expect("override")
+            .last_probe_epoch_ms = now_ms.saturating_sub(301_000);
+
+        runtime.probe_degraded_sessions().await;
+        // Second tick immediately after: in-flight marker + send-time stamp
+        // must prevent a duplicate probe.
+        runtime.probe_degraded_sessions().await;
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let probes: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert_eq!(probes.len(), 1, "exactly one probe: {:#?}", *emitted);
+        let probe = &probes[0];
+        assert_eq!(
+            probe["target_role"], "model",
+            "the probe must target the ORIGIN tier, not the active fallback tier"
+        );
+        assert_eq!(probe["task"]["session_id"], "sess-probe-a");
+        assert!(
+            probe["task"]["turn_id"]
+                .as_str()
+                .expect("probe turn_id")
+                .starts_with("probe-"),
+            "probe turns carry a dedicated probe- turn_id: {probe:#?}"
+        );
+        assert_eq!(probe["task"]["user_content"], "ping");
+        assert_eq!(
+            probe["task"]["provider_options"]["probe"], true,
+            "the payload carries the probe marker"
+        );
+    }
+
+    /// Probe outcome handling: an error response correlated to the probe
+    /// leaves the session degraded (only the in-flight marker clears); a
+    /// successful response clears the override, after which dispatch resolves
+    /// back to the origin tier. Neither outcome touches the (absent) active
+    /// turn.
+    #[tokio::test]
+    async fn probe_success_clears_override_and_probe_failure_keeps_it() {
+        let socket_path = format!("/tmp/philote-ovclear-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-clear".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-clear");
+
+        let session_id = "sess-ov-clear";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation =
+                Some(role_activation_with_ladder(&["model", "model.openrouter"]));
+            let mut ov = test_fallback_override("model", "model.openrouter");
+            ov.last_probe_epoch_ms = 0; // long past the cadence
+            state.fallback_override = Some(ov);
+        }
+
+        // First probe → origin still failing.
+        runtime.probe_degraded_sessions().await;
+        let probe_id = runtime
+            .pending_fallback_probes
+            .get(session_id)
+            .cloned()
+            .expect("probe in flight");
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(probe_id),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "still down".into(),
+                    provider: Some("gemini".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("probe failure handled");
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .fallback_override
+                .is_some(),
+            "a failed probe must leave the session degraded"
+        );
+        assert!(
+            !runtime.pending_fallback_probes.contains_key(session_id),
+            "the in-flight marker must clear on any probe outcome"
+        );
+
+        // Second probe → origin recovered.
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .fallback_override
+            .as_mut()
+            .expect("override")
+            .last_probe_epoch_ms = 0;
+        runtime.probe_degraded_sessions().await;
+        let probe_id = runtime
+            .pending_fallback_probes
+            .get(session_id)
+            .cloned()
+            .expect("second probe in flight");
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(probe_id),
+                agent_action: Some(serde_json::json!({
+                    "kind": "respond",
+                    "content": "pong",
+                })),
+                content: Some("pong".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("probe success handled");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            assert!(
+                state.fallback_override.is_none(),
+                "a successful probe must clear the override"
+            );
+            assert!(
+                state.active_turn.is_none(),
+                "probes must never materialize a WorkingTurn"
+            );
+            let (_, role, _) = resolve_model_execution_target(
+                Some(state),
+                "text.generate",
+                DEFAULT_TEXT_MODEL_ROLE,
+            );
+            assert_eq!(
+                role, "model",
+                "after recovery the next turn resolves to the origin tier"
+            );
+        }
+        assert!(!runtime.pending_fallback_probes.contains_key(session_id));
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A role change (inbound handoff_bundle — the application path of
+    /// `/role <name>`) must clear the fallback override and ONLY that field.
+    #[tokio::test]
+    async fn role_change_clears_fallback_override() {
+        let socket_path = format!("/tmp/philote-ovrole-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-role".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-role");
+
+        let session_id = "sess-ov-role";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+            state.pinned_tier_role = Some("model.ollama".into());
+        }
+
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    handoff_bundle: Some(philotic_client::HandoffBundle {
+                        to_role: Some("developer".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handoff bundle");
+
+        let state = runtime.sessions.get(session_id).expect("session");
+        assert!(
+            state.fallback_override.is_none(),
+            "a role change must clear the fallback override"
+        );
+        assert_eq!(
+            state.pinned_tier_role.as_deref(),
+            Some("model.ollama"),
+            "clearing the override must not touch other session state"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Any `/model` invocation — setting a pin or clearing it — resets the
+    /// fallback override: the operator is taking explicit control of tier
+    /// selection.
+    #[tokio::test]
+    async fn model_pin_command_clears_fallback_override() {
+        let socket_path = format!("/tmp/philote-ovpin-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-pin".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-pin");
+
+        let session_id = "sess-ov-pin";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+
+        // Setting a pin clears the override.
+        runtime
+            .handle_session_control_command(
+                Uuid::new_v4(),
+                session_id.to_string(),
+                "turn-ov-pin-1".into(),
+                "123".into(),
+                SlashCommand::Model {
+                    tier: Some("model.ollama".into()),
+                },
+            )
+            .await
+            .expect("pin command");
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            assert!(
+                state.fallback_override.is_none(),
+                "setting a pin must clear the fallback override"
+            );
+            assert_eq!(state.pinned_tier_role.as_deref(), Some("model.ollama"));
+        }
+
+        // A bare /model (pin clear) also clears a lingering override.
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+        runtime
+            .handle_session_control_command(
+                Uuid::new_v4(),
+                session_id.to_string(),
+                "turn-ov-pin-2".into(),
+                "123".into(),
+                SlashCommand::Model { tier: None },
+            )
+            .await
+            .expect("pin clear command");
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            assert!(
+                state.fallback_override.is_none(),
+                "clearing the pin must also clear the fallback override"
+            );
+            assert!(state.pinned_tier_role.is_none());
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     // ── Provider 4xx mid-turn switch (forensic 2026-07-08) ───────────────────

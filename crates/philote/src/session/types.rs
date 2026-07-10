@@ -636,6 +636,41 @@ pub enum SelectionSource {
     AutoFallback,
 }
 
+/// Narrow persisted fallback override (Slice 2 of Model Failover Layers).
+///
+/// Today a fallback tier lives only on the active turn (`WorkingTurn::fallback_tier`)
+/// and resets on the next turn, so every new user message re-probes a known-bad
+/// primary. `FallbackOverride` sticks a session to the tier that last worked and
+/// tracks when to health-check the origin tier again — see
+/// `advance_turn_to_next_fallback_tier` (writes/updates it on a successful
+/// escalation), `resolve_model_execution_target` (routes new turns to
+/// `active_tier_role` while it is set), and `turn_loop::probe_degraded_sessions`
+/// (clears it once the origin tier answers again).
+///
+/// Owns ONLY these fields — clearing it (on `/role`, `/model` pin changes, and
+/// session reset paths) must never touch other session state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackOverride {
+    /// The tier role the session would use with no override in effect (the
+    /// primary/tier-0 resolution at the time the override was first created).
+    pub origin_tier_role: String,
+    /// The tier role fallback escalation landed on most recently.
+    pub active_tier_role: String,
+    /// Short cause string for the failure that (most recently) drove escalation
+    /// (e.g. `"provider_failure"`, `"provider_contract_failure"`, `"model_timeout"`).
+    pub reason: String,
+    /// Epoch millis when this override was first created. Stable across
+    /// subsequent escalations on the same degraded session.
+    pub since_epoch_ms: u64,
+    /// Epoch millis of the last origin-tier probe attempt (or override
+    /// creation, before any probe has fired). Advances every eligible tick
+    /// regardless of probe outcome so the 300s cadence is honored.
+    pub last_probe_epoch_ms: u64,
+    /// Latch reserved for Slice 3's membrane recovery/degradation notices.
+    /// This slice only persists it — no rendering happens here.
+    pub notice_sent: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
