@@ -544,6 +544,13 @@ impl IpcServer {
         model_profile: Option<String>,
         context_window_policy: Option<String>,
         fallback_tiers: Option<Vec<String>>,
+        // Per-agent model NAME binding (Layer 1). Same preserve-on-None
+        // contract as `fallback_tiers`: `None` preserves whatever is already
+        // on the record (empty for a brand-new role); `Some(map)` sets it
+        // explicitly. Mirrors the #179/#213 preserve-or-source contract so
+        // `aiua load`'s reseed (`seed_orchestrator_roles`) never wipes an
+        // operator-set binding.
+        model_bindings: Option<std::collections::BTreeMap<String, String>>,
         // Content-filtering posture for this role. `None` PRESERVES whatever is
         // already on the record (or defaults a brand-new role to `"standard"`) —
         // mirrors the `fallback_tiers` preserve-on-None fix so reconfiguring a
@@ -633,6 +640,31 @@ impl IpcServer {
             },
         };
 
+        // Model-binding resolution (Layer 1): same preserve-on-None contract
+        // as `fallback_tiers` above — `None` preserves the existing record's
+        // bindings (empty for a brand-new role); `Some(map)` sets them
+        // explicitly. Keys/values are trimmed and empty entries rejected so a
+        // malformed IPC/tool call can't silently persist a dead binding.
+        let resolved_model_bindings = match model_bindings {
+            Some(bindings) => {
+                if bindings
+                    .iter()
+                    .any(|(k, v)| k.trim().is_empty() || v.trim().is_empty())
+                {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_INVALID_MODEL_BINDINGS",
+                        "model_bindings keys and values must be non-empty",
+                    );
+                }
+                bindings
+            }
+            None => match previous.as_ref() {
+                Some(prev) => prev.turn_loop_config.model_bindings.clone(),
+                None => Default::default(),
+            },
+        };
+
         // Content-policy resolution: `None` preserves the existing record's policy
         // (or defaults a brand-new role to `"standard"`) — same preserve-on-None
         // contract as `fallback_tiers` above. `Some(value)` must be a known policy.
@@ -688,6 +720,7 @@ impl IpcServer {
                 iteration_cap,
                 approval_policy,
                 model_profile,
+                model_bindings: resolved_model_bindings,
                 context_window_policy,
                 loop_script: None,
                 fallback_tiers: resolved_fallback_tiers,
@@ -719,6 +752,8 @@ impl IpcServer {
                 || existing.toolset_profile != record.toolset_profile
                 || existing.role_manifest != record.role_manifest
                 || existing.turn_loop_config.model_profile != record.turn_loop_config.model_profile
+                || existing.turn_loop_config.model_bindings
+                    != record.turn_loop_config.model_bindings
         });
 
         if is_new_role || breaking_change {
@@ -2968,6 +3003,7 @@ mod tests {
                 model_profile: Some("fast".into()),
                 context_window_policy: Some("standard".into()),
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: None,
             })
             .await
@@ -3056,6 +3092,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: None,
             })
             .await
@@ -3157,6 +3194,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: Some(custom_tiers.clone()),
+                model_bindings: None,
                 content_policy: None,
             })
             .await
@@ -3254,6 +3292,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: Some(custom_tiers.clone()),
+                model_bindings: None,
                 content_policy: None,
             })
             .await
@@ -3278,6 +3317,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: None,
             })
             .await
@@ -3377,6 +3417,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: None,
             })
             .await
@@ -3405,6 +3446,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: Some("unrestricted".into()),
             })
             .await
@@ -3434,6 +3476,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: None,
             })
             .await
@@ -3466,6 +3509,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: Some("permissive".into()),
             })
             .await
@@ -3561,6 +3605,7 @@ mod tests {
                     model_profile: None,
                     context_window_policy: None,
                     fallback_tiers: Some(bad_tiers),
+                    model_bindings: None,
                     content_policy: None,
                 })
                 .await
@@ -3840,6 +3885,7 @@ mod tests {
                 model_profile: Some("fast".into()),
                 context_window_policy: Some("standard".into()),
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: None,
             })
             .await
@@ -3914,6 +3960,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                model_bindings: None,
                 content_policy: None,
             })
             .await

@@ -287,10 +287,33 @@ pub struct TurnLoopConfig {
     pub iteration_cap: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<String>,
+    /// Vestigial: persisted and operator-editable (`role.configure`), but
+    /// never consumed at dispatch (see `bug: philote per-agent model-name
+    /// has no wired lever`, routing drill 2026-07-09). Superseded by
+    /// `model_bindings` below, which IS consumed. Kept for backward
+    /// compatibility with already-persisted role records; do not add new
+    /// consumers of this field — extend `model_bindings` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_policy: Option<String>,
+    /// Per-agent model NAME binding, keyed by provider role (a `fallback_tiers`
+    /// entry, e.g. `"model.openrouter"`, `"model"`, `"model.ollama"`) mapping
+    /// to the model id/name to request from that provider for this role.
+    /// Consumed by philote's dispatch (`role_model_binding` in
+    /// `crates/philote/src/runtime.rs`) to set `ControllerTask.model` for
+    /// whichever provider role `resolve_model_execution_target` resolves —
+    /// covering both the primary dispatch and every fallback tier, since each
+    /// tier is looked up independently by its own role key. Precedence at
+    /// dispatch: an explicit caller-set model (if any) > this binding for the
+    /// resolved provider role > the provider's own global default (e.g.
+    /// `openrouter_default_model`). A `BTreeMap` (not `HashMap`) for
+    /// deterministic serialization — durability diffing (mesh-config
+    /// preserve-or-source, `seed_orchestrator_roles`) depends on stable
+    /// ordering. Empty when unset; missing entries fall through to the
+    /// provider default.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_bindings: std::collections::BTreeMap<String, String>,
     /// When present, philote runs the scripted step tree instead of the
     /// standard hard-coded tool re-entry loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]

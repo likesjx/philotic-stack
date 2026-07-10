@@ -1361,6 +1361,14 @@ pub enum IpcRequest {
         /// brand-new role with `None` gets `DEFAULT_FALLBACK_TIERS`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fallback_tiers: Option<Vec<String>>,
+        /// Per-agent model NAME binding (Layer 1), keyed by provider role
+        /// (a `fallback_tiers` entry, e.g. `"model.openrouter"`) mapping to
+        /// the model id to request from that provider. `None` (the default
+        /// when omitted) PRESERVES whatever bindings are already on the
+        /// record — same preserve-on-None contract as `fallback_tiers`
+        /// above. `Some(map)` sets them explicitly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_bindings: Option<std::collections::BTreeMap<String, String>>,
         /// Content-filtering posture for this role: `"unrestricted"` | `"standard"`
         /// | `"strict"`. `None` (the default when omitted) PRESERVES whatever
         /// policy is already on the record — same preserve-on-None contract as
@@ -3028,6 +3036,7 @@ mod tests {
             model_profile: None,
             context_window_policy: None,
             fallback_tiers: Some(vec!["model".into(), "model.openrouter".into()]),
+            model_bindings: None,
             content_policy: None,
         };
         let json = serde_json::to_value(&req).expect("serialize");

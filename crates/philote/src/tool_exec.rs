@@ -23,6 +23,21 @@ pub(super) fn parse_fallback_tiers_arg(value: &serde_json::Value) -> Option<Vec<
     })
 }
 
+/// Parses the `model_bindings` tool argument (Layer 1 per-agent model NAME
+/// binding): a JSON object mapping provider role (e.g. `"model.openrouter"`)
+/// to model id (e.g. `"z-ai/glm-5.2"`). Non-string values are dropped rather
+/// than erroring the whole call — mirrors `parse_fallback_tiers_arg`'s
+/// permissive-filter shape.
+pub(super) fn parse_model_bindings_arg(
+    value: &serde_json::Value,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    value.as_object().map(|obj| {
+        obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect::<std::collections::BTreeMap<String, String>>()
+    })
+}
+
 impl AgentRuntime {
     /// Classify a tool call against the set of gates that ALWAYS require live
     /// operator approval and can never be preapproved or bypassed by policy
@@ -1866,6 +1881,9 @@ impl AgentRuntime {
                 let fallback_tiers = args
                     .get("fallback_tiers")
                     .and_then(parse_fallback_tiers_arg);
+                let model_bindings = args
+                    .get("model_bindings")
+                    .and_then(parse_model_bindings_arg);
                 let content_policy = args
                     .get("content_policy")
                     .and_then(|v| v.as_str())
@@ -1895,6 +1913,7 @@ impl AgentRuntime {
                     model_profile,
                     context_window_policy,
                     fallback_tiers: fallback_tiers.clone(),
+                    model_bindings: model_bindings.clone(),
                     content_policy,
                 };
 
@@ -1909,6 +1928,16 @@ impl AgentRuntime {
                             self.configured_roles
                                 .get(&name)
                                 .map(|c| c.turn_loop_config.fallback_tiers.clone())
+                                .unwrap_or_default()
+                        });
+                        // Same preserve-on-None mirroring for model_bindings
+                        // (Layer 1): an omitted argument keeps whatever this
+                        // process already had cached rather than collapsing
+                        // it to empty.
+                        let effective_model_bindings = model_bindings.unwrap_or_else(|| {
+                            self.configured_roles
+                                .get(&name)
+                                .map(|c| c.turn_loop_config.model_bindings.clone())
                                 .unwrap_or_default()
                         });
                         // Same preserve-on-None mirroring for content_policy: an
@@ -1959,10 +1988,12 @@ impl AgentRuntime {
                                     })
                                     .map(|mut tlc| {
                                         tlc.fallback_tiers = effective_fallback_tiers.clone();
+                                        tlc.model_bindings = effective_model_bindings.clone();
                                         tlc
                                     })
                                     .unwrap_or(ansible_mesh_core::graph::TurnLoopConfig {
                                         fallback_tiers: effective_fallback_tiers,
+                                        model_bindings: effective_model_bindings,
                                         ..Default::default()
                                     }),
                                 content_policy: effective_content_policy,
@@ -2107,6 +2138,9 @@ impl AgentRuntime {
                 let fallback_tiers = args
                     .get("fallback_tiers")
                     .and_then(parse_fallback_tiers_arg);
+                let model_bindings = args
+                    .get("model_bindings")
+                    .and_then(parse_model_bindings_arg);
                 let content_policy = args
                     .get("content_policy")
                     .and_then(|v| v.as_str())
@@ -2134,6 +2168,7 @@ impl AgentRuntime {
                     model_profile,
                     context_window_policy,
                     fallback_tiers: fallback_tiers.clone(),
+                    model_bindings: model_bindings.clone(),
                     content_policy,
                 };
 
@@ -2145,6 +2180,16 @@ impl AgentRuntime {
                             self.configured_roles
                                 .get(&name)
                                 .map(|c| c.turn_loop_config.fallback_tiers.clone())
+                                .unwrap_or_default()
+                        });
+                        // Same preserve-on-None mirroring for model_bindings
+                        // (Layer 1): an omitted argument keeps whatever this
+                        // process already had cached rather than collapsing
+                        // it to empty.
+                        let effective_model_bindings = model_bindings.unwrap_or_else(|| {
+                            self.configured_roles
+                                .get(&name)
+                                .map(|c| c.turn_loop_config.model_bindings.clone())
                                 .unwrap_or_default()
                         });
                         let effective_content_policy = args
@@ -2191,10 +2236,12 @@ impl AgentRuntime {
                                     })
                                     .map(|mut tlc| {
                                         tlc.fallback_tiers = effective_fallback_tiers.clone();
+                                        tlc.model_bindings = effective_model_bindings.clone();
                                         tlc
                                     })
                                     .unwrap_or(ansible_mesh_core::graph::TurnLoopConfig {
                                         fallback_tiers: effective_fallback_tiers,
+                                        model_bindings: effective_model_bindings,
                                         ..Default::default()
                                     }),
                                 content_policy: effective_content_policy,

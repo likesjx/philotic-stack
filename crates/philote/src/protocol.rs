@@ -162,6 +162,18 @@ pub struct ModelRequestPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<TransportAttachment>,
     pub tools_for_model: Vec<ToolDefinition>,
+    /// The specific model NAME to request from the dispatched provider role,
+    /// resolved from the active role's per-agent `model_bindings` (Layer 1 —
+    /// see `TurnLoopConfig::model_bindings`, `role_model_binding` in
+    /// `runtime.rs`) for whichever provider role
+    /// `resolve_model_execution_target` chose. `None` when the agent has no
+    /// binding for that role — model-router then falls back to the
+    /// provider's own global default (`openrouter_default_model`, etc; see
+    /// `ControllerTask::from_value` / `OpenAIProvider::default_model` /
+    /// `GeminiProvider::request_model`, which already read this top-level
+    /// `model` field via `task.model`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Forwarded verbatim to the model controller as `response_contract`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_contract: Option<serde_json::Value>,

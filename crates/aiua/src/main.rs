@@ -9624,6 +9624,142 @@ mod tests {
         }
     }
 
+    // ── seed_orchestrator_roles: Layer 1 model_bindings durability ──────────
+    //
+    // `model_bindings` is a field on the SAME `TurnLoopConfig` struct as
+    // `fallback_tiers` and `model_profile`, so it rides the existing
+    // whole-struct preserve-or-source contract at `seed_orchestrator_roles`
+    // (`orchestrator_turn_loop_config.clone().or_else(|| existing ...)`) for
+    // free — no new preserve-on-None branch was needed. This test proves that
+    // holds for real: an operator-set binding (e.g. Jane's
+    // `model.openrouter` -> `z-ai/glm-5.2`, from the 2026-07-09 routing
+    // drill) must survive a reseed where mesh-config's agent stanza doesn't
+    // repeat `orchestrator_turn_loop_config` at all.
+
+    fn model_bindings_test_profile(
+        turn_loop_config: Option<ansible_mesh_core::graph::TurnLoopConfig>,
+    ) -> AgentProfile {
+        AgentProfile {
+            agent_key: "jane".into(),
+            agent_id: "agent-jane".into(),
+            persona_name: "Jane".into(),
+            import_workspace: None,
+            is_admin: false,
+            orchestrator_turn_loop_config: turn_loop_config,
+            content_policy: None,
+        }
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_preserves_model_bindings_when_mesh_config_omits_turn_loop_config() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        let jane_turn_loop_config = ansible_mesh_core::graph::TurnLoopConfig {
+            fallback_tiers: vec![
+                "model.openrouter".to_string(),
+                "model".to_string(),
+                "model.ollama".to_string(),
+            ],
+            model_bindings: std::collections::BTreeMap::from([(
+                "model.openrouter".to_string(),
+                "z-ai/glm-5.2".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        // First seed: mesh-config (or a prior role.configure) set Jane's
+        // per-agent model binding.
+        seed_orchestrator_roles(
+            &graph,
+            &[model_bindings_test_profile(Some(
+                jane_turn_loop_config.clone(),
+            ))],
+        )
+        .expect("initial seed");
+        let seeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            seeded.turn_loop_config.model_bindings.get("model.openrouter"),
+            Some(&"z-ai/glm-5.2".to_string())
+        );
+
+        // Reseed (simulating `aiua load` on every deploy) with mesh-config
+        // NOT specifying orchestrator_turn_loop_config at all — the DB's
+        // model_bindings must survive, matching the #179/#213-class
+        // preserve-or-source contract fallback_tiers and content_policy
+        // already have.
+        seed_orchestrator_roles(&graph, &[model_bindings_test_profile(None)])
+            .expect("reseed with mesh-config omitting turn_loop_config");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded
+                .turn_loop_config
+                .model_bindings
+                .get("model.openrouter"),
+            Some(&"z-ai/glm-5.2".to_string()),
+            "model_bindings must survive a reseed where mesh-config doesn't specify turn_loop_config"
+        );
+        assert_eq!(
+            reseeded.turn_loop_config.fallback_tiers,
+            jane_turn_loop_config.fallback_tiers,
+            "fallback_tiers must survive the same reseed"
+        );
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_mesh_config_model_bindings_win_when_present() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_orchestrator_roles(
+            &graph,
+            &[model_bindings_test_profile(Some(
+                ansible_mesh_core::graph::TurnLoopConfig {
+                    model_bindings: std::collections::BTreeMap::from([(
+                        "model.openrouter".to_string(),
+                        "old-model".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+            ))],
+        )
+        .expect("initial seed");
+
+        // A reseed where mesh-config explicitly names a different binding
+        // must win over whatever is currently in the DB.
+        seed_orchestrator_roles(
+            &graph,
+            &[model_bindings_test_profile(Some(
+                ansible_mesh_core::graph::TurnLoopConfig {
+                    model_bindings: std::collections::BTreeMap::from([(
+                        "model.openrouter".to_string(),
+                        "new-model".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+            ))],
+        )
+        .expect("reseed with explicit mesh-config model_bindings");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded
+                .turn_loop_config
+                .model_bindings
+                .get("model.openrouter"),
+            Some(&"new-model".to_string()),
+            "an explicit mesh-config turn_loop_config must override the existing DB value"
+        );
+    }
+
     #[test]
     fn seed_orchestrator_roles_preserves_existing_content_policy_when_mesh_config_omits_it() {
         let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
