@@ -1635,6 +1635,14 @@ struct AgentProfile {
     /// Operator-supplied turn loop config for the orchestrator role.
     /// When present, overrides the default (empty) TurnLoopConfig on every seed.
     orchestrator_turn_loop_config: Option<ansible_mesh_core::graph::TurnLoopConfig>,
+    /// Operator-supplied content policy for the orchestrator role, sourced from the
+    /// mesh-config agent stanza's optional `content_policy` field. `None` means
+    /// mesh-config didn't specify one for this seed pass — `seed_orchestrator_roles`
+    /// then falls back to preserving whatever is already in the DB (or "standard"
+    /// for a brand-new role) rather than wiping it, the same preserve-or-source
+    /// contract `role.configure` uses for `content_policy` and `fallback_tiers`
+    /// (see `role_materialization.rs`'s `resolved_content_policy`).
+    content_policy: Option<String>,
 }
 
 fn title_case_agent_name(agent_key: &str) -> String {
@@ -1669,6 +1677,7 @@ fn default_agent_profile_for_hotel(hotel_name: &str) -> AgentProfile {
         import_workspace: None,
         is_admin: false,
         orchestrator_turn_loop_config: None,
+        content_policy: None,
     }
 }
 
@@ -1897,6 +1906,13 @@ fn agent_profile_from_config(
         .get("turn_loop_config")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    let content_policy = agent
+        .get("content_policy")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
     Some(AgentProfile {
         agent_key,
         agent_id,
@@ -1904,6 +1920,7 @@ fn agent_profile_from_config(
         import_workspace,
         is_admin,
         orchestrator_turn_loop_config,
+        content_policy,
     })
 }
 
@@ -1950,6 +1967,12 @@ fn all_agent_profiles_from_config(
             let orchestrator_turn_loop_config = agent
                 .get("turn_loop_config")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let content_policy = agent
+                .get("content_policy")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
             Some(AgentProfile {
                 agent_key,
                 agent_id,
@@ -1957,6 +1980,7 @@ fn all_agent_profiles_from_config(
                 import_workspace,
                 is_admin,
                 orchestrator_turn_loop_config,
+                content_policy,
             })
         })
         .collect()
@@ -4877,6 +4901,30 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             .clone()
             .or_else(|| existing.as_ref().map(|r| r.turn_loop_config.clone()))
             .unwrap_or_default();
+        // Content-policy resolution mirrors the turn_loop_config/fallback_tiers
+        // preserve-or-source contract above: a mesh-config `content_policy` on the
+        // agent stanza wins when present and valid; otherwise the existing DB row's
+        // content_policy is PRESERVED (this is the fix — `..Default::default()`
+        // below would otherwise silently reset content_policy to "standard" on
+        // every `aiua load`, wiping an operator-set "unrestricted" on every
+        // deploy); a brand-new role with neither falls back to "standard". Same
+        // shape as `role.configure`'s `resolved_content_policy`
+        // (role_materialization.rs).
+        let mesh_content_policy = profile.content_policy.as_deref().and_then(|policy| {
+            if ansible_mesh_core::graph::is_valid_content_policy(policy) {
+                Some(policy.to_string())
+            } else {
+                warn!(
+                    agent_id = %profile.agent_id,
+                    content_policy = %policy,
+                    "seed_orchestrator_roles: mesh-config content_policy is not one of unrestricted/standard/strict — ignoring or preserving existing DB value instead"
+                );
+                None
+            }
+        });
+        let content_policy = mesh_content_policy
+            .or_else(|| existing.as_ref().map(|r| r.content_policy.clone()))
+            .unwrap_or_else(ansible_mesh_core::graph::default_content_policy);
         let role_identity_addendum = existing.and_then(|r| r.role_identity_addendum);
 
         let record = ansible_mesh_core::graph::RoleIncarnationRecord {
@@ -4886,6 +4934,7 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             toolset_profile: "orchestrator".into(),
             role_identity_addendum,
             role_manifest: Some(ORCHESTRATOR_MANIFEST.into()),
+            content_policy,
             is_admin: profile.is_admin,
             readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
@@ -8239,7 +8288,7 @@ mod tests {
         hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, nearest_available_base_port, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
-        seed_toolset_profiles, startup_test_gemini_base_url,
+        seed_orchestrator_roles, seed_toolset_profiles, startup_test_gemini_base_url,
     };
 
     #[test]
@@ -8653,6 +8702,7 @@ mod tests {
                 import_workspace: None,
                 is_admin: false,
                 orchestrator_turn_loop_config: None,
+                content_policy: None,
             },
         );
         let agent_graph = guests
@@ -8708,6 +8758,7 @@ mod tests {
                 import_workspace: None,
                 is_admin: false,
                 orchestrator_turn_loop_config: None,
+                content_policy: None,
             },
         );
         let profile_config: serde_json::Value =
@@ -8727,6 +8778,7 @@ mod tests {
                 import_workspace: None,
                 is_admin: false,
                 orchestrator_turn_loop_config: None,
+                content_policy: None,
             },
         );
         let membrane_guest = guests
@@ -9033,6 +9085,7 @@ mod tests {
             import_workspace: None,
             is_admin: false,
             orchestrator_turn_loop_config: None,
+            content_policy: None,
         };
         let guests = guest_seed_for_profile("default", &profile);
         let membrane = guests
@@ -9060,6 +9113,7 @@ mod tests {
             import_workspace: None,
             is_admin: false,
             orchestrator_turn_loop_config: None,
+            content_policy: None,
         };
         let mut agent_config = serde_json::Map::new();
         agent_config.insert(
@@ -9082,6 +9136,7 @@ mod tests {
             import_workspace: None,
             is_admin: false,
             orchestrator_turn_loop_config: None,
+            content_policy: None,
         };
         let mut agent_config = serde_json::Map::new();
         agent_config.insert("system_prompt".into(), "Fallback prompt.".into());
@@ -9545,5 +9600,111 @@ mod tests {
             config["env"]["PHILOTIC_GEMINI_BASE_URL"].as_str(),
             Some(expected_base_url.as_str())
         );
+    }
+
+    // ── seed_orchestrator_roles: content_policy durability across `aiua load` ──
+    //
+    // Mirrors the `resolved_content_policy` preserve-or-source contract in
+    // `role_materialization.rs`'s `configure_role_sets_and_preserves_content_policy`
+    // test, but exercised through the startup reseed path instead of the
+    // ConfigureRole IPC. Before this fix, `seed_orchestrator_roles` built every
+    // record with `..Default::default()` and no `content_policy` override, so an
+    // operator-set "unrestricted" was silently reset to "standard" on every
+    // `aiua load` (i.e. every deploy).
+
+    fn content_policy_test_profile(content_policy: Option<&str>) -> AgentProfile {
+        AgentProfile {
+            agent_key: "jane".into(),
+            agent_id: "agent-jane".into(),
+            persona_name: "Jane".into(),
+            import_workspace: None,
+            is_admin: false,
+            orchestrator_turn_loop_config: None,
+            content_policy: content_policy.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_preserves_existing_content_policy_when_mesh_config_omits_it() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        // First seed: mesh-config (or role.configure) set content_policy = unrestricted.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("unrestricted"))])
+            .expect("initial seed");
+        let seeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(seeded.content_policy, "unrestricted");
+
+        // Reseed (simulating `aiua load` on every deploy) with mesh-config NOT
+        // specifying content_policy at all — the DB value must survive.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(None)])
+            .expect("reseed with mesh-config omitting content_policy");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded.content_policy, "unrestricted",
+            "content_policy must survive a reseed where mesh-config doesn't specify it"
+        );
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_mesh_config_value_wins_when_present() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("unrestricted"))])
+            .expect("initial seed");
+
+        // A reseed where mesh-config explicitly names a different policy must win
+        // over whatever is currently in the DB.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("strict"))])
+            .expect("reseed with explicit mesh-config content_policy");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded.content_policy, "strict",
+            "an explicit mesh-config content_policy must override the existing DB value"
+        );
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_brand_new_role_defaults_to_standard_content_policy() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        // No existing DB row and mesh-config doesn't specify content_policy.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(None)])
+            .expect("seed brand-new role");
+        let seeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(seeded.content_policy, "standard");
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_invalid_mesh_config_value_falls_back_to_preserve_or_default() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("unrestricted"))])
+            .expect("initial seed");
+
+        // A garbled/typo'd mesh-config content_policy must not be written verbatim
+        // — it's ignored, and the existing DB value is preserved instead.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("permissive"))])
+            .expect("reseed with invalid mesh-config content_policy");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(reseeded.content_policy, "unrestricted");
     }
 }
