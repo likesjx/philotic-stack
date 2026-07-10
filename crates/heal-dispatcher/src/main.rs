@@ -4,7 +4,8 @@ use ansible_mesh_core::heal_queue::HealQueueRow;
 use anyhow::Result;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use recurrence::{Breach, RecurrenceTracker};
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 const ROLE: &str = "heal-dispatcher";
@@ -15,9 +16,141 @@ const POLL_INTERVAL_SECS: u64 = 30;
 // Max entries fetched per cycle.
 const BATCH_LIMIT: usize = 20;
 
+// Per-request IPC timeout (F3). PhiloticClient::send_request has no internal
+// timeout, so a single hung hotel-side reply would otherwise wedge the whole
+// dispatcher forever while its PID stays alive (the supervisor's PID-liveness
+// check never respawns it) and the heal queue backs up. Every send_request in
+// the dispatch path is wrapped so an expiry is treated exactly like an IPC
+// disconnect: break the cycle and let `main` reconnect.
+const IPC_TIMEOUT: Duration = Duration::from_secs(20);
+
+// Application-level liveness key (F3). Each successful poll cycle stamps the
+// current unix time here via SetConfig so a wedged-but-alive dispatcher is
+// externally detectable. The name is a contract consumed by the phil doctor
+// check — do NOT rename without updating that check.
+const HEARTBEAT_KEY: &str = "heal_dispatcher.last_cycle_at";
+
+// Ollama circuit breaker (F5). gemma_classify is awaited per-row with a 30s
+// HTTP timeout; if Ollama is down and many rows fall through rule_classify,
+// one cycle could take BATCH_LIMIT*30s. After this many consecutive Ollama
+// failures the breaker opens and gemma_classify is short-circuited to the
+// fail-safe ("unknown"/"unclassified"/"noop") for a cooldown window instead of
+// re-attempting the 30s timeout per row. A single success resets it.
+const OLLAMA_BREAKER_THRESHOLD: u32 = 3;
+const OLLAMA_BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
+
 // Prefix of the operator-visibility heal-queue entries the hotel writes when a
 // work item is filed. Never track these for recurrence — they are our own echo.
 const WORK_ITEM_FILED_PREFIX: &str = "work_item_filed:";
+
+// ── IPC timeout guard (F3) ─────────────────────────────────────────────────────
+
+/// The error a timed-out `send_request` maps to. It wraps a `std::io::Error`
+/// with `ErrorKind::BrokenPipe` **specifically** so `is_ipc_disconnect` returns
+/// true and the existing reconnect path fires — a plain `anyhow!("timed out")`
+/// would NOT downcast and would silently defeat the reconnect. Reconnecting (not
+/// reusing the connection) is correct: the request write already went out, so a
+/// late reply left in the old socket would desync the length-prefix framing on
+/// the next read.
+fn ipc_timeout_error() -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        format!("heal-dispatcher IPC request timed out after {IPC_TIMEOUT:?}"),
+    ))
+}
+
+/// Wrap an in-flight IPC response future with a timeout, mapping expiry to a
+/// disconnect-class error. Kept generic so it is unit-testable without a live
+/// hotel (a hung responder can be injected as a sleeping future).
+async fn with_ipc_timeout<F>(dur: Duration, fut: F) -> Result<IpcResponse>
+where
+    F: Future<Output = Result<IpcResponse>>,
+{
+    match tokio::time::timeout(dur, fut).await {
+        Ok(res) => res,
+        Err(_elapsed) => Err(ipc_timeout_error()),
+    }
+}
+
+/// `PhiloticClient::send_request` with a per-request timeout. Do NOT change the
+/// shared client — the guard lives here at the call site.
+async fn send_request_timeout(
+    ipc: &mut PhiloticClient,
+    req: IpcRequest,
+    dur: Duration,
+) -> Result<IpcResponse> {
+    with_ipc_timeout(dur, ipc.send_request(req)).await
+}
+
+// ── Application-level liveness heartbeat (F3) ──────────────────────────────────
+
+/// Build the SetConfig request that stamps the liveness heartbeat.
+fn heartbeat_request(now_secs: u64) -> IpcRequest {
+    IpcRequest::SetConfig {
+        key: HEARTBEAT_KEY.to_string(),
+        // Stored verbatim as the config blob; a bare integer is valid JSON.
+        value_json: now_secs.to_string(),
+    }
+}
+
+/// Stamp the heartbeat. A non-disconnect failure is logged and swallowed (the
+/// heartbeat is a best-effort signal and must never abort a cycle); a
+/// disconnect/timeout propagates so `main` reconnects.
+async fn record_heartbeat(ipc: &mut PhiloticClient) -> Result<()> {
+    let now = unix_now();
+    match send_request_timeout(ipc, heartbeat_request(now), IPC_TIMEOUT).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if is_ipc_disconnect(&e) {
+                return Err(e);
+            }
+            warn!("heal-dispatcher: heartbeat write failed (non-fatal): {e}");
+            Ok(())
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ── Ollama circuit breaker (F5) ────────────────────────────────────────────────
+
+/// Tracks consecutive Ollama classification failures and, once a threshold is
+/// crossed, holds the breaker open for a cooldown window so we stop paying the
+/// 30s HTTP timeout per row while Ollama is down. A single success resets it.
+struct OllamaBreaker {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+}
+
+impl OllamaBreaker {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            open_until: None,
+        }
+    }
+
+    fn is_open(&self, now: Instant) -> bool {
+        self.open_until.is_some_and(|until| now < until)
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.open_until = None;
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= OLLAMA_BREAKER_THRESHOLD {
+            self.open_until = Some(now + OLLAMA_BREAKER_COOLDOWN);
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,13 +162,16 @@ async fn main() -> Result<()> {
     // the hotel dedups any double filing into a count bump). Owned by main so
     // IPC reconnects do NOT reset it.
     let mut tracker = RecurrenceTracker::from_env(|key| std::env::var(key).ok());
+    // Circuit-breaker state is likewise owned by main so an IPC reconnect does
+    // not forget that Ollama is currently down.
+    let mut breaker = OllamaBreaker::new();
     let intel_graph_url = std::env::var("PHILOTIC_INTEL_GRAPH_URL")
         .ok()
         .map(|url| url.trim_end_matches('/').to_string())
         .filter(|url| !url.is_empty());
 
     loop {
-        match run(&mut tracker, intel_graph_url.as_deref()).await {
+        match run(&mut tracker, &mut breaker, intel_graph_url.as_deref()).await {
             Ok(()) => {
                 info!("heal-dispatcher exiting cleanly");
                 break;
@@ -53,7 +189,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run(tracker: &mut RecurrenceTracker, intel_graph_url: Option<&str>) -> Result<()> {
+async fn run(
+    tracker: &mut RecurrenceTracker,
+    breaker: &mut OllamaBreaker,
+    intel_graph_url: Option<&str>,
+) -> Result<()> {
     let identity = GuestIdentity {
         guest_id: GUEST_ID.to_string(),
         role: ROLE.to_string(),
@@ -80,6 +220,7 @@ async fn run(tracker: &mut RecurrenceTracker, intel_graph_url: Option<&str>) -> 
             &ollama_url,
             &ollama_model,
             tracker,
+            breaker,
             intel_graph_url,
         )
         .await
@@ -92,18 +233,23 @@ async fn run(tracker: &mut RecurrenceTracker, intel_graph_url: Option<&str>) -> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_cycle(
     ipc: &mut PhiloticClient,
     http: &reqwest::Client,
     ollama_url: &str,
     ollama_model: &str,
     tracker: &mut RecurrenceTracker,
+    breaker: &mut OllamaBreaker,
     intel_graph_url: Option<&str>,
 ) -> Result<()> {
     // Proactively repair session turns stuck in "running" for more than 5 minutes.
-    match ipc
-        .send_request(IpcRequest::RepairStaleSessionTurns { min_age_secs: 300 })
-        .await
+    match send_request_timeout(
+        ipc,
+        IpcRequest::RepairStaleSessionTurns { min_age_secs: 300 },
+        IPC_TIMEOUT,
+    )
+    .await
     {
         Ok(IpcResponse::Standard {
             data: Some(data), ..
@@ -118,15 +264,28 @@ async fn dispatch_cycle(
             }
         }
         Ok(_) => {}
-        Err(e) => warn!("heal-dispatcher: RepairStaleSessionTurns failed: {e}"),
+        Err(e) => {
+            if is_ipc_disconnect(&e) {
+                return Err(e);
+            }
+            warn!("heal-dispatcher: RepairStaleSessionTurns failed: {e}");
+        }
     }
 
-    let resp = ipc
-        .send_request(IpcRequest::GetHealQueuePending { limit: BATCH_LIMIT })
-        .await?;
+    let resp = send_request_timeout(
+        ipc,
+        IpcRequest::GetHealQueuePending { limit: BATCH_LIMIT },
+        IPC_TIMEOUT,
+    )
+    .await?;
     let IpcResponse::HealQueuePending { rows } = resp else {
         return Ok(());
     };
+
+    // A successful poll completed — stamp the liveness heartbeat before doing
+    // any per-row work so even empty cycles advance it. A disconnect here
+    // propagates to reconnect; any other failure is swallowed inside.
+    record_heartbeat(ipc).await?;
 
     if rows.is_empty() {
         return Ok(());
@@ -138,29 +297,37 @@ async fn dispatch_cycle(
     );
 
     for row in rows {
+        // A disconnect/timeout while processing a row breaks the cycle so the
+        // whole dispatcher reconnects (rather than hammering a wedged socket
+        // for every remaining row). At-least-once redelivery is acceptable: the
+        // in-flight row's Resolve may not have landed, so it is reprocessed next
+        // cycle — the hotel dedups filings and the heal actions are idempotent.
         process_row(
             ipc,
             http,
             ollama_url,
             ollama_model,
             tracker,
+            breaker,
             intel_graph_url,
             &row,
         )
-        .await;
+        .await?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_row(
     ipc: &mut PhiloticClient,
     http: &reqwest::Client,
     ollama_url: &str,
     ollama_model: &str,
     tracker: &mut RecurrenceTracker,
+    breaker: &mut OllamaBreaker,
     intel_graph_url: Option<&str>,
     row: &HealQueueRow,
-) {
+) -> Result<()> {
     // Rows from the hotel's turn-failure intake (FailTask classification,
     // philote PushHealEvent) arrive pre-triaged: pattern_tag + severity were
     // assigned at insert. Honour them — the tag keys A3 recurrence
@@ -177,31 +344,44 @@ async fn process_row(
                 tag.to_string(),
                 ansible_mesh_core::heal_queue::heal_action_for_pattern_tag(tag).to_string(),
             ),
-            None => classify(http, ollama_url, ollama_model, &row.guest_id, &row.raw_text).await,
+            None => {
+                classify(
+                    http,
+                    ollama_url,
+                    ollama_model,
+                    breaker,
+                    &row.guest_id,
+                    &row.raw_text,
+                )
+                .await
+            }
         };
 
     // Write triage back.
-    if let Err(e) = ipc
-        .send_request(IpcRequest::TriageHealEntry {
+    if let Err(e) = send_request_timeout(
+        ipc,
+        IpcRequest::TriageHealEntry {
             id: row.id.clone(),
             severity: severity.clone(),
             pattern_tag: pattern_tag.clone(),
             heal_action: heal_action.clone(),
-        })
-        .await
+        },
+        IPC_TIMEOUT,
+    )
+    .await
     {
+        if is_ipc_disconnect(&e) {
+            return Err(e);
+        }
         warn!(id = %row.id, "triage write failed: {e}");
-        return;
+        return Ok(());
     }
 
     // Recurrence tracking (Autopoiesis Slice A3): a (pattern_tag, guest_id)
     // pair breaching the sliding-window threshold files a heal work item on
     // the hotel through the fleet.heal_slices autonomy lane.
     if !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = unix_now();
         if let Some(breach) = tracker.record(&pattern_tag, &row.guest_id, now, &row.raw_text) {
             file_heal_work_item(
                 ipc,
@@ -212,19 +392,25 @@ async fn process_row(
                 breach,
                 tracker.window_secs(),
             )
-            .await;
+            .await?;
         }
     }
 
     // Execute the action and record outcome.
-    let outcome = execute_action(ipc, &row.guest_id, &heal_action).await;
-    if let Err(e) = ipc
-        .send_request(IpcRequest::ResolveHealEntry {
+    let outcome = execute_action(ipc, &row.guest_id, &heal_action).await?;
+    if let Err(e) = send_request_timeout(
+        ipc,
+        IpcRequest::ResolveHealEntry {
             id: row.id.clone(),
             outcome: outcome.clone(),
-        })
-        .await
+        },
+        IPC_TIMEOUT,
+    )
+    .await
     {
+        if is_ipc_disconnect(&e) {
+            return Err(e);
+        }
         warn!(id = %row.id, "resolve write failed: {e}");
     }
 
@@ -236,6 +422,7 @@ async fn process_row(
         outcome = %outcome,
         "heal-dispatcher: entry resolved"
     );
+    Ok(())
 }
 
 // ── Work-item filing (Autopoiesis Slice A3) ───────────────────────────────────
@@ -247,6 +434,9 @@ async fn process_row(
 /// the hotel context graph). This side only reports the breach — and, when
 /// the hotel confirms a fresh filing, mirrors it to the intel graph
 /// best-effort.
+///
+/// Returns `Err` only on a disconnect/timeout (so the cycle reconnects); any
+/// other IPC or shape error is logged and swallowed.
 async fn file_heal_work_item(
     ipc: &mut PhiloticClient,
     http: &reqwest::Client,
@@ -255,16 +445,19 @@ async fn file_heal_work_item(
     guest_id: &str,
     breach: Breach,
     window_secs: u64,
-) {
-    let response = ipc
-        .send_request(IpcRequest::FileHealWorkItem {
+) -> Result<()> {
+    let response = send_request_timeout(
+        ipc,
+        IpcRequest::FileHealWorkItem {
             pattern_tag: pattern_tag.to_string(),
             guest_id: guest_id.to_string(),
             occurrence_count: breach.count,
             window_secs,
             evidence_lines: breach.evidence,
-        })
-        .await;
+        },
+        IPC_TIMEOUT,
+    )
+    .await;
 
     let data = match response {
         Ok(IpcResponse::Standard {
@@ -279,14 +472,17 @@ async fn file_heal_work_item(
                 ?other,
                 "heal work item filing got unexpected response"
             );
-            return;
+            return Ok(());
         }
         Err(e) => {
+            if is_ipc_disconnect(&e) {
+                return Err(e);
+            }
             warn!(
                 pattern_tag,
                 guest_id, "heal work item filing IPC error: {e}"
             );
-            return;
+            return Ok(());
         }
     };
 
@@ -340,6 +536,7 @@ async fn file_heal_work_item(
             guest_id, reason, "heal work item filing refused by autonomy grant"
         );
     }
+    Ok(())
 }
 
 /// Mirror a fresh filing into the intel graph via `POST /api/decide` — the
@@ -400,6 +597,7 @@ async fn classify(
     http: &reqwest::Client,
     ollama_url: &str,
     ollama_model: &str,
+    breaker: &mut OllamaBreaker,
     guest_id: &str,
     raw_text: &str,
 ) -> (String, String, String) {
@@ -408,14 +606,30 @@ async fn classify(
         return result;
     }
 
+    // Circuit breaker (F5): if Ollama has been failing, skip the 30s HTTP
+    // timeout entirely and return the fail-safe classification. This prevents a
+    // single cycle full of novel lines from stalling for BATCH_LIMIT*30s.
+    if breaker.is_open(Instant::now()) {
+        debug!("heal-dispatcher: ollama circuit breaker open, short-circuiting classify to noop");
+        return noop_classification();
+    }
+
     // FunctionGemma: call Ollama for novel/unclassified patterns.
     match gemma_classify(http, ollama_url, ollama_model, guest_id, raw_text).await {
-        Ok(result) => result,
+        Ok(result) => {
+            breaker.record_success();
+            result
+        }
         Err(e) => {
+            breaker.record_failure(Instant::now());
             warn!("gemma classify failed ({e}), falling back to noop");
-            ("unknown".into(), "unclassified".into(), "noop".into())
+            noop_classification()
         }
     }
+}
+
+fn noop_classification() -> (String, String, String) {
+    ("unknown".into(), "unclassified".into(), "noop".into())
 }
 
 fn rule_classify(text: &str) -> Option<(String, String, String)> {
@@ -538,26 +752,39 @@ Output only the JSON object, no other text."#
 
 // ── Action executor ───────────────────────────────────────────────────────────
 
-async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &str) -> String {
+/// Returns `Err` only on a disconnect/timeout (so the cycle reconnects); every
+/// other outcome — including non-disconnect IPC errors — resolves to an outcome
+/// string that the caller records.
+async fn execute_action(
+    ipc: &mut PhiloticClient,
+    guest_id: &str,
+    heal_action: &str,
+) -> Result<String> {
     match heal_action {
         "restart_guest" => {
             info!(guest_id, "heal-dispatcher: requesting guest restart");
             // Emit a restart request to the hotel's materialization surface.
             // The hotel will reclaim and respawn the guest via GuestManager.
-            match ipc
-                .send_request(IpcRequest::RestartComponent {
+            match send_request_timeout(
+                ipc,
+                IpcRequest::RestartComponent {
                     guest_id: guest_id.to_string(),
-                })
-                .await
+                },
+                IPC_TIMEOUT,
+            )
+            .await
             {
-                Ok(IpcResponse::Standard { ok: true, .. }) => "restarted".into(),
+                Ok(IpcResponse::Standard { ok: true, .. }) => Ok("restarted".into()),
                 Ok(resp) => {
                     warn!(guest_id, ?resp, "restart response unexpected");
-                    "restart_failed".into()
+                    Ok("restart_failed".into())
                 }
                 Err(e) => {
+                    if is_ipc_disconnect(&e) {
+                        return Err(e);
+                    }
                     warn!(guest_id, "restart request error: {e}");
-                    "restart_error".into()
+                    Ok("restart_error".into())
                 }
             }
         }
@@ -566,17 +793,17 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
                 guest_id,
                 "heal-dispatcher: triggering immediate MuninnDB probe"
             );
-            match ipc.send_request(IpcRequest::RefreshMemoryConfig).await {
+            match send_request_timeout(ipc, IpcRequest::RefreshMemoryConfig, IPC_TIMEOUT).await {
                 Ok(IpcResponse::MuninnStatus {
                     available,
                     endpoint,
                 }) => {
                     if available {
                         info!(guest_id, endpoint = %endpoint, "MuninnDB probe succeeded — memory restored");
-                        "memory_restored".into()
+                        Ok("memory_restored".into())
                     } else {
                         warn!(guest_id, endpoint = %endpoint, "MuninnDB still unreachable after probe");
-                        "still_unreachable".into()
+                        Ok("still_unreachable".into())
                     }
                 }
                 Ok(resp) => {
@@ -585,11 +812,14 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
                         ?resp,
                         "refresh_memory_config got unexpected response"
                     );
-                    "probe_failed".into()
+                    Ok("probe_failed".into())
                 }
                 Err(e) => {
+                    if is_ipc_disconnect(&e) {
+                        return Err(e);
+                    }
                     warn!(guest_id, "refresh_memory_config IPC error: {e}");
-                    "probe_error".into()
+                    Ok("probe_error".into())
                 }
             }
         }
@@ -598,15 +828,20 @@ async fn execute_action(ipc: &mut PhiloticClient, guest_id: &str, heal_action: &
                 guest_id,
                 "heal-dispatcher: escalating — operator attention required"
             );
-            "escalated".into()
+            Ok("escalated".into())
         }
-        _ => "noop".into(),
+        _ => Ok("noop".into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::rule_classify;
+    use super::{
+        HEARTBEAT_KEY, OLLAMA_BREAKER_COOLDOWN, OLLAMA_BREAKER_THRESHOLD, OllamaBreaker,
+        heartbeat_request, ipc_timeout_error, rule_classify, with_ipc_timeout,
+    };
+    use philotic_client::{IpcRequest, IpcResponse, is_ipc_disconnect};
+    use std::time::{Duration, Instant};
 
     /// Turn-failure tags must classify identically to the hotel's FailTask
     /// intake (shared classifier), and provider_4xx must escalate — never
@@ -686,5 +921,89 @@ mod tests {
             heal_action_for_pattern_tag("provider_timeout:gemini"),
             "noop"
         );
+    }
+
+    // ── F3: IPC timeout guard ─────────────────────────────────────────────────
+
+    /// The timeout error MUST be recognised by `is_ipc_disconnect` so the
+    /// existing reconnect path fires. A plain `anyhow!` message would not
+    /// downcast to an io error and would silently defeat reconnection.
+    #[test]
+    fn ipc_timeout_error_maps_to_reconnect() {
+        assert!(
+            is_ipc_disconnect(&ipc_timeout_error()),
+            "a timed-out request must be treated as an IPC disconnect"
+        );
+    }
+
+    /// A hung responder (injected here as a future that never resolves in time)
+    /// must trip the timeout and yield the disconnect-class error that drives
+    /// the reconnect path — not hang forever.
+    #[tokio::test]
+    async fn hung_reply_times_out_and_triggers_reconnect() {
+        let hung = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(IpcResponse::success("never", None))
+        };
+        let err = with_ipc_timeout(Duration::from_millis(50), hung)
+            .await
+            .expect_err("hung reply must time out");
+        assert!(
+            is_ipc_disconnect(&err),
+            "timeout must map to the reconnect path"
+        );
+    }
+
+    // ── F3: heartbeat ─────────────────────────────────────────────────────────
+
+    /// The heartbeat writes the EXACT key the phil doctor check reads, and the
+    /// value is valid JSON carrying the unix seconds.
+    #[test]
+    fn heartbeat_request_writes_exact_key() {
+        assert_eq!(HEARTBEAT_KEY, "heal_dispatcher.last_cycle_at");
+        match heartbeat_request(1_720_000_000) {
+            IpcRequest::SetConfig { key, value_json } => {
+                assert_eq!(key, "heal_dispatcher.last_cycle_at");
+                let v: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("heartbeat value must be valid JSON");
+                assert_eq!(v.as_u64(), Some(1_720_000_000));
+            }
+            other => panic!("expected SetConfig, got {other:?}"),
+        }
+    }
+
+    // ── F5: Ollama circuit breaker ────────────────────────────────────────────
+
+    /// The breaker opens only after N consecutive failures, short-circuits for
+    /// the cooldown window, then closes again once the window elapses; a single
+    /// success resets the failure count and closes it early.
+    #[test]
+    fn ollama_breaker_opens_after_threshold_short_circuits_then_resets() {
+        let t0 = Instant::now();
+        let mut breaker = OllamaBreaker::new();
+
+        // Below threshold: stays closed.
+        for _ in 0..(OLLAMA_BREAKER_THRESHOLD - 1) {
+            breaker.record_failure(t0);
+            assert!(!breaker.is_open(t0), "must stay closed below threshold");
+        }
+
+        // Nth failure opens it.
+        breaker.record_failure(t0);
+        assert!(breaker.is_open(t0), "must open at the threshold");
+
+        // Short-circuits throughout the cooldown window…
+        assert!(breaker.is_open(t0 + OLLAMA_BREAKER_COOLDOWN - Duration::from_secs(1)));
+        // …and closes again once the window has fully elapsed.
+        assert!(!breaker.is_open(t0 + OLLAMA_BREAKER_COOLDOWN + Duration::from_secs(1)));
+
+        // A fresh run of failures re-opens it; a success then resets and closes.
+        breaker.record_failure(t0);
+        breaker.record_failure(t0);
+        breaker.record_failure(t0);
+        assert!(breaker.is_open(t0));
+        breaker.record_success();
+        assert!(!breaker.is_open(t0), "a success must reset the breaker");
+        assert_eq!(breaker.consecutive_failures, 0);
     }
 }
