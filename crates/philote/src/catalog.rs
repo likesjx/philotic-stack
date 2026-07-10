@@ -1878,6 +1878,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "items": { "type": "string" },
                         "description": "Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter', 'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it never clears a previously configured ladder. Pass an explicit non-empty list only when you intend to replace it."
                     },
+                    "model_bindings": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Per-agent model NAME binding, keyed by provider role from fallback_tiers (e.g. {\"model.openrouter\": \"z-ai/glm-5.2\", \"model\": \"gemini-flash-latest\"}). Consumed at dispatch: whichever provider role resolve_model_execution_target picks (primary or a fallback tier) uses this role's bound model name instead of that provider's global default. OMIT this field to leave the role's existing bindings untouched — omitting it never clears previously configured bindings. Pass an explicit object only when you intend to replace it."
+                    },
                     "content_policy": {
                         "type": "string",
                         "enum": ["unrestricted", "standard", "strict"],
@@ -2018,6 +2023,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter', 'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it never clears a previously configured ladder. Pass an explicit non-empty list only when you intend to replace it."
+                    },
+                    "model_bindings": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Per-agent model NAME binding, keyed by provider role from fallback_tiers (e.g. {\"model.openrouter\": \"z-ai/glm-5.2\", \"model\": \"gemini-flash-latest\"}). Consumed at dispatch: whichever provider role resolve_model_execution_target picks (primary or a fallback tier) uses this role's bound model name instead of that provider's global default. OMIT this field to leave the role's existing bindings untouched — omitting it never clears previously configured bindings. Pass an explicit object only when you intend to replace it."
                     },
                     "content_policy": {
                         "type": "string",

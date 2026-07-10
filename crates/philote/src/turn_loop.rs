@@ -511,6 +511,7 @@ impl AgentRuntime {
             response_contract: None,
             response_route: None,
             ligand: None,
+            model: role_model_binding(self.sessions.get(&session_id), &origin_role),
             provider_options,
             chat_id: String::new(),
             reply_to: local_node_id(),
@@ -1853,7 +1854,7 @@ impl AgentRuntime {
                     &user_content,
                     &tools_for_model,
                 );
-                let model_req = ModelRequestPayload {
+                let mut model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
                     request_class: Some("cognitive".to_string()),
                     session_id: session_id.clone(),
@@ -1868,6 +1869,7 @@ impl AgentRuntime {
                     response_contract,
                     response_route,
                     ligand,
+                    model: None,
                     provider_options: resolve_content_policy_provider_options(
                         self.sessions.get(&session_id),
                     ),
@@ -1884,6 +1886,7 @@ impl AgentRuntime {
                     "text.generate",
                     DEFAULT_TEXT_MODEL_ROLE,
                 );
+                model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
 
                 info!(
                     "Session [{}] re-entering model loop (iteration {})",
@@ -1993,7 +1996,7 @@ impl AgentRuntime {
             &user_content,
             &tools_for_model,
         );
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
@@ -2008,6 +2011,7 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
+            model: None,
             provider_options: resolve_content_policy_provider_options(
                 self.sessions.get(&session_id),
             ),
@@ -2037,6 +2041,7 @@ impl AgentRuntime {
             "text.generate",
             DEFAULT_TEXT_MODEL_ROLE,
         );
+        model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
@@ -2114,6 +2119,25 @@ impl AgentRuntime {
                     .map(|tlc| tlc.fallback_tiers.clone())
             })
             .unwrap_or_default();
+
+        // Per-agent model NAME bindings (Layer 1 — same precedence source as
+        // `configured_tiers` above, so a live `ConfigureRole` edit and the
+        // persisted role record agree). Resolved per-tier below by role key,
+        // so each fallback tier gets its own bound model, not just the
+        // primary dispatch.
+        let configured_model_bindings: std::collections::BTreeMap<String, String> =
+            active_role_name
+                .as_deref()
+                .and_then(|rn| self.configured_roles.get(rn))
+                .map(|c| c.turn_loop_config.model_bindings.clone())
+                .or_else(|| {
+                    self.sessions
+                        .get(&session_id)
+                        .and_then(|s| s.role_activation.as_ref())
+                        .and_then(|ra| ra.turn_loop_config.as_ref())
+                        .map(|tlc| tlc.model_bindings.clone())
+                })
+                .unwrap_or_default();
 
         // Check tier boundaries before any mutable borrow.
         let current_tier = self
@@ -2367,6 +2391,7 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
+            model: configured_model_bindings.get(&next_role).cloned(),
             provider_options: resolve_content_policy_provider_options(
                 self.sessions.get(&session_id),
             ),

@@ -5704,6 +5704,7 @@ impl IpcServer {
                 model_profile,
                 context_window_policy,
                 fallback_tiers,
+                model_bindings,
                 content_policy,
             } => {
                 Self::configure_role_record(
@@ -5726,6 +5727,7 @@ impl IpcServer {
                     model_profile,
                     context_window_policy,
                     fallback_tiers,
+                    model_bindings,
                     content_policy,
                 )
                 .await
@@ -5818,6 +5820,15 @@ impl IpcServer {
                                 arr.iter()
                                     .filter_map(|t| t.as_str().map(str::to_string))
                                     .collect::<Vec<String>>()
+                            })
+                        }),
+                        arguments.get("model_bindings").and_then(|v| {
+                            v.as_object().map(|obj| {
+                                obj.iter()
+                                    .filter_map(|(k, val)| {
+                                        val.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect::<std::collections::BTreeMap<String, String>>()
                             })
                         }),
                         arguments
@@ -11852,6 +11863,7 @@ fn select_component_route(
                 "execution_mode": "preferred",
                 "availability_state": "live",
                 "selection_reason": "preferred_incarnation_live",
+                "explicit_pin": true,
             }));
         }
 
@@ -11874,11 +11886,18 @@ fn select_component_route(
                     "execution_mode": "preferred",
                     "availability_state": remote.availability_state,
                     "selection_reason": "preferred_incarnation_live",
+                    "explicit_pin": true,
                 }));
             }
         }
     }
 
+    // `explicit_pin` distinguishes a genuine operator/reflex `component_routes`
+    // pin (`binding.is_some()`) from the hotel's implicit local default
+    // (`target_role` fell through to `default_component_role`). Consumed by
+    // philote's `resolve_model_execution_target` (routing drill 2026-07-09) so
+    // an unconfigured hotel route no longer silently outranks a role's
+    // `fallback_tiers` ladder for ladder-governed capabilities.
     if let Some(local) = local_subscribers
         .iter()
         .find(|subscriber| subscriber.role == target_role)
@@ -11896,6 +11915,7 @@ fn select_component_route(
             } else {
                 "live_local_fallback"
             },
+            "explicit_pin": binding.is_some(),
         }));
     }
 
@@ -11908,11 +11928,8 @@ fn select_component_route(
             "environment_id": preferred_environment_id,
             "execution_mode": "capability",
             "availability_state": "live",
-            "selection_reason": if binding.is_some() {
-                "local_active_guest_fallback"
-            } else {
-                "local_active_guest_fallback"
-            },
+            "selection_reason": "local_active_guest_fallback",
+            "explicit_pin": binding.is_some(),
         }));
     }
 
@@ -11932,6 +11949,7 @@ fn select_component_route(
                 "execution_mode": "capability",
                 "availability_state": remote.availability_state,
                 "selection_reason": remote.selection_hint.unwrap_or_else(|| "remote_latency_capacity".into()),
+                "explicit_pin": binding.is_some(),
             }));
         }
     }
@@ -11945,6 +11963,7 @@ fn select_component_route(
         "execution_mode": "capability",
         "availability_state": "materialization_required",
         "selection_reason": "local_requires_materialization",
+        "explicit_pin": binding.is_some(),
     }))
 }
 

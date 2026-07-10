@@ -828,20 +828,41 @@ fn extract_audio_artifact(model_result: Option<&Value>) -> Option<String> {
 ///      Slice 2) — a session degraded by a prior escalation stays on the
 ///      tier that last worked until the origin-tier probe clears it.
 ///   3. The hotel-computed execution route (`resolve_component_execution_route`)
-///      — explicit hotel/mesh routing intent (cross-hotel park, a reflex-set
-///      `target_capability`, etc). Always wins over the ladder.
-///   4. An explicit component binding (`preferred_component_implementation`,
-///      e.g. `bindings.effective_model_controller`) — an operator/session-level
-///      pin to a specific implementation. More specific than a role-wide
-///      default, so it outranks the ladder too.
+///      — but for ladder-governed capabilities (`fallback_role ==
+///      DEFAULT_TEXT_MODEL_ROLE`), ONLY when it reflects genuine explicit
+///      routing intent: a remote/cross-hotel placement (`target_node` !=
+///      local — e.g. cross-hotel park, an oracle remote pick), or an
+///      operator/reflex `component_routes` pin (`route.explicit_pin`).
+///      Non-ladder capabilities (voice synthesis, ...) always trust the
+///      hotel route, as before.
+///   4. An explicit per-session `component_routes` pin
+///      (`SessionState.component_route_for_capability`) — an operator/reflex
+///      binding to a specific implementation. More specific than a role-wide
+///      default, so it outranks the ladder too. This does NOT include the
+///      legacy `effective_model_controller` fallback (step 6 below).
 ///   5. The active role's configured fallback ladder primary
 ///      (`role_activation.turn_loop_config.fallback_tiers[0]`) — only consulted
 ///      for text-generation dispatch (`fallback_role == DEFAULT_TEXT_MODEL_ROLE`)
 ///      and only when neither of the above is set. This is what lets a
 ///      configured ladder (e.g. `["model.openrouter", "model.ollama"]`) govern
 ///      the *initial* dispatch, not just failure escalation.
-///   6. `fallback_role` (`DEFAULT_TEXT_MODEL_ROLE` for text turns) — the last
-///      resort when nothing else is configured.
+///   6. The legacy `preferred_component_implementation` fallback (e.g.
+///      `bindings.effective_model_controller` for text-generation, or the
+///      agent-profile voice provider policy for voice capabilities) — a last
+///      resort *below* the ladder for agents with no ladder configured.
+///   7. `fallback_role` (`DEFAULT_TEXT_MODEL_ROLE` for text turns) — the very
+///      last resort when nothing else is configured.
+///
+/// Routing drill 2026-07-09: steps 3 and 6 used to sit *above* the ladder
+/// unconditionally. In production, aiua's `compose_component_route_assembly`
+/// always populates a `text.generate` execution route (`declared_component_
+/// capabilities` unconditionally includes it), defaulting to plain "model"
+/// (gemini) via `default_component_role` when nothing is explicitly pinned —
+/// so step 3 silently outranked every agent's ladder for the *primary*
+/// dispatch, and a stale legacy `effective_model_controller` (step 6) did
+/// too. Both are now demoted below the ladder unless they represent genuine
+/// explicit routing intent, so a role's `fallback_tiers[0]` (Layer 1's
+/// per-agent model binding surface) is actually authoritative.
 fn resolve_model_execution_target(
     state: Option<&SessionState>,
     capability: &str,
@@ -871,13 +892,12 @@ fn resolve_model_execution_target(
         }
     }
 
-    if let Some(route) = state.and_then(|state| state.resolve_component_execution_route(capability))
-    {
-        return (
-            route.target_node.clone(),
-            route.target_role.clone(),
-            route.incarnation_id.clone(),
-        );
+    if let Some(target) = pre_ladder_dispatch_target(state, capability, fallback_role) {
+        return target;
+    }
+
+    if let Some(role) = ladder_primary_role(state, fallback_role) {
+        return (local_node_id(), role, None);
     }
 
     if let Some(implementation) =
@@ -890,10 +910,46 @@ fn resolve_model_execution_target(
         );
     }
 
-    let target_role =
-        ladder_primary_role(state, fallback_role).unwrap_or_else(|| fallback_role.into());
+    (local_node_id(), fallback_role.into(), None)
+}
 
-    (local_node_id(), target_role, None)
+/// Steps 3–4 of [`resolve_model_execution_target`]'s precedence (operator
+/// pin and sticky fallback override excluded — those are checked separately
+/// by callers that need them). Returns `Some` when a pre-ladder step
+/// resolved a target; `None` means the ladder (step 5, if configured) or the
+/// legacy fallback (step 6) governs. Shared by `resolve_model_execution_target`
+/// and `primary_dispatch_used_ladder` so the two precedence computations can
+/// never drift out of sync (see the off-by-one defect their docs reference).
+fn pre_ladder_dispatch_target(
+    state: Option<&SessionState>,
+    capability: &str,
+    fallback_role: &str,
+) -> Option<(String, String, Option<String>)> {
+    let ladder_governed = fallback_role == DEFAULT_TEXT_MODEL_ROLE;
+
+    if let Some(route) = state.and_then(|state| state.resolve_component_execution_route(capability))
+    {
+        if !ladder_governed || route.target_node != local_node_id() || route.explicit_pin {
+            return Some((
+                route.target_node.clone(),
+                route.target_role.clone(),
+                route.incarnation_id.clone(),
+            ));
+        }
+        // Ladder-governed capability, local target, no explicit pin: this is
+        // the hotel's implicit default (e.g. `default_component_role`) —
+        // fall through so the ladder gets a chance to govern instead.
+    }
+
+    if let Some(role) = state
+        .and_then(|state| state.component_route_for_capability(capability))
+        .and_then(|route| route.implementation.as_deref())
+        .map(implementation_to_model_role)
+    {
+        return Some((local_node_id(), role, None));
+    }
+
+    None
 }
 
 /// The active role's configured fallback ladder (`turn_loop_config.fallback_tiers`),
@@ -906,6 +962,25 @@ fn role_ladder_tiers(state: Option<&SessionState>) -> Option<&[String]> {
         .and_then(|ra| ra.turn_loop_config.as_ref())
         .map(|tlc| tlc.fallback_tiers.as_slice())
         .filter(|tiers| !tiers.is_empty())
+}
+
+/// Resolves the per-agent model NAME bound to `target_role` (a provider
+/// role such as `"model.openrouter"`) from the active role's
+/// `turn_loop_config.model_bindings` (Layer 1 — see
+/// `TurnLoopConfig::model_bindings`). `None` when no role is active, the
+/// role has no `turn_loop_config`, or the role has no binding for this
+/// specific provider role — callers then leave `ModelRequestPayload.model`
+/// unset, so model-router falls back to the provider's own global default
+/// (`openrouter_default_model`, etc). Called with whichever `target_role`
+/// `resolve_model_execution_target` (or the fallback-tier advance walk)
+/// resolved, so each fallback tier gets its own binding, not just the
+/// primary.
+fn role_model_binding(state: Option<&SessionState>, target_role: &str) -> Option<String> {
+    state
+        .and_then(|state| state.role_activation.as_ref())
+        .and_then(|ra| ra.turn_loop_config.as_ref())
+        .and_then(|tlc| tlc.model_bindings.get(target_role))
+        .cloned()
 }
 
 /// `role_ladder_tiers(state)[0]`, gated to text-generation dispatch. The
@@ -928,16 +1003,7 @@ fn ladder_primary_role(state: Option<&SessionState>, fallback_role: &str) -> Opt
 /// attempted (try it before advancing further) — see DEF: off-by-one on
 /// single-tier ladders.
 fn primary_dispatch_used_ladder(state: Option<&SessionState>, capability: &str) -> bool {
-    if state
-        .and_then(|state| state.resolve_component_execution_route(capability))
-        .is_some()
-    {
-        return false;
-    }
-    if state
-        .and_then(|state| state.preferred_component_implementation(capability))
-        .is_some()
-    {
+    if pre_ladder_dispatch_target(state, capability, DEFAULT_TEXT_MODEL_ROLE).is_some() {
         return false;
     }
     role_ladder_tiers(state).is_some()
@@ -2257,7 +2323,7 @@ impl AgentRuntime {
                     &restored_user_content,
                     &tools,
                 );
-                let model_req = ModelRequestPayload {
+                let mut model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
                     request_class: Some("cognitive".to_string()),
                     session_id: session_id.clone(),
@@ -2272,6 +2338,7 @@ impl AgentRuntime {
                     response_contract,
                     response_route,
                     ligand,
+                    model: None,
                     provider_options: resolve_content_policy_provider_options(
                         self.sessions.get(&session_id),
                     ),
@@ -2287,6 +2354,7 @@ impl AgentRuntime {
                     "text.generate",
                     DEFAULT_TEXT_MODEL_ROLE,
                 );
+                model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
                 self.ipc_client
                     .send_request(IpcRequest::EmitTask {
                         target_node,
@@ -2977,6 +3045,7 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
+            model: role_model_binding(self.sessions.get(&session_id), &target_role),
             provider_options,
             chat_id,
             reply_to: local_node_id(),
@@ -3419,7 +3488,7 @@ impl AgentRuntime {
             &reentry.user_content,
             &reentry.tools_for_model,
         );
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
@@ -3434,6 +3503,7 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
+            model: None,
             provider_options: resolve_content_policy_provider_options(
                 self.sessions.get(&session_id),
             ),
@@ -3450,6 +3520,7 @@ impl AgentRuntime {
             "text.generate",
             DEFAULT_TEXT_MODEL_ROLE,
         );
+        model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
 
         info!(
             "Session [{}] re-entering normal reasoning after voice transcription",
@@ -4097,7 +4168,7 @@ impl AgentRuntime {
         ));
         let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools);
         let affordances = model_affordances(self.sessions.get(&session_id), &user_content, &tools);
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
@@ -4112,6 +4183,7 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
+            model: None,
             provider_options: resolve_content_policy_provider_options(
                 self.sessions.get(&session_id),
             ),
@@ -4128,6 +4200,7 @@ impl AgentRuntime {
             "text.generate",
             DEFAULT_TEXT_MODEL_ROLE,
         );
+        model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
 
         info!(
             "Scripted loop [{}] emitting model call for phase '{}'",
@@ -4715,7 +4788,7 @@ impl AgentRuntime {
             &user_content,
             &tools_for_model,
         );
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
@@ -4730,6 +4803,7 @@ impl AgentRuntime {
             response_contract: None,
             response_route,
             ligand,
+            model: None,
             provider_options: resolve_content_policy_provider_options(
                 self.sessions.get(&session_id),
             ),
@@ -4746,6 +4820,7 @@ impl AgentRuntime {
             "text.generate",
             DEFAULT_TEXT_MODEL_ROLE,
         );
+        model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
@@ -6149,7 +6224,8 @@ mod tests {
         format_role_command_reply, format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
         media_analysis_attachments, next_ladder_tier, normalized_user_content,
         parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
-        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
+        resolve_media_routing, resolve_model_execution_target, role_model_binding,
+        should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -6398,6 +6474,7 @@ mod tests {
             response_contract: None,
             response_route: Some("text_only".into()),
             ligand: None,
+            model: None,
             provider_options: serde_json::Map::new(),
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
@@ -6584,6 +6661,7 @@ mod tests {
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
                     target_capability: None,
+                    explicit_pin: false,
                 },
             )]),
         };
@@ -6594,9 +6672,19 @@ mod tests {
         assert_eq!(target.1, "model");
     }
 
-    /// An explicit `effective_model_controller` binding wins over the ladder.
+    /// Reversed by the routing drill 2026-07-09 fix: `effective_model_controller`
+    /// is a legacy fallback (see its `[legacy]` label in
+    /// `component_route_summary`), not a genuine per-session pin. A
+    /// configured role ladder is the intended per-agent primary-model lever
+    /// and must now win over a stale `effective_model_controller`, not sit
+    /// below it — this was proven live on mbp-jane (Jane's
+    /// `fallback_tiers[0]=model.openrouter` was silently losing to a stale
+    /// controller binding). Previously this test asserted the opposite
+    /// ("model.elevenlabs" wins); see `ladder_precedence_ladder_wins_over_hotel_default_route`
+    /// and `ladder_precedence_explicit_pin_hotel_route_still_wins_locally`
+    /// below for the full precedence matrix this change preserves.
     #[test]
-    fn ladder_precedence_explicit_binding_wins_over_ladder() {
+    fn ladder_precedence_ladder_beats_legacy_effective_model_controller() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
@@ -6605,6 +6693,98 @@ mod tests {
         let target =
             resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
         assert_eq!(target.0, LOCAL_NODE.to_string());
+        assert_eq!(
+            target.1, "model.openrouter",
+            "a configured ladder must beat the legacy effective_model_controller fallback"
+        );
+    }
+
+    /// A role with NO configured ladder still honors `effective_model_controller`
+    /// as a legacy fallback — this mechanism isn't removed, only demoted
+    /// below the ladder when one is configured.
+    #[test]
+    fn ladder_precedence_legacy_effective_model_controller_still_applies_without_ladder() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.effective_model_controller = Some("elevenlabs".into());
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.0, LOCAL_NODE.to_string());
+        assert_eq!(target.1, "model.elevenlabs");
+    }
+
+    /// Regression (routing drill 2026-07-09): production always populates a
+    /// hotel-computed `text.generate` execution route (aiua's
+    /// `compose_component_route_assembly` — `declared_component_capabilities`
+    /// unconditionally includes "text.generate", and `select_component_route`
+    /// always returns a route, defaulting to "model"/gemini when nothing is
+    /// explicitly pinned). Before this fix, that implicit-default route —
+    /// `selection_reason: "live_local_fallback"`, `explicit_pin: false` —
+    /// silently outranked every agent's ladder for the *primary* dispatch,
+    /// making `fallback_tiers[0]` dead in production even though the bare
+    /// `ladder_precedence_tiers_zero_used_when_set` fixture (no hotel route
+    /// at all) passed.
+    #[test]
+    fn ladder_precedence_ladder_wins_over_hotel_default_route() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: LOCAL_NODE.into(),
+                    target_role: "model".into(),
+                    incarnation_id: None,
+                    hotel_id: Some(LOCAL_NODE.into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("live_local_fallback".into()),
+                    target_capability: None,
+                    explicit_pin: false,
+                },
+            )]),
+        };
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(
+            target.1, "model.openrouter",
+            "the role's ladder must govern the primary dispatch when the hotel \
+             route is only its implicit local default, not an explicit pin"
+        );
+    }
+
+    /// A genuine explicit `component_routes` pin (`explicit_pin: true` —
+    /// operator/reflex-set, not the hotel's implicit default) still wins
+    /// over the ladder even when it resolves to a local live guest.
+    #[test]
+    fn ladder_precedence_explicit_pin_hotel_route_still_wins_locally() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: LOCAL_NODE.into(),
+                    target_role: "model.elevenlabs".into(),
+                    incarnation_id: None,
+                    hotel_id: Some(LOCAL_NODE.into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("live_local_capability".into()),
+                    target_capability: None,
+                    explicit_pin: true,
+                },
+            )]),
+        };
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
         assert_eq!(target.1, "model.elevenlabs");
     }
 
@@ -6636,6 +6816,84 @@ mod tests {
             resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
         assert_eq!(target.1, DEFAULT_TEXT_MODEL_ROLE);
         assert!(!primary_dispatch_used_ladder(Some(&state), "text.generate"));
+    }
+
+    // ── Layer 1: per-agent model NAME binding ─────────────────────────────
+
+    fn role_activation_with_ladder_and_bindings(
+        tiers: &[&str],
+        bindings: &[(&str, &str)],
+    ) -> RoleActivation {
+        RoleActivation {
+            role_name: "researcher".into(),
+            activation_reason: "test".into(),
+            turn_loop_config: Some(ansible_mesh_core::graph::TurnLoopConfig {
+                fallback_tiers: tiers.iter().map(|t| t.to_string()).collect(),
+                model_bindings: bindings
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `role_model_binding` resolves independently per provider role — the
+    /// core requirement that per-agent model selection covers both the
+    /// primary dispatch AND every fallback tier, not just tier 0.
+    #[test]
+    fn role_model_binding_resolves_per_provider_role() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder_and_bindings(
+            &["model.openrouter", "model"],
+            &[
+                ("model.openrouter", "z-ai/glm-5.2"),
+                ("model", "gemini-flash-latest"),
+            ],
+        ));
+
+        assert_eq!(
+            role_model_binding(Some(&state), "model.openrouter").as_deref(),
+            Some("z-ai/glm-5.2")
+        );
+        assert_eq!(
+            role_model_binding(Some(&state), "model").as_deref(),
+            Some("gemini-flash-latest")
+        );
+        // No binding configured for this role — falls through to None so the
+        // caller leaves ModelRequestPayload.model unset (provider global default).
+        assert_eq!(role_model_binding(Some(&state), "model.ollama"), None);
+    }
+
+    #[test]
+    fn role_model_binding_none_without_role_or_bindings() {
+        assert_eq!(role_model_binding(None, "model.openrouter"), None);
+
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        assert_eq!(role_model_binding(Some(&state), "model.openrouter"), None);
+    }
+
+    /// End-to-end wiring: `resolve_model_execution_target` resolves the
+    /// provider ROLE, and `role_model_binding` resolves the model NAME for
+    /// that same role — the two compose correctly for the primary dispatch.
+    #[test]
+    fn role_model_binding_composes_with_ladder_primary_dispatch() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder_and_bindings(
+            &["model.openrouter"],
+            &[("model.openrouter", "z-ai/glm-5.2")],
+        ));
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.1, "model.openrouter");
+        assert_eq!(
+            role_model_binding(Some(&state), &target.1).as_deref(),
+            Some("z-ai/glm-5.2")
+        );
     }
 
     /// The ladder is a text-generation construct: a non-text `fallback_role`
@@ -6689,6 +6947,7 @@ mod tests {
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
                     target_capability: None,
+                    explicit_pin: false,
                 },
             )]),
         };
@@ -6873,6 +7132,7 @@ mod tests {
                     availability_state: "live".into(),
                     selection_reason: None,
                     target_capability: Some("response.generate".into()),
+                    explicit_pin: false,
                 },
             )]),
         };
@@ -9399,12 +9659,16 @@ mod tests {
     // ── Single-tier ladder reachability (defect 2: off-by-one) ───────────────
 
     /// Regression for the off-by-one: a role with a single-tier ladder whose
-    /// *primary* dispatch bypassed the ladder (an explicit
-    /// `effective_model_controller` binding won precedence — see
-    /// `resolve_model_execution_target`) must still get a shot at that one
-    /// ladder tier on failure. Before the fix, `fallback_tier` started at 0
-    /// unconditionally and the walk jumped straight to tier 1, which
-    /// immediately exceeded a single-tier ladder's `max_tier` (0) and skipped
+    /// *primary* dispatch bypassed the ladder (an explicit per-session
+    /// `component_routes` pin won precedence — see
+    /// `resolve_model_execution_target`; routing drill 2026-07-09 demoted
+    /// the legacy `effective_model_controller` fallback this test used to
+    /// use for the bypass below the ladder, so a genuine explicit pin is
+    /// used here instead to keep exercising the same bypass class) must
+    /// still get a shot at that one ladder tier on failure. Before the fix,
+    /// `fallback_tier` started at 0 unconditionally and the walk jumped
+    /// straight to tier 1, which immediately exceeded a single-tier
+    /// ladder's `max_tier` (0) and skipped
     /// the ladder entirely.
     #[tokio::test]
     async fn single_tier_ladder_reachable_when_primary_bypassed_it() {
@@ -9430,14 +9694,21 @@ mod tests {
             .await
             .expect("session load");
 
-        // A 1-tier ladder is configured, but an explicit binding (higher
-        // precedence than the ladder) is what actually drove the primary
-        // dispatch to gemini — the "default-primary role with a 1-tier
-        // ladder" case.
+        // A 1-tier ladder is configured, but an explicit per-session
+        // `component_routes` pin (higher precedence than the ladder) is what
+        // actually drove the primary dispatch to gemini — the
+        // "default-primary role with a 1-tier ladder" case.
         {
             let state = runtime.sessions.get_mut(session_id).expect("session");
             state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
-            state.bindings.effective_model_controller = Some("gemini".into());
+            state.bindings.component_routes.push(ComponentRouteBinding {
+                capability: "text.generate".into(),
+                selection_mode: "preferred".into(),
+                implementation: Some("gemini".into()),
+                incarnation: None,
+                preferred_hotel_id: None,
+                preferred_environment_id: None,
+            });
         }
 
         let mut turn = def004_working_turn(turn_id, "hotel.status");
@@ -9539,15 +9810,25 @@ mod tests {
             .await
             .expect("session load");
 
-        // Two-tier ladder configured, but an explicit binding wins precedence
-        // for the primary dispatch (bypasses the ladder entirely).
+        // Two-tier ladder configured, but an explicit per-session
+        // `component_routes` pin wins precedence for the primary dispatch
+        // (bypasses the ladder entirely) — see the single-tier variant above
+        // for why this uses a genuine explicit pin rather than the legacy
+        // `effective_model_controller` fallback this test used pre-routing-drill.
         {
             let state = runtime.sessions.get_mut(session_id).expect("session");
             state.role_activation = Some(role_activation_with_ladder(&[
                 "model.openrouter",
                 "model.ollama",
             ]));
-            state.bindings.effective_model_controller = Some("gemini".into());
+            state.bindings.component_routes.push(ComponentRouteBinding {
+                capability: "text.generate".into(),
+                selection_mode: "preferred".into(),
+                implementation: Some("gemini".into()),
+                incarnation: None,
+                preferred_hotel_id: None,
+                preferred_environment_id: None,
+            });
         }
 
         let mut turn = def004_working_turn(turn_id, "hotel.status");
@@ -9617,6 +9898,141 @@ mod tests {
             vec!["model.openrouter".to_string(), "model.ollama".to_string()],
             "the walk must cover each ladder entry exactly once, in order: {:#?}",
             redispatches
+        );
+    }
+
+    /// Layer 1 isolation, driven through the real fallback-tier *advance*
+    /// dispatch (`turn_loop.rs`'s `configured_model_bindings`, not just the
+    /// primary-dispatch helper covered by the `role_model_binding_*` tests
+    /// above): "Aria" has her OWN `model_bindings`, distinct per tier and
+    /// distinct from any other agent's or the provider's global default.
+    /// Proves each fallback tier resolves its own bound model — the routing
+    /// drill's headline complaint was Aria's openrouter *fallback* silently
+    /// inheriting Jane's GLM-5.2 via the shared global
+    /// `openrouter_default_model`; per-agent `model_bindings` is the fix.
+    #[tokio::test]
+    async fn aria_fallback_tier_uses_her_own_model_binding_not_a_shared_default() {
+        let socket_path = format!("/tmp/philote-aria-binding-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-aria".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-aria");
+
+        let session_id = "sess-aria-binding";
+        let turn_id = "turn-aria-binding";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Two-tier ladder, primary dispatch bypassed (explicit component_routes
+        // pin, same harness pattern as the off-by-one tests above) so both
+        // tier 0 and tier 1 get a real dispatch through
+        // `advance_turn_to_next_fallback_tier` in this synthetic test. Aria's
+        // bindings are deliberately NOT "z-ai/glm-5.2" (Jane's model from the
+        // routing drill) to prove isolation, not just presence.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder_and_bindings(
+                &["model.openrouter", "model.ollama"],
+                &[
+                    ("model.openrouter", "aria/openrouter-preferred"),
+                    ("model.ollama", "aria/ollama-preferred"),
+                ],
+            ));
+            state.bindings.component_routes.push(ComponentRouteBinding {
+                capability: "text.generate".into(),
+                selection_mode: "preferred".into(),
+                implementation: Some("gemini".into()),
+                incarnation: None,
+                preferred_hotel_id: None,
+                preferred_environment_id: None,
+            });
+        }
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        turn.fallback_tier = 0;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Tier 0 (bypassed primary gets its shot): must carry Aria's
+        // model.openrouter binding, not Jane's glm-5.2 or an unset default.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "watchdog timeout".into(),
+            )
+            .await
+            .expect("first escalation");
+
+        // Tier 1: must carry Aria's OWN model.ollama binding — a distinct
+        // value per tier, not a single agent-wide model pinned once.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "watchdog timeout".into(),
+            )
+            .await
+            .expect("second escalation");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let dispatches: Vec<(String, Option<String>)> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .map(|e| {
+                (
+                    e["target_role"].as_str().unwrap_or("").to_string(),
+                    e["task"]["model"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            dispatches,
+            vec![
+                (
+                    "model.openrouter".to_string(),
+                    Some("aria/openrouter-preferred".to_string())
+                ),
+                (
+                    "model.ollama".to_string(),
+                    Some("aria/ollama-preferred".to_string())
+                ),
+            ],
+            "each fallback tier must carry Aria's OWN per-tier bound model, \
+             not Jane's z-ai/glm-5.2 or a shared global default: {:#?}",
+            dispatches
+        );
+        assert!(
+            dispatches
+                .iter()
+                .all(|(_, model)| model.as_deref() != Some("z-ai/glm-5.2")),
+            "Aria's dispatches must never carry Jane's bound model: {:#?}",
+            dispatches
         );
     }
 

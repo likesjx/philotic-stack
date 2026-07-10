@@ -5756,6 +5756,7 @@ mod tests {
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
                     target_capability: None,
+                    explicit_pin: false,
                 },
             )]),
         };

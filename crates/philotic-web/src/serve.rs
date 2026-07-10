@@ -5128,6 +5128,9 @@ async fn ipc_patch_role(
             // "preserve" server-side (see ConfigureRole fix), so the patch no
             // longer silently wipes a DB-edited fallback ladder.
             fallback_tiers: None,
+            // Same preserve-on-None contract; this endpoint doesn't expose
+            // per-agent model-binding editing yet either.
+            model_bindings: None,
             content_policy: None,
         })
         .await?

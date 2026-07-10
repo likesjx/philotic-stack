@@ -1665,6 +1665,20 @@ pub struct ComponentExecutionRoute {
     pub selection_reason: Option<String>,
     #[serde(default)]
     pub target_capability: Option<String>,
+    /// True when this route was driven by a genuine operator/reflex
+    /// `component_routes` pin (an explicit `implementation`/`incarnation`
+    /// binding), as opposed to the hotel's implicit local default
+    /// (`default_component_role` — e.g. plain "model"/gemini for
+    /// `text.generate` when nothing was pinned). `resolve_model_execution_target`
+    /// uses this to keep the role's `fallback_tiers` ladder authoritative for
+    /// ladder-governed capabilities when the hotel route is only an implicit
+    /// default, while still honoring genuine pins and cross-hotel placement.
+    /// See routing drill 2026-07-09: an unconfigured hotel route previously
+    /// always defaulted to "model", silently outranking every agent's ladder
+    /// for the primary dispatch. Serde-defaults to `false` so routes emitted
+    /// before this field existed deserialize as non-explicit.
+    #[serde(default)]
+    pub explicit_pin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

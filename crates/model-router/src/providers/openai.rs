@@ -1064,6 +1064,47 @@ mod tests {
         );
     }
 
+    /// Layer 1 precedence at the provider boundary: an explicit
+    /// `ControllerTask.model` (set from philote's per-agent `model_bindings`
+    /// — see `ModelRequestPayload.model` / `role_model_binding` in
+    /// `crates/philote/src/runtime.rs`) wins over the provider's own global
+    /// default (`openrouter_default_model` / `self.default_model`); when the
+    /// task carries no model, the global default governs. This is the
+    /// consuming end of the wire: philote sets the top-level `"model"` JSON
+    /// key, `ControllerTask::from_value` reads it into `task.model`
+    /// (controller.rs), and `default_model` here is the final precedence
+    /// choke point every non-realtime/non-audio text/media task funnels
+    /// through.
+    #[test]
+    fn default_model_prefers_explicit_task_model_over_provider_default() {
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            None,
+            None,
+            None,
+            Some("global-default-model".into()),
+            None,
+        );
+
+        let bound_task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+            "model": "z-ai/glm-5.2",
+        }))
+        .expect("valid task");
+        assert_eq!(provider.default_model(&bound_task), "z-ai/glm-5.2");
+
+        let unbound_task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+        }))
+        .expect("valid task");
+        assert_eq!(
+            provider.default_model(&unbound_task),
+            "global-default-model"
+        );
+    }
+
     #[test]
     fn auth_prefers_oauth_bearer_over_api_key() {
         assert_eq!(
