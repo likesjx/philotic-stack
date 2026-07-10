@@ -1361,6 +1361,14 @@ pub enum IpcRequest {
         /// brand-new role with `None` gets `DEFAULT_FALLBACK_TIERS`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fallback_tiers: Option<Vec<String>>,
+        /// Content-filtering posture for this role: `"unrestricted"` | `"standard"`
+        /// | `"strict"`. `None` (the default when omitted) PRESERVES whatever
+        /// policy is already on the record — same preserve-on-None contract as
+        /// `fallback_tiers` above, so an unrelated reconfigure never silently
+        /// resets an operator-set `"unrestricted"` policy back to `"standard"`.
+        /// A brand-new role with `None` gets `"standard"` (current behavior).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_policy: Option<String>,
     },
     /// Execute a governed workflow through the hotel's workflow plane.
     ExecuteWorkflow {
@@ -3003,6 +3011,7 @@ mod tests {
             model_profile: None,
             context_window_policy: None,
             fallback_tiers: Some(vec!["model".into(), "model.openrouter".into()]),
+            content_policy: None,
         };
         let json = serde_json::to_value(&req).expect("serialize");
         let decoded: IpcRequest = serde_json::from_value(json).expect("deserialize");

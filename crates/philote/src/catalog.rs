@@ -1878,6 +1878,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "items": { "type": "string" },
                         "description": "Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter', 'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it never clears a previously configured ladder. Pass an explicit non-empty list only when you intend to replace it."
                     },
+                    "content_policy": {
+                        "type": "string",
+                        "enum": ["unrestricted", "standard", "strict"],
+                        "description": "Content-filtering posture for this role. 'standard' (the default) preserves current provider defaults. 'unrestricted' disables provider-level safety filtering where the provider exposes a toggle (Gemini safetySettings at BLOCK_NONE) — only set this when the operator has explicitly asked for it for a specific role/agent. 'strict' tightens filtering. OMIT this field to leave the role's existing policy untouched — omitting it never resets a previously configured policy back to 'standard'."
+                    },
                     "reasoning": {
                         "type": "object",
                         "description": "Required reasoning for this role's existence, purpose, and capability posture.",
@@ -2013,6 +2018,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter', 'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it never clears a previously configured ladder. Pass an explicit non-empty list only when you intend to replace it."
+                    },
+                    "content_policy": {
+                        "type": "string",
+                        "enum": ["unrestricted", "standard", "strict"],
+                        "description": "Content-filtering posture for this role. 'standard' (the default) preserves current provider defaults. 'unrestricted' disables provider-level safety filtering where the provider exposes a toggle (Gemini safetySettings at BLOCK_NONE) — only set this when the operator has explicitly asked for it for a specific role/agent. 'strict' tightens filtering. OMIT this field to leave the role's existing policy untouched — omitting it never resets a previously configured policy back to 'standard'."
                     },
                     "reasoning": {
                         "type": "object",

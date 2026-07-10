@@ -544,6 +544,13 @@ impl IpcServer {
         model_profile: Option<String>,
         context_window_policy: Option<String>,
         fallback_tiers: Option<Vec<String>>,
+        // Content-filtering posture for this role. `None` PRESERVES whatever is
+        // already on the record (or defaults a brand-new role to `"standard"`) —
+        // mirrors the `fallback_tiers` preserve-on-None fix so reconfiguring a
+        // role for an unrelated field (e.g. toolset_profile) never silently
+        // resets an operator-set `"unrestricted"` policy back to `"standard"`.
+        // `Some(value)` must be one of `unrestricted` | `standard` | `strict`.
+        content_policy: Option<String>,
     ) -> IpcResponse {
         let Some(identity) = current_identity else {
             return IpcResponse::error(
@@ -625,6 +632,27 @@ impl IpcServer {
                     .collect(),
             },
         };
+
+        // Content-policy resolution: `None` preserves the existing record's policy
+        // (or defaults a brand-new role to `"standard"`) — same preserve-on-None
+        // contract as `fallback_tiers` above. `Some(value)` must be a known policy.
+        let resolved_content_policy = match content_policy {
+            Some(policy) => {
+                if !ansible_mesh_core::graph::is_valid_content_policy(&policy) {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_INVALID_CONTENT_POLICY",
+                        "content_policy must be one of: unrestricted, standard, strict",
+                    );
+                }
+                policy
+            }
+            None => match previous.as_ref() {
+                Some(prev) => prev.content_policy.clone(),
+                None => ansible_mesh_core::graph::default_content_policy(),
+            },
+        };
+
         // For a new role, check if the base agent is currently live. Single-process philote
         // registers as the base agent_id and handles all roles internally, so any new role
         // it creates is immediately routable via the base guest.
@@ -652,6 +680,7 @@ impl IpcServer {
             toolset_profile,
             role_identity_addendum,
             role_manifest,
+            content_policy: resolved_content_policy,
             is_admin,
             readiness_state: initial_readiness,
             inactive_ttl_seconds,
@@ -1451,6 +1480,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 
@@ -1663,6 +1693,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
         graph
@@ -1924,6 +1955,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed orchestrator role");
         graph
@@ -2134,6 +2166,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed orchestrator role");
         graph
@@ -2365,6 +2398,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("developer role should seed");
         let server = IpcServer::new(
@@ -2521,6 +2555,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
         graph
@@ -2536,6 +2571,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("developer role should seed");
         let server = IpcServer::new(
@@ -2698,6 +2734,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("developer role should seed");
 
@@ -2931,6 +2968,7 @@ mod tests {
                 model_profile: Some("fast".into()),
                 context_window_policy: Some("standard".into()),
                 fallback_tiers: None,
+                content_policy: None,
             })
             .await
             .expect("configure request");
@@ -3018,6 +3056,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                content_policy: None,
             })
             .await
             .expect("configure request");
@@ -3118,6 +3157,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: Some(custom_tiers.clone()),
+                content_policy: None,
             })
             .await
             .expect("configure request");
@@ -3214,6 +3254,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: Some(custom_tiers.clone()),
+                content_policy: None,
             })
             .await
             .expect("first configure request");
@@ -3237,6 +3278,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                content_policy: None,
             })
             .await
             .expect("second configure request");
@@ -3251,6 +3293,195 @@ mod tests {
             "fallback_tiers must survive a reconfigure that passes None"
         );
         assert_eq!(role.turn_loop_config.iteration_cap, Some(25));
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// End-to-end config passthrough for the per-agent content policy feature:
+    /// `role.configure` (via the `ConfigureRole` IPC) sets `content_policy`,
+    /// it lands on the persisted `RoleIncarnationRecord`, an unrelated
+    /// reconfigure with `content_policy: None` preserves it (same
+    /// preserve-on-None contract as `fallback_tiers`), and an invalid value
+    /// is rejected rather than silently stored.
+    #[tokio::test]
+    async fn configure_role_sets_and_preserves_content_policy() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        // A brand-new role with content_policy omitted defaults to "standard"
+        // — nothing changes for agents that never touch this feature.
+        let resp0 = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "jane".into(),
+                guest_id: "agent-jane-01:jane".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "companion".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: None,
+                content_policy: None,
+            })
+            .await
+            .expect("create role request");
+        assert!(matches!(resp0, IpcResponse::ConfigureRoleOk { .. }));
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "jane")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(role.content_policy, "standard");
+
+        // Explicitly set content_policy = "unrestricted".
+        let resp1 = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "jane".into(),
+                guest_id: "agent-jane-01:jane".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "companion".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: None,
+                content_policy: Some("unrestricted".into()),
+            })
+            .await
+            .expect("set content_policy request");
+        assert!(matches!(resp1, IpcResponse::ConfigureRoleOk { .. }));
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "jane")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(role.content_policy, "unrestricted");
+
+        // An unrelated reconfigure with content_policy: None must PRESERVE
+        // "unrestricted" — must not silently reset to "standard".
+        let resp2 = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "jane".into(),
+                guest_id: "agent-jane-01:jane".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "companion".into(),
+                role_identity_addendum: Some("updated addendum".into()),
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: Some(30),
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: None,
+                content_policy: None,
+            })
+            .await
+            .expect("unrelated reconfigure request");
+        assert!(matches!(resp2, IpcResponse::ConfigureRoleOk { .. }));
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "jane")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(
+            role.content_policy, "unrestricted",
+            "content_policy must survive a reconfigure that passes None"
+        );
+        assert_eq!(role.turn_loop_config.iteration_cap, Some(30));
+
+        // An invalid value is rejected, not silently stored.
+        let resp3 = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "jane".into(),
+                guest_id: "agent-jane-01:jane".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "companion".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: None,
+                content_policy: Some("permissive".into()),
+            })
+            .await
+            .expect("invalid content_policy request");
+        match resp3 {
+            IpcResponse::Standard { ok: false, .. } | IpcResponse::Error(_) => {}
+            other => panic!("expected an error response for invalid content_policy, got {other:?}"),
+        }
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "jane")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(
+            role.content_policy, "unrestricted",
+            "a rejected update must not have mutated the stored policy"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -3330,6 +3561,7 @@ mod tests {
                     model_profile: None,
                     context_window_policy: None,
                     fallback_tiers: Some(bad_tiers),
+                    content_policy: None,
                 })
                 .await
                 .expect("configure request");
@@ -3608,6 +3840,7 @@ mod tests {
                 model_profile: Some("fast".into()),
                 context_window_policy: Some("standard".into()),
                 fallback_tiers: None,
+                content_policy: None,
             })
             .await
             .expect("configure request");
@@ -3681,6 +3914,7 @@ mod tests {
                 model_profile: None,
                 context_window_policy: None,
                 fallback_tiers: None,
+                content_policy: None,
             })
             .await
             .expect("configure request");
@@ -3744,6 +3978,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
 
@@ -3888,6 +4123,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
 
@@ -4028,6 +4264,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("orchestrator role should seed");
 

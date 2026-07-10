@@ -2489,6 +2489,7 @@ mod tests {
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
             home_node: None,
+            ..Default::default()
         };
         d.upsert_role_incarnation(&r).unwrap();
         let loaded = d.get_role_incarnation("bjork", "coder").unwrap().unwrap();
@@ -2517,6 +2518,7 @@ mod tests {
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
             home_node: None,
+            ..Default::default()
         };
         d.upsert_role_incarnation(&mk("orchestrator")).unwrap();
         d.upsert_role_incarnation(&mk("Chronos")).unwrap();
@@ -2628,6 +2630,7 @@ mod tests {
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
             home_node: Some("mac-jane".to_string()),
+            ..Default::default()
         })
         .unwrap();
         d.upsert_membrane_transport_home(&MembraneTransportHomeRecord {

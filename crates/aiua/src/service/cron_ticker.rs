@@ -828,6 +828,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 
@@ -936,6 +937,7 @@ mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                ..Default::default()
             })
             .expect("seed role incarnation");
 

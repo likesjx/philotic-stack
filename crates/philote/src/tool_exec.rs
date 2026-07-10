@@ -1866,6 +1866,10 @@ impl AgentRuntime {
                 let fallback_tiers = args
                     .get("fallback_tiers")
                     .and_then(parse_fallback_tiers_arg);
+                let content_policy = args
+                    .get("content_policy")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
 
                 // Read the active persona role from session state to pass as calling authority.
                 // Falls back to "orchestrator" when no role is active (default persona).
@@ -1891,6 +1895,7 @@ impl AgentRuntime {
                     model_profile,
                     context_window_policy,
                     fallback_tiers: fallback_tiers.clone(),
+                    content_policy,
                 };
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
@@ -1906,6 +1911,20 @@ impl AgentRuntime {
                                 .map(|c| c.turn_loop_config.fallback_tiers.clone())
                                 .unwrap_or_default()
                         });
+                        // Same preserve-on-None mirroring for content_policy: an
+                        // omitted argument keeps whatever this process already had
+                        // cached (or "standard" for a brand-new role) rather than
+                        // resetting an operator-set "unrestricted" policy.
+                        let effective_content_policy = args
+                            .get("content_policy")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                self.configured_roles
+                                    .get(&name)
+                                    .map(|c| c.content_policy.clone())
+                                    .unwrap_or_else(|| "standard".to_string())
+                            });
                         self.configured_roles.insert(
                             name.clone(),
                             CachedRoleConfig {
@@ -1946,6 +1965,7 @@ impl AgentRuntime {
                                         fallback_tiers: effective_fallback_tiers,
                                         ..Default::default()
                                     }),
+                                content_policy: effective_content_policy,
                             },
                         );
                         // Refresh the delegation roster so new/updated roles appear
@@ -2087,6 +2107,10 @@ impl AgentRuntime {
                 let fallback_tiers = args
                     .get("fallback_tiers")
                     .and_then(parse_fallback_tiers_arg);
+                let content_policy = args
+                    .get("content_policy")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
 
                 let calling_role = self
                     .sessions
@@ -2110,6 +2134,7 @@ impl AgentRuntime {
                     model_profile,
                     context_window_policy,
                     fallback_tiers: fallback_tiers.clone(),
+                    content_policy,
                 };
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
@@ -2122,6 +2147,16 @@ impl AgentRuntime {
                                 .map(|c| c.turn_loop_config.fallback_tiers.clone())
                                 .unwrap_or_default()
                         });
+                        let effective_content_policy = args
+                            .get("content_policy")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                self.configured_roles
+                                    .get(&name)
+                                    .map(|c| c.content_policy.clone())
+                                    .unwrap_or_else(|| "standard".to_string())
+                            });
                         self.configured_roles.insert(
                             name.clone(),
                             CachedRoleConfig {
@@ -2162,6 +2197,7 @@ impl AgentRuntime {
                                         fallback_tiers: effective_fallback_tiers,
                                         ..Default::default()
                                     }),
+                                content_policy: effective_content_policy,
                             },
                         );
                         self.fetch_role_names().await;
@@ -6226,6 +6262,7 @@ mod tests {
                         fallback_tiers: vec!["model".to_string(), "model.openrouter".to_string()],
                         ..Default::default()
                     },
+                    content_policy: "standard".into(),
                 },
             );
 

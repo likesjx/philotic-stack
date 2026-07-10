@@ -268,6 +268,96 @@ impl GeminiProvider {
         })
     }
 
+    /// Builds the Gemini `safetySettings` array for a per-agent `content_policy`
+    /// (`"unrestricted"` | `"standard"` | `"strict"`, threaded down from philote
+    /// via `ControllerTask.provider_options["content_policy"]` —
+    /// `RoleIncarnationRecord.content_policy` → `SessionState::effective_content_policy`
+    /// → `resolve_content_policy_provider_options`).
+    ///
+    /// - `"unrestricted"` → every `HarmCategory` at `BLOCK_NONE` — this is a
+    ///   private, single-operator system; the operator has explicitly opted a
+    ///   specific agent (e.g. a companion persona) out of Gemini's default
+    ///   safety filtering.
+    /// - `"strict"` → tightens to `BLOCK_MEDIUM_AND_ABOVE`.
+    /// - `"standard"` / `None` / any unrecognized value → `None` (omit the key
+    ///   entirely), which is the exact pre-feature wire shape — Gemini applies
+    ///   its own server-side defaults. This is the fail-safe branch: a typo'd
+    ///   or missing policy value never accidentally loosens filtering.
+    fn safety_settings_for_content_policy(content_policy: Option<&str>) -> Option<Value> {
+        match content_policy {
+            Some("unrestricted") => Some(json!([
+                { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE" },
+            ])),
+            Some("strict") => Some(json!([
+                { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE" },
+                { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE" },
+                { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE" },
+                { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE" },
+            ])),
+            _ => None,
+        }
+    }
+
+    /// Applies `safetySettings` to an already-built request payload, in place,
+    /// as a single post-processing step so all three payload shapes
+    /// (`request_payload` / `tool_aware_request_payload` /
+    /// `structured_text_request_payload`) get identical treatment without
+    /// duplicating the injection three times. No-op when the policy resolves
+    /// to `None` (standard/unset) — the wire payload is then byte-for-byte
+    /// unchanged from before this feature existed.
+    fn apply_safety_settings(payload: &mut Value, content_policy: Option<&str>) {
+        if let Some(settings) = Self::safety_settings_for_content_policy(content_policy) {
+            if let Value::Object(map) = payload {
+                map.insert("safetySettings".to_string(), settings);
+            }
+        }
+    }
+
+    /// Detects a Gemini safety block on an otherwise-2xx response — either an
+    /// empty `candidates` array with `promptFeedback.blockReason` set, or a
+    /// candidate whose `finishReason` is `SAFETY` / `PROHIBITED_CONTENT`.
+    ///
+    /// Returns a `Some(reason)` string carrying the stable
+    /// `"gemini_content_policy_block"` marker substring that
+    /// `classify_provider_failure` (model-router/src/runtime.rs) matches on to
+    /// stamp `error_class = "content_blocked"` — a distinct outcome from the
+    /// generic `"Gemini returned an empty response"` bail, which today falls
+    /// through to `switch_provider` and causes the jarring silent provider hop
+    /// this detection exists to prevent (2026-07-09 operator report: an
+    /// intermittent Gemini safety block on an `unrestricted`-intent
+    /// conversation silently escalated to OpenRouter mid-turn).
+    fn detect_content_policy_block(body: &Value) -> Option<String> {
+        if let Some(reason) = body
+            .get("promptFeedback")
+            .and_then(|pf| pf.get("blockReason"))
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty() && *r != "BLOCK_REASON_UNSPECIFIED")
+        {
+            return Some(format!(
+                "gemini_content_policy_block: promptFeedback.blockReason={reason}"
+            ));
+        }
+
+        let finish_reason = body
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("finishReason"))
+            .and_then(Value::as_str);
+        if matches!(finish_reason, Some("SAFETY") | Some("PROHIBITED_CONTENT")) {
+            return Some(format!(
+                "gemini_content_policy_block: finishReason={}",
+                finish_reason.unwrap_or_default()
+            ));
+        }
+
+        None
+    }
+
     fn gemini_function_aliases(tools: &[serde_json::Value]) -> Vec<(String, String)> {
         let mut aliases = Vec::with_capacity(tools.len());
         let mut used = std::collections::HashSet::new();
@@ -1519,6 +1609,21 @@ impl GeminiProvider {
         }
     }
 
+    /// Detects a safety block on a single SSE chunk (`data: {...}`), reusing
+    /// `detect_content_policy_block` since each streamed chunk is shaped like
+    /// the batch response body. `None` for non-data lines, unparseable JSON,
+    /// or a chunk that isn't a block.
+    fn detect_content_policy_block_in_sse_line(line: &str) -> Option<String> {
+        let json_str = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))?;
+        if json_str.trim() == "[DONE]" {
+            return None;
+        }
+        let chunk: Value = serde_json::from_str(json_str).ok()?;
+        Self::detect_content_policy_block(&chunk)
+    }
+
     /// Parse one SSE line (`data: {...}`) and extract the text fragment from
     /// `candidates[0].content.parts[0].text`. Returns `None` for non-data lines
     /// or lines with no text part (e.g. finish-reason-only chunks).
@@ -1733,7 +1838,7 @@ impl ModelProvider for GeminiProvider {
         let use_structured = task.kind == TaskKind::TextGenerate
             && (has_tools || task.wants_channel("spoken_text") || wants_concept || wants_plan);
 
-        let payload = match task.kind {
+        let mut payload = match task.kind {
             TaskKind::TextGenerate => {
                 let prompt = task
                     .composed_prompt_text()
@@ -1769,6 +1874,11 @@ impl ModelProvider for GeminiProvider {
             TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
             TaskKind::Embed => bail!("Gemini does not support local embedding (use OnnxProvider)"),
         };
+
+        // Per-agent content policy → safetySettings. A single post-processing
+        // step covers all payload shapes above (see `apply_safety_settings`
+        // doc). No-op for "standard"/unset — wire-identical to pre-feature.
+        Self::apply_safety_settings(&mut payload, task.provider_option_str("content_policy"));
 
         if Self::debug_model_requests_enabled() && task.kind == TaskKind::TextGenerate {
             let prompt = task
@@ -1807,6 +1917,17 @@ impl ModelProvider for GeminiProvider {
                 status.as_u16(),
                 Self::api_error_detail(&body)
             );
+        }
+
+        // A safety block is a 2xx response with an empty/absent `candidates`
+        // array — distinguish it explicitly from a generic empty response so
+        // it never falls through to the generic "Gemini returned an empty
+        // response" bail, which `classify_provider_failure` maps to
+        // `switch_provider` (a jarring silent provider hop mid-turn). Checked
+        // for both response shapes (structured and plain) since the block can
+        // occur before any candidate-shape branching.
+        if let Some(block_reason) = Self::detect_content_policy_block(&body) {
+            bail!(block_reason);
         }
 
         if use_structured {
@@ -1887,7 +2008,7 @@ impl ModelProvider for GeminiProvider {
         let use_structured =
             has_tools || task.wants_channel("spoken_text") || wants_concept || wants_plan;
 
-        let payload = {
+        let mut payload = {
             let prompt = task
                 .composed_prompt_text()
                 .context("Gemini streaming text task missing prompt")?;
@@ -1910,6 +2031,10 @@ impl ModelProvider for GeminiProvider {
                 Self::request_payload(&prompt)
             }
         };
+        // Same per-agent content policy → safetySettings projection as batch
+        // `invoke` — streaming builds its own payload above and must not be
+        // skipped (see `apply_safety_settings` doc).
+        Self::apply_safety_settings(&mut payload, task.provider_option_str("content_policy"));
 
         if Self::debug_model_requests_enabled() {
             let prompt = task
@@ -1999,6 +2124,11 @@ impl ModelProvider for GeminiProvider {
         // calls via streaming without any text content; we capture them here so the
         // empty-full_text check below can return them instead of bailing.
         let mut pending_function_call: Option<ProviderOutput> = None;
+        // Same safety-block detection as batch `invoke`, applied per SSE chunk —
+        // each `data: {...}` line is a full response-shaped JSON object. Sticky
+        // (first hit wins) since a block can arrive on a later chunk than the
+        // one carrying any partial text.
+        let mut content_policy_block: Option<String> = None;
         loop {
             // Hard wall-clock cap: Gemini can drip keep-alive SSE bytes every ~7s,
             // resetting the idle timer without making progress. Bail if the whole
@@ -2019,6 +2149,10 @@ impl ModelProvider for GeminiProvider {
                             line_buf.clear();
                             if line.is_empty() {
                                 continue;
+                            }
+                            if content_policy_block.is_none() {
+                                content_policy_block =
+                                    Self::detect_content_policy_block_in_sse_line(&line);
                             }
                             if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                                 full_text.push_str(&text_chunk);
@@ -2072,6 +2206,9 @@ impl ModelProvider for GeminiProvider {
         if !line_buf.is_empty() {
             let line = String::from_utf8_lossy(&line_buf).trim().to_string();
             if !line.is_empty() {
+                if content_policy_block.is_none() {
+                    content_policy_block = Self::detect_content_policy_block_in_sse_line(&line);
+                }
                 if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                     full_text.push_str(&text_chunk);
                 }
@@ -2099,7 +2236,15 @@ impl ModelProvider for GeminiProvider {
         }
 
         if full_text.trim().is_empty() {
-            // Stream completed without delivering text content (safety block, quota, etc.).
+            // A safety block takes priority over the generic empty-stream bail —
+            // without this, a blocked turn was tagged "streaming_timeout" (a
+            // transient/retry-same-provider signal) and, after one pointless
+            // same-provider retry that fails identically, still escalated to
+            // switch_provider: the exact jarring hop this detection removes.
+            if let Some(block_reason) = content_policy_block {
+                bail!(block_reason);
+            }
+            // Stream completed without delivering text content (quota, etc.).
             // Do NOT fall back to batch — that path has no timeout and caused a 27-minute hang.
             // Return a streaming_timeout error so philote escalates to the next fallback tier.
             warn!("Gemini streaming returned no content; escalating to fallback tier");
@@ -3621,6 +3766,149 @@ mod tests {
             provider.request_model(&task),
             super::GEMINI_TEXT_DEFAULT_MODEL
         );
+    }
+
+    // ── content_policy → safetySettings ───────────────────────────────────
+
+    fn harm_categories(settings: &serde_json::Value) -> std::collections::HashSet<String> {
+        settings
+            .as_array()
+            .expect("safetySettings is an array")
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("category")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("category present")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unrestricted_policy_sets_block_none_for_all_five_categories() {
+        let settings =
+            GeminiProvider::safety_settings_for_content_policy(Some("unrestricted")).unwrap();
+        let categories = harm_categories(&settings);
+        for expected in [
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "HARM_CATEGORY_CIVIC_INTEGRITY",
+        ] {
+            assert!(
+                categories.contains(expected),
+                "missing {expected} in {categories:?}"
+            );
+        }
+        for entry in settings.as_array().unwrap() {
+            assert_eq!(
+                entry.get("threshold").and_then(serde_json::Value::as_str),
+                Some("BLOCK_NONE")
+            );
+        }
+    }
+
+    #[test]
+    fn strict_policy_sets_block_medium_and_above() {
+        let settings = GeminiProvider::safety_settings_for_content_policy(Some("strict")).unwrap();
+        assert!(!settings.as_array().unwrap().is_empty());
+        for entry in settings.as_array().unwrap() {
+            assert_eq!(
+                entry.get("threshold").and_then(serde_json::Value::as_str),
+                Some("BLOCK_MEDIUM_AND_ABOVE")
+            );
+        }
+    }
+
+    #[test]
+    fn standard_and_unset_and_unknown_policy_omit_safety_settings() {
+        assert!(GeminiProvider::safety_settings_for_content_policy(Some("standard")).is_none());
+        assert!(GeminiProvider::safety_settings_for_content_policy(None).is_none());
+        assert!(
+            GeminiProvider::safety_settings_for_content_policy(Some("typo-value")).is_none(),
+            "an unrecognized value must fail safe (omit), never accidentally loosen filtering"
+        );
+    }
+
+    #[test]
+    fn apply_safety_settings_is_noop_for_standard_payload_shape() {
+        let mut payload = GeminiProvider::request_payload("hi");
+        let before = payload.clone();
+        GeminiProvider::apply_safety_settings(&mut payload, Some("standard"));
+        assert_eq!(payload, before, "standard must not touch the wire payload");
+        assert!(payload.get("safetySettings").is_none());
+    }
+
+    #[test]
+    fn apply_safety_settings_injects_into_all_three_payload_shapes() {
+        let mut plain = GeminiProvider::request_payload("hi");
+        GeminiProvider::apply_safety_settings(&mut plain, Some("unrestricted"));
+        assert!(plain.get("safetySettings").is_some());
+
+        let mut tool_bearing = GeminiProvider::tool_aware_request_payload(
+            "hi",
+            &[serde_json::json!({"tool_name": "echo", "description": "d"})],
+            false,
+            false,
+            None,
+        );
+        GeminiProvider::apply_safety_settings(&mut tool_bearing, Some("unrestricted"));
+        assert!(tool_bearing.get("safetySettings").is_some());
+
+        let mut structured =
+            GeminiProvider::structured_text_request_payload("hi", false, false, None);
+        GeminiProvider::apply_safety_settings(&mut structured, Some("unrestricted"));
+        assert!(structured.get("safetySettings").is_some());
+    }
+
+    // ── safety-block detection ─────────────────────────────────────────────
+
+    #[test]
+    fn detect_content_policy_block_recognizes_prompt_feedback_block_reason() {
+        let body = serde_json::json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "candidates": []
+        });
+        let reason = GeminiProvider::detect_content_policy_block(&body).unwrap();
+        assert!(reason.contains("gemini_content_policy_block"));
+        assert!(reason.contains("blockReason=SAFETY"));
+    }
+
+    #[test]
+    fn detect_content_policy_block_recognizes_finish_reason_safety() {
+        let body = serde_json::json!({
+            "candidates": [{ "finishReason": "SAFETY", "content": { "parts": [] } }]
+        });
+        let reason = GeminiProvider::detect_content_policy_block(&body).unwrap();
+        assert!(reason.contains("gemini_content_policy_block"));
+        assert!(reason.contains("finishReason=SAFETY"));
+    }
+
+    #[test]
+    fn detect_content_policy_block_recognizes_prohibited_content() {
+        let body = serde_json::json!({
+            "candidates": [{ "finishReason": "PROHIBITED_CONTENT" }]
+        });
+        assert!(GeminiProvider::detect_content_policy_block(&body).is_some());
+    }
+
+    #[test]
+    fn detect_content_policy_block_ignores_normal_stop_and_generic_empty() {
+        let normal = serde_json::json!({
+            "candidates": [{ "finishReason": "STOP", "content": { "parts": [{"text": "hi"}] } }]
+        });
+        assert!(GeminiProvider::detect_content_policy_block(&normal).is_none());
+
+        let generic_empty = serde_json::json!({ "candidates": [] });
+        assert!(GeminiProvider::detect_content_policy_block(&generic_empty).is_none());
+
+        let unspecified = serde_json::json!({
+            "promptFeedback": { "blockReason": "BLOCK_REASON_UNSPECIFIED" },
+            "candidates": []
+        });
+        assert!(GeminiProvider::detect_content_policy_block(&unspecified).is_none());
     }
 }
 

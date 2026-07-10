@@ -1358,6 +1358,27 @@ fn classify_provider_failure(
     );
     payload.status = extract_http_status(message);
 
+    // Content-policy / safety block (currently Gemini-specific — see
+    // `GeminiProvider::detect_content_policy_block`). Checked before every
+    // other rule: this is a 2xx-with-empty-candidates outcome, not an HTTP
+    // failure, so it must never fall into the generic "unclassified
+    // provider_failure" bucket that philote's `classify_provider_error`
+    // defaults to `SwitchProvider` (2026-07-08 forensic) — that default exists
+    // for genuinely unrecognized failures, but a content block is recognized
+    // right here and deserves its own non-escalating outcome: switching to a
+    // different-behaving model mid-conversation is the jarring behavior this
+    // classification exists to prevent.
+    if message.contains("gemini_content_policy_block") {
+        payload.code = Some("MODEL_CONTENT_BLOCKED".into());
+        payload.sub_kind = Some("content_policy_block".into());
+        // Not retryable in the classic sense (retrying the identical prompt
+        // against the identical provider reproduces the identical block), but
+        // this is intentionally NOT `switch_provider` — see `error_class` below.
+        payload.retryable = Some(false);
+        payload.error_class = Some("content_blocked".into());
+        return payload;
+    }
+
     let malformed_tool_call = message.contains("tool_call.arguments missing from")
         || message.contains("returned invalid tool_call")
         || message.contains("returned unsupported tool_call");
@@ -1761,6 +1782,38 @@ mod failure_tests {
 
         assert_eq!(payload.sub_kind.as_deref(), Some("network_error"));
         assert_eq!(payload.error_class.as_deref(), Some("retry_same_provider"));
+    }
+
+    /// The core of the second fix: a Gemini safety block (carried as the
+    /// `gemini_content_policy_block` marker bailed by
+    /// `GeminiProvider::detect_content_policy_block`) must classify as
+    /// `content_blocked`, NOT `switch_provider` — switching to a
+    /// different-behaving model mid-conversation is the jarring failover this
+    /// class exists to prevent (2026-07-09 operator report).
+    #[test]
+    fn classify_provider_failure_marks_content_policy_block_as_content_blocked_not_switch() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "gemini_content_policy_block: finishReason=SAFETY",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("content_policy_block"));
+        assert_eq!(payload.error_class.as_deref(), Some("content_blocked"));
+        assert_ne!(payload.error_class.as_deref(), Some("switch_provider"));
+        assert_ne!(payload.error_class.as_deref(), Some("retry_same_provider"));
+        assert_eq!(payload.code.as_deref(), Some("MODEL_CONTENT_BLOCKED"));
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_prompt_feedback_block_reason_as_content_blocked() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "gemini_content_policy_block: promptFeedback.blockReason=SAFETY",
+        );
+
+        assert_eq!(payload.error_class.as_deref(), Some("content_blocked"));
     }
 
     #[test]

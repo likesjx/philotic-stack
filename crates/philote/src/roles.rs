@@ -163,6 +163,14 @@ impl AgentRuntime {
                     .get("role_identity_addendum")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
+                // `content_policy` is a required (non-`skip_serializing_if`) field on the
+                // stored record, so a hotel that has adopted this feature always sends it;
+                // an older hotel simply omits the key and this falls back to "standard"
+                // via `Option`, matching current (pre-feature) behavior exactly.
+                let content_policy = rec
+                    .get("content_policy")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
 
                 let turn_loop_config = rec.get("turn_loop_config").and_then(|v| {
                     serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(v.clone())
@@ -186,6 +194,7 @@ impl AgentRuntime {
                     working_memory_policy: None,
                     memory_projection_policy: None,
                     turn_loop_config,
+                    content_policy,
                 })
             }
             _ => {
@@ -325,6 +334,7 @@ impl AgentRuntime {
                 working_memory_policy: None,
                 memory_projection_policy: None,
                 turn_loop_config: role_config.as_ref().map(|c| c.turn_loop_config.clone()),
+                content_policy: role_config.as_ref().map(|c| c.content_policy.clone()),
             };
 
             if let Some(cap) = activation

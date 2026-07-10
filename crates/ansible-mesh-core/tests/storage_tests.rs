@@ -136,6 +136,7 @@ fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
             plan_continuation_budget: None,
         },
         home_node: None,
+        ..Default::default()
     }
 }
 
@@ -884,6 +885,7 @@ fn graph_storage_lists_role_incarnations_by_agent() {
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
             home_node: None,
+            ..Default::default()
         })
         .unwrap();
 

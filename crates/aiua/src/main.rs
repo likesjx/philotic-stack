@@ -4891,6 +4891,7 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             inactive_ttl_seconds: None,
             turn_loop_config,
             home_node: None,
+            ..Default::default()
         };
         // Always upsert — the hotel seed is the canonical source for the orchestrator manifest.
         // The manifest is institutional (same rules for all agents), not per-agent customizable.
