@@ -1,4 +1,6 @@
-use crate::controller::{DatasourceProvider, DatasourceTask, ProviderOutput, ProviderRegistry};
+use crate::controller::{
+    CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput, ProviderRegistry,
+};
 use anyhow::Result;
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute, TaskErrorPayload,
@@ -137,13 +139,30 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
                         .await?;
                     }
                     Err(err) => {
-                        error!("datasource provider invocation failed: {err}");
-                        emit_failure(
+                        // Use the alternate/chain Display ({err:#}) so anyhow's
+                        // .context() cause chain (e.g. the serde field/type mismatch
+                        // that produced a parse failure) reaches the log and the
+                        // caller instead of being swallowed by the top-level message.
+                        let chained = format!("{err:#}");
+                        error!("datasource provider invocation failed: {chained}");
+                        // Provider handlers mark pre-write, model-fixable
+                        // contract/parameter failures with CONTRACT_ERROR_MARKER
+                        // (see data-memorygraphrag's handle_observe). Tag those as
+                        // "invalid_request" so philote can tell a contract failure
+                        // (worth one bounded model retry) apart from an infra/
+                        // transport failure, without guessing from free-text.
+                        let sub_kind = if chained.contains(CONTRACT_ERROR_MARKER) {
+                            Some("invalid_request")
+                        } else {
+                            None
+                        };
+                        emit_failure_with_sub_kind(
                             &mut ipc_client,
                             &reply,
                             Some(controller_task.kind.as_str()),
                             Some(provider.id()),
-                            format!("provider failed: {err}"),
+                            format!("provider failed: {chained}"),
+                            sub_kind,
                         )
                         .await?;
                     }
@@ -216,8 +235,26 @@ async fn emit_failure(
     provider: Option<&str>,
     message: String,
 ) -> Result<()> {
-    let payload =
+    emit_failure_with_sub_kind(ipc_client, reply, capability, provider, message, None).await
+}
+
+/// Same as [`emit_failure`], but lets the caller tag the failure with a
+/// `sub_kind` (e.g. `"invalid_request"` for parameter/parse contract
+/// failures) so downstream consumers like philote can distinguish a
+/// malformed-parameters failure — worth one bounded model self-correction
+/// retry — from a transport/routing failure, without string-matching
+/// `message`.
+async fn emit_failure_with_sub_kind(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    capability: Option<&str>,
+    provider: Option<&str>,
+    message: String,
+    sub_kind: Option<&str>,
+) -> Result<()> {
+    let mut payload =
         TaskErrorPayload::provider_failure("datasource_controller", capability, provider, message);
+    payload.sub_kind = sub_kind.map(str::to_string);
 
     ipc_client
         .send_request(IpcRequest::EmitTask {

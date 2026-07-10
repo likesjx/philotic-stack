@@ -1150,7 +1150,7 @@ impl AgentRuntime {
             .filter(|command| !command.claim_summary.trim().is_empty());
 
         if let Some(command) = direct_life_observe_command {
-            {
+            let tool_call = {
                 let Some(state) = self.sessions.get_mut(&session_id) else {
                     warn!("Tool result returned for unknown session {}", session_id);
                     return Ok(());
@@ -1163,11 +1163,85 @@ impl AgentRuntime {
                         tool_name: tool_result.tool_name.clone(),
                         arguments: serde_json::json!({}),
                     });
-                state.push_tool_history(tool_call, tool_result.clone());
+                state.push_tool_history(tool_call.clone(), tool_result.clone());
                 state.clear_pending_tool_call();
-                if let Some(turn) = state.active_turn.as_mut() {
-                    turn.iteration += 1;
-                }
+                // NOTE: iteration is bumped below, once, on whichever path is
+                // actually taken — the retry path below already counts its
+                // own re-entry via retry_active_turn_after_provider_failure,
+                // so incrementing here too would double-count one round-trip
+                // against iteration_cap.
+                tool_call
+            };
+
+            // A life.observe failure tagged sub_kind "invalid_request" is a
+            // pre-write contract/parameter error (see
+            // datasource::controller::CONTRACT_ERROR_MARKER, set by
+            // LifeGraphProvider::handle_observe) — something the model can
+            // reasonably self-correct, as opposed to a transport/routing
+            // failure (unmarked; handled by the existing paths below/
+            // elsewhere, unchanged). 2026-07-10 LifeGraph forensic: today
+            // these get apologized-and-dropped with no retry.
+            let is_contract_error = step_failed
+                && task.error.as_ref().and_then(|e| e.sub_kind.as_deref())
+                    == Some("invalid_request");
+            // The direct-command parser (memory_integration.rs) has no model
+            // in the loop to act on a corrective note — a bad payload there
+            // is a parser bug, not a retryable model mistake, so it always
+            // skips straight to the heal_queue branch below.
+            let is_direct_origin = is_direct_life_observe_origin(&tool_call.arguments);
+            let repair_attempts = self
+                .sessions
+                .get(&session_id)
+                .map(|s| s.provider_repair_attempts())
+                .unwrap_or(0);
+
+            if is_contract_error && !is_direct_origin && repair_attempts < 1 {
+                let cause = task.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+                warn!(
+                    session_id = %session_id,
+                    turn_id = %turn_id,
+                    "life.observe contract error; giving the model one bounded retry with cause surfaced"
+                );
+                return self
+                    .retry_active_turn_after_provider_failure(
+                        session_id,
+                        turn_id,
+                        Some(life_observe_repair_note(&cause)),
+                    )
+                    .await;
+            }
+
+            // Not retrying (success, non-contract failure, direct-command
+            // origin, or an already-exhausted retry): this life.observe call
+            // is finalizing as its own tool round-trip, so count it the same
+            // way the generic re-entry path below does.
+            if let Some(turn) = self
+                .sessions
+                .get_mut(&session_id)
+                .and_then(|s| s.active_turn.as_mut())
+            {
+                turn.iteration += 1;
+            }
+
+            if is_contract_error {
+                // Either this call can't retry (direct-command origin) or the
+                // model's one bounded retry already failed again — don't drop
+                // it silently. File a heal_queue entry so it's A3-visible
+                // instead of just an apology to the operator.
+                let cause = task.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+                self.push_heal_event(
+                    "life_observe_parse_failed",
+                    &format!(
+                        "life.observe contract error for session {session_id} turn {turn_id} \
+                         ({}): {cause}",
+                        if is_direct_origin {
+                            "direct-command origin, no retry attempted"
+                        } else {
+                            "retry exhausted"
+                        }
+                    ),
+                )
+                .await;
             }
 
             let reply = if step_failed {

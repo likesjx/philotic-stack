@@ -7764,6 +7764,453 @@ mod tests {
         assert_eq!(reply["target_guest_id"], "membrane-seat-1");
     }
 
+    // ── life.observe contract-error retry (2026-07-10 LifeGraph forensic) ────
+    //
+    // A model-invoked `life.observe` call whose payload fails datasource's
+    // pre-write contract validation (CONTRACT_ERROR_MARKER, tagged
+    // `sub_kind: "invalid_request"` — see FIX 1 in datasource/runtime.rs and
+    // data-memorygraphrag/provider.rs) must get exactly one bounded model
+    // retry with the cause surfaced, instead of being silently apologized
+    // away. If the retry also fails — or the payload came from philote's own
+    // direct-command parser, which has no model in the loop to act on a
+    // retry — the failure must escalate to heal_queue (`life_observe_parse_failed`)
+    // and still reach the user. Non-contract errors (transport/routing) must
+    // not retry at all; that class already has its own handling.
+
+    fn life_observe_arguments(claim_summary: &str, direct_origin: bool) -> serde_json::Value {
+        let mut evidence = serde_json::json!({
+            "packet_id": "pkt-1",
+            "claim_ref": { "id": "life:openloop:1", "label": "OpenLoop", "datasource": "life-graph" },
+            "claim_summary": claim_summary,
+            "source_refs": [{
+                "source_id": "membrane:telegram",
+                "source_kind": "runtime_observation",
+                "reliability": { "score": 0.9, "basis": "direct_observation" },
+            }],
+            "passage_refs": [],
+            "confidence": 0.8,
+            "validation_state": "proposed",
+            "source_reliability": 0.9,
+            "conflict_ids": [],
+            "adjudication_status": "not_needed",
+        });
+        if direct_origin {
+            evidence["metadata"] = serde_json::json!({
+                "route": "philote_direct_life_observe",
+                "session_id": "sess-lifeobs",
+                "turn_id": "turn-lifeobs",
+                "chat_id": "555",
+                "agent_id": "agent-lifeobs",
+            });
+        }
+        serde_json::json!({
+            "observation_id": "obs-1",
+            "evidence": evidence,
+            "proposed_graph_refs": [],
+        })
+    }
+
+    fn life_observe_working_turn(turn_id: &str, direct_origin: bool) -> WorkingTurn {
+        let mut turn = test_working_turn(TurnPhase::WaitingTool);
+        turn.turn_id = turn_id.into();
+        turn.chat_id = "555".into();
+        turn.user_content = "Toastmasters OpenLoop capture".into();
+        turn.final_reply_to = "membrane-node-01".into();
+        turn.final_reply_role = "membrane".into();
+        turn.final_reply_guest_id = Some("membrane-seat-1".into());
+        turn.pending_tool_call = Some(ToolCall {
+            tool_name: "life.observe".into(),
+            arguments: life_observe_arguments(
+                "Toastmasters: own the Toastmaster role next meeting",
+                direct_origin,
+            ),
+        });
+        turn
+    }
+
+    fn life_observe_error_task(
+        session_id: &str,
+        turn_id: &str,
+        sub_kind: Option<&str>,
+        message: &str,
+    ) -> InboundTaskPayload {
+        InboundTaskPayload {
+            action: Some("tool_result".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some(turn_id.into()),
+            tool_name: Some("life.observe".into()),
+            content: Some(format!(
+                "Tool call failed: {message} (provider: life-graph-runner, capability: life.observe)"
+            )),
+            error: Some(philotic_client::TaskErrorPayload {
+                kind: "provider_failure".into(),
+                message: message.into(),
+                code: None,
+                component: Some("datasource_controller".into()),
+                provider: Some("life-graph-runner".into()),
+                capability: Some("life.observe".into()),
+                retryable: None,
+                sub_kind: sub_kind.map(str::to_string),
+                status: None,
+                error_class: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// FIX 2, case 1: a model-invoked life.observe call fails with a
+    /// contract error → exactly one model re-entry with the cause surfaced,
+    /// no user-facing reply yet, no heal event yet.
+    #[tokio::test]
+    async fn life_observe_contract_error_retries_model_once_with_cause() {
+        let socket_path = format!("/tmp/philote-lifeobs-retry-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-retry".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-retry");
+
+        let session_id = "sess-lifeobs-retry";
+        let turn_id = "turn-lifeobs-retry";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, false));
+
+        runtime
+            .handle_tool_result(life_observe_error_task(
+                session_id,
+                turn_id,
+                Some("invalid_request"),
+                "provider failed: contract_error: failed to parse life.observe parameters as \
+                 LifeObserveInput: invalid type: string \"maybe\", expected f64 at line 1 column 42",
+            ))
+            .await
+            .expect("tool result handled");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state
+                .active_turn
+                .as_ref()
+                .expect("turn must still be active for a retry, not finalized to the user");
+            assert_eq!(turn.phase, TurnPhase::WaitingModel);
+            assert_eq!(
+                turn.provider_repair_attempts, 1,
+                "one retry attempt must be recorded"
+            );
+            assert_eq!(
+                turn.iteration, 1,
+                "the retried round-trip must count as exactly one iteration \
+                 against iteration_cap, not two"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let reentries: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert_eq!(
+            reentries.len(),
+            1,
+            "exactly one model re-entry expected: {:#?}",
+            *emitted
+        );
+        let reentry_json = serde_json::to_string(&reentries[0]["task"]).unwrap();
+        assert!(
+            reentry_json.contains("Your life.observe call failed"),
+            "reentry must surface the life.observe repair note: {reentry_json}"
+        );
+        assert!(
+            reentry_json.contains("invalid type: string"),
+            "reentry must surface the actual cause, not a generic message: {reentry_json}"
+        );
+
+        assert!(
+            emitted.iter().all(|e| e.get("heal_event").is_none()),
+            "no heal event should fire on the first, retried failure: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted
+                .iter()
+                .all(|e| e["task"]["action"] != "send_reply"),
+            "no user-facing reply should fire before the retry is exhausted: {:#?}",
+            *emitted
+        );
+    }
+
+    /// FIX 2, case 2: the model's one retry also fails → surfaced to the
+    /// user AND a `life_observe_parse_failed` heal event is filed; no second
+    /// retry is attempted.
+    #[tokio::test]
+    async fn life_observe_contract_error_after_retry_exhausted_heals_and_tells_user() {
+        let socket_path = format!("/tmp/philote-lifeobs-exhausted-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-exhausted".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-exhausted");
+
+        let session_id = "sess-lifeobs-exhausted";
+        let turn_id = "turn-lifeobs-exhausted";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Simulate the retry budget already being spent (as it would be
+        // after case 1's one bounded retry came back with a second failure).
+        let mut turn = life_observe_working_turn(turn_id, false);
+        turn.provider_repair_attempts = 1;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .handle_tool_result(life_observe_error_task(
+                session_id,
+                turn_id,
+                Some("invalid_request"),
+                "provider failed: contract_error: life.observe plan validation failed: \
+                 observation_id must not be empty",
+            ))
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+
+        let reentries: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert!(
+            reentries.is_empty(),
+            "must not attempt a second model retry: {:#?}",
+            *emitted
+        );
+
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.get("heal_event").is_some())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "exactly one heal event expected: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            heal_events[0]["heal_event"]["pattern_tag"],
+            "life_observe_parse_failed"
+        );
+        assert!(
+            heal_events[0]["heal_event"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("retry exhausted")
+        );
+
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "the user must still be told, not left with a silent drop: {:#?}",
+            *emitted
+        );
+        assert!(
+            send_replies[0]["task"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("I tried to record this")
+        );
+    }
+
+    /// FIX 2, case 3: a non-contract error (transport/routing — unmarked
+    /// `sub_kind`) must never trigger the retry or the new heal path; that
+    /// class already has its own handling elsewhere.
+    #[tokio::test]
+    async fn life_observe_non_contract_error_does_not_retry_or_heal() {
+        let socket_path = format!("/tmp/philote-lifeobs-transport-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-transport".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-transport");
+
+        let session_id = "sess-lifeobs-transport";
+        let turn_id = "turn-lifeobs-transport";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, false));
+
+        runtime
+            .handle_tool_result(life_observe_error_task(
+                session_id,
+                turn_id,
+                None, // no sub_kind: e.g. a Memgraph connection failure, not a contract error
+                "provider failed: Memgraph connection refused",
+            ))
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .all(|e| e["task"]["action"] != "generate_text"),
+            "a non-contract error must never trigger the life.observe retry: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().all(|e| e.get("heal_event").is_none()),
+            "a non-contract error must not use the new life.observe heal path: {:#?}",
+            *emitted
+        );
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "existing apology-to-user behavior must be unchanged: {:#?}",
+            *emitted
+        );
+    }
+
+    /// FIX 2, case 4: a contract error on a payload built by philote's own
+    /// direct-command parser (no model in the loop) must skip the retry
+    /// entirely and go straight to heal_queue + user notification.
+    #[tokio::test]
+    async fn life_observe_direct_command_origin_contract_error_skips_retry() {
+        let socket_path = format!("/tmp/philote-lifeobs-direct-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-direct".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-direct");
+
+        let session_id = "sess-lifeobs-direct";
+        let turn_id = "turn-lifeobs-direct";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, true));
+
+        runtime
+            .handle_tool_result(life_observe_error_task(
+                session_id,
+                turn_id,
+                Some("invalid_request"),
+                "provider failed: contract_error: failed to parse life.observe parameters as \
+                 LifeObserveInput: missing field `claim_summary`",
+            ))
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .all(|e| e["task"]["action"] != "generate_text"),
+            "direct-command origin must never get a model retry: {:#?}",
+            *emitted
+        );
+
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.get("heal_event").is_some())
+            .collect();
+        assert_eq!(heal_events.len(), 1, "expected one heal event: {:#?}", *emitted);
+        assert_eq!(
+            heal_events[0]["heal_event"]["pattern_tag"],
+            "life_observe_parse_failed"
+        );
+        assert!(
+            heal_events[0]["heal_event"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("direct-command origin")
+        );
+
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(send_replies.len(), 1, "user must still be told: {:#?}", *emitted);
+    }
+
     // ── Turn-failure heal intake (self-heal) ─────────────────────────────────
 
     /// A watchdog eviction must push a `stuck_turn_evicted:{phase}` heal
