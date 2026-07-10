@@ -529,17 +529,42 @@ remote-homebrew-push remote hotel expected_host="":
     set -euo pipefail
     exec ./scripts/push-homebrew-remote.sh "{{remote}}" "{{hotel}}" "{{expected_host}}"
 
+# Stop a macOS hotel. DUAL-SUPERVISION HAZARD: mbp-jane / mac-jane run aiua under
+# a launchd LaunchAgent (KeepAlive=true). A bare `pkill` there just trips a
+# KeepAlive respawn — the process comes right back. So when a plist manages this
+# hotel, `bootout` the launchd service (stops it AND keeps it stopped); only
+# `pkill` on non-launchd (hand-started) hosts.
 remote-homebrew-stop remote hotel:
     #!/usr/bin/env bash
-    ssh "{{remote}}" "pkill -f 'aiua --hotel {{hotel}}' && echo '▶ aiua stopped for hotel {{hotel}}' || echo '▶ aiua was not running for hotel {{hotel}}'"
+    ssh "{{remote}}" "uid=\$(id -u); LABEL=com.philotic.aiua.{{hotel}}; \
+      if [ -f \"\$HOME/Library/LaunchAgents/\${LABEL}.plist\" ]; then \
+        launchctl bootout gui/\${uid}/\${LABEL} 2>/dev/null && echo '▶ launchd \${LABEL} booted out' || echo '▶ launchd \${LABEL} was not loaded'; \
+      else \
+        pkill -f '[a]iua --hotel {{hotel}}' 2>/dev/null && echo '▶ aiua stopped for hotel {{hotel}}' || echo '▶ aiua was not running for hotel {{hotel}}'; \
+      fi"
 
+# Start a macOS hotel. DUAL-SUPERVISION HAZARD: mbp-jane / mac-jane run aiua under
+# launchd (KeepAlive=true, RunAtLoad=true). Hand-starting with nohup on top of that
+# spawns a SECOND aiua that fights launchd's copy over the same IPC socket + mesh
+# port → crashes / respawn-budget exhaustion (the historical incident). So restart
+# THROUGH launchd when a plist exists (kickstart -k if loaded, else bootstrap so
+# RunAtLoad starts it); only hand-start via nohup when NO plist exists.
 remote-homebrew-start remote hotel:
     #!/usr/bin/env bash
     profile="{{hotel}}"
     if [[ "{{hotel}}" == "mbp-jane" || "{{hotel}}" == "mac-jane" ]]; then profile="jane"; fi
     if [[ "{{hotel}}" == "local-telegram" || "{{hotel}}" == "bjork" ]]; then profile="bjork"; fi
-    ssh "{{remote}}" "uid=\$(id -u); launchctl bootout gui/\${uid}/com.philotic.aiua.{{hotel}} 2>/dev/null || true; pkill -f '[a]iua --hotel {{hotel}}' 2>/dev/null || true"
-    ssh "{{remote}}" "mkdir -p ~/.philotic/${profile}/graphs && ulimit -n 65536; nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE=vps-jane-aiua-01 PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE=vps-jane-aiua-01 PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid)"
+    ssh "{{remote}}" "uid=\$(id -u); LABEL=com.philotic.aiua.{{hotel}}; PLIST=\"\$HOME/Library/LaunchAgents/\${LABEL}.plist\"; \
+      if [ -f \"\$PLIST\" ]; then \
+        if launchctl print gui/\${uid}/\${LABEL} >/dev/null 2>&1; then \
+          launchctl kickstart -k gui/\${uid}/\${LABEL} && echo '▶ \${LABEL} kickstarted under launchd'; \
+        else \
+          launchctl bootstrap gui/\${uid} \"\$PLIST\" 2>/dev/null || true; echo '▶ \${LABEL} bootstrapped under launchd (RunAtLoad starts it)'; \
+        fi; \
+      else \
+        mkdir -p ~/.philotic/${profile}/graphs; ulimit -n 65536; \
+        nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE=vps-jane-aiua-01 PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE=vps-jane-aiua-01 PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid); \
+      fi"
 
 remote-homebrew-status remote hotel:
     @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
