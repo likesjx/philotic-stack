@@ -97,7 +97,7 @@ Per-seam open items for the next implementation round:
 | Seam | Open |
 |---|---|
 | `life-graph-memorygraphrag-runner` | `life.recall.feedback` is provider/test-green and now emits governed patch proposals; next is live smoke through hotel IPC and patch review UX |
-| `life-graph-semantic-retrieval` | Named strategy dispatch is provider-green; next is retrieval quality aggregation, ranking/bridge tuning, and live feedback smoke |
+| `life-graph-semantic-retrieval` | Named strategy dispatch is provider-green; read-only retrieval-quality aggregation now ships as `life.recall.stats` (per-rating counts, weighted connectivity, useful-rate); next is recording `named_strategy` on feedback signals for per-strategy grouping, then flag-gated ranking/bridge tuning and live feedback smoke |
 | `life-graph-evidence-conflict` | Runtime conflict detection still needs first-class triggering; provider `handle_conflict` / `handle_resolve` are test-green, and Muninn-facing resolve plans now route implemented `true_up` / `contradiction_review` / `trust_update` intents through Philote's `memory.true_up` surface |
 | `life-graph-attention-steward` | Active SIL entries and operator confirmation gate in philote (first slice is observe-only; active interruptions unlock after 5 confirmed SIL entries) |
 | `life-graph-agentic-growth-loop` | Growth-loop philote role; background drift detector job |
@@ -427,6 +427,17 @@ and `disconnected`. Disconnected, missing, stale, and noisy feedback now generat
 system patch proposals for bridge/ranking maintenance; overconfident feedback generates a
 medium-risk attention patch proposal that requires confirmation before tuning can reinforce
 the pattern.
+
+Retrieval-quality aggregation (life-graph-semantic-retrieval seam): the read-only
+`life.recall.stats` tool aggregates those recorded feedback `Signal` nodes into a
+steward-facing retrieval-quality summary — per-rating counts, sample-weighted average
+connectivity ratio, useful-count, friction-count, and useful-rate — over an optional
+`since` ISO window. It is a dispatch-only steward surface (like `life.patch.list`), issues a
+single read query, and changes no ranking behaviour: it is the raw signal a later tuning
+increment consumes. The next increment records the recall `named_strategy` on each feedback
+`Signal` (a wire-compatible optional field threaded from the recall response through the
+feedback callers) so the summary can group per-strategy, after which a default-preserving
+flag can nudge a strategy's `RankingWeights` by its measured useful-rate.
 
 ## Memgraph GraphRAG Applicability
 

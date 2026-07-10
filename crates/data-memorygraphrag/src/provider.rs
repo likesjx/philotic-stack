@@ -8,7 +8,8 @@ use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
     GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchApplyInput,
-    LifePatchListInput, LifePatchProposalInput, LifeResolveInput, MemoryGraphRagRunner,
+    LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput, LifeResolveInput,
+    MemoryGraphRagRunner,
     PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter, RankingWeights,
     ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery,
     RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef,
@@ -424,6 +425,7 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.patch.propose" => self.handle_patch_propose(task).await,
             "life.patch.apply" => self.handle_patch_apply(task).await,
             "life.patch.list" => self.handle_patch_list(task).await,
+            "life.recall.stats" => self.handle_recall_stats(task).await,
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -1550,6 +1552,59 @@ impl LifeGraphProvider {
         })))
     }
 
+    /// Handle `life.recall.stats` — the READ-ONLY retrieval-quality review
+    /// surface (life-graph-semantic-retrieval seam).
+    ///
+    /// Aggregates the `life.recall.feedback` Signal nodes into per-rating
+    /// counts plus average connectivity over an optional `since` window, then
+    /// derives useful-rate and friction for the steward. This is the raw
+    /// signal a later tuning increment consumes; it changes no ranking
+    /// behaviour and issues a single read query — never a write.
+    async fn handle_recall_stats(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeRecallStatsInput =
+            serde_json::from_value(task.parameters.clone()).unwrap_or_default();
+        let since = input.effective_since();
+
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(query(cypher::recall_feedback_stats_query()).param("since", since.as_str()))
+            .await?;
+        let mut per_rating = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let rating: String = row.get("rating").unwrap_or_default();
+            if rating.is_empty() {
+                continue;
+            }
+            let count: i64 = row.get("count").unwrap_or(0);
+            // avg() over a group with no non-null samples returns null → Err.
+            let avg_connectivity_ratio: Option<f64> = row.get("avg_connectivity_ratio").ok();
+            let connectivity_samples: i64 = row.get("connectivity_samples").unwrap_or(0);
+            per_rating.push(RecallStatRow {
+                rating,
+                count,
+                avg_connectivity_ratio,
+                connectivity_samples,
+            });
+        }
+
+        let summary = aggregate_recall_stats(&per_rating);
+        let total_feedback = summary
+            .get("total_feedback")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        info!(
+            total_feedback,
+            "life.recall.stats: retrieval-quality summary computed"
+        );
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "read_only": true,
+            "since": if since.is_empty() { Value::Null } else { Value::String(since) },
+            "stats": summary,
+        })))
+    }
+
     async fn execute_conflict_cypher(&self, compiled: &cypher::ConflictCypher) -> Result<()> {
         let graph = self.connect().await?;
         let mut q = query(&compiled.query)
@@ -2179,6 +2234,79 @@ fn patch_provenance_summary(patch_json: &str) -> Value {
     })
 }
 
+/// One per-rating aggregation row returned by [`cypher::recall_feedback_stats_query`].
+#[derive(Debug, Clone, PartialEq)]
+struct RecallStatRow {
+    rating: String,
+    count: i64,
+    avg_connectivity_ratio: Option<f64>,
+    connectivity_samples: i64,
+}
+
+/// Round to four decimal places for a stable, readable rate.
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+
+/// Pure aggregation of per-rating recall-feedback rows into a steward-facing
+/// retrieval-quality summary. Testable without a graph connection.
+///
+/// `useful_rate` = useful / total; `friction_count` is everything that is not
+/// `useful` (stale, noisy, missing, disconnected, overconfident). The overall
+/// `avg_connectivity_ratio` is weighted by each rating's non-null sample count
+/// so ratings with more connectivity samples count proportionally; it is
+/// `null` when no feedback carried a connectivity ratio.
+fn aggregate_recall_stats(rows: &[RecallStatRow]) -> Value {
+    let total: i64 = rows.iter().map(|r| r.count).sum();
+    let useful = rows
+        .iter()
+        .find(|r| r.rating == "useful")
+        .map(|r| r.count)
+        .unwrap_or(0);
+    let friction = total - useful;
+    let useful_rate = if total > 0 {
+        round4(useful as f64 / total as f64)
+    } else {
+        0.0
+    };
+
+    let (weighted_sum, sample_total) =
+        rows.iter()
+            .fold((0.0_f64, 0_i64), |(sum, n), r| match r.avg_connectivity_ratio {
+                Some(avg) if r.connectivity_samples > 0 => (
+                    sum + avg * r.connectivity_samples as f64,
+                    n + r.connectivity_samples,
+                ),
+                _ => (sum, n),
+            });
+    let avg_connectivity_ratio = if sample_total > 0 {
+        Some(round4(weighted_sum / sample_total as f64))
+    } else {
+        None
+    };
+
+    let ratings: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "rating": r.rating,
+                "count": r.count,
+                "avg_connectivity_ratio": r.avg_connectivity_ratio.map(round4),
+                "connectivity_samples": r.connectivity_samples,
+            })
+        })
+        .collect();
+
+    json!({
+        "total_feedback": total,
+        "useful_count": useful,
+        "friction_count": friction,
+        "useful_rate": useful_rate,
+        "avg_connectivity_ratio": avg_connectivity_ratio,
+        "ratings": ratings,
+    })
+}
+
 fn recall_feedback_patch_proposal(
     input: &RetrievalFeedbackInput,
 ) -> Option<LifePatchProposalInput> {
@@ -2787,6 +2915,65 @@ mod tests {
     fn useful_recall_feedback_does_not_generate_patch() {
         let feedback = feedback_input(RetrievalFeedbackRating::Useful);
         assert!(recall_feedback_patch_proposal(&feedback).is_none());
+    }
+
+    #[test]
+    fn aggregate_recall_stats_computes_useful_rate_and_weighted_connectivity() {
+        let rows = vec![
+            RecallStatRow {
+                rating: "useful".into(),
+                count: 6,
+                avg_connectivity_ratio: Some(0.9),
+                connectivity_samples: 6,
+            },
+            RecallStatRow {
+                rating: "disconnected".into(),
+                count: 3,
+                avg_connectivity_ratio: Some(0.2),
+                connectivity_samples: 2,
+            },
+            RecallStatRow {
+                // A rating with no connectivity samples must not drag the
+                // weighted average — it contributes to counts only.
+                rating: "missing".into(),
+                count: 1,
+                avg_connectivity_ratio: None,
+                connectivity_samples: 0,
+            },
+        ];
+        let summary = aggregate_recall_stats(&rows);
+
+        assert_eq!(summary["total_feedback"], 10);
+        assert_eq!(summary["useful_count"], 6);
+        assert_eq!(summary["friction_count"], 4);
+        assert_eq!(summary["useful_rate"], 0.6);
+        // Weighted by samples: (0.9*6 + 0.2*2) / 8 = 5.8/8 = 0.725.
+        assert_eq!(summary["avg_connectivity_ratio"], 0.725);
+        assert_eq!(summary["ratings"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn aggregate_recall_stats_handles_empty_and_all_null_connectivity() {
+        // No feedback at all: zeroed, null connectivity, never divides by zero.
+        let empty = aggregate_recall_stats(&[]);
+        assert_eq!(empty["total_feedback"], 0);
+        assert_eq!(empty["useful_count"], 0);
+        assert_eq!(empty["useful_rate"], 0.0);
+        assert!(empty["avg_connectivity_ratio"].is_null());
+
+        // Feedback exists but none carried a connectivity ratio.
+        let rows = vec![RecallStatRow {
+            rating: "stale".into(),
+            count: 2,
+            avg_connectivity_ratio: None,
+            connectivity_samples: 0,
+        }];
+        let summary = aggregate_recall_stats(&rows);
+        assert_eq!(summary["total_feedback"], 2);
+        assert_eq!(summary["useful_count"], 0);
+        assert_eq!(summary["friction_count"], 2);
+        assert_eq!(summary["useful_rate"], 0.0);
+        assert!(summary["avg_connectivity_ratio"].is_null());
     }
 
     #[test]

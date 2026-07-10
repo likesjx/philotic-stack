@@ -576,6 +576,27 @@ pub fn patch_list_query(statuses: &[String], limit: usize) -> String {
     )
 }
 
+/// Read-only aggregation query for `life.recall.stats` — the retrieval-quality
+/// review surface. Aggregates the recorded `life.recall.feedback` Signal nodes
+/// (written by [`compile_recall_feedback`]) into per-rating counts plus an
+/// average connectivity ratio, optionally bounded by an ISO `$since` cutoff.
+///
+/// Safety: this query performs NO writes. The `$since` window is a bound
+/// parameter (empty string = no window), never interpolated. Rating
+/// cardinality is small (six documented ratings), so the grouped result is
+/// naturally bounded without a `LIMIT` — bounding the pre-aggregation scan
+/// would corrupt the aggregate counts, so no scan limit is applied.
+pub fn recall_feedback_stats_query() -> &'static str {
+    "MATCH (s:Signal) \
+     WHERE s.signal_type = 'life.recall.feedback' \
+     AND ($since = '' OR coalesce(s.observed_at, '') >= $since) \
+     RETURN s.rating AS rating, \
+     count(s) AS count, \
+     avg(s.connectivity_ratio) AS avg_connectivity_ratio, \
+     count(s.connectivity_ratio) AS connectivity_samples \
+     ORDER BY count DESC"
+}
+
 pub fn compile_recall_feedback(
     input: &RetrievalFeedbackInput,
     growth_evaluation: &serde_json::Value,
@@ -1324,6 +1345,28 @@ mod tests {
         assert!(q.contains("ORDER BY p.proposed_at DESC"));
         assert!(q.contains("LIMIT 50"));
         assert!(q.contains("'proposed'"));
+    }
+
+    #[test]
+    fn recall_feedback_stats_query_is_read_only_and_windowed() {
+        let q = recall_feedback_stats_query();
+        // Read-only: no mutation verbs.
+        for verb in ["MERGE", "CREATE", "SET ", "DELETE", "REMOVE"] {
+            assert!(
+                !q.contains(verb),
+                "recall_feedback_stats_query must not contain {verb}: {q}"
+            );
+        }
+        // Scoped to recall-feedback signals only.
+        assert!(q.contains("s.signal_type = 'life.recall.feedback'"));
+        // Per-rating aggregation surface for the steward.
+        assert!(q.contains("s.rating AS rating"));
+        assert!(q.contains("count(s) AS count"));
+        assert!(q.contains("avg(s.connectivity_ratio) AS avg_connectivity_ratio"));
+        assert!(q.contains("count(s.connectivity_ratio) AS connectivity_samples"));
+        // Optional window is a bound param, never interpolated.
+        assert!(q.contains("$since"));
+        assert!(q.contains("ORDER BY count DESC"));
     }
 
     #[test]

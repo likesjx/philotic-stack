@@ -1603,6 +1603,37 @@ impl LifePatchListInput {
     }
 }
 
+/// Read-only input for `life.recall.stats` — the retrieval-quality review
+/// surface. Aggregates recorded `life.recall.feedback` Signal nodes into
+/// per-rating counts and average connectivity so a steward can see how the
+/// living retrieval loop is performing (useful-rate, friction, connectivity)
+/// over an optional time window. This tool never mutates the graph.
+///
+/// Like `life.patch.list`, this is a dispatch-only steward/operator surface:
+/// intentionally kept out of `life_graph_tool_catalog` (not an agent-turn
+/// cognitive tool).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LifeRecallStatsInput {
+    /// Optional ISO-8601 lower bound on `observed_at`. When set, only feedback
+    /// observed at or after this instant is aggregated. Unset / blank = all
+    /// recorded recall feedback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
+impl LifeRecallStatsInput {
+    /// The window cutoff to bind as `$since`. Blank/absent collapses to the
+    /// empty-string sentinel the query treats as "no window".
+    pub fn effective_since(&self) -> String {
+        self.since
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", content = "input", rename_all = "snake_case")]
 pub enum LifeGraphToolRequest {
@@ -3057,5 +3088,28 @@ mod tests {
             LifePatchListInput::pending_statuses()
         );
         assert_eq!(invalid.effective_limit(), 1);
+    }
+
+    #[test]
+    fn life_recall_stats_input_windows_and_defaults() {
+        // Empty input → no window (empty-string sentinel the query reads as
+        // "all feedback").
+        assert_eq!(LifeRecallStatsInput::default().effective_since(), "");
+
+        // Blank / whitespace collapses to the no-window sentinel.
+        let blank = LifeRecallStatsInput {
+            since: Some("   ".into()),
+        };
+        assert_eq!(blank.effective_since(), "");
+
+        // A real ISO cutoff is trimmed and preserved.
+        let windowed = LifeRecallStatsInput {
+            since: Some("  2026-07-01T00:00:00Z ".into()),
+        };
+        assert_eq!(windowed.effective_since(), "2026-07-01T00:00:00Z");
+
+        // Wire-compatible: a bare object with no fields still deserializes.
+        let parsed: LifeRecallStatsInput = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(parsed, LifeRecallStatsInput::default());
     }
 }
