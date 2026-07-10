@@ -1752,17 +1752,45 @@ fn parse_epoch_secs(value_json: &str) -> Option<i64> {
 /// `node_config` table itself) is absent or unparseable. Never a hard error
 /// for an absent key — absence is a legitimate, softly-handled state.
 fn read_config_epoch_secs(conn: &Connection, key: &str) -> Result<Option<i64>> {
-    if !table_exists(conn, "node_config")? {
-        return Ok(None);
+    // Canonical config store: GraphDomain writes config values as `graph_nodes`
+    // rows keyed `config:<key>` with `data_json = {"value": "<v>"}` — this is
+    // where the heal-dispatcher (and provider tokens, etc.) actually land. The
+    // legacy `node_config` table holds only a couple of keys; check it as a
+    // fallback so older writers still resolve.
+    if table_exists(conn, "graph_nodes")? {
+        let node_key = format!("config:{key}");
+        let data_json: Option<String> = conn
+            .query_row(
+                "SELECT data_json FROM graph_nodes WHERE node_key = ?1",
+                params![node_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(dj) = data_json {
+            // Extract the inner {"value": ...} then reuse parse_epoch_secs,
+            // which already handles a number or a numeric string.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&dj) {
+                if let Some(inner) = v.get("value") {
+                    if let Some(ts) = parse_epoch_secs(&inner.to_string()) {
+                        return Ok(Some(ts));
+                    }
+                }
+            }
+        }
     }
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT value_json FROM node_config WHERE key = ?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(raw.as_deref().and_then(parse_epoch_secs))
+
+    if table_exists(conn, "node_config")? {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM node_config WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        return Ok(raw.as_deref().and_then(parse_epoch_secs));
+    }
+
+    Ok(None)
 }
 
 // ── heal.queue-depth ─────────────────────────────────────────────────────
@@ -3762,5 +3790,32 @@ mod tests {
         assert!(only(&[Severity::Critical], &depth), "{:?}", depth);
         let age = HealOldestPendingAge.detect(&ctx).expect("detect age");
         assert!(only(&[Severity::Critical], &age), "{:?}", age);
+    }
+
+    #[test]
+    fn read_config_epoch_reads_graph_nodes_config_node() {
+        // The heal-dispatcher stamps its heartbeat as a `graph_nodes` row keyed
+        // `config:<key>` with `data_json = {"value": "<epoch>"}` — the canonical
+        // config store. Doctor previously only read the legacy `node_config`
+        // table and so never saw a live heartbeat (dispatcher-staleness stuck on
+        // the "can't confirm" note even against a healthy dispatcher).
+        let (_dir, path) = fixture_db();
+        let ts = now_epoch_secs();
+        {
+            let w = Connection::open(&path).expect("open writable");
+            w.execute(
+                "INSERT INTO graph_nodes (node_key, kind, data_json) VALUES (?1, 'config', ?2)",
+                params![
+                    format!("config:{HEAL_DISPATCHER_HEARTBEAT_KEY}"),
+                    format!("{{\"value\":\"{ts}\"}}")
+                ],
+            )
+            .expect("insert config heartbeat node");
+        }
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open ro");
+        let got = read_config_epoch_secs(&conn, HEAL_DISPATCHER_HEARTBEAT_KEY)
+            .expect("read config epoch");
+        assert_eq!(got, Some(ts), "heartbeat must resolve from graph_nodes config node");
     }
 }
