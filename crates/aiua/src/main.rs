@@ -7720,11 +7720,30 @@ async fn main() -> Result<()> {
                         }
                     }
                 });
-                // Vacuum resolved rows older than 7 days once per hour.
+                // Vacuum terminal rows older than 7 days once per hour, and
+                // (F10) force-resolve pending/assigned rows older than the
+                // abandon ceiling so a stalled dispatcher can't grow the table
+                // without bound. Ceiling is env-overridable, defaulting to
+                // several days.
                 tokio::spawn(async move {
+                    use ansible_mesh_core::heal_queue::DEFAULT_ABANDON_CEILING_SECS;
                     const SEVEN_DAYS: u64 = 7 * 24 * 3600;
+                    let abandon_ceiling = std::env::var("PHILOTIC_HEAL_ABANDON_CEILING_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v > 0)
+                        .unwrap_or(DEFAULT_ABANDON_CEILING_SECS);
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        // Abandon stuck pending/assigned rows first so this
+                        // pass's vacuum_old can reap the ones already past 7d.
+                        match hq_vacuum.vacuum_abandoned(abandon_ceiling) {
+                            Ok(n) if n > 0 => {
+                                warn!(abandoned = n, "heal_queue force-resolved stuck rows")
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("heal_queue abandon-vacuum failed: {e}"),
+                        }
                         match hq_vacuum.vacuum_old(SEVEN_DAYS) {
                             Ok(n) if n > 0 => info!(deleted = n, "heal_queue vacuum complete"),
                             Ok(_) => {}

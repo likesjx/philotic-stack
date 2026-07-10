@@ -106,6 +106,49 @@ pub const HEAL_FLOOD_WINDOW_SECS: u64 = 60;
 /// Maximum bytes of raw failure text stored per turn-failure heal entry.
 pub const MAX_TURN_FAILURE_RAW_BYTES: usize = 2048;
 
+/// Upper bound on how many recent in-window rows the raw-stderr flood check
+/// scans per push (see [`SqliteHealQueueStorage::push_error`]). Caps the cost
+/// of the dedup lookup so a genuinely-distinct-line flood — the one case where
+/// near-identical collapse does not apply — can never make the scan unbounded.
+pub const HEAL_STDERR_DEDUP_SCAN_LIMIT: usize = 64;
+
+/// Default ceiling for the abandon-vacuum policy: pending/assigned heal rows
+/// older than this (with no dispatcher progress) are force-resolved to
+/// `abandoned` so a stalled dispatcher can't grow the table without bound.
+/// Several days by default; override at the call site (env-driven in the
+/// hotel's hourly vacuum task). See [`HealQueueStorage::vacuum_abandoned`].
+pub const DEFAULT_ABANDON_CEILING_SECS: u64 = 3 * 24 * 3600;
+
+/// Terminal status stamped on heal rows force-resolved by the abandon-vacuum
+/// policy (distinct from operator/dispatcher `resolved`).
+pub const HEAL_STATUS_ABANDONED: &str = "abandoned";
+
+/// Cheap, allocation-light dedup key for a raw guest-stderr line: the first
+/// line only, lowercased, with every run of ASCII digits collapsed to a single
+/// `#`. This makes a crash-looping guest's near-identical repeats (which differ
+/// only by a changing counter/timestamp/pid, e.g. `worker 12 died` vs
+/// `worker 13 died`) hash together, while genuinely distinct wording stays
+/// distinct. Used only for in-window flood collapse — never persisted, so no
+/// schema migration is required and behaviour degrades safely to "no collapse"
+/// if the scan finds nothing.
+pub fn stderr_dedup_key(raw_text: &str) -> String {
+    let first_line = raw_text.lines().next().unwrap_or("").trim();
+    let mut out = String::with_capacity(first_line.len());
+    let mut in_digit_run = false;
+    for ch in first_line.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digit_run {
+                out.push('#');
+                in_digit_run = true;
+            }
+        } else {
+            in_digit_run = false;
+            out.extend(ch.to_lowercase());
+        }
+    }
+    out
+}
+
 /// Cap a turn-failure raw line to [`MAX_TURN_FAILURE_RAW_BYTES`], truncating
 /// on a char boundary with a truncation marker.
 pub fn cap_turn_failure_text(line: &str) -> String {
@@ -358,7 +401,22 @@ pub trait HealQueueStorage: Send + Sync {
         heal_action: &str,
     ) -> Result<()>;
     fn resolve(&self, id: &str, outcome: &str) -> Result<()>;
+    /// Delete terminal rows (`resolved` **and** `abandoned`) older than
+    /// `older_than_secs`. Pending/assigned rows are never touched here.
     fn vacuum_old(&self, older_than_secs: u64) -> Result<usize>;
+    /// Secondary vacuum policy (F10): force-resolve `pending`/`assigned` rows
+    /// older than `pending_ceiling_secs` to [`HEAL_STATUS_ABANDONED`] with an
+    /// outcome note, so a stalled dispatcher can't grow the table without
+    /// bound. The abandoned rows are then reaped by [`vacuum_old`] like any
+    /// other terminal row. Returns the number of rows force-resolved.
+    ///
+    /// The default implementation is a no-op returning `Ok(0)` so existing
+    /// trait mocks keep compiling; real stores should override it.
+    ///
+    /// [`vacuum_old`]: HealQueueStorage::vacuum_old
+    fn vacuum_abandoned(&self, _pending_ceiling_secs: u64) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 // ── SQLite impl ───────────────────────────────────────────────────────────────
@@ -375,6 +433,48 @@ impl SqliteHealQueueStorage {
         };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// [`HealQueueStorage::push_error`] with an explicit clock, for
+    /// deterministic flood-window tests.
+    ///
+    /// Raw-stderr flood control (F2): a second line from the same `guest_id`
+    /// whose [`stderr_dedup_key`] matches any row seen inside the last
+    /// [`HEAL_FLOOD_WINDOW_SECS`] (scanning at most
+    /// [`HEAL_STDERR_DEDUP_SCAN_LIMIT`] recent rows) collapses into that row —
+    /// its id is returned and no new row is inserted. Genuinely distinct lines
+    /// are always inserted.
+    fn push_error_at(&self, guest_id: &str, raw_text: &str, now: i64) -> Result<String> {
+        let key = stderr_dedup_key(raw_text);
+        let cutoff = now - HEAL_FLOOD_WINDOW_SECS as i64;
+        // Poisoned-lock recovery: never panic on the heal path (this is the
+        // self-heal system — a hardening guard must not be able to wedge it).
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let recent: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, raw_text FROM heal_queue
+                 WHERE guest_id = ?1 AND timestamp >= ?2
+                 ORDER BY timestamp DESC LIMIT ?3",
+            )?;
+            let mapped = stmt.query_map(
+                params![guest_id, cutoff, HEAL_STDERR_DEDUP_SCAN_LIMIT as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, text) in recent {
+            if stderr_dedup_key(&text) == key {
+                // Collapse: return the existing row's real id so callers that
+                // surface it (IPC PushHealEntry) point at a live row.
+                return Ok(id);
+            }
+        }
+        let id = ulid::Ulid::new().to_string();
+        conn.execute(
+            "INSERT INTO heal_queue (id, guest_id, timestamp, raw_text) VALUES (?1, ?2, ?3, ?4)",
+            params![id, guest_id, now, raw_text],
+        )?;
+        Ok(id)
     }
 
     /// [`HealQueueStorage::push_classified`] with an explicit clock, for
@@ -407,6 +507,50 @@ impl SqliteHealQueueStorage {
             params![id, guest_id, now, raw_text, severity, pattern_tag],
         )?;
         Ok(Some(id))
+    }
+
+    /// Read every row regardless of status (test-only; `pending_errors` filters
+    /// to `pending`).
+    #[cfg(test)]
+    fn all_rows_for_test(&self) -> Result<Vec<HealQueueRow>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT id, guest_id, timestamp, raw_text, severity, status,
+                    pattern_tag, heal_action, outcome
+             FROM heal_queue ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(HealQueueRow {
+                id: row.get(0)?,
+                guest_id: row.get(1)?,
+                timestamp: row.get(2)?,
+                raw_text: row.get(3)?,
+                severity: row.get(4)?,
+                status: row.get(5)?,
+                pattern_tag: row.get(6)?,
+                heal_action: row.get(7)?,
+                outcome: row.get(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// [`HealQueueStorage::vacuum_abandoned`] with an explicit clock, for
+    /// deterministic tests.
+    fn vacuum_abandoned_at(&self, pending_ceiling_secs: i64, now: i64) -> Result<usize> {
+        let cutoff = now.saturating_sub(pending_ceiling_secs.max(0));
+        let note = format!(
+            "abandoned: pending/assigned exceeded max age of {pending_ceiling_secs}s \
+             without dispatch (heal-queue abandon-vacuum, F10)"
+        );
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let n = conn.execute(
+            "UPDATE heal_queue
+             SET status = 'abandoned', outcome = ?1
+             WHERE status IN ('pending', 'assigned') AND timestamp < ?2",
+            params![note, cutoff],
+        )?;
+        Ok(n)
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -443,17 +587,11 @@ impl SqliteHealQueueStorage {
 
 impl HealQueueStorage for SqliteHealQueueStorage {
     fn push_error(&self, guest_id: &str, raw_text: &str) -> Result<String> {
-        let id = ulid::Ulid::new().to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO heal_queue (id, guest_id, timestamp, raw_text) VALUES (?1, ?2, ?3, ?4)",
-            params![id, guest_id, now, raw_text],
-        )?;
-        Ok(id)
+        self.push_error_at(guest_id, raw_text, now)
     }
 
     fn push_classified(
@@ -471,12 +609,16 @@ impl HealQueueStorage for SqliteHealQueueStorage {
     }
 
     fn pending_errors(&self, limit: usize) -> Result<Vec<HealQueueRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // F6: FIFO (oldest-first). Under sustained overload the dispatcher only
+        // services BATCH_LIMIT rows per pass; newest-first (DESC) starved the
+        // oldest pending rows indefinitely. ASC guarantees every row is
+        // eventually serviced at the cost of freshest-first responsiveness.
         let mut stmt = conn.prepare(
             "SELECT id, guest_id, timestamp, raw_text, severity, status,
                     pattern_tag, heal_action, outcome
              FROM heal_queue WHERE status = 'pending'
-             ORDER BY timestamp DESC LIMIT ?1",
+             ORDER BY timestamp ASC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             Ok(HealQueueRow {
@@ -527,12 +669,23 @@ impl HealQueueStorage for SqliteHealQueueStorage {
             .map(|d| d.as_secs())
             .unwrap_or(0)
             .saturating_sub(older_than_secs) as i64;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // Reap both operator/dispatcher `resolved` rows and abandon-vacuum
+        // `abandoned` rows (F10) — both are terminal.
         let n = conn.execute(
-            "DELETE FROM heal_queue WHERE status = 'resolved' AND timestamp < ?1",
+            "DELETE FROM heal_queue
+             WHERE status IN ('resolved', 'abandoned') AND timestamp < ?1",
             params![cutoff],
         )?;
         Ok(n)
+    }
+
+    fn vacuum_abandoned(&self, pending_ceiling_secs: u64) -> Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.vacuum_abandoned_at(pending_ceiling_secs.min(i64::MAX as u64) as i64, now)
     }
 }
 
@@ -912,6 +1065,175 @@ mod tests {
         assert_eq!(rows[0].severity, "medium");
         assert_eq!(rows[0].pattern_tag.as_deref(), Some("provider_4xx:gemini"));
         assert_eq!(rows[0].status, "pending");
+    }
+
+    // ── F6: FIFO drain order ──────────────────────────────────────────────────
+
+    #[test]
+    fn pending_errors_returns_oldest_first() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        // Insert three distinct rows with strictly increasing timestamps.
+        store.push_error_at("g", "oldest", 1_000).expect("push");
+        store.push_error_at("g", "middle", 2_000).expect("push");
+        store.push_error_at("g", "newest", 3_000).expect("push");
+
+        let rows = store.pending_errors(10).expect("pending");
+        assert_eq!(rows.len(), 3);
+        // FIFO: oldest timestamp first so no row is starved under a batch cap.
+        assert_eq!(rows[0].raw_text, "oldest");
+        assert_eq!(rows[1].raw_text, "middle");
+        assert_eq!(rows[2].raw_text, "newest");
+        assert!(rows[0].timestamp <= rows[1].timestamp);
+        assert!(rows[1].timestamp <= rows[2].timestamp);
+
+        // Under a batch cap the OLDEST rows are the ones serviced.
+        let batch = store.pending_errors(2).expect("pending");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].raw_text, "oldest");
+        assert_eq!(batch[1].raw_text, "middle");
+    }
+
+    // ── F2: raw-stderr flood dedup ─────────────────────────────────────────────
+
+    #[test]
+    fn stderr_dedup_key_collapses_digit_runs_but_not_words() {
+        // Differ only by digits → same key.
+        assert_eq!(
+            stderr_dedup_key("worker 12 died"),
+            stderr_dedup_key("worker 13 died")
+        );
+        // Differ by wording → distinct keys.
+        assert_ne!(
+            stderr_dedup_key("worker died"),
+            stderr_dedup_key("master died")
+        );
+        // Only the first line participates.
+        assert_eq!(
+            stderr_dedup_key("panic at 42\nbacktrace A"),
+            stderr_dedup_key("panic at 99\nbacktrace B")
+        );
+    }
+
+    #[test]
+    fn push_error_collapses_near_identical_stderr_but_keeps_distinct() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        const T0: i64 = 1_750_000_000;
+
+        // First stderr line inserts.
+        let first = store
+            .push_error_at("guest-crashloop", "worker 1 panicked", T0)
+            .expect("push");
+
+        // Near-identical repeat inside the window (differs only by a counter):
+        // collapses INTO the first row (same id, no new row).
+        let dup = store
+            .push_error_at("guest-crashloop", "worker 2 panicked", T0 + 5)
+            .expect("push");
+        assert_eq!(dup, first, "near-identical repeat collapses into first row");
+
+        // Genuinely distinct wording inserts a new row.
+        let distinct = store
+            .push_error_at("guest-crashloop", "disk full", T0 + 5)
+            .expect("push");
+        assert_ne!(distinct, first, "distinct error is preserved");
+
+        // Same key but a DIFFERENT guest inserts (dedup is per-guest).
+        let other_guest = store
+            .push_error_at("guest-other", "worker 3 panicked", T0 + 5)
+            .expect("push");
+        assert_ne!(other_guest, first);
+
+        // After the flood window the same key inserts again.
+        let after_window = store
+            .push_error_at(
+                "guest-crashloop",
+                "worker 4 panicked",
+                T0 + HEAL_FLOOD_WINDOW_SECS as i64 + 1,
+            )
+            .expect("push");
+        assert_ne!(after_window, first, "same key re-inserts after the window");
+
+        // Exactly two crash-loop rows survived (first + after-window), plus the
+        // distinct "disk full" row = 3 for this guest.
+        let rows = store.pending_errors(100).expect("pending");
+        let crashloop: Vec<_> = rows
+            .iter()
+            .filter(|r| r.guest_id == "guest-crashloop")
+            .collect();
+        assert_eq!(crashloop.len(), 3, "collapse kept the table bounded");
+    }
+
+    // ── F10: abandon-vacuum for stuck pending/assigned rows ────────────────────
+
+    #[test]
+    fn vacuum_abandoned_force_resolves_ancient_and_leaves_fresh() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        const NOW: i64 = 10_000_000;
+        let ceiling: i64 = 1_000; // rows older than this are abandoned
+
+        // Ancient pending row (well past the ceiling).
+        let ancient = store
+            .push_error_at("g", "ancient pending", NOW - 5_000)
+            .expect("push");
+        // Ancient row that got assigned but never resolved.
+        let stuck_assigned = store
+            .push_error_at("g", "stuck assigned", NOW - 5_000)
+            .expect("push");
+        store
+            .update_triage(&stuck_assigned, "medium", "provider_error:x", "escalate")
+            .expect("triage"); // → status 'assigned'
+        // Fresh pending row, inside the ceiling.
+        let fresh = store
+            .push_error_at("g", "fresh pending", NOW - 10)
+            .expect("push");
+
+        let n = store.vacuum_abandoned_at(ceiling, NOW).expect("abandon");
+        assert_eq!(n, 2, "both ancient pending and stuck assigned abandoned");
+
+        // Fresh row is untouched and still pending/visible.
+        let pending = store.pending_errors(100).expect("pending");
+        let pending_ids: Vec<_> = pending.iter().map(|r| r.id.as_str()).collect();
+        assert!(pending_ids.contains(&fresh.as_str()));
+        assert!(!pending_ids.contains(&ancient.as_str()));
+        assert!(!pending_ids.contains(&stuck_assigned.as_str()));
+
+        // Abandoned rows carry the terminal status + an outcome note.
+        let all = store.all_rows_for_test().expect("all");
+        let ab = all
+            .iter()
+            .find(|r| r.id == ancient)
+            .expect("ancient row present");
+        assert_eq!(ab.status, HEAL_STATUS_ABANDONED);
+        assert!(ab.outcome.as_deref().unwrap_or("").contains("abandoned"));
+
+        // Then vacuum_old reaps the abandoned rows (older_than_secs=0 → cutoff
+        // is NOW-ish; these ancient rows are well before it).
+        let deleted = store.vacuum_old(0).expect("vacuum");
+        assert_eq!(deleted, 2, "abandoned rows are reaped like resolved rows");
+        let remaining = store.all_rows_for_test().expect("all");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, fresh);
+    }
+
+    #[test]
+    fn vacuum_old_still_reaps_resolved_rows() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        let old_resolved = store.push_error_at("g", "old", 1_000).expect("push");
+        store.resolve(&old_resolved, "fixed").expect("resolve");
+        // A recent pending row must survive an aggressive vacuum.
+        let recent_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let fresh = store
+            .push_error_at("g", "fresh", recent_now)
+            .expect("push");
+
+        let deleted = store.vacuum_old(3600).expect("vacuum");
+        assert_eq!(deleted, 1, "the ancient resolved row is reaped");
+        let rows = store.pending_errors(100).expect("pending");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, fresh);
     }
 
     #[test]

@@ -363,6 +363,9 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
         Box::new(VaultKeySourceDivergence),
         Box::new(LogsRotationMissing),
         Box::new(SecretsStorePermissions),
+        Box::new(HealQueueDepth),
+        Box::new(HealOldestPendingAge),
+        Box::new(HealDispatcherStaleness),
     ]
 }
 
@@ -1659,6 +1662,370 @@ impl Check for SecretsStorePermissions {
             let _ = (ctx, finding, apply);
             Ok(RepairOutcome::NotRepairable)
         }
+    }
+}
+
+// ── self-heal circuit observability ─────────────────────────────────────
+//
+// Three read-only checks that make the self-heal circuit's health visible at
+// a glance (finding F3-observability). All three read `heal_queue` /
+// `node_config`, which live in the same `context.db` doctor already opens
+// read-only — so, like every other check, they work offline even when the
+// hotel can't boot. None of them repair anything (visibility only): the
+// trait-default `repair()` (`NotRepairable`) is inherited unchanged.
+//
+// SAFETY: this is the self-heal circuit itself. A visibility check that
+// false-cleans is worse than no check — so every branch that can't prove
+// "healthy" fails toward a finding (or a soft note), never toward a silent
+// green. In particular the dispatcher heartbeat is a contract with the
+// heal-dispatcher sibling lane (`heal_dispatcher.last_cycle_at`, written each
+// 30s cycle); an unexpected value (absent, unparseable, or a future
+// timestamp from a seconds/millis format mismatch) is surfaced, never read as
+// fresh.
+
+/// Depth (pending + assigned) at which the backlog is a warning / critical.
+const HEAL_DEPTH_WARN_ABOVE: i64 = 100;
+const HEAL_DEPTH_CRITICAL_ABOVE: i64 = 500;
+
+/// Age of the oldest still-`pending` entry at which the dispatcher is visibly
+/// behind (warn) or effectively stalled (critical).
+const HEAL_OLDEST_PENDING_WARN_SECS: i64 = 600; // 10 min
+const HEAL_OLDEST_PENDING_CRITICAL_SECS: i64 = 1800; // 30 min
+
+/// Hotel config key the heal-dispatcher stamps at the end of each poll cycle.
+/// Fixed name — the integration seam with the heal-dispatcher sibling lane.
+const HEAL_DISPATCHER_HEARTBEAT_KEY: &str = "heal_dispatcher.last_cycle_at";
+/// The dispatcher's poll interval (`POLL_INTERVAL_SECS` in
+/// `crates/heal-dispatcher/src/main.rs`). Duplicated because heal-dispatcher
+/// ships bin-only and doctor must stand alone.
+const HEAL_DISPATCHER_POLL_INTERVAL_SECS: i64 = 30;
+/// Heartbeat older than 3× the poll interval ⇒ the dispatcher is very likely
+/// wedged or down. PID-liveness alone can't catch a *wedged* (still-running,
+/// not-cycling) dispatcher — only a stale heartbeat can.
+const HEAL_DISPATCHER_STALE_SECS: i64 = 3 * HEAL_DISPATCHER_POLL_INTERVAL_SECS; // 90s
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Render a non-negative second count as a compact `Nm Ns` / `Ns` string.
+fn human_age(secs: i64) -> String {
+    if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Parse a stored `node_config.value_json` into epoch **seconds**.
+///
+/// Contract with the heal-dispatcher sibling lane: the heartbeat is written as
+/// a JSON number of epoch **seconds** (matching `heal_queue.timestamp`, which
+/// is `SystemTime … as_secs()`). We parse defensively — JSON number, JSON
+/// string, or a bare integer — and return `None` on anything we can't read as
+/// an integer, so an unexpected encoding degrades to a soft "unreadable" note
+/// rather than a false-clean or a hard error. A value that parses but is in
+/// the *wrong unit* (e.g. milliseconds) is deliberately NOT normalized here —
+/// it surfaces downstream as an implausible future timestamp, which the age
+/// evaluators flag rather than silently trusting.
+fn parse_epoch_secs(value_json: &str) -> Option<i64> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(value_json) {
+        if let Some(n) = v.as_i64() {
+            return Some(n);
+        }
+        if let Some(f) = v.as_f64() {
+            return Some(f as i64);
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(n) = s.trim().parse::<i64>() {
+                return Some(n);
+            }
+        }
+    }
+    value_json.trim().parse::<i64>().ok()
+}
+
+/// Read `node_config.<key>` as epoch seconds, or `None` when the key (or the
+/// `node_config` table itself) is absent or unparseable. Never a hard error
+/// for an absent key — absence is a legitimate, softly-handled state.
+fn read_config_epoch_secs(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    if !table_exists(conn, "node_config")? {
+        return Ok(None);
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value_json FROM node_config WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw.as_deref().and_then(parse_epoch_secs))
+}
+
+// ── heal.queue-depth ─────────────────────────────────────────────────────
+
+fn evaluate_heal_queue_depth(check_id: &'static str, pending: i64, assigned: i64) -> Vec<Finding> {
+    let backlog = pending.saturating_add(assigned);
+    let severity = if backlog > HEAL_DEPTH_CRITICAL_ABOVE {
+        Severity::Critical
+    } else if backlog > HEAL_DEPTH_WARN_ABOVE {
+        Severity::Warning
+    } else {
+        return Vec::new();
+    };
+
+    vec![Finding {
+        check_id: check_id.to_string(),
+        severity,
+        message: format!(
+            "self-heal queue backlog is {backlog} unresolved entr{} ({pending} pending, \
+             {assigned} assigned) — warn>{HEAL_DEPTH_WARN_ABOVE}, \
+             critical>{HEAL_DEPTH_CRITICAL_ABOVE}; the heal-dispatcher is not draining the \
+             queue fast enough",
+            if backlog == 1 { "y" } else { "ies" }
+        ),
+        evidence: json!({
+            "pending": pending,
+            "assigned": assigned,
+            "backlog": backlog,
+            "warn_above": HEAL_DEPTH_WARN_ABOVE,
+            "critical_above": HEAL_DEPTH_CRITICAL_ABOVE,
+        }),
+        fix_hint:
+            "check heal.dispatcher-staleness first: a growing backlog with a fresh dispatcher \
+             heartbeat means triage/classification is failing (not that the dispatcher is down); \
+             a stale heartbeat means the dispatcher is wedged — restart it"
+                .to_string(),
+        auto_repairable: false,
+    }]
+}
+
+struct HealQueueDepth;
+
+impl Check for HealQueueDepth {
+    fn id(&self) -> &'static str {
+        "heal.queue-depth"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "heal_queue")? {
+            return Ok(findings);
+        }
+        let pending: i64 = ctx.conn.query_row(
+            "SELECT COUNT(*) FROM heal_queue WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        let assigned: i64 = ctx.conn.query_row(
+            "SELECT COUNT(*) FROM heal_queue WHERE status = 'assigned'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(evaluate_heal_queue_depth(self.id(), pending, assigned))
+    }
+}
+
+// ── heal.oldest-pending-age ──────────────────────────────────────────────
+
+fn evaluate_heal_oldest_pending(
+    check_id: &'static str,
+    oldest_ts: Option<i64>,
+    now: i64,
+) -> Vec<Finding> {
+    let Some(ts) = oldest_ts else {
+        // No pending rows — nothing is waiting on the dispatcher.
+        return Vec::new();
+    };
+    let age = now - ts;
+
+    // Future timestamp (clock skew or a bad write): NOT a drain problem, and
+    // must never read as "fresh". Surface it softly instead of returning clean.
+    if age < 0 {
+        return vec![Finding {
+            check_id: check_id.to_string(),
+            severity: Severity::Info,
+            message: format!(
+                "oldest pending heal entry is timestamped {} in the future (ts={ts}, now={now}) \
+                 — clock skew or a bad write; not treated as a backlog age",
+                human_age(age.abs())
+            ),
+            evidence: json!({"oldest_ts": ts, "now": now, "age_secs": age}),
+            fix_hint: "verify the hotel clock and how heal_queue rows are timestamped; a future \
+                       timestamp masks real backlog age from this check"
+                .to_string(),
+            auto_repairable: false,
+        }];
+    }
+
+    let severity = if age > HEAL_OLDEST_PENDING_CRITICAL_SECS {
+        Severity::Critical
+    } else if age > HEAL_OLDEST_PENDING_WARN_SECS {
+        Severity::Warning
+    } else {
+        return Vec::new();
+    };
+
+    vec![Finding {
+        check_id: check_id.to_string(),
+        severity,
+        message: format!(
+            "oldest pending heal entry has waited {} (warn>{}s, critical>{}s) — the \
+             heal-dispatcher is behind or wedged and this entry is not being triaged",
+            human_age(age), HEAL_OLDEST_PENDING_WARN_SECS, HEAL_OLDEST_PENDING_CRITICAL_SECS
+        ),
+        evidence: json!({
+            "oldest_ts": ts,
+            "now": now,
+            "age_secs": age,
+            "warn_above_secs": HEAL_OLDEST_PENDING_WARN_SECS,
+            "critical_above_secs": HEAL_OLDEST_PENDING_CRITICAL_SECS,
+        }),
+        fix_hint: "check heal.dispatcher-staleness — a stale dispatcher heartbeat alongside this \
+                   means the dispatcher is wedged; restart it and confirm the queue drains"
+            .to_string(),
+        auto_repairable: false,
+    }]
+}
+
+struct HealOldestPendingAge;
+
+impl Check for HealOldestPendingAge {
+    fn id(&self) -> &'static str {
+        "heal.oldest-pending-age"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "heal_queue")? {
+            return Ok(findings);
+        }
+        // MIN over an empty match set returns a single NULL row → None.
+        let oldest: Option<i64> = ctx.conn.query_row(
+            "SELECT MIN(timestamp) FROM heal_queue WHERE status = 'pending'",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(evaluate_heal_oldest_pending(self.id(), oldest, now_epoch_secs()))
+    }
+}
+
+// ── heal.dispatcher-staleness ────────────────────────────────────────────
+
+fn evaluate_heal_dispatcher_staleness(
+    check_id: &'static str,
+    last_cycle_at: Option<i64>,
+    now: i64,
+) -> Vec<Finding> {
+    let Some(ts) = last_cycle_at else {
+        // Absent heartbeat: either an older dispatcher build that doesn't emit
+        // one yet, or a dispatcher that has never completed a cycle. Doctor
+        // can't distinguish, so this degrades to a soft Info note — NOT a hard
+        // failure — rather than false-alarming every not-yet-upgraded hotel.
+        return vec![Finding {
+            check_id: check_id.to_string(),
+            severity: Severity::Info,
+            message: format!(
+                "no '{HEAL_DISPATCHER_HEARTBEAT_KEY}' heartbeat in node_config — heal-dispatcher \
+                 liveness can't be confirmed offline (dispatcher build predates the heartbeat, or \
+                 it has never completed a cycle)"
+            ),
+            evidence: json!({"heartbeat_key": HEAL_DISPATCHER_HEARTBEAT_KEY, "present": false}),
+            fix_hint: format!(
+                "if the heal-dispatcher is deployed and running, confirm it stamps \
+                 '{HEAL_DISPATCHER_HEARTBEAT_KEY}' each cycle; a build predating that heartbeat \
+                 can't be liveness-checked by doctor"
+            ),
+            auto_repairable: false,
+        }];
+    };
+
+    let age = now - ts;
+
+    // Future heartbeat: clock skew, or a seconds/millis unit mismatch with the
+    // writer (a millis value read as seconds lands ~decades in the future).
+    // This must NEVER be read as "fresh" — that would silently mask a wedged
+    // dispatcher. Surface the mismatch as a warning instead.
+    if age < 0 {
+        return vec![Finding {
+            check_id: check_id.to_string(),
+            severity: Severity::Warning,
+            message: format!(
+                "heal-dispatcher heartbeat '{HEAL_DISPATCHER_HEARTBEAT_KEY}' is {} in the future \
+                 (last_cycle_at={ts}, now={now}) — clock skew or a seconds/millis format \
+                 mismatch; dispatcher liveness can't be trusted",
+                human_age(age.abs())
+            ),
+            evidence: json!({
+                "heartbeat_key": HEAL_DISPATCHER_HEARTBEAT_KEY,
+                "present": true,
+                "last_cycle_at": ts,
+                "now": now,
+                "age_secs": age,
+            }),
+            fix_hint: "confirm the hotel clock and that the heal-dispatcher writes \
+                       heal_dispatcher.last_cycle_at in epoch SECONDS (not millis)"
+                .to_string(),
+            auto_repairable: false,
+        }];
+    }
+
+    if age > HEAL_DISPATCHER_STALE_SECS {
+        return vec![Finding {
+            check_id: check_id.to_string(),
+            severity: Severity::Critical,
+            message: format!(
+                "heal-dispatcher last cycled {} ago (>{}s = 3× the {}s poll interval) — likely \
+                 wedged or down; the heal queue will not drain while it's stalled, and \
+                 PID-liveness alone can't catch a wedged (running-but-not-cycling) dispatcher",
+                human_age(age), HEAL_DISPATCHER_STALE_SECS, HEAL_DISPATCHER_POLL_INTERVAL_SECS
+            ),
+            evidence: json!({
+                "heartbeat_key": HEAL_DISPATCHER_HEARTBEAT_KEY,
+                "present": true,
+                "last_cycle_at": ts,
+                "now": now,
+                "age_secs": age,
+                "stale_above_secs": HEAL_DISPATCHER_STALE_SECS,
+                "poll_interval_secs": HEAL_DISPATCHER_POLL_INTERVAL_SECS,
+            }),
+            fix_hint: "restart the heal-dispatcher guest and inspect its logs for a stuck cycle \
+                       (blocked IPC, hung classifier); confirm the heartbeat resumes advancing"
+                .to_string(),
+            auto_repairable: false,
+        }];
+    }
+
+    Vec::new()
+}
+
+struct HealDispatcherStaleness;
+
+impl Check for HealDispatcherStaleness {
+    fn id(&self) -> &'static str {
+        "heal.dispatcher-staleness"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Critical
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        let last_cycle_at = read_config_epoch_secs(&ctx.conn, HEAL_DISPATCHER_HEARTBEAT_KEY)?;
+        Ok(evaluate_heal_dispatcher_staleness(
+            self.id(),
+            last_cycle_at,
+            now_epoch_secs(),
+        ))
     }
 }
 
@@ -3223,5 +3590,177 @@ mod tests {
             before, after,
             "NeedsConfirm/NotRepairable must not mutate the DB"
         );
+    }
+
+    // ── self-heal circuit observability ─────────────────────────────────
+
+    fn only(sev: &[Severity], findings: &[Finding]) -> bool {
+        findings.iter().map(|f| f.severity).eq(sev.iter().copied())
+    }
+
+    // heal.queue-depth threshold logic.
+    #[test]
+    fn heal_queue_depth_thresholds_fire_by_backlog() {
+        let id = "heal.queue-depth";
+        // Below and exactly at the warn boundary → clean.
+        assert!(evaluate_heal_queue_depth(id, 100, 0).is_empty());
+        assert!(evaluate_heal_queue_depth(id, 40, 60).is_empty());
+        // Just over warn (pending + assigned counted together) → Warning.
+        assert!(only(&[Severity::Warning], &evaluate_heal_queue_depth(id, 60, 41)));
+        // Exactly at the critical boundary is still Warning; over it → Critical.
+        assert!(only(&[Severity::Warning], &evaluate_heal_queue_depth(id, 500, 0)));
+        assert!(only(
+            &[Severity::Critical],
+            &evaluate_heal_queue_depth(id, 400, 101)
+        ));
+    }
+
+    // heal.oldest-pending-age threshold logic.
+    #[test]
+    fn heal_oldest_pending_thresholds_fire_by_age() {
+        let id = "heal.oldest-pending-age";
+        let now = 1_000_000;
+        // No pending rows → clean.
+        assert!(evaluate_heal_oldest_pending(id, None, now).is_empty());
+        // Fresh and exactly at the warn boundary → clean.
+        assert!(evaluate_heal_oldest_pending(id, Some(now - 600), now).is_empty());
+        // Over warn → Warning.
+        assert!(only(
+            &[Severity::Warning],
+            &evaluate_heal_oldest_pending(id, Some(now - 601), now)
+        ));
+        // Over critical → Critical.
+        assert!(only(
+            &[Severity::Critical],
+            &evaluate_heal_oldest_pending(id, Some(now - 1801), now)
+        ));
+    }
+
+    // A future oldest-pending timestamp must NOT read as clean — it degrades to
+    // a soft Info note, never a silent green.
+    #[test]
+    fn heal_oldest_pending_future_timestamp_is_soft_note_not_clean() {
+        let now = 1_000_000;
+        let findings = evaluate_heal_oldest_pending("heal.oldest-pending-age", Some(now + 5_000), now);
+        assert!(only(&[Severity::Info], &findings));
+        assert!(!findings.is_empty(), "future ts must surface, not read clean");
+    }
+
+    // heal.dispatcher-staleness: absent heartbeat degrades to a soft Info note
+    // (older dispatcher build / never-cycled), never a hard failure.
+    #[test]
+    fn heal_dispatcher_absent_heartbeat_is_soft_info() {
+        let findings =
+            evaluate_heal_dispatcher_staleness("heal.dispatcher-staleness", None, 1_000_000);
+        assert!(only(&[Severity::Info], &findings));
+        assert_eq!(findings[0].severity, Severity::Info);
+        assert!(findings[0].severity < Severity::Error, "must not be a failure");
+    }
+
+    // A fresh heartbeat (within 3× poll) is clean; a stale one is Critical.
+    #[test]
+    fn heal_dispatcher_staleness_fires_critical_when_wedged() {
+        let id = "heal.dispatcher-staleness";
+        let now = 1_000_000;
+        // Exactly at the stale boundary (90s) is still fresh.
+        assert!(evaluate_heal_dispatcher_staleness(id, Some(now - 90), now).is_empty());
+        // One second past the boundary → Critical (dispatcher wedged/down).
+        assert!(only(
+            &[Severity::Critical],
+            &evaluate_heal_dispatcher_staleness(id, Some(now - 91), now)
+        ));
+        // Hours stale → still Critical.
+        assert!(only(
+            &[Severity::Critical],
+            &evaluate_heal_dispatcher_staleness(id, Some(now - 7_200), now)
+        ));
+    }
+
+    // THE fail-safe: a heartbeat written in the WRONG UNIT (epoch millis read
+    // as seconds) lands far in the future → negative age. It must be flagged
+    // as a format mismatch, NEVER read as "fresh" (which would silently mask a
+    // wedged dispatcher).
+    #[test]
+    fn heal_dispatcher_future_heartbeat_never_reads_as_fresh() {
+        let id = "heal.dispatcher-staleness";
+        let now = 1_750_000_000; // ~2025 in epoch seconds
+        let millis_value = now * 1000; // what a millis-writing dispatcher would store
+        let findings = evaluate_heal_dispatcher_staleness(id, Some(millis_value), now);
+        assert!(!findings.is_empty(), "future/millis heartbeat must not read clean");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(
+            findings[0].message.contains("future"),
+            "should name the future/format-mismatch cause: {}",
+            findings[0].message
+        );
+    }
+
+    // Defensive epoch parsing: number, JSON string, bare int all work; garbage
+    // yields None (→ treated as absent, a soft note — never a false value).
+    #[test]
+    fn parse_epoch_secs_is_defensive() {
+        assert_eq!(parse_epoch_secs("1750000000"), Some(1_750_000_000));
+        assert_eq!(parse_epoch_secs("\"1750000000\""), Some(1_750_000_000));
+        assert_eq!(parse_epoch_secs("  1750000000  "), Some(1_750_000_000));
+        assert_eq!(parse_epoch_secs("1750000000.0"), Some(1_750_000_000));
+        assert_eq!(parse_epoch_secs("not-a-number"), None);
+        assert_eq!(parse_epoch_secs("\"nope\""), None);
+    }
+
+    // Detect-level graceful degradation: a DB with no heal_queue table (e.g. a
+    // hotel that never booted the heal sink) must NOT hard-error — it yields a
+    // single soft "table not present, skipped" Warning.
+    #[test]
+    fn heal_queue_checks_degrade_when_table_absent() {
+        let (_dir, path) = fixture_db();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        for check in [
+            Box::new(HealQueueDepth) as Box<dyn Check>,
+            Box::new(HealOldestPendingAge) as Box<dyn Check>,
+        ] {
+            let findings = check.detect(&ctx).expect("detect must not error");
+            assert!(only(&[Severity::Warning], &findings), "{:?}", findings);
+            assert!(findings[0].message.contains("heal_queue"));
+        }
+    }
+
+    // Detect-level: node_config present but the heartbeat key absent → the
+    // dispatcher check returns a soft Info note, never an error.
+    #[test]
+    fn heal_dispatcher_detect_absent_key_is_info() {
+        let (_dir, path) = fixture_db();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let findings = HealDispatcherStaleness.detect(&ctx).expect("detect");
+        assert!(only(&[Severity::Info], &findings), "{:?}", findings);
+    }
+
+    // Detect-level, full path against a real populated heal_queue: an old
+    // pending backlog fires both the depth (Critical) and oldest-age
+    // (Critical) checks, proving the guards fire end-to-end.
+    #[test]
+    fn heal_queue_checks_fire_against_real_backlog() {
+        use ansible_mesh_core::heal_queue::SqliteHealQueueStorage;
+        let (_dir, path) = fixture_db();
+        // Create the heal_queue schema on the same DB file.
+        drop(SqliteHealQueueStorage::open(&path).expect("create heal_queue schema"));
+
+        let old_ts = now_epoch_secs() - 3_600; // 1h old → past both age tiers
+        {
+            let w = Connection::open(&path).expect("open writable");
+            for i in 0..=HEAL_DEPTH_CRITICAL_ABOVE {
+                w.execute(
+                    "INSERT INTO heal_queue (id, guest_id, timestamp, raw_text, severity, status) \
+                     VALUES (?1, 'g', ?2, 'boom', 'high', 'pending')",
+                    params![format!("row-{i}"), old_ts],
+                )
+                .expect("insert pending row");
+            }
+        }
+
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let depth = HealQueueDepth.detect(&ctx).expect("detect depth");
+        assert!(only(&[Severity::Critical], &depth), "{:?}", depth);
+        let age = HealOldestPendingAge.detect(&ctx).expect("detect age");
+        assert!(only(&[Severity::Critical], &age), "{:?}", age);
     }
 }
