@@ -24,6 +24,19 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+/// Fallback text model for the OpenRouter controller when neither
+/// `PHILOTIC_OPENROUTER_DEFAULT_MODEL` nor `config:openrouter_default_model`
+/// is set.
+///
+/// The OpenRouter controller reuses the generic OpenAI-compat provider
+/// (`OpenAIProvider`), whose own hardcoded fallback is `gpt-4.1-mini` — a bare
+/// slug that is NOT a valid OpenRouter model id. The controller must therefore
+/// supply its OWN OpenRouter-valid default rather than inheriting the OpenAI
+/// one. Keep this as the single source of truth the
+/// `model-controller-openrouter` bin references so the fallback can't silently
+/// regress back onto an OpenAI-shaped slug.
+pub const DEFAULT_OPENROUTER_MODEL: &str = "z-ai/glm-5.2";
+
 /// Default overall per-task provider-dispatch cap, in seconds.
 ///
 /// Covers ANY await between receiving a task and obtaining a provider result —
@@ -1940,5 +1953,22 @@ mod tests {
             model_result["native_live"]["session_marker"]["resumption_handle"],
             json!("resume-123")
         );
+    }
+}
+
+#[cfg(test)]
+mod openrouter_default_tests {
+    use super::DEFAULT_OPENROUTER_MODEL;
+
+    /// The OpenRouter controller must supply its own OpenRouter-valid default
+    /// model. Regression guard: it must NOT fall back to the generic
+    /// `OpenAIProvider` slug `gpt-4.1-mini` (nor its `openai/`-prefixed form),
+    /// which is what the bin used before this fix. This pins the single const
+    /// the `model-controller-openrouter` bin references.
+    #[test]
+    fn openrouter_default_model_is_glm_not_openai_slug() {
+        assert_eq!(DEFAULT_OPENROUTER_MODEL, "z-ai/glm-5.2");
+        assert_ne!(DEFAULT_OPENROUTER_MODEL, "gpt-4.1-mini");
+        assert_ne!(DEFAULT_OPENROUTER_MODEL, "openai/gpt-4.1-mini");
     }
 }
