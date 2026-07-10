@@ -945,6 +945,13 @@ pub struct VoiceResponsePolicy {
     /// Fall back to text-only delivery if synthesis fails. Default: true.
     #[serde(default = "default_true")]
     pub fallback_to_text: bool,
+    /// Sentence-pipelined streaming TTS for operator-chat turns. `None`
+    /// (default) means enabled wherever it applies (transport
+    /// `operator_chat` with Synthesized delivery); `Some(false)` opts the
+    /// agent out and restores whole-reply batch synthesis everywhere.
+    /// Other transports (Telegram etc.) always use batch synthesis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_sentences: Option<bool>,
 }
 
 impl VoiceResponsePolicy {
@@ -1019,6 +1026,7 @@ impl Default for VoiceResponsePolicy {
             speed_percent: None,
             send_text_caption: true,
             fallback_to_text: true,
+            stream_sentences: None,
         }
     }
 }

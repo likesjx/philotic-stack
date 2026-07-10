@@ -585,6 +585,7 @@ async fn turn_submit_streams_turn_events() {
             conversation_id: Some("conv-e2e".into()),
             content: "hi there".into(),
             blob_refs: vec![],
+            message_kind: None,
         },
     )
     .await;
@@ -636,6 +637,7 @@ async fn reconnect_with_cursor_replays_missed_frames() {
             conversation_id: Some("conv-replay".into()),
             content: "stream me".into(),
             blob_refs: vec![],
+            message_kind: None,
         },
     )
     .await;
@@ -703,6 +705,7 @@ async fn events_broadcast_while_disconnected_are_recovered_on_reconnect() {
             conversation_id: Some("conv-offline".into()),
             content: "answer while I am offline".into(),
             blob_refs: vec![],
+            message_kind: None,
         },
     )
     .await;
@@ -776,6 +779,7 @@ async fn second_hello_kicks_previous_session_and_avoids_duplicates() {
             conversation_id: Some("conv-kick".into()),
             content: "no doubles please".into(),
             blob_refs: vec![],
+            message_kind: None,
         },
     )
     .await;

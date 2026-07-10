@@ -316,6 +316,8 @@ impl AgentRuntime {
             self.stuck_turn_first_seen.remove(&session_id);
             self.stuck_turn_signature.remove(&session_id);
             self.total_active_since.remove(&session_id);
+            // Sentence-pipelined TTS: the evicted turn takes its pipeline with it.
+            self.clear_voice_chunk_pipeline(&session_id);
 
             if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.active_turn = None;
@@ -850,6 +852,17 @@ impl AgentRuntime {
             Some(turn_id) => turn_id.to_string(),
             None => return Ok(()),
         };
+
+        // Sentence-pipelined TTS: per-sentence synthesis responses carry a
+        // synthetic "<turn_id>::vchunk::<seq>" turn id so they can never be
+        // mistaken for the turn's own model response. Route them to the voice
+        // chunk handler before any active-turn bookkeeping.
+        if let Some((base_turn_id, dispatch_seq)) = parse_voice_chunk_turn_id(&turn_id) {
+            return self
+                .handle_voice_chunk_synthesis_response(session_id, base_turn_id, dispatch_seq, task)
+                .await;
+        }
+
         self.ensure_session_loaded(&session_id, "unknown").await?;
 
         // Slice 2: intercept a response correlated to an outstanding
@@ -2512,6 +2525,23 @@ impl AgentRuntime {
                     .await;
             }
 
+            // Streaming mode (operator_chat): the sentence pipeline was armed
+            // at turn start and has been synthesizing while tokens streamed.
+            // Flush the tail and drain instead of one batch synthesis.
+            if self.voice_chunk_pipeline_matches(&session_id, &turn_id) {
+                return self
+                    .finalize_streaming_voice_turn(
+                        session_id,
+                        turn_id,
+                        content,
+                        spoken_text,
+                        voice_policy,
+                        memory_concept,
+                        memory_candidate,
+                    )
+                    .await;
+            }
+
             return self
                 .start_voice_synthesis(session_id, turn_id, content, spoken_text, voice_policy)
                 .await;
@@ -2540,6 +2570,11 @@ impl AgentRuntime {
         memory_concept: Option<String>,
         memory_candidate: Option<MemoryCandidate>,
     ) -> Result<()> {
+        // Sentence-pipelined TTS: the turn is over — any leftover pipeline is
+        // stale (the streaming path removes its own pipeline before calling
+        // here, so this only clears policy-flip / non-streaming residue).
+        self.clear_voice_chunk_pipeline(&session_id);
+
         // LifeGraph auto-capture fork (Slice E2): lived-fact candidates ALSO
         // flow to the graph as proposed nodes. Fork, not move — the Muninn
         // Attend hook below still receives the same candidate. Runs before
@@ -2782,6 +2817,8 @@ impl AgentRuntime {
         turn_id: String,
         message: String,
     ) -> Result<()> {
+        // Sentence-pipelined TTS: drop any streaming-voice state with the turn.
+        self.clear_voice_chunk_pipeline(&session_id);
         let (
             task_id,
             checkpoint_memory_type,

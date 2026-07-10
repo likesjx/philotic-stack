@@ -619,6 +619,7 @@ pub async fn run(
             .map(str::to_string),
     );
     let socket = crate::start::socket_path(&hotel);
+    let socket_for_lease_recovery = socket.clone();
     let lease_key = desktop_membrane_lease_key(&hotel);
     let lease_handle = acquire_desktop_membrane_lease(&socket, &lease_key, port).await?;
 
@@ -664,6 +665,12 @@ pub async fn run(
         // Edge-mesh tier (see serve/edge.rs): invite-code-gated enrollment plus
         // the bearer-authenticated edge-protocol WebSocket termination
         .route("/api/edge/enroll", post(edge::handle_edge_enroll))
+        .route("/api/edge/agents", get(edge::handle_edge_agents))
+        .route(
+            "/api/edge/blob",
+            post(edge::handle_edge_blob)
+                .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
+        )
         .route("/api/edge/ws", get(edge::handle_edge_ws))
         // API routes
         .route("/api/mesh/roster", get(handle_mesh_roster))
@@ -859,6 +866,8 @@ pub async fn run(
     let renew_handle = tokio::spawn(run_desktop_membrane_lease_renewal(
         lease_handle.clone(),
         shutdown_tx.clone(),
+        socket_for_lease_recovery,
+        port,
     ));
 
     let display_host = display_host_for(bind_host);
@@ -996,6 +1005,8 @@ async fn release_desktop_membrane_lease(handle: &DesktopMembraneLeaseHandle) -> 
 async fn run_desktop_membrane_lease_renewal(
     handle: DesktopMembraneLeaseHandle,
     shutdown_tx: watch::Sender<bool>,
+    socket: String,
+    port: u16,
 ) {
     let mut shutdown_rx = shutdown_tx.subscribe();
     let mut epoch = match current_desktop_membrane_lease(&handle).await {
@@ -1016,9 +1027,28 @@ async fn run_desktop_membrane_lease_renewal(
                         epoch = lease.lease_epoch;
                     }
                     Err(err) => {
-                        eprintln!("desktop membrane lease renewal lost: {err:#}");
-                        let _ = shutdown_tx.send(true);
-                        return;
+                        // A dropped renewal usually means the hotel restarted
+                        // (broken UDS pipe). Surviving that is a resilience
+                        // requirement: reconnect and re-acquire with backoff
+                        // instead of shutting the operator surface down.
+                        eprintln!(
+                            "desktop membrane lease renewal lost ({err:#}); entering re-acquire loop"
+                        );
+                        match reacquire_desktop_membrane_lease(
+                            &handle,
+                            &mut shutdown_rx,
+                            &socket,
+                            port,
+                        )
+                        .await
+                        {
+                            Some(new_epoch) => {
+                                epoch = new_epoch;
+                                interval.reset();
+                            }
+                            // Shutdown requested while re-acquiring.
+                            None => return,
+                        }
                     }
                 }
             }
@@ -1029,6 +1059,83 @@ async fn run_desktop_membrane_lease_renewal(
             }
         }
     }
+}
+
+/// Reconnect to the hotel and re-acquire the desktop membrane lease, retrying
+/// every 5s until it succeeds or shutdown is requested. On success the fresh
+/// IPC client replaces the one inside `handle` (all lease calls go through
+/// that shared mutex) and the new lease epoch is returned.
+async fn reacquire_desktop_membrane_lease(
+    handle: &DesktopMembraneLeaseHandle,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    socket: &str,
+    port: u16,
+) -> Option<u64> {
+    loop {
+        if *shutdown_rx.borrow() {
+            return None;
+        }
+        match try_reacquire_once(handle, socket, port).await {
+            Ok(epoch) => {
+                println!("desktop membrane lease re-acquired after hotel restart (epoch {epoch})");
+                return Some(epoch);
+            }
+            Err(err) => {
+                eprintln!("desktop membrane lease re-acquire failed ({err:#}); retrying in 5s");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_ok() && *shutdown_rx.borrow() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One re-acquire attempt: fresh IPC connection + AcquireDesktopMembraneLease,
+/// swapping the new client into the shared handle on success. Returns the new
+/// lease epoch.
+async fn try_reacquire_once(
+    handle: &DesktopMembraneLeaseHandle,
+    socket: &str,
+    port: u16,
+) -> Result<u64> {
+    let identity = GuestIdentity {
+        guest_id: format!("philotic-web-membrane-{port}"),
+        role: "management".into(),
+        supported_tools: vec![],
+    };
+    let mut client = PhiloticClient::connect_at(socket, identity)
+        .await
+        .with_context(|| format!("reconnect to hotel at {socket} for desktop membrane lease"))?;
+    let response = client
+        .send_request(IpcRequest::AcquireDesktopMembraneLease {
+            lease_key: handle.lease_key.as_str().to_string(),
+            port,
+        })
+        .await
+        .context("re-acquire desktop membrane lease")?;
+    let lease = match response {
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: true,
+            desktop_lease: Some(lease),
+        } => lease,
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: false,
+            desktop_lease: Some(lease),
+        } => bail!(
+            "desktop membrane lease [{}] is held by [{}] (epoch {})",
+            lease.lease_scope,
+            lease.owner_guest_id,
+            lease.lease_epoch
+        ),
+        other => bail!("unexpected desktop membrane lease response: {other:?}"),
+    };
+    *handle.client.lock().await = client;
+    Ok(lease.lease_epoch)
 }
 
 async fn current_desktop_membrane_lease(
@@ -2842,6 +2949,8 @@ async fn handle_mesh_target_agent_chat(
         &operator_session_id,
         conversation_id,
         body.content,
+        None,
+        Vec::new(),
     )
     .await
     {
@@ -2869,6 +2978,8 @@ async fn submit_operator_chat_turn(
     operator_session_id: &str,
     conversation_id: String,
     content: String,
+    message_kind: Option<String>,
+    attachments: Vec<Value>,
 ) -> Result<OperatorChatAcceptedView, OperatorChatSubmitError> {
     let targets = ipc_desktop_membrane_targets(&state.socket)
         .await
@@ -2930,6 +3041,8 @@ async fn submit_operator_chat_turn(
             session_id,
             turn_id,
             content,
+            message_kind,
+            attachments,
         )
         .await
         {
@@ -2987,6 +3100,8 @@ async fn stream_operator_chat_turn(
     session_id: String,
     turn_id: String,
     content: String,
+    message_kind: Option<String>,
+    attachments: Vec<Value>,
 ) -> Result<()> {
     let reply_guest_id = new_operator_chat_id("operator-chat");
     let mut client = connect_client_with_identity(
@@ -3014,18 +3129,29 @@ async fn stream_operator_chat_turn(
             target_node: target_node_id.clone(),
             target_role: "agent".into(),
             target_guest_id: Some(agent_id.clone()),
-            task_json: json!({
-                "source": "operator_chat",
-                "transport": "operator_chat",
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "chat_id": conversation_id,
-                "content": content,
-                "final_reply_to": local_node_id,
-                "final_reply_role": OPERATOR_CHAT_REPLY_ROLE,
-                "final_reply_guest_id": reply_guest_id
-            })
-            .to_string(),
+            task_json: {
+                let mut task = json!({
+                    "source": "operator_chat",
+                    "transport": "operator_chat",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": conversation_id,
+                    "content": content,
+                    "final_reply_to": local_node_id,
+                    "final_reply_role": OPERATOR_CHAT_REPLY_ROLE,
+                    "final_reply_guest_id": reply_guest_id
+                });
+                // "voice"/"audio" sets philote's had_voice_input, which lets
+                // the agent's own voice_response_policy synthesize a persona
+                // voice reply — the same marker membranes stamp on voice notes.
+                if let Some(kind) = &message_kind {
+                    task["message_kind"] = json!(kind);
+                }
+                if !attachments.is_empty() {
+                    task["attachments"] = json!(attachments);
+                }
+                task.to_string()
+            },
         })
         .await?
     {
@@ -3038,7 +3164,14 @@ async fn stream_operator_chat_turn(
             .await
             .map_err(|_| anyhow!("timed out waiting for operator chat reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = inbound else {
-            bail!("unexpected operator chat reply envelope: {inbound:?}");
+            // The hotel pushes unsolicited status broadcasts (e.g. MuninnStatus)
+            // to every subscribed IPC client. They are not reply tasks — skip
+            // them instead of failing the turn (model-router's runtime does the
+            // same for its inbound leg).
+            eprintln!(
+                "philotic-web: operator chat reply leg skipping non-task IPC push: {inbound:?}"
+            );
+            continue;
         };
         let payload: Value = serde_json::from_str(&task_json)?;
         let action = payload
@@ -3080,6 +3213,26 @@ async fn stream_operator_chat_turn(
                     .to_string(),
                 );
             }
+            "voice_chunk" => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:voice_chunk",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default(),
+                            "audio_artifact": payload.get("audio_artifact").cloned().unwrap_or(Value::Null),
+                            "chunk_seq": payload.get("chunk_seq").cloned().unwrap_or(Value::Null),
+                            "is_final": payload.get("is_final").cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .to_string(),
+                );
+            }
             "send_reply" => {
                 let _ = tx.send(
                     json!({
@@ -3092,7 +3245,12 @@ async fn stream_operator_chat_turn(
                             "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
                             "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
                             "reply_action": action,
-                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default()
+                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default(),
+                            // Synthesized persona-voice replies ride the same
+                            // send_reply payload as an inline audio envelope;
+                            // forward it so edge/WS consumers can play it.
+                            "audio_artifact": payload.get("audio_artifact").cloned().unwrap_or(Value::Null),
+                            "send_text_caption": payload.get("send_text_caption").cloned().unwrap_or(Value::Null)
                         }
                     })
                     .to_string(),

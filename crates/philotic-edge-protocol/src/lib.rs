@@ -109,6 +109,76 @@ pub enum EdgeMessage {
         /// Attached blobs (voice notes, images, files).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         blob_refs: Vec<BlobRef>,
+        /// Inbound modality marker ("voice" | "audio") — mirrors the
+        /// membrane `message_kind` field philote reads to set
+        /// `had_voice_input`, which drives the agent's own
+        /// `voice_response_policy` (persona TTS). Absent = plain text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_kind: Option<String>,
+    },
+    /// Client -> server: open an uplink audio stream bound to a target
+    /// agent. Chunks follow as `AudioChunk`; `AudioStreamEnd` seals the
+    /// stream, at which point the server assembles the audio, stores it,
+    /// and submits the voice turn — the client never waits on an upload
+    /// after it stops speaking.
+    AudioStreamStart {
+        /// Client-chosen stream identifier (unique per session).
+        stream_id: String,
+        /// Hotel node that hosts the target agent.
+        target_node_id: String,
+        /// Agent the eventual voice turn is addressed to.
+        target_agent_id: String,
+        /// Existing conversation to continue, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        /// MIME type of the assembled audio (e.g. "audio/mp4").
+        mime_type: String,
+    },
+    /// Client -> server: one chunk of an open audio stream. Chunks are
+    /// base64 in protocol v1; a future protocol rev moves them to binary
+    /// WS frames (seam: edge-audio-frames).
+    AudioChunk {
+        /// Stream this chunk belongs to.
+        stream_id: String,
+        /// 0-based chunk ordinal — must arrive in order (WS is ordered;
+        /// this guards reconnect/duplication bugs, not reordering).
+        chunk_seq: u64,
+        /// Base64-encoded audio bytes.
+        data_base64: String,
+    },
+    /// Client -> server: seal (or abandon) an open audio stream.
+    AudioStreamEnd {
+        /// Stream to seal.
+        stream_id: String,
+        /// True to discard the stream without submitting a turn.
+        #[serde(default)]
+        cancel: bool,
+    },
+    /// Server -> client: inline synthesized voice audio for a completed
+    /// turn. Audio rides inline (base64) because hotel TTS artifacts are
+    /// inline and blob download URLs embed loopback hosts a remote device
+    /// cannot reach.
+    VoiceReply {
+        /// Conversation the spoken reply belongs to.
+        conversation_id: String,
+        /// Turn the audio was synthesized for, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        /// Base64-encoded audio bytes.
+        audio_base64: String,
+        /// MIME type of the audio (e.g. "audio/mpeg").
+        mime_type: String,
+        /// Text the audio speaks, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript: Option<String>,
+        /// Ordinal of this chunk within a streamed voice reply (sentence
+        /// pipelining). Absent = a whole-reply voice message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_seq: Option<u64>,
+        /// True on the last chunk of a streamed voice reply. Absent on
+        /// whole-reply voice messages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_final: Option<bool>,
     },
     /// Server -> client: streamed turn output and status.
     TurnEvent {
@@ -359,6 +429,7 @@ mod tests {
                 download_url: Some("https://example/blob-1".to_string()),
                 mime: Some("audio/ogg".to_string()),
             }],
+            message_kind: Some("voice".to_string()),
         });
         round_trip(EdgeMessage::TurnSubmit {
             target_node_id: "mbp-jane".to_string(),
@@ -366,6 +437,107 @@ mod tests {
             conversation_id: None,
             content: "hello".to_string(),
             blob_refs: vec![],
+            message_kind: None,
+        });
+    }
+
+    #[test]
+    fn round_trip_audio_stream() {
+        round_trip(EdgeMessage::AudioStreamStart {
+            stream_id: "stream-1".to_string(),
+            target_node_id: "mac-jane-aiua-01".to_string(),
+            target_agent_id: "agent-bjork-01".to_string(),
+            conversation_id: Some("conv-9".to_string()),
+            mime_type: "audio/mp4".to_string(),
+        });
+        round_trip(EdgeMessage::AudioChunk {
+            stream_id: "stream-1".to_string(),
+            chunk_seq: 0,
+            data_base64: "bW9jaw==".to_string(),
+        });
+        round_trip(EdgeMessage::AudioStreamEnd {
+            stream_id: "stream-1".to_string(),
+            cancel: false,
+        });
+        round_trip(EdgeMessage::AudioStreamEnd {
+            stream_id: "stream-1".to_string(),
+            cancel: true,
+        });
+    }
+
+    /// Golden wire fixtures for the audio-stream family — copy-pastable into
+    /// Swift Codable tests. Do not change without bumping PROTOCOL_VERSION.
+    #[test]
+    fn golden_json_audio_stream() {
+        const GOLDEN_START: &str = r#"{"v":1,"seq":10,"msg":{"type":"audio_stream_start","stream_id":"stream-1","target_node_id":"mac-jane-aiua-01","target_agent_id":"agent-bjork-01","conversation_id":"conv-9","mime_type":"audio/mp4"}}"#;
+        const GOLDEN_CHUNK: &str = r#"{"v":1,"seq":11,"msg":{"type":"audio_chunk","stream_id":"stream-1","chunk_seq":0,"data_base64":"bW9jaw=="}}"#;
+        const GOLDEN_END: &str = r#"{"v":1,"seq":12,"msg":{"type":"audio_stream_end","stream_id":"stream-1","cancel":false}}"#;
+
+        let start = EdgeEnvelope::new(
+            10,
+            None,
+            EdgeMessage::AudioStreamStart {
+                stream_id: "stream-1".to_string(),
+                target_node_id: "mac-jane-aiua-01".to_string(),
+                target_agent_id: "agent-bjork-01".to_string(),
+                conversation_id: Some("conv-9".to_string()),
+                mime_type: "audio/mp4".to_string(),
+            },
+        );
+        assert_eq!(serde_json::to_string(&start).unwrap(), GOLDEN_START);
+        let chunk = EdgeEnvelope::new(
+            11,
+            None,
+            EdgeMessage::AudioChunk {
+                stream_id: "stream-1".to_string(),
+                chunk_seq: 0,
+                data_base64: "bW9jaw==".to_string(),
+            },
+        );
+        assert_eq!(serde_json::to_string(&chunk).unwrap(), GOLDEN_CHUNK);
+        let end = EdgeEnvelope::new(
+            12,
+            None,
+            EdgeMessage::AudioStreamEnd {
+                stream_id: "stream-1".to_string(),
+                cancel: false,
+            },
+        );
+        assert_eq!(serde_json::to_string(&end).unwrap(), GOLDEN_END);
+        for golden in [GOLDEN_START, GOLDEN_CHUNK, GOLDEN_END] {
+            let back: EdgeEnvelope = serde_json::from_str(golden).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), golden);
+        }
+    }
+
+    #[test]
+    fn round_trip_voice_reply() {
+        round_trip(EdgeMessage::VoiceReply {
+            conversation_id: "conv-9".to_string(),
+            turn_id: Some("turn-3".to_string()),
+            audio_base64: "bW9jay1hdWRpbw==".to_string(),
+            mime_type: "audio/mpeg".to_string(),
+            transcript: Some("hello there".to_string()),
+            chunk_seq: None,
+            is_final: None,
+        });
+        round_trip(EdgeMessage::VoiceReply {
+            conversation_id: "conv-9".to_string(),
+            turn_id: Some("turn-3".to_string()),
+            audio_base64: "bW9jay1hdWRpbw==".to_string(),
+            mime_type: "audio/mpeg".to_string(),
+            transcript: Some("First sentence.".to_string()),
+            chunk_seq: Some(0),
+            is_final: Some(false),
+        });
+        round_trip(EdgeMessage::VoiceReply {
+            conversation_id: "conv-9".to_string(),
+            turn_id: None,
+            audio_base64: "bW9jaw==".to_string(),
+            mime_type: "audio/mpeg".to_string(),
+            transcript: None,
+            chunk_seq: None,
+            is_final: None,
         });
     }
 
@@ -533,7 +705,7 @@ mod tests {
     /// without bumping PROTOCOL_VERSION.
     #[test]
     fn golden_json_turn_submit() {
-        const GOLDEN_TURN_SUBMIT: &str = r#"{"v":1,"seq":2,"msg":{"type":"turn_submit","target_node_id":"mbp-jane","target_agent_id":"jane","conversation_id":"conv-9","content":"hello there","blob_refs":[{"blob_id":"blob-1","download_url":"https://example/blob-1","mime":"audio/ogg"}]}}"#;
+        const GOLDEN_TURN_SUBMIT: &str = r#"{"v":1,"seq":2,"msg":{"type":"turn_submit","target_node_id":"mbp-jane","target_agent_id":"jane","conversation_id":"conv-9","content":"hello there","blob_refs":[{"blob_id":"blob-1","download_url":"https://example/blob-1","mime":"audio/ogg"}],"message_kind":"voice"}}"#;
 
         let envelope = EdgeEnvelope::new(
             2,
@@ -548,6 +720,7 @@ mod tests {
                     download_url: Some("https://example/blob-1".to_string()),
                     mime: Some("audio/ogg".to_string()),
                 }],
+                message_kind: Some("voice".to_string()),
             },
         );
         assert_eq!(
@@ -574,6 +747,7 @@ mod tests {
                 conversation_id: None,
                 content: "hello".to_string(),
                 blob_refs: vec![],
+                message_kind: None,
             },
         );
         assert_eq!(
@@ -581,6 +755,33 @@ mod tests {
             GOLDEN_TURN_SUBMIT_MINIMAL
         );
         let back: EdgeEnvelope = serde_json::from_str(GOLDEN_TURN_SUBMIT_MINIMAL).unwrap();
+        assert_eq!(back, envelope);
+    }
+
+    /// Golden wire fixture for `VoiceReply` — copy-pastable into Swift
+    /// Codable tests. Do not change without bumping PROTOCOL_VERSION.
+    #[test]
+    fn golden_json_voice_reply() {
+        const GOLDEN_VOICE_REPLY: &str = r#"{"v":1,"seq":8,"msg":{"type":"voice_reply","conversation_id":"conv-9","turn_id":"turn-3","audio_base64":"bW9jay1hdWRpbw==","mime_type":"audio/mpeg","transcript":"hello there"}}"#;
+
+        let envelope = EdgeEnvelope::new(
+            8,
+            None,
+            EdgeMessage::VoiceReply {
+                conversation_id: "conv-9".to_string(),
+                turn_id: Some("turn-3".to_string()),
+                audio_base64: "bW9jay1hdWRpbw==".to_string(),
+                mime_type: "audio/mpeg".to_string(),
+                transcript: Some("hello there".to_string()),
+                chunk_seq: None,
+                is_final: None,
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&envelope).unwrap(),
+            GOLDEN_VOICE_REPLY
+        );
+        let back: EdgeEnvelope = serde_json::from_str(GOLDEN_VOICE_REPLY).unwrap();
         assert_eq!(back, envelope);
     }
 

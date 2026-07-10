@@ -171,6 +171,7 @@ async fn main() {
             conversation_id: Some("conv-edge-e2e".into()),
             content: "edge e2e smoke: please reply".into(),
             blob_refs: vec![],
+            message_kind: None,
         },
     )
     .await;

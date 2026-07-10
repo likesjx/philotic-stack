@@ -217,7 +217,8 @@ public enum EdgeMessage: Equatable, Sendable {
         targetAgentId: String,
         conversationId: String?,
         content: String,
-        blobRefs: [BlobRef]
+        blobRefs: [BlobRef],
+        messageKind: String? = nil
     )
     /// Server -> client: streamed turn output and status.
     case turnEvent(
@@ -234,6 +235,38 @@ public enum EdgeMessage: Equatable, Sendable {
     case lifeGraphChange(changeKind: String, nodeId: String, label: String?, summary: String?)
     /// Server -> client: a voice blob is ready for download/playback.
     case voiceBlob(blobId: String, downloadUrl: String, mime: String?, transcript: String?)
+    /// Server -> client: a synthesized voice reply for a turn, carried inline
+    /// as base64 audio (as opposed to ``voiceBlob(blobId:downloadUrl:mime:transcript:)``,
+    /// which references a downloadable blob). When the server streams TTS
+    /// per sentence, `chunkSeq` (0-based) and `isFinal` are present; both
+    /// are omitted on the wire for whole-reply voice messages.
+    case voiceReply(
+        conversationId: String,
+        turnId: String?,
+        audioBase64: String,
+        mimeType: String,
+        transcript: String?,
+        chunkSeq: UInt64? = nil,
+        isFinal: Bool? = nil
+    )
+    /// Client -> server: open a live audio input stream to a target agent.
+    /// The server assembles the chunks and submits the voice turn itself on
+    /// ``audioStreamEnd(streamId:cancel:)`` with `cancel: false`.
+    case audioStreamStart(
+        streamId: String,
+        targetNodeId: String,
+        targetAgentId: String,
+        conversationId: String?,
+        mimeType: String
+    )
+    /// Client -> server: one chunk of a live audio stream. `chunkSeq` starts
+    /// at 0 and must increment by 1; a violation discards the stream.
+    case audioChunk(streamId: String, chunkSeq: UInt64, dataBase64: String)
+    /// Client -> server: close a live audio stream. `cancel: false` makes the
+    /// server assemble + store the audio and submit the voice turn;
+    /// `cancel: true` discards it. A dropped WebSocket also discards any
+    /// partial stream (re-record, don't resume).
+    case audioStreamEnd(streamId: String, cancel: Bool)
     /// Server -> client: invoke a tool the device advertised in its
     /// capabilities (e.g. HealthKit read, Shortcuts run).
     case toolInvoke(invocationId: String, toolRef: String, argsJson: String)
@@ -262,6 +295,7 @@ extension EdgeMessage: Codable {
         case conversationId = "conversation_id"
         case content
         case blobRefs = "blob_refs"
+        case messageKind = "message_kind"
         case eventKind = "event_kind"
         case turnId = "turn_id"
         case approvalId = "approval_id"
@@ -276,6 +310,13 @@ extension EdgeMessage: Codable {
         case downloadUrl = "download_url"
         case mime
         case transcript
+        case audioBase64 = "audio_base64"
+        case mimeType = "mime_type"
+        case streamId = "stream_id"
+        case chunkSeq = "chunk_seq"
+        case dataBase64 = "data_base64"
+        case cancel
+        case isFinal = "is_final"
         case invocationId = "invocation_id"
         case toolRef = "tool_ref"
         case argsJson = "args_json"
@@ -296,6 +337,10 @@ extension EdgeMessage: Codable {
         case approvalResolve = "approval_resolve"
         case lifeGraphChange = "life_graph_change"
         case voiceBlob = "voice_blob"
+        case voiceReply = "voice_reply"
+        case audioStreamStart = "audio_stream_start"
+        case audioChunk = "audio_chunk"
+        case audioStreamEnd = "audio_stream_end"
         case toolInvoke = "tool_invoke"
         case toolResult = "tool_result"
         case capabilitiesUpdate = "capabilities_update"
@@ -333,12 +378,14 @@ extension EdgeMessage: Codable {
             let conversationId = try container.decodeIfPresent(String.self, forKey: .conversationId)
             let content = try container.decode(String.self, forKey: .content)
             let blobRefs = try container.decodeIfPresent([BlobRef].self, forKey: .blobRefs) ?? []
+            let messageKind = try container.decodeIfPresent(String.self, forKey: .messageKind)
             self = .turnSubmit(
                 targetNodeId: targetNodeId,
                 targetAgentId: targetAgentId,
                 conversationId: conversationId,
                 content: content,
-                blobRefs: blobRefs
+                blobRefs: blobRefs,
+                messageKind: messageKind
             )
 
         case .turnEvent:
@@ -378,6 +425,49 @@ extension EdgeMessage: Codable {
             let mime = try container.decodeIfPresent(String.self, forKey: .mime)
             let transcript = try container.decodeIfPresent(String.self, forKey: .transcript)
             self = .voiceBlob(blobId: blobId, downloadUrl: downloadUrl, mime: mime, transcript: transcript)
+
+        case .voiceReply:
+            let conversationId = try container.decode(String.self, forKey: .conversationId)
+            let turnId = try container.decodeIfPresent(String.self, forKey: .turnId)
+            let audioBase64 = try container.decode(String.self, forKey: .audioBase64)
+            let mimeType = try container.decode(String.self, forKey: .mimeType)
+            let transcript = try container.decodeIfPresent(String.self, forKey: .transcript)
+            let chunkSeq = try container.decodeIfPresent(UInt64.self, forKey: .chunkSeq)
+            let isFinal = try container.decodeIfPresent(Bool.self, forKey: .isFinal)
+            self = .voiceReply(
+                conversationId: conversationId,
+                turnId: turnId,
+                audioBase64: audioBase64,
+                mimeType: mimeType,
+                transcript: transcript,
+                chunkSeq: chunkSeq,
+                isFinal: isFinal
+            )
+
+        case .audioStreamStart:
+            let streamId = try container.decode(String.self, forKey: .streamId)
+            let targetNodeId = try container.decode(String.self, forKey: .targetNodeId)
+            let targetAgentId = try container.decode(String.self, forKey: .targetAgentId)
+            let conversationId = try container.decodeIfPresent(String.self, forKey: .conversationId)
+            let mimeType = try container.decode(String.self, forKey: .mimeType)
+            self = .audioStreamStart(
+                streamId: streamId,
+                targetNodeId: targetNodeId,
+                targetAgentId: targetAgentId,
+                conversationId: conversationId,
+                mimeType: mimeType
+            )
+
+        case .audioChunk:
+            let streamId = try container.decode(String.self, forKey: .streamId)
+            let chunkSeq = try container.decode(UInt64.self, forKey: .chunkSeq)
+            let dataBase64 = try container.decode(String.self, forKey: .dataBase64)
+            self = .audioChunk(streamId: streamId, chunkSeq: chunkSeq, dataBase64: dataBase64)
+
+        case .audioStreamEnd:
+            let streamId = try container.decode(String.self, forKey: .streamId)
+            let cancel = try container.decode(Bool.self, forKey: .cancel)
+            self = .audioStreamEnd(streamId: streamId, cancel: cancel)
 
         case .toolInvoke:
             let invocationId = try container.decode(String.self, forKey: .invocationId)
@@ -426,7 +516,9 @@ extension EdgeMessage: Codable {
             try container.encode(sessionId, forKey: .sessionId)
             try container.encodeIfPresent(replayFrom, forKey: .replayFrom)
 
-        case .turnSubmit(let targetNodeId, let targetAgentId, let conversationId, let content, let blobRefs):
+        case .turnSubmit(
+            let targetNodeId, let targetAgentId, let conversationId, let content, let blobRefs,
+            let messageKind):
             try container.encode(Tag.turnSubmit.rawValue, forKey: .type)
             try container.encode(targetNodeId, forKey: .targetNodeId)
             try container.encode(targetAgentId, forKey: .targetAgentId)
@@ -435,6 +527,7 @@ extension EdgeMessage: Codable {
             if !blobRefs.isEmpty {
                 try container.encode(blobRefs, forKey: .blobRefs)
             }
+            try container.encodeIfPresent(messageKind, forKey: .messageKind)
 
         case .turnEvent(let conversationId, let eventKind, let content, let turnId):
             try container.encode(Tag.turnEvent.rawValue, forKey: .type)
@@ -468,6 +561,38 @@ extension EdgeMessage: Codable {
             try container.encode(downloadUrl, forKey: .downloadUrl)
             try container.encodeIfPresent(mime, forKey: .mime)
             try container.encodeIfPresent(transcript, forKey: .transcript)
+
+        case .voiceReply(
+            let conversationId, let turnId, let audioBase64, let mimeType, let transcript,
+            let chunkSeq, let isFinal):
+            try container.encode(Tag.voiceReply.rawValue, forKey: .type)
+            try container.encode(conversationId, forKey: .conversationId)
+            try container.encodeIfPresent(turnId, forKey: .turnId)
+            try container.encode(audioBase64, forKey: .audioBase64)
+            try container.encode(mimeType, forKey: .mimeType)
+            try container.encodeIfPresent(transcript, forKey: .transcript)
+            try container.encodeIfPresent(chunkSeq, forKey: .chunkSeq)
+            try container.encodeIfPresent(isFinal, forKey: .isFinal)
+
+        case .audioStreamStart(let streamId, let targetNodeId, let targetAgentId, let conversationId, let mimeType):
+            try container.encode(Tag.audioStreamStart.rawValue, forKey: .type)
+            try container.encode(streamId, forKey: .streamId)
+            try container.encode(targetNodeId, forKey: .targetNodeId)
+            try container.encode(targetAgentId, forKey: .targetAgentId)
+            try container.encodeIfPresent(conversationId, forKey: .conversationId)
+            try container.encode(mimeType, forKey: .mimeType)
+
+        case .audioChunk(let streamId, let chunkSeq, let dataBase64):
+            try container.encode(Tag.audioChunk.rawValue, forKey: .type)
+            try container.encode(streamId, forKey: .streamId)
+            try container.encode(chunkSeq, forKey: .chunkSeq)
+            try container.encode(dataBase64, forKey: .dataBase64)
+
+        case .audioStreamEnd(let streamId, let cancel):
+            try container.encode(Tag.audioStreamEnd.rawValue, forKey: .type)
+            try container.encode(streamId, forKey: .streamId)
+            // `cancel` is always encoded, matching the Rust wire form.
+            try container.encode(cancel, forKey: .cancel)
 
         case .toolInvoke(let invocationId, let toolRef, let argsJson):
             try container.encode(Tag.toolInvoke.rawValue, forKey: .type)

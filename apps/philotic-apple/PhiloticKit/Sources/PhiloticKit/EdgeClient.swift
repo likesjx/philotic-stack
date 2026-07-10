@@ -71,6 +71,10 @@ public actor EdgeClient {
 
     private var isRunning = false
     private var reconnectAttempt = 0
+    /// Incremented on every `connect()`. Guards stale stream-termination
+    /// callbacks: a previous stream's `onTermination` must never tear down
+    /// the session a LATER `connect()` established.
+    private var streamGeneration: UInt64 = 0
 
     /// Current connection lifecycle state.
     public private(set) var state: EdgeConnectionState = .disconnected
@@ -105,6 +109,12 @@ public actor EdgeClient {
         capabilities: EdgeCapabilities,
         cursor: String? = nil
     ) async throws -> AsyncStream<EdgeMessage> {
+        // Defensive: a connect over a live connection would leave two sockets
+        // for one node and trigger the server's single-session kick against
+        // ourselves. Tear the old one down first.
+        if isRunning {
+            await disconnect()
+        }
         self.url = url
         self.bearerToken = bearerToken
         self.nodeId = nodeId
@@ -114,11 +124,21 @@ public actor EdgeClient {
         self.isRunning = true
         self.reconnectAttempt = 0
 
+        streamGeneration += 1
+        let generation = streamGeneration
         let stream = AsyncStream<EdgeMessage> { continuation in
             self.continuation = continuation
-            continuation.onTermination = { [weak self] _ in
-                guard let self else { return }
-                Task { await self.disconnect() }
+            continuation.onTermination = { [weak self] reason in
+                // Only a consumer-side CANCELLATION of the stream should tear
+                // the connection down. `.finished` means WE finished it
+                // (disconnect / fatal handshake rejection) — reacting to it
+                // was the sticky-disconnect bug: a reconnect-over-existing-
+                // session finishes the old stream inside connect(), and the
+                // old stream's unconditional `disconnect()` then landed on
+                // the actor AFTER the new session opened, killing it with
+                // `isRunning = false` so nothing ever reconnected.
+                guard case .cancelled = reason, let self else { return }
+                Task { await self.disconnectIfCurrent(generation: generation) }
             }
         }
 
@@ -155,6 +175,13 @@ public actor EdgeClient {
         continuation = nil
     }
 
+    /// `disconnect()`, but only if `generation` is still the live stream —
+    /// termination callbacks from superseded streams are ignored.
+    private func disconnectIfCurrent(generation: UInt64) async {
+        guard generation == streamGeneration else { return }
+        await disconnect()
+    }
+
     /// The resume cursor to present on the next `Hello`: the highest durably
     /// processed server-push seq from this process, else the cursor handed
     /// to `connect`.
@@ -167,10 +194,11 @@ public actor EdgeClient {
     /// see `highestPeerSeqSeen`.
     static func advancesResumeCursor(_ message: EdgeMessage) -> Bool {
         switch message {
-        case .turnEvent, .approvalRequest, .lifeGraphChange, .voiceBlob, .toolInvoke:
+        case .turnEvent, .approvalRequest, .lifeGraphChange, .voiceBlob, .voiceReply, .toolInvoke:
             return true
         case .hello, .helloAck, .turnSubmit, .approvalResolve, .toolResult,
-            .capabilitiesUpdate, .ping, .pong, .error:
+            .capabilitiesUpdate, .ping, .pong, .error,
+            .audioStreamStart, .audioChunk, .audioStreamEnd:
             return false
         }
     }
@@ -242,22 +270,44 @@ public actor EdgeClient {
 
     private func receiveLoop() async {
         while isRunning, let currentTask = task {
+            let rawMessage: URLSessionWebSocketTask.Message
             do {
-                let envelope = try await receiveEnvelope(on: currentTask)
-                highestPeerSeqSeen = Self.advanceWatermark(
-                    highestPeerSeqSeen, envelopeSeq: envelope.seq, message: envelope.msg)
-                if case .ping(let nonce) = envelope.msg {
-                    try? await sendEnvelope(
-                        EdgeEnvelope(seq: nextSeq(), ack: highestPeerSeqSeen, msg: .pong(nonce: nonce))
-                    )
-                }
-                continuation?.yield(envelope.msg)
+                rawMessage = try await currentTask.receive()
             } catch {
+                // A genuine socket-level failure: the connection is gone.
                 guard isRunning else { return }
                 await handleDisconnect()
                 return
             }
+
+            let envelope: EdgeEnvelope
+            do {
+                envelope = try Self.decodeEnvelope(rawMessage)
+            } catch {
+                // A frame this build cannot decode — most commonly an
+                // unrecognized `"type"` tag the server started emitting after
+                // this build shipped — must not tear down an otherwise-live
+                // session. Log and keep listening; only socket-level failures
+                // (caught above) trigger reconnect.
+                logUndecodableFrame(error)
+                continue
+            }
+
+            highestPeerSeqSeen = Self.advanceWatermark(
+                highestPeerSeqSeen, envelopeSeq: envelope.seq, message: envelope.msg)
+            if case .ping(let nonce) = envelope.msg {
+                try? await sendEnvelope(
+                    EdgeEnvelope(seq: nextSeq(), ack: highestPeerSeqSeen, msg: .pong(nonce: nonce))
+                )
+            }
+            continuation?.yield(envelope.msg)
         }
+    }
+
+    private func logUndecodableFrame(_ error: Error) {
+        #if DEBUG
+        print("EdgeClient: skipping undecodable inbound frame: \(error)")
+        #endif
     }
 
     // MARK: - Keepalive
@@ -337,6 +387,10 @@ public actor EdgeClient {
 
     private func receiveEnvelope(on task: URLSessionWebSocketTask) async throws -> EdgeEnvelope {
         let message = try await task.receive()
+        return try Self.decodeEnvelope(message)
+    }
+
+    private static func decodeEnvelope(_ message: URLSessionWebSocketTask.Message) throws -> EdgeEnvelope {
         let data: Data
         switch message {
         case .data(let raw):

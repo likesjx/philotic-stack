@@ -8,6 +8,10 @@ import SwiftUI
 struct ConnectionStatusBar: View {
     let endpointName: String?
     let state: EdgeConnectionState
+    /// Shown as a "Reconnect" button while disconnected or failed. For
+    /// `.failed`, tapping retries the handshake (clearing the failed state);
+    /// the label text still carries the re-enrollment guidance.
+    var onReconnect: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -23,6 +27,11 @@ struct ConnectionStatusBar: View {
                     .foregroundStyle(.tertiary)
             }
             Spacer()
+            if showsReconnect, let onReconnect {
+                Button("Reconnect", action: onReconnect)
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -31,6 +40,13 @@ struct ConnectionStatusBar: View {
         #else
             .background(.bar)
         #endif
+    }
+
+    private var showsReconnect: Bool {
+        switch state {
+        case .disconnected, .failed: return true
+        case .connecting, .connected, .reconnecting: return false
+        }
     }
 
     private var label: String {
