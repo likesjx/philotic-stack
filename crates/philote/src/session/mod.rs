@@ -290,6 +290,13 @@ pub struct SessionState {
     /// fallback escalation) and dispatch is routed to this tier role at the
     /// `resolve_model_execution_target` choke point.
     pub pinned_tier_role: Option<String>,
+    /// Narrow persisted fallback override (Slice 2 of Model Failover Layers).
+    /// Set/updated by `advance_turn_to_next_fallback_tier` on a successful
+    /// escalation; sticks new turns to `active_tier_role` at the
+    /// `resolve_model_execution_target` choke point (beneath the operator
+    /// pin) until the periodic origin-tier probe clears it. Cleared on
+    /// `/role` changes, `/model` pin changes, and session reset paths.
+    pub fallback_override: Option<FallbackOverride>,
 }
 
 impl SessionState {
@@ -333,6 +340,7 @@ impl SessionState {
             active_user_task_id: None,
             base_context_window: None,
             pinned_tier_role: None,
+            fallback_override: None,
         }
     }
 
@@ -3763,6 +3771,7 @@ impl SessionState {
             "carryover_plan": self.carryover_plan,
             "active_user_task_id": self.active_user_task_id,
             "pinned_tier_role": self.pinned_tier_role,
+            "fallback_override": self.fallback_override,
             "life_recall_cache": self.life_recall_cache,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
@@ -4135,6 +4144,14 @@ impl SessionState {
             .and_then(|v| if v.is_null() { None } else { Some(v) })
             .and_then(|v| serde_json::from_value::<CarryoverPlan>(v.clone()).ok());
 
+        // Restore the fallback override if one was checkpointed. Missing key
+        // (checkpoints written before Slice 2) or unparseable value degrades
+        // to None — a session simply resumes on its primary tier.
+        let fallback_override = checkpoint
+            .get("fallback_override")
+            .and_then(|v| if v.is_null() { None } else { Some(v) })
+            .and_then(|v| serde_json::from_value::<FallbackOverride>(v.clone()).ok());
+
         Some(Self {
             session_id,
             agent_id,
@@ -4190,6 +4207,7 @@ impl SessionState {
                 .get("pinned_tier_role")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            fallback_override,
         })
     }
 }
@@ -5264,11 +5282,11 @@ mod tests {
     use super::{
         ActivePlan, ApprovalPolicy, ApprovalRiskHint, CarryoverPlan, ComponentExecutionRoute,
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
-        ContextLayerId, ContextMutability, HookRequest, HookResult, LIFE_RECALL_TRUNCATION_MARKER,
-        LifeRecallCacheEntry, MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope,
-        MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, PlanStep,
-        PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation,
-        SelectionSource, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ContextLayerId, ContextMutability, FallbackOverride, HookRequest, HookResult,
+        LIFE_RECALL_TRUNCATION_MARKER, LifeRecallCacheEntry, MemoryAuthority, MemorySpacetimeFrame,
+        MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus,
+        PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode,
+        RoleActivation, SelectionSource, SessionBindings, SessionState, TaskRunnerBaseConfig,
         ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, TurnRecord,
         VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn, apply_life_recall_char_budget,
         default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
@@ -5400,6 +5418,47 @@ mod tests {
 
         let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
         assert!(restored.pinned_tier_role.is_none());
+    }
+
+    #[test]
+    fn fallback_override_round_trips_through_checkpoint() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.fallback_override = Some(FallbackOverride {
+            origin_tier_role: "model.gemini".into(),
+            active_tier_role: "model.openrouter".into(),
+            reason: "provider_failure".into(),
+            since_epoch_ms: 1_000,
+            last_probe_epoch_ms: 1_000,
+            notice_sent: false,
+        });
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+
+        let ov = restored
+            .fallback_override
+            .expect("fallback override survives checkpoint round trip");
+        assert_eq!(ov.origin_tier_role, "model.gemini");
+        assert_eq!(ov.active_tier_role, "model.openrouter");
+        assert_eq!(ov.reason, "provider_failure");
+        assert_eq!(ov.since_epoch_ms, 1_000);
+        assert_eq!(ov.last_probe_epoch_ms, 1_000);
+        assert!(!ov.notice_sent);
+    }
+
+    #[test]
+    fn checkpoint_without_fallback_override_restores_none() {
+        // Simulate a checkpoint written before Slice 2: no fallback_override key.
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut checkpoint = state.checkpoint_json();
+        checkpoint
+            .as_object_mut()
+            .expect("checkpoint is an object")
+            .remove("fallback_override");
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert!(restored.fallback_override.is_none());
     }
 
     #[test]
