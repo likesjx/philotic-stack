@@ -80,6 +80,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
+use base64::Engine as _;
 use philotic_edge_protocol::{
     EdgeEnvelope, EdgeMessage, EnrollmentRequest, EnrollmentResponse, TurnEventKind,
     PROTOCOL_VERSION,
@@ -369,6 +370,24 @@ impl EdgeState {
         (seq, frame)
     }
 
+    /// Seq-number a frame and send it on the node's live-delivery channel
+    /// WITHOUT retaining it in the replay ring. For deliver-once payloads
+    /// minted by the retainer (e.g. inline voice audio): played live when a
+    /// session is up, silently dropped otherwise — the retained Final
+    /// `TurnEvent` still carries the transcript text for replay. Direct
+    /// session replies (Pong/Error) must NOT use this: the session writes
+    /// those to its own socket and the delivery channel would duplicate them.
+    pub(crate) fn outbound_delivery_only(&self, node_id: &str, msg: EdgeMessage) -> u64 {
+        let mut rings = self.rings.lock().expect("edge rings lock");
+        let ring = rings.entry(node_id.to_string()).or_default();
+        ring.next_seq += 1;
+        let seq = ring.next_seq;
+        let frame = serde_json::to_string(&EdgeEnvelope::new(seq, None, msg))
+            .expect("edge envelope serialization is infallible");
+        let _ = ring.delivery.send((seq, frame));
+        seq
+    }
+
     /// Retained `(seq, frame)` pairs with seq strictly greater than `cursor`,
     /// oldest first.
     pub(crate) fn replay_after(&self, node_id: &str, cursor: u64) -> Vec<(u64, String)> {
@@ -521,6 +540,199 @@ pub(crate) async fn handle_edge_ws(
     ws.on_upgrade(move |socket| edge_ws_session(socket, state, auth))
 }
 
+/// Resolve a client-supplied chat target to a registry node id. Edge clients
+/// commonly know hotels by name (`mbp-jane`) while the registry keys targets
+/// by node id (`mbp-jane-aiua-01`); the operator target view carries both, so
+/// hotel names map through it. Unknown values pass through untouched so aiua
+/// stays the authority on the final error.
+pub(crate) async fn resolve_target_node_id(state: &AppState, requested: &str) -> String {
+    match super::ipc_desktop_membrane_targets(&state.socket).await {
+        Ok(targets) => {
+            if targets.iter().any(|t| t.target_node_id == requested) {
+                return requested.to_string();
+            }
+            if let Some(t) = targets.iter().find(|t| t.target_hotel == requested) {
+                return t.target_node_id.clone();
+            }
+            requested.to_string()
+        }
+        Err(err) => {
+            eprintln!(
+                "philotic-web: edge target resolution unavailable ({err}); passing [{requested}] through"
+            );
+            requested.to_string()
+        }
+    }
+}
+
+/// Base URL of the hotel blob store the edge blob proxy forwards to:
+/// `PHILOTIC_WEB_BLOB_BASE` env, else the conventional default. TODO
+/// (apple-edge-client/edge-blob-discovery): resolve from the hotel record's
+/// advertised `blob_port` over IPC instead of configuration.
+fn edge_blob_base() -> String {
+    std::env::var("PHILOTIC_WEB_BLOB_BASE")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:9001".to_string())
+}
+
+/// `POST /api/edge/blob` — edge-bearer-scoped blob upload proxy. Accepts raw
+/// bytes (Content-Type = the media MIME), forwards them to the hotel blob
+/// store's multipart `/upload`, and returns `{blob_id, download_url, mime}`.
+/// The returned `download_url` is HOTEL-LOCAL (loopback): it is meant to ride
+/// a `TurnSubmit.blob_refs` entry so hotel-side consumers (transcription
+/// providers) can fetch it — remote devices should not expect to dereference
+/// it themselves.
+pub(crate) async fn handle_edge_blob(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "empty blob body"})),
+        )
+            .into_response();
+    }
+    let mime = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    match upload_to_blob_store(body.to_vec(), &mime).await {
+        Ok((blob_id, download_url)) => Json(json!({
+            "blob_id": blob_id,
+            "download_url": download_url,
+            "mime": mime,
+        }))
+        .into_response(),
+        Err(err) => (StatusCode::BAD_GATEWAY, Json(json!({"error": err}))).into_response(),
+    }
+}
+
+/// Upload bytes to the hotel blob store's multipart `/upload`. Returns
+/// `(blob_id, hotel-local download_url)`. Shared by the HTTP blob proxy and
+/// the streamed-audio assembly path.
+async fn upload_to_blob_store(bytes: Vec<u8>, mime: &str) -> Result<(String, String), String> {
+    let blob_base = edge_blob_base();
+    let part = match reqwest::multipart::Part::bytes(bytes.clone())
+        .file_name("edge-upload")
+        .mime_str(mime)
+    {
+        Ok(part) => part,
+        Err(_) => reqwest::multipart::Part::bytes(bytes).file_name("edge-upload"),
+    };
+    let form = reqwest::multipart::Form::new().part("file", part);
+    let response = reqwest::Client::new()
+        .post(format!("{blob_base}/upload"))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|err| format!("blob store unreachable at {blob_base}: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("blob store rejected upload: {}", response.status()));
+    }
+    let parsed: Value = response
+        .json()
+        .await
+        .map_err(|err| format!("bad blob store response: {err}"))?;
+    let blob_id = parsed
+        .get("blob_ids")
+        .and_then(Value::as_array)
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| "blob store returned no blob id".to_string())?
+        .to_string();
+    let download_url = format!("{blob_base}/download/{blob_id}");
+    Ok((blob_id, download_url))
+}
+
+#[derive(Serialize)]
+struct EdgeAgentEntry {
+    target_node_id: String,
+    agent_id: String,
+    display_name: String,
+    authority_hotel: String,
+}
+
+/// `GET /api/edge/agents` — edge-bearer-scoped agent directory. Returns each
+/// mesh agent with its authority hotel already resolved to a registry node id
+/// suitable for `TurnSubmit.target_node_id`, so clients never hardcode a
+/// catalog or guess node ids.
+pub(crate) async fn handle_edge_agents(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    let agents = match super::ipc_desktop_membrane_agents(&state.socket).await {
+        Ok(agents) => agents,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("hotel agents unavailable: {err}")})),
+            )
+                .into_response();
+        }
+    };
+    let targets = super::ipc_desktop_membrane_targets(&state.socket)
+        .await
+        .unwrap_or_default();
+    let mut entries: Vec<EdgeAgentEntry> = agents
+        .iter()
+        .map(|a| {
+            let target_node_id = targets
+                .iter()
+                .find(|t| t.target_hotel == a.authority_hotel)
+                .map(|t| t.target_node_id.clone())
+                .unwrap_or_else(|| a.authority_hotel.clone());
+            EdgeAgentEntry {
+                target_node_id,
+                agent_id: a.agent_id.clone(),
+                display_name: a.persona_name.clone(),
+                authority_hotel: a.authority_hotel.clone(),
+            }
+        })
+        .collect();
+    // Union in remote targets' agents so the directory covers the whole
+    // reachable mesh, not just this hotel's authority. Remote queries are
+    // best-effort: a slow or dark peer must not break the local list.
+    for target in &targets {
+        if target.is_local {
+            continue;
+        }
+        let inventory = tokio::time::timeout(
+            Duration::from_secs(4),
+            super::ipc_desktop_membrane_target_agents(&state.socket, &target.target_node_id),
+        )
+        .await;
+        let Ok(Ok(inventory)) = inventory else {
+            continue;
+        };
+        for a in &inventory.agents {
+            if entries
+                .iter()
+                .any(|e| e.target_node_id == target.target_node_id && e.agent_id == a.agent_id)
+            {
+                continue;
+            }
+            entries.push(EdgeAgentEntry {
+                target_node_id: target.target_node_id.clone(),
+                agent_id: a.agent_id.clone(),
+                display_name: a.persona_name.clone(),
+                authority_hotel: a.authority_hotel.clone(),
+            });
+        }
+    }
+    Json(json!({ "agents": entries })).into_response()
+}
+
 /// Outcome of a successful handshake ([`process_hello`]).
 #[derive(Debug, PartialEq)]
 struct HandshakeAccept {
@@ -653,6 +865,10 @@ async fn edge_ws_session(mut socket: WebSocket, state: AppState, auth: EdgeBeare
     let node_id = accept.node_id.clone();
     let marker = edge_session_marker(&node_id);
     let mut client_seq = accept.client_seq;
+    // Open uplink audio streams for this session (streaming voice capture).
+    // Session-scoped on purpose: a dropped connection discards partial audio
+    // — the client re-records rather than resuming a half-stream.
+    let mut audio_streams: HashMap<String, AudioAssembly> = HashMap::new();
 
     // Subscribe to the node's delivery channel before acking so no retained
     // frame minted mid-setup is missed (the replay dedupe below handles any
@@ -748,8 +964,15 @@ async fn edge_ws_session(mut socket: WebSocket, state: AppState, auth: EdgeBeare
                         }
                     }
                     Message::Text(text) => {
-                        match handle_edge_frame(&state, &node_id, &marker, &mut client_seq, &text)
-                            .await
+                        match handle_edge_frame(
+                            &state,
+                            &node_id,
+                            &marker,
+                            &mut client_seq,
+                            &mut audio_streams,
+                            &text,
+                        )
+                        .await
                         {
                             FrameOutcome::Continue => {}
                             FrameOutcome::Reply { msg, retain } => {
@@ -805,9 +1028,15 @@ pub(crate) fn spawn_edge_retainer(
         loop {
             match rx.recv().await {
                 Ok(raw) => {
-                    if let Some((node_id, msg)) = translate_edge_broadcast(&raw) {
+                    if let Some((node_id, msgs)) = translate_edge_broadcast(&raw) {
                         if edge.is_enrolled(&node_id) {
-                            let _ = edge.outbound_envelope(&node_id, None, msg, true);
+                            for (msg, retain) in msgs {
+                                if retain {
+                                    let _ = edge.outbound_envelope(&node_id, None, msg, true);
+                                } else {
+                                    let _ = edge.outbound_delivery_only(&node_id, msg);
+                                }
+                            }
                         }
                     }
                 }
@@ -837,6 +1066,24 @@ enum FrameOutcome {
     Close,
 }
 
+/// One in-flight uplink audio stream: chunks accumulate here until
+/// `AudioStreamEnd` seals the stream and the assembled audio becomes a
+/// blob-backed voice turn.
+struct AudioAssembly {
+    target_node_id: String,
+    target_agent_id: String,
+    conversation_id: Option<String>,
+    mime_type: String,
+    next_chunk: u64,
+    bytes: Vec<u8>,
+}
+
+/// Per-stream assembled-audio ceiling (matches the blob proxy body limit).
+const AUDIO_STREAM_MAX_BYTES: usize = 25 * 1024 * 1024;
+/// Concurrent open streams per session — one live recording plus headroom
+/// for a stop/start race.
+const AUDIO_STREAM_MAX_OPEN: usize = 2;
+
 /// Handle one post-handshake client frame. Fatal outcomes are protocol
 /// violations; undecodable frames only earn a non-fatal `Error` (a newer
 /// client may legitimately speak message types this server does not know).
@@ -845,6 +1092,7 @@ async fn handle_edge_frame(
     node_id: &str,
     marker: &str,
     client_seq: &mut u64,
+    audio_streams: &mut HashMap<String, AudioAssembly>,
     raw: &str,
 ) -> FrameOutcome {
     let envelope: EdgeEnvelope = match serde_json::from_str(raw) {
@@ -888,15 +1136,33 @@ async fn handle_edge_frame(
             conversation_id,
             content,
             blob_refs,
+            message_kind,
         } => {
-            if !blob_refs.is_empty() {
-                eprintln!(
-                    "philotic-web: edge turn from [{node_id}] carried {} blob ref(s) — ignored in v0",
-                    blob_refs.len()
-                );
-            }
+            // Blob refs become hotel-side attachments matching philote's
+            // TransportAttachment shape (crates/philote/src/protocol.rs) —
+            // `kind` and `file_id` are REQUIRED (missing fields make philote
+            // drop the whole task payload with only a warn), and the MIME
+            // key is `mime_type`. `file_id` has no transport meaning here,
+            // so the content-addressed blob id doubles as it.
+            let attachments: Vec<Value> = blob_refs
+                .iter()
+                .map(|b| {
+                    let kind = match message_kind.as_deref() {
+                        Some(k @ ("voice" | "audio")) => k,
+                        _ => "file",
+                    };
+                    json!({
+                        "kind": kind,
+                        "file_id": b.blob_id,
+                        "blob_id": b.blob_id,
+                        "blob_download_url": b.download_url,
+                        "mime_type": b.mime,
+                    })
+                })
+                .collect();
             let conversation_id = conversation_id
                 .unwrap_or_else(|| format!("operator-chat:{marker}:{target_agent_id}"));
+            let target_node_id = resolve_target_node_id(state, &target_node_id).await;
             match super::submit_operator_chat_turn(
                 state,
                 &target_node_id,
@@ -904,6 +1170,159 @@ async fn handle_edge_frame(
                 marker,
                 conversation_id.clone(),
                 content,
+                message_kind,
+                attachments,
+            )
+            .await
+            {
+                Ok(accepted) => FrameOutcome::Reply {
+                    msg: EdgeMessage::TurnEvent {
+                        conversation_id: accepted.conversation_id,
+                        event_kind: TurnEventKind::Status,
+                        content: "accepted".into(),
+                        turn_id: Some(accepted.turn_id),
+                    },
+                    retain: true,
+                },
+                Err(err) => FrameOutcome::Reply {
+                    msg: EdgeMessage::TurnEvent {
+                        conversation_id,
+                        event_kind: TurnEventKind::Error,
+                        content: err.message,
+                        turn_id: None,
+                    },
+                    retain: true,
+                },
+            }
+        }
+        EdgeMessage::AudioStreamStart {
+            stream_id,
+            target_node_id,
+            target_agent_id,
+            conversation_id,
+            mime_type,
+        } => {
+            if audio_streams.len() >= AUDIO_STREAM_MAX_OPEN {
+                return FrameOutcome::Reply {
+                    msg: edge_error("audio_stream", "too many open audio streams", false),
+                    retain: false,
+                };
+            }
+            if audio_streams.contains_key(&stream_id) {
+                return FrameOutcome::Reply {
+                    msg: edge_error("audio_stream", "duplicate stream id", false),
+                    retain: false,
+                };
+            }
+            audio_streams.insert(
+                stream_id,
+                AudioAssembly {
+                    target_node_id,
+                    target_agent_id,
+                    conversation_id,
+                    mime_type,
+                    next_chunk: 0,
+                    bytes: Vec::new(),
+                },
+            );
+            FrameOutcome::Continue
+        }
+        EdgeMessage::AudioChunk {
+            stream_id,
+            chunk_seq,
+            data_base64,
+        } => {
+            let Some(assembly) = audio_streams.get_mut(&stream_id) else {
+                return FrameOutcome::Reply {
+                    msg: edge_error("audio_stream", "chunk for unknown stream", false),
+                    retain: false,
+                };
+            };
+            if chunk_seq != assembly.next_chunk {
+                audio_streams.remove(&stream_id);
+                return FrameOutcome::Reply {
+                    msg: edge_error(
+                        "audio_stream",
+                        "out-of-order chunk; stream discarded",
+                        false,
+                    ),
+                    retain: false,
+                };
+            }
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data_base64) else {
+                audio_streams.remove(&stream_id);
+                return FrameOutcome::Reply {
+                    msg: edge_error("audio_stream", "undecodable chunk; stream discarded", false),
+                    retain: false,
+                };
+            };
+            if assembly.bytes.len() + bytes.len() > AUDIO_STREAM_MAX_BYTES {
+                audio_streams.remove(&stream_id);
+                return FrameOutcome::Reply {
+                    msg: edge_error(
+                        "audio_stream",
+                        "stream exceeds size ceiling; discarded",
+                        false,
+                    ),
+                    retain: false,
+                };
+            }
+            assembly.next_chunk += 1;
+            assembly.bytes.extend_from_slice(&bytes);
+            FrameOutcome::Continue
+        }
+        EdgeMessage::AudioStreamEnd { stream_id, cancel } => {
+            let Some(assembly) = audio_streams.remove(&stream_id) else {
+                return FrameOutcome::Reply {
+                    msg: edge_error("audio_stream", "end for unknown stream", false),
+                    retain: false,
+                };
+            };
+            if cancel {
+                return FrameOutcome::Continue;
+            }
+            if assembly.bytes.is_empty() {
+                return FrameOutcome::Reply {
+                    msg: edge_error("audio_stream", "stream sealed with no audio", false),
+                    retain: false,
+                };
+            }
+            let conversation_id = assembly
+                .conversation_id
+                .clone()
+                .unwrap_or_else(|| format!("operator-chat:{marker}:{}", assembly.target_agent_id));
+            let (blob_id, download_url) =
+                match upload_to_blob_store(assembly.bytes, &assembly.mime_type).await {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        return FrameOutcome::Reply {
+                            msg: EdgeMessage::TurnEvent {
+                                conversation_id,
+                                event_kind: TurnEventKind::Error,
+                                content: format!("voice stream store failed: {err}"),
+                                turn_id: None,
+                            },
+                            retain: true,
+                        };
+                    }
+                };
+            let attachments = vec![json!({
+                "kind": "voice",
+                "file_id": blob_id,
+                "blob_id": blob_id,
+                "blob_download_url": download_url,
+                "mime_type": assembly.mime_type,
+            })];
+            let target_node_id = resolve_target_node_id(state, &assembly.target_node_id).await;
+            match super::submit_operator_chat_turn(
+                state,
+                &target_node_id,
+                &assembly.target_agent_id,
+                marker,
+                conversation_id.clone(),
+                String::new(),
+                Some("voice".to_string()),
+                attachments,
             )
             .await
             {
@@ -972,6 +1391,7 @@ async fn handle_edge_frame(
         | EdgeMessage::ApprovalRequest { .. }
         | EdgeMessage::LifeGraphChange { .. }
         | EdgeMessage::VoiceBlob { .. }
+        | EdgeMessage::VoiceReply { .. }
         | EdgeMessage::ToolInvoke { .. } => FrameOutcome::Fatal {
             code: "protocol",
             message: "clients must not send server-to-client message types".into(),
@@ -980,9 +1400,9 @@ async fn handle_edge_frame(
 }
 
 /// Translate an operator-chat broadcast event addressed to ANY edge node
-/// (marker `edge:{node_id}`) into `(node_id, TurnEvent)`. Used by the
+/// (marker `edge:{node_id}`) into `(node_id, [(frame, retain)])`. Used by the
 /// process-wide retainer, which does not know a marker up front.
-fn translate_edge_broadcast(raw: &str) -> Option<(String, EdgeMessage)> {
+fn translate_edge_broadcast(raw: &str) -> Option<(String, Vec<(EdgeMessage, bool)>)> {
     let value: Value = serde_json::from_str(raw).ok()?;
     let marker = value
         .get("payload")?
@@ -993,19 +1413,28 @@ fn translate_edge_broadcast(raw: &str) -> Option<(String, EdgeMessage)> {
     if node_id.is_empty() {
         return None;
     }
-    let msg = translate_operator_broadcast_value(&marker, &value)?;
-    Some((node_id, msg))
+    let msgs = translate_operator_broadcast_value(&marker, &value);
+    if msgs.is_empty() {
+        return None;
+    }
+    Some((node_id, msgs))
 }
 
 /// Translate an operator-chat broadcast event (as fanned out by
-/// `stream_operator_chat_turn`) into a `TurnEvent` frame for the edge node
-/// whose session marker is `marker`. Returns `None` for events that belong
-/// to other sessions or other types.
-fn translate_operator_broadcast_value(marker: &str, value: &Value) -> Option<EdgeMessage> {
-    let kind = value.get("type")?.as_str()?;
-    let payload = value.get("payload")?;
+/// `stream_operator_chat_turn`) into edge frames for the node whose session
+/// marker is `marker`, each paired with a retain flag (replayable or
+/// ephemeral). Empty for events that belong to other sessions/types. A final
+/// reply with an inline synthesized-audio artifact yields the retained Final
+/// `TurnEvent` plus an ephemeral `VoiceReply`.
+fn translate_operator_broadcast_value(marker: &str, value: &Value) -> Vec<(EdgeMessage, bool)> {
+    let Some(kind) = value.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(payload) = value.get("payload") else {
+        return Vec::new();
+    };
     if payload.get("operator_session_id").and_then(Value::as_str) != Some(marker) {
-        return None;
+        return Vec::new();
     }
     let conversation_id = payload
         .get("conversation_id")
@@ -1023,18 +1452,95 @@ fn translate_operator_broadcast_value(marker: &str, value: &Value) -> Option<Edg
             .unwrap_or(fallback)
             .to_string()
     };
+    if kind == "operator_chat:voice_chunk" {
+        return voice_reply_from_payload(
+            payload,
+            &conversation_id,
+            turn_id,
+            &str_field("content", ""),
+        )
+        .map(|voice| vec![(voice, false)])
+        .unwrap_or_default();
+    }
     let (event_kind, content) = match kind {
         "operator_chat:turn_event" => (TurnEventKind::Status, str_field("event", "unknown")),
         "operator_chat:partial_reply" => (TurnEventKind::Token, str_field("content", "")),
         "operator_chat:reply" => (TurnEventKind::Final, str_field("content", "")),
         "operator_chat:error" => (TurnEventKind::Error, str_field("message", "turn failed")),
+        _ => return Vec::new(),
+    };
+    let mut out = vec![(
+        EdgeMessage::TurnEvent {
+            conversation_id: conversation_id.clone(),
+            event_kind,
+            content: content.clone(),
+            turn_id: turn_id.clone(),
+        },
+        true,
+    )];
+    if kind == "operator_chat:reply" {
+        if let Some(voice) = voice_reply_from_payload(payload, &conversation_id, turn_id, &content)
+        {
+            out.push((voice, false));
+        }
+    }
+    out
+}
+
+/// Extract an inline persona-voice reply from a `send_reply` broadcast
+/// payload. The philote attaches TTS output as `audio_artifact` — a
+/// serialized [`AudioArtifactEnvelope`] JSON string (or already-inline
+/// object) with `audio_base64` at the top level (Synthesized path) or nested
+/// under `payload` (NativeAudio path).
+fn voice_reply_from_payload(
+    payload: &Value,
+    conversation_id: &str,
+    turn_id: Option<String>,
+    content: &str,
+) -> Option<EdgeMessage> {
+    let chunk_seq = payload.get("chunk_seq").and_then(Value::as_u64);
+    let is_final = payload.get("is_final").and_then(Value::as_bool);
+    let raw = payload.get("audio_artifact")?;
+    let artifact: Value = match raw {
+        Value::String(s) => serde_json::from_str(s).ok()?,
+        Value::Object(_) => raw.clone(),
         _ => return None,
     };
-    Some(EdgeMessage::TurnEvent {
-        conversation_id,
-        event_kind,
-        content,
+    let nested = artifact.get("payload");
+    let audio_base64 = artifact
+        .get("audio_base64")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            nested
+                .and_then(|p| p.get("audio_base64"))
+                .and_then(Value::as_str)
+        })?
+        .to_string();
+    if audio_base64.is_empty() {
+        return None;
+    }
+    let mime_type = artifact
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            nested
+                .and_then(|p| p.get("mime_type"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("audio/mpeg")
+        .to_string();
+    Some(EdgeMessage::VoiceReply {
+        conversation_id: conversation_id.to_string(),
         turn_id,
+        audio_base64,
+        mime_type,
+        transcript: if content.is_empty() {
+            None
+        } else {
+            Some(content.to_string())
+        },
+        chunk_seq,
+        is_final,
     })
 }
 
@@ -1520,10 +2026,78 @@ mod tests {
     // ── Broadcast translation ───────────────────────────────────────────────
 
     /// Test shim over [`translate_operator_broadcast_value`] keeping the
-    /// original string-based call sites readable.
+    /// original string-based call sites readable (first frame only).
     fn translate_operator_broadcast(marker: &str, raw: &str) -> Option<EdgeMessage> {
         let value: Value = serde_json::from_str(raw).ok()?;
         translate_operator_broadcast_value(marker, &value)
+            .into_iter()
+            .next()
+            .map(|(msg, _)| msg)
+    }
+
+    /// All frames (with retain flags) for a raw broadcast string.
+    fn translate_operator_broadcast_all(marker: &str, raw: &str) -> Vec<(EdgeMessage, bool)> {
+        let value: Value = serde_json::from_str(raw).ok().unwrap_or(Value::Null);
+        translate_operator_broadcast_value(marker, &value)
+    }
+
+    #[test]
+    fn reply_with_audio_artifact_yields_ephemeral_voice_reply() {
+        let marker = "edge:edge-node-1";
+        let artifact = json!({
+            "kind": "audio_artifact",
+            "provider": "elevenlabs",
+            "mime_type": "audio/mpeg",
+            "audio_base64": "bW9jay1hdWRpbw=="
+        })
+        .to_string();
+        let raw = broadcast_event(
+            "operator_chat:reply",
+            marker,
+            &[("content", "Hello!"), ("audio_artifact", artifact.as_str())],
+        );
+        let frames = translate_operator_broadcast_all(marker, &raw);
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected Final + VoiceReply, got {frames:?}"
+        );
+        assert!(matches!(
+            frames[0],
+            (
+                EdgeMessage::TurnEvent {
+                    event_kind: TurnEventKind::Final,
+                    ..
+                },
+                true
+            )
+        ));
+        match &frames[1] {
+            (
+                EdgeMessage::VoiceReply {
+                    audio_base64,
+                    mime_type,
+                    transcript,
+                    ..
+                },
+                retain,
+            ) => {
+                assert_eq!(audio_base64, "bW9jay1hdWRpbw==");
+                assert_eq!(mime_type, "audio/mpeg");
+                assert_eq!(transcript.as_deref(), Some("Hello!"));
+                assert!(!retain, "voice replies must be ephemeral (not replayed)");
+            }
+            other => panic!("expected VoiceReply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reply_without_audio_yields_single_retained_final() {
+        let marker = "edge:edge-node-1";
+        let raw = broadcast_event("operator_chat:reply", marker, &[("content", "Hello!")]);
+        let frames = translate_operator_broadcast_all(marker, &raw);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].1, "final turn events must stay replayable");
     }
 
     fn broadcast_event(kind: &str, marker: &str, extra: &[(&str, &str)]) -> String {
