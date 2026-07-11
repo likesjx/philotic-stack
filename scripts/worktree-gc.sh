@@ -27,6 +27,17 @@
 #   7. NEVER `cargo clean` a preserved worktree, never touch remote branches.
 #   8. FAIL SAFE: a bare run is a DRY RUN. Deletion requires `--apply` or
 #      PHILOTIC_WTGC_APPLY=1.
+#   9. GRACE PERIOD: NEVER reap an otherwise-removable (merged+clean+non-
+#      excluded) worktree whose most-recent git activity is within
+#      PHILOTIC_WTGC_GRACE_HOURS (default 6). A brand-new `git worktree add`
+#      is clean and sits at the develop tip, so it counts as merged+clean the
+#      instant it exists — without this, the scheduled job could delete a fresh
+#      worktree out from under the session that just created it but hasn't
+#      committed yet. "Most-recent activity" is the NEWEST mtime among the
+#      worktree's `.git` pointer file and the HEAD file in its resolved gitdir;
+#      both are (re)written by `git worktree add` and by any commit/checkout,
+#      but NOT by cargo builds — so an idle-but-recently-created worktree is
+#      protected while a long-idle merged one is still reaped.
 #
 # USAGE
 #   scripts/worktree-gc.sh [--dry-run | --apply]
@@ -35,6 +46,8 @@
 #   env PHILOTIC_WTGC_APPLY=1   same as --apply
 #   env PHILOTIC_WTGC_KEEP      extra branch names to preserve
 #                               (space- or comma-separated)
+#   env PHILOTIC_WTGC_GRACE_HOURS   grace window in hours (default 6); newer
+#                               otherwise-removable worktrees are preserved
 #
 # LOG: every run appends to ~/.philotic/worktree-gc.log
 # =============================================================================
@@ -52,6 +65,11 @@ EXCLUDE_BRANCHES=("codex/model-catalog-sync")
 
 LOG_FILE="${HOME}/.philotic/worktree-gc.log"
 DATA_VOLUME="/System/Volumes/Data"
+
+# Grace window (hours). An otherwise-removable worktree whose most-recent git
+# activity is newer than this is PRESERVED so a freshly-created, not-yet-
+# committed worktree isn't reaped before its session starts working.
+GRACE_HOURS="${PHILOTIC_WTGC_GRACE_HOURS:-6}"
 
 # --- argument / mode parsing --------------------------------------------------
 
@@ -118,6 +136,23 @@ has_uncommitted() {
     leftover="$(git -C "${wt}" status --porcelain 2>/dev/null \
         | grep -vE '^\?\? (.*/)?target/?$' || true)"
     [[ -n "${leftover}" ]]
+}
+
+# newest_activity_epoch <worktree>: echoes the NEWEST mtime (epoch seconds)
+# among the worktree's git-activity markers — its `.git` pointer file and the
+# HEAD file in its resolved gitdir. Both are (re)written by `git worktree add`
+# and by any commit/checkout, but NOT by cargo builds, so this tracks real git
+# activity rather than build churn. Echoes 0 if no marker is stat-able.
+newest_activity_epoch() {
+    local wt="$1"
+    local gitdir newest=0 marker m
+    gitdir="$(git -C "${wt}" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    for marker in "${wt}/.git" "${gitdir:+${gitdir}/HEAD}"; do
+        [[ -n "${marker}" && -e "${marker}" ]] || continue
+        m="$(stat -f %m "${marker}" 2>/dev/null || true)"
+        [[ -n "${m}" && "${m}" -gt "${newest}" ]] && newest="${m}"
+    done
+    printf '%s' "${newest}"
 }
 
 # --- preflight ----------------------------------------------------------------
@@ -188,6 +223,22 @@ process_worktree() {
         log "PRESERVE (excluded): ${wt} (${branch})"
         n_preserved=$((n_preserved + 1))
         return
+    fi
+
+    # Invariant 9: grace period. This worktree is otherwise removable
+    # (merged+clean+not-excluded), but a freshly-created one looks exactly like
+    # this the instant it exists. Preserve it if its most-recent git activity is
+    # within the grace window so a session that just created it isn't reaped
+    # before its first commit.
+    local activity age_h
+    activity="$(newest_activity_epoch "${wt}")"
+    if [[ "${activity}" -gt 0 ]]; then
+        age_h=$(( ( $(date +%s) - activity ) / 3600 ))
+        if [[ "${age_h}" -lt "${GRACE_HOURS}" ]]; then
+            log "PRESERVE (grace: touched ${age_h}h ago): ${wt} (${branch})"
+            n_preserved=$((n_preserved + 1))
+            return
+        fi
     fi
 
     # Eligible: merged AND clean AND not-excluded.
