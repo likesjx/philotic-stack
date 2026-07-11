@@ -23,9 +23,12 @@ public final class VoiceController: NSObject {
     public private(set) var transcript: String = ""
     /// True while actively capturing microphone audio for dictation.
     public private(set) var isListening: Bool = false
-    /// True while capturing raw audio via ``startRecording()`` (the default
-    /// mic mode — the recording is uploaded for hotel-side transcription).
+    /// True while capturing raw audio to a container via ``startRecording()``
+    /// (HTTP-upload fallback path — batch transcription wants a container).
     public private(set) var isRecording: Bool = false
+    /// True while capturing raw PCM via ``startPCMStreaming()`` (default WS
+    /// streaming mic mode — realtime STT consumes raw PCM, not AAC).
+    public private(set) var isCapturingPCM: Bool = false
     /// True while a voice reply or fallback utterance is audible.
     public private(set) var isPlaying: Bool = false
     /// Last voice-related failure, suitable for display in the UI. Cleared
@@ -39,15 +42,19 @@ public final class VoiceController: NSObject {
 
     private var audioRecorder: AVAudioRecorder?
     private var recordingURL: URL?
-    /// Tail-follower for streaming capture: polls the growing recording file
-    /// and yields appended bytes into the chunk stream.
-    private var tailTask: Task<Void, Never>?
+
+    private var pcmEngine: AVAudioEngine?
+    private var pcmContinuation: AsyncStream<Data>.Continuation?
+    private var pcmAccumulator: PCMFrameAccumulator?
 
     private var audioPlayer: AVAudioPlayer?
     private let speechSynthesizer = AVSpeechSynthesizer()
 
     /// MIME type of files produced by ``startRecording()`` (.m4a / AAC).
     public static let recordingMimeType = "audio/mp4"
+    /// MIME type of frames produced by ``startPCMStreaming()`` — raw
+    /// little-endian signed 16-bit PCM, 16 kHz, mono, no container.
+    public static let pcmStreamMimeType = "audio/pcm;rate=16000;channels=1"
 
     public override init() {
         self.speechRecognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer()
@@ -260,65 +267,143 @@ public final class VoiceController: NSObject {
         try? FileManager.default.removeItem(at: url)
     }
 
-    // MARK: - Streaming capture
+    // NOTE: the previous m4a "tail-follower" streaming capture
+    // (startStreamingRecording / stopStreamingRecording) was retired when
+    // the WS streaming path moved to raw PCM (realtime STT consumes PCM,
+    // not AAC containers). The HTTP-upload fallback uses the plain
+    // startRecording()/stopRecording() pair above.
 
-    /// Starts recording (same temp `.m4a` as ``startRecording()``) and
-    /// returns an `AsyncStream` of the file's appended bytes, polled every
-    /// ~250ms by a tail-follower. The stream finishes only after
-    /// ``stopStreamingRecording()``: the recorder is stopped FIRST (which
-    /// finalizes the container — the moov atom is written on stop), then the
-    /// follower drains to EOF so the finalized bytes are always included and
-    /// the concatenated chunks form a complete, valid m4a.
-    public func startStreamingRecording() async -> AsyncStream<Data>? {
-        await startRecording()
-        guard isRecording, let url = recordingURL else { return nil }
+    // MARK: - PCM streaming capture (realtime STT)
+
+    /// Starts a raw-PCM capture and returns an `AsyncStream` of ~250ms
+    /// frames of 16 kHz mono s16le audio (``pcmStreamMimeType``), suitable
+    /// for the server's realtime STT pipeline. The tap converts each engine
+    /// buffer via `AVAudioConverter` and accumulates bytes into fixed-size
+    /// frames; ``stopPCMStreaming()`` flushes the remainder and finishes
+    /// the stream.
+    public func startPCMStreaming() async -> AsyncStream<Data>? {
+        guard !isCapturingPCM, !isRecording, !isListening else { return nil }
+        voiceError = nil
+
+        guard await Self.requestMicrophoneAuthorization() else {
+            voiceError = "Microphone permission was denied. Enable it in Settings to send voice messages."
+            return nil
+        }
+
+        #if os(iOS)
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            voiceError = "Could not configure the audio session: \(error.localizedDescription)"
+            return nil
+        }
+        #endif
+
+        let engine = AVAudioEngine()
+        let inputNode = engine.inputNode
+
+        // Echo cancellation: Apple's voice processing (AEC/noise suppression)
+        // so the agent's own audio doesn't transcribe itself in conversation
+        // mode. MUST happen before the format is read and the tap installed —
+        // enabling voice processing changes the node's I/O format.
+        do {
+            try inputNode.setVoiceProcessingEnabled(true)
+        } catch {
+            // Not fatal: capture still works, but the agent's voice may leak
+            // into the mic (barge-in becomes less reliable).
+            #if DEBUG
+            print("VoiceController: voice processing unavailable: \(error)")
+            #endif
+        }
+
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard
+            inputFormat.sampleRate > 0,
+            let targetFormat = AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: true
+            ),
+            let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+        else {
+            voiceError = "Could not configure PCM conversion for this input device."
+            return nil
+        }
 
         let (stream, continuation) = AsyncStream<Data>.makeStream()
-        tailTask = Task {
-            guard let handle = try? FileHandle(forReadingFrom: url) else {
-                continuation.finish()
-                return
-            }
-            defer { try? handle.close() }
-            while !Task.isCancelled {
-                if let chunk = try? handle.readToEnd(), !chunk.isEmpty {
-                    continuation.yield(chunk)
+        // 250ms @ 16 kHz mono s16le = 16000 * 0.25 * 2 bytes.
+        let accumulator = PCMFrameAccumulator(frameSize: 8_000)
+
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
+            // Runs on the audio render thread: convert to 16k mono Int16,
+            // slice into fixed frames, and yield (the continuation is
+            // Sendable; observable state is never touched from here).
+            let ratio = targetFormat.sampleRate / inputFormat.sampleRate
+            let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 64
+            guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity)
+            else { return }
+
+            var fed = false
+            let status = converter.convert(to: outBuffer, error: nil) { _, outStatus in
+                if fed {
+                    outStatus.pointee = .noDataNow
+                    return nil
                 }
-                try? await Task.sleep(nanoseconds: 250_000_000)
+                fed = true
+                outStatus.pointee = .haveData
+                return buffer
             }
-            // Final drain: cancellation only ever arrives from
-            // stopStreamingRecording(), AFTER the recorder has been stopped
-            // and the file finalized — read to EOF to pick up the tail
-            // (including the moov atom the recorder writes on stop).
-            if let tail = try? handle.readToEnd(), !tail.isEmpty {
-                continuation.yield(tail)
+            guard status != .error, outBuffer.frameLength > 0,
+                let channelData = outBuffer.int16ChannelData
+            else { return }
+
+            let byteCount = Int(outBuffer.frameLength) * MemoryLayout<Int16>.size
+            let converted = Data(bytes: channelData[0], count: byteCount)
+            for frame in accumulator.append(converted) {
+                continuation.yield(frame)
             }
-            continuation.finish()
         }
+
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            continuation.finish()
+            voiceError = "Could not start the audio engine: \(error.localizedDescription)"
+            return nil
+        }
+
+        pcmEngine = engine
+        pcmContinuation = continuation
+        pcmAccumulator = accumulator
+        isCapturingPCM = true
         return stream
     }
 
-    /// Stops streaming capture: recorder first (finalizing the file), then
-    /// waits for the tail-follower's final drain so the chunk stream has
-    /// yielded every byte and finished before this returns. Deletes the
-    /// temp file (all bytes have been handed to the stream consumer).
-    public func stopStreamingRecording() async {
-        guard isRecording else { return }
-        audioRecorder?.stop()
-        audioRecorder = nil
-        isRecording = false
+    /// Stops PCM capture: removes the tap, stops the engine, flushes the
+    /// accumulator's remaining sub-frame bytes as a final (short) frame,
+    /// and finishes the stream.
+    public func stopPCMStreaming() {
+        guard isCapturingPCM else { return }
+        pcmEngine?.inputNode.removeTap(onBus: 0)
+        pcmEngine?.stop()
+        pcmEngine = nil
+
+        if let tail = pcmAccumulator?.drain(), !tail.isEmpty {
+            pcmContinuation?.yield(tail)
+        }
+        pcmAccumulator = nil
+        pcmContinuation?.finish()
+        pcmContinuation = nil
+        isCapturingPCM = false
+
         #if os(iOS)
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         #endif
-
-        tailTask?.cancel()
-        await tailTask?.value
-        tailTask = nil
-
-        if let url = recordingURL {
-            try? FileManager.default.removeItem(at: url)
-        }
-        recordingURL = nil
     }
 
     // MARK: - Voice-reply playback
@@ -345,6 +430,12 @@ public final class VoiceController: NSObject {
     }
 
     // MARK: - Chunked voice-reply playback
+
+    /// True while agent reply audio is audible or queued — the barge-in
+    /// condition for conversation mode (stricter VAD onset applies).
+    public var hasPendingReplyAudio: Bool {
+        isPlaying || !chunkQueue.isEmpty
+    }
 
     /// FIFO of decoded audio chunks awaiting playback (per-sentence TTS).
     private var chunkQueue: [Data] = []
@@ -458,5 +549,40 @@ extension VoiceController: AVAudioPlayerDelegate {
         Task { @MainActor [weak self] in
             self?.handlePlaybackFinished(errorDescription: description)
         }
+    }
+}
+
+/// Lock-protected byte accumulator that slices an incoming PCM byte stream
+/// into fixed-size frames. Written from the audio render thread (the tap),
+/// drained from the main actor on stop — hence the lock.
+final class PCMFrameAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = Data()
+    private let frameSize: Int
+
+    init(frameSize: Int) {
+        self.frameSize = frameSize
+    }
+
+    /// Appends `data` and returns every complete frame now available.
+    func append(_ data: Data) -> [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        buffer.append(data)
+        var frames: [Data] = []
+        while buffer.count >= frameSize {
+            frames.append(buffer.prefix(frameSize))
+            buffer.removeFirst(frameSize)
+        }
+        return frames
+    }
+
+    /// Returns (and clears) any remaining sub-frame bytes.
+    func drain() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        let tail = buffer
+        buffer = Data()
+        return tail
     }
 }

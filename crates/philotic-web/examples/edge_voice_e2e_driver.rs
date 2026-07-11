@@ -283,7 +283,10 @@ async fn main() {
     // ── assertions ───────────────────────────────────────────────────────────
     let mut failures = 0usize;
     let mut check = |name: &str, ok: bool, evidence: String| {
-        println!("ASSERT {name} {} — {evidence}", if ok { "PASS" } else { "FAIL" });
+        println!(
+            "ASSERT {name} {} — {evidence}",
+            if ok { "PASS" } else { "FAIL" }
+        );
         if !ok {
             failures += 1;
         }
@@ -376,7 +379,11 @@ async fn main() {
                 let path = format!(
                     "{out_dir}/voice-chunk-{}.{}",
                     chunk_seq.map_or("whole".to_string(), |s| s.to_string()),
-                    if mime_type.contains("mpeg") { "mp3" } else { "bin" }
+                    if mime_type.contains("mpeg") {
+                        "mp3"
+                    } else {
+                        "bin"
+                    }
                 );
                 std::fs::write(&path, &bytes).expect("write voice chunk");
                 d_evidence.push(format!(

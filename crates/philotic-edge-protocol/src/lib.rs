@@ -154,6 +154,21 @@ pub enum EdgeMessage {
         #[serde(default)]
         cancel: bool,
     },
+    /// Server -> client: live partial transcript of an open uplink audio
+    /// stream (realtime STT). Ephemeral feedback — never retained/replayed,
+    /// never advances the resume cursor. `is_final: true` carries the final
+    /// transcript that becomes the submitted turn's content.
+    TranscriptPartial {
+        /// Uplink audio stream this transcript belongs to.
+        stream_id: String,
+        /// Conversation the eventual turn belongs to, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        /// Transcript text so far (full-replace, not a delta).
+        text: String,
+        /// True when this is the final transcript for the stream.
+        is_final: bool,
+    },
     /// Server -> client: inline synthesized voice audio for a completed
     /// turn. Audio rides inline (base64) because hotel TTS artifacts are
     /// inline and blob download URLs embed loopback hosts a remote device
@@ -508,6 +523,42 @@ mod tests {
             let back: EdgeEnvelope = serde_json::from_str(golden).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), golden);
         }
+    }
+
+    #[test]
+    fn round_trip_transcript_partial() {
+        round_trip(EdgeMessage::TranscriptPartial {
+            stream_id: "stream-1".to_string(),
+            conversation_id: Some("conv-9".to_string()),
+            text: "hello wor".to_string(),
+            is_final: false,
+        });
+        round_trip(EdgeMessage::TranscriptPartial {
+            stream_id: "stream-1".to_string(),
+            conversation_id: None,
+            text: "hello world".to_string(),
+            is_final: true,
+        });
+    }
+
+    /// Golden wire fixture for `TranscriptPartial` — copy-pastable into Swift
+    /// Codable tests. Do not change without bumping PROTOCOL_VERSION.
+    #[test]
+    fn golden_json_transcript_partial() {
+        const GOLDEN: &str = r#"{"v":1,"seq":13,"msg":{"type":"transcript_partial","stream_id":"stream-1","text":"hello wor","is_final":false}}"#;
+        let envelope = EdgeEnvelope::new(
+            13,
+            None,
+            EdgeMessage::TranscriptPartial {
+                stream_id: "stream-1".to_string(),
+                conversation_id: None,
+                text: "hello wor".to_string(),
+                is_final: false,
+            },
+        );
+        assert_eq!(serde_json::to_string(&envelope).unwrap(), GOLDEN);
+        let back: EdgeEnvelope = serde_json::from_str(GOLDEN).unwrap();
+        assert_eq!(back, envelope);
     }
 
     #[test]

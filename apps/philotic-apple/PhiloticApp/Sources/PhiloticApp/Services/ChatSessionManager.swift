@@ -54,6 +54,14 @@ public final class ChatSessionManager {
     public private(set) var isSendingVoice = false
     /// True while voice audio is streaming live over the edge WebSocket.
     public private(set) var isStreamingVoice = false
+    /// Realtime partial transcript of the in-flight voice stream (server
+    /// STT), rendered live in the input field. Stays nil when the server
+    /// sends no `transcript_partial` frames (older hotel) — the UI degrades
+    /// to the plain "Streaming…" state.
+    public private(set) var liveTranscript: String?
+    /// True while hands-free conversation mode is running (continuous PCM
+    /// capture + VAD-segmented utterance cycles).
+    public private(set) var isConversationActive = false
 
     private static let speakAllRepliesDefaultsKey = "com.philotic.apple.speakAllReplies"
     private static let transcribeOnDeviceDefaultsKey = "com.philotic.apple.transcribeOnDevice"
@@ -87,6 +95,30 @@ public final class ChatSessionManager {
     /// chunks are currently accepted into the playback queue. Chunks keyed
     /// to anything else (a superseded turn) are dropped.
     private var activeChunkedReplyKey: String?
+
+    /// The "🎤 Voice message" placeholder bubble of the most recent streamed
+    /// voice turn, so a late `transcript_partial(is_final:true)` (it usually
+    /// lands after `audio_stream_end`) can replace the placeholder with the
+    /// real transcript. Harmlessly stale if no final ever arrives.
+    private var pendingVoiceBubble: (streamId: String, conversationId: String, messageId: String)?
+    /// Final transcripts that arrived while their stream was still active
+    /// (server finalized before the user released the mic), keyed by
+    /// stream_id, consumed when the bubble is created at stream end.
+    private var earlyFinalTranscripts: [String: String] = [:]
+
+    /// Conversation mode: pumps VAD-segmented utterances from the continuous
+    /// PCM capture into audio_stream cycles.
+    @ObservationIgnored private var conversationTask: Task<Void, Never>?
+    /// VAD state machine; recreated fresh on every `startConversation()`.
+    @ObservationIgnored private var vad = VoiceActivityDetector()
+    /// stream_id of conversation mode's currently OPEN utterance, if any.
+    private var conversationStreamId: String?
+    /// chunk_seq for the open conversation utterance (resets per utterance).
+    @ObservationIgnored private var conversationChunkSeq: UInt64 = 0
+    /// Conversations whose in-flight agent reply the user barged in on:
+    /// VoiceReply frames for them are dropped until the next Final
+    /// TurnEvent (which belongs to the user's NEW turn) clears the flag.
+    private var suppressedVoiceReplyConversations: Set<String> = []
 
     /// Auto-reconnect triggers: network-path recovery, app activation, and
     /// a gentle periodic retry while frontmost. All of them only act on
@@ -265,13 +297,17 @@ public final class ChatSessionManager {
         fallbackTasks.values.forEach { $0.cancel() }
         fallbackTasks.removeAll()
         // A dropped/closed WS discards partial audio streams server-side;
-        // just stop capturing and drop the forwarder.
+        // just stop capturing and drop the forwarder / conversation loop.
+        if isConversationActive {
+            await stopConversation()
+        }
         if isStreamingVoice {
-            await voiceController.stopStreamingRecording()
+            voiceController.stopPCMStreaming()
             voiceStreamTask?.cancel()
             voiceStreamTask = nil
             activeVoiceStreamId = nil
             isStreamingVoice = false
+            liveTranscript = nil
         }
         voiceController.stopPlayback()
         voiceController.cancelFallback()
@@ -318,7 +354,19 @@ public final class ChatSessionManager {
     // MARK: - Sending / receiving
 
     public func send(_ text: String) async {
-        await submitTurn(content: text, messageKind: nil)
+        // "Speak replies" prefers the agent's PERSONA voice over local TTS:
+        // tagging the typed turn voice-modality sets philote's
+        // had_voice_input, so a `mode: auto` voice policy synthesizes the
+        // reply (ElevenLabs) server-side. Local Apple TTS remains only the
+        // 2.5s no-VoiceReply fallback (e.g. agents on pre-voice hotels).
+        if speakAllReplies {
+            if let conversation = currentConversation {
+                voiceExpectedConversations.insert(conversation.conversationId)
+            }
+            await submitTurn(content: text, messageKind: "voice")
+        } else {
+            await submitTurn(content: text, messageKind: nil)
+        }
     }
 
     /// Dictation path (on-device STT text), used when the "Transcribe on
@@ -376,14 +424,17 @@ public final class ChatSessionManager {
 
     // MARK: - Streaming voice capture (default mic behavior)
 
-    /// Begins voice capture. While the edge WS is connected the audio
-    /// streams live over the socket (`audio_stream_start` / `audio_chunk` /
-    /// `audio_stream_end`) and the SERVER assembles + submits the voice turn
-    /// itself. When not connected, falls back to record→HTTP blob upload so
-    /// the mic always works.
+    /// Begins voice capture. While the edge WS is connected, raw PCM
+    /// (16 kHz mono s16le — what the realtime STT API consumes) streams
+    /// live over the socket (`audio_stream_start` / `audio_chunk` /
+    /// `audio_stream_end`) and the SERVER transcribes in realtime and
+    /// submits the voice turn itself. When not connected, falls back to
+    /// record-to-m4a → HTTP blob upload (batch transcription still wants a
+    /// container) so the mic always works.
     public func startVoiceStreaming() async {
         guard let target = currentAgent, currentConversation != nil else { return }
-        guard !isStreamingVoice, !voiceController.isRecording else { return }
+        guard !isStreamingVoice, !voiceController.isRecording, !voiceController.isCapturingPCM
+        else { return }
 
         guard case .connected = connectionState else {
             voiceCaptureIsFallback = true
@@ -392,10 +443,13 @@ public final class ChatSessionManager {
         }
         voiceCaptureIsFallback = false
 
-        guard let chunks = await voiceController.startStreamingRecording() else { return }
+        guard let chunks = await voiceController.startPCMStreaming() else { return }
 
         let streamId = UUID().uuidString
         let conversationId = currentConversation?.conversationId
+        liveTranscript = nil
+        pendingVoiceBubble = nil
+        earlyFinalTranscripts.removeAll()
 
         do {
             try await edgeClient.send(
@@ -404,12 +458,12 @@ public final class ChatSessionManager {
                     targetNodeId: target.targetNodeId,
                     targetAgentId: target.targetAgentId,
                     conversationId: conversationId,
-                    mimeType: VoiceController.recordingMimeType
+                    mimeType: VoiceController.pcmStreamMimeType
                 )
             )
         } catch {
             lastError = "Voice stream failed to start: \(error.localizedDescription)"
-            await voiceController.stopStreamingRecording()
+            voiceController.stopPCMStreaming()
             return
         }
 
@@ -438,13 +492,14 @@ public final class ChatSessionManager {
         }
     }
 
-    /// Ends voice capture. Streaming path: stops the recorder (finalizing
-    /// the m4a), waits for the forwarder to send the drained tail chunk(s),
-    /// then sends `audio_stream_end(cancel: false)` — the server submits the
-    /// turn and the usual accepted-status/reply/VoiceReply flow follows on
-    /// this conversation. If any chunk failed, ends with `cancel: true`
-    /// instead (a partial stream is useless — re-record, don't resume).
-    /// Fallback path: uploads the finished recording over HTTP.
+    /// Ends voice capture. Streaming path: stops PCM capture (flushing the
+    /// accumulator's tail frame through the chunk stream), waits for the
+    /// forwarder to send the remaining chunk(s), then sends
+    /// `audio_stream_end(cancel: false)` — the server submits the turn and
+    /// the usual accepted-status/reply/VoiceReply flow follows on this
+    /// conversation. If any chunk failed, ends with `cancel: true` instead
+    /// (a partial stream is useless — re-record, don't resume). Fallback
+    /// path: uploads the finished m4a recording over HTTP.
     public func finishVoiceStreaming() async {
         if voiceCaptureIsFallback {
             voiceCaptureIsFallback = false
@@ -455,23 +510,19 @@ public final class ChatSessionManager {
 
         guard isStreamingVoice, let streamId = activeVoiceStreamId else { return }
 
-        // Recorder stop FIRST: finalizes the file, the tail-follower drains
-        // to EOF (moov atom included) and the chunk stream finishes, which
-        // lets the forwarder task complete.
-        await voiceController.stopStreamingRecording()
+        // Capture stop FIRST: flushes the final sub-frame bytes and finishes
+        // the chunk stream, which lets the forwarder task complete.
+        voiceController.stopPCMStreaming()
         let allChunksSent = await voiceStreamTask?.value ?? false
         voiceStreamTask = nil
         activeVoiceStreamId = nil
         isStreamingVoice = false
+        liveTranscript = nil
 
         do {
-            if allChunksSent, let conversation = currentConversation {
+            if allChunksSent, currentConversation != nil {
                 try await edgeClient.send(.audioStreamEnd(streamId: streamId, cancel: false))
-                voiceExpectedConversations.insert(conversation.conversationId)
-                var updated = conversation
-                updated.messages.append(ChatMessage(role: .operatorUser, content: "🎤 Voice message"))
-                currentConversation = updated
-                await conversationStore.upsert(updated)
+                await concludeVoiceUtterance(streamId: streamId)
             } else {
                 try await edgeClient.send(.audioStreamEnd(streamId: streamId, cancel: true))
                 lastError = "Voice stream interrupted — please try again."
@@ -481,6 +532,195 @@ public final class ChatSessionManager {
             lastError = "Voice stream failed: \(error.localizedDescription)"
             appendSystemMessage("Voice stream failed: \(error.localizedDescription)", isError: true)
         }
+    }
+
+    /// Shared post-`audio_stream_end(cancel:false)` bookkeeping for both
+    /// push-to-talk and conversation-mode utterances: marks the conversation
+    /// voice-expecting and appends the operator bubble. If the realtime STT
+    /// already finalized, the bubble carries the transcript immediately;
+    /// otherwise it's a "🎤 Voice message" placeholder that a late
+    /// `transcript_partial(is_final:true)` replaces (and remains a
+    /// placeholder if partials never arrive — graceful degradation).
+    private func concludeVoiceUtterance(streamId: String) async {
+        guard let conversation = currentConversation else { return }
+        voiceExpectedConversations.insert(conversation.conversationId)
+        let bubbleText = earlyFinalTranscripts.removeValue(forKey: streamId) ?? "🎤 Voice message"
+        let message = ChatMessage(role: .operatorUser, content: bubbleText)
+        var updated = conversation
+        updated.messages.append(message)
+        currentConversation = updated
+        await conversationStore.upsert(updated)
+        if bubbleText == "🎤 Voice message" {
+            pendingVoiceBubble = (streamId, conversation.conversationId, message.id)
+        }
+    }
+
+    // MARK: - Conversation mode (hands-free, client-side VAD)
+
+    /// Starts hands-free conversation mode: one continuous PCM capture; an
+    /// energy VAD segments utterances, each of which runs a full
+    /// audio_stream_start/chunk/end cycle (fresh stream_id, same target and
+    /// conversation) — live transcript, transcript bubble, accepted status,
+    /// and streamed VoiceReply playback all apply per utterance unchanged.
+    /// Requires a live connection (no HTTP fallback — hands-free over batch
+    /// upload makes no sense). Push-to-talk is untouched.
+    public func startConversation() async {
+        guard currentAgent != nil, currentConversation != nil else { return }
+        guard !isConversationActive else { return }
+        guard !isStreamingVoice, !voiceController.isRecording, !voiceController.isListening,
+            !voiceController.isCapturingPCM
+        else { return }
+        guard case .connected = connectionState else {
+            lastError = "Conversation mode needs a live connection."
+            return
+        }
+
+        guard let frames = await voiceController.startPCMStreaming() else { return }
+
+        vad = VoiceActivityDetector()
+        conversationStreamId = nil
+        conversationChunkSeq = 0
+        liveTranscript = nil
+        pendingVoiceBubble = nil
+        earlyFinalTranscripts.removeAll()
+        isConversationActive = true
+
+        conversationTask = Task { [weak self] in
+            for await frame in frames {
+                guard !Task.isCancelled, let self else { return }
+                await self.handleConversationFrame(frame)
+            }
+        }
+    }
+
+    /// Ends conversation mode. An open (mid-speech) utterance is discarded
+    /// (`cancel: true`) rather than submitted as a half phrase.
+    public func stopConversation() async {
+        guard isConversationActive else { return }
+        isConversationActive = false
+
+        if let streamId = conversationStreamId {
+            conversationStreamId = nil
+            try? await edgeClient.send(.audioStreamEnd(streamId: streamId, cancel: true))
+        }
+        voiceController.stopPCMStreaming()  // finishes the frame stream → task loop ends
+        conversationTask?.cancel()
+        conversationTask = nil
+        activeVoiceStreamId = nil
+        liveTranscript = nil
+    }
+
+    private func handleConversationFrame(_ frame: Data) async {
+        guard isConversationActive else { return }
+        // Stricter (sustained) onset while agent audio is audible or queued,
+        // to resist residual echo triggering false barge-ins.
+        let agentAudioActive = voiceController.hasPendingReplyAudio
+        for event in vad.process(frame: frame, requireSustainedOnset: agentAudioActive) {
+            switch event {
+            case .utteranceStarted(let preRollFrames):
+                if agentAudioActive {
+                    performBargeIn()
+                }
+                await beginConversationUtterance(preRollFrames: preRollFrames)
+            case .utteranceContinued(let frame):
+                await sendConversationFrame(frame)
+            case .utteranceEnded(let valid):
+                await endConversationUtterance(valid: valid)
+            }
+        }
+    }
+
+    /// Client-side barge-in: kill the agent's audio locally and drop the
+    /// rest of its reply chunks. Nothing is sent server-side (server-side
+    /// cancel is a later slice) — the interrupted turn's remaining
+    /// VoiceReply frames still arrive and are dropped via
+    /// `suppressedVoiceReplyConversations` until the NEXT turn's Final
+    /// TurnEvent clears the suppression (this also covers the case where
+    /// the interrupted turn's chunk 0 hadn't even arrived yet, which the
+    /// stale-key mechanism alone would miss).
+    private func performBargeIn() {
+        voiceController.stopPlayback()
+        voiceController.cancelFallback()
+        if let conversation = currentConversation {
+            cancelScheduledFallback(for: conversation.conversationId)
+            suppressedVoiceReplyConversations.insert(conversation.conversationId)
+        }
+        activeChunkedReplyKey = nil
+    }
+
+    private func beginConversationUtterance(preRollFrames: [Data]) async {
+        guard let target = currentAgent, let conversation = currentConversation else { return }
+        let streamId = UUID().uuidString
+        conversationStreamId = streamId
+        conversationChunkSeq = 0
+        activeVoiceStreamId = streamId  // routes transcript_partial → liveTranscript
+        liveTranscript = nil
+
+        do {
+            try await edgeClient.send(
+                .audioStreamStart(
+                    streamId: streamId,
+                    targetNodeId: target.targetNodeId,
+                    targetAgentId: target.targetAgentId,
+                    conversationId: conversation.conversationId,
+                    mimeType: VoiceController.pcmStreamMimeType
+                )
+            )
+            // Pre-roll first, so the utterance's first words aren't clipped.
+            for frame in preRollFrames {
+                try await sendConversationChunk(frame, streamId: streamId)
+            }
+        } catch {
+            await failConversation(error)
+        }
+    }
+
+    private func sendConversationFrame(_ frame: Data) async {
+        guard let streamId = conversationStreamId else { return }
+        do {
+            try await sendConversationChunk(frame, streamId: streamId)
+        } catch {
+            await failConversation(error)
+        }
+    }
+
+    private func sendConversationChunk(_ frame: Data, streamId: String) async throws {
+        try await edgeClient.send(
+            .audioChunk(
+                streamId: streamId,
+                chunkSeq: conversationChunkSeq,
+                dataBase64: frame.base64EncodedString()
+            )
+        )
+        conversationChunkSeq += 1
+    }
+
+    private func endConversationUtterance(valid: Bool) async {
+        guard let streamId = conversationStreamId else { return }
+        conversationStreamId = nil
+        activeVoiceStreamId = nil
+
+        do {
+            // Too-short utterances (coughs) are discarded server-side.
+            try await edgeClient.send(.audioStreamEnd(streamId: streamId, cancel: !valid))
+            if valid {
+                await concludeVoiceUtterance(streamId: streamId)
+            } else {
+                earlyFinalTranscripts[streamId] = nil
+            }
+        } catch {
+            await failConversation(error)
+        }
+        liveTranscript = nil
+    }
+
+    /// A send failed mid-conversation (WS died): surface it and shut the
+    /// mode down — the reconnect triggers will restore the connection, and
+    /// the operator can re-enter conversation mode.
+    private func failConversation(_ error: Error) async {
+        guard isConversationActive else { return }
+        lastError = "Conversation stream failed: \(error.localizedDescription)"
+        await stopConversation()
     }
 
     /// - Parameters:
@@ -530,6 +770,12 @@ public final class ChatSessionManager {
         case .voiceReply(
             let conversationId, let turnId, let audioBase64, let mimeType, _,
             let chunkSeq, _):
+            // Barge-in suppression: reply audio for a turn the user talked
+            // over is dropped entirely (chunked AND whole) — the next turn's
+            // Final TurnEvent lifts the suppression before its reply arrives.
+            if suppressedVoiceReplyConversations.contains(conversationId) {
+                return
+            }
             // Audio-only presentation: the matching Final `TurnEvent` carries
             // the text and lands in the transcript separately, so we do not
             // append another bubble here. The first frame (whole reply or
@@ -557,6 +803,9 @@ public final class ChatSessionManager {
                 voiceController.play(base64: audioBase64, mimeType: mimeType)
             }
 
+        case .transcriptPartial(let streamId, _, let text, let isFinal):
+            await handleTranscriptPartial(streamId: streamId, text: text, isFinal: isFinal)
+
         case .error(_, let errorMessage, let fatal):
             lastError = errorMessage
             if fatal {
@@ -569,6 +818,53 @@ public final class ChatSessionManager {
         default:
             break
         }
+    }
+
+    // MARK: - Realtime transcript routing
+
+    /// Routes `transcript_partial` frames: while the stream is active,
+    /// partials feed ``liveTranscript`` (rendered live in the input field);
+    /// a final transcript replaces the sent turn's "🎤 Voice message"
+    /// placeholder bubble — whether it arrives before or after
+    /// `audio_stream_end`. Frames for unknown/stale streams are ignored.
+    private func handleTranscriptPartial(streamId: String, text: String, isFinal: Bool) async {
+        if streamId == activeVoiceStreamId {
+            liveTranscript = text
+            if isFinal {
+                // Finalized before the user released the mic: remember it so
+                // the bubble created at stream end carries the transcript.
+                earlyFinalTranscripts[streamId] = text
+            }
+            return
+        }
+
+        // Stream already ended: only a final transcript is actionable (it
+        // replaces the placeholder bubble); late non-final partials for a
+        // finished stream are ignored.
+        guard isFinal, let pending = pendingVoiceBubble, pending.streamId == streamId else { return }
+        pendingVoiceBubble = nil
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        var conversation: Conversation
+        var isCurrent = false
+        if let current = currentConversation, current.conversationId == pending.conversationId {
+            conversation = current
+            isCurrent = true
+        } else if let stored = await conversationStore.conversationMatching(
+            conversationId: pending.conversationId)
+        {
+            conversation = stored
+        } else {
+            return
+        }
+
+        guard let index = conversation.messages.firstIndex(where: { $0.id == pending.messageId })
+        else { return }
+        conversation.messages[index].content = text
+        if isCurrent {
+            currentConversation = conversation
+        }
+        await conversationStore.upsert(conversation)
     }
 
     // MARK: - Voice fallback scheduling
@@ -628,6 +924,9 @@ public final class ChatSessionManager {
             }
 
         case .final:
+            // A Final always belongs to the newest turn: lift any barge-in
+            // suppression so THIS turn's voice reply can play.
+            suppressedVoiceReplyConversations.remove(conversationId)
             let spokenText: String
             if let last = conversation.messages.last, last.role == .agent, last.isStreaming {
                 var updated = last
