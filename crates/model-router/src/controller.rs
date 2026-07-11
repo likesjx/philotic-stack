@@ -1905,7 +1905,10 @@ pub fn serialize_audio_artifact(artifact: &AudioArtifact) -> Result<String> {
     )
 }
 
-async fn fetch_config_string(ipc_client: &mut PhiloticClient, key: &str) -> Result<Option<String>> {
+pub(crate) async fn fetch_config_string(
+    ipc_client: &mut PhiloticClient,
+    key: &str,
+) -> Result<Option<String>> {
     let response = ipc_client
         .send_request(IpcRequest::GetConfig { key: key.into() })
         .await?;
