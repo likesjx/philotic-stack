@@ -573,10 +573,7 @@ fn voice_response_provider_options(policy: &VoiceResponsePolicy) -> Map<String, 
 fn content_policy_provider_options(effective_content_policy: &str) -> Map<String, Value> {
     let mut options = Map::new();
     if effective_content_policy != "standard" {
-        options.insert(
-            "content_policy".into(),
-            json!(effective_content_policy),
-        );
+        options.insert("content_policy".into(), json!(effective_content_policy));
     }
     options
 }
@@ -591,7 +588,11 @@ fn content_policy_provider_options(effective_content_policy: &str) -> Map<String
 pub(crate) fn resolve_content_policy_provider_options(
     state: Option<&SessionState>,
 ) -> Map<String, Value> {
-    content_policy_provider_options(state.map(|s| s.effective_content_policy()).unwrap_or("standard"))
+    content_policy_provider_options(
+        state
+            .map(|s| s.effective_content_policy())
+            .unwrap_or("standard"),
+    )
 }
 
 fn voice_response_contract(policy: &VoiceResponsePolicy) -> Value {
@@ -896,8 +897,15 @@ fn resolve_model_execution_target(
         return target;
     }
 
-    if let Some(role) = ladder_primary_role(state, fallback_role) {
-        return (local_node_id(), role, None);
+    // The text fallback ladder serves TEXT capabilities only. Media
+    // capabilities (voice.transcribe, image.describe, media.analyze, …) must
+    // fall through: ladder tiers are text controllers (openrouter/ollama/…)
+    // with no media providers, and routing a voice note there yields
+    // "no provider registered for voice.transcribe".
+    if matches!(capability, "text.generate" | "response.generate") {
+        if let Some(role) = ladder_primary_role(state, fallback_role) {
+            return (local_node_id(), role, None);
+        }
     }
 
     if let Some(implementation) =
@@ -1003,6 +1011,11 @@ fn ladder_primary_role(state: Option<&SessionState>, fallback_role: &str) -> Opt
 /// attempted (try it before advancing further) — see DEF: off-by-one on
 /// single-tier ladders.
 fn primary_dispatch_used_ladder(state: Option<&SessionState>, capability: &str) -> bool {
+    // Media capabilities never dispatch via the ladder (see the gating in
+    // resolve_model_execution_target) — keep the two computations in sync.
+    if !matches!(capability, "text.generate" | "response.generate") {
+        return false;
+    }
     if pre_ladder_dispatch_target(state, capability, DEFAULT_TEXT_MODEL_ROLE).is_some() {
         return false;
     }
@@ -2940,11 +2953,38 @@ impl AgentRuntime {
             ));
         }
         let (target_node, target_role, target_guest_id) = {
-            let (node, role, guest_id) = resolve_model_execution_target(
-                self.sessions.get(&session_id),
-                &capability,
-                DEFAULT_TEXT_MODEL_ROLE,
-            );
+            let (node, role, guest_id) = if capability == "voice.transcribe"
+                && media_policy
+                    .transcription_provider
+                    .as_deref()
+                    .map(|p| !p.trim().is_empty())
+                    .unwrap_or(false)
+            {
+                // The agent's media policy names an STT provider — dispatch
+                // straight to that provider's controller role (e.g.
+                // "elevenlabs" → model.elevenlabs / Scribe). Transcription
+                // must never ride the text fallback ladder: its tiers are
+                // text controllers with no media providers.
+                let provider = media_policy
+                    .transcription_provider
+                    .as_deref()
+                    .unwrap()
+                    .trim()
+                    .to_ascii_lowercase();
+                let role = if provider == "gemini" {
+                    // Gemini's controller registers the plain "model" role.
+                    DEFAULT_TEXT_MODEL_ROLE.to_string()
+                } else {
+                    format!("model.{provider}")
+                };
+                (local_node_id(), role, None)
+            } else {
+                resolve_model_execution_target(
+                    self.sessions.get(&session_id),
+                    &capability,
+                    DEFAULT_TEXT_MODEL_ROLE,
+                )
+            };
             // Network-offline fast-path: skip cloud tiers entirely and go straight
             // to the local model. Uses the last entry in the configured fallback
             // tiers, falling back to DEFAULT_FALLBACK_TIERS.
@@ -7777,6 +7817,20 @@ mod tests {
     }
 
     #[test]
+    fn media_capabilities_never_ride_the_text_fallback_ladder() {
+        // No session state at all: text capability may consult the (absent)
+        // ladder and still lands on the fallback role; media capabilities
+        // must land on the fallback role WITHOUT ladder consultation. The
+        // regression this guards: a session whose text ladder starts at
+        // model.openrouter sent voice.transcribe to a text-only controller
+        // ("no provider registered for voice.transcribe").
+        let (_, role, _) = resolve_model_execution_target(None, "voice.transcribe", "model");
+        assert_eq!(role, "model");
+        let (_, role, _) = resolve_model_execution_target(None, "media.analyze", "model");
+        assert_eq!(role, "model");
+    }
+
+    #[test]
     fn image_action_describe_routes_to_image_describe_capability() {
         use crate::session::MediaRoutingPolicy;
 
@@ -8373,7 +8427,10 @@ mod tests {
     /// no user-facing reply yet, no heal event yet.
     #[tokio::test]
     async fn life_observe_contract_error_retries_model_once_with_cause() {
-        let socket_path = format!("/tmp/philote-lifeobs-retry-{}.sock", Uuid::new_v4().simple());
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-retry-{}.sock",
+            Uuid::new_v4().simple()
+        );
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
@@ -8460,9 +8517,7 @@ mod tests {
             *emitted
         );
         assert!(
-            emitted
-                .iter()
-                .all(|e| e["task"]["action"] != "send_reply"),
+            emitted.iter().all(|e| e["task"]["action"] != "send_reply"),
             "no user-facing reply should fire before the retry is exhausted: {:#?}",
             *emitted
         );
@@ -8473,7 +8528,10 @@ mod tests {
     /// retry is attempted.
     #[tokio::test]
     async fn life_observe_contract_error_after_retry_exhausted_heals_and_tells_user() {
-        let socket_path = format!("/tmp/philote-lifeobs-exhausted-{}.sock", Uuid::new_v4().simple());
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-exhausted-{}.sock",
+            Uuid::new_v4().simple()
+        );
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
@@ -8576,7 +8634,10 @@ mod tests {
     /// class already has its own handling elsewhere.
     #[tokio::test]
     async fn life_observe_non_contract_error_does_not_retry_or_heal() {
-        let socket_path = format!("/tmp/philote-lifeobs-transport-{}.sock", Uuid::new_v4().simple());
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-transport-{}.sock",
+            Uuid::new_v4().simple()
+        );
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
@@ -8647,7 +8708,10 @@ mod tests {
     /// entirely and go straight to heal_queue + user notification.
     #[tokio::test]
     async fn life_observe_direct_command_origin_contract_error_skips_retry() {
-        let socket_path = format!("/tmp/philote-lifeobs-direct-{}.sock", Uuid::new_v4().simple());
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-direct-{}.sock",
+            Uuid::new_v4().simple()
+        );
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
@@ -8702,7 +8766,12 @@ mod tests {
             .iter()
             .filter(|e| e.get("heal_event").is_some())
             .collect();
-        assert_eq!(heal_events.len(), 1, "expected one heal event: {:#?}", *emitted);
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "expected one heal event: {:#?}",
+            *emitted
+        );
         assert_eq!(
             heal_events[0]["heal_event"]["pattern_tag"],
             "life_observe_parse_failed"
@@ -8718,7 +8787,12 @@ mod tests {
             .iter()
             .filter(|e| e["task"]["action"] == "send_reply")
             .collect();
-        assert_eq!(send_replies.len(), 1, "user must still be told: {:#?}", *emitted);
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "user must still be told: {:#?}",
+            *emitted
+        );
     }
 
     // ── Turn-failure heal intake (self-heal) ─────────────────────────────────
