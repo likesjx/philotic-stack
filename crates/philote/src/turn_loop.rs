@@ -1456,7 +1456,11 @@ impl AgentRuntime {
                 .unwrap_or(0);
 
             if is_contract_error && !is_direct_origin && repair_attempts < 1 {
-                let cause = task.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+                let cause = task
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_default();
                 warn!(
                     session_id = %session_id,
                     turn_id = %turn_id,
@@ -1488,7 +1492,11 @@ impl AgentRuntime {
                 // model's one bounded retry already failed again — don't drop
                 // it silently. File a heal_queue entry so it's A3-visible
                 // instead of just an apology to the operator.
-                let cause = task.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+                let cause = task
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_default();
                 self.push_heal_event(
                     "life_observe_parse_failed",
                     &format!(
