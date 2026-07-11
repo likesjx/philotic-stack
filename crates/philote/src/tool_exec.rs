@@ -871,6 +871,7 @@ impl AgentRuntime {
                 | SlashCommand::Tts { .. }
                 | SlashCommand::Voice { .. }
                 | SlashCommand::Model { .. }
+                | SlashCommand::ModelPreset { .. }
                 | SlashCommand::Correct { .. }
                 | SlashCommand::Plan { .. } => {}
             }
@@ -1098,6 +1099,7 @@ impl AgentRuntime {
             | SlashCommand::Tts { .. }
             | SlashCommand::Voice { .. }
             | SlashCommand::Model { .. }
+            | SlashCommand::ModelPreset { .. }
             | SlashCommand::Correct { .. }
             | SlashCommand::Plan { .. } => {}
         }

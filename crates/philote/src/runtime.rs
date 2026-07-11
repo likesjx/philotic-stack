@@ -1,4 +1,6 @@
-use crate::commands::{SlashCommand, command_manifest, parse_slash_command};
+use crate::commands::{
+    SlashCommand, command_manifest, find_preset, model_presets, parse_slash_command,
+};
 use crate::r#loop::{
     AgentAction, ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase,
     interpret_model_payload,
@@ -2187,6 +2189,7 @@ impl AgentRuntime {
                 SlashCommand::Tts { .. } => {}
                 SlashCommand::Voice { .. } => {}
                 SlashCommand::Model { .. } => {}
+                SlashCommand::ModelPreset { .. } => {}
                 SlashCommand::Abandon { .. } => {}
                 SlashCommand::Plan { drop } => {
                     // Resolved without starting a turn so it works mid-turn too.
@@ -2832,7 +2835,8 @@ impl AgentRuntime {
                 SlashCommand::Plan { .. } => Ok(()),
                 SlashCommand::Tts { .. }
                 | SlashCommand::Voice { .. }
-                | SlashCommand::Model { .. } => {
+                | SlashCommand::Model { .. }
+                | SlashCommand::ModelPreset { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
                     )
@@ -5135,6 +5139,124 @@ impl AgentRuntime {
         // OperatorExplicit (see handle_user_message), which disables automatic
         // fallback escalation in advance_turn_to_next_fallback_tier, and is
         // routed at the resolve_model_execution_target choke point.
+        if let SlashCommand::ModelPreset { ref alias } = command {
+            let reply = match find_preset(alias) {
+                None => format!(
+                    "Unknown model preset `{alias}`. Send /model to see the available presets."
+                ),
+                Some(preset) => {
+                    // Read the active role + its current turn-loop config so we
+                    // change ONLY the model routing and preserve everything else
+                    // (toolset, manifest, content policy). This keeps the
+                    // ConfigureRole a "model-selection-only" change, which the
+                    // hotel gate lets a non-admin orchestrator apply to its own
+                    // role (see role_materialization.rs).
+                    let (role_name, mut tlc, toolset_profile) = {
+                        match self.sessions.get(&session_id) {
+                            Some(state) => {
+                                let ra = state.role_activation.as_ref();
+                                let role_name = ra
+                                    .map(|r| r.role_name.clone())
+                                    .unwrap_or_else(|| "orchestrator".to_string());
+                                let tlc = ra
+                                    .and_then(|r| r.turn_loop_config.clone())
+                                    .or_else(|| {
+                                        self.configured_roles
+                                            .get(&role_name)
+                                            .map(|c| c.turn_loop_config.clone())
+                                    })
+                                    .unwrap_or_default();
+                                let toolset_profile = ra
+                                    .and_then(|r| r.toolset_profile_ref.clone())
+                                    .or_else(|| {
+                                        self.configured_roles
+                                            .get(&role_name)
+                                            .map(|c| c.toolset_profile.clone())
+                                    })
+                                    .unwrap_or_else(|| "default".to_string());
+                                (role_name, tlc, toolset_profile)
+                            }
+                            None => (
+                                "orchestrator".to_string(),
+                                ansible_mesh_core::graph::TurnLoopConfig::default(),
+                                "default".to_string(),
+                            ),
+                        }
+                    };
+
+                    // Make the preset's provider tier primary, then bind the
+                    // concrete model name to that tier (Layer 1 model_bindings).
+                    let tier = preset.tier_role.to_string();
+                    let mut tiers: Vec<String> = tlc.fallback_tiers.clone();
+                    tiers.retain(|t| t != &tier);
+                    tiers.insert(0, tier.clone());
+                    if let Some(model_id) = preset.model_id {
+                        tlc.model_bindings.insert(tier.clone(), model_id.to_string());
+                    }
+                    tlc.fallback_tiers = tiers.clone();
+
+                    let req = IpcRequest::ConfigureRole {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        guest_id: format!("{}:{}", self.agent_id, role_name),
+                        calling_role: role_name.clone(),
+                        toolset_profile,
+                        role_identity_addendum: None,
+                        role_manifest: None,
+                        is_admin: false,
+                        inactive_ttl_seconds: None,
+                        iteration_cap: None,
+                        approval_policy: None,
+                        model_profile: None,
+                        context_window_policy: None,
+                        fallback_tiers: Some(tiers),
+                        model_bindings: Some(tlc.model_bindings.clone()),
+                        content_policy: None,
+                    };
+
+                    match self.ipc_client.send_request(req).await {
+                        Ok(IpcResponse::ConfigureRoleOk { .. }) => {
+                            // Live: update the active session's role config so the
+                            // very next turn routes through the new model — no
+                            // restart, mirroring role.configure's cache update.
+                            if let Some(state) = self.sessions.get_mut(&session_id) {
+                                if let Some(ra) = state.role_activation.as_mut() {
+                                    ra.turn_loop_config = Some(tlc.clone());
+                                }
+                            }
+                            if let Some(cached) = self.configured_roles.get_mut(&role_name) {
+                                cached.turn_loop_config = tlc;
+                            }
+                            format!("✅ Switched to {}. (live — no restart)", preset.label)
+                        }
+                        Ok(other) => {
+                            warn!("/model preset swap unexpected response: {other:?}");
+                            format!("Couldn't switch to {} — unexpected hotel response.", preset.label)
+                        }
+                        Err(e) => {
+                            warn!("/model preset swap failed: {e}");
+                            format!("Couldn't switch to {}: {e}", preset.label)
+                        }
+                    }
+                }
+            };
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: "session_policy_updated".into(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                })
+                .await?;
+            return self
+                .complete_local_command(session_id, command_turn_id, reply)
+                .await;
+        }
+
         if let SlashCommand::Model { ref tier } = command {
             let reply = if let Some(state) = self.sessions.get_mut(&session_id) {
                 // Any `/model` invocation (pin or clear) resets the persisted
@@ -5149,12 +5271,44 @@ impl AgentRuntime {
                             "Pinned this session to model tier `{t}`. Fallback escalation is disabled until you clear the pin with a bare `/model`."
                         )
                     }
-                    None => match state.pinned_tier_role.take() {
-                        Some(previous) => {
-                            format!("Cleared model tier pin (was `{previous}`).")
+                    None => {
+                        // Bare `/model`: clear any session tier pin and show the
+                        // current model plus the swappable presets.
+                        let cleared = state.pinned_tier_role.take();
+                        let current = state
+                            .role_activation
+                            .as_ref()
+                            .and_then(|ra| ra.turn_loop_config.as_ref())
+                            .and_then(|tlc| {
+                                tlc.fallback_tiers.first().map(|primary| {
+                                    tlc.model_bindings
+                                        .get(primary)
+                                        .cloned()
+                                        .unwrap_or_else(|| primary.clone())
+                                })
+                            });
+                        let current_label = current
+                            .as_deref()
+                            .map(|id| {
+                                model_presets()
+                                    .iter()
+                                    .find(|p| p.model_id == Some(id))
+                                    .map(|p| p.label.to_string())
+                                    .unwrap_or_else(|| id.to_string())
+                            })
+                            .unwrap_or_else(|| "provider default".to_string());
+                        let mut list = String::new();
+                        if let Some(prev) = cleared {
+                            list.push_str(&format!("Cleared session tier pin (was `{prev}`).\n"));
                         }
-                        None => "No model tier pin is set for this session.".to_string(),
-                    },
+                        list.push_str(&format!(
+                            "🧠 Current: {current_label}\nSwap with /model <name>:"
+                        ));
+                        for p in model_presets() {
+                            list.push_str(&format!("\n • {} — {}", p.alias, p.description));
+                        }
+                        list
+                    }
                 }
             } else {
                 "No active session.".to_string()
@@ -5414,6 +5568,7 @@ impl AgentRuntime {
                 | SlashCommand::Tts { .. }
                 | SlashCommand::Voice { .. }
                 | SlashCommand::Model { .. }
+                | SlashCommand::ModelPreset { .. }
                 | SlashCommand::Role { .. }
                 | SlashCommand::Roles
                 | SlashCommand::Back

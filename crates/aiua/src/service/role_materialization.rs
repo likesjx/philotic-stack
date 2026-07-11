@@ -591,7 +591,32 @@ impl IpcServer {
             .map(|r| r.is_admin)
             .unwrap_or(false);
 
-        if role_name == "orchestrator" && !caller_is_admin {
+        // Model-selection self-service: an agent's own orchestrator may retune
+        // its model routing (`fallback_tiers` / `model_bindings`) without admin
+        // rights. Choosing which model answers is lower-stakes than changing
+        // toolset, manifest, TTL, or admin status, and this backs the operator's
+        // one-tap `/model` swap command (philote `SlashCommand::ModelPreset`).
+        // Gated tightly: ONLY when no privileged field is being changed AND the
+        // toolset is left exactly as the record already has it, so this path can
+        // never escalate privilege or alter capabilities — only the model.
+        let is_model_selection_only = (fallback_tiers.is_some() || model_bindings.is_some())
+            && !is_admin
+            && role_identity_addendum.is_none()
+            && role_manifest.is_none()
+            && approval_policy.is_none()
+            && model_profile.is_none()
+            && context_window_policy.is_none()
+            && content_policy.is_none()
+            && inactive_ttl_seconds.is_none()
+            && iteration_cap.is_none()
+            && graph
+                .get_role_incarnation(&agent_id, &role_name)
+                .ok()
+                .flatten()
+                .map(|r| r.toolset_profile == toolset_profile)
+                .unwrap_or(false);
+
+        if role_name == "orchestrator" && !caller_is_admin && !is_model_selection_only {
             return IpcResponse::error(
                 "configure_role",
                 "CONFIGURE_FORBIDDEN",
