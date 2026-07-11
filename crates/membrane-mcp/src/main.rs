@@ -177,13 +177,14 @@ impl MembraneGuest for McpMembrane {
         // This must not block the listener from coming up: an endpoint provision
         // can materialize this guest after the first config push already raced
         // past an empty inbox.
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            client.send_request(IpcRequest::GetMcpRoutes {}),
-        )
-        .await
+        match client
+            .send_request_with_timeout(
+                IpcRequest::GetMcpRoutes {},
+                std::time::Duration::from_secs(3),
+            )
+            .await
         {
-            Ok(Ok(IpcResponse::McpRouteState { agents })) if !agents.is_empty() => {
+            Ok(IpcResponse::McpRouteState { agents }) if !agents.is_empty() => {
                 let mut table = self.state.routing_table.write().await;
                 for entry in &agents {
                     table.upsert_agent_routes(&entry.agent_id, entry.routes.clone());
@@ -193,11 +194,11 @@ impl MembraneGuest for McpMembrane {
                     "replayed persisted MCP routes on startup"
                 );
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),
-            Err(_) => {
+            Ok(_) => {}
+            Err(e) if philotic_client::is_ipc_timeout(&e) => {
                 warn!("GetMcpRoutes timed out — listener remains active with empty route table")
             }
+            Err(e) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),
         }
 
         if let Some(endpoint_id) = self
@@ -205,17 +206,18 @@ impl MembraneGuest for McpMembrane {
             .strip_prefix("mcp-membrane-")
             .map(str::to_string)
         {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                client.send_request(IpcRequest::GetMcpEndpointStatus { endpoint_id }),
-            )
-            .await
+            match client
+                .send_request_with_timeout(
+                    IpcRequest::GetMcpEndpointStatus { endpoint_id },
+                    std::time::Duration::from_secs(3),
+                )
+                .await
             {
-                Ok(Ok(IpcResponse::Standard {
+                Ok(IpcResponse::Standard {
                     ok: true,
                     data: Some(data),
                     ..
-                })) => {
+                }) => {
                     if let Some(config) = data
                         .get("config")
                         .and_then(|value| serde_json::from_value(value.clone()).ok())
@@ -231,9 +233,11 @@ impl MembraneGuest for McpMembrane {
                         *self.state.ingress_tier.write().unwrap() = tier;
                     }
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(err = %e, "GetMcpEndpointStatus failed"),
-                Err(_) => warn!("GetMcpEndpointStatus timed out — waiting for config push"),
+                Ok(_) => {}
+                Err(e) if philotic_client::is_ipc_timeout(&e) => {
+                    warn!("GetMcpEndpointStatus timed out — waiting for config push")
+                }
+                Err(e) => warn!(err = %e, "GetMcpEndpointStatus failed"),
             }
         }
 
