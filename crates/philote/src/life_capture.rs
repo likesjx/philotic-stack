@@ -394,15 +394,24 @@ impl LifeCaptureLedger {
 // life.observe task construction
 // ---------------------------------------------------------------------------
 
-/// OWNS edge toward the observing agent's domain Role node, when the agent is
-/// in the operator-decided domain map (same map the auto-recall lane uses for
-/// its ranking lens). Unknown agents get no edges — never guessed.
+/// OWNS edge toward the observing agent's canonical domain Role node, when
+/// the agent is in the operator-decided steward map (same map the
+/// auto-recall lane uses for its ranking lens, and the SCOPED_TO structural
+/// anchor uses for its target). Unknown agents get no edges — never guessed.
+///
+/// The target id is resolved through
+/// `data_memorygraphrag::zoning::canonical_role_node_id_for_agent` rather
+/// than reconstructed from the domain slug: a domain slug and its seeded
+/// `role_node_id` can diverge (e.g. domain `"architect"` anchors to
+/// `life:role:ai_architect`, not `life:role:architect`; domain `"human"`
+/// anchors to bare `"human"`, not `life:role:human`), and reconstructing
+/// would fork a parallel Role node invisible to recall ranking.
 pub(super) fn life_autocapture_edges(agent_id: &str) -> Vec<Value> {
-    life_domain_slug_for_agent(agent_id)
-        .map(|slug| {
+    data_memorygraphrag::zoning::canonical_role_node_id_for_agent(agent_id, None)
+        .map(|role_node_id| {
             vec![serde_json::json!({
                 "rel_type": "OWNS",
-                "target_id": format!("life:role:{}", slug.replace('_', "-")),
+                "target_id": role_node_id,
             })]
         })
         .unwrap_or_default()
@@ -1026,6 +1035,15 @@ mod tests {
 
         let edges = life_autocapture_edges("agent-astrid-01");
         assert_eq!(edges[0]["target_id"], "life:role:librarian");
+
+        // Discriminating cases: domain slug != role_node_id suffix. A naive
+        // slug-of-domain reconstruction forks to "life:role:architect" /
+        // "life:role:human" instead of the seeded canonical ids.
+        let edges = life_autocapture_edges("agent-aria-01");
+        assert_eq!(edges[0]["target_id"], "life:role:ai_architect");
+
+        let edges = life_autocapture_edges("agent-coach-01");
+        assert_eq!(edges[0]["target_id"], "human");
 
         // Unknown agents get no edges — never guessed.
         assert!(life_autocapture_edges("agent-unknown-01").is_empty());

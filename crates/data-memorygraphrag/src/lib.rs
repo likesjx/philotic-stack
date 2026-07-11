@@ -1422,14 +1422,23 @@ impl GrowthLoopPolicy {
 /// A typed living-cycle edge proposed alongside a `life.observe` node write.
 ///
 /// `rel_type` must be one of [`cypher::LIVING_CYCLE_REL_TYPES`]
-/// (OWNS / SHAPES / SETS / SPAWNS / RELATES_TO). Unknown rel_types are
-/// rejected before the node write. A `target_id` that matches no existing
-/// node creates nothing — the miss is reported in the response envelope
-/// without failing the node write.
+/// (OWNS / SHAPES / SETS / SPAWNS / RELATES_TO / SCOPED_TO). Unknown
+/// rel_types are rejected before the node write. By default (`upsert_target:
+/// false`) a `target_id` that matches no existing node creates nothing — the
+/// miss is reported in the response envelope without failing the node write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserveEdge {
     pub rel_type: String,
     pub target_id: String,
+    /// When `true`, the target node is upserted (`MERGE ... ON CREATE`)
+    /// instead of matched, so the edge can never be dropped as
+    /// `target_missing`. Reserved for server-injected structural anchors
+    /// (currently only the SCOPED_TO role anchor, see
+    /// `cypher::scoped_to_anchor_edge`) — model/domain edges must leave this
+    /// `false`, otherwise a typo'd `target_id` would manufacture a junk node
+    /// instead of reporting a miss.
+    #[serde(default)]
+    pub upsert_target: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2487,6 +2496,7 @@ mod tests {
             edges: vec![ObserveEdge {
                 rel_type: "OWNS".into(),
                 target_id: "life:role:chief-of-staff".into(),
+                upsert_target: false,
             }],
         };
 
@@ -2529,6 +2539,7 @@ mod tests {
                 edges: vec![ObserveEdge {
                     rel_type: "RELATES_TO".into(),
                     target_id: "life:role:librarian".into(),
+                    upsert_target: false,
                 }],
             }))
             .expect("observe should plan");
@@ -2551,6 +2562,7 @@ mod tests {
                 edges: vec![ObserveEdge {
                     rel_type: "DESTROYS".into(),
                     target_id: "life:role:librarian".into(),
+                    upsert_target: false,
                 }],
             }))
             .expect_err("unknown rel_type must be rejected");

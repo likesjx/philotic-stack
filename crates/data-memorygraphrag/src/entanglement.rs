@@ -731,8 +731,15 @@ mod tests {
         assert!(cypher.contains("MATCH (a)-[ra]-(bridge)-[rb]-(b)"));
         assert!(cypher.contains("a.id IN ['l:a:1', 'l:a\\'2']"));
         assert!(cypher.contains("b.id IN ['l:b:1']"));
-        assert!(cypher.contains("type(ra) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO']"));
-        assert!(cypher.contains("type(rb) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO']"));
+        // SCOPED_TO joined LIVING_CYCLE_REL_TYPES as the structural
+        // node->Role anchor rel type (LifeGraph auto-anchor Slice 1); bridge
+        // discovery shares that same vocabulary constant.
+        assert!(cypher.contains(
+            "type(ra) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'SCOPED_TO']"
+        ));
+        assert!(cypher.contains(
+            "type(rb) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'SCOPED_TO']"
+        ));
         assert!(cypher.contains("NOT bridge.id IN ['l:a:1', 'l:a\\'2']"));
         assert!(cypher.contains("NOT bridge.id IN ['l:b:1']"));
         assert!(cypher.contains("coalesce(bridge.validation_state, 'inferred') <> 'retired'"));

@@ -172,25 +172,16 @@ pub(super) fn life_autorecall_disabled() -> bool {
 /// `RetrievalQuery.active_role` so ranking can bias toward the agent's domain
 /// WITHOUT filtering out cross-domain results (soft boundaries).
 ///
-/// Matches on id segments (split at non-alphanumerics) so `aria` never
-/// shadows `ariel` inside ids like `agent-ariel-01`.
+/// Thin re-export of `data_memorygraphrag::zoning::domain_slug_for_agent` —
+/// the single source of truth for the agent -> domain steward map. This used
+/// to be a second, independently-hardcoded copy of the same match table
+/// (drift risk: the two could silently diverge); it now delegates so
+/// auto-recall ranking, the SCOPED_TO structural anchor
+/// (`data_memorygraphrag::cypher::scoped_to_anchor_edge`), and the
+/// auto-capture OWNS edge (`life_capture::life_autocapture_edges`) all agree
+/// on exactly one agent → domain mapping.
 pub(super) fn life_domain_slug_for_agent(agent_id: &str) -> Option<&'static str> {
-    for segment in agent_id.split(|ch: char| !ch.is_ascii_alphanumeric()) {
-        let slug = match segment.to_ascii_lowercase().as_str() {
-            "astrid" => Some("librarian"),
-            "ariel" => Some("communications"),
-            "jane" => Some("companion"),
-            "aria" => Some("architect"),
-            "beacon" => Some("chief_of_staff"),
-            "bjork" => Some("musician"),
-            "coach" => Some("human"),
-            _ => None,
-        };
-        if slug.is_some() {
-            return slug;
-        }
-    }
-    None
+    data_memorygraphrag::zoning::domain_slug_for_agent(agent_id)
 }
 
 /// Build the `execute_tool` task JSON for one prefetch strategy.

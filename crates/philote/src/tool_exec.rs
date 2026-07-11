@@ -23,6 +23,57 @@ pub(super) fn parse_fallback_tiers_arg(value: &serde_json::Value) -> Option<Vec<
     })
 }
 
+/// Structural anchoring for `life.observe` (LifeGraph auto-anchor Slice 1):
+/// the LLM tool schema never exposes `edges`, and non-model write paths have
+/// historically hardcoded `edges: vec![]` — so every observation lands as an
+/// orphan node with nothing to traverse at recall time. Given the mutable
+/// tool-call args (after `observed_by`/`observed_role` have already been
+/// resolved/stamped onto them), append the server-side SCOPED_TO anchor edge
+/// unless one is already present.
+///
+/// The anchor target is resolved from `observed_by` (the observing agent's
+/// canonical identity) through `scoped_to_anchor_edge`, which routes through
+/// the SAME agent -> domain -> seeded-Role-node map the auto-recall/
+/// provenance lane uses — never from a slugged role-name string, which could
+/// fork a parallel Role node. No-ops when `observed_by` is absent/non-string
+/// or resolves to no canonical Role (never manufactures a junk Role node).
+/// Idempotent — never doubles up the anchor.
+pub(super) fn inject_scoped_to_anchor(args: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(agent_id) = args
+        .get("observed_by")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let observed_role = args
+        .get("observed_role")
+        .and_then(serde_json::Value::as_str);
+    let Some(anchor) = data_memorygraphrag::cypher::scoped_to_anchor_edge(&agent_id, observed_role)
+    else {
+        return;
+    };
+
+    let edges = args
+        .entry("edges")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let Some(list) = edges.as_array_mut() else {
+        return;
+    };
+    let already_anchored = list.iter().any(|edge| {
+        edge.get("rel_type").and_then(serde_json::Value::as_str) == Some(anchor.rel_type.as_str())
+            && edge.get("target_id").and_then(serde_json::Value::as_str)
+                == Some(anchor.target_id.as_str())
+    });
+    if !already_anchored {
+        list.push(serde_json::json!({
+            "rel_type": anchor.rel_type,
+            "target_id": anchor.target_id,
+            "upsert_target": anchor.upsert_target,
+        }));
+    }
+}
+
 /// Parses the `model_bindings` tool argument (Layer 1 per-agent model NAME
 /// binding): a JSON object mapping provider role (e.g. `"model.openrouter"`)
 /// to model id (e.g. `"z-ai/glm-5.2"`). Non-string values are dropped rather
@@ -336,6 +387,15 @@ impl AgentRuntime {
                             args.insert("observed_role".into(), serde_json::Value::String(role));
                         }
                     }
+                    // Structural anchoring: the LLM tool schema never exposes
+                    // `edges`, and non-model write paths have historically
+                    // hardcoded `edges: vec![]` — so every observation lands
+                    // as an orphan node with nothing to traverse at recall
+                    // time. Server-side (zero model burden), attach a
+                    // SCOPED_TO anchor resolved from the canonical
+                    // observed_by identity, unless one is already present.
+                    // Idempotent — never doubles up.
+                    inject_scoped_to_anchor(args);
                 }
             }
             // Agent-level approval enforcement: if the tool's policy annotation marks it as
@@ -5994,6 +6054,128 @@ mod tests {
     use super::super::tests::test_working_turn;
     use super::*;
     use crate::r#loop::{ToolCall, TurnPhase};
+
+    #[test]
+    fn inject_scoped_to_anchor_appends_edge_when_agent_resolves_and_no_edges() {
+        // aria/architect is the discriminating case: the domain slug
+        // "architect" does NOT match its role_node_id suffix
+        // ("ai_architect"). A regression to slug-of-role/agent reconstruction
+        // would produce "life:role:architect" here instead.
+        let mut args = serde_json::json!({
+            "observed_by": "agent-aria-01",
+            "observed_role": "architect"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        inject_scoped_to_anchor(&mut args);
+
+        let edges = args
+            .get("edges")
+            .and_then(serde_json::Value::as_array)
+            .expect("edges array must be created");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["rel_type"], "SCOPED_TO");
+        assert_eq!(edges[0]["target_id"], "life:role:ai_architect");
+        assert_eq!(edges[0]["upsert_target"], true);
+    }
+
+    #[test]
+    fn inject_scoped_to_anchor_is_idempotent_when_already_anchored() {
+        let mut args = serde_json::json!({
+            "observed_by": "agent-aria-01",
+            "observed_role": "architect",
+            "edges": [
+                { "rel_type": "SCOPED_TO", "target_id": "life:role:ai_architect", "upsert_target": true }
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        inject_scoped_to_anchor(&mut args);
+
+        let edges = args
+            .get("edges")
+            .and_then(serde_json::Value::as_array)
+            .expect("edges array must survive");
+        assert_eq!(edges.len(), 1, "anchor must not be duplicated");
+    }
+
+    #[test]
+    fn inject_scoped_to_anchor_preserves_existing_domain_edges() {
+        let mut args = serde_json::json!({
+            "observed_by": "agent-aria-01",
+            "observed_role": "architect",
+            "edges": [
+                { "rel_type": "RELATES_TO", "target_id": "life:role:musician", "upsert_target": false }
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        inject_scoped_to_anchor(&mut args);
+
+        let edges = args
+            .get("edges")
+            .and_then(serde_json::Value::as_array)
+            .expect("edges array must survive");
+        assert_eq!(
+            edges.len(),
+            2,
+            "anchor must append alongside existing edges"
+        );
+        assert_eq!(edges[0]["rel_type"], "RELATES_TO");
+        assert_eq!(edges[1]["rel_type"], "SCOPED_TO");
+    }
+
+    #[test]
+    fn inject_scoped_to_anchor_resolves_via_observed_role_fallback_for_unknown_agent() {
+        let mut args = serde_json::json!({
+            "observed_by": "agent-unknown-01",
+            "observed_role": "chief_of_staff"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        inject_scoped_to_anchor(&mut args);
+
+        let edges = args
+            .get("edges")
+            .and_then(serde_json::Value::as_array)
+            .expect("edges array must be created via observed_role fallback");
+        assert_eq!(edges[0]["target_id"], "life:role:chief-of-staff");
+    }
+
+    #[test]
+    fn inject_scoped_to_anchor_noop_when_observed_by_absent() {
+        let mut args = serde_json::json!({ "observed_role": "architect" })
+            .as_object()
+            .unwrap()
+            .clone();
+
+        inject_scoped_to_anchor(&mut args);
+
+        assert!(args.get("edges").is_none());
+    }
+
+    #[test]
+    fn inject_scoped_to_anchor_noop_when_agent_and_role_both_unresolvable() {
+        let mut args = serde_json::json!({
+            "observed_by": "agent-unknown-01",
+            "observed_role": "not_a_domain"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        inject_scoped_to_anchor(&mut args);
+
+        assert!(args.get("edges").is_none());
+    }
 
     #[test]
     fn skill_register_is_an_unconditional_approval_gate() {

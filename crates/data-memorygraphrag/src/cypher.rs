@@ -3,7 +3,7 @@
 
 use crate::{
     ConflictHandoff, ConflictHandoffStatus, FeedbackEdgeSpec, LifeCommitInput, LifeObserveInput,
-    LifePatchProposalInput, LifeResolveInput, PatchKind, RetrievalFeedbackInput,
+    LifePatchProposalInput, LifeResolveInput, ObserveEdge, PatchKind, RetrievalFeedbackInput,
     RetrievalFeedbackRating, SourceKind, ValidationState,
 };
 
@@ -40,10 +40,51 @@ const KNOWN_LABELS: &[&str] = &[
 /// Living-cycle relationship types allowed on `life.observe` edge writes.
 /// The soft-zoning design routes all agent domains through this small,
 /// closed vocabulary; anything else is rejected before the node write.
-pub const LIVING_CYCLE_REL_TYPES: &[&str] = &["OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO"];
+///
+/// SCOPED_TO is the structural anchor rel type: it is the ONLY rel type ever
+/// injected server-side (never model-supplied) and always carries
+/// `upsert_target: true` so every observation resolves a Role target instead
+/// of risking an orphan write. OWNS remains reserved for real ownership.
+pub const LIVING_CYCLE_REL_TYPES: &[&str] = &[
+    "OWNS",
+    "SHAPES",
+    "SETS",
+    "SPAWNS",
+    "RELATES_TO",
+    "SCOPED_TO",
+];
 
 pub fn is_living_cycle_rel_type(rel_type: &str) -> bool {
     LIVING_CYCLE_REL_TYPES.contains(&rel_type)
+}
+
+/// Build the server-side structural anchor edge for a `life.observe` write:
+/// `node -SCOPED_TO-> Role`. Resolves the target through
+/// [`crate::zoning::canonical_role_node_id_for_agent`] — the SAME
+/// agent-identity -> domain -> seeded-Role-node resolver the auto-recall /
+/// provenance lane uses — so anchors always land on the canonical seeded
+/// Role node instead of a slug-reconstructed parallel one (e.g. the
+/// `architect` domain anchors to `life:role:ai_architect`, never
+/// `life:role:architect`).
+///
+/// Returns `None` when the agent isn't in the steward map AND
+/// `observed_role` doesn't itself name a seeded domain slug — an
+/// unrecognized observer never manufactures a junk Role node.
+///
+/// The anchor always sets `upsert_target: true` so the Role target is
+/// created if missing (see `compile_observe_edges`), making orphan writes
+/// structurally impossible regardless of whether the seed has run yet —
+/// and, because the id is canonical, that MERGE lands on the real seeded
+/// node rather than forking a lookalike. Shared by every observe write path
+/// (model-invoked `life.observe` today; non-model paths route through this
+/// in a later slice).
+pub fn scoped_to_anchor_edge(agent_id: &str, observed_role: Option<&str>) -> Option<ObserveEdge> {
+    let target_id = crate::zoning::canonical_role_node_id_for_agent(agent_id, observed_role)?;
+    Some(ObserveEdge {
+        rel_type: "SCOPED_TO".to_string(),
+        target_id: target_id.to_string(),
+        upsert_target: true,
+    })
 }
 
 /// Fallback written to `observed_by` when the caller predates per-agent provenance.
@@ -82,6 +123,10 @@ pub struct ObserveEdgeCypher {
     pub query: String,
     pub rel_type: String,
     pub target_id: String,
+    /// Mirrors `ObserveEdge::upsert_target` — `true` when the compiled query
+    /// MERGEs the target (structural anchors), `false` when it MATCHes
+    /// (model/domain edges).
+    pub upsert_target: bool,
 }
 
 #[derive(Debug)]
@@ -254,9 +299,11 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
 /// Compile the optional living-cycle edges of a `life.observe` request.
 ///
 /// Unknown rel_types are a hard error (callers should reject before the node
-/// write). Compiled queries `MATCH` the target by id, so a missing target
-/// simply produces no row — the provider reports it as `target_missing`
-/// without failing the node write.
+/// write). By default (`upsert_target: false`) compiled queries `MATCH` the
+/// target by id, so a missing target simply produces no row — the provider
+/// reports it as `target_missing` without failing the node write. Edges with
+/// `upsert_target: true` (structural anchors, e.g. SCOPED_TO) instead `MERGE`
+/// the target so it always resolves.
 pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdgeCypher>, String> {
     let label = &input.evidence.claim_ref.label;
     if !is_known_label(label) {
@@ -277,11 +324,40 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
         }
 
         // Label and rel_type are both whitelisted above — safe to interpolate.
-        // All values travel as bound parameters.
+        // All values travel as bound parameters. `upsert_target` picks the
+        // target-resolution strategy: MATCH (model/domain edges — a missing
+        // target creates nothing, reported as target_missing) or MERGE
+        // (server-injected structural anchors, which must always resolve so
+        // orphan writes are structurally impossible). MERGE-target is
+        // hardcoded to the Role label because the only upsert_target=true
+        // producer today is the SCOPED_TO anchor helper, which always
+        // targets a Role node; `t.name` falls back to the target id itself
+        // since no separate display name travels on the edge.
+        //
+        // Defense in depth: `upsert_target` is only honored for the
+        // `SCOPED_TO` rel_type (the sole structural-anchor relationship
+        // today). This is enforced here explicitly rather than trusted by
+        // convention, so a mis-set `upsert_target: true` on any other
+        // rel_type — whether from a future non-model write path or a bug in
+        // a caller — cannot MERGE (manufacture) an arbitrary target node; it
+        // is downgraded to MATCH, preserving target_missing semantics for
+        // every rel_type except SCOPED_TO.
+        // `will_upsert` is the decision actually baked into the query below —
+        // distinct from the raw `edge.upsert_target` input, which a
+        // non-SCOPED_TO edge may still set to `true` (ignored). Reporting
+        // this decision back on `ObserveEdgeCypher::upsert_target` (rather
+        // than echoing the input) keeps that field truthful to its own doc
+        // comment for any future consumer.
+        let will_upsert = edge.upsert_target && edge.rel_type == "SCOPED_TO";
+        let target_clause = if will_upsert {
+            "MERGE (t:Role {id: $target_id}) ON CREATE SET t.name = $target_id, t.created_at = $created_at "
+        } else {
+            "MATCH (t {id: $target_id}) "
+        };
         let query = format!(
             concat!(
                 "MATCH (n:{label} {{id: $id}}) ",
-                "MATCH (t {{id: $target_id}}) ",
+                "{target_clause}",
                 "MERGE (n)-[r:{rel_type}]->(t) ",
                 "ON CREATE SET ",
                 "r.created_at = $created_at, ",
@@ -290,6 +366,7 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
                 "RETURN t.id AS target_id",
             ),
             label = label,
+            target_clause = target_clause,
             rel_type = edge.rel_type
         );
 
@@ -297,6 +374,7 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
             query,
             rel_type: edge.rel_type.clone(),
             target_id: edge.target_id.clone(),
+            upsert_target: will_upsert,
         });
     }
 
@@ -933,10 +1011,12 @@ mod tests {
             crate::ObserveEdge {
                 rel_type: "OWNS".into(),
                 target_id: "life:role:chief-of-staff".into(),
+                upsert_target: false,
             },
             crate::ObserveEdge {
                 rel_type: "RELATES_TO".into(),
                 target_id: "life:role:musician".into(),
+                upsert_target: false,
             },
         ];
 
@@ -944,6 +1024,7 @@ mod tests {
         assert_eq!(compiled.len(), 2);
         assert_eq!(compiled[0].rel_type, "OWNS");
         assert_eq!(compiled[0].target_id, "life:role:chief-of-staff");
+        assert!(!compiled[0].upsert_target);
         assert!(compiled[0].query.contains("MATCH (n:Goal {id: $id})"));
         assert!(compiled[0].query.contains("MATCH (t {id: $target_id})"));
         assert!(compiled[0].query.contains("MERGE (n)-[r:OWNS]->(t)"));
@@ -952,11 +1033,70 @@ mod tests {
     }
 
     #[test]
+    fn compile_observe_edges_domain_edge_matches_target_when_upsert_target_false() {
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "RELATES_TO".into(),
+            target_id: "life:role:typo-target".into(),
+            upsert_target: false,
+        }];
+
+        let compiled = compile_observe_edges(&input).unwrap();
+        assert!(!compiled[0].upsert_target);
+        assert!(compiled[0].query.contains("MATCH (t {id: $target_id})"));
+        assert!(!compiled[0].query.contains("MERGE (t:Role"));
+    }
+
+    #[test]
+    fn compile_observe_edges_anchor_upserts_role_target_when_upsert_target_true() {
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "SCOPED_TO".into(),
+            target_id: "life:role:chief-of-staff".into(),
+            upsert_target: true,
+        }];
+
+        let compiled = compile_observe_edges(&input).unwrap();
+        assert!(compiled[0].upsert_target);
+        assert!(
+            compiled[0]
+                .query
+                .contains("MERGE (t:Role {id: $target_id}) ON CREATE SET t.name = $target_id, t.created_at = $created_at")
+        );
+        assert!(compiled[0].query.contains("MERGE (n)-[r:SCOPED_TO]->(t)"));
+        assert!(!compiled[0].query.contains("MATCH (t {id: $target_id})"));
+    }
+
+    #[test]
+    fn compile_observe_edges_ignores_upsert_target_on_non_scoped_to_rel_type() {
+        // Defense in depth: even if a caller mis-sets upsert_target=true on a
+        // rel_type other than SCOPED_TO, compile_observe_edges must not MERGE
+        // (manufacture) the target node. Only SCOPED_TO is a structural
+        // anchor; every other rel_type must fall back to MATCH so a typo'd
+        // or malicious target_id is reported as target_missing instead of
+        // silently creating a junk node.
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "RELATES_TO".into(),
+            target_id: "life:role:should-not-be-created".into(),
+            upsert_target: true,
+        }];
+
+        let compiled = compile_observe_edges(&input).unwrap();
+        assert!(compiled[0].query.contains("MATCH (t {id: $target_id})"));
+        assert!(!compiled[0].query.contains("MERGE (t:Role"));
+        // The reported field must reflect the decision actually compiled
+        // into the query above, not the raw (and here overridden) input.
+        assert!(!compiled[0].upsert_target);
+    }
+
+    #[test]
     fn compile_observe_edges_rejects_unknown_rel_type() {
         let mut input = minimal_observe_input("Goal");
         input.edges = vec![crate::ObserveEdge {
             rel_type: "DESTROYS".into(),
             target_id: "life:role:musician".into(),
+            upsert_target: false,
         }];
 
         let err = compile_observe_edges(&input).unwrap_err();
@@ -970,6 +1110,7 @@ mod tests {
         input.edges = vec![crate::ObserveEdge {
             rel_type: "SETS".into(),
             target_id: "  ".into(),
+            upsert_target: false,
         }];
 
         let err = compile_observe_edges(&input).unwrap_err();
@@ -977,10 +1118,51 @@ mod tests {
     }
 
     #[test]
+    fn scoped_to_is_a_living_cycle_rel_type() {
+        assert!(is_living_cycle_rel_type("SCOPED_TO"));
+    }
+
+    #[test]
+    fn scoped_to_anchor_edge_resolves_canonical_id_via_agent_identity() {
+        // The discriminating case: the "architect" domain slug does NOT
+        // match its role_node_id suffix ("ai_architect"). A naive slug of
+        // observed_role/agent_id would fork to "life:role:architect"; the
+        // canonical resolver must not.
+        let edge = scoped_to_anchor_edge("agent-aria-01", None).expect("steward agent resolves");
+        assert_eq!(edge.rel_type, "SCOPED_TO");
+        assert_eq!(edge.target_id, "life:role:ai_architect");
+        assert!(edge.upsert_target);
+    }
+
+    #[test]
+    fn scoped_to_anchor_edge_resolves_via_observed_role_fallback() {
+        // Unknown agent id, but observed_role happens to name a seeded
+        // domain slug verbatim.
+        let edge = scoped_to_anchor_edge("agent-unknown-01", Some("chief_of_staff"))
+            .expect("observed_role fallback resolves a known domain slug");
+        assert_eq!(edge.target_id, "life:role:chief-of-staff");
+    }
+
+    #[test]
+    fn scoped_to_anchor_edge_returns_none_for_unresolvable_agent_and_role() {
+        assert!(scoped_to_anchor_edge("agent-unknown-01", None).is_none());
+        assert!(scoped_to_anchor_edge("agent-unknown-01", Some("")).is_none());
+        assert!(scoped_to_anchor_edge("agent-unknown-01", Some("   ")).is_none());
+        assert!(scoped_to_anchor_edge("agent-unknown-01", Some("not_a_domain")).is_none());
+    }
+
+    #[test]
     fn living_cycle_rel_type_set_is_the_approved_vocabulary() {
         assert_eq!(
             LIVING_CYCLE_REL_TYPES,
-            &["OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO"]
+            &[
+                "OWNS",
+                "SHAPES",
+                "SETS",
+                "SPAWNS",
+                "RELATES_TO",
+                "SCOPED_TO"
+            ]
         );
         assert!(is_living_cycle_rel_type("SHAPES"));
         assert!(!is_living_cycle_rel_type("owns"));
