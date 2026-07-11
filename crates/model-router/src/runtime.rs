@@ -294,6 +294,36 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     &provider_configs,
                 ));
 
+                // Auxiliary-task model pinning (Model Failover Layers Slice 4).
+                // Loaded fresh per task alongside `provider_configs` above so a
+                // config change takes effect on the next dispatch without a
+                // restart. Any load failure (IPC error or timeout) degrades to
+                // `AuxModelConfig::default()` — Auto for every kind — never
+                // blocks or fails the task on account of this optional feature.
+                let aux_model_config = match tokio::time::timeout(
+                    model_dispatch_timeout(),
+                    crate::aux_model::AuxModelConfig::load(&mut ipc_client),
+                )
+                .await
+                {
+                    Ok(Ok(cfg)) => cfg,
+                    Ok(Err(err)) => {
+                        warn!(
+                            "aux_model config load failed; treating all aux tasks as Auto: {err}"
+                        );
+                        crate::aux_model::AuxModelConfig::default()
+                    }
+                    Err(_) => {
+                        warn!(
+                            "aux_model config load exceeded {}s; treating all aux tasks as Auto",
+                            model_dispatch_timeout().as_secs()
+                        );
+                        crate::aux_model::AuxModelConfig::default()
+                    }
+                };
+                let aux_pin = crate::aux_model::AuxTaskKind::from_task_kind(controller_task.kind)
+                    .and_then(|kind| aux_model_config.for_kind(kind));
+
                 let dispatch_start = Instant::now();
                 let task_kind = controller_task.kind.as_str().to_string();
                 if controller_task.kind.is_native_live() {
@@ -406,6 +436,122 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         }
                     }
                 } else {
+                    // Auxiliary-task model pinning (Model Failover Layers Slice 4):
+                    // if the operator configured a non-Auto `aux_model.<kind>` for
+                    // this task's aux kind, resolve the pin first, then walk
+                    // `fallback_chain` in order (one attempt each) on failure,
+                    // handling success/failure entirely in this block via
+                    // `continue`. When no pin is configured (`aux_pin` is `None`,
+                    // the default), this whole `if` is skipped and control falls
+                    // straight to the unmodified code below, so Auto behavior
+                    // stays bit-identical to today.
+                    if let Some(aux_model) = aux_pin {
+                        match crate::aux_model::dispatch_aux_chain(
+                            &controller_task,
+                            aux_model,
+                            &providers,
+                        )
+                        .await
+                        {
+                            Ok((provider_id, output)) => {
+                                let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                                let model_id = extract_output_model_gen(&output)
+                                    .or_else(|| controller_task.model.clone());
+                                record_routing_trace(
+                                    trace_store.as_deref(),
+                                    &reply,
+                                    &provider_id,
+                                    &task_kind,
+                                    "success",
+                                    None,
+                                    latency_ms,
+                                    model_id,
+                                    None,
+                                );
+                                if let Some(ref gd) = graph_domain {
+                                    if let Err(e) = gd.observe_model_outcome(
+                                        &provider_id,
+                                        &local_node_id(),
+                                        latency_ms,
+                                        true,
+                                    ) {
+                                        warn!("observe_model_outcome (success): {e}");
+                                    }
+                                }
+                                fire_transcription_capture_fanout(
+                                    &controller_task,
+                                    &output,
+                                    &reply,
+                                    config.guest_id,
+                                );
+                                match output {
+                                    ProviderOutput::ToolCall {
+                                        tool_name,
+                                        arguments,
+                                    } => {
+                                        emit_tool_call_response(
+                                            &mut ipc_client,
+                                            &reply,
+                                            tool_name,
+                                            arguments,
+                                            None,
+                                        )
+                                        .await?;
+                                    }
+                                    output => {
+                                        let response = ControllerResponseEnvelope::from_output(
+                                            &controller_task,
+                                            &provider_id,
+                                            output,
+                                        )?;
+                                        emit_text_response(&mut ipc_client, &reply, response)
+                                            .await?;
+                                    }
+                                }
+                                continue;
+                            }
+                            Err((last_provider, err)) => {
+                                if controller_task.kind == TaskKind::Embed {
+                                    // Embedding is the one aux kind that degrades to
+                                    // today's Auto path (the ONNX sidecar) on chain
+                                    // exhaustion instead of surfacing the error — an
+                                    // embedding caller (e.g. memory indexing) must
+                                    // never hard-fail just because an optional pin
+                                    // or fallback_chain was misconfigured. Falling
+                                    // through to the unmodified code below
+                                    // re-resolves via
+                                    // `providers.resolve(&controller_task)` on the
+                                    // ORIGINAL (unmodified provider/model) task —
+                                    // the exact same resolution today's Auto path
+                                    // performs.
+                                    warn!(
+                                        "aux fallback_chain exhausted for embedding task \
+                                         (last provider tried: {:?}): {}. Degrading to \
+                                         Auto (sidecar) resolution.",
+                                        last_provider, err
+                                    );
+                                } else {
+                                    error!(
+                                        "aux dispatch failed for {} task (last provider tried: {:?}): {}",
+                                        controller_task.kind.as_str(),
+                                        last_provider,
+                                        err
+                                    );
+                                    emit_failure(
+                                        &mut ipc_client,
+                                        &reply,
+                                        Some(controller_task.kind.as_str()),
+                                        last_provider.as_deref(),
+                                        config.guest_id,
+                                        format!("Provider invocation failed: {}", err),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     let primary_provider = match providers.resolve(&controller_task) {
                         Ok(provider) => provider,
                         Err(err) => {
@@ -790,65 +936,12 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             // ── Transcription flywheel fan-out ────────────────
                             // After a successful AudioTranscribe, fire a capture
                             // envelope to role=router-listener (if enabled).
-                            if controller_task.kind == TaskKind::AudioTranscribe {
-                                if let ProviderOutput::Text {
-                                    ref content,
-                                    ref model_gen,
-                                    ..
-                                } = output
-                                {
-                                    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref()
-                                        == Ok("true")
-                                    {
-                                        let blob_url = controller_task
-                                            .media_attachments()
-                                            .first()
-                                            .and_then(|a| a.url.clone());
-
-                                        let capture_json = serde_json::to_string(&json!({
-                                            "kind": "transcription_capture",
-                                            "session_id": reply.session_id,
-                                            "turn_id": reply.turn_id,
-                                            "agent_id": config.guest_id,
-                                            "transcript": content,
-                                            "model_gen": model_gen,
-                                            "blob_download_url": blob_url,
-                                            "timestamp": SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .map(|d| d.as_secs())
-                                                .unwrap_or(0),
-                                        }))
-                                        .unwrap_or_default();
-
-                                        let fanout_identity = GuestIdentity {
-                                            guest_id: format!("capture-fanout-{}", Ulid::new()),
-                                            role: config.guest_id.to_string(),
-                                            supported_tools: Vec::new(),
-                                        };
-                                        tokio::spawn(async move {
-                                            let connect = tokio::time::timeout(
-                                                Duration::from_secs(5),
-                                                PhiloticClient::connect(fanout_identity),
-                                            )
-                                            .await;
-                                            if let Ok(Ok(mut fanout_ipc)) = connect {
-                                                let _ = fanout_ipc
-                                                    .send_request_with_timeout(
-                                                        IpcRequest::EmitTask {
-                                                            target_node: local_node_id(),
-                                                            target_role: "router-listener"
-                                                                .to_string(),
-                                                            target_guest_id: None,
-                                                            task_json: capture_json,
-                                                        },
-                                                        Duration::from_secs(10),
-                                                    )
-                                                    .await;
-                                            }
-                                        });
-                                    }
-                                }
-                            }
+                            fire_transcription_capture_fanout(
+                                &controller_task,
+                                &output,
+                                &reply,
+                                config.guest_id,
+                            );
 
                             let response = ControllerResponseEnvelope::from_output(
                                 &controller_task,
@@ -1098,6 +1191,77 @@ fn validate_stub_prompt(task_value: &Value, stub_value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// After a successful `AudioTranscribe`, fire a capture envelope to
+/// role=router-listener (if `PHILOTIC_ROUTER_CAPTURE_ENABLED` is set). No-op
+/// for any other task kind. Shared by the default dispatch path and the aux
+/// pinned/fallback-chain dispatch path (Model Failover Layers Slice 4) so
+/// both preserve the same flywheel behavior on success.
+fn fire_transcription_capture_fanout(
+    controller_task: &ControllerTask,
+    output: &ProviderOutput,
+    reply: &ReplyRoute,
+    guest_id: &'static str,
+) {
+    if controller_task.kind != TaskKind::AudioTranscribe {
+        return;
+    }
+    let ProviderOutput::Text {
+        content, model_gen, ..
+    } = output
+    else {
+        return;
+    };
+    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref() != Ok("true") {
+        return;
+    }
+
+    let blob_url = controller_task
+        .media_attachments()
+        .first()
+        .and_then(|a| a.url.clone());
+
+    let capture_json = serde_json::to_string(&json!({
+        "kind": "transcription_capture",
+        "session_id": reply.session_id,
+        "turn_id": reply.turn_id,
+        "agent_id": guest_id,
+        "transcript": content,
+        "model_gen": model_gen,
+        "blob_download_url": blob_url,
+        "timestamp": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    }))
+    .unwrap_or_default();
+
+    let fanout_identity = GuestIdentity {
+        guest_id: format!("capture-fanout-{}", Ulid::new()),
+        role: guest_id.to_string(),
+        supported_tools: Vec::new(),
+    };
+    tokio::spawn(async move {
+        let connect = tokio::time::timeout(
+            Duration::from_secs(5),
+            PhiloticClient::connect(fanout_identity),
+        )
+        .await;
+        if let Ok(Ok(mut fanout_ipc)) = connect {
+            let _ = fanout_ipc
+                .send_request_with_timeout(
+                    IpcRequest::EmitTask {
+                        target_node: local_node_id(),
+                        target_role: "router-listener".to_string(),
+                        target_guest_id: None,
+                        task_json: capture_json,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await;
+        }
+    });
+}
+
 async fn emit_text_response(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
@@ -1210,6 +1374,44 @@ fn native_live_tool_call_model_result(
     }))
 }
 
+/// Isolation guarantee (Model Failover Layers Slice 4 — auxiliary-task model
+/// pinning): auxiliary (non-cognitive) task failures must never be classified
+/// in a way that engages philote's cognitive fallback ladder
+/// (`classify_provider_error` / `advance_turn_to_next_fallback_tier`) or
+/// persists a session `FallbackOverride`.
+///
+/// `classify_provider_failure` stamps `error_class` / `sub_kind` / `status`
+/// purely from the error message text, without regard to capability — that
+/// annotation must stay intact for model-router's OWN internal
+/// retry/rotation decisions (computed separately, earlier, in the attempt
+/// loop), but the WIRE payload sent to philote for the three real aux
+/// capabilities (`media.analyze`, `voice.transcribe`, `text.embed`) must
+/// present as an un-annotated, non-"text.generate" failure so philote's
+/// `classify_provider_error` falls through to its existing capability-gated
+/// default (`Unclassified` for any capability other than
+/// `text.generate`/`response.generate`) instead of matching one of the
+/// annotated escalation classes ahead of that check. This makes aux tasks
+/// resolve and degrade independently of the cognitive ladder, as required —
+/// and applies regardless of whether the failing aux task was Auto or
+/// pinned, since the guarantee must hold for aux dispatch in general.
+fn isolate_aux_failure_from_cognitive_ladder(
+    mut payload: TaskErrorPayload,
+    capability: Option<&str>,
+) -> TaskErrorPayload {
+    let is_aux_capability = matches!(
+        capability,
+        Some(k) if k == TaskKind::MediaAnalyze.as_str()
+            || k == TaskKind::AudioTranscribe.as_str()
+            || k == TaskKind::Embed.as_str()
+    );
+    if is_aux_capability {
+        payload.error_class = None;
+        payload.sub_kind = None;
+        payload.status = None;
+    }
+    payload
+}
+
 async fn emit_failure(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
@@ -1218,7 +1420,10 @@ async fn emit_failure(
     guest_id: &str,
     message: String,
 ) -> Result<()> {
-    let error_payload = classify_provider_failure(capability, provider, &message);
+    let error_payload = isolate_aux_failure_from_cognitive_ladder(
+        classify_provider_failure(capability, provider, &message),
+        capability,
+    );
     error!(
         "Emitting model failure capability={:?} provider={:?}: {}",
         capability, provider, message
@@ -1614,9 +1819,79 @@ impl ReplyRoute {
 
 #[cfg(test)]
 mod failure_tests {
-    use super::{classify_provider_failure, extract_http_status, model_dispatch_timeout};
+    use super::{
+        classify_provider_failure, extract_http_status, isolate_aux_failure_from_cognitive_ladder,
+        model_dispatch_timeout,
+    };
+    use crate::controller::TaskKind;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    // ── Aux-task isolation guarantee (Slice 4) ────────────────────────────
+
+    /// The exact aux-failure shape this slice's isolation guarantee protects
+    /// against: a real, richly-annotated `classify_provider_failure` outcome
+    /// (the same shape a text.generate 429 would carry, which DOES trigger
+    /// philote's ladder) must be stripped down to an un-annotated payload for
+    /// each of the three real aux capabilities, so philote's
+    /// `classify_provider_error` falls through to its capability-gated
+    /// default (`Unclassified`) instead of matching `error_class`/`sub_kind`/
+    /// `status` ahead of that check.
+    #[test]
+    fn aux_capabilities_strip_ladder_annotations_from_rate_limited_failure() {
+        for capability in [
+            TaskKind::MediaAnalyze.as_str(),
+            TaskKind::AudioTranscribe.as_str(),
+            TaskKind::Embed.as_str(),
+        ] {
+            let annotated = classify_provider_failure(
+                Some(capability),
+                Some("gemini"),
+                "Gemini API error (429): rate limit exceeded",
+            );
+            // Sanity: classify_provider_failure itself is NOT capability-aware —
+            // it stamps the same escalation-worthy fields regardless of
+            // capability. This is the raw shape the isolation guarantee acts on.
+            assert_eq!(annotated.error_class.as_deref(), Some("switch_provider"));
+            assert_eq!(annotated.sub_kind.as_deref(), Some("rate_limit"));
+
+            let isolated = isolate_aux_failure_from_cognitive_ladder(annotated, Some(capability));
+            assert_eq!(
+                isolated.error_class, None,
+                "capability [{capability}] must not carry error_class over the wire"
+            );
+            assert_eq!(
+                isolated.sub_kind, None,
+                "capability [{capability}] must not carry sub_kind over the wire"
+            );
+            assert_eq!(
+                isolated.status, None,
+                "capability [{capability}] must not carry status over the wire"
+            );
+            // `code`/`retryable`/`message`/`provider` are informational and
+            // must NOT be stripped — only the three fields philote's
+            // classify_provider_error consults for ladder escalation.
+            assert_eq!(isolated.provider.as_deref(), Some("gemini"));
+        }
+    }
+
+    /// Cognitive capabilities (and the `None` legacy-envelope case) must be
+    /// completely unaffected — this fix is deliberately narrow-scoped to the
+    /// three real aux kinds.
+    #[test]
+    fn cognitive_capabilities_are_not_isolated() {
+        for capability in [None, Some("text.generate"), Some("response.generate")] {
+            let annotated = classify_provider_failure(
+                capability,
+                Some("gemini"),
+                "Gemini API error (429): rate limit exceeded",
+            );
+            let isolated = isolate_aux_failure_from_cognitive_ladder(annotated.clone(), capability);
+            assert_eq!(isolated.error_class, annotated.error_class);
+            assert_eq!(isolated.sub_kind, annotated.sub_kind);
+            assert_eq!(isolated.status, annotated.status);
+        }
+    }
 
     /// Serializes tests that mutate `PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS` —
     /// cargo runs tests in this module on separate threads within one
