@@ -596,6 +596,56 @@ jane-start:
 jane-status:
     @just remote-homebrew-status mbp-jane mbp-jane
 
+# ── Disk-space watch ────────────────────────────────────────────────────────
+# Install a launchd StartInterval job that runs scripts/disk-space-watch.sh
+# (which runs `phil doctor` and alerts when system.disk-space fires). Turns the
+# on-demand doctor check into an active guard so a filling disk is caught BEFORE
+# ENOSPC wedges the hotel. Alert-only — never deletes anything.
+disk-watch-install profile="bjork" interval="1800":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LABEL=com.philotic.diskspacewatch
+    PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+    SCRIPT="{{justfile_directory()}}/scripts/disk-space-watch.sh"
+    chmod +x "$SCRIPT"
+    ALERT_LOG="$HOME/.philotic/{{profile}}/disk-space-alerts.log"
+    mkdir -p "$(dirname "$ALERT_LOG")"
+    cat > "$PLIST" <<EOF
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>Label</key><string>${LABEL}</string>
+      <key>ProgramArguments</key>
+      <array>
+        <string>/bin/bash</string>
+        <string>${SCRIPT}</string>
+        <string>{{profile}}</string>
+      </array>
+      <key>EnvironmentVariables</key>
+      <dict>
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PHIL_BIN</key><string>/opt/homebrew/bin/phil</string>
+      </dict>
+      <key>StartInterval</key><integer>{{interval}}</integer>
+      <key>RunAtLoad</key><true/>
+      <key>StandardErrorPath</key><string>${ALERT_LOG}</string>
+      <key>StandardOutPath</key><string>/dev/null</string>
+    </dict></plist>
+    EOF
+    uid=$(id -u)
+    launchctl bootout gui/${uid}/${LABEL} 2>/dev/null || true
+    launchctl bootstrap gui/${uid} "$PLIST"
+    echo "▶ installed ${LABEL}: runs phil doctor every {{interval}}s (profile {{profile}}), alerts → ${ALERT_LOG}"
+
+# Remove the disk-space watch launchd job.
+disk-watch-uninstall:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LABEL=com.philotic.diskspacewatch
+    uid=$(id -u)
+    launchctl bootout gui/${uid}/${LABEL} 2>/dev/null && echo "▶ ${LABEL} removed" || echo "▶ ${LABEL} was not loaded"
+    rm -f "$HOME/Library/LaunchAgents/${LABEL}.plist"
+
 # ── Logs (in-app daily rolling appender) ────────────────────────────────────
 # aiua now owns rotation: detailed logs live in ~/.philotic/<profile>/logs/
 # aiua.<date>.log (see crates/aiua/README.md). These recipes tail the newest
