@@ -8463,7 +8463,8 @@ mod tests {
     /// role-level content_policy is the effective value.
     #[test]
     fn effective_content_policy_uses_role_level_override() {
-        let mut state = SessionState::new("sess-cp2".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state =
+            SessionState::new("sess-cp2".into(), "agent-jane-01".into(), "telegram".into());
         state.role_activation = Some(RoleActivation {
             content_policy: Some("unrestricted".into()),
             ..make_role_activation("orchestrator")
@@ -8480,7 +8481,8 @@ mod tests {
     /// set an explicit (non-"standard") override of its own.
     #[test]
     fn effective_content_policy_falls_back_to_agent_level() {
-        let mut state = SessionState::new("sess-cp3".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state =
+            SessionState::new("sess-cp3".into(), "agent-jane-01".into(), "telegram".into());
         state.agent_profile.content_policy = Some("strict".into());
         assert_eq!(state.effective_content_policy(), "strict");
 
@@ -8500,7 +8502,8 @@ mod tests {
     /// provider reads via `ControllerTask.provider_option_str("content_policy")`.
     #[test]
     fn unrestricted_role_projects_into_provider_options() {
-        let mut state = SessionState::new("sess-cp4".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state =
+            SessionState::new("sess-cp4".into(), "agent-jane-01".into(), "telegram".into());
         state.role_activation = Some(RoleActivation {
             content_policy: Some("unrestricted".into()),
             ..make_role_activation("orchestrator")

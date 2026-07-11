@@ -58,9 +58,7 @@ async fn close(work_item_id: String) -> Result<()> {
         })
         .await?
     {
-        IpcResponse::Standard {
-            ok: true, data, ..
-        } => {
+        IpcResponse::Standard { ok: true, data, .. } => {
             let closed = data
                 .as_ref()
                 .and_then(|d| d.get("closed"))
@@ -97,8 +95,7 @@ async fn list(all: bool) -> Result<()> {
                 println!("no heal work items");
                 return Ok(());
             };
-            let items: Vec<serde_json::Value> =
-                serde_json::from_str(&json).unwrap_or_default();
+            let items: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap_or_default();
             let mut shown = 0usize;
             for item in &items {
                 let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -108,15 +105,22 @@ async fn list(all: bool) -> Result<()> {
                 shown += 1;
                 println!(
                     "{}  [{}]  pattern={} guest={} count={}",
-                    item.get("work_item_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                    item.get("work_item_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?"),
                     status,
-                    item.get("pattern_tag").and_then(|v| v.as_str()).unwrap_or("?"),
+                    item.get("pattern_tag")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?"),
                     item.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?"),
                     item.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
                 );
             }
             if shown == 0 {
-                println!("no {} heal work items", if all { "" } else { "open" }.trim());
+                println!(
+                    "no {} heal work items",
+                    if all { "" } else { "open" }.trim()
+                );
             }
             Ok(())
         }

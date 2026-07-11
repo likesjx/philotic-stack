@@ -9,11 +9,10 @@ use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
     GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchApplyInput,
     LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput, LifeResolveInput,
-    MemoryGraphRagRunner,
-    PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter, RankingWeights,
-    ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery,
-    RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef,
-    SourceReliability, ValidationState, feedback_edge_specs,
+    MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter,
+    RankingWeights, ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating,
+    RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind,
+    SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
 };
 use datasource::controller::{
     CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput,
@@ -2285,15 +2284,15 @@ fn aggregate_recall_stats(rows: &[RecallStatRow]) -> Value {
         0.0
     };
 
-    let (weighted_sum, sample_total) =
-        rows.iter()
-            .fold((0.0_f64, 0_i64), |(sum, n), r| match r.avg_connectivity_ratio {
-                Some(avg) if r.connectivity_samples > 0 => (
-                    sum + avg * r.connectivity_samples as f64,
-                    n + r.connectivity_samples,
-                ),
-                _ => (sum, n),
-            });
+    let (weighted_sum, sample_total) = rows.iter().fold((0.0_f64, 0_i64), |(sum, n), r| {
+        match r.avg_connectivity_ratio {
+            Some(avg) if r.connectivity_samples > 0 => (
+                sum + avg * r.connectivity_samples as f64,
+                n + r.connectivity_samples,
+            ),
+            _ => (sum, n),
+        }
+    });
     let avg_connectivity_ratio = if sample_total > 0 {
         Some(round4(weighted_sum / sample_total as f64))
     } else {

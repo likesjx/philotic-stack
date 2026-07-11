@@ -1907,7 +1907,9 @@ fn evaluate_heal_oldest_pending(
         message: format!(
             "oldest pending heal entry has waited {} (warn>{}s, critical>{}s) — the \
              heal-dispatcher is behind or wedged and this entry is not being triaged",
-            human_age(age), HEAL_OLDEST_PENDING_WARN_SECS, HEAL_OLDEST_PENDING_CRITICAL_SECS
+            human_age(age),
+            HEAL_OLDEST_PENDING_WARN_SECS,
+            HEAL_OLDEST_PENDING_CRITICAL_SECS
         ),
         evidence: json!({
             "oldest_ts": ts,
@@ -1944,7 +1946,11 @@ impl Check for HealOldestPendingAge {
             [],
             |row| row.get::<_, Option<i64>>(0),
         )?;
-        Ok(evaluate_heal_oldest_pending(self.id(), oldest, now_epoch_secs()))
+        Ok(evaluate_heal_oldest_pending(
+            self.id(),
+            oldest,
+            now_epoch_secs(),
+        ))
     }
 }
 
@@ -2016,7 +2022,9 @@ fn evaluate_heal_dispatcher_staleness(
                 "heal-dispatcher last cycled {} ago (>{}s = 3× the {}s poll interval) — likely \
                  wedged or down; the heal queue will not drain while it's stalled, and \
                  PID-liveness alone can't catch a wedged (running-but-not-cycling) dispatcher",
-                human_age(age), HEAL_DISPATCHER_STALE_SECS, HEAL_DISPATCHER_POLL_INTERVAL_SECS
+                human_age(age),
+                HEAL_DISPATCHER_STALE_SECS,
+                HEAL_DISPATCHER_POLL_INTERVAL_SECS
             ),
             evidence: json!({
                 "heartbeat_key": HEAL_DISPATCHER_HEARTBEAT_KEY,
@@ -3773,9 +3781,15 @@ mod tests {
         assert!(evaluate_heal_queue_depth(id, 100, 0).is_empty());
         assert!(evaluate_heal_queue_depth(id, 40, 60).is_empty());
         // Just over warn (pending + assigned counted together) → Warning.
-        assert!(only(&[Severity::Warning], &evaluate_heal_queue_depth(id, 60, 41)));
+        assert!(only(
+            &[Severity::Warning],
+            &evaluate_heal_queue_depth(id, 60, 41)
+        ));
         // Exactly at the critical boundary is still Warning; over it → Critical.
-        assert!(only(&[Severity::Warning], &evaluate_heal_queue_depth(id, 500, 0)));
+        assert!(only(
+            &[Severity::Warning],
+            &evaluate_heal_queue_depth(id, 500, 0)
+        ));
         assert!(only(
             &[Severity::Critical],
             &evaluate_heal_queue_depth(id, 400, 101)
@@ -3808,9 +3822,13 @@ mod tests {
     #[test]
     fn heal_oldest_pending_future_timestamp_is_soft_note_not_clean() {
         let now = 1_000_000;
-        let findings = evaluate_heal_oldest_pending("heal.oldest-pending-age", Some(now + 5_000), now);
+        let findings =
+            evaluate_heal_oldest_pending("heal.oldest-pending-age", Some(now + 5_000), now);
         assert!(only(&[Severity::Info], &findings));
-        assert!(!findings.is_empty(), "future ts must surface, not read clean");
+        assert!(
+            !findings.is_empty(),
+            "future ts must surface, not read clean"
+        );
     }
 
     // heal.dispatcher-staleness: absent heartbeat degrades to a soft Info note
@@ -3821,7 +3839,10 @@ mod tests {
             evaluate_heal_dispatcher_staleness("heal.dispatcher-staleness", None, 1_000_000);
         assert!(only(&[Severity::Info], &findings));
         assert_eq!(findings[0].severity, Severity::Info);
-        assert!(findings[0].severity < Severity::Error, "must not be a failure");
+        assert!(
+            findings[0].severity < Severity::Error,
+            "must not be a failure"
+        );
     }
 
     // A fresh heartbeat (within 3× poll) is clean; a stale one is Critical.
@@ -3853,7 +3874,10 @@ mod tests {
         let now = 1_750_000_000; // ~2025 in epoch seconds
         let millis_value = now * 1000; // what a millis-writing dispatcher would store
         let findings = evaluate_heal_dispatcher_staleness(id, Some(millis_value), now);
-        assert!(!findings.is_empty(), "future/millis heartbeat must not read clean");
+        assert!(
+            !findings.is_empty(),
+            "future/millis heartbeat must not read clean"
+        );
         assert_eq!(findings[0].severity, Severity::Warning);
         assert!(
             findings[0].message.contains("future"),
@@ -3951,11 +3975,15 @@ mod tests {
             )
             .expect("insert config heartbeat node");
         }
-        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open ro");
+        let conn =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).expect("open ro");
         let got = read_config_epoch_secs(&conn, HEAL_DISPATCHER_HEARTBEAT_KEY)
             .expect("read config epoch");
-        assert_eq!(got, Some(ts), "heartbeat must resolve from graph_nodes config node");
+        assert_eq!(
+            got,
+            Some(ts),
+            "heartbeat must resolve from graph_nodes config node"
+        );
     }
 
     // ── system.disk-space ────────────────────────────────────────────────

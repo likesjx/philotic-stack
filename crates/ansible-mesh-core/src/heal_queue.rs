@@ -547,7 +547,8 @@ impl SqliteHealQueueStorage {
                 outcome: row.get(8)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// [`HealQueueStorage::vacuum_abandoned`] with an explicit clock, for
@@ -1237,7 +1238,7 @@ mod tests {
         store
             .update_triage(&stuck_assigned, "medium", "provider_error:x", "escalate")
             .expect("triage"); // → status 'assigned'
-        // Fresh pending row, inside the ceiling.
+                               // Fresh pending row, inside the ceiling.
         let fresh = store
             .push_error_at("g", "fresh pending", NOW - 10)
             .expect("push");
@@ -1280,9 +1281,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let fresh = store
-            .push_error_at("g", "fresh", recent_now)
-            .expect("push");
+        let fresh = store.push_error_at("g", "fresh", recent_now).expect("push");
 
         let deleted = store.vacuum_old(3600).expect("vacuum");
         assert_eq!(deleted, 1, "the ancient resolved row is reaped");

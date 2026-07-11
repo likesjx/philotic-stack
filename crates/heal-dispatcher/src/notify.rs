@@ -242,7 +242,10 @@ mod tests {
         });
         assert_eq!(n.cooldown_secs, DEFAULT_NOTIFY_COOLDOWN_SECS);
         assert_eq!(n.escalate_window_secs, DEFAULT_ESCALATE_WINDOW_SECS);
-        assert_eq!(n.escalate_repeat_threshold, DEFAULT_ESCALATE_REPEAT_THRESHOLD);
+        assert_eq!(
+            n.escalate_repeat_threshold,
+            DEFAULT_ESCALATE_REPEAT_THRESHOLD
+        );
 
         // Zero cooldown clamps to 1 so the anti-spam guarantee always holds.
         let n = EscalationNotifier::new(0, 0, 0);
@@ -258,14 +261,16 @@ mod tests {
             DEFAULT_ESCALATION_ROLE
         );
         assert_eq!(
-            EscalationNotifier::escalation_role(|k| (k == ENV_ESCALATION_ROLE)
-                .then(|| "beacon".to_string())),
+            EscalationNotifier::escalation_role(
+                |k| (k == ENV_ESCALATION_ROLE).then(|| "beacon".to_string())
+            ),
             "beacon"
         );
         // Blank override falls back to the default.
         assert_eq!(
-            EscalationNotifier::escalation_role(|k| (k == ENV_ESCALATION_ROLE)
-                .then(|| "  ".to_string())),
+            EscalationNotifier::escalation_role(
+                |k| (k == ENV_ESCALATION_ROLE).then(|| "  ".to_string())
+            ),
             DEFAULT_ESCALATION_ROLE
         );
     }
