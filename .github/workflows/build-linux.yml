@@ -50,6 +50,38 @@ jobs:
           key: linux-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: linux-x86_64-cargo-
 
+      - name: Check out jaredlikes-desktop (private UI)
+        id: desktop_checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: likesjx/jaredlikes-desktop
+          ref: main
+          token: ${{ secrets.DESKTOP_REPO_TOKEN }}
+          path: jaredlikes-desktop
+          persist-credentials: false
+
+      - name: Report desktop checkout outcome
+        run: |
+          if [ "${{ steps.desktop_checkout.outcome }}" = "success" ]; then
+            echo "::notice::desktop UI checked out — will embed real UI"
+          else
+            echo "::warning::desktop checkout failed (token?) — building placeholder UI, job stays green"
+          fi
+
+      - name: Setup Node
+        if: steps.desktop_checkout.outcome == 'success'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Refresh ui-dist for embed
+        if: steps.desktop_checkout.outcome == 'success'
+        run: |
+          rm -rf crates/philotic-web/ui-dist
+          echo "PHILOTIC_DESKTOP_DIR=${{ github.workspace }}/jaredlikes-desktop" >> "$GITHUB_ENV"
+          echo "PHILOTIC_REFRESH_DESKTOP_UI=1" >> "$GITHUB_ENV"
+
       - name: Build release binaries
         run: |
           cargo build --release --target "${TARGET}" --bins \
