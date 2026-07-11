@@ -1,55 +1,39 @@
 // HistoryHydrator.swift
-// Best-effort hydration of a conversation's history from the server. There
-// is no `GET .../sessions/:id/turns` REST route on philotic-web today (only
-// the IPC-level `ListSessionTurns` exists, and `GET /api/sessions` is a
-// stub returning `[]` — see crates/philotic-web/src/serve.rs), so this is
-// deliberately a single speculative request that degrades to "unreachable"
-// on any failure. The local `ConversationStore` remains the source of
-// truth; this only ever supplements it.
+// Best-effort hydration of a conversation's history from the server via
+// `GET /api/edge/sessions/:id/turns` (the edge-sessions-bridge REST route
+// backed by the hotel's `ListSessionTurns` IPC). The hotel is the canonical
+// history authority; the local `ConversationStore` is a cache, so failures
+// here degrade to "stay local-only" rather than erroring the UI.
 
 import Foundation
-
-/// Mirrors the shape `philotic-web` would plausibly serve for session turns
-/// (see `SessionTurnView` in `philotic-client`), decoded defensively.
-private struct RemoteSessionTurn: Decodable {
-    let turnId: String
-    let role: String
-    let content: String
-    let createdAt: UInt64?
-    let status: String
-
-    enum CodingKeys: String, CodingKey {
-        case turnId = "turn_id"
-        case role
-        case content
-        case createdAt = "created_at"
-        case status
-    }
-}
+import PhiloticKit
 
 public enum HistoryHydrator {
     /// Attempts to fetch remote turn history for `sessionId` from `baseURL`.
-    /// Returns `nil` (never throws) if the server doesn't have this route,
-    /// the request fails, or the response can't be decoded — callers should
-    /// treat `nil` as "stay local-only".
+    /// Returns `nil` (never throws) if the server is unreachable, the bearer
+    /// is rejected, or the response can't be decoded — callers should treat
+    /// `nil` as "stay local-only".
     public static func hydrate(
         sessionId: String,
         baseURL: URL,
         bearerToken: String,
-        session: URLSession = .shared
+        session: URLSession? = nil
     ) async -> [ChatMessage]? {
-        var request = URLRequest(url: baseURL.appendingPathComponent("api/sessions/\(sessionId)/turns"))
-        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 5
-
-        guard let (data, response) = try? await session.data(for: request),
-            let http = response as? HTTPURLResponse,
-            (200..<300).contains(http.statusCode)
+        // Hydration is best-effort background fill: keep the default request
+        // timeout short so a dark hotel doesn't stall the conversation open.
+        let urlSession = session ?? {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = 5
+            return URLSession(configuration: config)
+        }()
+        let client = SessionDirectoryClient(session: urlSession)
+        guard
+            let turns = try? await client.fetchTurns(
+                baseURL: baseURL,
+                bearerToken: bearerToken,
+                sessionId: sessionId
+            )
         else {
-            return nil
-        }
-
-        guard let turns = try? JSONDecoder().decode([RemoteSessionTurn].self, from: data) else {
             return nil
         }
 

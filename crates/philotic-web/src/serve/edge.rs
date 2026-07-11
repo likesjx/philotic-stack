@@ -15,6 +15,10 @@
 //!   next to the hotel context DB (`edge-devices.json`, mode 0600) and returns
 //!   an [`EnrollmentResponse`] whose `edge_token` is accepted by the same
 //!   bearer path as the shared `PHILOTIC_WEB_EDGE_TOKEN`.
+//! - `GET /api/edge/sessions` (+ `/:session_id/turns`) — edge-bearer REST
+//!   bridge over the hotel's `ListOperatorSessions` / `ListSessionTurns` IPC,
+//!   making the hotel the canonical conversation-history authority for edge
+//!   devices (the app's local store is a cache, not truth).
 //! - `GET /api/edge/ws` — bearer-authenticated WebSocket speaking JSON
 //!   [`EdgeEnvelope`] text frames. The first client frame MUST be `Hello`;
 //!   the server validates the node is enrolled (and, when the bearer is a
@@ -75,7 +79,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Path, Query, State,
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
@@ -731,6 +735,73 @@ pub(crate) async fn handle_edge_agents(
         }
     }
     Json(json!({ "agents": entries })).into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct EdgeSessionsQuery {
+    /// Restrict to sessions whose primary agent matches (e.g. "jane").
+    agent_id: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /api/edge/sessions` — edge-bearer-scoped conversation history: the
+/// hotel's recorded operator sessions (most recent activity first), served
+/// from the context graph via `ListOperatorSessions`. This makes the hotel —
+/// not the device's local store — the canonical history authority, so a
+/// second device (or a reinstall) can list and resume prior conversations.
+pub(crate) async fn handle_edge_sessions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<EdgeSessionsQuery>,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    match super::ipc_list_operator_sessions(&state.socket, query.agent_id, query.limit).await {
+        Ok(sessions) => Json(json!({ "sessions": sessions })).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("hotel sessions unavailable: {err}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct EdgeSessionTurnsQuery {
+    limit: Option<u32>,
+    /// Pagination cursor: only turns strictly older than this turn_id.
+    before_turn_id: Option<String>,
+}
+
+/// `GET /api/edge/sessions/:session_id/turns` — expanded operator/agent
+/// messages for one session, oldest first, via `ListSessionTurns`. One stored
+/// turn record expands to two items sharing a `turn_id` (operator + agent),
+/// mirroring the IPC contract — clients fold the role into their row identity.
+pub(crate) async fn handle_edge_session_turns(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<EdgeSessionTurnsQuery>,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    match super::ipc_list_session_turns(
+        &state.socket,
+        session_id.clone(),
+        query.limit,
+        query.before_turn_id,
+    )
+    .await
+    {
+        Ok(turns) => Json(json!({ "session_id": session_id, "turns": turns })).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("hotel session turns unavailable: {err}")})),
+        )
+            .into_response(),
+    }
 }
 
 /// Outcome of a successful handshake ([`process_hello`]).
