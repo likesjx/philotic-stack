@@ -366,6 +366,7 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
         Box::new(HealQueueDepth),
         Box::new(HealOldestPendingAge),
         Box::new(HealDispatcherStaleness),
+        Box::new(SystemDiskSpace),
     ]
 }
 
@@ -2054,6 +2055,144 @@ impl Check for HealDispatcherStaleness {
             last_cycle_at,
             now_epoch_secs(),
         ))
+    }
+}
+
+// ── system.disk-space ────────────────────────────────────────────────────
+
+// A filling disk wedges *everything* (ENOSPC) with no warning of its own —
+// the hotel can't write its context DB, cargo can't build, logs can't rotate.
+// This guard makes a filling disk visible while there's still headroom to act.
+// Thresholds are on the volume backing `ctx.profile_dir` (~/.philotic/<profile>),
+// the disk that actually matters for the hotel.
+const DISK_AVAIL_WARN_KB: u64 = 15 * 1024 * 1024; // 15 GiB
+const DISK_AVAIL_CRITICAL_KB: u64 = 5 * 1024 * 1024; // 5 GiB
+const DISK_USED_WARN_PCT: u8 = 90;
+const DISK_USED_CRITICAL_PCT: u8 = 96;
+
+/// Parse a macOS `df -k` report into `(avail_kb, used_pct)`.
+///
+/// macOS `df -k` columns are:
+/// `Filesystem 1024-blocks Used Available Capacity iused ifree %iused Mounted`.
+/// Field index 3 (0-based) is Available (KB); field 4 is Capacity, e.g. `"83%"`.
+/// The header line is skipped, then all remaining tokens are flattened before
+/// indexing so a device name `df` wrapped onto its own line doesn't shift the
+/// field positions. Returns `None` on any shape/parse surprise so `detect`
+/// degrades to a soft note instead of panicking.
+fn parse_df_kb(output: &str) -> Option<(u64, u8)> {
+    let mut lines = output.lines();
+    let _header = lines.next()?;
+    let tokens: Vec<&str> = lines.flat_map(|l| l.split_whitespace()).collect();
+    if tokens.len() < 5 {
+        return None;
+    }
+    let avail_kb: u64 = tokens[3].parse().ok()?;
+    let used_pct: u8 = tokens[4].trim_end_matches('%').parse().ok()?;
+    Some((avail_kb, used_pct))
+}
+
+/// Pure threshold logic for the disk-space guard, split out so it is
+/// unit-testable without shelling out to `df`.
+///
+/// CRITICAL when available < 5 GiB OR capacity ≥ 96%; WARNING when available
+/// < 15 GiB OR capacity ≥ 90%; otherwise clean.
+fn evaluate_disk_space(check_id: &'static str, avail_kb: u64, used_pct: u8) -> Vec<Finding> {
+    let severity = if avail_kb < DISK_AVAIL_CRITICAL_KB || used_pct >= DISK_USED_CRITICAL_PCT {
+        Severity::Critical
+    } else if avail_kb < DISK_AVAIL_WARN_KB || used_pct >= DISK_USED_WARN_PCT {
+        Severity::Warning
+    } else {
+        return Vec::new();
+    };
+
+    let avail_gib = avail_kb as f64 / (1024.0 * 1024.0);
+    vec![Finding {
+        check_id: check_id.to_string(),
+        severity,
+        message: format!(
+            "profile-dir volume has {avail_gib:.1} GiB free at {used_pct}% used \
+             (warn <15 GiB or ≥{DISK_USED_WARN_PCT}%, critical <5 GiB or ≥{DISK_USED_CRITICAL_PCT}%) \
+             — a full disk hard-blocks the hotel, cargo builds, and log rotation with ENOSPC"
+        ),
+        evidence: json!({
+            "avail_kb": avail_kb,
+            "avail_gib": (avail_gib * 100.0).round() / 100.0,
+            "used_pct": used_pct,
+            "warn_avail_kb": DISK_AVAIL_WARN_KB,
+            "critical_avail_kb": DISK_AVAIL_CRITICAL_KB,
+            "warn_used_pct": DISK_USED_WARN_PCT,
+            "critical_used_pct": DISK_USED_CRITICAL_PCT,
+        }),
+        fix_hint:
+            "the usual bulk consumer is the regenerable cargo build dir (<repo>/target). \
+             Reclaim with `cargo clean` in the code repo (or `rm -rf <repo>/target <repo>/dist-ci`); \
+             also always-safe: `rm -f ~/.philotic/*/context.db.bak* ~/.philotic/*/*.quarantine`"
+                .to_string(),
+        auto_repairable: false,
+    }]
+}
+
+/// Read-only disk-space guard on the volume backing `ctx.profile_dir`.
+struct SystemDiskSpace;
+
+impl Check for SystemDiskSpace {
+    fn id(&self) -> &'static str {
+        "system.disk-space"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        // No libc/nix dep available: shell out to `df -k <profile_dir>`. Any
+        // failure (df missing, non-zero exit, unparseable output) degrades to a
+        // soft Info note — this is the doctor that runs when things are already
+        // going wrong, so it must never panic or hard-error on its own probe.
+        let output = std::process::Command::new("df")
+            .arg("-k")
+            .arg(&ctx.profile_dir)
+            .output();
+        let parsed = match output {
+            Ok(o) if o.status.success() => {
+                parse_df_kb(&String::from_utf8_lossy(&o.stdout))
+            }
+            _ => None,
+        };
+        match parsed {
+            Some((avail_kb, used_pct)) => {
+                Ok(evaluate_disk_space(self.id(), avail_kb, used_pct))
+            }
+            None => Ok(vec![Finding {
+                check_id: self.id().to_string(),
+                severity: Severity::Info,
+                message: format!(
+                    "could not read free space for {} via `df -k` — disk-space guard \
+                     is not reporting (this is a soft note, not a failure)",
+                    ctx.profile_dir.display()
+                ),
+                evidence: json!({"profile_dir": ctx.profile_dir.to_string_lossy(), "df_ok": false}),
+                fix_hint: "run `df -k <profile_dir>` by hand to confirm free space; \
+                           the guard degrades quietly when df is unavailable or its \
+                           output format is unexpected"
+                    .to_string(),
+                auto_repairable: false,
+            }]),
+        }
+    }
+
+    fn repair(&self, _ctx: &DoctorCtx, _finding: &Finding, _apply: bool) -> Result<RepairOutcome> {
+        // Disk cleanup is an operator decision in BOTH dry-run and apply: doctor
+        // can't know the code-repo path and must NEVER `rm` a build dir unprompted.
+        Ok(RepairOutcome::NeedsConfirm {
+            description:
+                "reclaim space by removing regenerable build artifacts: run `cargo clean` in the \
+                 code repo (or `rm -rf <repo>/target <repo>/dist-ci`). Always-safe extras: \
+                 `rm -f ~/.philotic/*/context.db.bak* ~/.philotic/*/*.quarantine`"
+                    .to_string(),
+            risk: "removes regenerable build artifacts; confirm no build/deploy is mid-flight"
+                .to_string(),
+        })
     }
 }
 
@@ -3817,5 +3956,77 @@ mod tests {
         let got = read_config_epoch_secs(&conn, HEAL_DISPATCHER_HEARTBEAT_KEY)
             .expect("read config epoch");
         assert_eq!(got, Some(ts), "heartbeat must resolve from graph_nodes config node");
+    }
+
+    // ── system.disk-space ────────────────────────────────────────────────
+
+    // Threshold logic at each tier: ample space is clean, then WARNING and
+    // CRITICAL by BOTH the available-bytes axis and the used-percent axis.
+    #[test]
+    fn evaluate_disk_space_fires_by_tier() {
+        let id = "system.disk-space";
+        // Plenty of space, low utilisation → clean.
+        assert!(evaluate_disk_space(id, 100 * 1024 * 1024, 40).is_empty());
+        // Exactly at the 15 GiB warn boundary (not below it) at safe % → clean.
+        assert!(evaluate_disk_space(id, DISK_AVAIL_WARN_KB, 40).is_empty());
+        // Below 15 GiB but above 5 GiB → Warning.
+        assert!(only(
+            &[Severity::Warning],
+            &evaluate_disk_space(id, 14 * 1024 * 1024, 40)
+        ));
+        // Below 5 GiB → Critical (regardless of a benign percent).
+        assert!(only(
+            &[Severity::Critical],
+            &evaluate_disk_space(id, 4 * 1024 * 1024, 40)
+        ));
+    }
+
+    // The used-percent axis fires independently of absolute free space.
+    #[test]
+    fn evaluate_disk_space_used_percent_axis() {
+        let id = "system.disk-space";
+        let ample = 100 * 1024 * 1024; // 100 GiB free
+        // 89% is still clean, 90% trips Warning.
+        assert!(evaluate_disk_space(id, ample, 89).is_empty());
+        assert!(only(&[Severity::Warning], &evaluate_disk_space(id, ample, 90)));
+        // 95% Warning, 96% escalates to Critical.
+        assert!(only(&[Severity::Warning], &evaluate_disk_space(id, ample, 95)));
+        assert!(only(&[Severity::Critical], &evaluate_disk_space(id, ample, 96)));
+    }
+
+    // The df parser handles a real macOS `df -k` report (header + data line),
+    // returning (avail_kb, used_pct); junk degrades to None (→ soft note).
+    #[test]
+    fn parse_df_kb_reads_macos_report() {
+        let sample = "Filesystem   1024-blocks      Used Available Capacity iused     ifree %iused  Mounted on\n\
+                      /dev/disk3s5   482766932 368216752  80200648    83% 3917534 802006480    0%   /System/Volumes/Data";
+        assert_eq!(parse_df_kb(sample), Some((80_200_648, 83)));
+        // A 100%-full disk (the incident this guard exists for).
+        let full = "Filesystem 1024-blocks Used Available Capacity iused ifree %iused Mounted on\n\
+                    /dev/disk1s1 100 100 0 100% 1 1 50% /";
+        assert_eq!(parse_df_kb(full), Some((0, 100)));
+        // Garbage / truncated output → None, never a panic.
+        assert_eq!(parse_df_kb(""), None);
+        assert_eq!(parse_df_kb("just a header line\n"), None);
+        assert_eq!(parse_df_kb("hdr\n/dev/x not numbers here"), None);
+    }
+
+    // Disk cleanup is always an operator decision: repair returns NeedsConfirm
+    // in BOTH dry-run and apply and never deletes anything.
+    #[test]
+    fn disk_space_repair_always_needs_confirm() {
+        let finding = evaluate_disk_space("system.disk-space", 1024 * 1024, 99)
+            .into_iter()
+            .next()
+            .expect("critical finding");
+        let (_dir, path) = fixture_db();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        for apply in [false, true] {
+            let outcome = SystemDiskSpace.repair(&ctx, &finding, apply).expect("repair");
+            assert!(
+                matches!(outcome, RepairOutcome::NeedsConfirm { .. }),
+                "apply={apply} must NeedsConfirm, got {outcome:?}"
+            );
+        }
     }
 }
