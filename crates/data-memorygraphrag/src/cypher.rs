@@ -58,45 +58,31 @@ pub fn is_living_cycle_rel_type(rel_type: &str) -> bool {
     LIVING_CYCLE_REL_TYPES.contains(&rel_type)
 }
 
-/// Slugify free text into the id-safe form used by `life:role:<slug>` node
-/// ids: lowercased alphanumeric runs joined by single `-`, with any
-/// leading/trailing/duplicate separators collapsed away. Non-alphanumeric
-/// characters (including `_`) act as separators, so `"chief_of_staff"` and
-/// `"Chief Of Staff!"` both slug to `"chief-of-staff"`.
-pub fn slug(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut pending_separator = false;
-    for ch in input.trim().chars() {
-        if ch.is_alphanumeric() {
-            if pending_separator && !out.is_empty() {
-                out.push('-');
-            }
-            out.extend(ch.to_lowercase());
-            pending_separator = false;
-        } else {
-            pending_separator = true;
-        }
-    }
-    out
-}
-
 /// Build the server-side structural anchor edge for a `life.observe` write:
-/// `node -SCOPED_TO-> Role`. Returns `None` for an empty/whitespace-only
-/// role — an unknown observer never manufactures a junk Role node.
+/// `node -SCOPED_TO-> Role`. Resolves the target through
+/// [`crate::zoning::canonical_role_node_id_for_agent`] — the SAME
+/// agent-identity -> domain -> seeded-Role-node resolver the auto-recall /
+/// provenance lane uses — so anchors always land on the canonical seeded
+/// Role node instead of a slug-reconstructed parallel one (e.g. the
+/// `architect` domain anchors to `life:role:ai_architect`, never
+/// `life:role:architect`).
+///
+/// Returns `None` when the agent isn't in the steward map AND
+/// `observed_role` doesn't itself name a seeded domain slug — an
+/// unrecognized observer never manufactures a junk Role node.
 ///
 /// The anchor always sets `upsert_target: true` so the Role target is
 /// created if missing (see `compile_observe_edges`), making orphan writes
-/// structurally impossible regardless of whether the Role was seeded ahead
-/// of time. Shared by every observe write path (model-invoked `life.observe`
-/// today; non-model paths route through this in a later slice).
-pub fn scoped_to_anchor_edge(observed_role: &str) -> Option<ObserveEdge> {
-    let slugged = slug(observed_role);
-    if slugged.is_empty() {
-        return None;
-    }
+/// structurally impossible regardless of whether the seed has run yet —
+/// and, because the id is canonical, that MERGE lands on the real seeded
+/// node rather than forking a lookalike. Shared by every observe write path
+/// (model-invoked `life.observe` today; non-model paths route through this
+/// in a later slice).
+pub fn scoped_to_anchor_edge(agent_id: &str, observed_role: Option<&str>) -> Option<ObserveEdge> {
+    let target_id = crate::zoning::canonical_role_node_id_for_agent(agent_id, observed_role)?;
     Some(ObserveEdge {
         rel_type: "SCOPED_TO".to_string(),
-        target_id: format!("life:role:{slugged}"),
+        target_id: target_id.to_string(),
         upsert_target: true,
     })
 }
@@ -1137,29 +1123,32 @@ mod tests {
     }
 
     #[test]
-    fn slug_lowercases_and_collapses_non_alphanumeric_runs() {
-        assert_eq!(slug("chief_of_staff"), "chief-of-staff");
-        assert_eq!(slug("Chief Of Staff!!"), "chief-of-staff");
-        assert_eq!(slug("  orchestrator  "), "orchestrator");
-        assert_eq!(slug("Musician/Composer"), "musician-composer");
-        assert_eq!(slug(""), "");
-        assert_eq!(slug("   "), "");
-        assert_eq!(slug("---"), "");
-    }
-
-    #[test]
-    fn scoped_to_anchor_edge_builds_role_target_from_slugged_role() {
-        let edge = scoped_to_anchor_edge("chief_of_staff").expect("non-empty role anchors");
+    fn scoped_to_anchor_edge_resolves_canonical_id_via_agent_identity() {
+        // The discriminating case: the "architect" domain slug does NOT
+        // match its role_node_id suffix ("ai_architect"). A naive slug of
+        // observed_role/agent_id would fork to "life:role:architect"; the
+        // canonical resolver must not.
+        let edge = scoped_to_anchor_edge("agent-aria-01", None).expect("steward agent resolves");
         assert_eq!(edge.rel_type, "SCOPED_TO");
-        assert_eq!(edge.target_id, "life:role:chief-of-staff");
+        assert_eq!(edge.target_id, "life:role:ai_architect");
         assert!(edge.upsert_target);
     }
 
     #[test]
-    fn scoped_to_anchor_edge_returns_none_for_empty_or_whitespace_role() {
-        assert!(scoped_to_anchor_edge("").is_none());
-        assert!(scoped_to_anchor_edge("   ").is_none());
-        assert!(scoped_to_anchor_edge("!!!").is_none());
+    fn scoped_to_anchor_edge_resolves_via_observed_role_fallback() {
+        // Unknown agent id, but observed_role happens to name a seeded
+        // domain slug verbatim.
+        let edge = scoped_to_anchor_edge("agent-unknown-01", Some("chief_of_staff"))
+            .expect("observed_role fallback resolves a known domain slug");
+        assert_eq!(edge.target_id, "life:role:chief-of-staff");
+    }
+
+    #[test]
+    fn scoped_to_anchor_edge_returns_none_for_unresolvable_agent_and_role() {
+        assert!(scoped_to_anchor_edge("agent-unknown-01", None).is_none());
+        assert!(scoped_to_anchor_edge("agent-unknown-01", Some("")).is_none());
+        assert!(scoped_to_anchor_edge("agent-unknown-01", Some("   ")).is_none());
+        assert!(scoped_to_anchor_edge("agent-unknown-01", Some("not_a_domain")).is_none());
     }
 
     #[test]

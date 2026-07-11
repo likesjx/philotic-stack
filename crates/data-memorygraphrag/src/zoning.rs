@@ -125,6 +125,43 @@ pub fn role_node_id_for_domain(domain_slug: &str) -> Option<&'static str> {
         .map(|seed| seed.role_node_id)
 }
 
+/// Resolve the canonical `life:role:...` (or bare `human`) node id a
+/// `life.observe` write should anchor/own to, given the observing agent's
+/// identity and (optionally) its resolved role name.
+///
+/// This is the SINGLE composition point for agent-or-role -> canonical
+/// Role-node-id resolution: `agent_id -> domain_slug_for_agent ->
+/// role_node_id_for_domain`. Every caller that needs a canonical anchor
+/// target (SCOPED_TO structural anchors, OWNS auto-capture edges, any future
+/// domain-scoped write) must go through this function rather than
+/// reconstructing the id from a slug — reconstructing forks the graph
+/// whenever a domain slug and its role_node_id diverge (e.g. domain
+/// `"architect"` anchors to `life:role:ai_architect`, not
+/// `life:role:architect"`; domain `"human"` anchors to bare `"human"`, not
+/// `life:role:human`).
+///
+/// Resolution order:
+/// 1. `agent_id` through the steward map (the common case — the agent
+///    calling `life.observe` IS the domain steward).
+/// 2. Fallback: treat `observed_role` itself as an already-canonical domain
+///    slug (covers non-steward callers where the resolved role name happens
+///    to name a seeded domain). Still routed through `role_node_id_for_domain`
+///    so it can only ever resolve to a real seeded node — never forges one.
+///
+/// Returns `None` when neither resolves, rather than manufacturing a
+/// non-canonical parallel Role node for an unrecognized agent/role.
+pub fn canonical_role_node_id_for_agent(
+    agent_id: &str,
+    observed_role: Option<&str>,
+) -> Option<&'static str> {
+    if let Some(domain_slug) = domain_slug_for_agent(agent_id) {
+        if let Some(role_node_id) = role_node_id_for_domain(domain_slug) {
+            return Some(role_node_id);
+        }
+    }
+    observed_role.and_then(|role| role_node_id_for_domain(role.trim()))
+}
+
 fn escape_cypher_literal(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -250,6 +287,52 @@ mod tests {
             );
         }
         assert_eq!(role_node_id_for_domain("not_a_domain"), None);
+    }
+
+    #[test]
+    fn canonical_role_node_id_for_agent_resolves_via_agent_identity() {
+        // The discriminating case: domain slug "architect" != role_node_id
+        // suffix "ai_architect". A naive slug-of-domain reconstruction would
+        // fork to "life:role:architect"; the canonical resolver must not.
+        assert_eq!(
+            canonical_role_node_id_for_agent("agent-aria-01", None),
+            Some("life:role:ai_architect")
+        );
+        assert_eq!(
+            canonical_role_node_id_for_agent("agent-beacon-01", None),
+            Some("life:role:chief-of-staff")
+        );
+        assert_eq!(
+            canonical_role_node_id_for_agent("agent-coach-01", None),
+            Some("human")
+        );
+    }
+
+    #[test]
+    fn canonical_role_node_id_for_agent_falls_back_to_observed_role_as_domain_slug() {
+        // Unknown agent, but observed_role happens to name a seeded domain
+        // slug verbatim: still resolved through the canonical map, never
+        // reconstructed from a slugged string.
+        assert_eq!(
+            canonical_role_node_id_for_agent("agent-unknown-01", Some("architect")),
+            Some("life:role:ai_architect")
+        );
+    }
+
+    #[test]
+    fn canonical_role_node_id_for_agent_skips_rather_than_forks() {
+        assert_eq!(
+            canonical_role_node_id_for_agent("agent-unknown-01", None),
+            None
+        );
+        assert_eq!(
+            canonical_role_node_id_for_agent("agent-unknown-01", Some("not_a_domain")),
+            None
+        );
+        assert_eq!(
+            canonical_role_node_id_for_agent("agent-unknown-01", Some("")),
+            None
+        );
     }
 
     #[test]
