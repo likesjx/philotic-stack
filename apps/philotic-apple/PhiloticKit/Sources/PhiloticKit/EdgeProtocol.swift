@@ -267,6 +267,11 @@ public enum EdgeMessage: Equatable, Sendable {
     /// `cancel: true` discards it. A dropped WebSocket also discards any
     /// partial stream (re-record, don't resume).
     case audioStreamEnd(streamId: String, cancel: Bool)
+    /// Server -> client: a realtime partial transcript of an in-flight audio
+    /// stream. Ephemeral live UI feedback — never retained in the server's
+    /// replay ring, so it must NOT advance the resume cursor. Sending it
+    /// client -> server is invalid.
+    case transcriptPartial(streamId: String, conversationId: String?, text: String, isFinal: Bool)
     /// Server -> client: invoke a tool the device advertised in its
     /// capabilities (e.g. HealthKit read, Shortcuts run).
     case toolInvoke(invocationId: String, toolRef: String, argsJson: String)
@@ -317,6 +322,7 @@ extension EdgeMessage: Codable {
         case dataBase64 = "data_base64"
         case cancel
         case isFinal = "is_final"
+        case text
         case invocationId = "invocation_id"
         case toolRef = "tool_ref"
         case argsJson = "args_json"
@@ -341,6 +347,7 @@ extension EdgeMessage: Codable {
         case audioStreamStart = "audio_stream_start"
         case audioChunk = "audio_chunk"
         case audioStreamEnd = "audio_stream_end"
+        case transcriptPartial = "transcript_partial"
         case toolInvoke = "tool_invoke"
         case toolResult = "tool_result"
         case capabilitiesUpdate = "capabilities_update"
@@ -469,6 +476,18 @@ extension EdgeMessage: Codable {
             let cancel = try container.decode(Bool.self, forKey: .cancel)
             self = .audioStreamEnd(streamId: streamId, cancel: cancel)
 
+        case .transcriptPartial:
+            let streamId = try container.decode(String.self, forKey: .streamId)
+            let conversationId = try container.decodeIfPresent(String.self, forKey: .conversationId)
+            let text = try container.decode(String.self, forKey: .text)
+            let isFinal = try container.decode(Bool.self, forKey: .isFinal)
+            self = .transcriptPartial(
+                streamId: streamId,
+                conversationId: conversationId,
+                text: text,
+                isFinal: isFinal
+            )
+
         case .toolInvoke:
             let invocationId = try container.decode(String.self, forKey: .invocationId)
             let toolRef = try container.decode(String.self, forKey: .toolRef)
@@ -593,6 +612,14 @@ extension EdgeMessage: Codable {
             try container.encode(streamId, forKey: .streamId)
             // `cancel` is always encoded, matching the Rust wire form.
             try container.encode(cancel, forKey: .cancel)
+
+        case .transcriptPartial(let streamId, let conversationId, let text, let isFinal):
+            try container.encode(Tag.transcriptPartial.rawValue, forKey: .type)
+            try container.encode(streamId, forKey: .streamId)
+            try container.encodeIfPresent(conversationId, forKey: .conversationId)
+            try container.encode(text, forKey: .text)
+            // `is_final` is always encoded, matching the Rust wire form.
+            try container.encode(isFinal, forKey: .isFinal)
 
         case .toolInvoke(let invocationId, let toolRef, let argsJson):
             try container.encode(Tag.toolInvoke.rawValue, forKey: .type)

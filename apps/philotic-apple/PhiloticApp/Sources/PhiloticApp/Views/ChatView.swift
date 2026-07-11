@@ -55,14 +55,28 @@ struct ChatView: View {
                         .foregroundStyle(micActive ? Color.red : Color.accentColor)
                         .symbolEffect(.pulse, isActive: micActive)
                 }
-                .disabled(session.currentAgent == nil || session.isSendingVoice)
+                .disabled(
+                    session.currentAgent == nil || session.isSendingVoice
+                        || session.isConversationActive
+                )
                 .accessibilityLabel(micAccessibilityLabel)
+
+                // Hands-free conversation mode toggle (additive to
+                // push-to-talk): pulses while active, tap again to end.
+                Button(action: toggleConversation) {
+                    Image(systemName: session.isConversationActive ? "waveform.circle.fill" : "waveform.circle")
+                        .font(.title2)
+                        .foregroundStyle(session.isConversationActive ? Color.red : Color.accentColor)
+                        .symbolEffect(.pulse, isActive: session.isConversationActive)
+                }
+                .disabled(session.currentAgent == nil || micActive)
+                .accessibilityLabel(session.isConversationActive ? "End conversation" : "Start conversation")
 
                 TextField(inputPlaceholder, text: fieldBinding, axis: .vertical)
                     .lineLimit(1...5)
                     .textFieldStyle(.roundedBorder)
                     .focused($inputFocused)
-                    .disabled(micActive || session.isSendingVoice)
+                    .disabled(micActive || session.isSendingVoice || session.isConversationActive)
                     .onSubmit(send)
 
                 if session.isSendingVoice {
@@ -90,19 +104,26 @@ struct ChatView: View {
         }
     }
 
-    /// True while the mic is capturing in either mode (recording or
-    /// dictation).
+    /// True while the mic is captured by a PUSH-TO-TALK mode (streaming,
+    /// fallback recording, or dictation). Conversation mode's continuous
+    /// capture deliberately doesn't count — its state shows on the
+    /// waveform button instead.
     private var micActive: Bool {
-        voice.isRecording || voice.isListening
+        guard !session.isConversationActive else { return false }
+        return voice.isCapturingPCM || voice.isRecording || voice.isListening
     }
 
     private var micAccessibilityLabel: String {
-        if voice.isRecording { return "Stop recording and send" }
+        if voice.isCapturingPCM || voice.isRecording { return "Stop recording and send" }
         if voice.isListening { return "Stop dictation" }
         return session.transcribeOnDevice ? "Start dictation" : "Record voice message"
     }
 
     private var inputPlaceholder: String {
+        if session.isConversationActive {
+            // Hands-free status line: idle-open mic vs agent audio.
+            return voice.isPlaying ? "Speaking…" : "Listening…"
+        }
         if session.isSendingVoice { return "Sending voice…" }  // HTTP fallback upload
         if session.isStreamingVoice { return "Streaming…" }  // live over the WS
         if voice.isRecording { return "Recording…" }  // fallback capture (WS down)
@@ -110,11 +131,21 @@ struct ChatView: View {
         return "Message"
     }
 
-    /// While dictating (on-device mode only), mirrors the live partial
-    /// transcript into the input field; otherwise it's a normal editable
-    /// draft. Raw recording shows no live transcript — there isn't one.
+    /// While dictating, mirrors the local partial transcript; while
+    /// WS-streaming or in conversation mode with realtime server STT,
+    /// mirrors the incoming `transcript_partial` text. Otherwise it's a
+    /// normal editable draft. (No partials from the server → the field
+    /// stays empty behind the placeholder — graceful degradation.)
     private var fieldBinding: Binding<String> {
-        voice.isListening ? .constant(voice.transcript) : $draft
+        if voice.isListening {
+            return .constant(voice.transcript)
+        }
+        if session.isStreamingVoice || session.isConversationActive,
+            let live = session.liveTranscript
+        {
+            return .constant(live)
+        }
+        return $draft
     }
 
     private func send() {
@@ -124,11 +155,20 @@ struct ChatView: View {
         Task { await session.send(text) }
     }
 
-    /// Default mode streams raw audio live over the edge WS for hotel-side
-    /// transcription (record→HTTP-upload fallback when disconnected); the
-    /// "Transcribe on device" setting switches to local dictation.
+    private func toggleConversation() {
+        if session.isConversationActive {
+            Task { await session.stopConversation() }
+        } else {
+            Task { await session.startConversation() }
+        }
+    }
+
+    /// Default mode streams raw PCM live over the edge WS for realtime
+    /// hotel-side transcription (record→HTTP-upload fallback when
+    /// disconnected); the "Transcribe on device" setting switches to local
+    /// dictation.
     private func toggleMic() {
-        if voice.isRecording {
+        if voice.isCapturingPCM || voice.isRecording {
             // Covers both the WS-streaming and HTTP-fallback captures —
             // the session knows which is active.
             Task { await session.finishVoiceStreaming() }

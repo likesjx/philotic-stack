@@ -170,6 +170,29 @@ final class EdgeProtocolTests: XCTestCase {
         try roundTrip(EdgeEnvelope(seq: 12, msg: .audioStreamEnd(streamId: "stream-1", cancel: true)))
     }
 
+    func testRoundTripTranscriptPartial() throws {
+        try roundTrip(
+            EdgeEnvelope(
+                seq: 13,
+                msg: .transcriptPartial(
+                    streamId: "stream-1",
+                    conversationId: "conv-9",
+                    text: "hello wor",
+                    isFinal: false
+                )
+            ))
+        try roundTrip(
+            EdgeEnvelope(
+                seq: 14,
+                msg: .transcriptPartial(
+                    streamId: "stream-1",
+                    conversationId: nil,
+                    text: "hello world",
+                    isFinal: true
+                )
+            ))
+    }
+
     func testRoundTripTurnEvent() throws {
         for kind in [TurnEventKind.token, .final, .status, .error] {
             try roundTrip(
@@ -350,6 +373,13 @@ final class EdgeProtocolTests: XCTestCase {
     private let goldenAudioStreamEnd =
         #"{"v":1,"seq":12,"msg":{"type":"audio_stream_end","stream_id":"stream-1","cancel":false}}"#
 
+    /// Byte-for-byte from `philotic-edge-protocol`'s
+    /// `golden_json_transcript_partial` — realtime STT feedback. This
+    /// fixture has no `conversation_id`, proving the key is OMITTED (not
+    /// null) when absent; `is_final` is always encoded.
+    private let goldenTranscriptPartial =
+        #"{"v":1,"seq":13,"msg":{"type":"transcript_partial","stream_id":"stream-1","text":"hello wor","is_final":false}}"#
+
     /// Byte-for-byte from `philotic-edge-protocol`'s `golden_json_approval_resolve`.
     private let goldenApprovalResolve =
         #"{"v":1,"seq":4,"ack":9,"msg":{"type":"approval_resolve","approval_id":"appr-1","approved":true,"note":"looks fine"}}"#
@@ -513,6 +543,33 @@ final class EdgeProtocolTests: XCTestCase {
 
     /// Catches "encodeIfPresent cancel" drift: `cancel:false` must stay
     /// present on the wire.
+    func testGoldenJsonTranscriptPartialDecodesToExpectedValue() throws {
+        let envelope = try decoder.decode(
+            EdgeEnvelope.self, from: Data(goldenTranscriptPartial.utf8))
+        XCTAssertEqual(
+            envelope,
+            EdgeEnvelope(
+                seq: 13,
+                ack: nil,
+                msg: .transcriptPartial(
+                    streamId: "stream-1",
+                    conversationId: nil,
+                    text: "hello wor",
+                    isFinal: false
+                )
+            )
+        )
+    }
+
+    /// Guards both wire rules at once: `conversation_id` must stay absent
+    /// when nil, and `is_final:false` must stay present.
+    func testGoldenJsonTranscriptPartialReencodesEquivalently() throws {
+        let envelope = try decoder.decode(
+            EdgeEnvelope.self, from: Data(goldenTranscriptPartial.utf8))
+        let reencoded = try encoder.encode(envelope)
+        try assertJSONEquivalent(reencoded, Data(goldenTranscriptPartial.utf8))
+    }
+
     func testGoldenJsonAudioStreamEndReencodesEquivalently() throws {
         let envelope = try decoder.decode(
             EdgeEnvelope.self, from: Data(goldenAudioStreamEnd.utf8))

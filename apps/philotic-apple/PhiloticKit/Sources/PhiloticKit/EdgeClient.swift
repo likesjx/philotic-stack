@@ -198,7 +198,10 @@ public actor EdgeClient {
             return true
         case .hello, .helloAck, .turnSubmit, .approvalResolve, .toolResult,
             .capabilitiesUpdate, .ping, .pong, .error,
-            .audioStreamStart, .audioChunk, .audioStreamEnd:
+            .audioStreamStart, .audioChunk, .audioStreamEnd,
+            // Server-push but ephemeral live feedback — never retained in
+            // the replay ring, so it must not move the ack watermark.
+            .transcriptPartial:
             return false
         }
     }
