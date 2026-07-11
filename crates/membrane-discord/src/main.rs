@@ -799,8 +799,22 @@ async fn handle_agent_reply(
         }
 
         "turn_event" => {
-            // Events like waiting_tool, waiting_model — show typing to keep Discord engaged
-            egress::send_typing(http, bot_token, &reply_channel).await;
+            let event = task["event"].as_str().unwrap_or("");
+            if event == "model_fallback" || event == "model_fallback_cleared" {
+                // Model-tier fallback/recovery notice (Slice 3 of Model
+                // Failover Layers): a one-time plain operational message, not
+                // an assistant reply — sent directly, no typing indicator, no
+                // draft tracking, no TTS. `TurnEventPayload` carries the
+                // formatted text in `partial_content` (not `content`).
+                let message = task["partial_content"].as_str().unwrap_or("");
+                if !message.is_empty() {
+                    let _ = egress::send_text_reply(http, bot_token, &reply_channel, message, None)
+                        .await;
+                }
+            } else {
+                // Events like waiting_tool, waiting_model — show typing to keep Discord engaged
+                egress::send_typing(http, bot_token, &reply_channel).await;
+            }
         }
 
         _ => {
