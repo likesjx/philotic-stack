@@ -50,32 +50,7 @@ jobs:
           key: linux-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: linux-x86_64-cargo-
 
-      # Check out the private desktop UI repo so build.rs can build & embed it
-      # into philotic-web. Uses the existing classic PAT (repo scope). Kept in a
-      # dedicated subdir; credentials are not persisted into the git config.
-      - name: Check out jaredlikes-desktop (private UI)
-        uses: actions/checkout@v4
-        with:
-          repository: likesjx/jaredlikes-desktop
-          ref: main
-          token: ${{ secrets.TAP_GITHUB_TOKEN }}
-          path: jaredlikes-desktop
-          persist-credentials: false
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      # Drop any stale committed dist so build.rs rebuilds the UI from the fresh
-      # desktop checkout (it recreates ui-dist/ from the freshly-built dist).
-      - name: Clear stale embedded UI dist
-        run: rm -rf crates/philotic-web/ui-dist
-
       - name: Build release binaries
-        env:
-          PHILOTIC_DESKTOP_DIR: ${{ github.workspace }}/jaredlikes-desktop
-          PHILOTIC_REFRESH_DESKTOP_UI: "1"
         run: |
           cargo build --release --target "${TARGET}" --bins \
             -p aiua \
