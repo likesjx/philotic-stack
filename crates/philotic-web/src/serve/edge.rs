@@ -85,6 +85,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use base64::Engine as _;
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse};
 use philotic_edge_protocol::{
     EdgeEnvelope, EdgeMessage, EnrollmentRequest, EnrollmentResponse, TurnEventKind,
     PROTOCOL_VERSION,
@@ -96,7 +97,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, mpsc, Notify};
 
 use super::AppState;
 
@@ -939,7 +940,7 @@ async fn edge_ws_session(mut socket: WebSocket, state: AppState, auth: EdgeBeare
     // Open uplink audio streams for this session (streaming voice capture).
     // Session-scoped on purpose: a dropped connection discards partial audio
     // — the client re-records rather than resuming a half-stream.
-    let mut audio_streams: HashMap<String, AudioAssembly> = HashMap::new();
+    let mut audio_streams: HashMap<String, AudioStreamState> = HashMap::new();
 
     // Subscribe to the node's delivery channel before acking so no retained
     // frame minted mid-setup is missed (the replay dedupe below handles any
@@ -1149,6 +1150,39 @@ struct AudioAssembly {
     bytes: Vec<u8>,
 }
 
+/// An open uplink audio stream is either batch-assembled (container audio ->
+/// blob -> attachment turn) or relayed live into a realtime STT session
+/// (raw PCM -> model.{provider} -> partial transcripts -> text turn).
+enum AudioStreamState {
+    Assemble(AudioAssembly),
+    Stt {
+        cmd_tx: mpsc::Sender<SttCmd>,
+        next_chunk: u64,
+    },
+}
+
+/// Commands from the WS session loop to a streaming-STT relay task.
+enum SttCmd {
+    Chunk(Vec<u8>),
+    End,
+    Cancel,
+}
+
+/// Realtime STT provider for PCM uplink streams: `PHILOTIC_WEB_STREAMING_STT`
+/// env (e.g. "elevenlabs"); unset/empty/"off" disables (batch assembly path).
+fn edge_streaming_stt_provider() -> Option<String> {
+    std::env::var("PHILOTIC_WEB_STREAMING_STT")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty() && v != "off")
+}
+
+/// Reply role the STT relay subscribes on for transcribe_partial tasks.
+const EDGE_STT_REPLY_ROLE: &str = "management.edge_stt.reply";
+/// Relay inactivity ceiling: no chunk, command, or provider reply for this
+/// long tears the session down with a terminal error frame.
+const EDGE_STT_IDLE_SECS: u64 = 120;
+
 /// Per-stream assembled-audio ceiling (matches the blob proxy body limit).
 const AUDIO_STREAM_MAX_BYTES: usize = 25 * 1024 * 1024;
 /// Concurrent open streams per session — one live recording plus headroom
@@ -1163,7 +1197,7 @@ async fn handle_edge_frame(
     node_id: &str,
     marker: &str,
     client_seq: &mut u64,
-    audio_streams: &mut HashMap<String, AudioAssembly>,
+    audio_streams: &mut HashMap<String, AudioStreamState>,
     raw: &str,
 ) -> FrameOutcome {
     let envelope: EdgeEnvelope = match serde_json::from_str(raw) {
@@ -1285,16 +1319,41 @@ async fn handle_edge_frame(
                     retain: false,
                 };
             }
+            if let Some(provider) =
+                edge_streaming_stt_provider().filter(|_| mime_type.starts_with("audio/pcm"))
+            {
+                let (cmd_tx, cmd_rx) = mpsc::channel::<SttCmd>(128);
+                audio_streams.insert(
+                    stream_id.clone(),
+                    AudioStreamState::Stt {
+                        cmd_tx,
+                        next_chunk: 0,
+                    },
+                );
+                tokio::spawn(run_edge_stt_relay(
+                    state.clone(),
+                    node_id.to_string(),
+                    marker.to_string(),
+                    provider,
+                    stream_id,
+                    target_node_id,
+                    target_agent_id,
+                    conversation_id,
+                    mime_type,
+                    cmd_rx,
+                ));
+                return FrameOutcome::Continue;
+            }
             audio_streams.insert(
                 stream_id,
-                AudioAssembly {
+                AudioStreamState::Assemble(AudioAssembly {
                     target_node_id,
                     target_agent_id,
                     conversation_id,
                     mime_type,
                     next_chunk: 0,
                     bytes: Vec::new(),
-                },
+                }),
             );
             FrameOutcome::Continue
         }
@@ -1303,13 +1362,17 @@ async fn handle_edge_frame(
             chunk_seq,
             data_base64,
         } => {
-            let Some(assembly) = audio_streams.get_mut(&stream_id) else {
+            let Some(stream) = audio_streams.get_mut(&stream_id) else {
                 return FrameOutcome::Reply {
                     msg: edge_error("audio_stream", "chunk for unknown stream", false),
                     retain: false,
                 };
             };
-            if chunk_seq != assembly.next_chunk {
+            let expected = match stream {
+                AudioStreamState::Assemble(a) => a.next_chunk,
+                AudioStreamState::Stt { next_chunk, .. } => *next_chunk,
+            };
+            if chunk_seq != expected {
                 audio_streams.remove(&stream_id);
                 return FrameOutcome::Reply {
                     msg: edge_error(
@@ -1327,27 +1390,54 @@ async fn handle_edge_frame(
                     retain: false,
                 };
             };
-            if assembly.bytes.len() + bytes.len() > AUDIO_STREAM_MAX_BYTES {
-                audio_streams.remove(&stream_id);
-                return FrameOutcome::Reply {
-                    msg: edge_error(
-                        "audio_stream",
-                        "stream exceeds size ceiling; discarded",
-                        false,
-                    ),
-                    retain: false,
-                };
+            match stream {
+                AudioStreamState::Assemble(assembly) => {
+                    if assembly.bytes.len() + bytes.len() > AUDIO_STREAM_MAX_BYTES {
+                        audio_streams.remove(&stream_id);
+                        return FrameOutcome::Reply {
+                            msg: edge_error(
+                                "audio_stream",
+                                "stream exceeds size ceiling; discarded",
+                                false,
+                            ),
+                            retain: false,
+                        };
+                    }
+                    assembly.next_chunk += 1;
+                    assembly.bytes.extend_from_slice(&bytes);
+                }
+                AudioStreamState::Stt { cmd_tx, next_chunk } => {
+                    if cmd_tx.try_send(SttCmd::Chunk(bytes)).is_err() {
+                        audio_streams.remove(&stream_id);
+                        return FrameOutcome::Reply {
+                            msg: edge_error(
+                                "audio_stream",
+                                "stt relay unavailable; stream discarded",
+                                false,
+                            ),
+                            retain: false,
+                        };
+                    }
+                    *next_chunk += 1;
+                }
             }
-            assembly.next_chunk += 1;
-            assembly.bytes.extend_from_slice(&bytes);
             FrameOutcome::Continue
         }
         EdgeMessage::AudioStreamEnd { stream_id, cancel } => {
-            let Some(assembly) = audio_streams.remove(&stream_id) else {
+            let Some(stream) = audio_streams.remove(&stream_id) else {
                 return FrameOutcome::Reply {
                     msg: edge_error("audio_stream", "end for unknown stream", false),
                     retain: false,
                 };
+            };
+            let assembly = match stream {
+                AudioStreamState::Stt { cmd_tx, .. } => {
+                    // The relay owns everything from here: final transcript,
+                    // turn submission, and status/error frames.
+                    let _ = cmd_tx.try_send(if cancel { SttCmd::Cancel } else { SttCmd::End });
+                    return FrameOutcome::Continue;
+                }
+                AudioStreamState::Assemble(assembly) => assembly,
             };
             if cancel {
                 return FrameOutcome::Continue;
@@ -1463,6 +1553,7 @@ async fn handle_edge_frame(
         | EdgeMessage::LifeGraphChange { .. }
         | EdgeMessage::VoiceBlob { .. }
         | EdgeMessage::VoiceReply { .. }
+        | EdgeMessage::TranscriptPartial { .. }
         | EdgeMessage::ToolInvoke { .. } => FrameOutcome::Fatal {
             code: "protocol",
             message: "clients must not send server-to-client message types".into(),
@@ -1556,6 +1647,275 @@ fn translate_operator_broadcast_value(marker: &str, value: &Value) -> Vec<(EdgeM
         }
     }
     out
+}
+
+/// Streaming-STT relay: bridges one uplink PCM audio stream into a realtime
+/// transcription session on `model.{provider}` and turns the final transcript
+/// into a TEXT operator-chat turn (tagged voice-modality so the persona voice
+/// replies). Partial transcripts stream to the device as ephemeral
+/// `TranscriptPartial` frames. The reasoning model never sees audio — this is
+/// the decoupling that lets any text model serve voice conversations.
+#[allow(clippy::too_many_arguments)]
+async fn run_edge_stt_relay(
+    state: AppState,
+    node_id: String,
+    marker: String,
+    provider: String,
+    stream_id: String,
+    target_node_id: String,
+    target_agent_id: String,
+    conversation_id: Option<String>,
+    audio_mime: String,
+    mut cmd_rx: mpsc::Receiver<SttCmd>,
+) {
+    let conversation_id =
+        conversation_id.unwrap_or_else(|| format!("operator-chat:{marker}:{target_agent_id}"));
+    let deliver_error = |message: &str| {
+        let _ = state
+            .edge
+            .outbound_delivery_only(&node_id, edge_error("stt_stream", message, false));
+    };
+
+    // Reply client: a dedicated ephemeral guest subscribed for
+    // transcribe_partial tasks from the provider controller.
+    let reply_guest_id = format!("edge-stt-{}", random_hex(8));
+    let identity = GuestIdentity {
+        guest_id: reply_guest_id.clone(),
+        role: EDGE_STT_REPLY_ROLE.into(),
+        supported_tools: vec![],
+    };
+    let mut client = match super::connect_client_with_identity(&state.socket, identity).await {
+        Ok(client) => client,
+        Err(err) => {
+            deliver_error(&format!("stt relay could not reach the hotel: {err}"));
+            return;
+        }
+    };
+    match client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: EDGE_STT_REPLY_ROLE.into(),
+        })
+        .await
+    {
+        Ok(IpcResponse::Standard { ok: true, .. }) => {}
+        other => {
+            deliver_error(&format!("stt relay subscribe failed: {other:?}"));
+            return;
+        }
+    }
+
+    // Local node id for reply routing (the controller EmitTasks back to us).
+    let local_node = match super::ipc_desktop_membrane_targets(&state.socket)
+        .await
+        .ok()
+        .and_then(|ts| ts.into_iter().find(|t| t.is_local))
+    {
+        Some(t) => t.target_node_id,
+        None => {
+            deliver_error("stt relay could not resolve the local node");
+            return;
+        }
+    };
+
+    // Parse rate/channels from the mime (audio/pcm;rate=16000;channels=1).
+    let param = |key: &str, default: u32| {
+        audio_mime
+            .split(';')
+            .filter_map(|part| part.trim().strip_prefix(&format!("{key}=")))
+            .filter_map(|v| v.parse::<u32>().ok())
+            .next()
+            .unwrap_or(default)
+    };
+    let stt_role = format!("model.{provider}");
+    let session_id = format!("edge-stt:{stream_id}");
+    let open = json!({
+        "kind": "voice.transcribe.stream",
+        "stream_op": "open",
+        "stream_session_id": session_id,
+        "audio_format": {
+            "encoding": "pcm_s16le",
+            "sample_rate": param("rate", 16_000),
+            "channels": param("channels", 1),
+        },
+        "reply_to": local_node,
+        "reply_role": EDGE_STT_REPLY_ROLE,
+        "reply_guest_id": reply_guest_id,
+    });
+    let emit = |task: Value| IpcRequest::EmitTask {
+        target_node: local_node.clone(),
+        target_role: stt_role.clone(),
+        target_guest_id: None,
+        task_json: task.to_string(),
+    };
+    match client.send_request(emit(open)).await {
+        Ok(IpcResponse::Standard { ok: true, .. }) => {}
+        other => {
+            deliver_error(&format!(
+                "streaming STT unavailable ({stt_role}): {other:?}"
+            ));
+            return;
+        }
+    }
+
+    // Poll loop: drain session commands, then wait briefly for provider
+    // replies. A 200ms recv window bounds both chunk-forwarding latency and
+    // partial-transcript latency without wrestling two &mut borrows.
+    let mut ended = false;
+    let mut final_text: Option<String> = None;
+    let mut last_activity = Instant::now();
+    'relay: loop {
+        if last_activity.elapsed() > Duration::from_secs(EDGE_STT_IDLE_SECS) {
+            deliver_error("stt relay idle timeout");
+            let _ = client
+                .send_request(emit(json!({
+                    "kind": "voice.transcribe.stream",
+                    "stream_op": "end",
+                    "stream_session_id": session_id,
+                })))
+                .await;
+            return;
+        }
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            last_activity = Instant::now();
+            match cmd {
+                SttCmd::Chunk(bytes) => {
+                    let chunk = json!({
+                        "kind": "voice.transcribe.stream",
+                        "stream_op": "chunk",
+                        "stream_session_id": session_id,
+                        "audio_base64":
+                            base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    });
+                    if let Err(err) = client.send_request(emit(chunk)).await {
+                        deliver_error(&format!("stt chunk forward failed: {err}"));
+                        return;
+                    }
+                }
+                SttCmd::End => {
+                    ended = true;
+                    let end = json!({
+                        "kind": "voice.transcribe.stream",
+                        "stream_op": "end",
+                        "stream_session_id": session_id,
+                    });
+                    if let Err(err) = client.send_request(emit(end)).await {
+                        deliver_error(&format!("stt end forward failed: {err}"));
+                        return;
+                    }
+                }
+                SttCmd::Cancel => {
+                    let _ = client
+                        .send_request(emit(json!({
+                            "kind": "voice.transcribe.stream",
+                            "stream_op": "end",
+                            "stream_session_id": session_id,
+                        })))
+                        .await;
+                    return;
+                }
+            }
+        }
+        match tokio::time::timeout(Duration::from_millis(200), client.recv_task()).await {
+            Err(_) => {} // window elapsed — loop back to command draining
+            Ok(Err(err)) => {
+                deliver_error(&format!("stt relay lost the hotel: {err}"));
+                return;
+            }
+            Ok(Ok(IpcResponse::InboundTask { task_json, .. })) => {
+                last_activity = Instant::now();
+                let Ok(payload) = serde_json::from_str::<Value>(&task_json) else {
+                    continue;
+                };
+                if payload.get("action").and_then(Value::as_str) != Some("transcribe_partial")
+                    || payload.get("stream_session_id").and_then(Value::as_str)
+                        != Some(session_id.as_str())
+                {
+                    continue;
+                }
+                let text = payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let is_final = payload
+                    .get("is_final")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if let Some(err) = payload.get("error").and_then(Value::as_str) {
+                    deliver_error(&format!("streaming transcription failed: {err}"));
+                    return;
+                }
+                let _ = state.edge.outbound_delivery_only(
+                    &node_id,
+                    EdgeMessage::TranscriptPartial {
+                        stream_id: stream_id.clone(),
+                        conversation_id: Some(conversation_id.clone()),
+                        text: text.clone(),
+                        is_final,
+                    },
+                );
+                if is_final {
+                    final_text = Some(text);
+                    if ended {
+                        break 'relay;
+                    }
+                }
+            }
+            Ok(Ok(_)) => {} // unsolicited pushes (MuninnStatus etc.) — skip
+        }
+        if ended && final_text.is_some() {
+            break 'relay;
+        }
+    }
+
+    let transcript = final_text.unwrap_or_default();
+    if transcript.trim().is_empty() {
+        deliver_error("streaming transcription produced no text");
+        return;
+    }
+    // Submit the transcript as a TEXT turn tagged voice-modality: the persona
+    // voice reply fires, but the reasoning model receives plain text — any
+    // downstream model works.
+    let resolved_target = resolve_target_node_id(&state, &target_node_id).await;
+    match super::submit_operator_chat_turn(
+        &state,
+        &resolved_target,
+        &target_agent_id,
+        &marker,
+        conversation_id.clone(),
+        transcript,
+        Some("voice".to_string()),
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(accepted) => {
+            let _ = state.edge.outbound_envelope(
+                &node_id,
+                None,
+                EdgeMessage::TurnEvent {
+                    conversation_id: accepted.conversation_id,
+                    event_kind: TurnEventKind::Status,
+                    content: "accepted".into(),
+                    turn_id: Some(accepted.turn_id),
+                },
+                true,
+            );
+        }
+        Err(err) => {
+            let _ = state.edge.outbound_envelope(
+                &node_id,
+                None,
+                EdgeMessage::TurnEvent {
+                    conversation_id,
+                    event_kind: TurnEventKind::Error,
+                    content: err.message,
+                    turn_id: None,
+                },
+                true,
+            );
+        }
+    }
 }
 
 /// Extract an inline persona-voice reply from a `send_reply` broadcast
