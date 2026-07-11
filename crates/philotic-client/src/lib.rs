@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::ErrorKind;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Represents the identity of a Guest materializing in the Hotel.
@@ -2688,6 +2689,16 @@ pub struct PhiloticClient {
     _identity: GuestIdentity,
     pending_push: VecDeque<IpcResponse>,
     read_buf: Vec<u8>,
+    /// DEF-045: number of responses still owed to requests whose caller gave up
+    /// on them (via [`Self::send_request_with_timeout`] elapsing) before the
+    /// hotel's reply arrived. The IPC stream is a single in-order pipe with no
+    /// per-message correlation ID, so a dropped future does not un-send the
+    /// request — the hotel still processes it and writes exactly one reply
+    /// frame back, later, in its turn. Every non-push frame read while this is
+    /// > 0 is *that* stale reply (FIFO ordering guarantees it precedes the
+    /// reply to any request written after the timeout), so it is discarded
+    /// before normal response matching resumes. Pushes are never discarded.
+    pending_stale_responses: u32,
 }
 
 pub fn is_ipc_disconnect(err: &anyhow::Error) -> bool {
@@ -2710,6 +2721,19 @@ pub fn is_ipc_disconnect(err: &anyhow::Error) -> bool {
 
 pub fn is_graceful_shutdown(resp: &IpcResponse) -> bool {
     matches!(resp, IpcResponse::GracefulShutdown { .. })
+}
+
+/// True if `err` (or something in its anyhow chain) is a
+/// [`Self::send_request_with_timeout`] elapse rather than a genuine transport/
+/// protocol failure. Lets callers that previously distinguished an outer
+/// `tokio::time::timeout` elapse from an inner `send_request` error keep doing
+/// so after migrating to `send_request_with_timeout`'s single `Result`.
+pub fn is_ipc_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    })
 }
 
 impl PhiloticClient {
@@ -2787,6 +2811,7 @@ impl PhiloticClient {
             _identity: identity.clone(),
             pending_push: VecDeque::new(),
             read_buf: Vec::new(),
+            pending_stale_responses: 0,
         };
 
         info!("Registering as Materialized Guest: {:?}", identity);
@@ -2812,19 +2837,99 @@ impl PhiloticClient {
         Self::connect_at(Self::socket_path(), identity).await
     }
 
-    /// Send an IPC request to the local Ansible
+    /// Send an IPC request to the local Ansible and wait indefinitely for its reply.
     pub async fn send_request(&mut self, req: IpcRequest) -> Result<IpcResponse> {
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
         self.write_frame(&payload).await?;
+        self.read_matching_response(&req).await
+    }
 
+    /// Same contract as [`Self::send_request`], but bounds the wait for a reply to
+    /// `timeout`. This exists because callers historically wrapped `send_request`
+    /// in an external `tokio::time::timeout` — but dropping that future when the
+    /// timeout elapsed did NOT stop the hotel from eventually writing a reply
+    /// frame back. Since this IPC stream carries no per-message correlation ID,
+    /// that orphaned reply would sit at the front of the stream and get handed
+    /// out as the response to the *next* `send_request` call, permanently
+    /// desyncing the connection one frame (DEF-045).
+    ///
+    /// This method owns the timeout internally so it can record that a reply is
+    /// still owed (see [`Self::pending_stale_responses`]) and transparently
+    /// discard it — instead of misdelivering it — the next time any response is
+    /// read on this connection.
+    ///
+    /// On elapse, returns an `Err` describing the timeout (mirrors the shape
+    /// callers get from `tokio::time::timeout(..).await?` today).
+    pub async fn send_request_with_timeout(
+        &mut self,
+        req: IpcRequest,
+        timeout: Duration,
+    ) -> Result<IpcResponse> {
+        let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
+        self.write_frame(&payload).await?;
+
+        match tokio::time::timeout(timeout, self.read_matching_response(&req)).await {
+            Ok(result) => result,
+            Err(elapsed) => {
+                self.pending_stale_responses = self.pending_stale_responses.saturating_add(1);
+                warn!(
+                    "IPC request timed out after {:?} waiting for a reply; the hotel's eventual \
+                     reply will be discarded when it arrives to keep the connection framed: {:?}",
+                    timeout, req
+                );
+                // Wrap (not discard) the tokio::time::error::Elapsed so callers that need to
+                // tell "timed out" apart from "the hotel replied with an actual error" can
+                // `err.downcast_ref::<tokio::time::error::Elapsed>()` — see is_ipc_timeout.
+                Err(anyhow::Error::new(elapsed).context(format!(
+                    "IPC request timed out after {:?}: {:?}",
+                    timeout, req
+                )))
+            }
+        }
+    }
+
+    /// Read frames from the stream until one matches `req`, buffering any push
+    /// messages encountered along the way and discarding stale replies owed to
+    /// earlier timed-out requests (see [`Self::pending_stale_responses`]).
+    async fn read_matching_response(&mut self, req: &IpcRequest) -> Result<IpcResponse> {
         loop {
             let resp = self.read_response().await?;
-            if Self::is_expected_response(&req, &resp) {
-                return Ok(resp);
-            }
+
+            // Pushes are never stale-request fallout and must never be lost —
+            // classify and buffer them before any stale-discard logic runs.
             if Self::is_push_message(&resp) {
                 self.pending_push.push_back(resp);
                 continue;
+            }
+
+            // A non-push frame arriving while a reply is still owed to an earlier
+            // timed-out request MUST be that reply: this stream is FIFO and that
+            // request's write strictly preceded `req`'s write, so its response
+            // (if not yet consumed) strictly precedes `req`'s response too.
+            //
+            // BUT: hotel-wide OOB broadcasts (`is_ignorable_push` — lease status
+            // pings, MuninnStatus, NetworkState, etc.) are not pushes but also are
+            // not owed replies to anything; they can land on this connection at
+            // any time regardless of pending_stale_responses. They must be
+            // skipped WITHOUT decrementing the counter here, or a broadcast
+            // arriving before the real stale reply burns the "owed" credit and
+            // the real reply then falls through to be misdelivered as the
+            // response to the current request — reintroducing the exact desync
+            // this counter exists to prevent.
+            if self.pending_stale_responses > 0 {
+                if Self::is_ignorable_push(&resp) {
+                    continue;
+                }
+                self.pending_stale_responses -= 1;
+                warn!(
+                    "Discarding stale IPC response left over from a prior timed-out request: {:?}",
+                    resp
+                );
+                continue;
+            }
+
+            if Self::is_expected_response(req, &resp) {
+                return Ok(resp);
             }
             // Ignorable hotel-wide broadcasts (MuninnStatus, NetworkState, lease events) can
             // arrive on any connection at any time, including between a request write and its
@@ -2930,6 +3035,27 @@ impl PhiloticClient {
             let resp = self.read_response().await?;
             if Self::is_push_message(&resp) {
                 return Ok(resp);
+            }
+            // DEF-045: a reply still owed to an earlier timed-out send_request_with_timeout
+            // call can surface here too (recv_task and send_request share one stream).
+            // Discard it silently rather than bailing — it is expected fallout, not a
+            // protocol violation.
+            //
+            // As in `read_matching_response`: OOB broadcasts (`is_ignorable_push`) are not
+            // owed replies and must be skipped WITHOUT decrementing the counter, or a
+            // broadcast landing before the real stale reply burns the credit and the real
+            // reply then falls through unrecognized below.
+            if self.pending_stale_responses > 0 {
+                if Self::is_ignorable_push(&resp) {
+                    continue;
+                }
+                self.pending_stale_responses -= 1;
+                warn!(
+                    "Discarding stale IPC response left over from a prior timed-out request \
+                     (observed in recv_task): {:?}",
+                    resp
+                );
+                continue;
             }
             // Some live EmitTask paths can leave a successful ACK on the stream before
             // the routed push arrives. While explicitly waiting for a pushed task, this
@@ -3745,10 +3871,521 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn send_request_with_timeout_discards_stale_response_before_next_reply() {
+        // DEF-045 regression: request A times out client-side before the hotel's
+        // reply arrives; request B is issued right after. The hotel's late reply
+        // to A must be discarded, not misdelivered as B's response.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                // Request A: the client will give up on this before we reply.
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request A") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "stale-a"),
+                    other => panic!("unexpected request A: {other:?}"),
+                }
+
+                // Delay well past the client's timeout, then send the late reply.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "stale-a".into(),
+                        value_json: Some("\"A\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                // Request B was written by the client right after its timeout fired.
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request B") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "fresh-b"),
+                    other => panic!("unexpected request B: {other:?}"),
+                }
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "fresh-b".into(),
+                        value_json: Some("\"B\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-stale".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let timed_out = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "stale-a".into(),
+                },
+                Duration::from_millis(30),
+            )
+            .await;
+        assert!(
+            timed_out.is_err(),
+            "expected request A to time out client-side, got {timed_out:?}"
+        );
+        assert_eq!(client.pending_stale_responses, 1);
+
+        let response_b = client
+            .send_request(IpcRequest::GetConfig {
+                key: "fresh-b".into(),
+            })
+            .await
+            .expect("send request B");
+
+        match response_b {
+            IpcResponse::ConfigData { key, value_json } => {
+                assert_eq!(key, "fresh-b");
+                assert_eq!(value_json.as_deref(), Some("\"B\""));
+            }
+            other => panic!("expected fresh-b response (stale-a must be discarded), got {other:?}"),
+        }
+        assert_eq!(
+            client.pending_stale_responses, 0,
+            "stale counter must be drained once the late reply is discarded"
+        );
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_response_discard_does_not_lose_interleaved_push() {
+        // DEF-045 regression: a push arriving between the discarded stale reply
+        // and the real reply must still surface via recv_task, not be dropped.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request A") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "stale-a"),
+                    other => panic!("unexpected request A: {other:?}"),
+                }
+
+                tokio::time::sleep(Duration::from_millis(150)).await;
+
+                // Stale reply to A, then a push, then (once it arrives) the real
+                // reply to B — push sits between the stale frame and the real one.
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "stale-a".into(),
+                        value_json: Some("\"A\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::InboundTask {
+                        source_node: "local-aiua-01".into(),
+                        task_id: Uuid::nil(),
+                        task_json: serde_json::json!({
+                            "action": "send_reply",
+                            "content": "push between stale and real"
+                        })
+                        .to_string(),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request B") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "fresh-b"),
+                    other => panic!("unexpected request B: {other:?}"),
+                }
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "fresh-b".into(),
+                        value_json: Some("\"B\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-stale-push".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let timed_out = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "stale-a".into(),
+                },
+                Duration::from_millis(30),
+            )
+            .await;
+        assert!(timed_out.is_err(), "expected request A to time out");
+
+        let response_b = client
+            .send_request(IpcRequest::GetConfig {
+                key: "fresh-b".into(),
+            })
+            .await
+            .expect("send request B");
+        match response_b {
+            IpcResponse::ConfigData { key, .. } => assert_eq!(key, "fresh-b"),
+            other => panic!("expected fresh-b response, got {other:?}"),
+        }
+
+        let pushed = client
+            .recv_task()
+            .await
+            .expect("interleaved push must not be lost");
+        match pushed {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("decode pushed task");
+                assert_eq!(payload["content"], "push between stale and real");
+            }
+            other => panic!("unexpected pushed response: {other:?}"),
+        }
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn ignorable_oob_broadcast_during_stale_window_is_not_mistaken_for_the_owed_reply() {
+        // DEF-045 regression: an OOB broadcast (lease status ping, MuninnStatus,
+        // NetworkState, ...) is NOT a push and NOT the owed stale reply, but it can
+        // land on this connection at any time — including while a stale reply is
+        // still outstanding. If it were allowed to burn the pending_stale_responses
+        // credit, the *real* stale reply arriving right after it would fall through
+        // unrecognized and get misdelivered as B's response — reintroducing the
+        // exact desync this counter exists to prevent.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request A") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "stale-a"),
+                    other => panic!("unexpected request A: {other:?}"),
+                }
+
+                tokio::time::sleep(Duration::from_millis(150)).await;
+
+                // OOB broadcast lands BEFORE the real stale reply.
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::TelegramPollLeaseStatus {
+                        active: true,
+                        lease: None,
+                    })
+                    .unwrap(),
+                )
+                .await;
+                // The real stale reply to A.
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "stale-a".into(),
+                        value_json: Some("\"A\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request B") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "fresh-b"),
+                    other => panic!("unexpected request B: {other:?}"),
+                }
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "fresh-b".into(),
+                        value_json: Some("\"B\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-stale-oob".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let timed_out = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "stale-a".into(),
+                },
+                Duration::from_millis(30),
+            )
+            .await;
+        assert!(timed_out.is_err(), "expected request A to time out");
+
+        let response_b = client
+            .send_request(IpcRequest::GetConfig {
+                key: "fresh-b".into(),
+            })
+            .await
+            .expect("send request B");
+        match response_b {
+            IpcResponse::ConfigData { key, value_json } => {
+                assert_eq!(key, "fresh-b");
+                assert_eq!(value_json.as_deref(), Some("\"B\""));
+            }
+            other => panic!(
+                "expected fresh-b response (OOB broadcast must not consume the stale credit), got {other:?}"
+            ),
+        }
+        assert_eq!(
+            client.pending_stale_responses, 0,
+            "stale counter must be drained by the real stale reply, not the OOB broadcast"
+        );
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_request_with_timeout_behaves_like_send_request_on_prompt_reply() {
+        // Normal (non-timeout) path: send_request_with_timeout must return the
+        // real reply and leave no stale-response bookkeeping behind, exactly
+        // like plain send_request.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "prompt"),
+                    other => panic!("unexpected request: {other:?}"),
+                }
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "prompt".into(),
+                        value_json: Some("\"ok\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-prompt".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let response = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "prompt".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("send request with ample timeout");
+
+        match response {
+            IpcResponse::ConfigData { key, value_json } => {
+                assert_eq!(key, "prompt");
+                assert_eq!(value_json.as_deref(), Some("\"ok\""));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert_eq!(client.pending_stale_responses, 0);
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
     #[test]
     fn disconnect_detection_matches_unexpected_eof() {
         let err = anyhow::Error::new(std::io::Error::from(ErrorKind::UnexpectedEof));
         assert!(is_ipc_disconnect(&err));
+    }
+
+    #[tokio::test]
+    async fn is_ipc_timeout_distinguishes_elapse_from_other_errors() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+                // Never respond to the next request — the client's timeout must elapse.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+        let identity = GuestIdentity {
+            guest_id: "guest-test-timeout-kind".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let err = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "never".into(),
+                },
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("expected timeout error");
+        assert!(
+            is_ipc_timeout(&err),
+            "expected an is_ipc_timeout error, got {err:?}"
+        );
+
+        let other = anyhow::anyhow!("some unrelated failure");
+        assert!(!is_ipc_timeout(&other));
+
+        server.abort();
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
     }
 
     #[test]

@@ -730,17 +730,18 @@ impl AgentRuntime {
                     .await;
             }
 
-            tokio::time::timeout(
-                Duration::from_secs(30),
-                self.ipc_client.send_request(IpcRequest::EmitTask {
-                    target_node: route.target_node,
-                    target_role: route.target_role,
-                    target_guest_id: route.incarnation_id.clone(),
-                    task_json: serde_json::to_string(&tool_req)?,
-                }),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("tool dispatch: ipc ack timeout after 30s"))??;
+            self.ipc_client
+                .send_request_with_timeout(
+                    IpcRequest::EmitTask {
+                        target_node: route.target_node,
+                        target_role: route.target_role,
+                        target_guest_id: route.incarnation_id.clone(),
+                        task_json: serde_json::to_string(&tool_req)?,
+                    },
+                    Duration::from_secs(30),
+                )
+                .await
+                .context("tool dispatch: ipc ack failed or timed out after 30s")?;
 
             Ok(())
         })

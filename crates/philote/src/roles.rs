@@ -123,23 +123,23 @@ impl AgentRuntime {
         &mut self,
         role_name: &str,
     ) -> Option<crate::session::RoleActivation> {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            self.ipc_client
-                .send_request(IpcRequest::ListRoleIncarnations {
+        match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::ListRoleIncarnations {
                     agent_id: self.agent_id.clone(),
-                }),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or(IpcResponse::Standard {
-            ok: false,
-            code: String::new(),
-            message: String::new(),
-            corr_id: String::new(),
-            data: None,
-        }) {
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .ok()
+            .unwrap_or(IpcResponse::Standard {
+                ok: false,
+                code: String::new(),
+                message: String::new(),
+                corr_id: String::new(),
+                data: None,
+            }) {
             IpcResponse::Standard {
                 ok: true,
                 data: Some(data),
@@ -213,22 +213,24 @@ impl AgentRuntime {
         state: &mut SessionState,
         profile_name: &str,
     ) {
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.ipc_client.send_request(IpcRequest::GetToolsetProfile {
-                profile_name: profile_name.to_string(),
-            }),
-        )
-        .await;
+        let response = self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetToolsetProfile {
+                    profile_name: profile_name.to_string(),
+                },
+                Duration::from_secs(5),
+            )
+            .await;
 
         let profile = match response {
-            Ok(Ok(IpcResponse::Standard {
+            Ok(IpcResponse::Standard {
                 ok: true,
                 data: Some(profile),
                 ..
-            })) => profile,
-            Ok(Ok(IpcResponse::Standard { ok: true, .. })) => return,
-            Ok(Ok(other)) => {
+            }) => profile,
+            Ok(IpcResponse::Standard { ok: true, .. }) => return,
+            Ok(other) => {
                 warn!(
                     agent_id = %self.agent_id,
                     profile = %profile_name,
@@ -236,19 +238,19 @@ impl AgentRuntime {
                 );
                 return;
             }
-            Ok(Err(err)) => {
-                warn!(
-                    agent_id = %self.agent_id,
-                    profile = %profile_name,
-                    "GetToolsetProfile failed while hydrating fresh session: {err}"
-                );
-                return;
-            }
-            Err(_) => {
+            Err(err) if philotic_client::is_ipc_timeout(&err) => {
                 warn!(
                     agent_id = %self.agent_id,
                     profile = %profile_name,
                     "GetToolsetProfile timed out while hydrating fresh session."
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    agent_id = %self.agent_id,
+                    profile = %profile_name,
+                    "GetToolsetProfile failed while hydrating fresh session: {err}"
                 );
                 return;
             }

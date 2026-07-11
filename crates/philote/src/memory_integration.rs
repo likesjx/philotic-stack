@@ -1154,13 +1154,15 @@ impl AgentRuntime {
         // A short timeout + retry window clears that race without hanging indefinitely.
         for attempt in 1u8..=3 {
             info!("Requesting MuninnDB config from hotel (attempt {attempt})...");
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                self.ipc_client.send_request(IpcRequest::FetchMemoryConfig),
-            )
-            .await;
+            let result = self
+                .ipc_client
+                .send_request_with_timeout(
+                    IpcRequest::FetchMemoryConfig,
+                    std::time::Duration::from_secs(3),
+                )
+                .await;
             match result {
-                Ok(Ok(IpcResponse::MemoryConfig(config))) if config.config_json.is_some() => {
+                Ok(IpcResponse::MemoryConfig(config)) if config.config_json.is_some() => {
                     let json = config.config_json.expect("checked is_some");
                     match serde_json::from_str::<MuninnConfig>(&json) {
                         Ok(cfg) => {
@@ -1171,18 +1173,18 @@ impl AgentRuntime {
                     }
                     return;
                 }
-                Ok(Ok(IpcResponse::MemoryConfig(config))) if config.config_json.is_none() => {
+                Ok(IpcResponse::MemoryConfig(config)) if config.config_json.is_none() => {
                     info!("Hotel has no MuninnDB config — running without memory");
                     return;
                 }
-                Ok(Ok(_)) | Ok(Err(_)) => {
-                    warn!(
-                        "Unexpected response to FetchMemoryConfig (attempt {attempt}) — retrying"
-                    );
-                }
-                Err(_) => {
+                Err(e) if philotic_client::is_ipc_timeout(&e) => {
                     warn!(
                         "FetchMemoryConfig timed out (attempt {attempt}) — response likely consumed by concurrent guest registration; retrying"
+                    );
+                }
+                Ok(_) | Err(_) => {
+                    warn!(
+                        "Unexpected response to FetchMemoryConfig (attempt {attempt}) — retrying"
                     );
                 }
             }

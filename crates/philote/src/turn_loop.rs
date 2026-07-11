@@ -603,19 +603,23 @@ impl AgentRuntime {
         // Publish command manifest to the hotel so membrane can discover it.
         let manifest = command_manifest(&[]);
         if let Ok(content_json) = serde_json::to_value(&manifest) {
-            let sync_result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.ipc_client.send_request(IpcRequest::SyncApartment {
-                    agent_id: self.agent_id.clone(),
-                    memory_type: "command_manifest".into(),
-                    content_json,
-                }),
-            )
-            .await;
+            let sync_result = self
+                .ipc_client
+                .send_request_with_timeout(
+                    IpcRequest::SyncApartment {
+                        agent_id: self.agent_id.clone(),
+                        memory_type: "command_manifest".into(),
+                        content_json,
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
             match sync_result {
-                Ok(Ok(_)) => info!("Command manifest published ({} entries).", manifest.len()),
-                Ok(Err(e)) => warn!("Failed to publish command manifest: {}", e),
-                Err(_) => warn!("Command manifest sync timed out (startup race) — continuing"),
+                Ok(_) => info!("Command manifest published ({} entries).", manifest.len()),
+                Err(e) if philotic_client::is_ipc_timeout(&e) => {
+                    warn!("Command manifest sync timed out (startup race) — continuing")
+                }
+                Err(e) => warn!("Failed to publish command manifest: {}", e),
             }
         }
 
