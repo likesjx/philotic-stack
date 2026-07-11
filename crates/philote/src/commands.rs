@@ -1,5 +1,76 @@
 use philotic_client::CommandManifestEntry;
 
+/// A named model the operator can swap to via `/model <alias>`. Maps a friendly
+/// alias to the provider tier role it routes through and the concrete model id
+/// to bind for that tier (`None` for a provider whose default model is used,
+/// e.g. Gemini). Backs the durable one-tap swap in the `/model` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelPreset {
+    pub alias: &'static str,
+    pub label: &'static str,
+    /// Provider tier role this preset makes primary (e.g. `"model.openrouter"`).
+    pub tier_role: &'static str,
+    /// Concrete model id to bind for `tier_role`, or `None` to use the
+    /// provider's own default model (Gemini).
+    pub model_id: Option<&'static str>,
+    pub description: &'static str,
+}
+
+/// Curated model presets, ordered for display in the `/model` list. Seeded from
+/// the uncensored-companion model comparison (UGI leaderboard + OpenRouter).
+pub fn model_presets() -> &'static [ModelPreset] {
+    &[
+        ModelPreset {
+            alias: "cydonia",
+            label: "Cydonia 24B",
+            tier_role: "model.openrouter",
+            model_id: Some("thedrummer/cydonia-24b-v4.1"),
+            description: "uncensored RP companion",
+        },
+        ModelPreset {
+            alias: "dolphin",
+            label: "Dolphin Venice",
+            tier_role: "model.openrouter",
+            model_id: Some("cognitivecomputations/dolphin-mistral-24b-venice-edition:free"),
+            description: "free, most willing",
+        },
+        ModelPreset {
+            alias: "euryale",
+            label: "Euryale 70B",
+            tier_role: "model.openrouter",
+            model_id: Some("sao10k/l3.3-euryale-70b"),
+            description: "bigger, best coherence",
+        },
+        ModelPreset {
+            alias: "deepseek",
+            label: "DeepSeek V3.2",
+            tier_role: "model.openrouter",
+            model_id: Some("deepseek/deepseek-v3.2"),
+            description: "smartest, still willing",
+        },
+        ModelPreset {
+            alias: "glm",
+            label: "GLM-5.2",
+            tier_role: "model.openrouter",
+            model_id: Some("z-ai/glm-5.2"),
+            description: "GLM-5.2",
+        },
+        ModelPreset {
+            alias: "gemini",
+            label: "Gemini",
+            tier_role: "model",
+            model_id: None,
+            description: "fast, filtered",
+        },
+    ]
+}
+
+/// Look up a preset by alias (case-insensitive).
+pub fn find_preset(alias: &str) -> Option<&'static ModelPreset> {
+    let alias = alias.trim().to_lowercase();
+    model_presets().iter().find(|p| p.alias == alias)
+}
+
 /// Returns the agent's command manifest.  Pass `active_skills` to include skill-specific commands.
 /// This is the single source of truth for what slash commands the agent handles.
 pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> {
@@ -68,8 +139,8 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
         },
         CommandManifestEntry {
             command: "model".into(),
-            description: "Pin this session to a model tier, or show/clear the current pin.".into(),
-            usage_hint: Some("/model [gemini|ollama|local|mlx]".into()),
+            description: "Swap this agent's model by preset (durable), or list the options.".into(),
+            usage_hint: Some("/model [cydonia|dolphin|euryale|deepseek|glm|gemini]".into()),
         },
         CommandManifestEntry {
             command: "preapprove".into(),
@@ -147,9 +218,15 @@ pub enum SlashCommand {
         voice_id: Option<String>,
     },
     /// Pin this session to a model tier role (e.g. `model.ollama`), or with no
-    /// argument show the current pin and clear it.
+    /// argument show the current model and the preset list.
     Model {
         tier: Option<String>,
+    },
+    /// Durably swap this agent's model to a named preset (e.g. `cydonia`).
+    /// Applies live (updates the active role's `model_bindings` + primary tier)
+    /// and persists via `role.configure`.
+    ModelPreset {
+        alias: String,
     },
     /// Submit a corrected transcript for a Whisper turn — feeds the training flywheel.
     Correct {
@@ -190,6 +267,7 @@ impl SlashCommand {
             Self::Tts { .. } => None,
             Self::Voice { .. } => None,
             Self::Model { .. } => None,
+            Self::ModelPreset { .. } => None,
             Self::Correct { .. } => None,
             Self::Plan { .. } => None,
         }
@@ -269,9 +347,20 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             voice_id: Some((*voice_id).to_string()),
         }),
         ["/model"] => Some(SlashCommand::Model { tier: None }),
-        ["/model", tier, ..] => Some(SlashCommand::Model {
-            tier: Some(normalize_model_tier(tier)),
-        }),
+        ["/model", arg, ..] => {
+            // A known preset alias (cydonia, glm, gemini, ...) triggers the
+            // durable swap; anything else falls through to the legacy
+            // session tier-pin (ollama/local/mlx/model.*).
+            if let Some(preset) = find_preset(arg) {
+                Some(SlashCommand::ModelPreset {
+                    alias: preset.alias.to_string(),
+                })
+            } else {
+                Some(SlashCommand::Model {
+                    tier: Some(normalize_model_tier(arg)),
+                })
+            }
+        }
         ["/correct", turn_id, rest @ ..] if !rest.is_empty() => Some(SlashCommand::Correct {
             turn_id: (*turn_id).to_string(),
             text: rest.join(" "),
@@ -472,10 +561,11 @@ mod tests {
             parse_slash_command("/model"),
             Some(SlashCommand::Model { tier: None })
         );
+        // `gemini` is a known preset now, so it takes the durable-swap path.
         assert_eq!(
             parse_slash_command("/model gemini"),
-            Some(SlashCommand::Model {
-                tier: Some("model".into()),
+            Some(SlashCommand::ModelPreset {
+                alias: "gemini".into(),
             })
         );
         assert_eq!(
@@ -502,6 +592,32 @@ mod tests {
                 tier: Some("model.ollama".into()),
             })
         );
+    }
+
+    #[test]
+    fn parses_model_presets() {
+        use super::{find_preset, model_presets};
+        for preset in model_presets() {
+            assert_eq!(
+                parse_slash_command(&format!("/model {}", preset.alias)),
+                Some(SlashCommand::ModelPreset {
+                    alias: preset.alias.to_string(),
+                }),
+                "alias {} should parse to a preset swap",
+                preset.alias
+            );
+        }
+        // Case-insensitive.
+        assert_eq!(
+            parse_slash_command("/model CYDONIA"),
+            Some(SlashCommand::ModelPreset {
+                alias: "cydonia".into(),
+            })
+        );
+        // find_preset resolves aliases and rejects unknowns.
+        assert_eq!(find_preset("glm").map(|p| p.tier_role), Some("model.openrouter"));
+        assert_eq!(find_preset("gemini").and_then(|p| p.model_id), None);
+        assert!(find_preset("nope-not-a-model").is_none());
     }
 
     #[test]
