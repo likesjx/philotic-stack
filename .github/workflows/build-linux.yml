@@ -69,44 +69,25 @@ jobs:
             echo "::warning::desktop checkout failed (token?) — building placeholder UI, job stays green"
           fi
 
-      - name: Setup Node
-        if: steps.desktop_checkout.outcome == 'success'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      # Prebuild the desktop UI OUTSIDE cargo and stage it directly into
-      # crates/philotic-web/ui-dist/. This step is non-fatal: any failure
-      # (broken vite build, missing deps, bad token) leaves ui-dist untouched
-      # so build.rs falls back to the placeholder and the job stays green.
+      # The jaredlikes-desktop repo commits its built dist/ into its tree, and
+      # its CI `npm run build` is broken (Rollup/dynamic-import resolution), so
+      # we do NOT rebuild. We stage the committed dist/ directly into
+      # crates/philotic-web/ui-dist/. Resilient: a missing dist/ leaves ui-dist
+      # as-is so build.rs falls back to the placeholder and the job stays green.
       # We deliberately do NOT set PHILOTIC_DESKTOP_DIR — that would make
-      # build.rs run npm itself and panic (fatal) on a bad build. Instead
-      # build.rs reuses whatever ui-dist we stage here (reuse-cached path).
-      - name: Prebuild desktop UI (non-fatal)
-        id: ui_prebuild
+      # build.rs run npm itself and panic (fatal). Instead build.rs reuses
+      # whatever ui-dist we stage here (reuse-cached path, no npm).
+      - name: Stage committed desktop dist into ui-dist
         if: steps.desktop_checkout.outcome == 'success'
-        continue-on-error: true
         run: |
           set -euo pipefail
-          DESKTOP="${{ github.workspace }}/jaredlikes-desktop"
-          UI_DIST="${{ github.workspace }}/crates/philotic-web/ui-dist"
-          cd "$DESKTOP"
-          npm install
-          npm run build
-          test -f dist/index.html
-          # Only touch ui-dist AFTER a successful build so a failed build
-          # never strips the existing tree (leaving a healthy fallback state).
-          rm -rf "$UI_DIST"
-          cp -r dist "$UI_DIST"
-          test -f "$UI_DIST/index.html"
-          echo "::notice::desktop UI prebuilt and staged into ui-dist — real UI will embed"
-
-      - name: Report UI embed decision
-        run: |
-          if [ "${{ steps.ui_prebuild.outcome }}" = "success" ]; then
-            echo "::notice::embedding REAL desktop UI"
+          if [ -f jaredlikes-desktop/dist/index.html ]; then
+            rm -rf crates/philotic-web/ui-dist
+            mkdir -p crates/philotic-web/ui-dist
+            cp -R jaredlikes-desktop/dist/. crates/philotic-web/ui-dist/
+            echo "::notice::staged committed desktop dist into ui-dist ($(ls crates/philotic-web/ui-dist | tr '\n' ' '))"
           else
-            echo "::warning::desktop UI NOT embedded (checkout or vite build failed) — placeholder UI, job stays green"
+            echo "::warning::jaredlikes-desktop/dist/index.html missing — leaving ui-dist as-is (placeholder fallback)"
           fi
 
       - name: Build release binaries
