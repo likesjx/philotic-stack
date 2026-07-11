@@ -2590,6 +2590,7 @@ mod tests {
         input.edges.push(ObserveEdge {
             rel_type: "NOT_A_REAL_REL_TYPE".to_string(),
             target_id: "node-123".to_string(),
+            upsert_target: false,
         });
 
         let err = cypher::compile_observe_edges(&input)
@@ -3034,7 +3035,12 @@ mod tests {
         let cypher =
             domain_edge_nodes_cypher("life:role:chief-of-staff", &["l:ol:a", "l:ol:b'quote"]);
         assert!(cypher.contains("(role:Role {id: 'life:role:chief-of-staff'})"));
-        assert!(cypher.contains("type(r) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO']"));
+        // SCOPED_TO joined LIVING_CYCLE_REL_TYPES as the structural
+        // node->Role anchor rel type (LifeGraph auto-anchor Slice 1); domain
+        // membership now also recognizes the auto-anchor as membership.
+        assert!(cypher.contains(
+            "type(r) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'SCOPED_TO']"
+        ));
         assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
         assert!(cypher.contains("RETURN DISTINCT n.id AS node_id"));
     }

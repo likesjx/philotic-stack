@@ -1154,7 +1154,12 @@ mod tests {
         let rel_types = expansion_rel_types(&[]);
         let cypher = expansion_cypher(&["l:ol:a", "l:ol:b'quote"], &rel_types, 32);
 
-        assert!(cypher.contains("MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO]-(related)"));
+        // Empty allowlist -> full living-cycle vocabulary, which now includes
+        // SCOPED_TO (LifeGraph auto-anchor Slice 1) so recall expansion
+        // traverses the server-injected node->Role anchor edges too.
+        assert!(
+            cypher.contains("MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO]-(related)")
+        );
         assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
         assert!(cypher.contains("coalesce(related.validation_state, 'inferred') <> 'retired'"));
         assert!(cypher.contains("RETURN n.id AS origin_id, type(r) AS rel_type, related AS node"));
@@ -1165,7 +1170,14 @@ mod tests {
     fn expansion_rel_types_intersects_allowlist_with_living_cycle_vocabulary() {
         assert_eq!(
             expansion_rel_types(&[]),
-            vec!["OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO"]
+            vec![
+                "OWNS",
+                "SHAPES",
+                "SETS",
+                "SPAWNS",
+                "RELATES_TO",
+                "SCOPED_TO"
+            ]
         );
         assert_eq!(
             expansion_rel_types(&["OWNS".into(), "BOGUS_TYPE".into()]),
