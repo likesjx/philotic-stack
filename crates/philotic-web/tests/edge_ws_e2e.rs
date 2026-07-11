@@ -13,7 +13,10 @@
 //! TCP WebSocket against the production router.
 
 use futures_util::{SinkExt, StreamExt};
-use philotic_client::{IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus, OperatorTargetView};
+use philotic_client::{
+    IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus, OperatorSessionView, OperatorTargetView,
+    SessionTurnView,
+};
 use philotic_edge_protocol::{
     EdgeCapabilities, EdgeEnvelope, EdgeHello, EdgeMessage, EnrollmentRequest, EnrollmentResponse,
     TurnEventKind, PROTOCOL_VERSION,
@@ -155,6 +158,35 @@ async fn fake_hotel_conn(mut stream: UnixStream) {
                 )
                 .await
             }
+            IpcRequest::ListOperatorSessions {
+                target_agent_id,
+                limit,
+            } => {
+                let mut sessions = canned_operator_sessions();
+                if let Some(agent) = target_agent_id {
+                    sessions.retain(|s| s.agent_id.as_deref() == Some(agent.as_str()));
+                }
+                if let Some(limit) = limit {
+                    sessions.truncate(limit as usize);
+                }
+                write_ipc_response(
+                    &mut stream,
+                    &IpcResponse::OperatorSessionList {
+                        operator_sessions: sessions,
+                    },
+                )
+                .await
+            }
+            IpcRequest::ListSessionTurns { session_id, .. } => {
+                write_ipc_response(
+                    &mut stream,
+                    &IpcResponse::SessionTurnList {
+                        turns_session_id: session_id,
+                        session_turns: canned_session_turns(),
+                    },
+                )
+                .await
+            }
             IpcRequest::EmitTask { task_json, .. } => {
                 let ack = write_ipc_response(&mut stream, &ok_response()).await;
                 if ack.is_err() {
@@ -170,6 +202,52 @@ async fn fake_hotel_conn(mut stream: UnixStream) {
             break;
         }
     }
+}
+
+/// Sessions the fake hotel reports for `ListOperatorSessions`: one per agent
+/// so the agent filter is observable through the REST bridge.
+fn canned_operator_sessions() -> Vec<OperatorSessionView> {
+    vec![
+        OperatorSessionView {
+            session_id: "operator-chat:edge:test-node:jane".into(),
+            agent_id: Some("jane".into()),
+            transport: Some("operator_chat".into()),
+            status: "active".into(),
+            last_activity_at: 1_770_000_000,
+            title: Some("edge:test-node".into()),
+            preview: Some(CANNED_FINAL.into()),
+        },
+        OperatorSessionView {
+            session_id: "operator-chat:edge:test-node:bjork".into(),
+            agent_id: Some("bjork".into()),
+            transport: Some("operator_chat".into()),
+            status: "paused".into(),
+            last_activity_at: 1_769_000_000,
+            title: None,
+            preview: None,
+        },
+    ]
+}
+
+/// One completed turn expanded to its two views (operator + agent) sharing a
+/// turn_id, mirroring the real `ListSessionTurns` contract.
+fn canned_session_turns() -> Vec<SessionTurnView> {
+    vec![
+        SessionTurnView {
+            turn_id: "turn-1".into(),
+            role: "operator".into(),
+            content: "hello there".into(),
+            created_at: Some(1_770_000_000),
+            status: "completed".into(),
+        },
+        SessionTurnView {
+            turn_id: "turn-1".into(),
+            role: "agent".into(),
+            content: CANNED_FINAL.into(),
+            created_at: Some(1_770_000_005),
+            status: "completed".into(),
+        },
+    ]
 }
 
 /// Push the canned streaming reply for one emitted operator-chat task:
@@ -511,6 +589,89 @@ async fn enroll_then_hello_handshake_happy_path() {
         "session should answer Ping with Pong"
     );
     ws.close(None).await.ok();
+}
+
+/// 1b. The edge-bearer session-history REST bridge: `GET /api/edge/sessions`
+///     (list + agent filter) and `GET /api/edge/sessions/:id/turns`, gated on
+///     the same bearer path as the WS, backed by the hotel's
+///     `ListOperatorSessions` / `ListSessionTurns` IPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_sessions_rest_bridge_serves_hotel_history() {
+    let server = spawn_server().await;
+
+    // No bearer → 401 before any IPC round-trip.
+    let unauthorized = server
+        .http
+        .get(server.url("/api/edge/sessions"))
+        .send()
+        .await
+        .expect("sessions request");
+    assert_eq!(unauthorized.status(), 401);
+
+    let enrollment = server.enroll("cHVia2V5LXNlc3Npb25z").await;
+    let bearer = format!("Bearer {}", enrollment.edge_token);
+
+    // Full list: both canned sessions, straight off the IPC view shape.
+    let listed: Value = server
+        .http
+        .get(server.url("/api/edge/sessions"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("sessions request")
+        .json()
+        .await
+        .expect("sessions body");
+    let sessions = listed["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(
+        sessions[0]["session_id"],
+        "operator-chat:edge:test-node:jane"
+    );
+    assert_eq!(sessions[0]["agent_id"], "jane");
+    assert_eq!(sessions[0]["preview"], CANNED_FINAL);
+
+    // Agent filter is forwarded to the IPC request.
+    let filtered: Value = server
+        .http
+        .get(server.url("/api/edge/sessions?agent_id=bjork&limit=10"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("filtered sessions request")
+        .json()
+        .await
+        .expect("filtered sessions body");
+    let filtered = filtered["sessions"].as_array().expect("sessions array");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0]["agent_id"], "bjork");
+
+    // Turns for one session: two views sharing a turn_id (operator + agent).
+    let turns_url = server.url("/api/edge/sessions/operator-chat:edge:test-node:jane/turns");
+    let unauthorized = server
+        .http
+        .get(&turns_url)
+        .send()
+        .await
+        .expect("turns request");
+    assert_eq!(unauthorized.status(), 401);
+    let body: Value = server
+        .http
+        .get(&turns_url)
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("turns request")
+        .json()
+        .await
+        .expect("turns body");
+    assert_eq!(body["session_id"], "operator-chat:edge:test-node:jane");
+    let turns = body["turns"].as_array().expect("turns array");
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["turn_id"], turns[1]["turn_id"]);
+    assert_eq!(turns[0]["role"], "operator");
+    assert_eq!(turns[1]["role"], "agent");
+    assert_eq!(turns[1]["content"], CANNED_FINAL);
 }
 
 /// 2. A non-Hello first frame is a protocol violation: fatal Error, then close.

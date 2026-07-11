@@ -80,6 +80,8 @@
 //!   POST /api/agents/:agent_id/roles/:role_name/skills  (assign skill)
 //!   DELETE /api/agents/:agent_id/roles/:role_name/skills/:skill_name  (revoke skill)
 //!   GET  /api/sessions    (stub — returns [] until session table exists)
+//!   GET  /api/edge/sessions   (edge-bearer; hotel session history via ListOperatorSessions)
+//!   GET  /api/edge/sessions/:session_id/turns   (edge-bearer; ListSessionTurns)
 //!   GET  /api/apartments/:agent_id   (disabled by default for the desktop membrane)
 //!   POST /api/guests/:guest_id/restart
 //!   POST /api/guests/:guest_id/stop
@@ -129,13 +131,14 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use philotic_client::{
     ComponentInventoryEntryView, ComponentManifest, CronJob, CronJobSource,
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView, GuestIdentity,
-    IpcRequest, IpcResponse, LeaseEnvelope, MeshRosterEntryView, OperatorTargetAgentInventoryView,
-    OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
-    OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
-    OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
-    OperatorTargetSecretInventoryView, OperatorTargetSecretMutationAckView,
-    OperatorTargetStatusView, OperatorTargetView, PhiloticClient, ResponseRoutePolicyView,
-    OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
+    IpcRequest, IpcResponse, LeaseEnvelope, MeshRosterEntryView, OperatorSessionView,
+    OperatorTargetAgentInventoryView, OperatorTargetComponentInventoryView,
+    OperatorTargetComponentMutationAckView, OperatorTargetConfigMutationAckView,
+    OperatorTargetConfigView, OperatorTargetGuestInventoryView, OperatorTargetPlacementView,
+    OperatorTargetRoleHomeAckView, OperatorTargetSecretInventoryView,
+    OperatorTargetSecretMutationAckView, OperatorTargetStatusView, OperatorTargetView,
+    PhiloticClient, ResponseRoutePolicyView, SessionTurnView, OPERATOR_CHAT_REPLY_ROLE,
+    OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -666,6 +669,11 @@ pub async fn run(
         // the bearer-authenticated edge-protocol WebSocket termination
         .route("/api/edge/enroll", post(edge::handle_edge_enroll))
         .route("/api/edge/agents", get(edge::handle_edge_agents))
+        .route("/api/edge/sessions", get(edge::handle_edge_sessions))
+        .route(
+            "/api/edge/sessions/:session_id/turns",
+            get(edge::handle_edge_session_turns),
+        )
         .route(
             "/api/edge/blob",
             post(edge::handle_edge_blob)
@@ -5466,6 +5474,48 @@ async fn ipc_desktop_membrane_targets(socket: &str) -> Result<Vec<OperatorTarget
         other => Err(anyhow!(
             "unexpected desktop membrane targets response: {other:?}"
         )),
+    }
+}
+
+async fn ipc_list_operator_sessions(
+    socket: &str,
+    target_agent_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<OperatorSessionView>> {
+    let mut client = connect_management_client(socket, "philotic-web-edge-sessions").await?;
+    match client
+        .send_request(IpcRequest::ListOperatorSessions {
+            target_agent_id,
+            limit,
+        })
+        .await?
+    {
+        IpcResponse::OperatorSessionList { operator_sessions } => Ok(operator_sessions),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected operator session list response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_list_session_turns(
+    socket: &str,
+    session_id: String,
+    limit: Option<u32>,
+    before_turn_id: Option<String>,
+) -> Result<Vec<SessionTurnView>> {
+    let mut client = connect_management_client(socket, "philotic-web-edge-session-turns").await?;
+    match client
+        .send_request(IpcRequest::ListSessionTurns {
+            session_id,
+            limit,
+            before_turn_id,
+        })
+        .await?
+    {
+        IpcResponse::SessionTurnList { session_turns, .. } => Ok(session_turns),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected session turn list response: {other:?}")),
     }
 }
 
