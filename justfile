@@ -596,6 +596,41 @@ jane-start:
 jane-status:
     @just remote-homebrew-status mbp-jane mbp-jane
 
+# ── mac-jane (LOCAL Air hotel) lifecycle ────────────────────────────────────
+# mac-jane runs on THIS machine under launchd. Do NOT use remote-homebrew-start
+# mac-jane — {{remote}} would be "mac-jane", which sshes to an unresolvable host
+# (255). These drive the local launchd job directly.
+mac-jane-stop:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LABEL=com.philotic.aiua.mac-jane; uid=$(id -u)
+    launchctl bootout gui/${uid}/${LABEL} 2>/dev/null || true
+    # Wait for full exit — a graceful drain can take ~30s, and a launchd/DB
+    # maintenance step must not race a still-draining process.
+    for _ in $(seq 1 40); do pgrep -f 'aiua --hotel mac-jane' >/dev/null || break; sleep 1; done
+    if pgrep -f 'aiua --hotel mac-jane' >/dev/null; then echo "⚠ aiua --hotel mac-jane still running after 40s"; exit 1; fi
+    echo "▶ mac-jane stopped (launchd job booted out)"
+
+mac-jane-start:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LABEL=com.philotic.aiua.mac-jane; uid=$(id -u); PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+    if launchctl print gui/${uid}/${LABEL} >/dev/null 2>&1; then
+      launchctl kickstart -k gui/${uid}/${LABEL} && echo "▶ mac-jane kickstarted under launchd"
+    else
+      launchctl bootstrap gui/${uid} "$PLIST" && echo "▶ mac-jane bootstrapped under launchd (RunAtLoad starts it)"
+    fi
+
+# Restart mac-jane cleanly (full stop + start), e.g. to load a freshly-installed
+# binary after `just local-push`.
+mac-jane-restart:
+    just mac-jane-stop
+    just mac-jane-start
+
+# Check whether mac-jane (aiua) is running locally.
+mac-jane-status:
+    @A=$(pgrep -f 'aiua --hotel mac-jane'|head -1); if [ -n "$A" ]; then echo "mac-jane aiua running: pid $A (launchd job: $(launchctl print gui/$(id -u)/com.philotic.aiua.mac-jane 2>/dev/null|grep -oE 'pid = [0-9]+'|head -1))"; else echo "mac-jane aiua is NOT running"; fi
+
 # ── Disk-space watch ────────────────────────────────────────────────────────
 # Install a launchd StartInterval job that runs scripts/disk-space-watch.sh
 # (which runs `phil doctor` and alerts when system.disk-space fires). Turns the
