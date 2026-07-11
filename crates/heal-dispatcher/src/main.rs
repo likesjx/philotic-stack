@@ -961,6 +961,26 @@ Output only the JSON object, no other text."#
 // ── Action executor ───────────────────────────────────────────────────────────
 
 /// Returns `Err` only on a disconnect/timeout (so the cycle reconnects); every
+/// True when `id` is a conversation session id rather than a materialized guest
+/// id. Sessions are keyed by their transport/source (`telegram:<chat>:…`,
+/// `operator-chat:…`, `paracrine:…`, etc.); materialized guests are keyed by
+/// component (`<hotel>:model-controller-…`, `heal-dispatcher-01`, …). Used to
+/// stop the heal loop from trying to `restart_guest` a session (always a no-op
+/// that returns GUEST_NOT_FOUND).
+fn is_session_like(id: &str) -> bool {
+    const SESSION_PREFIXES: &[&str] = &[
+        "telegram:",
+        "operator-chat:",
+        "paracrine:",
+        "discord:",
+        "slack:",
+        "web:",
+        "smoke",
+        "diagnostic",
+    ];
+    SESSION_PREFIXES.iter().any(|p| id.starts_with(p))
+}
+
 /// other outcome — including non-disconnect IPC errors — resolves to an outcome
 /// string that the caller records.
 async fn execute_action(
@@ -970,6 +990,18 @@ async fn execute_action(
 ) -> Result<String> {
     match heal_action {
         "restart_guest" => {
+            // A conversation SESSION is not a materialized guest — restarting it
+            // is meaningless and always returns GUEST_NOT_FOUND. This happens when
+            // the classifier flags a stalled/"zombie" session and prescribes
+            // restart_guest with the session id as the target. Skip it cleanly so
+            // it records as a no-op instead of spamming restart_failed + escalations.
+            if is_session_like(guest_id) {
+                warn!(
+                    guest_id,
+                    "heal-dispatcher: refusing restart_guest on a session id (not a materialized guest) — skipping"
+                );
+                return Ok("restart_skipped_not_a_guest".into());
+            }
             info!(guest_id, "heal-dispatcher: requesting guest restart");
             // Emit a restart request to the hotel's materialization surface.
             // The hotel will reclaim and respawn the guest via GuestManager.
@@ -1055,8 +1087,8 @@ async fn execute_action(
 mod tests {
     use super::{
         HEARTBEAT_KEY, OLLAMA_BREAKER_COOLDOWN, OLLAMA_BREAKER_THRESHOLD, OllamaBreaker,
-        OperatorNotifier, gate_llm_action, heartbeat_request, ipc_timeout_error, rule_classify,
-        with_ipc_timeout,
+        OperatorNotifier, gate_llm_action, heartbeat_request, ipc_timeout_error, is_session_like,
+        rule_classify, with_ipc_timeout,
     };
     use crate::notify::EscalationNotifier;
     use philotic_client::{IpcRequest, IpcResponse, is_ipc_disconnect};
@@ -1185,6 +1217,21 @@ mod tests {
         // Non-restart actions are never touched.
         assert_eq!(gate_llm_action("unknown", "escalate"), "escalate");
         assert_eq!(gate_llm_action("low", "noop"), "noop");
+    }
+
+    #[test]
+    fn session_ids_are_not_restartable_guests() {
+        // Session ids (what the "zombie" misfire targets) must be recognized.
+        assert!(is_session_like("telegram:7898847424:agent-jane"));
+        assert!(is_session_like(
+            "telegram:7898847424:1783786667254:agent-jane"
+        ));
+        assert!(is_session_like("operator-chat:smoke-agent-turn-abc:agent-jane"));
+        assert!(is_session_like("paracrine:7898847424:orchestrator"));
+        // Real materialized guests must NOT be treated as sessions.
+        assert!(!is_session_like("mbp-jane:model-controller-openrouter"));
+        assert!(!is_session_like("model-controller-openrouter-01"));
+        assert!(!is_session_like("heal-dispatcher-01"));
     }
 
     /// Turn-failure tags must classify identically to the hotel's FailTask
