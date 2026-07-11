@@ -4,7 +4,7 @@ doc_type: proposal
 domain: operator-control-plane
 status: active
 disposition: accepted-current-slice
-last_updated: 2026-07-08
+last_updated: 2026-07-11
 tags:
 - autopoiesis
 - self-building
@@ -15,6 +15,8 @@ related_docs:
 - LIFE_GRAPH_OS_PROPOSAL.md
 - AGENT_RESOURCE_MODEL_PROPOSAL.md
 - ARCH_RULES.md
+- SUBSTRATE_HARDENING_PROPOSAL.md
+- MEMORY_TRANSPARENCY_PROPOSAL.md
 task_refs:
 - docs/task.md
 ---
@@ -84,12 +86,20 @@ never global, and demotion is automatic on reversal.
 | 5 | Proposal → implementation | operator triggers a session | Scheduled agent sessions claim the top-scored open proposal within granted lanes and execute the SVE loop end-to-end | `work.execute_slices` |
 | 6 | Repeated success → shared skill | plan-eval history sits unread | A tool-pattern that keeps succeeding (same tool sequence across ≥ 3 completed plans, per the plan-eval records from #162) is distilled into a named `abstract_skill` and proposed through the authz-gated `skill.register` path (#143); operator approval registers it, and the skill becomes projectable to *other* philotes' toolset profiles — knowledge propagating through the team | `skills.register_learned` |
 | 7 | Delegation outcomes → team shape | whisper outcomes evaporate | Paracrine whisper outcomes accumulate as delegation memory, so orchestrators learn *who* to whisper to; stewards propose amendments to their own charters, applied by the operator through ConfigureRole | `team.evolve` |
+| 8 | Merged PR → running fleet | operator deploys by hand | Canary deploy: new binary rolls to ONE hotel, burn-in window watching heal queue / pattern tags / doctor, then promote to the fleet or auto-rollback with the evidence filed as a proposal (the loop-2 filing pattern, reused) | `fleet.canary_deploy` |
 
 Loop 5 is deliberately last among the execution loops: it is the full
 autopoietic cycle, and it should only run after lanes 1–4 have produced the
 track record that earns it. Loops 6 and 7 are the team dimension of the same
 idea — loop 6 builds the *skills* the team shares, loop 7 builds the *team*
 itself. Neither executes anything; both end in proposals a human approves.
+
+Loop 8 is the loop the original seven missed: without it, every "closed" loop
+still terminates in the operator — just later, at the deploy step. It only
+runs above a hardened substrate (see
+[SUBSTRATE_HARDENING_PROPOSAL.md](SUBSTRATE_HARDENING_PROPOSAL.md)) because
+rollback and burn-in judgments are only trustworthy when supervision, the
+heal circuit, and machine-readable verification are themselves reliable.
 
 ## Slices
 
@@ -104,20 +114,34 @@ itself. Neither executes anything; both end in proposals a human approves.
 | A7 `skills.register_learned` | When plan-eval-repeat (#162) records the same tool sequence succeeding across ≥ 3 completed plans, distill it into a named `abstract_skill` and propose it via the authz-gated `skill.register` path (#143). ProposalOnly — operator approval registers the skill, which then becomes projectable to other philotes' toolset profiles. Earned promotion: after 5 approved skills, ConfirmFirst. | M | test-green + first operator-approved skill projected onto a second philote |
 | A8a `team.evolve` — delegation memory | Record paracrine whisper outcomes per (orchestrator, specialist, task-class) as graph records, so orchestrators learn who to whisper to. Pure observation — no lane needed. | S–M | test-green + delegation records visible after live whispers |
 | A8b `team.evolve` — charter evolution | A steward may propose amendments to her *own* charter, `life.patch.propose`-style. ProposalOnly forever by default; the operator applies accepted amendments via the now-safe ConfigureRole path (#179). | M | test-green + first charter amendment proposal reviewed by operator |
+| A9 `trust-ledger` | Make posture promotion **arithmetic instead of vibes**. (a) Every AutonomyGrant audit record gains an `outcome` field — `confirmed_good` / `reversed` / `neutral` — stamped by operator confirmation, reversal detection, or timeout-to-neutral. (b) `phil autonomy status` (+ doctor section) reports per-lane: actions/day vs budget, consecutive failures, confirmed-good streak, and computed promotion eligibility straight from the earn/demote rules. The A6 gate ("≥ 2 weeks clean audit") becomes a query result. Outcome stamps are also the training signal for A7 and the model flywheel. | M | test-green + doctor/status output shows a real lane's eligibility |
+| A10 `fleet.canary_deploy` | Loop 8's lane. A deploy executor rolls a merged, verified binary to one designated canary hotel, watches heal queue / pattern tags / doctor for a burn-in window, then promotes fleet-wide or auto-rolls-back (backup binary path named in the audit record) and files the evidence as a proposal. ConfirmFirst at every step initially: proposes the canary, proposes the promotion. | L | watched-live (first canary cycle operator-reviewed end to end, including one induced rollback) |
 
 The A8c frontier — a steward *executing* team changes through `SpawnSubagent`
 (the wire contract that today returns an explicit `SUBAGENT_NOT_IMPLEMENTED`
 rejection) — is explicitly deferred until A6 ships and has a track record.
 
-Dependency: A1 → {A2, A3, A5}; A4 independent (config); A6 after A2–A4 have
-produced ≥ 2 weeks of clean audit records. A7 depends on A1 plus the plan-eval
-records from #162; A8a is independent (pure observation); A8b depends on the
-ConfigureRole ladder fix (#179); A8c waits on A6.
+Dependency: A1 → {A2, A3, A5}; A4 independent (config); A6 after A9 reports
+eligibility (the "≥ 2 weeks of clean audit records" gate, now mechanical).
+A7 depends on A1 plus the plan-eval records from #162; A8a is independent
+(pure observation); A8b depends on the ConfigureRole ladder fix (#179);
+A8c waits on A6. A9 depends only on A1's audit records. A10 depends on A9
+plus SUBSTRATE_HARDENING slices S1–S3 (supervision invariant, heal-the-healer,
+verification-as-data) being live.
 
 **Prerequisite:** the LifeGraph epic's in-flight slices (retrieval lane 3–4,
 charter, hygiene, auto-capture) land first — a self-building world needs its
 world-model working. A2 specifically builds on the retrieval lane's Slice 4
 (Muninn provenance) landing.
+
+**Substrate prerequisite (added 2026-07-11):** autonomy compounds whatever it
+sits on. No lane is promoted past ConfirmFirst — and A6/A10 do not run at
+all — until [SUBSTRATE_HARDENING_PROPOSAL.md](SUBSTRATE_HARDENING_PROPOSAL.md)
+S1–S3 are live: every hotel under a real supervisor, the heal circuit able to
+heal its own dispatcher, and verification recorded as machine-readable data.
+The memory dimension of the same discipline lives in
+[MEMORY_TRANSPARENCY_PROPOSAL.md](MEMORY_TRANSPARENCY_PROPOSAL.md) — memory
+writes are actions and carry the same auditable/reversible/budgeted contract.
 
 ## Autonomy Contract (standing rules)
 
@@ -146,7 +170,10 @@ world-model working. A2 specifically builds on the retrieval lane's Slice 4
 
 **A6 `scheduled-slice-executor`** is awaiting trust accumulation — the ≥ 2
 weeks of clean audit records from A2–A4 that its dependency line demands.
+A9 turns that gate from a judgment call into a query.
 
-Current slices: **A7 `skills.register_learned`** (skill-building) and **A8**
-(team-building, sub-slices A8a/A8b) — the two lanes that turn individual
-philote learning into team capability.
+Current slices: **A7 `skills.register_learned`** (skill-building), **A8**
+(team-building, sub-slices A8a/A8b), and **A9 `trust-ledger`** (added
+2026-07-11 — the mechanical promotion ledger that unblocks A6).
+**A10 `fleet.canary_deploy`** is specced but blocked on A9 +
+SUBSTRATE_HARDENING S1–S3.
