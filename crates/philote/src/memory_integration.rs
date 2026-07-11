@@ -921,7 +921,7 @@ pub(super) fn direct_life_observe_input(
     let packet_id = format!("evidence:{suffix}");
     let observation_id = format!("obs:{suffix}");
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         // Per-agent provenance: observed_by is the canonical agent identity;
         // source_membrane (in source_refs) stays the transport it came from.
         "observed_by": agent_id,
@@ -959,7 +959,19 @@ pub(super) fn direct_life_observe_input(
             }
         },
         "proposed_graph_refs": []
-    })
+    });
+
+    // LifeGraph auto-anchor Slice 2: this direct-command path builds its
+    // life.observe payload by hand and bypasses `route_tool_call_execution`
+    // (the model-invoked lane, which stamps the SCOPED_TO anchor via
+    // `tool_exec::inject_scoped_to_anchor` after observed_by/observed_role
+    // are resolved). Route through the SAME helper here so this observation
+    // is never an orphan either. Idempotent — no-op if `edges` already
+    // carries the anchor.
+    if let Some(map) = payload.as_object_mut() {
+        tool_exec::inject_scoped_to_anchor(map);
+    }
+    payload
 }
 
 pub(super) fn direct_life_observe_success_reply(
@@ -2773,6 +2785,65 @@ mod tests {
             serde_json::from_value(value).expect("direct input should satisfy the contract");
         assert_eq!(parsed.observed_by.as_deref(), Some("agent-beacon"));
         assert_eq!(parsed.observed_role.as_deref(), Some("chief_of_staff"));
+        // LifeGraph auto-anchor Slice 2: this direct-command path now routes
+        // through `tool_exec::inject_scoped_to_anchor` too, so a known
+        // steward agent (beacon -> ChiefOfStaff) gets the same canonical
+        // SCOPED_TO anchor the model-invoked path has carried since Slice 1.
+        assert_eq!(parsed.edges.len(), 1);
+        assert_eq!(parsed.edges[0].rel_type, "SCOPED_TO");
+        assert_eq!(parsed.edges[0].target_id, "life:role:chief-of-staff");
+        assert!(parsed.edges[0].upsert_target);
+    }
+
+    #[test]
+    fn direct_life_observe_input_anchor_is_idempotent() {
+        let command = super::DirectLifeObserveCommand {
+            label: "OpenLoop".into(),
+            claim_summary: "Schedule rowing habit on weekly Saturdays".into(),
+            source_id: "membrane:telegram".into(),
+            confidence: 0.8,
+        };
+
+        let mut value = super::direct_life_observe_input(
+            &command,
+            "telegram:123:agent-beacon",
+            "turn-1",
+            "123",
+            "agent-beacon",
+            Some("chief_of_staff"),
+        );
+
+        // Re-running the same server-side anchoring pass over an
+        // already-anchored payload must not append a duplicate edge.
+        if let Some(map) = value.as_object_mut() {
+            tool_exec::inject_scoped_to_anchor(map);
+        }
+
+        let parsed: data_memorygraphrag::LifeObserveInput =
+            serde_json::from_value(value).expect("direct input should satisfy the contract");
+        assert_eq!(parsed.edges.len(), 1);
+    }
+
+    #[test]
+    fn direct_life_observe_input_unknown_agent_yields_no_anchor() {
+        let command = super::DirectLifeObserveCommand {
+            label: "Signal".into(),
+            claim_summary: "A plain observation".into(),
+            source_id: "membrane:telegram".into(),
+            confidence: 0.7,
+        };
+
+        let value = super::direct_life_observe_input(
+            &command,
+            "telegram:123:agent-unknown",
+            "turn-1",
+            "123",
+            "agent-unknown-01",
+            None,
+        );
+
+        let parsed: data_memorygraphrag::LifeObserveInput =
+            serde_json::from_value(value).expect("direct input should satisfy the contract");
         assert!(parsed.edges.is_empty());
     }
 

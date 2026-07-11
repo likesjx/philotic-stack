@@ -80,9 +80,19 @@ impl AgentRuntime {
         }
 
         let now_iso = chrono::Utc::now().to_rfc3339();
-        if let Some(observe_input) =
-            attention_observer::decision_to_observe_input(&decision, &attention_signal, &now_iso)
-        {
+        // LifeGraph auto-anchor Slice 2: the paracrine lane IS the observing
+        // agent (this hotel's philote evaluating its own attention-steward
+        // signal), so its own canonical identity is what every Signal/SIL
+        // node written here should anchor to — same resolver
+        // (`cypher::scoped_to_anchor_edge`) the model-invoked `life.observe`
+        // path uses via `tool_exec::inject_scoped_to_anchor`.
+        if let Some(observe_input) = attention_observer::decision_to_observe_input(
+            &decision,
+            &attention_signal,
+            &now_iso,
+            &self.agent_id,
+            self.role_name.as_deref(),
+        ) {
             let node_id = local_node_id();
             let target_node = life_graph_runner_node_id();
             let task_json = serde_json::json!({

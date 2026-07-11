@@ -54,9 +54,14 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let now_iso = chrono::Utc::now().to_rfc3339();
-    let observe_input =
-        attention_observer::decision_to_observe_input(&decision, &observe_signal, &now_iso)
-            .expect("RecordObservation should produce LifeObserveInput");
+    let observe_input = attention_observer::decision_to_observe_input(
+        &decision,
+        &observe_signal,
+        &now_iso,
+        "agent-aria-01",
+        None,
+    )
+    .expect("RecordObservation should produce LifeObserveInput");
 
     assert_eq!(observe_input.evidence.claim_ref.label, "Signal");
 
@@ -133,9 +138,14 @@ async fn main() -> anyhow::Result<()> {
         "new_pattern signal should produce ProposeSilEntry"
     );
 
-    let sil_input =
-        attention_observer::decision_to_observe_input(&sil_decision, &sil_signal, &now_iso)
-            .expect("ProposeSilEntry should produce LifeObserveInput");
+    let sil_input = attention_observer::decision_to_observe_input(
+        &sil_decision,
+        &sil_signal,
+        &now_iso,
+        "agent-aria-01",
+        None,
+    )
+    .expect("ProposeSilEntry should produce LifeObserveInput");
 
     assert_eq!(sil_input.evidence.claim_ref.label, "StewardshipInstruction");
 
