@@ -64,7 +64,7 @@ jobs:
       - name: Report desktop checkout outcome
         run: |
           if [ "${{ steps.desktop_checkout.outcome }}" = "success" ]; then
-            echo "::notice::desktop UI checked out — will embed real UI"
+            echo "::notice::desktop UI checked out — will attempt to prebuild and embed real UI"
           else
             echo "::warning::desktop checkout failed (token?) — building placeholder UI, job stays green"
           fi
@@ -75,12 +75,39 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Refresh ui-dist for embed
+      # Prebuild the desktop UI OUTSIDE cargo and stage it directly into
+      # crates/philotic-web/ui-dist/. This step is non-fatal: any failure
+      # (broken vite build, missing deps, bad token) leaves ui-dist untouched
+      # so build.rs falls back to the placeholder and the job stays green.
+      # We deliberately do NOT set PHILOTIC_DESKTOP_DIR — that would make
+      # build.rs run npm itself and panic (fatal) on a bad build. Instead
+      # build.rs reuses whatever ui-dist we stage here (reuse-cached path).
+      - name: Prebuild desktop UI (non-fatal)
+        id: ui_prebuild
         if: steps.desktop_checkout.outcome == 'success'
+        continue-on-error: true
         run: |
-          rm -rf crates/philotic-web/ui-dist
-          echo "PHILOTIC_DESKTOP_DIR=${{ github.workspace }}/jaredlikes-desktop" >> "$GITHUB_ENV"
-          echo "PHILOTIC_REFRESH_DESKTOP_UI=1" >> "$GITHUB_ENV"
+          set -euo pipefail
+          DESKTOP="${{ github.workspace }}/jaredlikes-desktop"
+          UI_DIST="${{ github.workspace }}/crates/philotic-web/ui-dist"
+          cd "$DESKTOP"
+          npm install
+          npm run build
+          test -f dist/index.html
+          # Only touch ui-dist AFTER a successful build so a failed build
+          # never strips the existing tree (leaving a healthy fallback state).
+          rm -rf "$UI_DIST"
+          cp -r dist "$UI_DIST"
+          test -f "$UI_DIST/index.html"
+          echo "::notice::desktop UI prebuilt and staged into ui-dist — real UI will embed"
+
+      - name: Report UI embed decision
+        run: |
+          if [ "${{ steps.ui_prebuild.outcome }}" = "success" ]; then
+            echo "::notice::embedding REAL desktop UI"
+          else
+            echo "::warning::desktop UI NOT embedded (checkout or vite build failed) — placeholder UI, job stays green"
+          fi
 
       - name: Build release binaries
         run: |
