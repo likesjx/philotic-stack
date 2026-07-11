@@ -4,6 +4,10 @@ use crate::controller::{
     refresh_gemini_credential_pool,
 };
 use crate::credential_pool::{CredentialPool, RotationTrigger};
+use crate::transcribe_stream::{
+    self, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_SESSIONS, ElevenLabsRealtimeConnector,
+    IpcStreamReplySink, StreamFrame, StreamReplySink, SttSessionManager, parse_stream_frame,
+};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::router_trace::{
     RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
@@ -173,6 +177,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     let mut gemini_pool = CredentialPool::new("gemini");
     let gemini_pool_enabled = matches!(config.role, "model" | "model.gemini");
 
+    // Streaming transcription sessions (voice.transcribe.stream) live at the
+    // runtime level — they are long-lived WS sessions, not one-shot provider
+    // invocations. Only the ElevenLabs controller receives these frames (role
+    // model.elevenlabs), but the manager is harmless elsewhere.
+    let mut stt_sessions = SttSessionManager::new(
+        DEFAULT_MAX_SESSIONS,
+        Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+    );
+
     loop {
         match tokio::time::timeout(Duration::from_secs(5), ipc_client.recv_task()).await {
             Ok(Ok(IpcResponse::InboundTask {
@@ -192,6 +205,20 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         continue;
                     }
                 };
+
+                // Streaming transcription frames are session-level operations
+                // handled by the runtime's session manager — they must never
+                // reach normal one-shot provider dispatch.
+                if transcribe_stream::is_stream_task(&task_value) {
+                    handle_stream_frame(
+                        &mut ipc_client,
+                        &mut stt_sessions,
+                        &task_value,
+                        config.guest_id,
+                    )
+                    .await;
+                    continue;
+                }
 
                 let reply = ReplyRoute::from_task(&task_value);
 
@@ -1005,11 +1032,142 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         "Hotel IPC disconnected; model controller [{}] exiting.",
                         config.guest_id
                     );
+                    // Clean shutdown: finalize and close any live streaming
+                    // transcription sessions before the process exits.
+                    stt_sessions.shutdown().await;
                     return Ok(());
                 }
                 warn!("IPC recv error: {}", err);
             }
             Err(_) => {}
+        }
+    }
+}
+
+/// Dispatch one `voice.transcribe.stream` frame (open/chunk/end) into the
+/// streaming-transcription session manager. Every OPEN failure path delivers
+/// a terminal `is_final: true` error reply so the consumer never hangs;
+/// chunk/end frames for unknown sessions carry no reply address and are
+/// logged and dropped.
+async fn handle_stream_frame(
+    ipc_client: &mut PhiloticClient,
+    sessions: &mut SttSessionManager,
+    task_value: &Value,
+    controller_guest_id: &'static str,
+) {
+    match parse_stream_frame(task_value) {
+        Ok(StreamFrame::Open(open)) => {
+            let session_id = open.stream_session_id.clone();
+            // Dedicated reply IPC connection: session replies are emitted from
+            // spawned session tasks and cannot share the controller's client.
+            let mut sink = match IpcStreamReplySink::connect(
+                controller_guest_id,
+                open.reply.clone(),
+            )
+            .await
+            {
+                Ok(sink) => sink,
+                Err(err) => {
+                    warn!(
+                        session = %session_id,
+                        "transcribe-stream open: reply IPC connect failed, dropping open: {err:#}"
+                    );
+                    return;
+                }
+            };
+
+            // Resolve the ElevenLabs API key through the same config plumbing
+            // batch STT uses, bounded by the dispatch cap (RC-1 discipline).
+            let api_key = match tokio::time::timeout(
+                model_dispatch_timeout(),
+                ProviderConfigs::load(ipc_client),
+            )
+            .await
+            {
+                Ok(Ok(configs)) => configs
+                    .elevenlabs_api_key
+                    .filter(|key| !key.trim().is_empty()),
+                Ok(Err(err)) => {
+                    let _ = sink
+                        .send(
+                            &session_id,
+                            "",
+                            true,
+                            Some(&format!("provider config load failed: {err}")),
+                        )
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = sink
+                        .send(
+                            &session_id,
+                            "",
+                            true,
+                            Some(&format!(
+                                "provider_timeout: config load exceeded {}s before stream open",
+                                model_dispatch_timeout().as_secs()
+                            )),
+                        )
+                        .await;
+                    return;
+                }
+            };
+            let Some(api_key) = api_key else {
+                let _ = sink
+                    .send(
+                        &session_id,
+                        "",
+                        true,
+                        Some("ElevenLabs API key missing from config"),
+                    )
+                    .await;
+                return;
+            };
+
+            let connector = Arc::new(ElevenLabsRealtimeConnector::new(api_key));
+            sessions.open(open, connector, Box::new(sink)).await;
+        }
+        Ok(StreamFrame::Chunk {
+            stream_session_id,
+            audio_base64,
+        }) => {
+            if !sessions.chunk(&stream_session_id, audio_base64).await {
+                warn!(
+                    session = %stream_session_id,
+                    "transcribe-stream chunk for unknown session dropped"
+                );
+            }
+        }
+        Ok(StreamFrame::End { stream_session_id }) => {
+            if !sessions.end(&stream_session_id).await {
+                warn!(
+                    session = %stream_session_id,
+                    "transcribe-stream end for unknown session ignored"
+                );
+            }
+        }
+        Err(err) => {
+            warn!("malformed transcribe-stream frame: {err:#}");
+            // Best effort: OPEN-shaped frames carry a reply address — use it
+            // to deliver a terminal error instead of leaving the consumer to
+            // hang on a session that will never open.
+            if let (Some(session_id), Some(reply)) = (
+                transcribe_stream::stream_session_id(task_value),
+                transcribe_stream::reply_address(task_value),
+            ) {
+                if let Ok(mut sink) = IpcStreamReplySink::connect(controller_guest_id, reply).await
+                {
+                    let _ = sink
+                        .send(
+                            session_id,
+                            "",
+                            true,
+                            Some(&format!("invalid stream frame: {err}")),
+                        )
+                        .await;
+                }
+            }
         }
     }
 }
