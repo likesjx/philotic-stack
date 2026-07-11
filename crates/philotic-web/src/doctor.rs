@@ -2075,8 +2075,6 @@ impl Check for HealDispatcherStaleness {
 // the disk that actually matters for the hotel.
 const DISK_AVAIL_WARN_KB: u64 = 15 * 1024 * 1024; // 15 GiB
 const DISK_AVAIL_CRITICAL_KB: u64 = 5 * 1024 * 1024; // 5 GiB
-const DISK_USED_WARN_PCT: u8 = 90;
-const DISK_USED_CRITICAL_PCT: u8 = 96;
 
 /// Parse a macOS `df -k` report into `(avail_kb, used_pct)`.
 ///
@@ -2102,12 +2100,17 @@ fn parse_df_kb(output: &str) -> Option<(u64, u8)> {
 /// Pure threshold logic for the disk-space guard, split out so it is
 /// unit-testable without shelling out to `df`.
 ///
-/// CRITICAL when available < 5 GiB OR capacity ≥ 96%; WARNING when available
-/// < 15 GiB OR capacity ≥ 90%; otherwise clean.
+/// Severity keys on ABSOLUTE free space, not capacity percent: ENOSPC is about
+/// free bytes, and absolute thresholds already catch a near-full small disk
+/// (little free). A high used-% on a large disk (e.g. 93% of a 1 TB volume with
+/// 66 GiB still free) is not an ENOSPC risk, so percent is reported for context
+/// only and never triggers a finding on its own — it did in the first cut and
+/// false-warned healthy large disks. CRITICAL when available < 5 GiB; WARNING
+/// when available < 15 GiB; otherwise clean.
 fn evaluate_disk_space(check_id: &'static str, avail_kb: u64, used_pct: u8) -> Vec<Finding> {
-    let severity = if avail_kb < DISK_AVAIL_CRITICAL_KB || used_pct >= DISK_USED_CRITICAL_PCT {
+    let severity = if avail_kb < DISK_AVAIL_CRITICAL_KB {
         Severity::Critical
-    } else if avail_kb < DISK_AVAIL_WARN_KB || used_pct >= DISK_USED_WARN_PCT {
+    } else if avail_kb < DISK_AVAIL_WARN_KB {
         Severity::Warning
     } else {
         return Vec::new();
@@ -2118,8 +2121,8 @@ fn evaluate_disk_space(check_id: &'static str, avail_kb: u64, used_pct: u8) -> V
         check_id: check_id.to_string(),
         severity,
         message: format!(
-            "profile-dir volume has {avail_gib:.1} GiB free at {used_pct}% used \
-             (warn <15 GiB or ≥{DISK_USED_WARN_PCT}%, critical <5 GiB or ≥{DISK_USED_CRITICAL_PCT}%) \
+            "profile-dir volume has {avail_gib:.1} GiB free ({used_pct}% used) \
+             (warn <15 GiB, critical <5 GiB) \
              — a full disk hard-blocks the hotel, cargo builds, and log rotation with ENOSPC"
         ),
         evidence: json!({
@@ -2128,8 +2131,6 @@ fn evaluate_disk_space(check_id: &'static str, avail_kb: u64, used_pct: u8) -> V
             "used_pct": used_pct,
             "warn_avail_kb": DISK_AVAIL_WARN_KB,
             "critical_avail_kb": DISK_AVAIL_CRITICAL_KB,
-            "warn_used_pct": DISK_USED_WARN_PCT,
-            "critical_used_pct": DISK_USED_CRITICAL_PCT,
         }),
         fix_hint:
             "the usual bulk consumer is the regenerable cargo build dir (<repo>/target). \
@@ -4011,15 +4012,18 @@ mod tests {
 
     // The used-percent axis fires independently of absolute free space.
     #[test]
-    fn evaluate_disk_space_used_percent_axis() {
+    fn evaluate_disk_space_ignores_high_percent_when_free_is_ample() {
+        // Regression: a large disk at high capacity-% but with plenty of
+        // absolute free (e.g. mbp-jane's 66.8 GiB free at 93% used) must NOT
+        // warn — ENOSPC is about free bytes, not percent. The first cut
+        // OR'd the percent axis and false-warned healthy large disks.
         let id = "system.disk-space";
-        let ample = 100 * 1024 * 1024; // 100 GiB free
-        // 89% is still clean, 90% trips Warning.
-        assert!(evaluate_disk_space(id, ample, 89).is_empty());
-        assert!(only(&[Severity::Warning], &evaluate_disk_space(id, ample, 90)));
-        // 95% Warning, 96% escalates to Critical.
-        assert!(only(&[Severity::Warning], &evaluate_disk_space(id, ample, 95)));
-        assert!(only(&[Severity::Critical], &evaluate_disk_space(id, ample, 96)));
+        let ample = 66 * 1024 * 1024; // 66 GiB free
+        assert!(evaluate_disk_space(id, ample, 90).is_empty());
+        assert!(evaluate_disk_space(id, ample, 93).is_empty());
+        assert!(evaluate_disk_space(id, ample, 99).is_empty());
+        // Even a 100%-reported small margin is graded on the absolute bytes:
+        assert!(evaluate_disk_space(id, 100 * 1024 * 1024, 100).is_empty());
     }
 
     // The df parser handles a real macOS `df -k` report (header + data line),
