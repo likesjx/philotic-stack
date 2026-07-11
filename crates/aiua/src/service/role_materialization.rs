@@ -596,9 +596,10 @@ impl IpcServer {
         // rights. Choosing which model answers is lower-stakes than changing
         // toolset, manifest, TTL, or admin status, and this backs the operator's
         // one-tap `/model` swap command (philote `SlashCommand::ModelPreset`).
-        // Gated tightly: ONLY when no privileged field is being changed AND the
-        // toolset is left exactly as the record already has it, so this path can
-        // never escalate privilege or alter capabilities — only the model.
+        // Gated tightly: ONLY when no privileged field is being changed. The
+        // toolset the caller passed is IGNORED for this path (force-preserved to
+        // the existing record below), so it can never escalate privilege or
+        // alter capabilities — only the model routing changes.
         let is_model_selection_only = (fallback_tiers.is_some() || model_bindings.is_some())
             && !is_admin
             && role_identity_addendum.is_none()
@@ -608,13 +609,7 @@ impl IpcServer {
             && context_window_policy.is_none()
             && content_policy.is_none()
             && inactive_ttl_seconds.is_none()
-            && iteration_cap.is_none()
-            && graph
-                .get_role_incarnation(&agent_id, &role_name)
-                .ok()
-                .flatten()
-                .map(|r| r.toolset_profile == toolset_profile)
-                .unwrap_or(false);
+            && iteration_cap.is_none();
 
         if role_name == "orchestrator" && !caller_is_admin && !is_model_selection_only {
             return IpcResponse::error(
@@ -637,6 +632,19 @@ impl IpcServer {
             .ok()
             .flatten();
         let is_new_role = previous.is_none();
+
+        // Model-selection-only self-service (see the gate exemption above):
+        // force-preserve the existing toolset so a `/model`-style change can only
+        // touch model routing, never capabilities — regardless of what toolset
+        // the caller passed. Non-model-selection callers keep the passed value.
+        let toolset_profile = if is_model_selection_only {
+            previous
+                .as_ref()
+                .map(|p| p.toolset_profile.clone())
+                .unwrap_or(toolset_profile)
+        } else {
+            toolset_profile
+        };
 
         // Ladder resolution: `None` PRESERVES the existing record's ladder — this is
         // the fix for the bug where every ConfigureRole call unconditionally wiped

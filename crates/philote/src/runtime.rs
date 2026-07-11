@@ -5240,6 +5240,12 @@ impl AgentRuntime {
                             }
                             format!("✅ Switched to {}. (live — no restart)", preset.label)
                         }
+                        Ok(IpcResponse::Standard {
+                            ok: false, message, ..
+                        }) => {
+                            warn!("/model preset swap denied: {message}");
+                            format!("Couldn't switch to {}: {message}", preset.label)
+                        }
                         Ok(other) => {
                             warn!("/model preset swap unexpected response: {other:?}");
                             format!("Couldn't switch to {} — unexpected hotel response.", preset.label)
