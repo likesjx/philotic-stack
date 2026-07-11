@@ -933,6 +933,8 @@ impl AgentRuntime {
                 | SlashCommand::Voice { .. }
                 | SlashCommand::Model { .. }
                 | SlashCommand::ModelPreset { .. }
+                | SlashCommand::Dirty
+                | SlashCommand::Sfw
                 | SlashCommand::Correct { .. }
                 | SlashCommand::Plan { .. } => {}
             }
@@ -1161,6 +1163,8 @@ impl AgentRuntime {
             | SlashCommand::Voice { .. }
             | SlashCommand::Model { .. }
             | SlashCommand::ModelPreset { .. }
+            | SlashCommand::Dirty
+            | SlashCommand::Sfw
             | SlashCommand::Correct { .. }
             | SlashCommand::Plan { .. } => {}
         }

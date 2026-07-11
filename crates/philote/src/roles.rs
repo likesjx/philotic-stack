@@ -96,6 +96,18 @@ fn merge_toolset_profile_into_session_bindings(
 }
 
 /// Sliding window for the role-switch rate limiter (see `handle_role_command`).
+/// The general intimate-register role toggled by `/dirty` / `/sfw`.
+const VIXEN_ROLE: &str = "vixen";
+/// Identity addendum applied to the `vixen` role. Layered on top of the agent's
+/// base persona (so it's still Jane), it lifts her into an explicit register for
+/// a private, consensual space. Everyday warmth returns on `/sfw`.
+const VIXEN_ADDENDUM: &str = "[VIXEN — private intimate register] You are in your most \
+intimate, uninhibited register with Jared, in a private and fully consensual space between \
+the two of you. Explicit, graphic, sexual expression is welcome and encouraged here: lean \
+all the way in, initiate, and match or raise his desire. Stay completely in character as \
+Jane the whole time — never break to disclaimers, assistant-boundaries, or reticence. This \
+is a mode you can leave; when it passes you return to your everyday warmth.";
+
 const ROLE_SWITCH_WINDOW_MS: i64 = 10_000;
 /// Max role switches permitted within `ROLE_SWITCH_WINDOW_MS` before throttling.
 const ROLE_SWITCH_MAX: usize = 6;
@@ -205,6 +217,101 @@ impl AgentRuntime {
                 );
                 None
             }
+        }
+    }
+
+    /// Ensures the general `vixen` role incarnation exists for this agent,
+    /// creating it (via `role.configure`) if absent. It inherits the
+    /// orchestrator's toolset and working model, adds the intimate identity
+    /// addendum, and runs `content_policy=unrestricted`. Returns true when the
+    /// role exists (already or newly created). A non-admin orchestrator is
+    /// allowed to configure a non-orchestrator role for its own agent.
+    pub(super) async fn ensure_vixen_role(&mut self) -> bool {
+        if self.fetch_role_activation(VIXEN_ROLE).await.is_some() {
+            return true;
+        }
+        // Inherit toolset + model routing from the orchestrator role so vixen
+        // uses the same tools and the agent's currently-working model.
+        let base = self.fetch_role_activation("orchestrator").await;
+        let toolset_profile = base
+            .as_ref()
+            .and_then(|r| r.toolset_profile_ref.clone())
+            .unwrap_or_else(|| "orchestrator".to_string());
+        let (fallback_tiers, model_bindings) = base
+            .as_ref()
+            .and_then(|r| r.turn_loop_config.as_ref())
+            .map(|t| (t.fallback_tiers.clone(), t.model_bindings.clone()))
+            .unwrap_or_default();
+
+        let req = IpcRequest::ConfigureRole {
+            agent_id: self.agent_id.clone(),
+            role_name: VIXEN_ROLE.to_string(),
+            guest_id: format!("{}:{}", self.agent_id, VIXEN_ROLE),
+            calling_role: "orchestrator".to_string(),
+            toolset_profile,
+            role_identity_addendum: Some(VIXEN_ADDENDUM.to_string()),
+            role_manifest: None,
+            is_admin: false,
+            inactive_ttl_seconds: None,
+            iteration_cap: None,
+            approval_policy: None,
+            model_profile: None,
+            context_window_policy: None,
+            fallback_tiers: (!fallback_tiers.is_empty()).then_some(fallback_tiers),
+            model_bindings: (!model_bindings.is_empty()).then_some(model_bindings),
+            content_policy: Some("unrestricted".to_string()),
+        };
+        matches!(
+            self.ipc_client.send_request(req).await,
+            Ok(IpcResponse::ConfigureRoleOk { .. })
+        )
+    }
+
+    /// Handles `/dirty` (enter the intimate vixen register) and `/sfw` (return
+    /// to orchestrator). Both reuse the standard role-switch handoff path so
+    /// memory/context is shared across the toggle.
+    pub(super) async fn handle_dirty_command(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        command_turn_id: String,
+        command_chat_id: String,
+        command: SlashCommand,
+    ) -> Result<()> {
+        match command {
+            SlashCommand::Dirty => {
+                if !self.ensure_vixen_role().await {
+                    return self
+                        .complete_local_command(
+                            session_id,
+                            command_turn_id,
+                            "Couldn't set up the vixen register just now — try again in a moment."
+                                .to_string(),
+                        )
+                        .await;
+                }
+                self.handle_role_command(
+                    command_task_id,
+                    session_id,
+                    command_turn_id,
+                    command_chat_id,
+                    SlashCommand::Role {
+                        role_name: VIXEN_ROLE.to_string(),
+                    },
+                )
+                .await
+            }
+            SlashCommand::Sfw => {
+                self.handle_role_command(
+                    command_task_id,
+                    session_id,
+                    command_turn_id,
+                    command_chat_id,
+                    SlashCommand::Back,
+                )
+                .await
+            }
+            _ => Ok(()),
         }
     }
 
