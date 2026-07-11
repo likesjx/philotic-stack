@@ -163,6 +163,16 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
             description: "Show plan carryover status, or drop the carried-over plan.".into(),
             usage_hint: Some("/plan [drop]".into()),
         },
+        CommandManifestEntry {
+            command: "dirty".into(),
+            description: "Switch to the intimate 'vixen' register (private, explicit).".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
+            command: "sfw".into(),
+            description: "Return from the vixen register to normal.".into(),
+            usage_hint: None,
+        },
     ]
 }
 
@@ -237,6 +247,11 @@ pub enum SlashCommand {
     Plan {
         drop: bool,
     },
+    /// Switch this agent into the intimate `vixen` register (creates the role if
+    /// needed, then hands off to it). `/sfw` returns to the orchestrator.
+    Dirty,
+    /// Return from the `vixen` register to the normal orchestrator role.
+    Sfw,
 }
 
 impl SlashCommand {
@@ -268,6 +283,8 @@ impl SlashCommand {
             Self::Voice { .. } => None,
             Self::Model { .. } => None,
             Self::ModelPreset { .. } => None,
+            Self::Dirty => None,
+            Self::Sfw => None,
             Self::Correct { .. } => None,
             Self::Plan { .. } => None,
         }
@@ -368,6 +385,8 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/plan"] => Some(SlashCommand::Plan { drop: false }),
         ["/plan", "drop", ..] => Some(SlashCommand::Plan { drop: true }),
         ["/plan", "status", ..] => Some(SlashCommand::Plan { drop: false }),
+        ["/dirty", ..] => Some(SlashCommand::Dirty),
+        ["/sfw", ..] => Some(SlashCommand::Sfw),
         _ => None,
     }
 }
@@ -618,6 +637,13 @@ mod tests {
         assert_eq!(find_preset("glm").map(|p| p.tier_role), Some("model.openrouter"));
         assert_eq!(find_preset("gemini").and_then(|p| p.model_id), None);
         assert!(find_preset("nope-not-a-model").is_none());
+    }
+
+    #[test]
+    fn parses_dirty_sfw_commands() {
+        assert_eq!(parse_slash_command("/dirty"), Some(SlashCommand::Dirty));
+        assert_eq!(parse_slash_command("/dirty now"), Some(SlashCommand::Dirty));
+        assert_eq!(parse_slash_command("/sfw"), Some(SlashCommand::Sfw));
     }
 
     #[test]

@@ -2200,6 +2200,7 @@ impl AgentRuntime {
                 SlashCommand::Voice { .. } => {}
                 SlashCommand::Model { .. } => {}
                 SlashCommand::ModelPreset { .. } => {}
+                SlashCommand::Dirty | SlashCommand::Sfw => {}
                 SlashCommand::Abandon { .. } => {}
                 SlashCommand::Plan { drop } => {
                     // Resolved without starting a turn so it works mid-turn too.
@@ -2854,6 +2855,10 @@ impl AgentRuntime {
                 }
                 SlashCommand::Role { .. } | SlashCommand::Roles | SlashCommand::Back => {
                     self.handle_role_command(task_id, session_id, turn_id, chat_id, command)
+                        .await
+                }
+                SlashCommand::Dirty | SlashCommand::Sfw => {
+                    self.handle_dirty_command(task_id, session_id, turn_id, chat_id, command)
                         .await
                 }
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => Ok(()),
@@ -5586,6 +5591,8 @@ impl AgentRuntime {
                 | SlashCommand::Voice { .. }
                 | SlashCommand::Model { .. }
                 | SlashCommand::ModelPreset { .. }
+                | SlashCommand::Dirty
+                | SlashCommand::Sfw
                 | SlashCommand::Role { .. }
                 | SlashCommand::Roles
                 | SlashCommand::Back
