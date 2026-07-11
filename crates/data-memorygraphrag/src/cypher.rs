@@ -347,7 +347,23 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
         // producer today is the SCOPED_TO anchor helper, which always
         // targets a Role node; `t.name` falls back to the target id itself
         // since no separate display name travels on the edge.
-        let target_clause = if edge.upsert_target {
+        //
+        // Defense in depth: `upsert_target` is only honored for the
+        // `SCOPED_TO` rel_type (the sole structural-anchor relationship
+        // today). This is enforced here explicitly rather than trusted by
+        // convention, so a mis-set `upsert_target: true` on any other
+        // rel_type — whether from a future non-model write path or a bug in
+        // a caller — cannot MERGE (manufacture) an arbitrary target node; it
+        // is downgraded to MATCH, preserving target_missing semantics for
+        // every rel_type except SCOPED_TO.
+        // `will_upsert` is the decision actually baked into the query below —
+        // distinct from the raw `edge.upsert_target` input, which a
+        // non-SCOPED_TO edge may still set to `true` (ignored). Reporting
+        // this decision back on `ObserveEdgeCypher::upsert_target` (rather
+        // than echoing the input) keeps that field truthful to its own doc
+        // comment for any future consumer.
+        let will_upsert = edge.upsert_target && edge.rel_type == "SCOPED_TO";
+        let target_clause = if will_upsert {
             "MERGE (t:Role {id: $target_id}) ON CREATE SET t.name = $target_id, t.created_at = $created_at "
         } else {
             "MATCH (t {id: $target_id}) "
@@ -372,7 +388,7 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
             query,
             rel_type: edge.rel_type.clone(),
             target_id: edge.target_id.clone(),
-            upsert_target: edge.upsert_target,
+            upsert_target: will_upsert,
         });
     }
 
@@ -1063,6 +1079,29 @@ mod tests {
         );
         assert!(compiled[0].query.contains("MERGE (n)-[r:SCOPED_TO]->(t)"));
         assert!(!compiled[0].query.contains("MATCH (t {id: $target_id})"));
+    }
+
+    #[test]
+    fn compile_observe_edges_ignores_upsert_target_on_non_scoped_to_rel_type() {
+        // Defense in depth: even if a caller mis-sets upsert_target=true on a
+        // rel_type other than SCOPED_TO, compile_observe_edges must not MERGE
+        // (manufacture) the target node. Only SCOPED_TO is a structural
+        // anchor; every other rel_type must fall back to MATCH so a typo'd
+        // or malicious target_id is reported as target_missing instead of
+        // silently creating a junk node.
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "RELATES_TO".into(),
+            target_id: "life:role:should-not-be-created".into(),
+            upsert_target: true,
+        }];
+
+        let compiled = compile_observe_edges(&input).unwrap();
+        assert!(compiled[0].query.contains("MATCH (t {id: $target_id})"));
+        assert!(!compiled[0].query.contains("MERGE (t:Role"));
+        // The reported field must reflect the decision actually compiled
+        // into the query above, not the raw (and here overridden) input.
+        assert!(!compiled[0].upsert_target);
     }
 
     #[test]
