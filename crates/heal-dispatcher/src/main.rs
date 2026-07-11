@@ -192,12 +192,7 @@ impl OperatorNotifier {
 
     /// Repeated single-occurrence escalate (F4b): `Some(ping)` only once the
     /// same tag has escalated past the repeat threshold, throttled per tag.
-    fn on_escalate(
-        &mut self,
-        pattern_tag: &str,
-        guest_id: &str,
-        now: u64,
-    ) -> Option<OperatorPing> {
+    fn on_escalate(&mut self, pattern_tag: &str, guest_id: &str, now: u64) -> Option<OperatorPing> {
         if !self.throttle.should_notify_escalate(pattern_tag, now) {
             return None;
         }
@@ -704,9 +699,14 @@ async fn file_heal_work_item(
         // Push ONE throttled operator notification for the fresh filing (F4a).
         // Best-effort: push swallows every error, so it can never fail the
         // filing or the cycle.
-        if let Some(ping) =
-            notifier.on_filing(pattern_tag, guest_id, &work_item_id, breach.count, window_secs, now)
-        {
+        if let Some(ping) = notifier.on_filing(
+            pattern_tag,
+            guest_id,
+            &work_item_id,
+            breach.count,
+            window_secs,
+            now,
+        ) {
             notifier.push(ipc, ping).await;
         }
     } else if deduped {
@@ -1082,8 +1082,7 @@ mod tests {
     #[test]
     fn filing_notification_fires_once_then_is_throttled() {
         let mut n = test_notifier(3600, 1800, 2);
-        let first =
-            n.on_filing("connection_refused", "membrane-01", "wi-1", 5, 1800, TN);
+        let first = n.on_filing("connection_refused", "membrane-01", "wi-1", 5, 1800, TN);
         let ping = first.expect("first filing must produce an operator ping");
         assert_eq!(ping.pattern_tag, "connection_refused");
         assert!(ping.content.contains("wi-1"), "content: {}", ping.content);
@@ -1095,14 +1094,28 @@ mod tests {
 
         // Repeat filing of the same tag inside the cooldown: no second ping.
         assert!(
-            n.on_filing("connection_refused", "membrane-01", "wi-2", 6, 1800, TN + 60)
-                .is_none(),
+            n.on_filing(
+                "connection_refused",
+                "membrane-01",
+                "wi-2",
+                6,
+                1800,
+                TN + 60
+            )
+            .is_none(),
             "a repeat filing inside the cooldown must be throttled"
         );
         // A different tag is unaffected by the first tag's cooldown.
         assert!(
-            n.on_filing("api_key_expired", "model-router-01", "wi-3", 5, 1800, TN + 61)
-                .is_some(),
+            n.on_filing(
+                "api_key_expired",
+                "model-router-01",
+                "wi-3",
+                5,
+                1800,
+                TN + 61
+            )
+            .is_some(),
             "distinct tags must not throttle each other"
         );
     }
@@ -1127,8 +1140,14 @@ mod tests {
             ping.content
         );
         // Further escalates inside the cooldown are suppressed — no spam.
-        assert!(n.on_escalate("auth_failure", "membrane-01", TN + 90).is_none());
-        assert!(n.on_escalate("auth_failure", "membrane-01", TN + 600).is_none());
+        assert!(
+            n.on_escalate("auth_failure", "membrane-01", TN + 90)
+                .is_none()
+        );
+        assert!(
+            n.on_escalate("auth_failure", "membrane-01", TN + 600)
+                .is_none()
+        );
     }
 
     // The filing and escalate paths share ONE per-tag cooldown, so a filing
@@ -1137,7 +1156,10 @@ mod tests {
     fn filing_and_escalate_share_the_cooldown() {
         let mut n = test_notifier(3600, 1800, 2);
         assert!(n.on_escalate("missing_file", "philote-01", TN).is_none());
-        assert!(n.on_escalate("missing_file", "philote-01", TN + 10).is_some());
+        assert!(
+            n.on_escalate("missing_file", "philote-01", TN + 10)
+                .is_some()
+        );
         assert!(
             n.on_filing("missing_file", "philote-01", "wi-9", 5, 1800, TN + 20)
                 .is_none(),
@@ -1154,7 +1176,10 @@ mod tests {
         assert_eq!(gate_llm_action("low", "restart_guest"), "escalate");
         assert_eq!(gate_llm_action("", "restart_guest"), "escalate");
         // Trusted severities keep the restart.
-        assert_eq!(gate_llm_action("critical", "restart_guest"), "restart_guest");
+        assert_eq!(
+            gate_llm_action("critical", "restart_guest"),
+            "restart_guest"
+        );
         assert_eq!(gate_llm_action("high", "restart_guest"), "restart_guest");
         assert_eq!(gate_llm_action("medium", "restart_guest"), "restart_guest");
         // Non-restart actions are never touched.

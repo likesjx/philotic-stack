@@ -79,6 +79,19 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+/// Best-effort chat_id recovery for out-of-turn dispatch, when there is no
+/// active `WorkingTurn` to read `chat_id` from directly. Mirrors the
+/// session_id encoding from `InboundTaskPayload::session_id_or_default`
+/// (`"{source}:{chat_id}:..."`), the same convention `handle_paracrine_response`
+/// relies on to route to an idle session.
+fn chat_id_from_session_id(session_id: &str, source: &str) -> Option<String> {
+    session_id
+        .strip_prefix(&format!("{source}:"))
+        .and_then(|rest| rest.split(':').next())
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
 fn graph_datasource_node_id() -> String {
     std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_NODE")
         .ok()
@@ -3638,16 +3651,37 @@ impl AgentRuntime {
             let Some(state) = self.sessions.get(session_id) else {
                 return Ok(());
             };
-            let Some(active_turn) = state.active_turn.as_ref() else {
-                return Ok(());
-            };
-            (
-                active_turn.turn_id.clone(),
-                active_turn.chat_id.clone(),
-                active_turn.final_reply_to.clone(),
-                active_turn.final_reply_role.clone(),
-                active_turn.final_reply_guest_id.clone(),
-            )
+            match state.active_turn.as_ref() {
+                Some(active_turn) => (
+                    active_turn.turn_id.clone(),
+                    active_turn.chat_id.clone(),
+                    active_turn.final_reply_to.clone(),
+                    active_turn.final_reply_role.clone(),
+                    active_turn.final_reply_guest_id.clone(),
+                ),
+                // No active turn (e.g. a fallback-recovery notice fired from the
+                // origin-tier probe in `handle_fallback_probe_response`, which by
+                // construction only runs on idle sessions — see
+                // `probe_degraded_sessions`'s eligibility filter). Fall back to
+                // the session's persisted transport target and a chat_id inferred
+                // from the session_id encoding, mirroring the idle-session
+                // routing `handle_paracrine_response` already uses to reach a
+                // session with no in-flight turn.
+                None => {
+                    let Some(chat_id) = chat_id_from_session_id(session_id, &state.source) else {
+                        return Ok(());
+                    };
+                    let target =
+                        state.resolved_transport_reply_target(local_node_id(), "membrane", None);
+                    (
+                        String::new(),
+                        chat_id,
+                        target.target_node,
+                        target.target_role,
+                        target.target_guest_id,
+                    )
+                }
+            }
         };
 
         let event_payload = TurnEventPayload {
@@ -9135,7 +9169,10 @@ mod tests {
             assert_eq!(ov.reason, "provider_failure");
             assert!(ov.since_epoch_ms > 0);
             assert_eq!(ov.since_epoch_ms, ov.last_probe_epoch_ms);
-            assert!(!ov.notice_sent);
+            // Slice 3: the first escalation on a fresh override also fires
+            // (and latches) the `model_fallback` operational notice — see
+            // `escalation_emits_model_fallback_notice_once_then_latches_silent`.
+            assert!(ov.notice_sent);
             (ov.since_epoch_ms, ov.last_probe_epoch_ms)
         };
 
@@ -9176,6 +9213,130 @@ mod tests {
             assert_eq!(
                 ov.last_probe_epoch_ms, first_probe_ms,
                 "re-escalation must not consume the probe cadence"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Helper: pull every `turn_event` EmitTask recorded by `run_recording_hotel`
+    /// whose `event` field matches `event_name`.
+    fn recorded_turn_events<'a>(
+        emitted: &'a [serde_json::Value],
+        event_name: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == event_name)
+            .collect()
+    }
+
+    /// Slice 3: the first escalation on a fresh session (no override yet, so
+    /// `notice_sent` starts false) must emit exactly one `model_fallback`
+    /// turn_event and latch `notice_sent`; a second escalation on the same
+    /// already-notified session (sticky-turn / further tier walk) must emit
+    /// nothing more.
+    #[tokio::test]
+    async fn escalation_emits_model_fallback_notice_once_then_latches_silent() {
+        let socket_path = format!("/tmp/philote-ovnotice-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-notice".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-notice");
+
+        let session_id = "sess-ov-notice";
+        let turn_id = "turn-ov-notice";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&[
+                "model",
+                "model.openrouter",
+                "model.ollama",
+            ]));
+        }
+
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.turn_id = turn_id.into();
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::ProviderFailure,
+                Some("gemini".into()),
+                "gemini did not respond".into(),
+            )
+            .await
+            .expect("first escalation");
+
+        {
+            let recorded = emitted.lock().unwrap().clone();
+            let notices = recorded_turn_events(&recorded, "model_fallback");
+            assert_eq!(
+                notices.len(),
+                1,
+                "first escalation (notice_sent=false) must emit exactly one model_fallback event: {recorded:#?}"
+            );
+            let message = notices[0]["task"]["partial_content"]
+                .as_str()
+                .expect("partial_content");
+            assert_eq!(
+                message,
+                "\u{21aa}\u{fe0f} Model fallback: model.openrouter (was model; provider_failure)"
+            );
+        }
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .fallback_override
+                .as_ref()
+                .expect("override")
+                .notice_sent,
+            "notice_sent must latch true after the first emission"
+        );
+
+        // Second escalation on the same already-notified session — sticky
+        // turn / further tier walk. Must not emit a second notice.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "openrouter timed out".into(),
+            )
+            .await
+            .expect("second escalation");
+
+        {
+            let recorded = emitted.lock().unwrap().clone();
+            let notices = recorded_turn_events(&recorded, "model_fallback");
+            assert_eq!(
+                notices.len(),
+                1,
+                "an already-latched session must not emit a second model_fallback notice: {recorded:#?}"
             );
         }
 
@@ -9427,6 +9588,110 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
+    /// Slice 3: the origin-tier probe clearing the override must announce
+    /// recovery via `model_fallback_cleared` — but ONLY when the degradation
+    /// was actually announced in the first place (`notice_sent == true`). A
+    /// fallback the user never heard about doesn't need a recovery
+    /// announcement. `session_id` follows the `"{source}:{chat_id}:{...}"`
+    /// encoding so `emit_turn_event`'s no-active-turn fallback (there is no
+    /// `WorkingTurn` on a probe-cleared, idle session) can recover a chat_id.
+    #[tokio::test]
+    async fn probe_clear_emits_notice_only_when_previously_notified() {
+        async fn run_probe_clear_case(
+            session_id: &str,
+            notice_sent: bool,
+        ) -> Vec<serde_json::Value> {
+            let socket_path = format!("/tmp/philote-ovclearn-{}.sock", Uuid::new_v4().simple());
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+            let emitted =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+            let identity = philotic_client::GuestIdentity {
+                guest_id: "agent-ov-clear-notice".into(),
+                role: "agent".into(),
+                supported_tools: Vec::new(),
+            };
+            let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+                .await
+                .expect("connect to stub hotel");
+            let mut runtime = AgentRuntime::new(client, "agent-ov-clear-notice");
+
+            runtime
+                .ensure_session_loaded(session_id, "telegram")
+                .await
+                .expect("session load");
+            {
+                let state = runtime.sessions.get_mut(session_id).expect("session");
+                state.role_activation =
+                    Some(role_activation_with_ladder(&["model", "model.openrouter"]));
+                let mut ov = test_fallback_override("model", "model.openrouter");
+                ov.notice_sent = notice_sent;
+                ov.last_probe_epoch_ms = 0; // long past the cadence
+                state.fallback_override = Some(ov);
+            }
+
+            runtime.probe_degraded_sessions().await;
+            let probe_id = runtime
+                .pending_fallback_probes
+                .get(session_id)
+                .cloned()
+                .expect("probe in flight");
+            runtime
+                .handle_model_response(InboundTaskPayload {
+                    action: Some("model_response".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some(probe_id),
+                    agent_action: Some(serde_json::json!({
+                        "kind": "respond",
+                        "content": "pong",
+                    })),
+                    content: Some("pong".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("probe success handled");
+
+            assert!(
+                runtime
+                    .sessions
+                    .get(session_id)
+                    .expect("session")
+                    .fallback_override
+                    .is_none(),
+                "a successful probe must clear the override"
+            );
+
+            let recorded = emitted.lock().unwrap().clone();
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+            recorded
+        }
+
+        let with_notice = run_probe_clear_case("telegram:98765:agent-ov-clear-a", true).await;
+        let notices = recorded_turn_events(&with_notice, "model_fallback_cleared");
+        assert_eq!(
+            notices.len(),
+            1,
+            "a previously-notified session must emit exactly one model_fallback_cleared event: {with_notice:#?}"
+        );
+        let message = notices[0]["task"]["partial_content"]
+            .as_str()
+            .expect("partial_content");
+        assert_eq!(
+            message,
+            "\u{21aa}\u{fe0f} Model fallback cleared: model (was model.openrouter)"
+        );
+
+        let without_notice = run_probe_clear_case("telegram:98766:agent-ov-clear-b", false).await;
+        let notices = recorded_turn_events(&without_notice, "model_fallback_cleared");
+        assert!(
+            notices.is_empty(),
+            "a session whose degradation was never announced must not emit a recovery notice: {without_notice:#?}"
+        );
+    }
+
     /// A role change (inbound handoff_bundle — the application path of
     /// `/role <name>`) must clear the fallback override and ONLY that field.
     #[tokio::test]
@@ -9491,7 +9756,9 @@ mod tests {
 
     /// Any `/model` invocation — setting a pin or clearing it — resets the
     /// fallback override: the operator is taking explicit control of tier
-    /// selection.
+    /// selection. This is an operator-driven clear, so — unlike the
+    /// origin-tier probe path — it must never emit `model_fallback_cleared`
+    /// even when `notice_sent` was true (the operator caused it; they know).
     #[tokio::test]
     async fn model_pin_command_clears_fallback_override() {
         let socket_path = format!("/tmp/philote-ovpin-{}.sock", Uuid::new_v4().simple());
@@ -9514,11 +9781,13 @@ mod tests {
             .ensure_session_loaded(session_id, "telegram")
             .await
             .expect("session load");
+        let mut notified_override = test_fallback_override("model", "model.openrouter");
+        notified_override.notice_sent = true;
         runtime
             .sessions
             .get_mut(session_id)
             .expect("session")
-            .fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+            .fallback_override = Some(notified_override);
 
         // Setting a pin clears the override.
         runtime
@@ -9543,11 +9812,13 @@ mod tests {
         }
 
         // A bare /model (pin clear) also clears a lingering override.
+        let mut notified_override = test_fallback_override("model", "model.openrouter");
+        notified_override.notice_sent = true;
         runtime
             .sessions
             .get_mut(session_id)
             .expect("session")
-            .fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+            .fallback_override = Some(notified_override);
         runtime
             .handle_session_control_command(
                 Uuid::new_v4(),
@@ -9566,6 +9837,13 @@ mod tests {
             );
             assert!(state.pinned_tier_role.is_none());
         }
+
+        let recorded = emitted.lock().unwrap().clone();
+        assert!(
+            recorded_turn_events(&recorded, "model_fallback_cleared").is_empty(),
+            "operator-driven /model clears must never emit model_fallback_cleared, \
+             even when notice_sent was true: {recorded:#?}"
+        );
 
         drop(runtime);
         let _ = server.await;

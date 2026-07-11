@@ -437,7 +437,11 @@ impl GuestManager {
     /// mark the guest exhausted once (graph marker + heal entry) and reuse the
     /// existing cool-down/resume path; a still-exhausted budget is denied silently
     /// so we do not re-push a heal entry every dispatch cycle.
-    pub(crate) fn check_heal_restart_budget_at(&self, guest_id: &str, now: u64) -> HealRestartVerdict {
+    pub(crate) fn check_heal_restart_budget_at(
+        &self,
+        guest_id: &str,
+        now: u64,
+    ) -> HealRestartVerdict {
         match self.respawn_budget.check(guest_id, now) {
             RespawnDecision::Allowed { resumed } => {
                 if resumed {
@@ -1359,8 +1363,12 @@ mod tests {
             last_active_at: None,
         }]));
         let heal = Arc::new(MockHealQueue::new());
-        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(MockMaterializer::new(HashMap::new())))
-            .with_heal_queue(heal.clone());
+        let manager = GuestManager::new(
+            "test-hotel",
+            graph.clone(),
+            Box::new(MockMaterializer::new(HashMap::new())),
+        )
+        .with_heal_queue(heal.clone());
 
         // Fake clock: all six attempts fall inside a single sliding window.
         let base = 10_000u64;
@@ -1386,9 +1394,14 @@ mod tests {
         assert!(state.contains("respawn_budget_exhausted"));
 
         // ...and surfaced to the heal queue exactly once (StillExhausted must not re-push).
-        let _ = manager.check_heal_restart_budget_at("flappy", base + RESPAWN_BUDGET_MAX as u64 + 1);
+        let _ =
+            manager.check_heal_restart_budget_at("flappy", base + RESPAWN_BUDGET_MAX as u64 + 1);
         let pushes = heal.pushes.lock().unwrap();
-        assert_eq!(pushes.len(), 1, "only the breaching transition files a heal entry");
+        assert_eq!(
+            pushes.len(),
+            1,
+            "only the breaching transition files a heal entry"
+        );
         assert_eq!(pushes[0].0, "flappy");
     }
 
@@ -1405,7 +1418,11 @@ mod tests {
             active_pid: None,
             last_active_at: None,
         }]));
-        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(MockMaterializer::new(HashMap::new())));
+        let manager = GuestManager::new(
+            "test-hotel",
+            graph.clone(),
+            Box::new(MockMaterializer::new(HashMap::new())),
+        );
 
         let base = 10_000u64;
         for i in 0..RESPAWN_BUDGET_MAX {

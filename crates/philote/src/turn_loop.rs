@@ -559,7 +559,7 @@ impl AgentRuntime {
             };
             state.fallback_override.take()
         };
-        if cleared.is_some() {
+        if let Some(ov) = cleared {
             info!(
                 session_id = %session_id,
                 "Origin-tier probe succeeded — clearing fallback override"
@@ -574,6 +574,21 @@ impl AgentRuntime {
                 {
                     warn!(session_id = %session_id, "Failed to persist checkpoint after clearing fallback override: {}", e);
                 }
+            }
+            // Slice 3: only announce recovery if the user was actually told
+            // about the degradation in the first place (`notice_sent`) — a
+            // fallback they never heard about doesn't need a recovery
+            // announcement. Operator-driven clears (`/role`, `/back`,
+            // `/model`) reset `fallback_override` directly and never reach
+            // this path, so they never emit either.
+            if ov.notice_sent {
+                let message = format!(
+                    "↪️ Model fallback cleared: {} (was {})",
+                    ov.origin_tier_role, ov.active_tier_role
+                );
+                let _ = self
+                    .emit_turn_event(&session_id, "model_fallback_cleared", Some(message))
+                    .await;
             }
         }
         Ok(())
@@ -2287,10 +2302,22 @@ impl AgentRuntime {
             // most recent failure.
             let reason = no_response_reason_str(class);
             let now_ms = now_epoch_ms();
-            match state.fallback_override.as_mut() {
+            // Slice 3: the `model_fallback` operational notice fires exactly
+            // once per degraded stretch — latched by `notice_sent` on the
+            // override itself so sticky turns (further tier walks on an
+            // already-notified session) stay silent. `should_notify_fallback`
+            // is decided here (before/at the same time notice_sent flips)
+            // because the escalation's checkpoint write below is the same
+            // write that persists the latch — see `escalation_writes_fallback_override_then_updates_active_only`.
+            let should_notify_fallback = match state.fallback_override.as_mut() {
                 Some(existing) => {
                     existing.active_tier_role = next_role.clone();
                     existing.reason = reason.to_string();
+                    let should_notify = !existing.notice_sent;
+                    if should_notify {
+                        existing.notice_sent = true;
+                    }
+                    should_notify
                 }
                 None => {
                     state.fallback_override = Some(FallbackOverride {
@@ -2299,10 +2326,22 @@ impl AgentRuntime {
                         reason: reason.to_string(),
                         since_epoch_ms: now_ms,
                         last_probe_epoch_ms: now_ms,
-                        notice_sent: false,
+                        notice_sent: true,
                     });
+                    true
                 }
-            }
+            };
+            let fallback_notice = should_notify_fallback.then(|| {
+                let ov = state
+                    .fallback_override
+                    .as_ref()
+                    .expect("just written above");
+                (
+                    ov.active_tier_role.clone(),
+                    ov.origin_tier_role.clone(),
+                    ov.reason.clone(),
+                )
+            });
 
             match state.build_reentry_context_envelope() {
                 Some((prompt, context, context_projection, tools_for_model)) => {
@@ -2320,6 +2359,7 @@ impl AgentRuntime {
                         state.checkpoint_memory_type(),
                         state.checkpoint_json(),
                         state.clone(),
+                        fallback_notice,
                     ))
                 }
                 None => Err(anyhow::anyhow!(
@@ -2341,6 +2381,7 @@ impl AgentRuntime {
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
+            fallback_notice,
         ) = plan;
 
         self.ipc_client
@@ -2364,6 +2405,19 @@ impl AgentRuntime {
                     "provider_switch",
                     Some(format!("{switch_from} -> {switch_to} ({switch_reason})")),
                 )
+                .await;
+        }
+
+        // Slice 3: one-time operational notice so the operator learns their
+        // session degraded to a fallback tier — latched by `notice_sent` above
+        // so sticky turns (further tier walks while already-notified) stay
+        // silent. This is a plain informational message, not an assistant
+        // reply: membranes must render it without draft-edit streaming or TTS
+        // (see membrane-telegram's `model_fallback` turn_event arm).
+        if let Some((active_role, origin_role, reason)) = fallback_notice {
+            let message = format!("↪️ Model fallback: {active_role} (was {origin_role}; {reason})");
+            let _ = self
+                .emit_turn_event(&session_id, "model_fallback", Some(message))
                 .await;
         }
 

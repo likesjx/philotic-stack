@@ -3082,6 +3082,33 @@ impl TelegramSeatGuest {
                 }
             }
             // waiting_tool and waiting_model: typing continues — no action needed.
+            else if event == "model_fallback" || event == "model_fallback_cleared" {
+                // Model-tier fallback/recovery notice (Slice 3 of Model
+                // Failover Layers): a one-time plain operational message, not
+                // an assistant reply — no draft-edit streaming and no TTS.
+                // Those behaviors (upsert_formatted_text's draft tracking,
+                // audio_artifact synthesis) only apply to the send_reply
+                // branch further down, which this event never reaches.
+                let message = task
+                    .get("partial_content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !chat_id.is_empty() && !message.is_empty() {
+                    let thread_id = {
+                        let turns = self.active_turns.lock().unwrap();
+                        turns.get(&session_id).and_then(|a| a.thread_id.clone())
+                    };
+                    let _ = send_telegram_text(
+                        &self.http_client,
+                        &tg_base,
+                        &chat_id,
+                        thread_id.as_deref(),
+                        message,
+                        None,
+                    )
+                    .await;
+                }
+            }
         } else if action == "partial_reply" {
             let content = task
                 .get("content")
@@ -3578,8 +3605,8 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand, TelegramFileRef,
-        TelegramSeatGuest, UpdateDedupe, approval_callback_content,
+        ActiveTurn, TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand,
+        TelegramFileRef, TelegramSeatGuest, UpdateDedupe, approval_callback_content,
         build_combined_telegram_commands, build_telegram_menu_commands, default_attachment_name,
         enrich_attachment_with_transport, next_error_backoff_secs,
         normalize_telegram_menu_command_name, telegram_command, telegram_format_text,
@@ -3588,7 +3615,7 @@ mod tests {
     use philotic_client::CommandManifestEntry;
     use serde_json::{Value, json};
     use std::time::Duration;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     #[test]
     fn telegram_text_envelope_normalizes_threaded_message() {
@@ -4710,6 +4737,119 @@ mod tests {
         assert_eq!(
             sent, 2,
             "a genuinely new turn arriving after the dedupe TTL must still be delivered"
+        );
+    }
+
+    // ── Slice 3 (Model Failover Layers): model_fallback / model_fallback_cleared ──
+
+    /// A `model_fallback` turn_event must be delivered as a single plain
+    /// `sendMessage` — not routed through the draft/edit machinery
+    /// (`editMessageText`) that a `send_reply` or `partial_reply` would use.
+    #[tokio::test]
+    async fn model_fallback_notice_sends_plain_message() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+
+        let task_json = json!({
+            "action": "turn_event",
+            "event": "model_fallback",
+            "session_id": "sess-fallback-notice",
+            "turn_id": "turn-1",
+            "chat_id": "123",
+            "partial_content": "\u{21aa}\u{fe0f} Model fallback: model.ollama (was model; provider_failure)"
+        })
+        .to_string();
+
+        guest.handle_inbound_task(&task_json).await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["sendMessage".to_string()],
+            "the fallback notice must be exactly one plain sendMessage, with no draft edit"
+        );
+    }
+
+    /// A `model_fallback_cleared` turn_event fires on an idle session (no
+    /// active_turn on the philote side, and — mirroring that — no tracked
+    /// `ActiveTurn` here either). It must still be delivered as a plain
+    /// `sendMessage`.
+    #[tokio::test]
+    async fn model_fallback_cleared_notice_sends_plain_message() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+
+        let task_json = json!({
+            "action": "turn_event",
+            "event": "model_fallback_cleared",
+            "session_id": "sess-fallback-cleared-notice",
+            "turn_id": "",
+            "chat_id": "123",
+            "partial_content": "\u{21aa}\u{fe0f} Model fallback cleared: model (was model.ollama)"
+        })
+        .to_string();
+
+        guest.handle_inbound_task(&task_json).await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["sendMessage".to_string()],
+            "the recovery notice must be exactly one plain sendMessage, with no draft edit"
+        );
+    }
+
+    /// The notice must not disturb an in-flight turn's draft/typing state: a
+    /// `model_fallback` firing mid-turn (the real philote-side timing — see
+    /// `advance_turn_to_next_fallback_tier`) must leave the session's
+    /// `ActiveTurn` entry (and its draft) exactly as it was, unlike
+    /// `waiting_approval` (which removes it) or `send_reply` (which
+    /// finalizes and removes it).
+    #[tokio::test]
+    async fn model_fallback_notice_does_not_disturb_active_turn_state() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+
+        let session_id = "sess-fallback-midturn";
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let mut active = ActiveTurn::new(cancel_tx, None);
+        active.draft_message_id = Some(555);
+        active.draft_text = "partial draft so far".into();
+        guest
+            .active_turns
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), active);
+
+        let task_json = json!({
+            "action": "turn_event",
+            "event": "model_fallback",
+            "session_id": session_id,
+            "turn_id": "turn-mid",
+            "chat_id": "123",
+            "partial_content": "\u{21aa}\u{fe0f} Model fallback: model.ollama (was model; provider_failure)"
+        })
+        .to_string();
+
+        guest.handle_inbound_task(&task_json).await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["sendMessage".to_string()],
+            "the notice sends a fresh plain message, not an edit of the draft"
+        );
+        let turns = guest.active_turns.lock().unwrap();
+        let active = turns
+            .get(session_id)
+            .expect("model_fallback must not remove the in-flight ActiveTurn entry");
+        assert_eq!(
+            active.draft_message_id,
+            Some(555),
+            "the existing draft must be untouched by the notice"
         );
     }
 }
