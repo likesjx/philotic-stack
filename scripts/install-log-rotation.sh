@@ -41,8 +41,13 @@ OWNER="$(id -un):staff"
 #   G = logfilename is a glob;  J = bzip2-compress rotated archives
 #   size 51200KB = 50MB;  when '*' = rotate on size only
 # No signal flag: aiua holds the log fd via launchd StandardOutPath, so writes
-# follow the renamed file until the next restart — deploys and kickstarts are
-# frequent enough that this converges in practice.
+# follow the renamed file until the next restart — and once newsyslog bzip2s
+# (and deletes) the renamed file, everything written after the rename is lost
+# to an unlinked inode until the next kickstart. Guests (philote, membranes,
+# model-router) inherit stdout and write several MB/hour here, so that loss
+# window is real. Prefer scripts/rotate-hotel-logs.sh (user-level launchd
+# copytruncate agent, no sudo, no rename) on operator machines; this newsyslog
+# drop-in remains for hosts where a root-owned mechanism is preferred.
 CONF_CONTENT="# Philotic hotel log rotation (managed by scripts/install-log-rotation.sh)
 # logfilename                              [owner:group]        mode count size when  flags
 ${LOG_GLOB}    ${OWNER}    644  5     51200 *     GJ"
