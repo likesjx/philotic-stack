@@ -367,6 +367,7 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
         Box::new(HealOldestPendingAge),
         Box::new(HealDispatcherStaleness),
         Box::new(SystemDiskSpace),
+        Box::new(MeshOrphanHotelNode),
     ]
 }
 
@@ -2163,15 +2164,11 @@ impl Check for SystemDiskSpace {
             .arg(&ctx.profile_dir)
             .output();
         let parsed = match output {
-            Ok(o) if o.status.success() => {
-                parse_df_kb(&String::from_utf8_lossy(&o.stdout))
-            }
+            Ok(o) if o.status.success() => parse_df_kb(&String::from_utf8_lossy(&o.stdout)),
             _ => None,
         };
         match parsed {
-            Some((avail_kb, used_pct)) => {
-                Ok(evaluate_disk_space(self.id(), avail_kb, used_pct))
-            }
+            Some((avail_kb, used_pct)) => Ok(evaluate_disk_space(self.id(), avail_kb, used_pct)),
             None => Ok(vec![Finding {
                 check_id: self.id().to_string(),
                 severity: Severity::Info,
@@ -2200,6 +2197,252 @@ impl Check for SystemDiskSpace {
                  `rm -f ~/.philotic/*/context.db.bak* ~/.philotic/*/*.quarantine`"
                     .to_string(),
             risk: "removes regenerable build artifacts; confirm no build/deploy is mid-flight"
+                .to_string(),
+        })
+    }
+}
+
+// ── mesh.orphan-hotel-node ───────────────────────────────────────────────
+//
+// A hotel that misboots under a wrong/default identity registers a stale
+// `hotel:<name>` graph node carrying THIS machine's own mesh_host (or a null
+// one if the mesh never resolved). The outbound mesh dispatcher then tries to
+// deliver to it forever but can never authenticate to it — an "undead mesh
+// peer". Part 1 (crates/aiua) stops the dispatcher log-spam; this check
+// surfaces the ghost node so an operator can remove it.
+
+/// One `graph_nodes` hotel row, decoded just enough to run the orphan
+/// predicate. Rows with unparseable `data_json` or missing `hotel_name`/
+/// `node_id` are skipped by [`read_hotel_nodes`] rather than aborting.
+#[derive(Debug, Clone)]
+struct HotelNodeInfo {
+    node_key: String,
+    hotel_name: String,
+    node_id: String,
+    /// `$.mesh_host` — may be absent, null, or empty in the stored record.
+    mesh_host: Option<String>,
+    /// Raw `graph_nodes.updated_at` (SQLite datetime text), for corroborating
+    /// staleness evidence only — never gates the predicate.
+    updated_at: String,
+}
+
+/// True when `mesh_host` is absent, empty, or whitespace-only.
+fn mesh_host_is_blank(mesh_host: Option<&str>) -> bool {
+    mesh_host.map(|h| h.trim().is_empty()).unwrap_or(true)
+}
+
+/// Human-readable staleness for `updated_at` (SQLite datetime text). Best
+/// effort: an unparseable value degrades to "staleness unknown" rather than
+/// erroring.
+fn describe_staleness(updated_at: &str) -> String {
+    use chrono::{NaiveDateTime, Utc};
+    let trimmed = updated_at.trim();
+    let parsed = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S"));
+    match parsed {
+        Ok(ts) => {
+            let days = (Utc::now().naive_utc() - ts).num_days();
+            if days >= 0 {
+                format!("{days} days stale")
+            } else {
+                "updated_at is in the future".to_string()
+            }
+        }
+        Err(_) => "staleness unknown".to_string(),
+    }
+}
+
+/// Pure orphan predicate, split out for unit testing.
+///
+/// A hotel node is an ORPHAN (undead mesh peer) when its `node_id` differs
+/// from the local node AND its `mesh_host` is blank OR equal to the local
+/// hotel's own `mesh_host`. Rationale: a wrong/default-identity misboot
+/// registers a node carrying THIS machine's own mesh_host (or a null one if
+/// the mesh never resolved) — two genuinely distinct real hotels never share a
+/// mesh_host. The local node is NEVER flagged (guarded by the `node_id`
+/// check — load-bearing, because a hotel's own self-record often carries a
+/// blank mesh_host). Staleness is reported for context but never gates the
+/// predicate.
+fn evaluate_orphan_hotels(
+    check_id: &'static str,
+    local_node_id: &str,
+    local_mesh_host: Option<&str>,
+    hotels: &[HotelNodeInfo],
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for hotel in hotels {
+        // Never flag the local node — this guard is what keeps the local
+        // self-record (which may itself carry a blank mesh_host) safe.
+        if hotel.node_id == local_node_id {
+            continue;
+        }
+        let host_matches_local = match (hotel.mesh_host.as_deref(), local_mesh_host) {
+            (Some(h), Some(l)) => !h.trim().is_empty() && h.trim() == l.trim(),
+            _ => false,
+        };
+        let is_orphan = mesh_host_is_blank(hotel.mesh_host.as_deref()) || host_matches_local;
+        if !is_orphan {
+            continue;
+        }
+        let staleness = describe_staleness(&hotel.updated_at);
+        let mesh_desc = match hotel.mesh_host.as_deref() {
+            Some(h) if !h.trim().is_empty() => {
+                format!("mesh_host={h} (= this machine's own mesh_host)")
+            }
+            _ => "mesh_host is null/empty".to_string(),
+        };
+        findings.push(Finding {
+            check_id: check_id.to_string(),
+            severity: Severity::Warning,
+            message: format!(
+                "hotel '{}' (node_id {}) looks like an undead mesh peer: {mesh_desc}; \
+                 last updated {} ({staleness}). The mesh dispatcher cannot authenticate to it \
+                 and will keep trying to deliver to it.",
+                hotel.hotel_name, hotel.node_id, hotel.updated_at
+            ),
+            evidence: json!({
+                "node_key": hotel.node_key,
+                "hotel_name": hotel.hotel_name,
+                "node_id": hotel.node_id,
+                "mesh_host": hotel.mesh_host,
+                "updated_at": hotel.updated_at,
+                "local_mesh_host": local_mesh_host,
+            }),
+            fix_hint: format!(
+                "if '{name}' is a misboot ghost (not a powered-off real peer), remove its \
+                 subtree: DELETE FROM graph_nodes WHERE node_key='hotel:{name}' OR \
+                 node_key LIKE 'guest:{name}:%'",
+                name = hotel.hotel_name
+            ),
+            auto_repairable: false,
+        });
+    }
+    findings
+}
+
+/// Read all `kind='hotel'` graph nodes, decoding each `data_json` defensively.
+/// A row with unparseable JSON or without both `hotel_name` and
+/// `capabilities.node_id` is skipped (never a hard error) so one bad record
+/// cannot blind the whole check.
+fn read_hotel_nodes(conn: &Connection) -> Result<Vec<HotelNodeInfo>> {
+    let mut stmt = conn
+        .prepare("SELECT node_key, data_json, updated_at FROM graph_nodes WHERE kind = 'hotel'")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        ))
+    })?;
+    let mut hotels = Vec::new();
+    for row in rows {
+        let (node_key, data_json, updated_at) = row?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data_json) else {
+            continue;
+        };
+        let hotel_name = value.get("hotel_name").and_then(|v| v.as_str());
+        let node_id = value
+            .get("capabilities")
+            .and_then(|c| c.get("node_id"))
+            .and_then(|v| v.as_str());
+        let (Some(hotel_name), Some(node_id)) = (hotel_name, node_id) else {
+            continue;
+        };
+        let mesh_host = value
+            .get("mesh_host")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        hotels.push(HotelNodeInfo {
+            node_key,
+            hotel_name: hotel_name.to_string(),
+            node_id: node_id.to_string(),
+            mesh_host,
+            updated_at,
+        });
+    }
+    Ok(hotels)
+}
+
+/// Surfaces "undead mesh peer" hotel nodes — stale, unauthenticatable targets
+/// the mesh dispatcher can never deliver to. Read-only; removal is always
+/// operator-gated (`NeedsConfirm`).
+struct MeshOrphanHotelNode;
+
+impl Check for MeshOrphanHotelNode {
+    fn id(&self) -> &'static str {
+        "mesh.orphan-hotel-node"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "graph_nodes")? {
+            return Ok(findings);
+        }
+        let hotels = read_hotel_nodes(&ctx.conn)?;
+
+        // Local identity = `ctx.hotel`, the codebase's own convention for
+        // "which hotel is this" (see `IpcStaleSocket`). The finalized spec
+        // named a `node_config` key `hotel_name`, but that key does not exist
+        // on the live fleet (mac-jane/mbp-jane/vps-jane all lack it; the column
+        // is `value_json`, not `value`), so its literal form is a dead no-op.
+        // The mesh_host predicate itself is unchanged.
+        let local_name = ctx.hotel.trim();
+
+        // "default" is BOTH clap's `--hotel` default AND the canonical
+        // misboot-ghost name, so it can never authoritatively identify the
+        // local hotel. Without this guard, a bare `phil doctor` (ctx.hotel =
+        // "default") run while a `hotel:default` ghost exists would match the
+        // GHOST as the sole "local" node — inverting the predicate so the REAL
+        // hotel (which shares the ghost's mesh_host) gets flagged for deletion.
+        // To catch a "default" ghost, invoke with an explicit `--hotel <real>`
+        // (same as the ports/ipc checks, which also key on `ctx.hotel`).
+        if local_name.is_empty() || local_name == "default" {
+            return Ok(Vec::new());
+        }
+
+        let local_matches: Vec<&HotelNodeInfo> = hotels
+            .iter()
+            .filter(|h| h.hotel_name.trim() == local_name)
+            .collect();
+
+        // Fail-safe: only run the predicate when the local hotel pins to
+        // exactly one node. The predicate keys on "not the local node"; a wrong
+        // local guess could flag a real peer, and mesh_host alone cannot
+        // distinguish a ghost from local (the ghost shares local's mesh_host).
+        // Surfacing nothing is strictly safer than risking a false positive —
+        // this is also why the bare `phil doctor` (`--hotel` defaults to
+        // "default", which matches no node once the ghost is cleaned) is green.
+        let [local] = local_matches.as_slice() else {
+            return Ok(Vec::new());
+        };
+        Ok(evaluate_orphan_hotels(
+            self.id(),
+            &local.node_id,
+            local.mesh_host.as_deref(),
+            &hotels,
+        ))
+    }
+
+    /// Removal is an operator decision in BOTH dry-run and `--fix`: the
+    /// predicate only surfaces a suspect; a powered-off real peer can look
+    /// identical to a misboot ghost. Never auto-deletes.
+    fn repair(&self, _ctx: &DoctorCtx, finding: &Finding, _apply: bool) -> Result<RepairOutcome> {
+        let hotel_name = finding
+            .evidence
+            .get("hotel_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        Ok(RepairOutcome::NeedsConfirm {
+            description: format!(
+                "remove the orphan hotel subtree (stop the hotel first if it is local — an orphan \
+                 never is): DELETE FROM graph_nodes WHERE node_key='hotel:{hotel_name}' OR \
+                 node_key LIKE 'guest:{hotel_name}:%'"
+            ),
+            risk: "removes a hotel node + its guest children; confirm it is a misboot ghost, \
+                   not a powered-off real peer"
                 .to_string(),
         })
     }
@@ -4054,11 +4297,238 @@ mod tests {
         let (_dir, path) = fixture_db();
         let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
         for apply in [false, true] {
-            let outcome = SystemDiskSpace.repair(&ctx, &finding, apply).expect("repair");
+            let outcome = SystemDiskSpace
+                .repair(&ctx, &finding, apply)
+                .expect("repair");
             assert!(
                 matches!(outcome, RepairOutcome::NeedsConfirm { .. }),
                 "apply={apply} must NeedsConfirm, got {outcome:?}"
             );
+        }
+    }
+
+    // ── mesh.orphan-hotel-node ──────────────────────────────────────────
+
+    const ORPHAN_ID: &str = "mesh.orphan-hotel-node";
+
+    fn hotel_info(hotel_name: &str, node_id: &str, mesh_host: Option<&str>) -> HotelNodeInfo {
+        HotelNodeInfo {
+            node_key: format!("hotel:{hotel_name}"),
+            hotel_name: hotel_name.to_string(),
+            node_id: node_id.to_string(),
+            mesh_host: mesh_host.map(str::to_string),
+            updated_at: "2026-07-11 02:44:00".to_string(),
+        }
+    }
+
+    /// (1) A real peer on a DISTINCT remote IP is not an orphan — even with no
+    /// enrollment config anywhere (the predicate never consults enrollment).
+    #[test]
+    fn orphan_distinct_remote_ip_not_flagged() {
+        let local = hotel_info("mac-jane", "mac-jane-aiua-01", Some("100.64.230.106"));
+        let peer = hotel_info("mbp-jane", "mbp-jane-aiua-01", Some("100.79.239.64"));
+        let findings = evaluate_orphan_hotels(
+            ORPHAN_ID,
+            &local.node_id,
+            local.mesh_host.as_deref(),
+            &[local.clone(), peer],
+        );
+        assert!(findings.is_empty(), "distinct-IP peer must not be flagged");
+    }
+
+    /// (2) A node sharing the local hotel's mesh_host is the mesh-enabled
+    /// misboot case → flagged.
+    #[test]
+    fn orphan_shared_mesh_host_flagged() {
+        let local = hotel_info("mac-jane", "mac-jane-aiua-01", Some("100.64.230.106"));
+        let ghost = hotel_info("default", "default-aiua-01", Some("100.64.230.106"));
+        let findings = evaluate_orphan_hotels(
+            ORPHAN_ID,
+            &local.node_id,
+            local.mesh_host.as_deref(),
+            &[local.clone(), ghost],
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0]
+                .evidence
+                .get("hotel_name")
+                .and_then(|v| v.as_str()),
+            Some("default")
+        );
+        assert_eq!(findings[0].severity, Severity::Warning);
+    }
+
+    /// (3) A hotel with null/empty mesh_host is flagged regardless of the local
+    /// mesh_host.
+    #[test]
+    fn orphan_null_or_empty_mesh_host_flagged() {
+        let local = hotel_info("mac-jane", "mac-jane-aiua-01", Some("100.64.230.106"));
+        let null_host = hotel_info("ghost-null", "ghost-null-aiua-01", None);
+        let empty_host = hotel_info("ghost-empty", "ghost-empty-aiua-01", Some("   "));
+        let findings = evaluate_orphan_hotels(
+            ORPHAN_ID,
+            &local.node_id,
+            local.mesh_host.as_deref(),
+            &[local.clone(), null_host, empty_host],
+        );
+        let flagged: Vec<&str> = findings
+            .iter()
+            .filter_map(|f| f.evidence.get("hotel_name").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(flagged, vec!["ghost-null", "ghost-empty"]);
+    }
+
+    /// (4) The local node is never flagged — even when its own self-record
+    /// carries a blank mesh_host (the vps-jane self-record shape).
+    #[test]
+    fn orphan_local_node_never_flagged() {
+        // Local self-record with a blank mesh_host, exactly like vps-jane's own
+        // record in its own DB.
+        let local = hotel_info("vps-jane", "vps-jane-aiua-01", None);
+        let findings = evaluate_orphan_hotels(
+            ORPHAN_ID,
+            &local.node_id,
+            local.mesh_host.as_deref(),
+            &[local.clone()],
+        );
+        assert!(findings.is_empty(), "local node must never be flagged");
+    }
+
+    /// (5) Realistic 4-hotel fixture: local + two real remotes on distinct IPs
+    /// + one ghost → flags exactly the ghost.
+    #[test]
+    fn orphan_four_hotel_fixture_flags_only_ghost() {
+        let local = hotel_info("mac-jane", "mac-jane-aiua-01", Some("100.64.230.106"));
+        let remote1 = hotel_info("mbp-jane", "mbp-jane-aiua-01", Some("100.79.239.64"));
+        let remote2 = hotel_info("vps-jane", "vps-jane-aiua-01", Some("100.64.212.8"));
+        let ghost = hotel_info("default", "default-aiua-01", Some("100.64.230.106"));
+        let findings = evaluate_orphan_hotels(
+            ORPHAN_ID,
+            &local.node_id,
+            local.mesh_host.as_deref(),
+            &[local.clone(), remote1, remote2, ghost],
+        );
+        assert_eq!(findings.len(), 1, "exactly the ghost is flagged");
+        assert_eq!(
+            findings[0]
+                .evidence
+                .get("hotel_name")
+                .and_then(|v| v.as_str()),
+            Some("default")
+        );
+    }
+
+    // ── detect() identity + fail-safe (mesh.orphan-hotel-node) ──────────
+
+    fn insert_hotel_node(
+        conn: &Connection,
+        hotel_name: &str,
+        node_id: &str,
+        mesh_host: Option<&str>,
+    ) {
+        let data = json!({
+            "hotel_name": hotel_name,
+            "capabilities": { "node_id": node_id },
+            "mesh_host": mesh_host,
+        });
+        conn.execute(
+            "INSERT INTO graph_nodes (node_key, kind, label, data_json, updated_at) \
+             VALUES (?1, 'hotel', ?2, ?3, '2026-07-11 02:44:00')",
+            params![format!("hotel:{hotel_name}"), hotel_name, data.to_string()],
+        )
+        .expect("insert hotel node");
+    }
+
+    /// detect() flags the ghost when `ctx.hotel` pins the local node.
+    #[test]
+    fn orphan_detect_flags_ghost_when_ctx_hotel_matches_local() {
+        let (_dir, path) = fixture_db();
+        {
+            let w = Connection::open(&path).expect("open rw");
+            insert_hotel_node(&w, "mac-jane", "mac-jane-aiua-01", Some("100.64.230.106"));
+            insert_hotel_node(&w, "mbp-jane", "mbp-jane-aiua-01", Some("100.79.239.64"));
+            insert_hotel_node(&w, "default", "default-aiua-01", Some("100.64.230.106"));
+        }
+        let ctx = DoctorCtx::open_at("mac-jane", path).expect("open ctx");
+        let findings = MeshOrphanHotelNode.detect(&ctx).expect("detect");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0]
+                .evidence
+                .get("hotel_name")
+                .and_then(|v| v.as_str()),
+            Some("default")
+        );
+    }
+
+    /// detect() is fail-safe: when `ctx.hotel` matches no hotel node (the bare
+    /// `phil doctor` case, `--hotel` defaults to "default" with the ghost
+    /// cleaned), it flags nothing rather than risking a false positive.
+    #[test]
+    fn orphan_detect_failsafe_when_local_unidentified() {
+        let (_dir, path) = fixture_db();
+        {
+            let w = Connection::open(&path).expect("open rw");
+            insert_hotel_node(&w, "mac-jane", "mac-jane-aiua-01", Some("100.64.230.106"));
+            insert_hotel_node(&w, "mbp-jane", "mbp-jane-aiua-01", Some("100.79.239.64"));
+        }
+        // ctx.hotel = "default" matches no node → fail-safe, zero findings.
+        let ctx = DoctorCtx::open_at("default", path).expect("open ctx");
+        let findings = MeshOrphanHotelNode.detect(&ctx).expect("detect");
+        assert!(findings.is_empty(), "unidentified local must flag nothing");
+    }
+
+    /// Regression: a bare `phil doctor` (ctx.hotel = "default") with a
+    /// `hotel:default` ghost present must NOT invert — the ghost, being the sole
+    /// "default" match, must not be treated as local and cause the REAL hotel
+    /// (which shares its mesh_host) to be flagged for deletion. The "default"
+    /// sentinel guard makes this fail-safe; catching a default ghost needs an
+    /// explicit `--hotel <real-name>`.
+    #[test]
+    fn orphan_detect_no_inversion_bare_invocation_with_default_ghost() {
+        let (_dir, path) = fixture_db();
+        {
+            let w = Connection::open(&path).expect("open rw");
+            insert_hotel_node(&w, "mac-jane", "mac-jane-aiua-01", Some("100.64.230.106"));
+            insert_hotel_node(&w, "default", "default-aiua-01", Some("100.64.230.106"));
+        }
+        // `--hotel` defaults to "default"; the ghost is the sole "default" match.
+        let ctx = DoctorCtx::open_at("default", path).expect("open ctx");
+        let findings = MeshOrphanHotelNode.detect(&ctx).expect("detect");
+        assert!(
+            findings.is_empty(),
+            "must not flag the real hotel (no inversion)"
+        );
+    }
+
+    /// detect() repair is always operator-gated (NeedsConfirm) in both modes.
+    #[test]
+    fn orphan_repair_needs_confirm_both_modes() {
+        let finding = evaluate_orphan_hotels(
+            ORPHAN_ID,
+            "mac-jane-aiua-01",
+            Some("100.64.230.106"),
+            &[hotel_info(
+                "default",
+                "default-aiua-01",
+                Some("100.64.230.106"),
+            )],
+        )
+        .remove(0);
+        let (_dir, path) = fixture_db();
+        let ctx = DoctorCtx::open_at("mac-jane", path).expect("open ctx");
+        for apply in [false, true] {
+            let outcome = MeshOrphanHotelNode
+                .repair(&ctx, &finding, apply)
+                .expect("repair");
+            match outcome {
+                RepairOutcome::NeedsConfirm { description, .. } => {
+                    assert!(description.contains("guest:default:"));
+                    assert!(description.contains("hotel:default"));
+                }
+                other => panic!("apply={apply} must NeedsConfirm, got {other:?}"),
+            }
         }
     }
 }
