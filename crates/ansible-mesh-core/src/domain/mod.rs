@@ -2056,13 +2056,13 @@ mod tests {
 
         // Outcome update round-trips.
         assert!(domain
-            .set_autonomy_audit_outcome("audit-1", AuditOutcome::Confirmed, 3_000)
+            .set_autonomy_audit_outcome("audit-1", AuditOutcome::ConfirmedGood, 3_000)
             .expect("set outcome"));
         let updated = domain
             .get_autonomy_audit("audit-1")
             .expect("get")
             .expect("exists");
-        assert_eq!(updated.outcome, AuditOutcome::Confirmed);
+        assert_eq!(updated.outcome, AuditOutcome::ConfirmedGood);
         assert_eq!(updated.updated_at, 3_000);
         assert_eq!(updated.created_at, 1_000);
         assert!(!domain

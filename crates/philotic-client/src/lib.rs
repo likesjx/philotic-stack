@@ -1979,14 +1979,23 @@ pub enum IpcRequest {
     },
     /// Operator/steward → hotel: report the reviewed outcome of an audited
     /// autonomous action so the lane earns (or loses) trust (Autopoiesis
-    /// Slice A2; feeds A1's `record_autonomy_outcome`).
+    /// Slice A2; feeds A1's `record_autonomy_outcome`; the `outcome` vocabulary
+    /// itself — including `"neutral"` — is Slice A9's `trust-ledger`).
     ///
-    /// `outcome` is `"confirmed_good"` or `"reversed"`. The hotel stamps the
-    /// `autonomy_audit` record and applies the grant transition (promotion /
+    /// `outcome` is `"confirmed_good"` (feeds the earn counter), `"reversed"`
+    /// (demotes one posture level), or `"neutral"` (stamps the audit record
+    /// only — no effect on the grant's earn/demote counters; a wash, not a
+    /// signal). The hotel stamps the `autonomy_audit` record and, for
+    /// `confirmed_good`/`reversed`, applies the grant transition (promotion /
     /// demotion / failure-streak bookkeeping). Recording is idempotent: a
     /// second report against an already-reviewed audit id is refused with
     /// `recorded=false, reason="already_recorded"` so one confirmation can
     /// never double-count toward promotion.
+    ///
+    /// TODO(A9): a configurable timeout-to-`"neutral"` for audits left
+    /// `Pending` past some age is not wired up — `"neutral"` is only
+    /// reachable through an explicit report today. See
+    /// `ansible_mesh_core::autonomy::AuditOutcome::Neutral`.
     ///
     /// Responds with [`IpcResponse::Standard`] — `data` carries
     /// `{recorded, lane?, transition?, posture?, reason?}`.
