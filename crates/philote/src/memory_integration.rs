@@ -2417,6 +2417,80 @@ impl AgentRuntime {
         })
         .await
     }
+
+    /// Memory Transparency Slice M3 (`memory-delta-digest`): fetch and
+    /// return the operator-facing digest of what the fleet's Muninn vaults
+    /// remembered, forgot, and found contradictory in a trailing window.
+    /// Delegates the actual collection to the hotel over IPC — the hotel
+    /// owns the vault registry, tokens, and the M4 hygiene last-run marker
+    /// this digest folds in — via the same `GetConfig` synthetic-key
+    /// pattern Autopoiesis Slice A9's `__autonomy_status__` established
+    /// (`aiua::service::ipc::IpcServer::handle_memory_delta_digest`).
+    pub(super) async fn execute_memory_delta_digest_tool(
+        &mut self,
+        payload: ToolExecutionPayload,
+    ) -> Result<()> {
+        let window_hours = payload
+            .arguments
+            .get("window_hours")
+            .and_then(|v| v.as_u64())
+            .filter(|h| *h > 0)
+            .unwrap_or(24);
+        let key = format!("__memory_delta_digest__:{window_hours}");
+
+        let (content, tool_err) = match self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig { key })
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(raw),
+                ..
+            }) => {
+                let text = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("rendered")
+                            .and_then(|r| r.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or(raw);
+                (text, None)
+            }
+            Ok(IpcResponse::ConfigData {
+                value_json: None, ..
+            }) => (
+                "memory.delta_digest: MuninnDB is not configured on this hotel, or the local \
+                 hotel record could not be resolved — no digest to show."
+                    .to_string(),
+                None,
+            ),
+            Ok(_) => ("memory.delta_digest: response unrecognized.".into(), None),
+            Err(e) => {
+                let err = TaskErrorPayload::transport_error(
+                    "philote",
+                    format!("memory.delta_digest: IPC transport error — {e}"),
+                );
+                (err.display_message(), Some(err))
+            }
+        };
+
+        self.handle_tool_result(InboundTaskPayload {
+            action: Some("tool_result".into()),
+            source: Some("agent".into()),
+            session_id: Some(payload.session_id),
+            turn_id: Some(payload.turn_id),
+            chat_id: Some(payload.chat_id),
+            content: Some(content),
+            error: tool_err,
+            tool_name: Some(payload.tool_name),
+            final_reply_to: Some(payload.final_reply_to),
+            final_reply_role: Some(payload.final_reply_role),
+            final_reply_guest_id: payload.final_reply_guest_id,
+            ..Default::default()
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -2462,7 +2536,10 @@ mod tests {
         // `MemoryEngine::remember_with_metadata` → `WriteRequest.metadata`
         // → `POST /api/engrams` — proving the envelope lands in the record
         // actually sent to MuninnDB, not just in an intermediate struct.
-        assert_eq!(metadata["provenance"]["author"], "agent-bjork-01/orchestrator");
+        assert_eq!(
+            metadata["provenance"]["author"],
+            "agent-bjork-01/orchestrator"
+        );
         assert_eq!(metadata["provenance"]["trust"], "told");
         assert_eq!(metadata["provenance"]["evidence"][0], "session:sess-42");
         // Pre-existing metadata fields are preserved, not clobbered.

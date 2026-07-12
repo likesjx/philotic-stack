@@ -4920,6 +4920,8 @@ impl AgentRuntime {
 
             "memory.fix" => self.execute_memory_fix_tool(payload).await,
 
+            "memory.delta_digest" => self.execute_memory_delta_digest_tool(payload).await,
+
             "rule.propose" => {
                 let description = payload
                     .arguments

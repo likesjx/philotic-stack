@@ -3830,6 +3830,30 @@ impl IpcServer {
                         .unwrap_or(0);
                     return Self::handle_query_autonomy_status(graph, Some(lane), now);
                 }
+                // Read-only operator/steward surface for the Memory
+                // Transparency Slice M3 delta digest (`memory.delta_digest`
+                // philote tool). `__memory_delta_digest__` uses the default
+                // 24h window; `__memory_delta_digest__:{hours}` overrides it.
+                // A query, not a write — no autonomy grant is consulted (the
+                // Autonomy Contract governs autonomous actions, not reads
+                // that render already-durable state).
+                if key == "__memory_delta_digest__" {
+                    return Self::handle_memory_delta_digest(
+                        graph,
+                        local_node_id,
+                        crate::memory_delta_digest::DEFAULT_WINDOW_HOURS,
+                    )
+                    .await;
+                }
+                if let Some(hours_str) = key.strip_prefix("__memory_delta_digest__:") {
+                    let window_hours = hours_str
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|h| *h > 0)
+                        .unwrap_or(crate::memory_delta_digest::DEFAULT_WINDOW_HOURS);
+                    return Self::handle_memory_delta_digest(graph, local_node_id, window_hours)
+                        .await;
+                }
                 // Returns a JSON array of memory_type strings for all session apartments
                 // belonging to the given agent — used by philote at startup for stale-turn sweep.
                 // Key format: `__session_apartments__:{agent_id}`
@@ -9238,6 +9262,84 @@ impl IpcServer {
         IpcResponse::ConfigData { key, value_json }
     }
 
+    /// Handle `GetConfig("__memory_delta_digest__")` /
+    /// `GetConfig("__memory_delta_digest__:{hours}")` — the Memory
+    /// Transparency Slice M3 delta digest the `memory.delta_digest` philote
+    /// tool calls. Reconstructs a [`MuninnConfig`](memory_core::MuninnConfig)
+    /// on demand via [`crate::memory::load_muninn_config`] rather than
+    /// threading one through `process_request`'s already-long parameter
+    /// list — the same config `run_scheduled_sweep` uses, built from the same
+    /// graph-backed vault registry. Returns `ConfigData` with `value_json`
+    /// `null` when Muninn is not configured on this hotel (an honest "not
+    /// wired up" rather than an empty-but-successful digest).
+    async fn handle_memory_delta_digest(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        window_hours: u64,
+    ) -> IpcResponse {
+        let key = format!("__memory_delta_digest__:{window_hours}");
+
+        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
+            Some(name) => name,
+            None => {
+                warn!("memory.delta_digest: local hotel record missing — cannot collect digest");
+                return IpcResponse::ConfigData {
+                    key,
+                    value_json: None,
+                };
+            }
+        };
+
+        let muninn_config = match crate::memory::load_muninn_config(graph) {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                debug!("memory.delta_digest: Muninn not configured on this hotel — skipping");
+                return IpcResponse::ConfigData {
+                    key,
+                    value_json: None,
+                };
+            }
+            Err(e) => {
+                warn!("memory.delta_digest: failed to load Muninn config: {e:#}");
+                return IpcResponse::ConfigData {
+                    key,
+                    value_json: None,
+                };
+            }
+        };
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("memory.delta_digest: failed to build HTTP client — {e}");
+                return IpcResponse::ConfigData {
+                    key,
+                    value_json: None,
+                };
+            }
+        };
+
+        let digest = crate::memory_delta_digest::collect(
+            &client,
+            &muninn_config,
+            graph,
+            &hotel_name,
+            window_hours,
+            chrono::Utc::now(),
+        )
+        .await;
+
+        let value_json = serde_json::to_string(&serde_json::json!({
+            "rendered": digest.render(),
+            "digest": digest,
+        }))
+        .ok();
+        IpcResponse::ConfigData { key, value_json }
+    }
+
     // ── Agent migration ───────────────────────────────────────────────────────
 
     /// Build an `AgentMigrationBundle`, upload it to the local blob store, then
@@ -13105,7 +13207,13 @@ pub(crate) mod tests {
                 ansible_mesh_core::provenance::TrustTier::Observed
             );
             assert!(!provenance.evidence.is_empty());
-            assert!(provenance.reversal.as_deref().unwrap_or("").contains(&work_item_id));
+            assert!(
+                provenance
+                    .reversal
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&work_item_id)
+            );
             // Budget consumed exactly once.
             let grant = graph
                 .get_autonomy_grant(LANE_FLEET_HEAL_SLICES)

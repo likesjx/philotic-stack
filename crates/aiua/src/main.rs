@@ -38,6 +38,7 @@ mod auth;
 mod dream;
 mod graph;
 mod memory;
+mod memory_delta_digest;
 mod memory_hygiene;
 mod mesh;
 mod muninn_provision;

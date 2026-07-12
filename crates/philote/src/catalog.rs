@@ -269,6 +269,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "memory.promote_candidate",
             "memory.status",
             "memory.fix",
+            "memory.delta_digest",
         ],
         "routing.refinement" => &[
             "session.status",
@@ -2602,6 +2603,34 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "memory.delta_digest".into(),
+        ToolDefinition {
+            tool_name: "memory.delta_digest".into(),
+            description: "Memory Transparency Slice M3: return a digest of what the fleet's \
+                          Muninn vaults remembered, forgot, and found contradictory in a \
+                          trailing window (default 24h), each notable line carrying its \
+                          provenance (author/trust) when known and a textual revert hint \
+                          (e.g. 'muninn_restore <id>'). Also reports the most recent \
+                          memory.hygiene sweep's findings. 'Evolved' memories are always 0 \
+                          today — MuninnDB has no queryable evolution history yet; this is a \
+                          named gap in the digest itself, not a missing feature of this tool. \
+                          Use this before composing an operator morning brief, or whenever the \
+                          operator asks what the system's memory has changed recently."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "window_hours": {
+                        "type": "integer",
+                        "description": "Trailing window size in hours. Defaults to 24 if omitted."
+                    }
+                }
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
         "approval.request_standing".into(),
         ToolDefinition {
             tool_name: "approval.request_standing".into(),
@@ -3309,6 +3338,34 @@ mod tests {
                 "life.steward implied tool {tool} should have a real catalog schema"
             );
         }
+    }
+
+    /// Memory Transparency Slice M3: `memory.delta_digest` must have a real
+    /// catalog entry and be projected via the `memory` skill grouping — the
+    /// same grouping a future architect-charter steward would carry, so the
+    /// tool is reachable without a bespoke toolset entry per role.
+    #[test]
+    fn memory_delta_digest_is_cataloged_and_skill_projected() {
+        let catalog = tool_catalog();
+        for tool in skill_implied_tools("memory") {
+            assert!(
+                catalog.contains_key(*tool),
+                "memory implied tool {tool} should have a real catalog schema"
+            );
+        }
+
+        let digest = catalog
+            .get("memory.delta_digest")
+            .expect("memory.delta_digest catalog entry");
+        assert_eq!(digest.class.as_deref(), Some("memory"));
+        assert!(
+            digest.input_schema["properties"]["window_hours"].is_object(),
+            "memory.delta_digest should accept an optional window_hours argument"
+        );
+        assert!(
+            skill_implied_tools("memory").contains(&"memory.delta_digest"),
+            "memory.delta_digest should be projected by the memory skill"
+        );
     }
 
     #[test]
