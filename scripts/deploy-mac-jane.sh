@@ -30,6 +30,14 @@ chmod u+w "$CWEB" 2>/dev/null || true
 cp "$WT/target/release/philotic-web" "$CWEB"
 echo "    $installed guest binaries + philotic-web installed"
 
+# In-place cp over an existing executable corrupts the kernel's cached code
+# signature (inode reuse) — macOS then kills the binary at spawn with
+# OS_REASON_CODESIGNING, flakily. Ad-hoc re-sign everything we touched.
+echo "==> re-signing (ad-hoc) to clear stale signature caches"
+for b in "$CBIN"/*; do [ -f "$b" ] && codesign -f -s - "$b" 2>/dev/null; done
+codesign -f -s - "$CWEB" 2>/dev/null
+codesign -v "$CBIN/aiua" && echo "    signatures valid"
+
 echo "==> hash verification"
 for b in aiua philote model-router model-controller-elevenlabs model-controller-gemini; do
   a=$(shasum "$WT/target/release/$b" | cut -d' ' -f1)
