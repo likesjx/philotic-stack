@@ -1869,6 +1869,7 @@ impl AgentRuntime {
                 recalled_memories: Vec::new(),
                 active_plan: None,
                 consecutive_step_failures: 0,
+                streak_extension: 0,
                 provider_repair_note: None,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
