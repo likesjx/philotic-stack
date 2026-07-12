@@ -9,10 +9,11 @@ use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
     GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchApplyInput,
     LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput, LifeResolveInput,
-    MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter,
-    RankingWeights, ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating,
-    RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind,
-    SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
+    LifeViewNeighborhoodInput, LifeViewNodeInput, MemoryGraphRagRunner, PatchApplyDecision,
+    PatchGate, PatchKind, PatchRisk, PolicyFilter, RankingWeights, ReliabilityBasis,
+    RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery, RetrievalStrategy,
+    RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef, SourceReliability,
+    ValidationState, feedback_edge_specs,
 };
 use datasource::controller::{
     CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput,
@@ -427,6 +428,8 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.patch.apply" => self.handle_patch_apply(task).await,
             "life.patch.list" => self.handle_patch_list(task).await,
             "life.recall.stats" => self.handle_recall_stats(task).await,
+            "life.view.node" => self.handle_view_node(task).await,
+            "life.view.neighborhood" => self.handle_view_neighborhood(task).await,
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -1623,6 +1626,202 @@ impl LifeGraphProvider {
             "read_only": true,
             "since": if since.is_empty() { Value::Null } else { Value::String(since) },
             "stats": summary,
+        })))
+    }
+
+    /// Handle `life.view.node` — the READ-ONLY single-node detail surface
+    /// (lifegraph-read-plane seam), serving the edge viz through the
+    /// `/api/edge/lifegraph/node/:id` REST bridge.
+    ///
+    /// Dispatch-only steward-style surface like `life.patch.list`: no plan
+    /// gating, two bounded read queries, never a write. The provenance
+    /// envelope (validation_state, confidence, source_membrane, observed_at,
+    /// …) rides in the returned node's `properties`.
+    async fn handle_view_node(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeViewNodeInput =
+            serde_json::from_value(task.parameters.clone()).unwrap_or_default();
+        let node_id = input.id.trim().to_string();
+        if node_id.is_empty() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "error": "id is required",
+            })));
+        }
+        let edge_limit = input.effective_edge_limit();
+
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(query(cypher::view_node_query()).param("id", node_id.as_str()))
+            .await?;
+        let mut node_json = Value::Null;
+        if let Some(row) = rows.next().await? {
+            node_json = row_to_json(&row)?.get("n").cloned().unwrap_or(Value::Null);
+        }
+        if node_json.is_null() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "not_found",
+                "read_only": true,
+                "id": node_id,
+            })));
+        }
+
+        let mut rows = graph
+            .execute(
+                query(&cypher::view_node_edges_query(edge_limit)).param("id", node_id.as_str()),
+            )
+            .await?;
+        let mut neighbors = Vec::new();
+        while let Some(row) = rows.next().await? {
+            neighbors.push(row_to_json(&row)?);
+        }
+
+        info!(
+            id = node_id.as_str(),
+            neighbors = neighbors.len(),
+            "life.view.node: node detail served"
+        );
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "read_only": true,
+            "id": node_id,
+            "node": node_json,
+            "edge_limit": edge_limit,
+            "neighbor_count": neighbors.len(),
+            "neighbors": neighbors,
+        })))
+    }
+
+    /// Handle `life.view.neighborhood` — the READ-ONLY bounded-expansion viz
+    /// surface (lifegraph-read-plane seam), serving the edge canvas through
+    /// `/api/edge/lifegraph/neighborhood/:id`.
+    ///
+    /// Expansion reuses the read-side living-cycle machinery
+    /// ([`projection::expansion_rel_types`] + [`projection::expansion_cypher`]),
+    /// so only whitelisted relationship types are ever interpolated and
+    /// retired neighbours are excluded in-query. Edges are undirected
+    /// adjacency: `from` is the seed the neighbour was discovered from.
+    async fn handle_view_neighborhood(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeViewNeighborhoodInput =
+            serde_json::from_value(task.parameters.clone()).unwrap_or_default();
+        let origin_id = input.id.trim().to_string();
+        if origin_id.is_empty() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "error": "id is required",
+            })));
+        }
+        let depth = input.effective_depth();
+        let max_nodes = input.effective_max_nodes();
+        let rel_types = projection::expansion_rel_types(&input.allowed_edge_types);
+        if rel_types.is_empty() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "error": "allowed_edge_types matches no living-cycle relationship types",
+            })));
+        }
+
+        // Origin node first — a neighborhood of an unknown id is not_found,
+        // not an empty graph.
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(query(cypher::view_node_query()).param("id", origin_id.as_str()))
+            .await?;
+        let mut origin_json = Value::Null;
+        if let Some(row) = rows.next().await? {
+            origin_json = row_to_json(&row)?.get("n").cloned().unwrap_or(Value::Null);
+        }
+        if origin_json.is_null() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "not_found",
+                "read_only": true,
+                "id": origin_id,
+            })));
+        }
+
+        let mut nodes: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+        nodes.insert(origin_id.clone(), origin_json);
+        let mut edges: Vec<Value> = Vec::new();
+        let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+        let mut seeds: Vec<String> = vec![origin_id.clone()];
+        let mut truncated = false;
+
+        for _hop in 0..depth {
+            if seeds.is_empty() || nodes.len() >= max_nodes {
+                break;
+            }
+            let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+            // Rows can repeat neighbours across seeds; over-fetch modestly and
+            // bound the round trip regardless.
+            let row_budget = ((max_nodes - nodes.len()) * 2).clamp(1, 400);
+            let cypher_text = projection::expansion_cypher(&seed_refs, &rel_types, row_budget);
+            let result = self.execute_cypher(&cypher_text).await?;
+            let hits = projection::parse_expansion_rows(&result);
+            let mut next_seeds = Vec::new();
+            for hit in hits {
+                let Some(neighbor_id) = hit.hit.prop_str("id").map(str::to_string) else {
+                    continue;
+                };
+                let edge_key = if hit.origin_id <= neighbor_id {
+                    (
+                        hit.origin_id.clone(),
+                        hit.rel_type.clone(),
+                        neighbor_id.clone(),
+                    )
+                } else {
+                    (
+                        neighbor_id.clone(),
+                        hit.rel_type.clone(),
+                        hit.origin_id.clone(),
+                    )
+                };
+                if !nodes.contains_key(&neighbor_id) {
+                    if nodes.len() >= max_nodes {
+                        truncated = true;
+                        continue;
+                    }
+                    nodes.insert(
+                        neighbor_id.clone(),
+                        json!({
+                            "kind": "node",
+                            "labels": [hit.hit.label],
+                            "properties": hit.hit.properties,
+                        }),
+                    );
+                    next_seeds.push(neighbor_id.clone());
+                }
+                if seen_edges.insert(edge_key) {
+                    edges.push(json!({
+                        "from": hit.origin_id,
+                        "rel_type": hit.rel_type,
+                        "to": neighbor_id,
+                    }));
+                }
+            }
+            seeds = next_seeds;
+        }
+
+        info!(
+            id = origin_id.as_str(),
+            depth,
+            node_count = nodes.len(),
+            edge_count = edges.len(),
+            truncated,
+            "life.view.neighborhood: bounded expansion served"
+        );
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "read_only": true,
+            "origin_id": origin_id,
+            "depth": depth,
+            "max_nodes": max_nodes,
+            "node_count": nodes.len(),
+            "nodes": nodes.into_values().collect::<Vec<_>>(),
+            "edges": edges,
+            "truncated": truncated,
         })))
     }
 

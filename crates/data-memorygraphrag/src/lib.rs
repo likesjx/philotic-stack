@@ -1650,6 +1650,56 @@ impl LifeRecallStatsInput {
     }
 }
 
+/// Input for `life.view.node` — the READ-ONLY single-node detail surface
+/// (lifegraph-read-plane seam). Serves node detail (provenance envelope rides
+/// in the node's properties) plus its typed, non-retired edges to a device
+/// viz through the edge REST bridge.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LifeViewNodeInput {
+    /// Canonical node `id` property (not the Bolt internal id).
+    #[serde(default)]
+    pub id: String,
+    /// Maximum edges returned. Default 50, clamped to `1..=200`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_limit: Option<usize>,
+}
+
+impl LifeViewNodeInput {
+    pub fn effective_edge_limit(&self) -> usize {
+        self.edge_limit.unwrap_or(50).clamp(1, 200)
+    }
+}
+
+/// Input for `life.view.neighborhood` — the READ-ONLY bounded-expansion viz
+/// surface (lifegraph-read-plane seam). Expansion follows only living-cycle
+/// relationship types (caller `allowed_edge_types` intersect the whitelist —
+/// unknown types are never interpolated into Cypher).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LifeViewNeighborhoodInput {
+    /// Canonical node `id` property to expand from.
+    #[serde(default)]
+    pub id: String,
+    /// Expansion hops. Default 1, clamped to `1..=2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    /// Total node budget (origin included). Default 50, clamped to `1..=150`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nodes: Option<usize>,
+    /// Optional living-cycle edge-type allowlist; empty = all living-cycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_edge_types: Vec<String>,
+}
+
+impl LifeViewNeighborhoodInput {
+    pub fn effective_depth(&self) -> usize {
+        self.depth.unwrap_or(1).clamp(1, 2)
+    }
+
+    pub fn effective_max_nodes(&self) -> usize {
+        self.max_nodes.unwrap_or(50).clamp(1, 150)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", content = "input", rename_all = "snake_case")]
 pub enum LifeGraphToolRequest {
@@ -2090,6 +2140,32 @@ mod tests {
             adjudication_status: AdjudicationStatus::Pending,
             metadata: serde_json::json!({"role": "beacon"}),
         }
+    }
+
+    #[test]
+    fn life_view_inputs_default_and_clamp() {
+        // Lenient parse from empty parameters (dispatch-only surfaces never
+        // hard-error on shape).
+        let node: LifeViewNodeInput = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(node.id.is_empty());
+        assert_eq!(node.effective_edge_limit(), 50);
+        let node: LifeViewNodeInput =
+            serde_json::from_value(serde_json::json!({"id": "goal-1", "edge_limit": 9999}))
+                .unwrap();
+        assert_eq!(node.effective_edge_limit(), 200);
+
+        let hood: LifeViewNeighborhoodInput =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(hood.effective_depth(), 1);
+        assert_eq!(hood.effective_max_nodes(), 50);
+        let hood: LifeViewNeighborhoodInput = serde_json::from_value(serde_json::json!({
+            "id": "goal-1", "depth": 7, "max_nodes": 100000,
+            "allowed_edge_types": ["OWNS", "NOT_A_REAL_TYPE"]
+        }))
+        .unwrap();
+        assert_eq!(hood.effective_depth(), 2);
+        assert_eq!(hood.effective_max_nodes(), 150);
+        assert_eq!(hood.allowed_edge_types.len(), 2);
     }
 
     #[test]
