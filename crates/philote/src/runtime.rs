@@ -2391,6 +2391,9 @@ impl AgentRuntime {
                     final_reply_to: restored_reply_to,
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
+                    agent_id: Some(self.agent_id.clone()),
+                    oracle_pick: None,
+                    oracle_agreement: None,
                 };
                 let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
                     self.sessions.get(&session_id),
@@ -3128,6 +3131,9 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         if debug_model_requests_enabled()
@@ -3589,6 +3595,9 @@ impl AgentRuntime {
             final_reply_to: reentry.final_reply_to,
             final_reply_role: reentry.final_reply_role,
             final_reply_guest_id: reentry.final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
@@ -4290,6 +4299,9 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
@@ -4910,6 +4922,9 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
@@ -6738,10 +6753,14 @@ mod tests {
             final_reply_to: LOCAL_NODE.into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
+            agent_id: Some("jane".into()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         let json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(json["reply_role"], "agent");
+        assert_eq!(json["agent_id"], "jane");
         assert_eq!(json["final_reply_role"], "membrane");
         assert_eq!(json["request_class"], "cognitive");
         assert_eq!(json["response_route"], "text_only");

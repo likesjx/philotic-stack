@@ -192,6 +192,23 @@ pub struct ModelRequestPayload {
     pub final_reply_role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_reply_guest_id: Option<String>,
+    /// Persona/agent that owns this turn (e.g. `"jane"`). Threaded through so
+    /// the model-router's training-tap trace can record the real agent instead
+    /// of an empty string, enabling per-agent routing analysis. `None` only
+    /// for legacy/interop payloads that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Shadow-mode (`PHILOTIC_SHADOW_ORACLE`) annotation: the routing oracle's
+    /// top pick (`"role:provider"`) at dispatch time. `None` when shadow mode
+    /// is off. Log-only — the model-router persists it to the trace store; it
+    /// never influences routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_pick: Option<String>,
+    /// Shadow-mode annotation: whether the oracle's top pick agreed with the
+    /// ladder's resolved role. `None` when shadow mode is off or the oracle was
+    /// unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_agreement: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

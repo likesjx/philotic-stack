@@ -519,6 +519,9 @@ impl AgentRuntime {
             final_reply_to: local_node_id(),
             final_reply_role: "agent".into(),
             final_reply_guest_id: None,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         self.ipc_client
@@ -1906,6 +1909,9 @@ impl AgentRuntime {
                     final_reply_to,
                     final_reply_role,
                     final_reply_guest_id,
+                    agent_id: Some(self.agent_id.clone()),
+                    oracle_pick: None,
+                    oracle_agreement: None,
                 };
 
                 let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
@@ -1914,6 +1920,14 @@ impl AgentRuntime {
                     DEFAULT_TEXT_MODEL_ROLE,
                 );
                 model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
+
+                // Shadow-mode (PHILOTIC_SHADOW_ORACLE, default OFF): annotate the
+                // task with the oracle's top pick vs this ladder-resolved role.
+                // Log-only — the dispatch target below is unchanged. Zero cost
+                // when the flag is off (guarded inside `shadow_oracle_pick`).
+                let (shadow_pick, shadow_agreement) = self.shadow_oracle_pick(&target_role).await;
+                model_req.oracle_pick = shadow_pick;
+                model_req.oracle_agreement = shadow_agreement;
 
                 info!(
                     "Session [{}] re-entering model loop (iteration {})",
@@ -2048,6 +2062,9 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         if debug_model_requests_enabled() {
@@ -2069,6 +2086,13 @@ impl AgentRuntime {
             DEFAULT_TEXT_MODEL_ROLE,
         );
         model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
+
+        // Shadow-mode (PHILOTIC_SHADOW_ORACLE, default OFF): log-only oracle-vs-
+        // ladder annotation. Never alters the dispatch target. Zero cost when
+        // the flag is off (guarded inside `shadow_oracle_pick`).
+        let (shadow_pick, shadow_agreement) = self.shadow_oracle_pick(&target_role).await;
+        model_req.oracle_pick = shadow_pick;
+        model_req.oracle_agreement = shadow_agreement;
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
@@ -2467,6 +2491,9 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         info!(
@@ -2566,6 +2593,81 @@ impl AgentRuntime {
             "Routing oracle reroute: dispatching beneath exhausted ladder"
         );
         Some(role)
+    }
+
+    /// Shadow-mode (`PHILOTIC_SHADOW_ORACLE`, default OFF) oracle-vs-ladder
+    /// comparison for the healthy dispatch path (Model Oracle Primary
+    /// Authority, slice 1).
+    ///
+    /// Returns `(oracle_pick, agreement)` to stamp onto the outgoing model task
+    /// so the model-router's trace store can persist whether the oracle's top
+    /// pick over the FULL healthy provider set matched `resolved_role` (the
+    /// role the ladder actually chose). This is **strictly log-only** — callers
+    /// never change their dispatch target based on the result.
+    ///
+    /// Invariants:
+    /// - When the flag is OFF this does ZERO work (no IPC, no allocation) and
+    ///   returns `(None, None)` before touching `ipc_client`.
+    /// - The query uses an EMPTY `exclude_providers` so the hotel ranks the
+    ///   full healthy set AND takes the pure read path in
+    ///   `handle_query_model_route` (the heal-queue reroute write is gated on a
+    ///   non-empty exclude list, so shadow queries have no side effects).
+    /// - On any oracle error / non-success / empty ranking it returns
+    ///   `(None, None)` (divergence-unknown) and never fails the turn.
+    async fn shadow_oracle_pick(&mut self, resolved_role: &str) -> (Option<String>, Option<bool>) {
+        if !ansible_mesh_core::model_oracle::shadow_oracle_enabled() {
+            return (None, None);
+        }
+
+        let resp = self
+            .ipc_client
+            .send_request(IpcRequest::QueryModelRoute {
+                request_class: "cognitive".to_string(),
+                needs_tools: true,
+                needs_structured: true,
+                approx_context_tokens: 0,
+                latency_class: "interactive".to_string(),
+                trust_ceiling: "remote_cloud".to_string(),
+                // Empty exclude → rank the full healthy set AND keep the hotel
+                // handler on its read-only path (no reroute heal-queue write).
+                exclude_providers: Vec::new(),
+            })
+            .await;
+
+        // Reuse `pick_oracle_role` with an empty tried-set so it yields the
+        // oracle's unconditional top-ranked entry.
+        let top = match resp {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => pick_oracle_role(&data, &std::collections::HashSet::new()),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("shadow-oracle query failed (divergence-unknown): {e}");
+                None
+            }
+        };
+
+        let (pick, agreement) = ansible_mesh_core::model_oracle::shadow_oracle_agreement(
+            top.as_ref().map(|(r, p)| (r.as_str(), p.as_str())),
+            resolved_role,
+        );
+
+        match agreement {
+            Some(agree) => info!(
+                resolved_role = %resolved_role,
+                oracle_pick = %pick.as_deref().unwrap_or("?"),
+                agreement = agree,
+                "shadow-oracle: oracle-vs-ladder agreement (log-only)"
+            ),
+            None => info!(
+                resolved_role = %resolved_role,
+                "shadow-oracle: oracle pick unavailable (divergence-unknown)"
+            ),
+        }
+
+        (pick, agreement)
     }
 
     pub(super) async fn complete_agent_response(

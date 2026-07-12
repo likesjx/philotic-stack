@@ -50,6 +50,17 @@ pub struct RouterTrainingRecord {
     /// Total tokens consumed (prompt + completion), if reported by the provider.
     #[serde(default)]
     pub token_count: Option<u64>,
+    /// Shadow-mode (`PHILOTIC_SHADOW_ORACLE`): the routing oracle's top-ranked
+    /// pick at dispatch time (`"role:provider"`), for oracle-vs-ladder
+    /// agreement analysis. `None` when shadow mode was off or the oracle was
+    /// unavailable. Log-only — never influenced the actual routing decision.
+    #[serde(default)]
+    pub oracle_pick: Option<String>,
+    /// Shadow-mode: whether the oracle's top pick agreed with the ladder's
+    /// resolved role. `None` when shadow mode was off or the oracle was
+    /// unavailable (divergence-unknown).
+    #[serde(default)]
+    pub oracle_agreement: Option<bool>,
     /// Unix epoch (seconds) when the routing call was made.
     pub timestamp: u64,
 }
@@ -143,6 +154,8 @@ impl SqliteRouterTraceStorage {
                 failure_code TEXT,
                 latency_ms   INTEGER,
                 token_count  INTEGER,
+                oracle_pick      TEXT,
+                oracle_agreement INTEGER,
                 timestamp    INTEGER NOT NULL
             );
 
@@ -158,9 +171,17 @@ impl SqliteRouterTraceStorage {
             COMMIT;
             ",
         )?;
-        // Idempotent migration for existing databases.
+        // Idempotent migrations for existing databases. Each ADD COLUMN is
+        // guarded — SQLite errors with "duplicate column name" when the column
+        // already exists, which we intentionally ignore so old DBs upgrade in
+        // place and existing rows stay valid (new columns default to NULL).
         let _ = conn.execute(
             "ALTER TABLE router_traces ADD COLUMN token_count INTEGER",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE router_traces ADD COLUMN oracle_pick TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE router_traces ADD COLUMN oracle_agreement INTEGER",
             [],
         );
         Ok(())
@@ -173,8 +194,9 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         conn.execute(
             "INSERT OR IGNORE INTO router_traces
              (trace_id, agent_id, session_id, turn_id, provider_id, model_id,
-              task_kind, outcome, failure_code, latency_ms, token_count, timestamp)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+              task_kind, outcome, failure_code, latency_ms, token_count,
+              oracle_pick, oracle_agreement, timestamp)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 r.trace_id,
                 r.agent_id,
@@ -187,6 +209,8 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
                 r.failure_code,
                 r.latency_ms.map(|v| v as i64),
                 r.token_count.map(|v| v as i64),
+                r.oracle_pick,
+                r.oracle_agreement.map(|b| b as i64),
                 r.timestamp as i64,
             ],
         )?;
@@ -197,7 +221,8 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT trace_id, agent_id, session_id, turn_id, provider_id, model_id,
-                    task_kind, outcome, failure_code, latency_ms, token_count, timestamp
+                    task_kind, outcome, failure_code, latency_ms, token_count,
+                    oracle_pick, oracle_agreement, timestamp
              FROM router_traces ORDER BY timestamp DESC LIMIT ?1",
         )?;
         collect_records(&mut stmt, params![limit as i64])
@@ -211,7 +236,8 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT trace_id, agent_id, session_id, turn_id, provider_id, model_id,
-                    task_kind, outcome, failure_code, latency_ms, token_count, timestamp
+                    task_kind, outcome, failure_code, latency_ms, token_count,
+                    oracle_pick, oracle_agreement, timestamp
              FROM router_traces WHERE agent_id = ?1
              ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -226,7 +252,8 @@ impl RouterTraceStorage for SqliteRouterTraceStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT trace_id, agent_id, session_id, turn_id, provider_id, model_id,
-                    task_kind, outcome, failure_code, latency_ms, token_count, timestamp
+                    task_kind, outcome, failure_code, latency_ms, token_count,
+                    oracle_pick, oracle_agreement, timestamp
              FROM router_traces WHERE provider_id = ?1
              ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -349,7 +376,9 @@ fn collect_records(
             failure_code: row.get(8)?,
             latency_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
             token_count: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-            timestamp: row.get::<_, i64>(11)? as u64,
+            oracle_pick: row.get::<_, Option<String>>(11)?,
+            oracle_agreement: row.get::<_, Option<i64>>(12)?.map(|v| v != 0),
+            timestamp: row.get::<_, i64>(13)? as u64,
         })
     })?;
     let mut records = Vec::new();
@@ -387,6 +416,8 @@ mod tests {
             failure_code: None,
             latency_ms: Some(n * 100),
             token_count: None,
+            oracle_pick: None,
+            oracle_agreement: None,
             timestamp: 1_000_000 + n,
         }
     }
@@ -528,6 +559,94 @@ mod tests {
         let gemini = stats.iter().find(|r| r.provider_id == "gemini").unwrap();
         assert_eq!(gemini.total_calls, 1);
         assert_eq!(gemini.success_count, 0);
+    }
+
+    #[test]
+    fn oracle_shadow_fields_round_trip_and_default_null() {
+        let (s, _f) = open_tmp();
+        // Default (shadow off) path records NULLs.
+        s.record_trace(&make_record(1, "gemini", "aria", "success"))
+            .unwrap();
+        // Shadow-on path records a pick + agreement.
+        let mut r = make_record(2, "gemini", "aria", "success");
+        r.oracle_pick = Some("model.openrouter:openrouter".into());
+        r.oracle_agreement = Some(false);
+        s.record_trace(&r).unwrap();
+
+        let traces = s.list_traces(10).unwrap();
+        let shadow = traces.iter().find(|t| t.trace_id == "trace-0002").unwrap();
+        assert_eq!(
+            shadow.oracle_pick.as_deref(),
+            Some("model.openrouter:openrouter")
+        );
+        assert_eq!(shadow.oracle_agreement, Some(false));
+
+        let off = traces.iter().find(|t| t.trace_id == "trace-0001").unwrap();
+        assert_eq!(off.oracle_pick, None);
+        assert_eq!(off.oracle_agreement, None);
+    }
+
+    #[test]
+    fn migration_adds_oracle_columns_to_old_db_and_preserves_rows() {
+        let f = NamedTempFile::new().unwrap();
+        // Simulate a deployed hotel's pre-shadow DB: the router_traces table
+        // exists WITHOUT the oracle_pick / oracle_agreement columns, with one
+        // legacy row already stored.
+        {
+            let conn = Connection::open(f.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE router_traces (
+                    trace_id     TEXT PRIMARY KEY,
+                    agent_id     TEXT NOT NULL,
+                    session_id   TEXT NOT NULL DEFAULT '',
+                    turn_id      TEXT NOT NULL DEFAULT '',
+                    provider_id  TEXT NOT NULL,
+                    model_id     TEXT,
+                    task_kind    TEXT NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    failure_code TEXT,
+                    latency_ms   INTEGER,
+                    token_count  INTEGER,
+                    timestamp    INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO router_traces
+                 (trace_id, agent_id, session_id, turn_id, provider_id, model_id,
+                  task_kind, outcome, latency_ms, timestamp)
+                 VALUES ('legacy-1','jane','s0','t0','gemini','gemini-2.0-flash',
+                         'text.generate','success',123,1000)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening via the store must migrate the schema in place without error.
+        let s = SqliteRouterTraceStorage::open(f.path()).unwrap();
+
+        // The legacy row survives and reads back with NULL oracle fields.
+        let traces = s.list_traces(10).unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].trace_id, "legacy-1");
+        assert_eq!(traces[0].agent_id, "jane");
+        assert_eq!(traces[0].oracle_pick, None);
+        assert_eq!(traces[0].oracle_agreement, None);
+
+        // The migrated DB accepts new rows carrying the shadow fields.
+        let mut r = make_record(2, "gemini", "jane", "success");
+        r.oracle_pick = Some("model:gemini".into());
+        r.oracle_agreement = Some(true);
+        s.record_trace(&r).unwrap();
+        let after = s.list_traces(10).unwrap();
+        let migrated = after.iter().find(|t| t.trace_id == "trace-0002").unwrap();
+        assert_eq!(migrated.oracle_pick.as_deref(), Some("model:gemini"));
+        assert_eq!(migrated.oracle_agreement, Some(true));
+
+        // Re-opening runs the guarded migration again; the duplicate-column
+        // errors must be swallowed so this does not panic.
+        let s2 = SqliteRouterTraceStorage::open(f.path()).unwrap();
+        assert_eq!(s2.list_traces(10).unwrap().len(), 2);
     }
 
     #[test]

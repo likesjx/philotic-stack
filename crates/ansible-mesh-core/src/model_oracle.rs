@@ -73,6 +73,49 @@ pub fn routing_oracle_disabled() -> bool {
     )
 }
 
+/// Opt-in switch: `PHILOTIC_SHADOW_ORACLE=1` enables **log-only** shadow-mode
+/// comparison of the routing oracle's top pick against the ladder's resolved
+/// role on the healthy dispatch path (Model Oracle Primary Authority, slice 1).
+///
+/// Default OFF. When off, callers must do **zero** extra work — no oracle IPC,
+/// no allocation — so this is checked first on the hot path. Turning it on
+/// NEVER changes the routing decision; it only annotates the outgoing model
+/// task so the trace writer can persist agreement data.
+pub fn shadow_oracle_enabled() -> bool {
+    matches!(
+        std::env::var("PHILOTIC_SHADOW_ORACLE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// Pure agreement computation for shadow-mode oracle logging.
+///
+/// `oracle_top` is the oracle's top-ranked `(role, provider)` pick, or `None`
+/// when the oracle query failed / returned nothing (divergence-unknown).
+/// `resolved_role` is the role the ladder actually chose for this dispatch.
+///
+/// Returns `(oracle_pick, agreement)`:
+/// - `oracle_pick` is a self-describing `"role:provider"` string, or `None`
+///   when the oracle pick was unavailable.
+/// - `agreement` is `Some(true)` when the oracle's top role matches the
+///   resolved ladder role, `Some(false)` when it diverges, and `None` when the
+///   oracle pick was unavailable.
+///
+/// Pure and IPC-free so the agree / diverge / unavailable cases are unit
+/// testable without a running hotel.
+pub fn shadow_oracle_agreement(
+    oracle_top: Option<(&str, &str)>,
+    resolved_role: &str,
+) -> (Option<String>, Option<bool>) {
+    match oracle_top {
+        Some((role, provider)) => (
+            Some(format!("{role}:{provider}")),
+            Some(role == resolved_role),
+        ),
+        None => (None, None),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Route need
 // ─────────────────────────────────────────────────────────────────────────────
@@ -353,6 +396,28 @@ pub fn apply_model_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_oracle_agreement_agree() {
+        let (pick, agree) = shadow_oracle_agreement(Some(("model", "gemini")), "model");
+        assert_eq!(pick.as_deref(), Some("model:gemini"));
+        assert_eq!(agree, Some(true));
+    }
+
+    #[test]
+    fn shadow_oracle_agreement_diverge() {
+        let (pick, agree) =
+            shadow_oracle_agreement(Some(("model.openrouter", "openrouter")), "model");
+        assert_eq!(pick.as_deref(), Some("model.openrouter:openrouter"));
+        assert_eq!(agree, Some(false));
+    }
+
+    #[test]
+    fn shadow_oracle_agreement_unavailable_is_divergence_unknown() {
+        let (pick, agree) = shadow_oracle_agreement(None, "model");
+        assert_eq!(pick, None);
+        assert_eq!(agree, None);
+    }
 
     fn profile(provider: &str) -> ModelProfileRecord {
         ModelProfileRecord {
