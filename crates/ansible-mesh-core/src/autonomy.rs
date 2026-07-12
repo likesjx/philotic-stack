@@ -29,16 +29,20 @@ pub const LANE_WORK_FILE_PROPOSALS: &str = "work.file_proposals";
 pub const LANE_STEWARD_ACTIVE_CHECKINS: &str = "steward.active_checkins";
 /// Known lane: scheduled sessions execute SVE slices end-to-end (Loop 5).
 pub const LANE_WORK_EXECUTE_SLICES: &str = "work.execute_slices";
+/// Known lane: nightly Muninn contradiction/staleness sweep files aggregated
+/// annotation-only findings (Memory Transparency Slice M4).
+pub const LANE_MEMORY_HYGIENE: &str = "memory.hygiene";
 
 /// All lanes named by the Autopoiesis proposal. Lanes are open vocabulary —
 /// this list exists for enumeration (dashboards, kill-switch sweeps), not as a
 /// closed set.
-pub const KNOWN_LANES: [&str; 5] = [
+pub const KNOWN_LANES: [&str; 6] = [
     LANE_GRAPH_BRIDGE_EDGES,
     LANE_FLEET_HEAL_SLICES,
     LANE_WORK_FILE_PROPOSALS,
     LANE_STEWARD_ACTIVE_CHECKINS,
     LANE_WORK_EXECUTE_SLICES,
+    LANE_MEMORY_HYGIENE,
 ];
 
 /// Prefix for the per-lane env kill switch.
@@ -627,6 +631,10 @@ mod tests {
             (
                 LANE_WORK_EXECUTE_SLICES,
                 "PHILOTIC_AUTONOMY_DISABLE_WORK_EXECUTE_SLICES",
+            ),
+            (
+                LANE_MEMORY_HYGIENE,
+                "PHILOTIC_AUTONOMY_DISABLE_MEMORY_HYGIENE",
             ),
         ];
         assert_eq!(expected.len(), KNOWN_LANES.len());

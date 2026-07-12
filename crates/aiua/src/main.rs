@@ -38,6 +38,7 @@ mod auth;
 mod dream;
 mod graph;
 mod memory;
+mod memory_hygiene;
 mod mesh;
 mod muninn_provision;
 mod vault;
@@ -7522,6 +7523,19 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Memory Transparency Slice M4 (`memory.hygiene`): idempotent, operator
+    // opt-in registration of the nightly Muninn contradiction/staleness
+    // sweep cron job. No-op unless PHILOTIC_MEMORY_HYGIENE_ENABLED is set
+    // for this hotel process; never overwrites an operator-edited schedule.
+    if let Err(e) = memory_hygiene::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+        |k| std::env::var(k).ok(),
+    ) {
+        warn!(error = %e, "memory.hygiene: failed to ensure nightly sweep cron job");
+    }
+
     if smoke_mode {
         warn!(
             "PHILOTIC_SMOKE_MODE enabled: starting local-only IPC runtime without mesh or guest materialization."
@@ -7987,6 +8001,10 @@ async fn main() -> Result<()> {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
             * 1000;
+        let intel_graph_url = std::env::var("PHILOTIC_INTEL_GRAPH_URL")
+            .ok()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty());
         let cron_ticker = CronTicker::new(
             graph_domain_arc.clone(),
             dispatcher_tx.clone(),
@@ -7996,6 +8014,15 @@ async fn main() -> Result<()> {
             ipc_parked_inbound.clone(),
             ipc_materialization_requester.clone(),
             ipc_delivery_claims.clone(),
+        )
+        .with_memory_hygiene(
+            muninn_config_arc.clone(),
+            hotel_name.clone(),
+            intel_graph_url,
+            // Local-hotel opt-in, re-checked at fire time (not just at
+            // registration): CronJobSync replicates the job definition to
+            // every mesh peer regardless of that peer's own opt-in.
+            memory_hygiene::sweep_enabled(|k| std::env::var(k).ok()),
         );
         tokio::spawn(async move {
             cron_ticker.run().await;
@@ -9682,7 +9709,10 @@ mod tests {
             .expect("get role incarnation")
             .expect("role exists");
         assert_eq!(
-            seeded.turn_loop_config.model_bindings.get("model.openrouter"),
+            seeded
+                .turn_loop_config
+                .model_bindings
+                .get("model.openrouter"),
             Some(&"z-ai/glm-5.2".to_string())
         );
 
@@ -9706,8 +9736,7 @@ mod tests {
             "model_bindings must survive a reseed where mesh-config doesn't specify turn_loop_config"
         );
         assert_eq!(
-            reseeded.turn_loop_config.fallback_tiers,
-            jane_turn_loop_config.fallback_tiers,
+            reseeded.turn_loop_config.fallback_tiers, jane_turn_loop_config.fallback_tiers,
             "fallback_tiers must survive the same reseed"
         );
     }

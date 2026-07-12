@@ -3,7 +3,7 @@ title: Memory Transparency — One Provenance Envelope, One Explain Surface
 doc_type: proposal
 domain: memory-context
 status: active
-disposition: proposed
+disposition: accepted for current slice
 last_updated: 2026-07-11
 tags:
 - memory
@@ -69,7 +69,7 @@ ProvenanceEnvelope {
 | M1 `provenance-envelope` | Define the envelope as a shared type (ansible-mesh-core), adopt it on all three write paths: Muninn writes map their existing fields onto it; intel-graph decision records gain the missing fields (evidence pointer, reversal path); LifeGraph mutations (life.observe, patches, steward writes) attach it. Cross-plane promotions (seam:lifegraph-muninn-promotion) carry the envelope through so lineage survives the hop. | M–L | test-green + one memory traced across a Muninn→LifeGraph promotion with intact lineage |
 | M2 `explain-surface` | One query — "why do you believe X?" — that fans out to muninn_explain + intel-graph decision trail + LifeGraph evidence and returns a merged provenance chain, separating confirmed facts / seeded placeholders / inferred intent (the lifegraph-truth-summarizer skill's vocabulary, promoted from agent instructions to a runtime tool any philote or the operator can invoke). Exposed via IPC tool + `phil memory explain`. | M | test-green + live query on a real belief returns all three planes' evidence |
 | M3 `memory-delta-digest` | Extend the architect-charter morning dev-brief: what the fleet remembered, evolved, forgot, and found contradictory yesterday — each line linking to its envelope, each reversible from the digest. This is the operator's window on the system's changing mind; without it, transparency exists but is never looked at. | S–M | watched-live (first digest reviewed by operator; one item reversed from it) |
-| M4 `memory.hygiene` lane | Nightly per-hotel consolidation cadence: muninn_consolidate, contradiction sweep (muninn_contradictions), staleness annotation, graph_memory_true_up. Findings that need judgment file proposals (the autopoiesis A3 filing pattern pointed at memory instead of guests). Runs as an AutonomyGrant lane: ProposalOnly for anything destructive, AutoWithAudit only ever for annotation/flagging. Learning is not just accumulation — nothing currently prunes. | M | smoke-green (seeded contradiction is swept, annotated, and filed) + first live nightly cycle audited |
+| M4 `memory.hygiene` lane | **First slice landed** (`codex/memory-m4-hygiene-lane`): nightly per-hotel sweep — `GET /api/contradictions` and an age-based staleness proxy (`GET /api/engrams?sort=created&before=...`; MuninnDB's public REST has no `last_accessed` field, so this is `created_at` age, not true access recency — see the module doc in `crates/aiua/src/memory_hygiene.rs`). Findings crossing threshold file ONE aggregated `autonomy_audit` record on the `memory.hygiene` lane (annotation only — no `forget`/`consolidate` call); every run, filed or clean, also gets a lightweight per-run marker (hotel-scoped config value, not budget-gated) so "what was scanned" stays visible even on clean nights. Scoped out of this slice: `muninn_consolidate` (destructive by definition — excluded from M4's non-destructive contract on purpose) and `graph_memory_true_up` (MCP-only on the graph-intelligence server, logic lives in the `philote` guest — not callable in-process from `aiua`). Registered as a `CronJob` whose fire is intercepted by `CronTicker` before guest delivery; opt-in per hotel via `PHILOTIC_MEMORY_HYGIENE_ENABLED`, re-checked at fire time (not just registration) because mesh `CronJobSync` replicates job *definitions* to every peer hotel unconditionally — without the fire-time re-check, one hotel's opt-in would silently sweep every mesh-connected peer. Filing itself additionally gated by the lane's `AutonomyGrant` kill switch/budget (`PHILOTIC_AUTONOMY_DISABLE_MEMORY_HYGIENE`). | M | test-green (25 new unit tests: threshold/aggregation logic, lane filing/kill-switch/budget, per-run marker, idempotent cron registration, mesh-replication-does-not-leak-execution regression; `ansible-mesh-core`'s existing lane-enumeration tests extended to cover the new lane) — no live nightly cycle audited yet |
 
 Dependency: M1 → {M2, M3}; M4 independent of M1 (uses existing Muninn
 primitives) but its filings get richer once M1 lands. M3 rides the existing
@@ -90,5 +90,9 @@ architect-charter cron (autopoiesis A4). The LifeGraph retrieval lane's Slice 4
 
 ## Disposition
 
-`proposed` — authored 2026-07-11 from the autopoiesis roadmap assessment.
-M4 (hygiene lane) and M1 (envelope) can start immediately and in parallel.
+`accepted for current slice` — authored 2026-07-11 from the autopoiesis
+roadmap assessment. M4's first slice (contradiction + age-based staleness
+sweep, aggregated annotation-only filing, opt-in nightly cron) landed
+2026-07-11 on `codex/memory-m4-hygiene-lane`; see the M4 row above for what
+shipped and what was scoped out. M1 (envelope) has not started; M4's filings
+stay evidence-light until it lands, per the dependency note above.

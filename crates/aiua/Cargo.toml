@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 aes-gcm = "0.10"
 async-trait = "0.1"
+chrono = { version = "0.4", features = ["clock"] }
 ansible-mesh-core = { path = "../ansible-mesh-core" }
 perimeter-core = { path = "../perimeter-core" }
 memory-core = { path = "../memory-core" }
