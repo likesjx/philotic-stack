@@ -24,6 +24,7 @@ pub mod materializer;
 pub mod mcp_endpoint;
 pub mod mcp_route;
 pub mod membership;
+pub mod memory_explain;
 pub mod meshops;
 pub mod model_catalog_discovery;
 pub mod model_manager;

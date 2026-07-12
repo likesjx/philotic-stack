@@ -25,6 +25,7 @@ media-prep = { path = "../media-prep" }
 memory-core = { path = "../memory-core" }
 clap = { version = "4.5", features = ["derive"] }
 philotic-client = { path = "../philotic-client" }
+reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "time", "process"] }

@@ -3380,6 +3380,7 @@ dependencies = [
  "media-prep",
  "memory-core",
  "philotic-client",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
