@@ -77,6 +77,32 @@ outage generation).
 `proposed` — authored 2026-07-11 from the autopoiesis roadmap assessment.
 S1 is the single highest-leverage item and should be the first slice claimed.
 
+### Slice status
+
+- **S1** `supervision-invariant` — not started.
+- **S2** `heal-the-healer` — landed 2026-07-11 (`codex/substrate-s2-heal-the-healer`):
+  `GuestManager::check_heal_dispatcher_heartbeat` watchdog closes the loop
+  doctor's `heal.dispatcher-staleness` check only displayed (stale heartbeat
+  on a PID-alive dispatcher → heal-restart through the shared `RespawnBudget`
+  / existing throttled escalation, never a parallel budget); `phil doctor`
+  gained `supervision.not-supervised` (the small S1 leftover). Root-cause
+  pass on the mbp-jane "recurring-restart instability": it was a
+  **misdiagnosis at the guest level** — mbp-jane's `aiua.err.log` shows
+  ~9.6k `Error: Hotel 'mbp-jane' is already running with PID <N>` collisions
+  from a still-unidentified duplicate launcher (no crontab, no matching
+  `launchctl` job — consistent with S1 finding mbp-jane unsupervised), not
+  the dispatcher crash-looping independently; every collision attempt
+  re-logs the full guest roster (including heal-dispatcher) before the PID
+  guard bails, which reads as dispatcher churn from outside. Tracked as
+  DEF-046 (open) — needs S1 (launchd supervision) plus identifying what
+  issues the duplicate launches. Verified: test-green (targeted unit +
+  integration tests); no watched-live-green this slice (no live hotel to
+  induce a real hang against).
+- **S3** `verification-as-data` — landed (PR #248,
+  `codex/substrate-s3-verification-data`, merged to develop).
+- **S4** `chaos-smokes` — not started; blocked on S1/S2 per the stated
+  dependency.
+
 **S3 `verification-as-data`** — implemented 2026-07-11 (codex/substrate-s3-verification-data).
 `just test` now runs `scripts/test-and-record.sh`, which POSTs pass/fail/duration to
 `/api/test-run` whenever the graph server at :8900 is reachable (one-line notice, not a

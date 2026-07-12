@@ -359,6 +359,7 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
     vec![
         Box::new(PortsHotelRecordDrift),
         Box::new(ProcOrphanInstances),
+        Box::new(SupervisionInvariant),
         Box::new(IpcStaleSocket),
         Box::new(VaultKeySourceDivergence),
         Box::new(LogsRotationMissing),
@@ -675,6 +676,126 @@ impl Check for ProcOrphanInstances {
                    operator must confirm the exact pid list before signaling"
                 .to_string(),
         })
+    }
+}
+
+// ── supervision.not-supervised ───────────────────────────────────────────
+//
+// SUBSTRATE_HARDENING_PROPOSAL Standing Rule 1: "a hotel process not under
+// launchd/systemd KeepAlive is a defect, not a deployment style. Doctor
+// flags it." S1 moved mbp-jane from nohup to launchd; this is the small S1
+// leftover the S2 slice picks up — a read-only check that would have caught
+// that gap directly instead of relying on an operator noticing a downed
+// hotel.
+//
+// Detection is deliberately conservative/heuristic (see `hotel_is_supervised`
+// per-platform doc comments): an ambiguous read degrades to a soft Info note,
+// never a false "supervised" green — matching the self-heal-observability
+// checks' "fail toward a finding" rule just above.
+
+/// Best-effort "is this pid running under a real process supervisor?" probe.
+/// `None` means "couldn't tell" (unsupported platform, unreadable process
+/// state) — the caller must treat that as a soft note, not a clean bill of
+/// health.
+#[cfg(target_os = "macos")]
+fn hotel_is_supervised(hotel: &str, active_pid: u32) -> Option<bool> {
+    // Mirrors `proc.orphan-instances`: launchd is supervising this hotel iff
+    // the pid `launchctl print <target>` reports for the hotel's own Label
+    // is the SAME pid the hotel recorded as `hotels.active_pid`. A bare
+    // `nohup`/manual-start process shares neither the Label nor the pid.
+    Some(launchd_pid(hotel) == Some(active_pid))
+}
+
+#[cfg(target_os = "linux")]
+fn hotel_is_supervised(_hotel: &str, active_pid: u32) -> Option<bool> {
+    // systemd (since v232) stamps `INVOCATION_ID` into the environment of
+    // every process a unit starts; a directly-invoked process (nohup, a
+    // bare shell) never has it. Documented caveat: this is a per-process
+    // environment heuristic, not a `systemctl`/dbus query — a unit that
+    // deliberately scrubs its own environment would false-negative here,
+    // and an unreadable `/proc/<pid>/environ` (permissions, pid raced away)
+    // degrades to "unknown" rather than a guess in either direction.
+    let environ_path = format!("/proc/{active_pid}/environ");
+    match std::fs::read(&environ_path) {
+        Ok(bytes) => Some(
+            bytes
+                .split(|&b| b == 0)
+                .any(|field| field.starts_with(b"INVOCATION_ID=")),
+        ),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn hotel_is_supervised(_hotel: &str, _active_pid: u32) -> Option<bool> {
+    None
+}
+
+fn evaluate_supervision(
+    check_id: &'static str,
+    hotel: &str,
+    active_pid: Option<u32>,
+    supervised: Option<bool>,
+) -> Vec<Finding> {
+    let Some(pid) = active_pid else {
+        // Hotel isn't running at all — nothing to supervise; that's a
+        // different failure mode than "running unsupervised" and other
+        // checks (e.g. proc.orphan-instances) already cover liveness.
+        return Vec::new();
+    };
+
+    match supervised {
+        Some(true) => Vec::new(),
+        Some(false) => vec![Finding {
+            check_id: check_id.to_string(),
+            severity: Severity::Warning,
+            message: format!(
+                "hotel '{hotel}' (pid {pid}) does not appear to be running under a process \
+                 supervisor (launchd/systemd) — supervision invariant defect \
+                 (SUBSTRATE_HARDENING_PROPOSAL Standing Rule 1): if this process dies, nothing \
+                 restarts it"
+            ),
+            evidence: json!({"hotel": hotel, "active_pid": pid, "supervised": false}),
+            fix_hint: "install the hotel under launchd (`phil service install --hotel <name>`) \
+                       or the equivalent systemd unit, then restart the hotel so it starts \
+                       under the supervisor instead of a bare/nohup process"
+                .to_string(),
+            auto_repairable: false,
+        }],
+        None => vec![Finding {
+            check_id: check_id.to_string(),
+            severity: Severity::Info,
+            message: format!(
+                "could not determine whether hotel '{hotel}' (pid {pid}) is running under a \
+                 supervisor — detection is heuristic/platform-limited; not treated as a defect"
+            ),
+            evidence: json!({"hotel": hotel, "active_pid": pid, "supervised": null}),
+            fix_hint: "verify supervision manually: `launchctl print <target>` (macOS) or \
+                       `systemctl status <unit>` / `loginctl` (Linux)"
+                .to_string(),
+            auto_repairable: false,
+        }],
+    }
+}
+
+struct SupervisionInvariant;
+
+impl Check for SupervisionInvariant {
+    fn id(&self) -> &'static str {
+        "supervision.not-supervised"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "hotels")? {
+            return Ok(findings);
+        }
+        let active_pid = hotel_active_pid(&ctx.conn, &ctx.hotel)?;
+        let supervised = active_pid.and_then(|pid| hotel_is_supervised(&ctx.hotel, pid));
+        Ok(evaluate_supervision(self.id(), &ctx.hotel, active_pid, supervised))
     }
 }
 
@@ -2904,6 +3025,75 @@ mod tests {
             .map(|(pid, _)| *pid)
             .collect();
         assert_eq!(surviving, vec![100, 300]);
+    }
+
+    // ── supervision.not-supervised ────────────────────────────────────────
+
+    #[test]
+    fn supervision_hotel_not_running_is_clean() {
+        // Nothing to supervise if the hotel isn't running at all — that's a
+        // liveness question for a different check, not a supervision defect.
+        let findings = evaluate_supervision("supervision.not-supervised", "jane", None, None);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn supervision_confirmed_supervised_is_clean() {
+        let findings =
+            evaluate_supervision("supervision.not-supervised", "jane", Some(100), Some(true));
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn supervision_confirmed_unsupervised_is_warning() {
+        let findings =
+            evaluate_supervision("supervision.not-supervised", "jane", Some(100), Some(false));
+        assert!(only(&[Severity::Warning], &findings));
+        assert_eq!(findings[0].evidence["supervised"], json!(false));
+        assert!(findings[0].message.contains("jane"));
+    }
+
+    // Ambiguous detection (unsupported platform, unreadable process state)
+    // must degrade to a soft Info note — never a silent "supervised" green
+    // AND never a false-alarm Warning on data doctor couldn't actually read.
+    #[test]
+    fn supervision_unknown_is_soft_info_not_a_failure() {
+        let findings =
+            evaluate_supervision("supervision.not-supervised", "jane", Some(100), None);
+        assert!(only(&[Severity::Info], &findings));
+        assert!(
+            findings[0].severity < Severity::Warning,
+            "ambiguous detection must not read as a defect"
+        );
+    }
+
+    // Detect-level, real fixture DB: the doctor process itself is running as
+    // this very test's pid, which is under neither launchd nor a systemd
+    // unit on any CI/dev box — so a real hotel row pointed at our own pid
+    // must fire the Warning, proving detect() wires the real platform probe
+    // through end-to-end (not just the pure evaluator above).
+    #[test]
+    fn supervision_detect_flags_the_test_processs_own_unsupervised_pid() {
+        let (_dir, path) = fixture_db();
+        let pid = std::process::id().to_string();
+        {
+            let conn = Connection::open(&path).expect("open writable");
+            insert_hotel(&conn, "jane", 1, 2, 3, Some(&pid));
+        }
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let findings = SupervisionInvariant.detect(&ctx).expect("detect");
+        assert!(only(&[Severity::Warning], &findings), "{:?}", findings);
+    }
+
+    #[test]
+    fn supervision_check_on_db_missing_hotels_table_skips_gracefully() {
+        let (_dir, path) = bare_db_missing_expected_tables();
+        let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
+        let findings = SupervisionInvariant
+            .detect(&ctx)
+            .expect("detect must not hard-error on a missing table");
+        assert!(only(&[Severity::Warning], &findings), "{:?}", findings);
+        assert!(findings[0].message.contains("hotels"));
     }
 
     // ── ipc.stale-socket ─────────────────────────────────────────────────
