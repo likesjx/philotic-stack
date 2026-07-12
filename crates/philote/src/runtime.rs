@@ -479,6 +479,41 @@ fn recent_low_progress_tool_run(turn: &WorkingTurn) -> usize {
         .count()
 }
 
+/// Absolute ceiling on the effective iteration cap — the same ceiling the
+/// plan-scaled cap enforces (`turn_loop.rs` plan handling). The earned-streak
+/// extension can never push a turn past this.
+const STREAK_CAP_CEILING: u32 = 50;
+
+/// Effective iteration cap for a turn: the configured (possibly plan-scaled)
+/// cap plus iterations earned by the turn's productive streak, bounded by
+/// [`STREAK_CAP_CEILING`]. A configured cap already at or above the ceiling
+/// is honoured unchanged — the extension only ever adds, never shrinks.
+fn effective_iteration_cap(configured_cap: u32, turn: &WorkingTurn) -> u32 {
+    configured_cap
+        .saturating_add(turn.streak_extension)
+        .min(STREAK_CAP_CEILING.max(configured_cap))
+}
+
+/// True when a completed tool step earns the turn one extra iteration
+/// (cognitive-loop-streak-extension seam): the step succeeded, was not a
+/// diagnostic/status call, was not a skipped duplicate, and is NOVEL — no
+/// prior call this turn used the same tool with the same arguments. Judged
+/// against the history BEFORE the step is pushed onto it.
+fn tool_step_earns_streak(
+    turn: &WorkingTurn,
+    call: &ToolCall,
+    result: &ToolResult,
+    step_failed: bool,
+) -> bool {
+    if step_failed || low_progress_tool_name(&call.tool_name) || duplicate_tool_skip(result) {
+        return false;
+    }
+    !turn
+        .working_tool_history
+        .iter()
+        .any(|(prior, _)| prior.tool_name == call.tool_name && prior.arguments == call.arguments)
+}
+
 fn loop_stop_reason(turn: &WorkingTurn, iteration_cap: u32) -> Option<&'static str> {
     let recent_low_progress = recent_low_progress_tool_run(turn);
     if turn.iteration >= 4 && recent_low_progress >= 4 {
@@ -2625,6 +2660,7 @@ impl AgentRuntime {
                 recalled_memories: Vec::new(),
                 active_plan: seeded_plan,
                 consecutive_step_failures: 0,
+                streak_extension: 0,
                 provider_repair_note: None,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
@@ -5225,7 +5261,8 @@ impl AgentRuntime {
                     tiers.retain(|t| t != &tier);
                     tiers.insert(0, tier.clone());
                     if let Some(model_id) = preset.model_id {
-                        tlc.model_bindings.insert(tier.clone(), model_id.to_string());
+                        tlc.model_bindings
+                            .insert(tier.clone(), model_id.to_string());
                     }
                     tlc.fallback_tiers = tiers.clone();
 
@@ -5271,7 +5308,10 @@ impl AgentRuntime {
                         }
                         Ok(other) => {
                             warn!("/model preset swap unexpected response: {other:?}");
-                            format!("Couldn't switch to {} — unexpected hotel response.", preset.label)
+                            format!(
+                                "Couldn't switch to {} — unexpected hotel response.",
+                                preset.label
+                            )
                         }
                         Err(e) => {
                             warn!("/model preset swap failed: {e}");
@@ -6490,13 +6530,14 @@ mod tests {
     use super::{
         AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE,
         MAX_ORACLE_EXTRA_TIERS, NoResponseAction, NoResponseClass, ProviderErrorClass,
-        classify_provider_error, cognitive_response_contract, context_pressure_pct_from_projection,
-        decide_no_response_action, extract_model_error, extract_model_error_payload,
-        format_role_command_reply, format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
+        STREAK_CAP_CEILING, classify_provider_error, cognitive_response_contract,
+        context_pressure_pct_from_projection, decide_no_response_action, effective_iteration_cap,
+        extract_model_error, extract_model_error_payload, format_role_command_reply,
+        format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
         media_analysis_attachments, next_ladder_tier, normalized_user_content,
         parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
         resolve_media_routing, resolve_model_execution_target, role_model_binding,
-        should_attempt_provider_repair,
+        should_attempt_provider_repair, tool_step_earns_streak,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -6641,6 +6682,7 @@ mod tests {
             recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            streak_extension: 0,
             provider_repair_note: None,
             provider_repair_attempts: 0,
             pending_text_reply: None,
@@ -6677,6 +6719,77 @@ mod tests {
             },
         ));
         turn.iteration += 1;
+    }
+
+    #[test]
+    fn tool_step_earns_streak_only_for_novel_successful_work() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            tool_name: name.into(),
+            arguments: args,
+        };
+        let ok = |name: &str| ToolResult {
+            tool_name: name.into(),
+            content: "ok".into(),
+        };
+        let observe_a = call("life.observe", serde_json::json!({"observation_id": "a"}));
+
+        // Novel successful work earns.
+        assert!(tool_step_earns_streak(
+            &turn,
+            &observe_a,
+            &ok("life.observe"),
+            false
+        ));
+        // A failed step never earns.
+        assert!(!tool_step_earns_streak(
+            &turn,
+            &observe_a,
+            &ok("life.observe"),
+            true
+        ));
+        // Diagnostic/status tools never earn — they are the loop signature.
+        assert!(!tool_step_earns_streak(
+            &turn,
+            &call("hotel.status", serde_json::json!({})),
+            &ok("hotel.status"),
+            false
+        ));
+        // Skipped duplicates never earn.
+        let dup = ToolResult {
+            tool_name: "life.observe".into(),
+            content: "[Duplicate call skipped] identical call already ran".into(),
+        };
+        assert!(!tool_step_earns_streak(&turn, &observe_a, &dup, false));
+
+        // An identical repeat of a prior call never earns; new arguments do.
+        turn.working_tool_history
+            .push((observe_a.clone(), ok("life.observe")));
+        assert!(!tool_step_earns_streak(
+            &turn,
+            &observe_a,
+            &ok("life.observe"),
+            false
+        ));
+        assert!(tool_step_earns_streak(
+            &turn,
+            &call("life.observe", serde_json::json!({"observation_id": "b"})),
+            &ok("life.observe"),
+            false
+        ));
+    }
+
+    #[test]
+    fn effective_iteration_cap_adds_streak_and_respects_ceiling() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        assert_eq!(effective_iteration_cap(10, &turn), 10);
+        turn.streak_extension = 5;
+        assert_eq!(effective_iteration_cap(10, &turn), 15);
+        turn.streak_extension = 100;
+        assert_eq!(effective_iteration_cap(10, &turn), STREAK_CAP_CEILING);
+        // A configured cap already at the ceiling is honoured unchanged —
+        // the extension only adds headroom below it, never shrinks.
+        assert_eq!(effective_iteration_cap(50, &turn), 50);
     }
 
     #[test]
@@ -7577,6 +7690,7 @@ mod tests {
             recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            streak_extension: 0,
             provider_repair_note: None,
             provider_repair_attempts: 0,
             pending_text_reply: None,

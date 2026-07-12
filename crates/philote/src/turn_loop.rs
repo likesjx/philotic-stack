@@ -1315,7 +1315,8 @@ impl AgentRuntime {
             AgentAction::ToolCall(tool_call) => {
                 let forced_stop_reply = self.sessions.get(&session_id).and_then(|state| {
                     let turn = state.active_turn.as_ref()?;
-                    let iteration_cap = state.settings.execution.iteration_cap;
+                    let iteration_cap =
+                        effective_iteration_cap(state.settings.execution.iteration_cap, turn);
                     let reason = if turn.iteration >= iteration_cap {
                         Some("the turn reached its maximum tool-iteration limit")
                     } else {
@@ -1604,6 +1605,16 @@ impl AgentRuntime {
                     arguments: serde_json::json!({}),
                 });
 
+            // Earned streak (cognitive-loop-streak-extension seam): judge the
+            // step against the history BEFORE it is pushed — a successful,
+            // novel, non-diagnostic step is forward progress, not loop
+            // evidence, and buys the turn one extra iteration below.
+            let earns_streak = state
+                .active_turn
+                .as_ref()
+                .map(|turn| tool_step_earns_streak(turn, &tool_call, &tool_result, step_failed))
+                .unwrap_or(false);
+
             state.push_tool_history(tool_call.clone(), tool_result.clone());
             state.clear_pending_tool_call();
 
@@ -1627,12 +1638,29 @@ impl AgentRuntime {
             // carries the correct (post-increment) iteration number. This ensures
             // turn/iteration-aware stubs and any model-side telemetry see the right value.
             if let Some(turn) = state.active_turn.as_mut() {
+                if earns_streak {
+                    turn.streak_extension = turn.streak_extension.saturating_add(1);
+                }
                 turn.iteration += 1;
                 turn.phase = TurnPhase::WaitingModel;
             }
 
             let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
-            let iteration_cap = state.settings.execution.iteration_cap;
+            let configured_cap = state.settings.execution.iteration_cap;
+            let iteration_cap = state
+                .active_turn
+                .as_ref()
+                .map(|turn| effective_iteration_cap(configured_cap, turn))
+                .unwrap_or(configured_cap);
+            if iteration_cap > configured_cap && iteration >= configured_cap {
+                info!(
+                    session_id = %session_id,
+                    iteration,
+                    configured_cap,
+                    effective_cap = iteration_cap,
+                    "Turn running on earned streak-extended iteration budget."
+                );
+            }
             let stop_reason = state
                 .active_turn
                 .as_ref()

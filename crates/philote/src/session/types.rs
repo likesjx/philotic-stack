@@ -700,6 +700,15 @@ pub struct WorkingTurn {
     /// When this reaches `settings.execution.stall_detection_threshold`, the loop
     /// surfaces to the user instead of re-entering.
     pub consecutive_step_failures: u32,
+    /// Iterations EARNED this turn by a productive streak
+    /// (cognitive-loop-streak-extension seam): each successful, novel,
+    /// non-diagnostic tool step adds one, spent on top of the configured or
+    /// plan-scaled iteration cap up to the shared absolute ceiling. True
+    /// loops — repeated identical calls, failures, status spirals — earn
+    /// nothing, so the anti-loop guard is preserved. Turn-scoped: unlike the
+    /// plan-scaled cap this never mutates session settings.
+    #[serde(default)]
+    pub streak_extension: u32,
     /// One-shot corrective note injected into the next model request after a
     /// retryable provider failure. Cleared after projection.
     pub provider_repair_note: Option<String>,
@@ -1856,6 +1865,7 @@ mod paracrine_budget_tests {
             recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            streak_extension: 0,
             provider_repair_note: None,
             provider_repair_attempts: 0,
             pending_text_reply: None,
