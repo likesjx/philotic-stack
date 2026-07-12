@@ -503,6 +503,41 @@ pub(super) fn shaped_memory_metadata(shaping: &MemoryShapingContext) -> Value {
     })
 }
 
+/// Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`): build
+/// the shared provenance envelope for a `memory.remember` tool call. `source`
+/// is the turn that caused the write; `author` is this philote's agent+role;
+/// `trust` is `Told` — the calling model asserted this fact via the tool
+/// call, it was not independently observed by the runtime. Pure/no I/O so
+/// it is directly unit-testable without a live session or memory engine.
+pub(super) fn remember_provenance(
+    agent_id: &str,
+    active_role: Option<&str>,
+    session_id: &str,
+    turn_id: &str,
+) -> ansible_mesh_core::provenance::ProvenanceEnvelope {
+    ansible_mesh_core::provenance::ProvenanceEnvelope::from_agent(agent_id, active_role)
+        .with_source(turn_id)
+        .with_trust(ansible_mesh_core::provenance::TrustTier::Told)
+        .with_evidence([format!("session:{session_id}")])
+}
+
+/// Insert a serialized [`ansible_mesh_core::provenance::ProvenanceEnvelope`]
+/// into a `metadata` JSON object under the `"provenance"` key. No-op if
+/// `metadata` is not a JSON object (defensive — `shaped_memory_metadata`
+/// always returns one, but this keeps the merge honest about that
+/// assumption instead of panicking on it).
+pub(super) fn merge_provenance_into_metadata(
+    metadata: &mut Value,
+    provenance: &ansible_mesh_core::provenance::ProvenanceEnvelope,
+) {
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            "provenance".to_string(),
+            serde_json::to_value(provenance).unwrap_or(Value::Null),
+        );
+    }
+}
+
 pub(super) fn shaped_memory_entities(shaping: &MemoryShapingContext) -> Vec<Value> {
     let mut entities = Vec::new();
     let mut push = |name: Option<&str>, entity_type: &str| {
@@ -2055,7 +2090,24 @@ impl AgentRuntime {
             &scope,
         );
         let tags = shaped_memory_tags(tags, &shaping);
-        let metadata = shaped_memory_metadata(&shaping);
+        let mut metadata = shaped_memory_metadata(&shaping);
+        // Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
+        // attach the shared provenance envelope onto the `metadata` field —
+        // MuninnDB's `/api/engrams` write already accepts an open `metadata`
+        // JSON blob (see `memory_core::rest_client::WriteRequest`), so this
+        // is additive, not a MuninnDB schema change.
+        let active_role = self
+            .sessions
+            .get(&payload.session_id)
+            .and_then(|s| s.role_activation.as_ref())
+            .map(|r| r.role_name.clone());
+        let provenance = remember_provenance(
+            &self.agent_id,
+            active_role.as_deref(),
+            &payload.session_id,
+            &payload.turn_id,
+        );
+        merge_provenance_into_metadata(&mut metadata, &provenance);
         let result_text = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
             None => "Memory unavailable: MuninnDB not configured.".to_string(),
             Some(engine) => {
@@ -2370,6 +2422,52 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
+    // proof-of-adoption for the Muninn `memory.remember` write path — the
+    // envelope must actually land in the `metadata` `Value` that becomes
+    // `WriteRequest.metadata` in `memory_core::rest_client`, not just exist
+    // as an unused type.
+    #[test]
+    fn remember_provenance_builds_told_envelope_from_agent_and_role() {
+        let provenance =
+            remember_provenance("agent-bjork-01", Some("orchestrator"), "sess-42", "turn-7");
+
+        assert_eq!(provenance.author, "agent-bjork-01/orchestrator");
+        assert_eq!(provenance.source, "turn-7");
+        assert_eq!(
+            provenance.trust,
+            ansible_mesh_core::provenance::TrustTier::Told
+        );
+        assert_eq!(provenance.evidence, vec!["session:sess-42".to_string()]);
+        assert!(!provenance.is_empty_shell());
+    }
+
+    #[test]
+    fn merge_provenance_into_metadata_lands_on_the_stored_record() {
+        let shaping = MemoryShapingContext {
+            frame: MemorySpacetimeFrame::default(),
+            graph_anchors: GraphAnchors::default(),
+            recall_policy: None,
+            write_policy: None,
+            promotion_policy: None,
+        };
+        let mut metadata = shaped_memory_metadata(&shaping);
+        let provenance =
+            remember_provenance("agent-bjork-01", Some("orchestrator"), "sess-42", "turn-7");
+
+        merge_provenance_into_metadata(&mut metadata, &provenance);
+
+        // This is exactly the `Value` that flows into
+        // `MemoryEngine::remember_with_metadata` → `WriteRequest.metadata`
+        // → `POST /api/engrams` — proving the envelope lands in the record
+        // actually sent to MuninnDB, not just in an intermediate struct.
+        assert_eq!(metadata["provenance"]["author"], "agent-bjork-01/orchestrator");
+        assert_eq!(metadata["provenance"]["trust"], "told");
+        assert_eq!(metadata["provenance"]["evidence"][0], "session:sess-42");
+        // Pre-existing metadata fields are preserved, not clobbered.
+        assert_eq!(metadata["source"], "philote.memory.remember");
+    }
 
     #[test]
     fn life_recall_prefetch_task_json_matches_runner_contract() {

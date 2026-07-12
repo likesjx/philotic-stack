@@ -8743,6 +8743,7 @@ impl IpcServer {
         use ansible_mesh_core::heal_queue::{
             HEAL_WORK_ITEM_STATUS_OPEN, HealWorkItemRecord, cap_evidence_lines,
         };
+        use ansible_mesh_core::provenance::{ProvenanceEnvelope, TrustTier};
 
         const CORR: &str = "file_heal_work_item";
         let lane = AutonomyLane::new(LANE_FLEET_HEAL_SLICES);
@@ -8819,6 +8820,16 @@ impl IpcServer {
         let evidence = cap_evidence_lines(evidence_lines);
         let work_item_id = Uuid::new_v4().to_string();
         let audit_id = format!("heal_filing:{work_item_id}");
+        // Memory Transparency Slice M1: component-authored provenance for
+        // the A3 heal filing — evidence pointers are the same evidence
+        // lines already captured on the work item, so no new plumbing.
+        let provenance = ProvenanceEnvelope::from_component("heal-dispatcher")
+            .with_source(pattern_tag)
+            .with_trust(TrustTier::Observed)
+            .with_evidence(evidence.clone())
+            .with_reversal(format!(
+                "close_heal_work_item({work_item_id}) via GraphDomain::close_heal_work_item"
+            ));
         let audit = AutonomyAuditRecord::new(
             audit_id.clone(),
             lane,
@@ -8830,7 +8841,8 @@ impl IpcServer {
             "close the work item (GraphDomain::close_heal_work_item)",
             grant.posture,
             now,
-        );
+        )
+        .with_provenance(provenance);
         if let Err(e) = graph.record_autonomy_audit(&audit) {
             return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
         }
@@ -13079,6 +13091,21 @@ pub(crate) mod tests {
                 .expect("audit exists");
             assert_eq!(audit.lane.as_str(), LANE_FLEET_HEAL_SLICES);
             assert!(audit.reversal_hint.contains("close the work item"));
+            // Memory Transparency Slice M1: proof-of-adoption for the A3
+            // heal filing write path — the audit record's `provenance`
+            // field is populated with the pattern tag as source and the
+            // work item's evidence lines as evidence pointers.
+            let provenance = audit
+                .provenance
+                .expect("A3 heal filing must attach a provenance envelope");
+            assert_eq!(provenance.author, "heal-dispatcher");
+            assert_eq!(provenance.source, "connection_refused");
+            assert_eq!(
+                provenance.trust,
+                ansible_mesh_core::provenance::TrustTier::Observed
+            );
+            assert!(!provenance.evidence.is_empty());
+            assert!(provenance.reversal.as_deref().unwrap_or("").contains(&work_item_id));
             // Budget consumed exactly once.
             let grant = graph
                 .get_autonomy_grant(LANE_FLEET_HEAL_SLICES)

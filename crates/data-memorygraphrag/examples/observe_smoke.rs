@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         observed_by: None,
         observed_role: None,
         edges: vec![],
+        provenance: None,
     };
 
     let now = chrono::Utc::now().to_rfc3339();

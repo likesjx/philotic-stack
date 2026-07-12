@@ -113,6 +113,13 @@ pub struct ObserveCypher {
     pub origin_engram_id: Option<String>,
     /// Muninn origin: reliability score of that source ref (0.0–1.0).
     pub origin_trust: Option<f64>,
+    /// Memory Transparency Slice M1: JSON-serialized
+    /// `ansible_mesh_core::provenance::ProvenanceEnvelope`, when
+    /// `LifeObserveInput::provenance` was populated by the caller. `None`
+    /// for callers that predate M1 or have not adopted the envelope —
+    /// stored as Memgraph `null`, not an empty-string sentinel, since this
+    /// is a JSON blob rather than a plain scalar.
+    pub provenance_envelope_json: Option<String>,
 }
 
 /// One compiled living-cycle edge MERGE for a `life.observe` request.
@@ -245,6 +252,11 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         .clone()
         .filter(|value| !value.trim().is_empty());
 
+    let provenance_envelope_json = input
+        .provenance
+        .as_ref()
+        .map(|envelope| serde_json::to_string(envelope).unwrap_or_default());
+
     // Label is whitelisted above — safe to interpolate. All string values are
     // escaped via escape_cypher_str before embedding in the query.
     let query = format!(
@@ -264,13 +276,15 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
             "n.observed_by = $observed_by, ",
             "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
             "n.origin_engram_id = CASE $origin_engram_id WHEN '' THEN null ELSE $origin_engram_id END, ",
-            "n.origin_trust = CASE WHEN $origin_trust < 0.0 THEN null ELSE $origin_trust END ",
+            "n.origin_trust = CASE WHEN $origin_trust < 0.0 THEN null ELSE $origin_trust END, ",
+            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN null ELSE $provenance_envelope END ",
             "ON MATCH SET ",
             "n.confidence = $confidence, ",
             "n.observation_id = $observation_id, ",
             "n.packet_id = $packet_id, ",
             "n.observed_by = $observed_by, ",
-            "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END ",
+            "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
+            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN n.provenance_envelope ELSE $provenance_envelope END ",
             "RETURN n.id AS id, n.validation_state AS validation_state",
         ),
         label = label
@@ -293,6 +307,7 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         packet_id: input.evidence.packet_id.clone(),
         origin_engram_id,
         origin_trust,
+        provenance_envelope_json,
     })
 }
 
@@ -835,6 +850,7 @@ mod tests {
             observed_by: None,
             observed_role: None,
             edges: vec![],
+            provenance: None,
         }
     }
 
@@ -875,6 +891,44 @@ mod tests {
         assert_eq!(compiled.observed_role, None);
         assert!(compiled.query.contains("n.observed_by = $observed_by"));
         assert!(compiled.query.contains("n.observed_role = CASE"));
+    }
+
+    #[test]
+    fn compile_observe_with_no_provenance_envelope_is_null_not_naked_write() {
+        // Memory Transparency Slice M1: a caller that predates M1 (or hasn't
+        // adopted the envelope) compiles to `provenance_envelope_json: None`
+        // — an honest, visible gap — not a missing field / panic.
+        let input = minimal_observe_input("Signal");
+        assert!(input.provenance.is_none());
+        let compiled = compile_observe(&input, "2026-06-04T12:00:00Z").unwrap();
+        assert_eq!(compiled.provenance_envelope_json, None);
+        assert!(compiled.query.contains("n.provenance_envelope = CASE"));
+    }
+
+    #[test]
+    fn compile_observe_carries_provenance_envelope_into_the_stored_record() {
+        // Memory Transparency Slice M1's proof-of-adoption test: a
+        // `LifeObserveInput` with a populated envelope compiles to a
+        // `provenance_envelope_json` that round-trips back to the exact
+        // envelope — this is what actually lands on the Memgraph node via
+        // the `$provenance_envelope` bound param in `provider.rs`.
+        let mut input = minimal_observe_input("Signal");
+        let envelope = ansible_mesh_core::provenance::ProvenanceEnvelope::from_agent(
+            "agent-astrid-01",
+            Some("orchestrator"),
+        )
+        .with_source("signal:paracrine-42")
+        .with_trust(ansible_mesh_core::provenance::TrustTier::Inferred)
+        .with_evidence(["signal:paracrine-42", "hotel:mac-jane"]);
+        input.provenance = Some(envelope.clone());
+
+        let compiled = compile_observe(&input, "2026-06-04T12:00:00Z").unwrap();
+        let stored_json = compiled
+            .provenance_envelope_json
+            .expect("provenance envelope must compile to stored JSON");
+        let round_tripped: ansible_mesh_core::provenance::ProvenanceEnvelope =
+            serde_json::from_str(&stored_json).expect("stored provenance JSON must deserialize");
+        assert_eq!(round_tripped, envelope);
     }
 
     #[test]

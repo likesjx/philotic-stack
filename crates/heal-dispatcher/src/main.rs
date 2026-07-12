@@ -744,6 +744,13 @@ async fn push_intel_graph_record(
     window_secs: u64,
     work_item_id: &str,
 ) {
+    // Memory Transparency Slice M1: mirror the same provenance the
+    // hotel-side `autonomy_audit` record carries (see
+    // `handle_file_heal_work_item` in aiua's ipc.rs) onto the intel-graph
+    // decision record — evidence pointer is the work item id itself (the
+    // durable hotel-graph record this decision references), reversal is
+    // the same close-work-item path, trust is observed (the dispatcher
+    // directly classified and filed this).
     let body = serde_json::json!({
         "target_node": "doc:AUTOPOIESIS_PROPOSAL",
         "action": "heal_work_item_filed",
@@ -753,6 +760,9 @@ async fn push_intel_graph_record(
              filed as hotel-graph heal_work_item {work_item_id}"
         ),
         "agent": "heal-dispatcher",
+        "evidence": [format!("heal_work_item:{work_item_id}"), format!("pattern:{pattern_tag}")],
+        "reversal": "close_heal_work_item via GraphDomain::close_heal_work_item",
+        "trust": "observed",
     });
     let result = http
         .post(format!("{base_url}/api/decide"))

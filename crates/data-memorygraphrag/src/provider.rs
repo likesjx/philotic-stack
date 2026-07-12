@@ -499,7 +499,14 @@ impl LifeGraphProvider {
                 "origin_engram_id",
                 compiled.origin_engram_id.as_deref().unwrap_or(""),
             )
-            .param("origin_trust", compiled.origin_trust.unwrap_or(-1.0));
+            .param("origin_trust", compiled.origin_trust.unwrap_or(-1.0))
+            // Memory Transparency Slice M1: empty-string sentinel becomes
+            // Memgraph `null` in the compiled CASE clause, same pattern as
+            // `origin_engram_id` above.
+            .param(
+                "provenance_envelope",
+                compiled.provenance_envelope_json.as_deref().unwrap_or(""),
+            );
 
         let mut rows = graph.execute(q).await?;
         let first_row = rows.next().await?;
@@ -2550,6 +2557,7 @@ mod tests {
             observed_by: None,
             observed_role: None,
             edges: vec![],
+            provenance: None,
         }
     }
 

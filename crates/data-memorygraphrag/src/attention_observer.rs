@@ -5,6 +5,7 @@ use ansible_mesh_core::attention_steward::{
     AttentionStewardDecision, AttentionStewardResponse, AttentionStewardSignal,
     ProposedStewardshipInstruction,
 };
+use ansible_mesh_core::provenance::{ProvenanceEnvelope, TrustTier};
 use ulid::Ulid;
 
 use crate::{
@@ -34,6 +35,38 @@ fn anchor_fields(
         Some(agent_id.to_string())
     };
     (observed_by, observed_role.map(str::to_string), edges)
+}
+
+/// Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`): build
+/// the shared provenance envelope for a paracrine-sourced `LifeObserveInput`.
+/// `source` is the paracrine signal that triggered this write; `author` is
+/// the observing agent+role (the same identity `anchor_fields` uses for the
+/// `SCOPED_TO` structural anchor); `trust` is `Inferred` — the steward
+/// classified this from a signal, it did not independently verify the
+/// claim. No reversal path is known for LifeGraph observation nodes today
+/// (append-only signal/SIL/checkin writes) — left `None` rather than
+/// invented.
+fn observation_provenance(
+    agent_id: &str,
+    observed_role: Option<&str>,
+    signal: &AttentionStewardSignal,
+) -> Option<ProvenanceEnvelope> {
+    Some(
+        ProvenanceEnvelope::from_agent(
+            if agent_id.is_empty() {
+                "attention-steward".to_string()
+            } else {
+                agent_id.to_string()
+            },
+            observed_role,
+        )
+        .with_source(format!("signal:{}", signal.signal_id))
+        .with_trust(TrustTier::Inferred)
+        .with_evidence([
+            format!("signal:{}", signal.signal_id),
+            format!("hotel:{}", signal.source_hotel),
+        ]),
+    )
 }
 
 /// Map an evaluated `AttentionStewardDecision` into a `LifeObserveInput` ready for
@@ -136,6 +169,7 @@ fn record_observation_input(
         observed_by,
         observed_role: observed_role_owned,
         edges,
+        provenance: observation_provenance(agent_id, observed_role, signal),
     }
 }
 
@@ -195,6 +229,7 @@ fn propose_sil_input(
         observed_by,
         observed_role: observed_role_owned,
         edges,
+        provenance: observation_provenance(agent_id, observed_role, signal),
     }
 }
 
@@ -266,6 +301,7 @@ fn active_checkin_awaiting_posture_input(
         observed_by,
         observed_role: observed_role_owned,
         edges,
+        provenance: observation_provenance(agent_id, observed_role, signal),
     }
 }
 
@@ -338,6 +374,21 @@ mod tests {
         );
         assert!(!input.observation_id.is_empty());
         assert!(!input.evidence.packet_id.is_empty());
+
+        // Memory Transparency Slice M1: this write path is one of the two
+        // adopted LifeGraph mutation producers — the envelope must land on
+        // the input handed to `cypher::compile_observe`, not just exist as
+        // a type.
+        let provenance = input.provenance.expect("paracrine observation must carry provenance");
+        assert_eq!(provenance.author, "agent-aria-01");
+        assert_eq!(provenance.trust, TrustTier::Inferred);
+        assert_eq!(provenance.source, "signal:cron:job-42:1717531200");
+        assert!(
+            provenance
+                .evidence
+                .contains(&"signal:cron:job-42:1717531200".to_string())
+        );
+        assert!(!provenance.is_empty_shell());
     }
 
     #[test]
