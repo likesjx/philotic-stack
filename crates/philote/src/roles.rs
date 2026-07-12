@@ -98,6 +98,14 @@ fn merge_toolset_profile_into_session_bindings(
 /// Sliding window for the role-switch rate limiter (see `handle_role_command`).
 /// The general intimate-register role toggled by `/dirty` / `/sfw`.
 const VIXEN_ROLE: &str = "vixen";
+/// Default model for a freshly-created vixen role: an OpenRouter model that is
+/// BOTH tool-calling-capable (won't 404 on the loop's tool requests) AND
+/// permissive on explicit content. The tool-capable frontier models (GLM,
+/// DeepSeek) refuse explicit; the fully-uncensored RP finetunes (Cydonia,
+/// Euryale-L3.3) lack tool support and 404. Euryale-L3.1 is the intersection —
+/// `tools:true` on OpenRouter and a genuine roleplay finetune. Operators can
+/// re-bind per agent via a live role config patch.
+const VIXEN_DEFAULT_MODEL: &str = "sao10k/l3.1-euryale-70b";
 /// Identity addendum applied to the `vixen` role. Layered on top of the agent's
 /// base persona (so it's still Jane), it lifts her into an explicit register for
 /// a private, consensual space. Everyday warmth returns on `/sfw`.
@@ -240,11 +248,15 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|r| r.toolset_profile_ref.clone())
             .unwrap_or_else(|| "orchestrator".to_string());
-        let (fallback_tiers, model_bindings) = base
-            .as_ref()
-            .and_then(|r| r.turn_loop_config.as_ref())
-            .map(|t| (t.fallback_tiers.clone(), t.model_bindings.clone()))
-            .unwrap_or_default();
+        // Bind the intimate register to an uncensored + tool-capable model, on an
+        // openrouter-only ladder so a hiccup never falls back to a refusing model
+        // (Gemini) mid-scene. Not inherited from orchestrator (which runs GLM and
+        // would refuse explicit).
+        let model_bindings = std::collections::BTreeMap::from([(
+            "model.openrouter".to_string(),
+            VIXEN_DEFAULT_MODEL.to_string(),
+        )]);
+        let fallback_tiers = vec!["model.openrouter".to_string()];
 
         let req = IpcRequest::ConfigureRole {
             agent_id: self.agent_id.clone(),
@@ -260,8 +272,8 @@ impl AgentRuntime {
             approval_policy: None,
             model_profile: None,
             context_window_policy: None,
-            fallback_tiers: (!fallback_tiers.is_empty()).then_some(fallback_tiers),
-            model_bindings: (!model_bindings.is_empty()).then_some(model_bindings),
+            fallback_tiers: Some(fallback_tiers),
+            model_bindings: Some(model_bindings),
             content_policy: Some("unrestricted".to_string()),
         };
         matches!(
