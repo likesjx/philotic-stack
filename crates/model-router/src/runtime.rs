@@ -95,6 +95,15 @@ struct ReplyRoute {
     session_id: String,
     turn_id: String,
     chat_id: String,
+    /// Persona/agent that owns this turn, threaded from philote's
+    /// `ModelRequestPayload.agent_id`. Empty string only for legacy payloads
+    /// that predate the field. Recorded verbatim into the training-tap trace.
+    agent_id: String,
+    /// Shadow-mode (`PHILOTIC_SHADOW_ORACLE`) annotations forwarded by philote:
+    /// the oracle's top pick and whether it agreed with the ladder's resolved
+    /// role. `None` when shadow mode was off. Persisted to the trace store only.
+    oracle_pick: Option<String>,
+    oracle_agreement: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1919,7 +1928,7 @@ fn record_routing_trace(
     let Some(store) = store else { return };
     let record = RouterTrainingRecord {
         trace_id: Ulid::new().to_string(),
-        agent_id: String::new(),
+        agent_id: reply.agent_id.clone(),
         session_id: reply.session_id.clone(),
         turn_id: reply.turn_id.clone(),
         provider_id: provider_id.to_string(),
@@ -1929,6 +1938,8 @@ fn record_routing_trace(
         failure_code: failure_code.map(str::to_string),
         latency_ms: Some(latency_ms),
         token_count,
+        oracle_pick: reply.oracle_pick.clone(),
+        oracle_agreement: reply.oracle_agreement,
         timestamp: now_epoch_secs(),
     };
     if let Err(e) = store.record_trace(&record) {
@@ -1971,6 +1982,16 @@ impl ReplyRoute {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            agent_id: task
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            oracle_pick: task
+                .get("oracle_pick")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            oracle_agreement: task.get("oracle_agreement").and_then(Value::as_bool),
         }
     }
 }
@@ -2049,6 +2070,98 @@ mod failure_tests {
             assert_eq!(isolated.sub_kind, annotated.sub_kind);
             assert_eq!(isolated.status, annotated.status);
         }
+    }
+
+    /// Closes the Component A / shadow loop end to end on the model-router
+    /// side: a task carrying a real `agent_id` (plus optional shadow fields)
+    /// is parsed by `ReplyRoute::from_task` and then persisted by
+    /// `record_routing_trace` — so the written trace carries the real agent
+    /// (not the old `String::new()`) and the shadow annotations round-trip.
+    #[test]
+    fn from_task_threads_agent_id_and_shadow_into_recorded_trace() {
+        use super::{ReplyRoute, record_routing_trace};
+        use ansible_mesh_core::router_trace::{
+            ProviderStats, RouterTraceStorage, RouterTrainingRecord,
+        };
+
+        #[derive(Default)]
+        struct MemTrace(Mutex<Vec<RouterTrainingRecord>>);
+        impl RouterTraceStorage for MemTrace {
+            fn record_trace(&self, r: &RouterTrainingRecord) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(r.clone());
+                Ok(())
+            }
+            fn list_traces(&self, _: usize) -> anyhow::Result<Vec<RouterTrainingRecord>> {
+                unreachable!()
+            }
+            fn list_traces_by_agent(
+                &self,
+                _: &str,
+                _: usize,
+            ) -> anyhow::Result<Vec<RouterTrainingRecord>> {
+                unreachable!()
+            }
+            fn list_traces_by_provider(
+                &self,
+                _: &str,
+                _: usize,
+            ) -> anyhow::Result<Vec<RouterTrainingRecord>> {
+                unreachable!()
+            }
+            fn provider_stats(&self, _: Option<u64>) -> anyhow::Result<Vec<ProviderStats>> {
+                unreachable!()
+            }
+        }
+
+        let task = serde_json::json!({
+            "action": "generate_text",
+            "session_id": "telegram:123:agent-jane",
+            "turn_id": "turn-1",
+            "chat_id": "123",
+            "agent_id": "jane",
+            "oracle_pick": "model.openrouter:openrouter",
+            "oracle_agreement": false,
+        });
+
+        // Parse: real agent + shadow annotations land on the ReplyRoute.
+        let reply = ReplyRoute::from_task(&task);
+        assert_eq!(reply.agent_id, "jane");
+        assert_eq!(
+            reply.oracle_pick.as_deref(),
+            Some("model.openrouter:openrouter")
+        );
+        assert_eq!(reply.oracle_agreement, Some(false));
+
+        // Write: the recorded trace carries the real agent (Component A fix)
+        // and the shadow fields — never an empty agent_id.
+        let store = MemTrace::default();
+        record_routing_trace(
+            Some(&store),
+            &reply,
+            "openrouter",
+            "text.generate",
+            "success",
+            None,
+            42,
+            Some("glm-5.2".into()),
+            None,
+        );
+        let rows = store.0.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "jane");
+        assert_eq!(
+            rows[0].oracle_pick.as_deref(),
+            Some("model.openrouter:openrouter")
+        );
+        assert_eq!(rows[0].oracle_agreement, Some(false));
+
+        // And the legacy/off path: a task with no agent_id / shadow fields
+        // records an empty agent + NULL shadow (interop with old philote).
+        let legacy = serde_json::json!({ "action": "generate_text", "turn_id": "t" });
+        let legacy_reply = ReplyRoute::from_task(&legacy);
+        assert_eq!(legacy_reply.agent_id, "");
+        assert_eq!(legacy_reply.oracle_pick, None);
+        assert_eq!(legacy_reply.oracle_agreement, None);
     }
 
     /// Serializes tests that mutate `PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS` —
