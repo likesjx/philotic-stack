@@ -7,16 +7,16 @@ use data_memorygraphrag::projection;
 use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
-    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveInput, LifePatchApplyInput,
-    LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput, LifeResolveInput,
-    LifeViewNeighborhoodInput, LifeViewNodeInput, MemoryGraphRagRunner, PatchApplyDecision,
-    PatchGate, PatchKind, PatchRisk, PolicyFilter, RankingWeights, ReliabilityBasis,
-    RetrievalFeedbackInput, RetrievalFeedbackRating, RetrievalQuery, RetrievalStrategy,
-    RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind, SourceRef, SourceReliability,
-    ValidationState, feedback_edge_specs,
+    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveBatchInput, LifeObserveInput,
+    LifePatchApplyInput, LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput,
+    LifeResolveInput, LifeViewNeighborhoodInput, LifeViewNodeInput, MAX_OBSERVE_BATCH,
+    MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter,
+    RankingWeights, ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating,
+    RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind,
+    SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
 };
 use datasource::controller::{
-    CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput,
+    CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput, TaskKind,
 };
 use neo4rs::{
     BoltList, BoltMap, BoltNode, BoltRelation, BoltType, BoltUnboundedRelation, ConfigBuilder,
@@ -419,6 +419,7 @@ impl DatasourceProvider for LifeGraphProvider {
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let mut output = match task.kind.as_str() {
             "life.observe" => self.handle_observe(task).await,
+            "life.observe.batch" => self.handle_observe_batch(task).await,
             "life.recall" => self.handle_recall(task).await,
             "life.recall.feedback" => self.handle_recall_feedback(task).await,
             "life.commit" => self.handle_commit(task).await,
@@ -456,6 +457,21 @@ impl DatasourceProvider for LifeGraphProvider {
 /// they must never generate device pings. The node reference is whichever
 /// canonical id the handler reported (`node_id`, `patch_id`, `conflict_id`).
 fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
+    // One ping per batch, not per item: the inner per-item handle_observe
+    // results never pass through invoke(), so this is the only notification
+    // a batch generates.
+    if kind == "life.observe.batch" {
+        let succeeded = data.get("succeeded").and_then(Value::as_u64).unwrap_or(0);
+        if succeeded == 0 {
+            return None;
+        }
+        let node_id = data.get("first_node_id").and_then(Value::as_str)?;
+        return Some(json!({
+            "change_kind": "observed",
+            "node_id": node_id,
+            "summary": format!("batch: {succeeded} observations"),
+        }));
+    }
     let change_kind = match kind {
         "life.observe" => "observed",
         "life.commit" => "committed",
@@ -737,6 +753,100 @@ impl LifeGraphProvider {
             "origin_trust": compiled.origin_trust,
             "embed_status": embed_status,
             "edges": edge_reports,
+        })))
+    }
+
+    /// Handle `life.observe.batch` — bounded bulk observation write
+    /// (lifegraph-batch-observe seam). Each item is dispatched through the
+    /// existing [`Self::handle_observe`] pipeline unchanged (plan gate,
+    /// provenance validation, Cypher write, embed-on-write, living-cycle
+    /// edges), so the batch adds NO policy bypass — it only collapses N model
+    /// round-trips into one tool call. Items are written individually and
+    /// durably; a failing item is reported in its result row and never rolls
+    /// back or aborts the rest of the batch.
+    async fn handle_observe_batch(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeObserveBatchInput = serde_json::from_value(task.parameters.clone())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{CONTRACT_ERROR_MARKER} failed to parse life.observe.batch parameters \
+                     as LifeObserveBatchInput: {e}"
+                )
+            })?;
+        if input.observations.is_empty() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "error": "observations must be a non-empty array",
+                "max_batch": MAX_OBSERVE_BATCH,
+            })));
+        }
+        if input.observations.len() > MAX_OBSERVE_BATCH {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "error": format!(
+                    "batch of {} exceeds the {MAX_OBSERVE_BATCH}-item cap — split the \
+                     structure into multiple life.observe.batch calls",
+                    input.observations.len()
+                ),
+                "max_batch": MAX_OBSERVE_BATCH,
+            })));
+        }
+
+        let requested = input.observations.len();
+        let mut results = Vec::with_capacity(requested);
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut first_node_id: Option<String> = None;
+        for (index, observation) in input.observations.into_iter().enumerate() {
+            let item_task = DatasourceTask {
+                kind: TaskKind::Custom("life.observe".into()),
+                provider: task.provider.clone(),
+                db: task.db.clone(),
+                graph_id: task.graph_id.clone(),
+                query: None,
+                parameters: serde_json::to_value(&observation)?,
+                identity: task.identity.clone(),
+            };
+            let item_result = match self.handle_observe(&item_task).await {
+                Ok(ProviderOutput::ResultSet(value)) => value,
+                Ok(_) => json!({ "status": "acknowledged" }),
+                Err(err) => json!({ "status": "error", "error": format!("{err:#}") }),
+            };
+            let status = item_result
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if status == "proposed" {
+                succeeded += 1;
+                if first_node_id.is_none() {
+                    first_node_id = item_result
+                        .get("node_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+            } else {
+                failed += 1;
+            }
+            results.push(json!({ "index": index, "result": item_result }));
+        }
+
+        let status = if failed == 0 {
+            "ok"
+        } else if succeeded > 0 {
+            "partial"
+        } else {
+            "failed"
+        };
+        info!(
+            requested,
+            succeeded, failed, "life.observe.batch: bulk observation write completed"
+        );
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": status,
+            "requested": requested,
+            "succeeded": succeeded,
+            "failed": failed,
+            "first_node_id": first_node_id,
+            "results": results,
         })))
     }
 
@@ -2696,6 +2806,77 @@ mod tests {
             parameters,
             identity: json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn observe_batch_guards_reject_empty_and_oversize_before_any_write() {
+        let provider = LifeGraphProvider::from_env();
+        let batch_task = |parameters: Value| DatasourceTask {
+            kind: TaskKind::Custom("life.observe.batch".into()),
+            provider: None,
+            db: None,
+            graph_id: None,
+            query: None,
+            parameters,
+            identity: json!({}),
+        };
+
+        // Empty batch: invalid_request, no Memgraph connection attempted.
+        let out = provider
+            .handle_observe_batch(&batch_task(json!({"observations": []})))
+            .await
+            .expect("empty batch is a guarded reply, not an error");
+        let ProviderOutput::ResultSet(value) = out else {
+            panic!("expected ResultSet");
+        };
+        assert_eq!(value["status"], "invalid_request");
+        assert_eq!(value["max_batch"], MAX_OBSERVE_BATCH);
+
+        // Oversize batch (cap + 1 valid items): invalid_request naming the cap.
+        let observations: Vec<LifeObserveInput> = (0..=MAX_OBSERVE_BATCH)
+            .map(|i| minimal_observe_input_for_provider_tests(&format!("obs-{i}")))
+            .collect();
+        let parameters = serde_json::to_value(LifeObserveBatchInput { observations })
+            .expect("serialize batch input");
+        let out = provider
+            .handle_observe_batch(&batch_task(parameters))
+            .await
+            .expect("oversize batch is a guarded reply, not an error");
+        let ProviderOutput::ResultSet(value) = out else {
+            panic!("expected ResultSet");
+        };
+        assert_eq!(value["status"], "invalid_request");
+        let msg = value["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("25"), "cap must be named: {msg}");
+        assert!(msg.contains("split"), "error must teach splitting: {msg}");
+
+        // Unparseable batch: contract error the model can fix.
+        let err = provider
+            .handle_observe_batch(&batch_task(json!({"observations": "nope"})))
+            .await
+            .expect_err("garbage batch parameters must be a contract error");
+        assert!(format!("{err:#}").contains(CONTRACT_ERROR_MARKER));
+    }
+
+    #[test]
+    fn change_notification_for_batch_pings_once_on_any_success() {
+        let change = change_notification_for(
+            "life.observe.batch",
+            &json!({"status": "partial", "succeeded": 3, "failed": 1, "first_node_id": "goal-1"}),
+        )
+        .expect("partial batch with successes must ping");
+        assert_eq!(change["change_kind"], "observed");
+        assert_eq!(change["node_id"], "goal-1");
+        assert!(change["summary"].as_str().unwrap_or_default().contains('3'));
+
+        assert!(
+            change_notification_for(
+                "life.observe.batch",
+                &json!({"status": "failed", "succeeded": 0, "failed": 4}),
+            )
+            .is_none(),
+            "an all-failed batch must not ping devices"
+        );
     }
 
     #[test]

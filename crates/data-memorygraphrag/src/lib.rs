@@ -1650,6 +1650,26 @@ impl LifeRecallStatsInput {
     }
 }
 
+/// Hard per-call cap on `life.observe.batch` items. Bounds one datasource
+/// round trip (each item still runs the full observe pipeline: plan gate,
+/// Cypher write, embed-on-write); larger structures split into multiple
+/// batch calls under a declared plan.
+pub const MAX_OBSERVE_BATCH: usize = 25;
+
+/// Input for `life.observe.batch` — bounded bulk observation write
+/// (lifegraph-batch-observe seam). Exists because seeding a linked structure
+/// through one `life.observe` call per node costs one model round-trip per
+/// node and exhausts the cognitive-loop iteration cap; one batch call records
+/// up to [`MAX_OBSERVE_BATCH`] observations while every item still passes the
+/// same per-item plan gating and provenance requirements. Items are written
+/// individually and durably — partial failure never rolls back completed
+/// writes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LifeObserveBatchInput {
+    #[serde(default)]
+    pub observations: Vec<LifeObserveInput>,
+}
+
 /// Input for `life.view.node` — the READ-ONLY single-node detail surface
 /// (lifegraph-read-plane seam). Serves node detail (provenance envelope rides
 /// in the node's properties) plus its typed, non-retired edges to a device
@@ -2140,6 +2160,16 @@ mod tests {
             adjudication_status: AdjudicationStatus::Pending,
             metadata: serde_json::json!({"role": "beacon"}),
         }
+    }
+
+    #[test]
+    fn life_observe_batch_input_defaults_empty_and_cap_is_sane() {
+        let empty: LifeObserveBatchInput = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.observations.is_empty());
+        // The cap bounds one datasource round trip; keep it meaningfully
+        // below the cognitive-loop hard ceiling so two batches + bookkeeping
+        // always fit a planned turn.
+        assert!(MAX_OBSERVE_BATCH >= 10 && MAX_OBSERVE_BATCH <= 50);
     }
 
     #[test]

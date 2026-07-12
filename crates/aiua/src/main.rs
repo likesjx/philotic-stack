@@ -4212,10 +4212,17 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                           Record grounded observations with life.observe, retrieve relevant open \
                           loops and commitments with life.recall, commit or resolve validated \
                           facts when appropriate, and propose governed LifeGraph patches when the \
-                          graph, skill, or policy surface needs to grow."
+                          graph, skill, or policy surface needs to grow. Bulk-write discipline: \
+                          when recording more than ~3 related nodes, FIRST declare a structured \
+                          plan (the loop raises the turn's iteration cap from the declared step \
+                          count), then use life.observe.batch (up to 25 observations per call) \
+                          instead of repeated life.observe calls. Completed writes are durable \
+                          per item — partial failure never rolls anything back, so never report \
+                          a rollback; re-check with life.recall and continue from what landed."
                 .into(),
             implied_tools: vec![
                 "life.observe".into(),
+                "life.observe.batch".into(),
                 "life.recall".into(),
                 "life.recall.feedback".into(),
                 "life.commit".into(),

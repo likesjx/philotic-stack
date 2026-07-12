@@ -293,6 +293,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
         ],
         "life.steward" => &[
             "life.observe",
+            "life.observe.batch",
             "life.recall",
             "life.recall.feedback",
             "life.commit",
@@ -316,6 +317,7 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "life.steward" => &[
             "life.observe",
+            "life.observe.batch",
             "life.recall",
             "life.recall.feedback",
             "life.commit",
@@ -3029,6 +3031,43 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "array",
                         "items": {"type": "object"},
                         "default": []
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.observe.batch".into(),
+        ToolDefinition {
+            tool_name: "life.observe.batch".into(),
+            description: "Propose UP TO 25 Life Graph observations in ONE tool call. Use this \
+                          instead of repeated life.observe calls whenever recording more than \
+                          ~3 related nodes (e.g. seeding goals + systems + open loops): one \
+                          batch call costs one model round-trip regardless of item count, so \
+                          large structures never exhaust the turn's iteration budget. Each item \
+                          is a complete life.observe input (observation_id + evidence, same \
+                          provenance requirements) and is gated and written INDIVIDUALLY — \
+                          results report per-item success/failure and completed writes are \
+                          durable; there is NO rollback on partial failure. For structures \
+                          larger than 25 nodes, declare a plan and split into multiple batch \
+                          calls."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["observations"],
+                "properties": {
+                    "observations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 25,
+                        "description": "Each item is a full life.observe input: \
+                            {observation_id, evidence:{packet_id, claim_ref:{id,label}, \
+                            claim_summary, source_refs, confidence, validation_state, \
+                            source_reliability, adjudication_status}, edges?}. See the \
+                            life.observe schema for field details.",
+                        "items": {"type": "object"}
                     }
                 }
             }),
