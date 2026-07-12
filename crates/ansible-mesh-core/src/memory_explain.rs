@@ -176,6 +176,17 @@ impl BandedExplainReport {
     }
 }
 
+/// Normalizes a MuninnDB `/api/activate` timestamp (observed live to be
+/// **nanosecond**-epoch, unlike `/api/engrams`'s second-epoch — a real wire
+/// inconsistency between the two endpoints, not a typo) to Unix seconds, so
+/// `recorded_at` is comparable across planes. `band_report`'s recency sort
+/// merges items from all three planes into one `Vec` per band — silently
+/// mixing units there would put every Muninn item first regardless of
+/// actual time, since a nanosecond epoch is ~1e9x a second epoch.
+pub fn muninn_activate_timestamp_to_unix_seconds(raw: i64) -> i64 {
+    raw / 1_000_000_000
+}
+
 fn sort_by_recency(items: &mut [ExplainEvidenceItem]) {
     items.sort_by(|a, b| b.recorded_at.unwrap_or(i64::MIN).cmp(&a.recorded_at.unwrap_or(i64::MIN)));
 }
@@ -503,6 +514,44 @@ mod tests {
         let banded = band_report(&report);
         assert_eq!(banded.confirmed[0].label, "newer");
         assert_eq!(banded.confirmed[1].label, "older");
+    }
+
+    #[test]
+    fn recency_sort_is_stable_across_muninn_and_intel_graph_units() {
+        // Regression: a raw Muninn `/api/activate` nanosecond timestamp and
+        // a raw intel-graph second timestamp must not be compared without
+        // normalizing units first, or the (numerically enormous) raw
+        // nanosecond value always sorts first regardless of real time.
+        let muninn_raw_ns: i64 = 1_782_527_813_435_365_000; // observed live
+        let mut muninn_item = item(ExplainPlane::Muninn, "muninn-2026", Some(envelope(TrustTier::Observed)));
+        muninn_item.recorded_at = Some(muninn_activate_timestamp_to_unix_seconds(muninn_raw_ns));
+
+        let mut intel_graph_item = item(
+            ExplainPlane::IntelGraph,
+            "intel-graph-later",
+            Some(envelope(TrustTier::Observed)),
+        );
+        // A later Unix-seconds timestamp than the normalized Muninn one above.
+        intel_graph_item.recorded_at = Some(muninn_activate_timestamp_to_unix_seconds(muninn_raw_ns) + 1000);
+
+        let report = ExplainReport {
+            claim: "claim".into(),
+            planes: vec![ExplainPlaneOutcome::ok(
+                ExplainPlane::Muninn,
+                vec![muninn_item, intel_graph_item],
+            )],
+        };
+        let banded = band_report(&report);
+        assert_eq!(banded.confirmed[0].label, "intel-graph-later");
+        assert_eq!(banded.confirmed[1].label, "muninn-2026");
+    }
+
+    #[test]
+    fn muninn_activate_timestamp_normalizes_nanoseconds_to_seconds() {
+        assert_eq!(
+            muninn_activate_timestamp_to_unix_seconds(1_782_527_813_435_365_000),
+            1_782_527_813
+        );
     }
 
     #[test]

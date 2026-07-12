@@ -2625,6 +2625,13 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "limit": {
                         "type": "integer",
                         "description": "Maximum Muninn engrams to consider. Defaults to 8. Range 1–20."
+                    },
+                    "entity": {
+                        "type": "string",
+                        "description": "Optional intel-graph target id hint (e.g. 'seam:role-handoff-seam', \
+                                        'doc:memory-transparency-proposal') to scope the intel-graph plane \
+                                        precisely instead of an untargeted recent-decisions scan. Use when \
+                                        you already know the seam/proposal/doc the claim concerns."
                     }
                 },
                 "required": ["claim"]

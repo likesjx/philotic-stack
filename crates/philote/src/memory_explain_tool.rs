@@ -24,8 +24,9 @@
 
 use super::*;
 use ansible_mesh_core::memory_explain::{
-    envelope_from_decision_details, envelope_from_engram_metadata, band_report, render_text,
-    ExplainEvidenceItem, ExplainPlane, ExplainPlaneOutcome, ExplainReport,
+    band_report, envelope_from_decision_details, envelope_from_engram_metadata,
+    muninn_activate_timestamp_to_unix_seconds, render_text, ExplainEvidenceItem, ExplainPlane,
+    ExplainPlaneOutcome, ExplainReport,
 };
 use ansible_mesh_core::provenance::{ProvenanceEnvelope, TrustTier};
 
@@ -64,6 +65,11 @@ impl AgentRuntime {
             .map(|n| n as usize)
             .unwrap_or(8)
             .clamp(1, 20);
+        let entity = payload
+            .arguments
+            .get("entity")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         let memory_user_id = self
             .sessions
@@ -72,7 +78,7 @@ impl AgentRuntime {
             .unwrap_or_else(|| self.agent_id.clone());
 
         let muninn_outcome = self.fetch_muninn_explain_plane(&claim, &memory_user_id, limit).await;
-        let intel_graph_outcome = fetch_intel_graph_explain_plane(&claim).await;
+        let intel_graph_outcome = fetch_intel_graph_explain_plane(&claim, entity.as_deref()).await;
         let lifegraph_outcome = self.fetch_lifegraph_explain_plane(&payload.session_id, &claim);
 
         let report = ExplainReport {
@@ -149,7 +155,12 @@ impl AgentRuntime {
                         label: eng.concept.clone(),
                         detail: eng.content.clone(),
                         source_ref: Some(eng.id.clone()),
-                        recorded_at: Some(eng.updated_at as i64),
+                        // `/api/activate` returns nanosecond-epoch timestamps
+                        // (unlike `/api/engrams`'s second-epoch) — normalize
+                        // so cross-plane recency sort compares like units.
+                        recorded_at: Some(muninn_activate_timestamp_to_unix_seconds(
+                            eng.updated_at as i64,
+                        )),
                         envelope: envelope_from_engram_metadata(&eng.metadata),
                     })
                     .collect();
@@ -240,13 +251,24 @@ fn life_recall_record_envelope(record: &RecalledMemoryRecord) -> Option<Provenan
     })
 }
 
-/// Intel-graph plane: `GET /api/mutations?limit=200` then a client-side
-/// substring filter against `reason`/`target_node`/`action` — the server
-/// has no full-text search over decision reason text (only `/api/search`
-/// over code/doc nodes). No ranking sophistication per the M2 slice
-/// contract; first `INTEL_GRAPH_MAX_MATCHES` hits, most-recent-first is
-/// applied later by the shared `band_report` recency sort.
-async fn fetch_intel_graph_explain_plane(claim: &str) -> ExplainPlaneOutcome {
+/// Intel-graph plane. Two modes:
+/// - **Targeted** (`entity` hint present): `GET /api/mutations?target=<entity>`
+///   — the server-side exact-match `target_node` filter (see
+///   `GraphEngine::get_mutations`), so results are not bounded by the
+///   untargeted scan's recency window. This is the fix for a real gap
+///   observed live during this slice: an untargeted substring scan over the
+///   most-recent 200 mutations missed an older (July 5) decision on
+///   `seam:role-handoff-seam` that a targeted query finds immediately.
+/// - **Untargeted** (no hint): `GET /api/mutations?limit=200` then a
+///   client-side substring filter against `reason`/`target_node`/`action`
+///   — the server has no full-text search over decision reason text (only
+///   `/api/search` over code/doc nodes). Bounded by the 200-most-recent
+///   window; older decisions can age out — a named scope limit, not a bug.
+///
+/// No ranking sophistication per the M2 slice contract; first
+/// `INTEL_GRAPH_MAX_MATCHES` hits, most-recent-first is applied later by the
+/// shared `band_report` recency sort.
+async fn fetch_intel_graph_explain_plane(claim: &str, entity: Option<&str>) -> ExplainPlaneOutcome {
     let base = std::env::var("PHILOTIC_INTEL_GRAPH_URL")
         .unwrap_or_else(|_| INTEL_GRAPH_DEFAULT_URL.to_string());
     let base = base.trim_end_matches('/').to_string();
@@ -264,8 +286,17 @@ async fn fetch_intel_graph_explain_plane(claim: &str) -> ExplainPlaneOutcome {
         }
     };
 
-    let url = format!("{base}/api/mutations?limit=200");
-    let resp = match client.get(&url).send().await {
+    let entity = entity.map(str::trim).filter(|e| !e.is_empty());
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(target) = entity {
+        query.push(("target", target.to_string()));
+        query.push(("limit", "50".to_string()));
+    } else {
+        query.push(("limit", "200".to_string()));
+    }
+
+    let url = format!("{base}/api/mutations");
+    let resp = match client.get(&url).query(&query).send().await {
         Ok(r) => r,
         Err(e) => {
             return ExplainPlaneOutcome::unavailable(
@@ -296,9 +327,14 @@ async fn fetch_intel_graph_explain_plane(claim: &str) -> ExplainPlaneOutcome {
         let reason = m.get("reason").and_then(|v| v.as_str()).unwrap_or("");
         let target = m.get("target_node").and_then(|v| v.as_str()).unwrap_or("");
         let action = m.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        let haystack = format!("{reason} {target} {action}").to_lowercase();
-        if !haystack.contains(&needle) {
-            continue;
+        // A targeted query already narrowed to this exact target_node
+        // server-side — trust it. Untargeted scans still need the
+        // client-side substring filter over the broad recent window.
+        if entity.is_none() {
+            let haystack = format!("{reason} {target} {action}").to_lowercase();
+            if !haystack.contains(&needle) {
+                continue;
+            }
         }
         let agent = m
             .get("agent")

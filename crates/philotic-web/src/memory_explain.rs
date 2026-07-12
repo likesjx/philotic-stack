@@ -25,8 +25,8 @@
 //!   the same "plane unavailable" contract so it is never silently dropped.
 
 use ansible_mesh_core::memory_explain::{
-    band_report, envelope_from_decision_details, ExplainEvidenceItem, ExplainPlane,
-    ExplainPlaneOutcome, ExplainReport, render_text,
+    band_report, envelope_from_decision_details, muninn_activate_timestamp_to_unix_seconds,
+    render_text, ExplainEvidenceItem, ExplainPlane, ExplainPlaneOutcome, ExplainReport,
 };
 use anyhow::Result;
 use clap::Subcommand;
@@ -49,16 +49,23 @@ pub enum MemoryAction {
         /// Maximum Muninn engrams to consider. Defaults to 8.
         #[arg(long, default_value_t = 8)]
         limit: usize,
+        /// Optional intel-graph target id hint (e.g. 'seam:role-handoff-seam',
+        /// 'doc:memory-transparency-proposal') to scope the intel-graph plane
+        /// to an exact target instead of an untargeted recent-decisions scan
+        /// (which is bounded to the 200 most recent decisions and can miss
+        /// older ones — see the module doc).
+        #[arg(long)]
+        entity: Option<String>,
     },
 }
 
 pub async fn run(action: MemoryAction) -> Result<()> {
     match action {
-        MemoryAction::Explain { claim, limit } => explain(claim, limit).await,
+        MemoryAction::Explain { claim, limit, entity } => explain(claim, limit, entity).await,
     }
 }
 
-async fn explain(claim: String, limit: usize) -> Result<()> {
+async fn explain(claim: String, limit: usize, entity: Option<String>) -> Result<()> {
     let claim = claim.trim().to_string();
     if claim.is_empty() {
         println!("phil memory explain: claim must not be empty");
@@ -67,7 +74,7 @@ async fn explain(claim: String, limit: usize) -> Result<()> {
     let limit = limit.clamp(1, 20);
 
     let muninn_outcome = fetch_muninn_plane(&claim, limit).await;
-    let intel_graph_outcome = fetch_intel_graph_plane(&claim).await;
+    let intel_graph_outcome = fetch_intel_graph_plane(&claim, entity.as_deref()).await;
     let lifegraph_outcome = ExplainPlaneOutcome::unavailable(
         ExplainPlane::LifeGraph,
         "phil has no transport to the LifeGraph plane in this slice — life.recall is \
@@ -153,10 +160,14 @@ async fn fetch_muninn_plane(claim: &str, limit: usize) -> ExplainPlaneOutcome {
             let concept = a.get("concept").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let content = a.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let id = a.get("id").and_then(|v| v.as_str()).map(str::to_string);
+            // `/api/activate` returns nanosecond-epoch timestamps (unlike
+            // `/api/engrams`'s second-epoch) — normalize so cross-plane
+            // recency sort in `band_report` compares like units.
             let recorded_at = a
                 .get("updated_at")
                 .and_then(|v| v.as_i64())
-                .or_else(|| a.get("created_at").and_then(|v| v.as_i64()));
+                .or_else(|| a.get("created_at").and_then(|v| v.as_i64()))
+                .map(muninn_activate_timestamp_to_unix_seconds);
             let metadata = a.get("metadata").cloned().unwrap_or(serde_json::Value::Null);
             ExplainEvidenceItem {
                 plane: ExplainPlane::Muninn,
@@ -172,7 +183,7 @@ async fn fetch_muninn_plane(claim: &str, limit: usize) -> ExplainPlaneOutcome {
     ExplainPlaneOutcome::ok(ExplainPlane::Muninn, items)
 }
 
-async fn fetch_intel_graph_plane(claim: &str) -> ExplainPlaneOutcome {
+async fn fetch_intel_graph_plane(claim: &str, entity: Option<&str>) -> ExplainPlaneOutcome {
     let base = env_or("PHILOTIC_INTEL_GRAPH_URL", INTEL_GRAPH_DEFAULT_URL);
     let base = base.trim_end_matches('/').to_string();
 
@@ -186,8 +197,22 @@ async fn fetch_intel_graph_plane(claim: &str) -> ExplainPlaneOutcome {
         }
     };
 
-    let url = format!("{base}/api/mutations?limit=200");
-    let resp = match client.get(&url).send().await {
+    // Targeted (`--entity`): exact-match `target_node` server-side, not
+    // bounded by the untargeted scan's recency window — the fix for a real
+    // gap observed live: an untargeted substring scan over the most-recent
+    // 200 decisions missed an older (July 5) `seam:role-handoff-seam`
+    // record that a targeted query finds immediately.
+    let entity = entity.map(str::trim).filter(|e| !e.is_empty());
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(target) = entity {
+        query.push(("target", target.to_string()));
+        query.push(("limit", "50".to_string()));
+    } else {
+        query.push(("limit", "200".to_string()));
+    }
+
+    let url = format!("{base}/api/mutations");
+    let resp = match client.get(&url).query(&query).send().await {
         Ok(r) => r,
         Err(e) => {
             return ExplainPlaneOutcome::unavailable(
@@ -218,9 +243,14 @@ async fn fetch_intel_graph_plane(claim: &str) -> ExplainPlaneOutcome {
         let reason = m.get("reason").and_then(|v| v.as_str()).unwrap_or("");
         let target = m.get("target_node").and_then(|v| v.as_str()).unwrap_or("");
         let action = m.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        let haystack = format!("{reason} {target} {action}").to_lowercase();
-        if !haystack.contains(&needle) {
-            continue;
+        // A targeted query already narrowed to this exact target_node
+        // server-side — trust it. Untargeted scans still need the
+        // client-side substring filter over the broad recent window.
+        if entity.is_none() {
+            let haystack = format!("{reason} {target} {action}").to_lowercase();
+            if !haystack.contains(&needle) {
+                continue;
+            }
         }
         let agent = m.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let details = m.get("details").cloned().unwrap_or(serde_json::Value::Null);
