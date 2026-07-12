@@ -53,6 +53,7 @@ phil graph serve               # start graph server (REST :8900, MCP :8901)
 phil graph status              # orientation — counts and proposal pipeline
 phil graph proposals           # all proposals with current status
 phil graph seams               # all registered seams
+phil graph green               # what is green right now — active proposals + latest recorded test run
 phil graph skeleton <crate>    # PlantUML diagram for a crate
 phil graph search "<text>"     # full-text search across code and docs
 

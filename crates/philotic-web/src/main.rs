@@ -296,6 +296,11 @@ enum GraphAction {
     /// List all seams
     Seams,
 
+    /// Show what is green right now: active proposals + their latest recorded
+    /// test run (pass/fail counts, age), read straight from recorded
+    /// TestRun/TestedBy evidence rather than the prose verification_level field.
+    Green,
+
     /// Search the graph
     Search {
         /// Search query
@@ -430,6 +435,20 @@ enum ServiceAction {
         #[arg(long, default_value = "default")]
         hotel: String,
     },
+}
+
+/// Format a chrono::Duration as a short human-readable age string (e.g. "5m", "3h", "2d").
+fn format_age(age: chrono::Duration) -> String {
+    let secs = age.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }
 
 #[tokio::main]
@@ -642,6 +661,84 @@ async fn main() -> Result<()> {
                     println!("Registered seams: {}", seams.len());
                     for s in &seams {
                         println!("  {}", s.name);
+                    }
+                    Ok(())
+                }
+                GraphAction::Green => {
+                    use graph_intelligence::schema::{EdgeRelation, NodeKind};
+
+                    let engine = GraphEngine::open(&config.db_path)?;
+                    let mut proposals = engine.query_nodes(Some(NodeKind::Proposal), None)?;
+                    proposals.retain(|p| {
+                        p.properties.get("status").and_then(|v| v.as_str()) == Some("active")
+                    });
+                    proposals.sort_by(|a, b| a.name.cmp(&b.name));
+
+                    let now = chrono::Utc::now();
+                    println!("{:<42} {:<12} {:<10} {}", "PROPOSAL", "RUN", "AGE", "STATUS");
+                    println!("{}", "\u{2500}".repeat(80));
+
+                    if proposals.is_empty() {
+                        println!("(no active proposals found)");
+                        return Ok(());
+                    }
+
+                    for p in &proposals {
+                        let mut latest: Option<graph_intelligence::schema::Node> = None;
+                        for e in engine
+                            .get_edges_to(&p.id)?
+                            .into_iter()
+                            .filter(|e| e.relation == EdgeRelation::TestedBy)
+                        {
+                            if let Some(run) = engine.get_node(&e.source_id)? {
+                                if run.kind == NodeKind::TestRun
+                                    && latest
+                                        .as_ref()
+                                        .map(|l| run.created_at > l.created_at)
+                                        .unwrap_or(true)
+                                {
+                                    latest = Some(run);
+                                }
+                            }
+                        }
+
+                        match latest {
+                            Some(run) => {
+                                let pass = run
+                                    .properties
+                                    .get("pass_count")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                let total = run
+                                    .properties
+                                    .get("test_count")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                let fail = run
+                                    .properties
+                                    .get("fail_count")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                let age = now.signed_duration_since(run.created_at);
+                                let status = if total == 0 {
+                                    "empty"
+                                } else if fail == 0 {
+                                    "green"
+                                } else {
+                                    "red"
+                                };
+                                println!(
+                                    "{:<42} {:<12} {:<10} {}",
+                                    p.name,
+                                    format!("{}/{}", pass, total),
+                                    format_age(age),
+                                    status
+                                );
+                            }
+                            None => {
+                                println!("{:<42} {:<12} {:<10} {}", p.name, "-", "-", "none");
+                            }
+                        }
                     }
                     Ok(())
                 }

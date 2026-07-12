@@ -311,9 +311,10 @@ worktree-gc-apply:
 worktree-gc-schedule:
     ./scripts/install-worktree-gc-schedule.sh
 
-# Run tests
+# Run tests, then record pass/fail totals to the intel graph by default
+# (graceful no-op notice if the graph server at :8900 isn't running).
 test:
-    cargo test --workspace
+    ./scripts/test-and-record.sh
 
 # Build the Apple edge client (PhiloticKit + PhiloticApp for macOS and iOS Simulator).
 app-build:
@@ -899,44 +900,11 @@ intel-graph-embed-proposals:
 smoke-agent-workflow:
     bash scripts/smoke-agent-workflow.sh
 
-# Run tests and record results to the graph (Option C foundation)
-# Works even with partial compilation failures - records what tests did run
+# Run tests and record results to the graph against an explicit target_id
+# (thin wrapper over scripts/test-and-record.sh, which now backs `just test`
+# by default — kept for explicit target overrides / CI call sites).
 test-and-record target_id:
-    #!/bin/bash
-    set +e  # Don't fail on test errors
-    echo "Running tests for {{target_id}}..."
-    START_TIME=$(date +%s%N)
-    cargo test --workspace 2>&1 | tee /tmp/test-output.txt
-    EXIT_CODE=$?
-    END_TIME=$(date +%s%N)
-    DURATION_MS=$(( (END_TIME - START_TIME) / 1000000 ))
-    
-    # Parse test results from output
-    # Handle both "running N tests" and "test result: X passed Y failed"
-    TEST_COUNT=$(grep -oE "running [0-9]+ tests" /tmp/test-output.txt | awk '{sum+=$2} END {print sum+0}')
-    RESULT_LINE=$(grep "^test result:" /tmp/test-output.txt | tail -1)
-    
-    if [ -n "$RESULT_LINE" ]; then
-        PASS_COUNT=$(echo "$RESULT_LINE" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
-        FAIL_COUNT=$(echo "$RESULT_LINE" | grep -oE "[0-9]+ failed" | grep -oE "[0-9]+")
-    else
-        PASS_COUNT=$(grep -c "^test .* ... ok$" /tmp/test-output.txt || echo "0")
-        FAIL_COUNT=$(grep -c "^test .* ... FAILED$" /tmp/test-output.txt || echo "0")
-    fi
-    
-    # Ensure values are set
-    TEST_COUNT=${TEST_COUNT:-0}
-    PASS_COUNT=${PASS_COUNT:-0}
-    FAIL_COUNT=${FAIL_COUNT:-0}
-    
-    echo "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
-    echo "Recording to graph..."
-    
-    curl -s -X POST http://127.0.0.1:8900/api/test-run \
-      -H "Content-Type: application/json" \
-      -d "{\"target_id\":\"{{target_id}}\",\"test_count\":$TEST_COUNT,\"pass_count\":$PASS_COUNT,\"fail_count\":$FAIL_COUNT,\"duration_ms\":$DURATION_MS}" | jq .
-    
-    exit $EXIT_CODE
+    GRAPH_TEST_TARGET={{target_id}} ./scripts/test-and-record.sh
 
 # Combined system health check (sessions + proposals + graph stats)
 intel-graph-health-check:

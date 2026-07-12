@@ -5,6 +5,7 @@ domain: operator-control-plane
 status: active
 disposition: proposed
 last_updated: 2026-07-11
+verification_level: test-green
 tags:
 - substrate
 - supervision
@@ -75,3 +76,18 @@ outage generation).
 
 `proposed` — authored 2026-07-11 from the autopoiesis roadmap assessment.
 S1 is the single highest-leverage item and should be the first slice claimed.
+
+**S3 `verification-as-data`** — implemented 2026-07-11 (codex/substrate-s3-verification-data).
+`just test` now runs `scripts/test-and-record.sh`, which POSTs pass/fail/duration to
+`/api/test-run` whenever the graph server at :8900 is reachable (one-line notice, not a
+failure, when it isn't). `target_id` resolves via `$GRAPH_TEST_TARGET` → branch-linked
+proposal (`codex/<slug>` looked up against `/api/worktrees` `linked_proposal`) →
+`workspace:test-baseline` fallback. `phil graph green` reads active proposals' latest
+recorded `TestRun`/`TestedBy` evidence directly from the graph DB (no server dependency)
+and answers "what is green right now?" with pass/total counts and run age — live-verified
+against the real graph.db: `Substrate Hardening — The Ground Under Autonomy` now shows
+`1198/1198 · 41s · green`, while unrecorded active proposals correctly show `none`.
+Reality gap: no proposal's slug matches this branch's `codex/substrate-s3-verification-data`
+naming (it's a sub-slice slug, not the parent proposal's doc slug), so the branch→proposal
+auto-link never fires for slice branches — `$GRAPH_TEST_TARGET` or the baseline fallback is
+the honest default path for slice work, not silent auto-linking.
