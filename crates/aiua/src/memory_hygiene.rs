@@ -61,6 +61,7 @@ use ansible_mesh_core::autonomy::{
     AutonomyAuditRecord, AutonomyLane, LANE_MEMORY_HYGIENE, lane_enabled, try_consume_daily_action,
 };
 use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::provenance::{ProvenanceEnvelope, TrustTier};
 use memory_core::MuninnConfig;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -272,6 +273,25 @@ impl HygieneReport {
             self.total_stale(),
             if self.total_stale() == 1 { "y" } else { "ies" }
         )
+    }
+
+    /// Evidence pointer strings for a [`ansible_mesh_core::provenance::ProvenanceEnvelope`]:
+    /// one `engram:<vault>:<id>` per contradiction/stale finding, bounded the
+    /// same way `evidence_summary` is (list order — contradictions first).
+    /// Distinct from `evidence_summary`, which is the bounded human-readable
+    /// prose blob stored on `AutonomyAuditRecord::evidence`.
+    pub fn evidence_pointers(&self) -> Vec<String> {
+        let mut pointers = Vec::new();
+        for v in &self.vaults {
+            for c in &v.contradictions {
+                pointers.push(format!("engram:{}:{}", v.vault, c.id_a));
+                pointers.push(format!("engram:{}:{}", v.vault, c.id_b));
+            }
+            for s in &v.stale {
+                pointers.push(format!("engram:{}:{}", v.vault, s.id));
+            }
+        }
+        pointers
     }
 }
 
@@ -563,6 +583,17 @@ pub fn file_if_warranted(
     }
 
     let audit_id = format!("memory_hygiene:{}:{now}", report.hotel_name);
+    // Memory Transparency Slice M1: component-authored provenance for the
+    // M4 hygiene filing — evidence pointers are per-engram (contradiction
+    // pairs + stale findings), directly observed by the sweep itself.
+    let provenance = ProvenanceEnvelope::from_component("memory-hygiene-sweep")
+        .with_source(format!("memory_hygiene:sweep:{}:{now}", report.hotel_name))
+        .with_trust(TrustTier::Observed)
+        .with_evidence(report.evidence_pointers())
+        .with_reversal(
+            "review flagged engrams via muninn_contradictions / muninn_consolidate; \
+             annotation-only, no automatic forget or merge",
+        );
     let audit = AutonomyAuditRecord::new(
         audit_id.clone(),
         lane,
@@ -572,7 +603,8 @@ pub fn file_if_warranted(
          no automatic forget or merge has occurred — this record is annotation-only",
         grant.posture,
         now,
-    );
+    )
+    .with_provenance(provenance);
     if let Err(e) = graph.record_autonomy_audit(&audit) {
         warn!("memory.hygiene: failed to record audit: {e:#}");
         return None;
@@ -599,6 +631,10 @@ pub async fn push_intel_graph_record(
     report: &HygieneReport,
     audit_id: &str,
 ) {
+    // Memory Transparency Slice M1: mirror the same provenance attached to
+    // the hotel-graph `autonomy_audit` record (see `file_if_warranted`
+    // above) onto the intel-graph decision record — evidence pointers are
+    // the same per-engram findings, reversal is the same review path.
     let body = serde_json::json!({
         "target_node": "doc:MEMORY_TRANSPARENCY_PROPOSAL",
         "action": "memory_hygiene_finding_filed",
@@ -608,6 +644,10 @@ pub async fn push_intel_graph_record(
             report.action_summary()
         ),
         "agent": "memory-hygiene-sweep",
+        "evidence": report.evidence_pointers(),
+        "reversal": "review flagged engrams via muninn_contradictions / muninn_consolidate; \
+             annotation-only, no automatic forget or merge",
+        "trust": "observed",
     });
     let result = http
         .post(format!("{}/api/decide", base_url.trim_end_matches('/')))
@@ -980,6 +1020,17 @@ mod tests {
         assert_eq!(audit.lane.as_str(), LANE_MEMORY_HYGIENE);
         assert!(audit.evidence.contains("self_agent-1"));
         assert!(!audit.reversal_hint.is_empty());
+
+        // Memory Transparency Slice M1: the audit record's `provenance`
+        // field is populated (not just present-but-None) — this is the
+        // proof-of-adoption for the M4 hygiene filing write path.
+        let provenance = audit
+            .provenance
+            .expect("M4 filing must attach a provenance envelope");
+        assert_eq!(provenance.author, "memory-hygiene-sweep");
+        assert_eq!(provenance.trust, ansible_mesh_core::provenance::TrustTier::Observed);
+        assert!(!provenance.evidence.is_empty());
+        assert!(provenance.reversal.is_some());
 
         let grant = graph
             .get_autonomy_grant(LANE_MEMORY_HYGIENE)

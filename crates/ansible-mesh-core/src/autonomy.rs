@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::provenance::ProvenanceEnvelope;
+
 // ── Lane ──────────────────────────────────────────────────────────────────────
 
 /// Known lane: bridge `RELATES_TO` edges from retrieval feedback (Loop 1).
@@ -452,11 +454,21 @@ pub struct AutonomyAuditRecord {
     pub created_at: u64,
     /// Unix timestamp (seconds) of the last outcome update.
     pub updated_at: u64,
+    /// Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
+    /// the shared provenance contract for this audit entry — author
+    /// component, trust tier, evidence pointers, reversal path. `None` for
+    /// records written before M1 landed, or by a lane that has not adopted
+    /// the envelope yet; `#[serde(default)]` keeps those deserializing.
+    /// This is additive to `evidence`/`reversal_hint` above (kept for
+    /// backward compat and human-readable summaries), not a replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceEnvelope>,
 }
 
 impl AutonomyAuditRecord {
     /// Build a `Pending` audit record, bounding `evidence` to
-    /// [`MAX_AUDIT_EVIDENCE_BYTES`].
+    /// [`MAX_AUDIT_EVIDENCE_BYTES`]. `provenance` defaults to `None`; attach
+    /// one with [`AutonomyAuditRecord::with_provenance`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         audit_id: impl Into<String>,
@@ -477,7 +489,14 @@ impl AutonomyAuditRecord {
             outcome: AuditOutcome::Pending,
             created_at: now,
             updated_at: now,
+            provenance: None,
         }
+    }
+
+    /// Attach a [`ProvenanceEnvelope`] to this audit record.
+    pub fn with_provenance(mut self, provenance: ProvenanceEnvelope) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 }
 
@@ -549,6 +568,52 @@ mod tests {
 
     fn grant() -> AutonomyGrant {
         AutonomyGrant::new(AutonomyLane::new(LANE_GRAPH_BRIDGE_EDGES), T0)
+    }
+
+    /// Memory Transparency Slice M1: a pre-M1 `autonomy_audit` node —
+    /// persisted before the `provenance` field existed, so its JSON has no
+    /// `provenance` key at all — must still deserialize, with `provenance`
+    /// defaulting to `None` rather than failing.
+    #[test]
+    fn autonomy_audit_record_without_provenance_key_deserializes_as_none() {
+        let legacy_json = serde_json::json!({
+            "audit_id": "heal_filing:abc123",
+            "lane": "fleet.heal_slices",
+            "action_summary": "filed heal work item abc123",
+            "evidence": "connection refused x5",
+            "reversal_hint": "close the work item",
+            "posture_at_action": "proposal_only",
+            "outcome": "pending",
+            "created_at": T0,
+            "updated_at": T0
+        });
+
+        let record: AutonomyAuditRecord =
+            serde_json::from_value(legacy_json).expect("legacy audit record must deserialize");
+        assert!(record.provenance.is_none());
+        assert_eq!(record.audit_id, "heal_filing:abc123");
+    }
+
+    #[test]
+    fn autonomy_audit_record_with_provenance_round_trips() {
+        let provenance = crate::provenance::ProvenanceEnvelope::from_component("heal-dispatcher")
+            .with_source("connection_refused")
+            .with_trust(crate::provenance::TrustTier::Observed)
+            .with_evidence(["heal_work_item:abc123"]);
+        let record = AutonomyAuditRecord::new(
+            "heal_filing:abc123",
+            AutonomyLane::new(LANE_GRAPH_BRIDGE_EDGES),
+            "filed heal work item abc123",
+            "connection refused x5",
+            "close the work item",
+            AutonomyPosture::ProposalOnly,
+            T0,
+        )
+        .with_provenance(provenance.clone());
+
+        let json = serde_json::to_value(&record).expect("serialize");
+        let back: AutonomyAuditRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.provenance, Some(provenance));
     }
 
     #[test]

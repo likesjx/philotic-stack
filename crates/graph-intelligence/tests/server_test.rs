@@ -844,6 +844,81 @@ async fn test_api_decide() {
     assert_eq!(body["status"].as_str().unwrap(), "recorded");
 }
 
+/// Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
+/// proof-of-adoption for the intel-graph decision plane — `evidence`,
+/// `reversal`, and `trust` (the provenance envelope fields this slice adds
+/// to `DecideBody`) must land on both the stored decision node's
+/// `properties` and the recorded mutation's `details`, matching what the A3
+/// heal-dispatcher / M4 memory-hygiene callers now send.
+#[tokio::test]
+async fn test_api_decide_carries_provenance_envelope_fields() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/decide", port))
+        .json(&serde_json::json!({
+            "target_node": "doc:MEMORY_TRANSPARENCY_PROPOSAL",
+            "action": "memory_hygiene_finding_filed",
+            "to_value": "memory_hygiene:hotel-1:123",
+            "reason": "1 contradiction pair(s) flagged for review",
+            "agent": "memory-hygiene-sweep",
+            "evidence": ["engram:self_agent-1:eng-a", "engram:self_agent-1:eng-b"],
+            "reversal": "review flagged engrams via muninn_contradictions / muninn_consolidate",
+            "trust": "observed"
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200, "decide should return 200");
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    let decision_id = body["decision_id"].as_str().unwrap().to_string();
+
+    // The stored decision node's properties carry the envelope fields.
+    let resp = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/nodes/{}",
+            port, decision_id
+        ))
+        .send()
+        .await
+        .expect("Failed to fetch decision node");
+    assert_eq!(resp.status(), 200);
+    let node: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    let evidence = node["properties"]["evidence"]
+        .as_array()
+        .expect("evidence array on decision node");
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence[0].as_str().unwrap(), "engram:self_agent-1:eng-a");
+    assert!(
+        node["properties"]["reversal"]
+            .as_str()
+            .unwrap()
+            .contains("muninn_contradictions")
+    );
+    assert_eq!(node["properties"]["trust"].as_str().unwrap(), "observed");
+
+    // The recorded mutation's details carry the same fields.
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/mutations", port))
+        .send()
+        .await
+        .expect("Failed to fetch mutations");
+    assert_eq!(resp.status(), 200);
+    let mutations: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    let mutation = mutations
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["action"].as_str() == Some("memory_hygiene_finding_filed"))
+        .expect("mutation for this decision should be recorded");
+    assert_eq!(
+        mutation["details"]["evidence"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(mutation["details"]["trust"].as_str().unwrap(), "observed");
+}
+
 #[tokio::test]
 async fn test_api_full_agent_lifecycle() {
     let (port, client) = start_test_server().await;

@@ -1458,6 +1458,13 @@ pub struct LifeObserveInput {
     /// Optional living-cycle edges to MERGE idempotently with the node write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edges: Vec<ObserveEdge>,
+    /// Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
+    /// the shared provenance envelope for this observation, additive to
+    /// `evidence`'s richer LifeGraph-native `SourceRef`/`EvidencePacket`
+    /// shape. `None` for callers that predate M1; `#[serde(default)]` keeps
+    /// those deserializing unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ansible_mesh_core::provenance::ProvenanceEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2498,6 +2505,7 @@ mod tests {
                 target_id: "life:role:chief-of-staff".into(),
                 upsert_target: false,
             }],
+            provenance: None,
         };
 
         let json = serde_json::to_value(&input).expect("serialize observe input");
@@ -2541,6 +2549,7 @@ mod tests {
                     target_id: "life:role:librarian".into(),
                     upsert_target: false,
                 }],
+                provenance: None,
             }))
             .expect("observe should plan");
 
@@ -2564,6 +2573,7 @@ mod tests {
                     target_id: "life:role:librarian".into(),
                     upsert_target: false,
                 }],
+                provenance: None,
             }))
             .expect_err("unknown rel_type must be rejected");
 

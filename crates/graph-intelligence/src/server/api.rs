@@ -96,6 +96,24 @@ pub struct DecideBody {
     pub reason: String,
     pub agent: String,
     pub session: Option<String>,
+    /// Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
+    /// evidence pointer strings backing this decision — log refs, graph
+    /// node ids, PR/commit shas, signal ids. Additive/optional so existing
+    /// callers that predate M1 keep working unchanged.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// Named undo path for this decision (soft-delete id, revert edge,
+    /// restore point), when one exists.
+    #[serde(default)]
+    pub reversal: Option<String>,
+    /// Trust tier of the fact behind this decision — `"observed"`,
+    /// `"inferred"`, or `"told"` (mirrors
+    /// `ansible_mesh_core::provenance::TrustTier`; kept as a plain string
+    /// here so this crate does not take a dependency on ansible-mesh-core
+    /// for one enum). Absent/unrecognized values are stored as-is and not
+    /// validated server-side.
+    #[serde(default)]
+    pub trust: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1332,6 +1350,12 @@ async fn post_decide(
             "agent": body.agent,
             "session": body.session,
             "timestamp": chrono::Utc::now().to_rfc3339(),
+            // Memory Transparency Slice M1: provenance envelope fields
+            // adopted on the decision record — empty/null when the caller
+            // predates M1 or omitted them.
+            "evidence": body.evidence,
+            "reversal": body.reversal,
+            "trust": body.trust,
         }),
         file_path: None,
         worktree: String::new(),
@@ -1366,7 +1390,11 @@ async fn post_decide(
         from_value: body.from_value.clone(),
         to_value: body.to_value.clone(),
         reason: Some(body.reason.clone()),
-        details: serde_json::json!({}),
+        details: serde_json::json!({
+            "evidence": body.evidence,
+            "reversal": body.reversal,
+            "trust": body.trust,
+        }),
     };
     engine.record_mutation(&mutation).map_err(internal_error)?;
 
