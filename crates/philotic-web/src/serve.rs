@@ -662,6 +662,21 @@ pub async fn run(
     // nodes even while they have no live WS session (see serve/edge.rs docs).
     let _edge_retainer = edge::spawn_edge_retainer(state.edge.clone(), state.tx.clone());
 
+    // lifegraph-change-push: when an observer role is configured, subscribe
+    // it and mint retained LifeGraphChange frames for enrolled edge devices.
+    // Env-gated so hotels without an edge surface run zero extra IPC.
+    let observer_role = std::env::var(edge::LIFEGRAPH_CHANGE_OBSERVER_ENV)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !observer_role.is_empty() {
+        let _lifegraph_observer = edge::spawn_lifegraph_change_observer(
+            state.edge.clone(),
+            state.socket.to_string(),
+            observer_role,
+        );
+    }
+
     // CORS — localhost only; UI is embedded and served from the same origin
     let cors = build_cors(allow_origins.as_deref());
 

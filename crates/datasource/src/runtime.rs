@@ -129,6 +129,12 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
 
                 match provider.invoke(&controller_task).await {
                     Ok(output) => {
+                        let change = match &output {
+                            ProviderOutput::ResultSet(data) => {
+                                data.get("change_notification").cloned()
+                            }
+                            _ => None,
+                        };
                         emit_success_response(
                             &mut ipc_client,
                             &reply,
@@ -137,6 +143,15 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
                             output,
                         )
                         .await?;
+                        if let Some(change) = change {
+                            forward_change_notification(
+                                &mut ipc_client,
+                                &controller_task,
+                                provider.id(),
+                                change,
+                            )
+                            .await;
+                        }
                     }
                     Err(err) => {
                         // Use the alternate/chain Display ({err:#}) so anyhow's
@@ -186,6 +201,46 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
             }
             Err(_) => {}
         }
+    }
+}
+
+/// Fire-and-forget fan-out of a provider-attached `change_notification` to
+/// the observer role named by `PHILOTIC_DATASOURCE_CHANGE_OBSERVER_ROLE`
+/// (lifegraph-change-push seam). Unset (the default) emits nothing, so hotels
+/// without an edge surface see zero extra traffic. The change ping is sent
+/// AFTER the requester's reply and delivery failures are logged and
+/// swallowed — a change notification must never fail the write it describes.
+async fn forward_change_notification(
+    ipc_client: &mut PhiloticClient,
+    task: &DatasourceTask,
+    provider_id: &str,
+    change: Value,
+) {
+    let observer_role = std::env::var("PHILOTIC_DATASOURCE_CHANGE_OBSERVER_ROLE")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if observer_role.is_empty() {
+        return;
+    }
+    let local_node_id =
+        std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string());
+    let result = ipc_client
+        .send_request(IpcRequest::EmitTask {
+            target_node: local_node_id,
+            target_role: observer_role,
+            target_guest_id: None,
+            task_json: json!({
+                "action": "datasource_change",
+                "capability": task.kind.as_str(),
+                "provider": provider_id,
+                "change": change,
+            })
+            .to_string(),
+        })
+        .await;
+    if let Err(err) = result {
+        warn!("change-notification forward failed (ignored): {err}");
     }
 }
 
