@@ -187,12 +187,20 @@ async fn fake_hotel_conn(mut stream: UnixStream) {
                 )
                 .await
             }
-            IpcRequest::EmitTask { task_json, .. } => {
+            IpcRequest::EmitTask {
+                task_json,
+                target_role,
+                ..
+            } => {
                 let ack = write_ipc_response(&mut stream, &ok_response()).await;
                 if ack.is_err() {
                     break;
                 }
-                stream_canned_reply(&mut stream, &task_json).await
+                if target_role == "life-graph-runner" {
+                    push_canned_datasource_reply(&mut stream, &task_json).await
+                } else {
+                    stream_canned_reply(&mut stream, &task_json).await
+                }
             }
             // Register, SubscribeInbox, ReleaseDesktopMembraneLease, and
             // anything else this surface sends only needs a Standard OK.
@@ -248,6 +256,66 @@ fn canned_session_turns() -> Vec<SessionTurnView> {
             status: "completed".into(),
         },
     ]
+}
+
+/// Answer a life-graph datasource task the way `data-memorygraphrag`'s
+/// runtime does: one `datasource_response` InboundTask on the requester's
+/// connection, echoing `turn_id`/`session_id` so the caller's correlation
+/// filter matches, with `result.data` shaped like the real handlers.
+async fn push_canned_datasource_reply(
+    stream: &mut UnixStream,
+    task_json: &str,
+) -> std::io::Result<()> {
+    let task: Value = serde_json::from_str(task_json).expect("life-graph task_json is JSON");
+    let tool = task["tool_name"].as_str().unwrap_or_default().to_string();
+    let args = &task["arguments"];
+    let data = match tool.as_str() {
+        "life.recall" => json!({
+            "status": "ok",
+            "named_strategy": args["named_strategy"],
+            "query_text": args["query_text"],
+            "context_packet": { "packets": [{"claim_summary": "canned open loop"}] },
+        }),
+        "life.view.node" => json!({
+            "status": "ok",
+            "read_only": true,
+            "id": args["id"],
+            "node": {
+                "kind": "node",
+                "labels": ["Goal"],
+                "properties": { "id": args["id"], "validation_state": "confirmed" },
+            },
+            "edge_limit": args["edge_limit"],
+            "neighbor_count": 0,
+            "neighbors": [],
+        }),
+        "life.view.neighborhood" => json!({
+            "status": "ok",
+            "read_only": true,
+            "origin_id": args["id"],
+            "depth": args["depth"],
+            "nodes": [],
+            "edges": [],
+            "truncated": false,
+        }),
+        other => json!({ "status": "not_yet_implemented_in_runner", "tool": other }),
+    };
+    let reply = IpcResponse::InboundTask {
+        source_node: LOCAL_TARGET_NODE.into(),
+        task_id: uuid::Uuid::new_v4(),
+        task_json: json!({
+            "action": "datasource_response",
+            "capability": tool,
+            "tool_name": tool,
+            "provider": "life-graph-memorygraphrag",
+            "session_id": task["session_id"],
+            "turn_id": task["turn_id"],
+            "chat_id": task["chat_id"],
+            "result": { "status": "success", "data": data },
+        })
+        .to_string(),
+    };
+    write_ipc_response(stream, &reply).await
 }
 
 /// Push the canned streaming reply for one emitted operator-chat task:
@@ -672,6 +740,89 @@ async fn edge_sessions_rest_bridge_serves_hotel_history() {
     assert_eq!(turns[0]["role"], "operator");
     assert_eq!(turns[1]["role"], "agent");
     assert_eq!(turns[1]["content"], CANNED_FINAL);
+}
+
+/// 1c. The edge-bearer LifeGraph read plane: lens / node / neighborhood REST
+///     routes bridged over the datasource request/reply IPC discipline
+///     (EmitTask at `life-graph-runner` + correlated `datasource_response`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_lifegraph_rest_bridge_serves_lens_node_and_neighborhood() {
+    let server = spawn_server().await;
+
+    // No bearer → 401 before any IPC round-trip.
+    let unauthorized = server
+        .http
+        .get(server.url("/api/edge/lifegraph/lens/open_loops_by_context"))
+        .send()
+        .await
+        .expect("lens request");
+    assert_eq!(unauthorized.status(), 401);
+
+    let enrollment = server.enroll("cHVia2V5LWxpZmU=").await;
+    let bearer = format!("Bearer {}", enrollment.edge_token);
+
+    // Unknown lens names never reach the datasource envelope.
+    let bad = server
+        .http
+        .get(server.url("/api/edge/lifegraph/lens/drop_all_tables"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("bad lens request");
+    assert_eq!(bad.status(), 400);
+
+    // Lens: named strategy + context text forwarded, packet data returned.
+    let body: Value =
+        server
+            .http
+            .get(server.url(
+                "/api/edge/lifegraph/lens/open_loops_by_context?context=porch%20project&limit=5",
+            ))
+            .header("authorization", &bearer)
+            .send()
+            .await
+            .expect("lens request")
+            .json()
+            .await
+            .expect("lens body");
+    assert_eq!(body["lens"], "open_loops_by_context");
+    assert_eq!(body["data"]["status"], "ok");
+    assert_eq!(body["data"]["named_strategy"], "open_loops_by_context");
+    assert_eq!(body["data"]["query_text"], "porch project");
+    assert_eq!(
+        body["data"]["context_packet"]["packets"][0]["claim_summary"],
+        "canned open loop"
+    );
+
+    // Node detail via life.view.node.
+    let body: Value = server
+        .http
+        .get(server.url("/api/edge/lifegraph/node/goal-1?edge_limit=25"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("node request")
+        .json()
+        .await
+        .expect("node body");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["node"]["properties"]["id"], "goal-1");
+    assert_eq!(body["edge_limit"], 25);
+
+    // Bounded expansion via life.view.neighborhood.
+    let body: Value = server
+        .http
+        .get(server.url("/api/edge/lifegraph/neighborhood/goal-1?depth=2"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .expect("neighborhood request")
+        .json()
+        .await
+        .expect("neighborhood body");
+    assert_eq!(body["origin_id"], "goal-1");
+    assert_eq!(body["depth"], 2);
+    assert_eq!(body["truncated"], false);
 }
 
 /// 2. A non-Hello first frame is a protocol violation: fatal Error, then close.

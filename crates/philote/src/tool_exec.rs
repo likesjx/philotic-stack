@@ -4922,6 +4922,8 @@ impl AgentRuntime {
 
             "memory.explain" => self.execute_memory_explain_tool(payload).await,
 
+            "memory.delta_digest" => self.execute_memory_delta_digest_tool(payload).await,
+
             "rule.propose" => {
                 let description = payload
                     .arguments

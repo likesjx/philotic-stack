@@ -303,12 +303,12 @@ struct ContradictionsResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ContradictionItem {
-    id_a: String,
-    concept_a: String,
-    id_b: String,
-    concept_b: String,
-    detected_at: i64,
+pub(crate) struct ContradictionItem {
+    pub(crate) id_a: String,
+    pub(crate) concept_a: String,
+    pub(crate) id_b: String,
+    pub(crate) concept_b: String,
+    pub(crate) detected_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,14 +316,20 @@ struct ListEngramsResponse {
     engrams: Vec<EngramItem>,
 }
 
+/// One row of `GET /api/engrams` list output. Reused by the M3 memory-delta
+/// digest (`memory_delta_digest.rs`) as well as this module's own staleness
+/// sweep — the list endpoint does not return `metadata`/`updated_at`, so
+/// neither consumer can read provenance or track evolution from this shape
+/// alone (see `memory_delta_digest`'s module doc for the per-engram detail
+/// fetch that fills the provenance gap for a bounded top-N of notable lines).
 #[derive(Debug, Deserialize)]
-struct EngramItem {
-    id: String,
-    concept: String,
-    created_at: i64,
+pub(crate) struct EngramItem {
+    pub(crate) id: String,
+    pub(crate) concept: String,
+    pub(crate) created_at: i64,
 }
 
-async fn fetch_contradictions(
+pub(crate) async fn fetch_contradictions(
     client: &reqwest::Client,
     base_url: &str,
     token: &str,
@@ -342,19 +348,55 @@ async fn fetch_contradictions(
     Ok(resp.json::<ContradictionsResponse>().await?.contradictions)
 }
 
-async fn fetch_stale_candidates(
+/// Map raw `GET /api/contradictions` items onto this module's
+/// [`ContradictionFinding`] vocabulary. Shared by this module's `sweep()` and
+/// by the M3 memory-delta digest, so the mapping only lives in one place.
+pub(crate) async fn fetch_contradiction_findings(
     client: &reqwest::Client,
     base_url: &str,
     token: &str,
-    before_rfc3339: &str,
+    vault_name: &str,
+) -> anyhow::Result<Vec<ContradictionFinding>> {
+    let items = fetch_contradictions(client, base_url, token).await?;
+    Ok(items
+        .into_iter()
+        .map(|c| ContradictionFinding {
+            vault: vault_name.to_string(),
+            id_a: c.id_a,
+            concept_a: c.concept_a,
+            id_b: c.id_b,
+            concept_b: c.concept_b,
+            detected_at: c.detected_at,
+        })
+        .collect())
+}
+
+/// Generic `GET /api/engrams` list call. `since`/`before` are RFC3339 and
+/// optional (server treats an absent filter as unbounded on that side).
+/// Shared by this module's staleness sweep (`before`, `sort=created`) and the
+/// M3 memory-delta digest's "remembered in the window" query (`since`,
+/// `sort=created`) — one endpoint wrapper, two callers.
+pub(crate) async fn fetch_engrams(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    sort: &str,
+    since_rfc3339: Option<&str>,
+    before_rfc3339: Option<&str>,
     limit: u32,
 ) -> anyhow::Result<Vec<EngramItem>> {
-    let url = format!(
-        "{}/api/engrams?sort=created&before={}&limit={}",
+    let mut url = format!(
+        "{}/api/engrams?sort={}&limit={}",
         base_url.trim_end_matches('/'),
-        urlencoding_light(before_rfc3339),
+        sort,
         limit,
     );
+    if let Some(since) = since_rfc3339 {
+        url.push_str(&format!("&since={}", urlencoding_light(since)));
+    }
+    if let Some(before) = before_rfc3339 {
+        url.push_str(&format!("&before={}", urlencoding_light(before)));
+    }
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -368,10 +410,29 @@ async fn fetch_stale_candidates(
     Ok(resp.json::<ListEngramsResponse>().await?.engrams)
 }
 
+async fn fetch_stale_candidates(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    before_rfc3339: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<EngramItem>> {
+    fetch_engrams(
+        client,
+        base_url,
+        token,
+        "created",
+        None,
+        Some(before_rfc3339),
+        limit,
+    )
+    .await
+}
+
 /// Minimal RFC3339 query-param escaping — the only characters an RFC3339
 /// timestamp contains that need encoding in a query string are `:` and `+`.
 /// Avoids pulling in a full percent-encoding dependency for one call site.
-fn urlencoding_light(s: &str) -> String {
+pub(crate) fn urlencoding_light(s: &str) -> String {
     s.replace(':', "%3A").replace('+', "%2B")
 }
 
@@ -415,19 +476,9 @@ pub async fn sweep(
             ..Default::default()
         };
 
-        match fetch_contradictions(client, &config.base_url, &token).await {
-            Ok(items) => {
-                result.contradictions = items
-                    .into_iter()
-                    .map(|c| ContradictionFinding {
-                        vault: vault_name.clone(),
-                        id_a: c.id_a,
-                        concept_a: c.concept_a,
-                        id_b: c.id_b,
-                        concept_b: c.concept_b,
-                        detected_at: c.detected_at,
-                    })
-                    .collect();
+        match fetch_contradiction_findings(client, &config.base_url, &token, vault_name).await {
+            Ok(findings) => {
+                result.contradictions = findings;
             }
             Err(e) => {
                 warn!(vault = %vault_name, error = %e, "memory.hygiene: contradictions fetch failed");
@@ -508,10 +559,10 @@ pub fn record_sweep_run(
 /// Read back the most recent sweep-run marker for `hotel_name`, if any sweep
 /// has run yet.
 ///
-/// Not yet called from production code — reserved for a future operator
-/// status surface (dashboard/`phil` CLI) or the M3 memory-delta digest.
-/// Exercised directly by tests today.
-#[allow(dead_code)]
+/// Consumed by the M3 memory-delta digest (`memory_delta_digest.rs`) to
+/// surface "what did the last hygiene sweep find" alongside the digest's own
+/// created/deleted/contradiction window. Also available for a future
+/// dashboard/`phil` CLI status surface.
 pub fn get_last_sweep_run(
     graph: &GraphDomain,
     hotel_name: &str,
@@ -1028,7 +1079,10 @@ mod tests {
             .provenance
             .expect("M4 filing must attach a provenance envelope");
         assert_eq!(provenance.author, "memory-hygiene-sweep");
-        assert_eq!(provenance.trust, ansible_mesh_core::provenance::TrustTier::Observed);
+        assert_eq!(
+            provenance.trust,
+            ansible_mesh_core::provenance::TrustTier::Observed
+        );
         assert!(!provenance.evidence.is_empty());
         assert!(provenance.reversal.is_some());
 
