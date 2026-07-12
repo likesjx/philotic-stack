@@ -28,6 +28,7 @@ active_seams:
 - edge-sessions-bridge
 - edge-cursor-ledger
 - lifegraph-read-plane
+- lifegraph-change-push
 - lifegraph-lens-ui
 - steward-review-ui
 - device-tool-plane
@@ -196,7 +197,8 @@ Bridged as edge-bearer REST (same EmitTask/SubscribeInbox round-trip pattern
 the chat path uses): `GET /api/edge/lifegraph/lens/{name}`,
 `GET /api/edge/lifegraph/node/{id}`, `GET /api/edge/lifegraph/neighborhood/{id}`.
 
-Live updates: emit `LifeGraphChange` at last. The life-graph-runner's write
+Live updates (seam `lifegraph-change-push`, split from slice 3 — needs aiua
+broadcast plumbing): emit `LifeGraphChange` at last. The life-graph-runner's write
 handlers (`life.observe/commit/resolve/patch.*`) publish a change event;
 philotic-web's existing per-node retainer translates it into the retained
 `LifeGraphChange` frame (`change_kind`, `node_id`, `label`, `summary`).
@@ -321,7 +323,8 @@ Two canonical owners, one mapping — no third source of truth:
 |---|---|---|---|
 | 1 | `edge-sessions-bridge` | `/api/edge/sessions*` REST over existing IPC; `SessionRepository` in app; ConversationStore → cache | smoke-green (two devices converge on one history) |
 | 2 | `edge-cursor-ledger` | EventStorage/CursorStorage-backed replay, opaque durable cursors | test-green + restart smoke |
-| 3 | `lifegraph-read-plane` | `life.view.*` tools + `/api/edge/lifegraph/*` + `LifeGraphChange` emission | smoke-green against vps-jane Memgraph |
+| 3 | `lifegraph-read-plane` | `life.view.*` read tools + `/api/edge/lifegraph/*` lens/node/neighborhood REST | smoke-green (fake-hotel e2e); live Memgraph smoke at deploy |
+| 3b | `lifegraph-change-push` | `LifeGraphChange` emission: runner write handlers → broadcast → edge retainer | smoke-green |
 | 4 | `lifegraph-lens-ui` | Life tab lenses, node detail w/ provenance + confirm/retire/feedback | watched-live-green (operator session) |
 | 5 | `steward-review-ui` | Today view, review inbox (patches/conflicts/SIL), ApprovalRequest UI | watched-live-green |
 | 6 | `device-tool-plane` | capability persistence, `edge_device` route, ToolInvoke/Result correlation, Swift ToolHost + EventKit toolpack | watched-live-green (philote creates a real reminder) |

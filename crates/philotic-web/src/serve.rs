@@ -82,6 +82,9 @@
 //!   GET  /api/sessions    (stub — returns [] until session table exists)
 //!   GET  /api/edge/sessions   (edge-bearer; hotel session history via ListOperatorSessions)
 //!   GET  /api/edge/sessions/:session_id/turns   (edge-bearer; ListSessionTurns)
+//!   GET  /api/edge/lifegraph/lens/:lens   (edge-bearer; life.recall named strategy)
+//!   GET  /api/edge/lifegraph/node/:node_id   (edge-bearer; life.view.node)
+//!   GET  /api/edge/lifegraph/neighborhood/:node_id   (edge-bearer; life.view.neighborhood)
 //!   GET  /api/apartments/:agent_id   (disabled by default for the desktop membrane)
 //!   POST /api/guests/:guest_id/restart
 //!   POST /api/guests/:guest_id/stop
@@ -673,6 +676,18 @@ pub async fn run(
         .route(
             "/api/edge/sessions/:session_id/turns",
             get(edge::handle_edge_session_turns),
+        )
+        .route(
+            "/api/edge/lifegraph/lens/:lens",
+            get(edge::handle_edge_lifegraph_lens),
+        )
+        .route(
+            "/api/edge/lifegraph/node/:node_id",
+            get(edge::handle_edge_lifegraph_node),
+        )
+        .route(
+            "/api/edge/lifegraph/neighborhood/:node_id",
+            get(edge::handle_edge_lifegraph_neighborhood),
         )
         .route(
             "/api/edge/blob",
@@ -5516,6 +5531,108 @@ async fn ipc_list_session_turns(
         IpcResponse::SessionTurnList { session_turns, .. } => Ok(session_turns),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected session turn list response: {other:?}")),
+    }
+}
+
+/// Round-trip a read-only life-graph datasource tool over hotel IPC: emit an
+/// `execute_tool` task at the local `life-graph-runner` role and await its
+/// `datasource_response` push. Mirrors the request/reply discipline of
+/// `philotic-client`'s `life_graph_ipc_smoke_driver`: the `EmitTask` ack is
+/// only a routing ack — the result arrives as a separate `InboundTask`,
+/// correlated here by `turn_id`. Each call subscribes a unique reply role so
+/// concurrent edge requests can never drain each other's replies.
+async fn ipc_life_graph_datasource_call(
+    socket: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let targets = ipc_desktop_membrane_targets(socket).await?;
+    let local_node = targets
+        .iter()
+        .find(|t| t.is_local)
+        .map(|t| t.target_node_id.clone())
+        .ok_or_else(|| anyhow!("no local operator target for life-graph routing"))?;
+
+    let reply_guest_id = new_operator_chat_id("edge-lifegraph");
+    let reply_role = format!("management.life-graph.reply.{reply_guest_id}");
+    let turn_id = new_operator_chat_id("lifegraph-turn");
+
+    let mut client = connect_client_with_identity(
+        socket,
+        GuestIdentity {
+            guest_id: reply_guest_id.clone(),
+            role: reply_role.clone(),
+            supported_tools: vec![],
+        },
+    )
+    .await?;
+    match client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: reply_role.clone(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("life-graph reply subscription refused: {other:?}"),
+    }
+
+    let task_json = serde_json::json!({
+        "action": "execute_tool",
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "session_id": format!("edge-lifegraph:{reply_guest_id}"),
+        "turn_id": turn_id,
+        "chat_id": "",
+        "agent_id": reply_guest_id,
+        "reply_to": local_node,
+        "reply_role": reply_role,
+    })
+    .to_string();
+    match client
+        .send_request(IpcRequest::EmitTask {
+            target_node: local_node.clone(),
+            target_role: "life-graph-runner".into(),
+            target_guest_id: None,
+            task_json,
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("life-graph task emit refused: {other:?}"),
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out awaiting {tool_name} datasource reply");
+        }
+        let pushed = tokio::time::timeout(remaining, client.recv_task())
+            .await
+            .map_err(|_| anyhow!("timed out awaiting {tool_name} datasource reply"))??;
+        // Skip unrelated pushes (MuninnStatus, apartment updates, stale
+        // replies) — only this call's datasource_response terminates the loop.
+        let IpcResponse::InboundTask { task_json, .. } = pushed else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) else {
+            continue;
+        };
+        if payload.get("action").and_then(serde_json::Value::as_str) != Some("datasource_response")
+        {
+            continue;
+        }
+        if payload.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id.as_str()) {
+            continue;
+        }
+        if let Some(error) = payload.get("error").filter(|e| !e.is_null()) {
+            bail!("life-graph {tool_name} failed: {error}");
+        }
+        return Ok(payload
+            .get("result")
+            .and_then(|r| r.get("data"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null));
     }
 }
 

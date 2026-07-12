@@ -612,6 +612,29 @@ pub fn patch_status_update_query() -> &'static str {
      RETURN p.id AS id, p.status AS status"
 }
 
+/// READ-ONLY `life.view.node` node fetch: one node by canonical `id`.
+/// The id binds as `$id` — nothing is interpolated.
+pub fn view_node_query() -> &'static str {
+    "MATCH (n {id: $id}) RETURN n LIMIT 1"
+}
+
+/// READ-ONLY `life.view.node` edge fetch: the node's typed edges to
+/// non-retired neighbours that carry a canonical `id`.
+///
+/// Safety: performs no writes. The node id binds as `$id`; `edge_limit` is
+/// clamped to `1..=200` and inlined as an integer.
+pub fn view_node_edges_query(edge_limit: usize) -> String {
+    let limit = edge_limit.clamp(1, 200);
+    format!(
+        "MATCH (n {{id: $id}})-[r]-(m) \
+         WHERE m.id IS NOT NULL \
+         AND coalesce(m.validation_state, 'inferred') <> 'retired' \
+         RETURN type(r) AS rel_type, startNode(r).id AS from_id, \
+         endNode(r).id AS to_id, m AS node \
+         LIMIT {limit}"
+    )
+}
+
 /// Read-only listing query for `life.patch.list` — the patch review surface.
 /// Returns governed patch proposals with risk tier, lifecycle status,
 /// provenance (`patch_json`), and audit anchor, newest first.
@@ -1527,6 +1550,32 @@ mod tests {
         assert!(q.contains("ORDER BY p.proposed_at DESC"));
         assert!(q.contains("LIMIT 50"));
         assert!(q.contains("'proposed'"));
+    }
+
+    #[test]
+    fn view_node_queries_are_read_only_parameterized_and_bounded() {
+        let node_q = view_node_query();
+        let edges_q = view_node_edges_query(50);
+        for q in [node_q, edges_q.as_str()] {
+            for verb in ["MERGE", "CREATE", "SET ", "DELETE", "REMOVE"] {
+                assert!(!q.contains(verb), "view query must not contain {verb}: {q}");
+            }
+            // The node id always binds as a parameter — never interpolated.
+            assert!(q.contains("$id"));
+        }
+        assert!(node_q.contains("LIMIT 1"));
+        assert!(edges_q.contains("LIMIT 50"));
+        // Retired neighbours are excluded in-query.
+        assert!(edges_q.contains("<> 'retired'"));
+        // Direction is reported so the client can render arrows.
+        assert!(edges_q.contains("startNode(r).id AS from_id"));
+        assert!(edges_q.contains("endNode(r).id AS to_id"));
+    }
+
+    #[test]
+    fn view_node_edges_query_clamps_limit() {
+        assert!(view_node_edges_query(0).contains("LIMIT 1"));
+        assert!(view_node_edges_query(9999).contains("LIMIT 200"));
     }
 
     #[test]

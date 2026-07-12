@@ -804,6 +804,141 @@ pub(crate) async fn handle_edge_session_turns(
     }
 }
 
+/// Named `life.recall` retrieval strategies a device may request as a lens.
+/// Mirrors `NamedRecallStrategy` in `data-memorygraphrag` — validated here so
+/// arbitrary device strings never reach the datasource task envelope.
+const LIFEGRAPH_LENSES: &[&str] = &[
+    "semantic_pivot",
+    "open_loops_by_context",
+    "goals_and_next_actions",
+    "commitments_approaching",
+    "re_entry_context",
+    "cross_domain_entanglement",
+    "current_prompt_semantic",
+];
+
+fn life_graph_unavailable(err: anyhow::Error) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": format!("life-graph unavailable: {err}")})),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct EdgeLifegraphLensQuery {
+    /// Optional operator context ("where was I on the porch project?") —
+    /// becomes the recall `query_text`; defaults to the lens name.
+    context: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /api/edge/lifegraph/lens/:lens` — edge-bearer LifeGraph lens read:
+/// one named `life.recall` retrieval strategy (open loops, commitments
+/// approaching, re-entry, …) served as a render-ready context packet. The
+/// device never sends Cypher — only a validated lens name plus free-text
+/// context; zoning and validation-state policy stay server-side in the
+/// life-graph-runner.
+pub(crate) async fn handle_edge_lifegraph_lens(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(lens): Path<String>,
+    Query(query): Query<EdgeLifegraphLensQuery>,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    if !LIFEGRAPH_LENSES.contains(&lens.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("unknown lens '{lens}'"),
+                "lenses": LIFEGRAPH_LENSES,
+            })),
+        )
+            .into_response();
+    }
+    let context = query
+        .context
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or(lens.as_str())
+        .to_string();
+    let arguments = json!({
+        "query_id": format!("edge-lens-{lens}"),
+        "query_text": context,
+        "named_strategy": lens,
+        "operator_intent": lens,
+        "max_context_packets": query.limit.unwrap_or(10).min(50),
+    });
+    match super::ipc_life_graph_datasource_call(&state.socket, "life.recall", arguments).await {
+        Ok(data) => Json(json!({ "lens": lens, "data": data })).into_response(),
+        Err(err) => life_graph_unavailable(err),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct EdgeLifegraphNodeQuery {
+    edge_limit: Option<u32>,
+}
+
+/// `GET /api/edge/lifegraph/node/:node_id` — edge-bearer node detail via the
+/// read-only `life.view.node` datasource tool: the node (provenance envelope
+/// in its properties) plus bounded typed edges to non-retired neighbours.
+pub(crate) async fn handle_edge_lifegraph_node(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Query(query): Query<EdgeLifegraphNodeQuery>,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    let mut arguments = json!({ "id": node_id });
+    if let Some(edge_limit) = query.edge_limit {
+        arguments["edge_limit"] = json!(edge_limit);
+    }
+    match super::ipc_life_graph_datasource_call(&state.socket, "life.view.node", arguments).await {
+        Ok(data) => Json(data).into_response(),
+        Err(err) => life_graph_unavailable(err),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct EdgeLifegraphNeighborhoodQuery {
+    depth: Option<u32>,
+    max_nodes: Option<u32>,
+}
+
+/// `GET /api/edge/lifegraph/neighborhood/:node_id` — edge-bearer bounded
+/// living-cycle expansion via the read-only `life.view.neighborhood`
+/// datasource tool, for the canvas view (depth ≤ 2, node budget ≤ 150 —
+/// clamped again runner-side).
+pub(crate) async fn handle_edge_lifegraph_neighborhood(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Query(query): Query<EdgeLifegraphNeighborhoodQuery>,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    let mut arguments = json!({ "id": node_id });
+    if let Some(depth) = query.depth {
+        arguments["depth"] = json!(depth);
+    }
+    if let Some(max_nodes) = query.max_nodes {
+        arguments["max_nodes"] = json!(max_nodes);
+    }
+    match super::ipc_life_graph_datasource_call(&state.socket, "life.view.neighborhood", arguments)
+        .await
+    {
+        Ok(data) => Json(data).into_response(),
+        Err(err) => life_graph_unavailable(err),
+    }
+}
+
 /// Outcome of a successful handshake ([`process_hello`]).
 #[derive(Debug, PartialEq)]
 struct HandshakeAccept {
