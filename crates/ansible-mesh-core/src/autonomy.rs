@@ -269,6 +269,27 @@ pub enum Transition {
     Frozen,
 }
 
+/// Has `grant` already met the bar [`record_outcome`] uses to promote one
+/// posture level?
+///
+/// Pure — mirrors exactly the condition `record_outcome` checks before
+/// promoting, so callers (e.g. the A9 trust-ledger status report) never
+/// invent a second copy of the promotion rule that can drift from the one
+/// that actually fires. True when: not frozen, not already at the ceiling
+/// (`AutoWithAudit`), and the confirmed-good streak has already reached
+/// `required_for_promotion`. Note this is normally `false` in steady state:
+/// `record_outcome` promotes and resets the streak the instant it reaches
+/// the threshold, so under normal operation the streak never sits at or
+/// above `required_for_promotion` between outcomes. It only happens in
+/// practice when a lane was frozen while confirmations kept accumulating
+/// (freeze suppresses promotion outright, so the streak can pile up past
+/// the threshold); clearing the freeze then reports this lane as eligible.
+pub fn promotion_eligible(grant: &AutonomyGrant) -> bool {
+    !grant.frozen_until_operator_review
+        && grant.posture != AutonomyPosture::AutoWithAudit
+        && grant.earned.confirmed_good_outcomes >= grant.earned.required_for_promotion
+}
+
 /// Apply `outcome` to `grant`. Pure — the clock is injected via `now`.
 ///
 /// Rules (Autopoiesis proposal, Autonomy Contract):
@@ -291,10 +312,7 @@ pub fn record_outcome(grant: &mut AutonomyGrant, outcome: Outcome, now: u64) -> 
             grant.earned.consecutive_failures = 0;
             grant.earned.confirmed_good_outcomes =
                 grant.earned.confirmed_good_outcomes.saturating_add(1);
-            let eligible = !grant.frozen_until_operator_review
-                && grant.posture != AutonomyPosture::AutoWithAudit
-                && grant.earned.confirmed_good_outcomes >= grant.earned.required_for_promotion;
-            if eligible {
+            if promotion_eligible(grant) {
                 let from = grant.posture;
                 grant.posture = from.promoted();
                 grant.earned.confirmed_good_outcomes = 0;
@@ -374,16 +392,38 @@ pub fn bound_evidence(evidence: &str) -> String {
     format!("{}… [truncated]", &evidence[..cut])
 }
 
-/// Review state of an audited autonomous action.
+/// Review state of an audited autonomous action (Autopoiesis Slice A9 —
+/// `trust-ledger`).
+///
+/// Stamped by [`crate::domain::GraphDomain::set_autonomy_audit_outcome`] via
+/// the `record_autonomy_outcome` IPC path. `ConfirmedGood` and `Reversed`
+/// come from an explicit operator report and drive the paired grant-level
+/// [`Outcome`] (`ConfirmedGood` feeds the earn counter, `Reversed` feeds the
+/// demote transition). `Neutral` is a review with no promotion/demotion
+/// effect — a wash, not a signal either way — and never mutates the grant.
+///
+/// TODO(A9): a configurable timeout-to-`Neutral` (an audit left `Pending`
+/// past some age auto-resolves to `Neutral` so it stops silently occupying
+/// "awaiting review" state forever) is not wired up. Today `Neutral` is only
+/// reachable through an explicit stamp; the timeout sweep needs a cron-like
+/// caller and is deferred to whichever slice adds scheduled hotel-side
+/// sweeps generally, rather than inventing a one-off timer for this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
     /// Action taken; awaiting operator confirmation or reversal.
     Pending,
-    /// Operator confirmed the action was good.
-    Confirmed,
-    /// Operator reversed the action (see `reversal_hint`).
+    /// Operator confirmed the action was good. Feeds `Outcome::ConfirmedGood`.
+    /// `#[serde(alias)]` accepts the pre-A9 wire value `"confirmed"` so
+    /// audit records written before this rename still deserialize.
+    #[serde(alias = "confirmed")]
+    ConfirmedGood,
+    /// Operator reversed the action (see `reversal_hint`). Feeds
+    /// `Outcome::OperatorReversal`.
     Reversed,
+    /// Reviewed with no promotion/demotion effect — a wash. Never mutates
+    /// the grant's earn/demote counters.
+    Neutral,
 }
 
 /// Decision record for one autonomous action on a lane.
@@ -434,6 +474,64 @@ impl AutonomyAuditRecord {
             created_at: now,
             updated_at: now,
         }
+    }
+}
+
+// ── Trust-ledger status report ──────────────────────────────────────────────
+
+/// A computed, per-lane snapshot of the trust ledger (Autopoiesis Slice A9 —
+/// `trust-ledger`): "arithmetic instead of vibes."
+///
+/// Every field is read straight off [`AutonomyGrant`] and the promotion rule
+/// already enforced by [`record_outcome`] — this type invents no new
+/// thresholds. It exists so operator surfaces (`phil autonomy status`) can
+/// report the same numbers the state machine itself acts on, instead of a
+/// human eyeballing "has it been about two weeks."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneStatusReport {
+    pub lane: AutonomyLane,
+    pub posture: AutonomyPosture,
+    pub frozen_until_operator_review: bool,
+    /// Autonomous actions consumed so far today (UTC), reset to 0 in this
+    /// report if `now` has rolled past the grant's stored `action_day_utc` —
+    /// mirrors the rollover [`try_consume_daily_action`] applies on the next
+    /// real consult, so the report never shows a stale yesterday's count.
+    pub actions_today: u32,
+    pub max_actions_per_day: u32,
+    pub consecutive_failures: u32,
+    pub max_consecutive_failures: u32,
+    /// Confirmed-good outcomes accrued at the *current* posture. A1 has no
+    /// time-window ("N over ≥ 14 days") concept — this is the raw earn
+    /// counter, exactly what [`record_outcome`] compares against
+    /// `required_for_promotion`.
+    pub confirmed_good_streak: u32,
+    pub required_for_promotion: u32,
+    /// See [`promotion_eligible`] — true iff the confirmed-good streak has
+    /// already met the promotion threshold (normally `false`: reaching the
+    /// threshold promotes and resets it immediately; `true` mainly signals a
+    /// frozen lane whose streak piled up past the bar while suppressed).
+    pub promotion_eligible: bool,
+}
+
+/// Compute [`LaneStatusReport`] for `grant` as of `now`. Pure — the clock is
+/// injected so this is testable without wall-clock time.
+pub fn lane_status_report(grant: &AutonomyGrant, now: u64) -> LaneStatusReport {
+    let actions_today = if grant.action_day_utc == utc_day(now) {
+        grant.actions_today
+    } else {
+        0
+    };
+    LaneStatusReport {
+        lane: grant.lane.clone(),
+        posture: grant.posture,
+        frozen_until_operator_review: grant.frozen_until_operator_review,
+        actions_today,
+        max_actions_per_day: grant.budget.max_actions_per_day,
+        consecutive_failures: grant.earned.consecutive_failures,
+        max_consecutive_failures: grant.budget.max_consecutive_failures,
+        confirmed_good_streak: grant.earned.confirmed_good_outcomes,
+        required_for_promotion: grant.earned.required_for_promotion,
+        promotion_eligible: promotion_eligible(grant),
     }
 }
 
@@ -717,5 +815,120 @@ mod tests {
         assert_eq!(g.earned.required_for_promotion, 5);
         assert!(!g.frozen_until_operator_review);
         assert_eq!(g.actions_today, 0);
+    }
+
+    #[test]
+    fn audit_outcome_confirmed_good_accepts_legacy_confirmed_alias() {
+        // Pre-A9 audit records serialized `AuditOutcome::Confirmed` as
+        // `"confirmed"`. The rename to `ConfirmedGood` must not strand
+        // already-stored records — snake_case now emits "confirmed_good"
+        // but "confirmed" still deserializes to the same variant.
+        let current: AuditOutcome = serde_json::from_value(serde_json::json!("confirmed_good"))
+            .expect("current wire value");
+        let legacy: AuditOutcome =
+            serde_json::from_value(serde_json::json!("confirmed")).expect("legacy wire value");
+        assert_eq!(current, AuditOutcome::ConfirmedGood);
+        assert_eq!(legacy, AuditOutcome::ConfirmedGood);
+        assert_eq!(
+            serde_json::to_value(AuditOutcome::ConfirmedGood).unwrap(),
+            serde_json::json!("confirmed_good")
+        );
+        assert_eq!(
+            serde_json::to_value(AuditOutcome::Neutral).unwrap(),
+            serde_json::json!("neutral")
+        );
+    }
+
+    // ── promotion_eligible / lane_status_report (Slice A9) ──────────────────
+
+    #[test]
+    fn promotion_eligible_matches_record_outcome_promotion_condition() {
+        let mut g = grant();
+        assert!(!promotion_eligible(&g), "fresh grant has no streak yet");
+
+        // One short of the threshold: not yet eligible.
+        g.earned.confirmed_good_outcomes = g.earned.required_for_promotion - 1;
+        assert!(!promotion_eligible(&g));
+
+        // At the threshold: eligible.
+        g.earned.confirmed_good_outcomes = g.earned.required_for_promotion;
+        assert!(promotion_eligible(&g));
+
+        // Frozen suppresses eligibility even with plenty of streak.
+        g.frozen_until_operator_review = true;
+        assert!(!promotion_eligible(&g));
+        g.frozen_until_operator_review = false;
+
+        // Already at the ceiling: never "eligible" (nowhere higher to go).
+        g.posture = AutonomyPosture::AutoWithAudit;
+        assert!(!promotion_eligible(&g));
+    }
+
+    #[test]
+    fn promotion_eligible_reflects_freeze_then_clear_like_record_outcome() {
+        // Exercises the real scenario the doc comment describes: a lane
+        // frozen mid-streak accumulates confirmed-good outcomes past the
+        // threshold without record_outcome ever promoting it (matches
+        // `freeze_on_consecutive_failures_retains_posture_and_blocks_actions`).
+        // Once an operator clears the freeze, the report must say eligible.
+        let mut g = grant();
+        g.posture = AutonomyPosture::ConfirmFirst;
+        g.frozen_until_operator_review = true;
+        for i in 1..=10 {
+            let t = record_outcome(&mut g, Outcome::ConfirmedGood, T0 + i);
+            assert_eq!(t, Transition::NoChange, "frozen lane must not promote");
+        }
+        assert!(g.earned.confirmed_good_outcomes >= g.earned.required_for_promotion);
+        assert!(!promotion_eligible(&g), "still frozen");
+
+        g.frozen_until_operator_review = false;
+        assert!(promotion_eligible(&g), "freeze cleared, streak already met");
+    }
+
+    #[test]
+    fn lane_status_report_maps_grant_fields_directly() {
+        let mut g = grant();
+        g.posture = AutonomyPosture::ConfirmFirst;
+        g.earned.consecutive_failures = 2;
+        g.earned.confirmed_good_outcomes = 3;
+        g.actions_today = 4;
+        g.action_day_utc = utc_day(T0);
+
+        let report = lane_status_report(&g, T0);
+        assert_eq!(report.lane, g.lane);
+        assert_eq!(report.posture, AutonomyPosture::ConfirmFirst);
+        assert!(!report.frozen_until_operator_review);
+        assert_eq!(report.actions_today, 4);
+        assert_eq!(report.max_actions_per_day, g.budget.max_actions_per_day);
+        assert_eq!(report.consecutive_failures, 2);
+        assert_eq!(
+            report.max_consecutive_failures,
+            g.budget.max_consecutive_failures
+        );
+        assert_eq!(report.confirmed_good_streak, 3);
+        assert_eq!(
+            report.required_for_promotion,
+            g.earned.required_for_promotion
+        );
+        assert!(!report.promotion_eligible, "3 < 5 required");
+    }
+
+    #[test]
+    fn lane_status_report_zeroes_actions_today_on_utc_day_rollover() {
+        let mut g = grant();
+        g.actions_today = 9;
+        g.action_day_utc = utc_day(T0);
+
+        // Same day: stale count reported as-is.
+        let report = lane_status_report(&g, T0 + 10);
+        assert_eq!(report.actions_today, 9);
+
+        // A day later: the report reflects the rollover try_consume_daily_action
+        // would apply, even though the grant itself hasn't been touched.
+        let next_day = (utc_day(T0) + 1) * 86_400;
+        let report = lane_status_report(&g, next_day);
+        assert_eq!(report.actions_today, 0);
+        // The stored grant is untouched — this is a read, not a mutation.
+        assert_eq!(g.actions_today, 9);
     }
 }

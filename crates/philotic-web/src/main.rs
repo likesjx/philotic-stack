@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod autonomy;
 mod component;
 mod doctor;
 mod explain;
@@ -223,6 +224,13 @@ enum Command {
     Heal {
         #[command(subcommand)]
         action: heal::HealAction,
+    },
+
+    /// Autonomy trust ledger — per-lane posture, budget, and promotion
+    /// eligibility (Autopoiesis Slice A9)
+    Autonomy {
+        #[command(subcommand)]
+        action: autonomy::AutonomyAction,
     },
 
     /// Project intelligence graph — scan, query, and serve the codebase graph
@@ -538,6 +546,7 @@ async fn main() -> Result<()> {
         Command::Mcp { action } => mcp::run(action).await,
         Command::Keys { action } => keys::run(action).await,
         Command::Heal { action } => heal::run(action).await,
+        Command::Autonomy { action } => autonomy::run(action).await,
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};
             use philotic_graph::PhiloticGraphConfig;

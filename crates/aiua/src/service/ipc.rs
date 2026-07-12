@@ -3812,6 +3812,24 @@ impl IpcServer {
                     let value_json = serde_json::to_string(&items).ok();
                     return IpcResponse::ConfigData { key, value_json };
                 }
+                // Read-only operator surface for the Autopoiesis Slice A9
+                // trust ledger (`phil autonomy status`). `__autonomy_status__`
+                // reports every granted lane; `__autonomy_status__:{lane}`
+                // scopes to one.
+                if key == "__autonomy_status__" {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    return Self::handle_query_autonomy_status(graph, None, now);
+                }
+                if let Some(lane) = key.strip_prefix("__autonomy_status__:") {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    return Self::handle_query_autonomy_status(graph, Some(lane), now);
+                }
                 // Returns a JSON array of memory_type strings for all session apartments
                 // belonging to the given agent — used by philote at startup for stale-turn sweep.
                 // Key format: `__session_apartments__:{agent_id}`
@@ -9065,14 +9083,17 @@ impl IpcServer {
     }
 
     /// Handle [`IpcRequest::RecordAutonomyOutcome`] — the operator/steward
-    /// reporting the reviewed outcome of an audited autonomous action.
+    /// reporting the reviewed outcome of an audited autonomous action
+    /// (Autopoiesis Slice A9 — `trust-ledger`).
     ///
-    /// `outcome`: `"confirmed_good"` → audit Confirmed + grant
-    /// `Outcome::ConfirmedGood` (counts toward promotion);
-    /// `"reversed"` → audit Reversed + grant `Outcome::OperatorReversal`
-    /// (demotes one posture level). Idempotent per audit id: an
-    /// already-reviewed audit refuses with `reason:"already_recorded"` so a
-    /// double-confirm never double-counts toward promotion.
+    /// `outcome`: `"confirmed_good"` → audit `ConfirmedGood` + grant
+    /// `Outcome::ConfirmedGood` (counts toward promotion); `"reversed"` →
+    /// audit `Reversed` + grant `Outcome::OperatorReversal` (demotes one
+    /// posture level); `"neutral"` → audit `Neutral` only — the grant's
+    /// earn/demote counters are untouched (a wash, not a signal). Idempotent
+    /// per audit id: an already-reviewed audit refuses with
+    /// `reason:"already_recorded"` so a double-confirm never double-counts
+    /// toward promotion.
     pub(crate) fn handle_record_autonomy_outcome(
         graph: &GraphDomain,
         audit_id: &str,
@@ -9082,14 +9103,17 @@ impl IpcServer {
         use ansible_mesh_core::autonomy::{AuditOutcome, Outcome, Transition};
 
         const CORR: &str = "record_autonomy_outcome";
-        let (audit_outcome, grant_outcome) = match outcome {
-            "confirmed_good" => (AuditOutcome::Confirmed, Outcome::ConfirmedGood),
-            "reversed" => (AuditOutcome::Reversed, Outcome::OperatorReversal),
+        let (audit_outcome, grant_outcome): (AuditOutcome, Option<Outcome>) = match outcome {
+            "confirmed_good" => (AuditOutcome::ConfirmedGood, Some(Outcome::ConfirmedGood)),
+            "reversed" => (AuditOutcome::Reversed, Some(Outcome::OperatorReversal)),
+            "neutral" => (AuditOutcome::Neutral, None),
             other => {
                 return IpcResponse::error(
                     CORR,
                     "INVALID_OUTCOME",
-                    format!("unknown outcome '{other}' (expected confirmed_good | reversed)"),
+                    format!(
+                        "unknown outcome '{other}' (expected confirmed_good | reversed | neutral)"
+                    ),
                 );
             }
         };
@@ -9119,11 +9143,17 @@ impl IpcServer {
         if let Err(e) = graph.set_autonomy_audit_outcome(audit_id, audit_outcome, now) {
             return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}"));
         }
-        let transition =
-            match graph.record_autonomy_outcome(audit.lane.as_str(), grant_outcome, now) {
-                Ok(transition) => transition,
-                Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
-            };
+        // Neutral carries no grant_outcome — it stamps the audit record and
+        // stops there (see AuditOutcome::Neutral doc).
+        let transition = match grant_outcome {
+            Some(grant_outcome) => {
+                match graph.record_autonomy_outcome(audit.lane.as_str(), grant_outcome, now) {
+                    Ok(transition) => transition,
+                    Err(e) => return IpcResponse::error(CORR, "STORAGE_ERROR", format!("{e:#}")),
+                }
+            }
+            None => Transition::NoChange,
+        };
         let transition_str = match transition {
             Transition::NoChange => "no_change",
             Transition::Promoted { .. } => "promoted",
@@ -9152,6 +9182,48 @@ impl IpcServer {
                 "posture": posture,
             })),
         )
+    }
+
+    /// Handle `GetConfig("__autonomy_status__")` /
+    /// `GetConfig("__autonomy_status__:{lane}")` — the per-lane trust-ledger
+    /// report `phil autonomy status` reads (Autopoiesis Slice A9). Read-only:
+    /// computed straight from the persisted [`AutonomyGrant`](ansible_mesh_core::autonomy::AutonomyGrant)s
+    /// via [`ansible_mesh_core::autonomy::lane_status_report`], no new state.
+    ///
+    /// `lane = None` → JSON array of every granted lane's report (lanes
+    /// never consulted have no grant yet and are omitted — there is nothing
+    /// to report). `lane = Some(l)` → JSON of that lane's report, or JSON
+    /// `null` if lane `l` has no grant yet.
+    pub(crate) fn handle_query_autonomy_status(
+        graph: &GraphDomain,
+        lane: Option<&str>,
+        now: u64,
+    ) -> IpcResponse {
+        use ansible_mesh_core::autonomy::lane_status_report;
+
+        let key = match lane {
+            Some(lane) => format!("__autonomy_status__:{lane}"),
+            None => "__autonomy_status__".to_string(),
+        };
+        let value_json = match lane {
+            Some(lane) => {
+                let report = graph
+                    .get_autonomy_grant(lane)
+                    .unwrap_or(None)
+                    .map(|g| lane_status_report(&g, now));
+                serde_json::to_string(&report).ok()
+            }
+            None => {
+                let reports: Vec<_> = graph
+                    .list_autonomy_grants()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|g| lane_status_report(g, now))
+                    .collect();
+                serde_json::to_string(&reports).ok()
+            }
+        };
+        IpcResponse::ConfigData { key, value_json }
     }
 
     // ── Agent migration ───────────────────────────────────────────────────────
@@ -13327,7 +13399,7 @@ pub(crate) mod tests {
                     .get_autonomy_audit(&audit_id)
                     .expect("get audit")
                     .expect("audit exists");
-                assert_eq!(audit.outcome, AuditOutcome::Confirmed);
+                assert_eq!(audit.outcome, AuditOutcome::ConfirmedGood);
             }
 
             let grant = graph
@@ -13421,6 +13493,113 @@ pub(crate) mod tests {
                 panic!("expected error Standard");
             };
             assert_eq!(code, "INVALID_LANE");
+        }
+
+        // ── Trust ledger (Autopoiesis Slice A9) ──────────────────────────────
+
+        #[test]
+        fn neutral_outcome_stamps_audit_without_touching_grant_counters() {
+            let graph = graph();
+            set_posture(&graph, AutonomyPosture::ConfirmFirst, T0);
+            let data = consult(&graph, T0 + 1, NO_ENV);
+            let audit_id = data["audit_id"].as_str().expect("audit id").to_string();
+
+            let grant_before = graph
+                .get_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES)
+                .expect("grant lookup")
+                .expect("grant exists");
+
+            let resp = record(&graph, &audit_id, "neutral", T0 + 2);
+            let IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            } = resp
+            else {
+                panic!("expected ok Standard");
+            };
+            assert_eq!(data["recorded"], true);
+            assert_eq!(data["transition"], "no_change");
+
+            let audit = graph
+                .get_autonomy_audit(&audit_id)
+                .expect("get audit")
+                .expect("audit exists");
+            assert_eq!(audit.outcome, AuditOutcome::Neutral);
+
+            let grant_after = graph
+                .get_autonomy_grant(LANE_GRAPH_BRIDGE_EDGES)
+                .expect("grant lookup")
+                .expect("grant exists");
+            // A wash: earn/demote counters and posture are byte-for-byte
+            // unchanged (only `updated_at` on the audit record moved).
+            assert_eq!(
+                grant_before.earned, grant_after.earned,
+                "neutral must not move the earn/demote counters"
+            );
+            assert_eq!(grant_before.posture, grant_after.posture);
+
+            // Idempotent, same as confirmed_good/reversed.
+            let resp = record(&graph, &audit_id, "neutral", T0 + 3);
+            let IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            } = resp
+            else {
+                panic!("expected ok Standard");
+            };
+            assert_eq!(data["recorded"], false);
+            assert_eq!(data["reason"], "already_recorded");
+        }
+
+        #[test]
+        fn status_report_reflects_posture_budget_and_streak() {
+            let graph = graph();
+            set_posture(&graph, AutonomyPosture::ConfirmFirst, T0);
+
+            // Two confirmed-good outcomes: streak=2, no promotion yet
+            // (required_for_promotion default is 5).
+            for i in 1..=2u64 {
+                let data = consult(&graph, T0 + i, NO_ENV);
+                let audit_id = data["audit_id"].as_str().expect("audit id").to_string();
+                record(&graph, &audit_id, "confirmed_good", T0 + 100 + i);
+            }
+
+            let resp = IpcServer::handle_query_autonomy_status(
+                &graph,
+                Some(LANE_GRAPH_BRIDGE_EDGES),
+                T0 + 200,
+            );
+            let IpcResponse::ConfigData { value_json, .. } = resp else {
+                panic!("expected ConfigData");
+            };
+            let report: serde_json::Value =
+                serde_json::from_str(&value_json.expect("some json")).expect("parse");
+            assert_eq!(report["lane"], LANE_GRAPH_BRIDGE_EDGES);
+            assert_eq!(report["posture"], "confirm_first");
+            assert_eq!(report["confirmed_good_streak"], 2);
+            assert_eq!(report["required_for_promotion"], 5);
+            assert_eq!(report["actions_today"], 2, "each consult spends the budget");
+            assert_eq!(report["promotion_eligible"], false);
+            assert_eq!(report["frozen_until_operator_review"], false);
+
+            // Unknown lane: null, not an error.
+            let resp = IpcServer::handle_query_autonomy_status(&graph, Some("no.such.lane"), T0);
+            let IpcResponse::ConfigData { value_json, .. } = resp else {
+                panic!("expected ConfigData");
+            };
+            assert_eq!(value_json.expect("some json"), "null");
+
+            // Unscoped: array containing the one granted lane.
+            let resp = IpcServer::handle_query_autonomy_status(&graph, None, T0 + 200);
+            let IpcResponse::ConfigData { value_json, .. } = resp else {
+                panic!("expected ConfigData");
+            };
+            let reports: Vec<serde_json::Value> =
+                serde_json::from_str(&value_json.expect("some json")).expect("parse");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0]["lane"], LANE_GRAPH_BRIDGE_EDGES);
         }
     }
 
