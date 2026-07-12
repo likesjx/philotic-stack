@@ -55,6 +55,9 @@ use memory_integration::*;
 mod life_capture;
 use life_capture::*;
 
+#[path = "memory_explain_tool.rs"]
+mod memory_explain_tool;
+
 #[path = "voice_stream.rs"]
 mod voice_stream;
 use voice_stream::*;

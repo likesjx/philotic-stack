@@ -4920,6 +4920,8 @@ impl AgentRuntime {
 
             "memory.fix" => self.execute_memory_fix_tool(payload).await,
 
+            "memory.explain" => self.execute_memory_explain_tool(payload).await,
+
             "rule.propose" => {
                 let description = payload
                     .arguments

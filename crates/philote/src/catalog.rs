@@ -269,6 +269,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "memory.promote_candidate",
             "memory.status",
             "memory.fix",
+            "memory.explain",
         ],
         "routing.refinement" => &[
             "session.status",
@@ -2597,6 +2598,37 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                           memory.status shows unreachable."
                 .into(),
             input_schema: json!({ "type": "object", "properties": {} }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.explain".into(),
+        ToolDefinition {
+            tool_name: "memory.explain".into(),
+            description: "Answer 'why do you believe X?' by fanning a claim out across all \
+                          three memory planes — Muninn (MuninnDB engrams), the intel graph \
+                          (decision trail), and LifeGraph (the session's cached life.recall \
+                          evidence) — and merging the result into confirmed / inferred / \
+                          told-or-seeded / pre-provenance bands. Any plane that could not be \
+                          reached is reported as a labeled gap, never silently omitted. Use \
+                          when asked to justify a belief, decision, or remembered fact."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "claim": {
+                        "type": "string",
+                        "description": "The belief/fact/decision to explain, in natural language \
+                                        (e.g. 'the vps deploy key rotates monthly')."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum Muninn engrams to consider. Defaults to 8. Range 1–20."
+                    }
+                },
+                "required": ["claim"]
+            }),
             class: Some("memory".into()),
         },
     );

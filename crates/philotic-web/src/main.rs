@@ -14,6 +14,7 @@ mod init;
 mod keys;
 mod load;
 mod mcp;
+mod memory_explain;
 mod mesh;
 mod muninn;
 mod onboard;
@@ -231,6 +232,13 @@ enum Command {
     Autonomy {
         #[command(subcommand)]
         action: autonomy::AutonomyAction,
+    },
+
+    /// Memory Transparency — merged provenance query across Muninn, the intel
+    /// graph, and LifeGraph (Memory Transparency Slice M2)
+    Memory {
+        #[command(subcommand)]
+        action: memory_explain::MemoryAction,
     },
 
     /// Project intelligence graph — scan, query, and serve the codebase graph
@@ -566,6 +574,7 @@ async fn main() -> Result<()> {
         Command::Keys { action } => keys::run(action).await,
         Command::Heal { action } => heal::run(action).await,
         Command::Autonomy { action } => autonomy::run(action).await,
+        Command::Memory { action } => memory_explain::run(action).await,
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};
             use philotic_graph::PhiloticGraphConfig;
