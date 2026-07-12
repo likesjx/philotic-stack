@@ -684,7 +684,10 @@ async fn main() -> Result<()> {
                     proposals.sort_by(|a, b| a.name.cmp(&b.name));
 
                     let now = chrono::Utc::now();
-                    println!("{:<42} {:<12} {:<10} {}", "PROPOSAL", "RUN", "AGE", "STATUS");
+                    println!(
+                        "{:<42} {:<12} {:<10} {}",
+                        "PROPOSAL", "RUN", "AGE", "STATUS"
+                    );
                     println!("{}", "\u{2500}".repeat(80));
 
                     if proposals.is_empty() {

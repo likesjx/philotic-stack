@@ -379,7 +379,9 @@ mod tests {
         // adopted LifeGraph mutation producers — the envelope must land on
         // the input handed to `cypher::compile_observe`, not just exist as
         // a type.
-        let provenance = input.provenance.expect("paracrine observation must carry provenance");
+        let provenance = input
+            .provenance
+            .expect("paracrine observation must carry provenance");
         assert_eq!(provenance.author, "agent-aria-01");
         assert_eq!(provenance.trust, TrustTier::Inferred);
         assert_eq!(provenance.source, "signal:cron:job-42:1717531200");

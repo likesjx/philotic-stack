@@ -114,7 +114,14 @@ fn ok_response() -> IpcResponse {
 /// serves the operator-target registry, and answers `EmitTask` with a canned
 /// streamed reply pushed as `InboundTask` frames on the same connection
 /// (mirroring how the real hotel routes the `SubscribeInbox` reply leg).
-async fn fake_hotel_conn(mut stream: UnixStream) {
+/// Observer role wired into every test server's environment
+/// (`PHILOTIC_DATASOURCE_CHANGE_OBSERVER_ROLE`); the fake hotel only pushes
+/// canned `datasource_change` events on it when the per-server
+/// `push_lifegraph_changes` flag is set, so unrelated tests see zero
+/// LifeGraphChange traffic.
+const LIFEGRAPH_OBSERVER_ROLE: &str = "lifegraph.change.observer";
+
+async fn fake_hotel_conn(mut stream: UnixStream, push_lifegraph_changes: bool) {
     while let Ok(Some(payload)) = read_ipc_frame(&mut stream).await {
         let request: IpcRequest = match serde_json::from_slice(&payload) {
             Ok(request) => request,
@@ -202,8 +209,23 @@ async fn fake_hotel_conn(mut stream: UnixStream) {
                     stream_canned_reply(&mut stream, &task_json).await
                 }
             }
-            // Register, SubscribeInbox, ReleaseDesktopMembraneLease, and
-            // anything else this surface sends only needs a Standard OK.
+            IpcRequest::SubscribeInbox { role } => {
+                let ack = write_ipc_response(&mut stream, &ok_response()).await;
+                if ack.is_err() {
+                    break;
+                }
+                if push_lifegraph_changes && role == LIFEGRAPH_OBSERVER_ROLE {
+                    // This connection is philotic-web's lifegraph observer:
+                    // it never sends again, so push canned changes until it
+                    // hangs up. Repeats so a change minted before the test
+                    // device enrolls is always followed by one after.
+                    push_lifegraph_changes_until_closed(&mut stream).await
+                } else {
+                    Ok(())
+                }
+            }
+            // Register, ReleaseDesktopMembraneLease, and anything else this
+            // surface sends only needs a Standard OK.
             _ => write_ipc_response(&mut stream, &ok_response()).await,
         };
         if write_result.is_err() {
@@ -318,6 +340,34 @@ async fn push_canned_datasource_reply(
     write_ipc_response(stream, &reply).await
 }
 
+/// Push a canned `datasource_change` (the shape the datasource runtime's
+/// `forward_change_notification` emits) every 150ms until the observer
+/// connection closes.
+async fn push_lifegraph_changes_until_closed(stream: &mut UnixStream) -> std::io::Result<()> {
+    loop {
+        let event = IpcResponse::InboundTask {
+            source_node: LOCAL_TARGET_NODE.into(),
+            task_id: uuid::Uuid::new_v4(),
+            task_json: json!({
+                "action": "datasource_change",
+                "capability": "life.observe",
+                "provider": "life-graph-memorygraphrag",
+                "change": {
+                    "change_kind": "observed",
+                    "node_id": "openloop-testchange",
+                    "label": "OpenLoop",
+                    "summary": "canned change summary",
+                },
+            })
+            .to_string(),
+        };
+        if write_ipc_response(stream, &event).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 /// Push the canned streaming reply for one emitted operator-chat task:
 /// a `turn_event` status, two `partial_reply` tokens, then the `send_reply`.
 async fn stream_canned_reply(stream: &mut UnixStream, task_json: &str) -> std::io::Result<()> {
@@ -380,6 +430,10 @@ fn free_loopback_port() -> u16 {
 }
 
 async fn spawn_server() -> TestServer {
+    spawn_server_with(false).await
+}
+
+async fn spawn_server_with(push_lifegraph_changes: bool) -> TestServer {
     let dir = std::env::temp_dir().join(format!(
         "pw-edge-e2e-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..12]
@@ -392,7 +446,7 @@ async fn spawn_server() -> TestServer {
     let listener = UnixListener::bind(&socket_path).expect("bind fake hotel socket");
     let hotel_task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(fake_hotel_conn(stream));
+            tokio::spawn(fake_hotel_conn(stream, push_lifegraph_changes));
         }
     });
 
@@ -421,6 +475,10 @@ async fn spawn_server() -> TestServer {
             socket_path.to_str().expect("utf8 socket path"),
         )
         .env("PHILOTIC_WEB_EDGE_INVITE", &invite)
+        .env(
+            "PHILOTIC_DATASOURCE_CHANGE_OBSERVER_ROLE",
+            LIFEGRAPH_OBSERVER_ROLE,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -823,6 +881,43 @@ async fn edge_lifegraph_rest_bridge_serves_lens_node_and_neighborhood() {
     assert_eq!(body["origin_id"], "goal-1");
     assert_eq!(body["depth"], 2);
     assert_eq!(body["truncated"], false);
+}
+
+/// 1d. lifegraph-change-push: `datasource_change` events on the observer
+///     role become retained `LifeGraphChange` frames on every enrolled
+///     device's ring, delivered live over the WS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifegraph_changes_push_as_retained_edge_frames() {
+    let server = spawn_server_with(true).await;
+    let (mut ws, _enrollment) = server.open_session("cHVia2V5LWNoYW5nZQ==", None).await;
+
+    // The fake hotel repeats the change every 150ms, so the first frame
+    // minted after this device enrolled arrives promptly. recv_envelope
+    // itself bounds each wait at 15s.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no LifeGraphChange frame within 10s"
+        );
+        let envelope = recv_envelope(&mut ws).await;
+        if let EdgeMessage::LifeGraphChange {
+            change_kind,
+            node_id,
+            label,
+            summary,
+        } = &envelope.msg
+        {
+            assert_eq!(change_kind, "observed");
+            assert_eq!(node_id, "openloop-testchange");
+            assert_eq!(label.as_deref(), Some("OpenLoop"));
+            assert_eq!(summary.as_deref(), Some("canned change summary"));
+            // Retained frames consume real seqs — replayable after reconnect.
+            assert!(envelope.seq > 0);
+            break;
+        }
+    }
+    ws.close(None).await.ok();
 }
 
 /// 2. A non-Hello first frame is a protocol violation: fatal Error, then close.

@@ -417,7 +417,7 @@ impl DatasourceProvider for LifeGraphProvider {
     }
 
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        match task.kind.as_str() {
+        let mut output = match task.kind.as_str() {
             "life.observe" => self.handle_observe(task).await,
             "life.recall" => self.handle_recall(task).await,
             "life.recall.feedback" => self.handle_recall_feedback(task).await,
@@ -437,8 +437,63 @@ impl DatasourceProvider for LifeGraphProvider {
                     "tool": other,
                 })))
             }
+        }?;
+        // lifegraph-change-push seam: a successful write attaches a
+        // change_notification that the datasource runtime fans out to the
+        // configured observer role (which philotic-web turns into retained
+        // LifeGraphChange frames for enrolled edge devices).
+        if let ProviderOutput::ResultSet(data) = &mut output {
+            if let Some(change) = change_notification_for(task.kind.as_str(), data) {
+                data["change_notification"] = change;
+            }
         }
+        Ok(output)
     }
+}
+
+/// Derive the change notification for a successful write handler's output.
+/// Read-only tools and blocked / invalid / not-found outcomes return `None` —
+/// they must never generate device pings. The node reference is whichever
+/// canonical id the handler reported (`node_id`, `patch_id`, `conflict_id`).
+fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
+    let change_kind = match kind {
+        "life.observe" => "observed",
+        "life.commit" => "committed",
+        "life.resolve" | "life.conflict.resolve" => "resolved",
+        "life.conflict" | "life.conflict.handle" => "conflict_opened",
+        "life.patch.propose" => "patch_proposed",
+        "life.patch.apply" => "patch_applied",
+        _ => return None,
+    };
+    let status = data
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let succeeded = matches!(
+        status,
+        "proposed" | "committed" | "resolved" | "applied" | "awaiting_operator"
+    ) || (change_kind == "conflict_opened" && status == "open");
+    if !succeeded {
+        return None;
+    }
+    let node_id = ["node_id", "patch_id", "conflict_id"]
+        .iter()
+        .find_map(|key| data.get(*key).and_then(Value::as_str))?;
+    let mut change = json!({
+        "change_kind": change_kind,
+        "node_id": node_id,
+    });
+    if let Some(label) = data.get("label").and_then(Value::as_str) {
+        change["label"] = json!(label);
+    }
+    if let Some(summary) = data
+        .get("summary")
+        .or_else(|| data.get("claim_summary"))
+        .and_then(Value::as_str)
+    {
+        change["summary"] = json!(summary);
+    }
+    Some(change)
 }
 
 impl LifeGraphProvider {
@@ -2641,6 +2696,66 @@ mod tests {
             parameters,
             identity: json!({}),
         }
+    }
+
+    #[test]
+    fn change_notification_derives_only_from_successful_writes() {
+        // Observe success → observed, with label + summary carried through.
+        let data = json!({
+            "status": "proposed",
+            "node_id": "openloop-1",
+            "label": "OpenLoop",
+            "claim_summary": "call pharmacy",
+        });
+        let change = change_notification_for("life.observe", &data).expect("change");
+        assert_eq!(change["change_kind"], "observed");
+        assert_eq!(change["node_id"], "openloop-1");
+        assert_eq!(change["label"], "OpenLoop");
+        assert_eq!(change["summary"], "call pharmacy");
+
+        // Blocked / failed writes never notify.
+        assert!(change_notification_for("life.observe", &json!({"status": "blocked"})).is_none());
+        assert!(change_notification_for("life.commit", &json!({"status": "not_found"})).is_none());
+
+        // Read-only kinds never notify, even with an ok status + node ref.
+        for kind in [
+            "life.recall",
+            "life.view.node",
+            "life.view.neighborhood",
+            "life.patch.list",
+        ] {
+            assert!(
+                change_notification_for(kind, &json!({"status": "ok", "node_id": "x"})).is_none(),
+                "{kind} must never generate a change notification"
+            );
+        }
+
+        // Conflict open uses the conflict_id as the node ref.
+        let change = change_notification_for(
+            "life.conflict",
+            &json!({"status": "open", "conflict_id": "conf-9"}),
+        )
+        .expect("conflict change");
+        assert_eq!(change["change_kind"], "conflict_opened");
+        assert_eq!(change["node_id"], "conf-9");
+
+        // Patch apply uses patch_id; awaiting_operator proposals also notify.
+        let change = change_notification_for(
+            "life.patch.apply",
+            &json!({"status": "applied", "patch_id": "patch-3"}),
+        )
+        .expect("patch change");
+        assert_eq!(change["node_id"], "patch-3");
+        assert!(
+            change_notification_for(
+                "life.patch.propose",
+                &json!({"status": "awaiting_operator", "patch_id": "patch-4"}),
+            )
+            .is_some()
+        );
+
+        // A success status without any node ref cannot notify.
+        assert!(change_notification_for("life.commit", &json!({"status": "committed"})).is_none());
     }
 
     #[test]

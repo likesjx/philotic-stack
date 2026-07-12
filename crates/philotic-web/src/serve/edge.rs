@@ -333,6 +333,17 @@ impl EdgeState {
             .any(|record| record.node_id == node_id)
     }
 
+    /// Every enrolled device node id — the fan-out set for graph-wide pushes
+    /// like `LifeGraphChange` (the operator's devices all observe one graph).
+    pub(crate) fn enrolled_node_ids(&self) -> Vec<String> {
+        self.registry
+            .lock()
+            .expect("edge registry lock")
+            .iter()
+            .map(|record| record.node_id.clone())
+            .collect()
+    }
+
     /// Resolve a presented bearer token to the enrolled device's node id.
     /// Each candidate comparison is constant-time.
     pub(crate) fn device_node_for_token(&self, presented: &str) -> Option<String> {
@@ -1256,6 +1267,101 @@ pub(crate) fn spawn_edge_retainer(
             }
         }
     })
+}
+
+/// Environment variable naming the observer role for datasource change
+/// pings (lifegraph-change-push seam). Must match the role the datasource
+/// runtime's `forward_change_notification` targets — set the SAME value in
+/// the hotel (guest) environment and the philotic-web service environment.
+pub(crate) const LIFEGRAPH_CHANGE_OBSERVER_ENV: &str = "PHILOTIC_DATASOURCE_CHANGE_OBSERVER_ROLE";
+
+/// Spawn the process-wide lifegraph change observer: a persistent IPC
+/// subscription on `observer_role` that turns each `datasource_change` push
+/// from the life-graph runner into retained [`EdgeMessage::LifeGraphChange`]
+/// frames for EVERY enrolled edge device — whether or not a session is live,
+/// so a disconnected device still replays the change on its next
+/// cursor-bearing Hello. Reconnects with a 5s backoff on any IPC failure
+/// (mirrors the hotel-restart resilience of the WS lease loop).
+pub(crate) fn spawn_lifegraph_change_observer(
+    edge: EdgeState,
+    socket: String,
+    observer_role: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = run_lifegraph_change_observer(&edge, &socket, &observer_role).await {
+                eprintln!(
+                    "philotic-web: lifegraph change observer disconnected: {err:#}; retrying in 5s"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    })
+}
+
+async fn run_lifegraph_change_observer(
+    edge: &EdgeState,
+    socket: &str,
+    observer_role: &str,
+) -> anyhow::Result<()> {
+    let mut client = super::connect_client_with_identity(
+        socket,
+        GuestIdentity {
+            guest_id: "philotic-web-lifegraph-observer".into(),
+            role: observer_role.to_string(),
+            supported_tools: vec![],
+        },
+    )
+    .await?;
+    match client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: observer_role.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => anyhow::bail!("lifegraph observer subscription refused: {other:?}"),
+    }
+    loop {
+        let pushed = client.recv_task().await?;
+        let IpcResponse::InboundTask { task_json, .. } = pushed else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&task_json) else {
+            continue;
+        };
+        if payload.get("action").and_then(Value::as_str) != Some("datasource_change") {
+            continue;
+        }
+        let change = payload.get("change").cloned().unwrap_or(Value::Null);
+        let node_id = change
+            .get("node_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if node_id.is_empty() {
+            continue;
+        }
+        let msg = EdgeMessage::LifeGraphChange {
+            change_kind: change
+                .get("change_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("changed")
+                .to_string(),
+            node_id,
+            label: change
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            summary: change
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        for device_node in edge.enrolled_node_ids() {
+            let _ = edge.outbound_envelope(&device_node, None, msg.clone(), true);
+        }
+    }
 }
 
 fn edge_error(code: &str, message: &str, fatal: bool) -> EdgeMessage {
