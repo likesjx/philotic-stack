@@ -254,6 +254,87 @@ impl Materializer for LocalProcessMaterializer {
     }
 }
 
+// ── Heal-the-healer: dispatcher heartbeat watchdog (S2) ────────────────────
+//
+// The doctor check (`crates/philotic-web/src/doctor.rs::HealDispatcherStaleness`,
+// #214) already *displays* a stale `heal_dispatcher.last_cycle_at` heartbeat
+// offline. This closes the loop with live enforcement: a PID-alive-but-wedged
+// heal-dispatcher (a hung classifier, blocked IPC — PID-liveness alone can't
+// see it) gets restarted through the SAME respawn budget every other
+// supervisor/heal restart draws down, never a parallel mechanism.
+
+/// Role name the heal-dispatcher guest is materialized under (see
+/// `crates/aiua/src/main.rs`, `GuestRecord { role: "heal-dispatcher", .. }`).
+pub(crate) const HEAL_DISPATCHER_ROLE: &str = "heal-dispatcher";
+
+/// Hotel config key the heal-dispatcher stamps at the end of each poll cycle.
+/// MUST match `HEARTBEAT_KEY` in `crates/heal-dispatcher/src/main.rs` and
+/// `HEAL_DISPATCHER_HEARTBEAT_KEY` in `crates/philotic-web/src/doctor.rs` —
+/// this constant is the live-enforcement half of the same integration
+/// contract doctor only reads offline.
+pub(crate) const HEAL_DISPATCHER_HEARTBEAT_KEY: &str = "heal_dispatcher.last_cycle_at";
+
+/// Mirrors heal-dispatcher's `POLL_INTERVAL_SECS`. Duplicated (not shared via
+/// a common crate) for the same reason doctor.rs duplicates it: heal-dispatcher
+/// ships bin-only.
+pub(crate) const HEAL_DISPATCHER_POLL_INTERVAL_SECS: u64 = 30;
+
+/// Heartbeat older than 3x the poll interval (or, for an absent heartbeat,
+/// that long since we first observed the current PID) ⇒ treat the dispatcher
+/// as wedged. Matches doctor's `HEAL_DISPATCHER_STALE_SECS` so live
+/// enforcement and offline visibility always agree on the same threshold.
+pub(crate) const HEAL_DISPATCHER_STALE_SECS: u64 = 3 * HEAL_DISPATCHER_POLL_INTERVAL_SECS;
+
+/// Parse a stored heartbeat config value into epoch seconds. Mirrors
+/// `philotic_web::doctor::parse_epoch_secs` (JSON number, JSON string, or a
+/// bare integer); returns `None` on anything else so an unreadable value
+/// degrades to "treat like absent" instead of panicking or reading false-fresh.
+pub(crate) fn parse_heartbeat_epoch_secs(value_json: &str) -> Option<i64> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(value_json) {
+        if let Some(n) = v.as_i64() {
+            return Some(n);
+        }
+        if let Some(f) = v.as_f64() {
+            return Some(f as i64);
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(n) = s.trim().parse::<i64>() {
+                return Some(n);
+            }
+        }
+    }
+    value_json.trim().parse::<i64>().ok()
+}
+
+/// Pure decision: given the dispatcher's last-read heartbeat (epoch seconds,
+/// if any), when we first observed its current PID, and the current time —
+/// is it wedged?
+///
+/// - A present, past-or-present heartbeat is stale once its age exceeds
+///   [`HEAL_DISPATCHER_STALE_SECS`].
+/// - A present but FUTURE heartbeat (clock skew, or a seconds/millis unit
+///   mismatch with the writer) is never treated as stale here: an untrustworthy
+///   timestamp must not drive a spurious restart. Doctor surfaces the mismatch
+///   itself (as a Warning finding); this watchdog just declines to act on it.
+/// - An absent heartbeat (an older dispatcher build, or one that has never
+///   completed a first cycle) is judged against how long we've observed the
+///   current PID, so a dispatcher wedged before its first cycle still gets
+///   caught instead of running unchecked forever — bounded by the same
+///   threshold, giving every fresh spawn one full grace window.
+pub(crate) fn dispatcher_heartbeat_is_stale(
+    heartbeat_epoch: Option<i64>,
+    pid_first_seen_epoch: u64,
+    now: u64,
+) -> bool {
+    match heartbeat_epoch {
+        Some(ts) if ts >= 0 && (ts as u64) <= now => {
+            now.saturating_sub(ts as u64) > HEAL_DISPATCHER_STALE_SECS
+        }
+        Some(_future_or_negative) => false,
+        None => now.saturating_sub(pid_first_seen_epoch) > HEAL_DISPATCHER_STALE_SECS,
+    }
+}
+
 /// Maximum supervisor respawns per guest within [`RESPAWN_BUDGET_WINDOW_SECS`].
 pub(crate) const RESPAWN_BUDGET_MAX: usize = 5;
 /// Sliding flap-protection window (seconds). Also the cool-down after a breach:
@@ -347,6 +428,13 @@ pub struct GuestManager {
     materializer: Arc<Mutex<Box<dyn Materializer>>>,
     respawn_budget: RespawnBudget,
     heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+    /// In-memory `guest_id -> (last observed pid, first-seen epoch)` for the
+    /// heal-dispatcher heartbeat watchdog (S2). Not persisted: a hotel
+    /// restart re-observes the current PID fresh on the next tick, which
+    /// simply grants one more grace window — acceptable, since the failure
+    /// this guards against (a wedged-but-alive dispatcher) can't survive a
+    /// hotel restart anyway.
+    dispatcher_pid_tracking: std::sync::Mutex<HashMap<String, (String, u64)>>,
 }
 
 #[async_trait]
@@ -376,6 +464,7 @@ impl GuestManager {
             materializer: Arc::new(Mutex::new(materializer)),
             respawn_budget: RespawnBudget::new(),
             heal_queue: None,
+            dispatcher_pid_tracking: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -692,6 +781,13 @@ impl GuestManager {
                     if let Err(e) = self.reconcile_all().await {
                         error!("Guest Supervisor Reconciliation Error: {}", e);
                     }
+                    // S2 heal-the-healer: a dead heal-dispatcher PID is already
+                    // caught by reconcile_all() above; this catches the case
+                    // reconcile_all can't — a PID that's alive but wedged
+                    // (stale heartbeat, not cycling).
+                    if let Err(e) = self.check_heal_dispatcher_heartbeat().await {
+                        warn!("Heal-dispatcher heartbeat watchdog error: {}", e);
+                    }
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Guest Supervisor received universal shutdown signal. Terminating loop.");
@@ -878,6 +974,138 @@ impl GuestManager {
                     Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// S2 heal-the-healer: detect a heal-dispatcher whose PID is alive but
+    /// whose `heal_dispatcher.last_cycle_at` heartbeat has gone stale (wedged
+    /// — a hung classifier, blocked IPC, ...) and restart it through the same
+    /// respawn budget every other supervisor/heal-triggered restart shares.
+    /// Budget exhaustion is not handled here at all: `check_heal_restart_budget_at`
+    /// already marks the graph and pushes the throttled heal-queue escalation
+    /// on the breaching call, exactly as it does for IPC-triggered heal
+    /// restarts — no parallel escalation path is introduced.
+    async fn check_heal_dispatcher_heartbeat(&self) -> Result<()> {
+        self.check_heal_dispatcher_heartbeat_at(epoch_now()).await
+    }
+
+    /// Clock injected for deterministic tests; see [`check_heal_dispatcher_heartbeat`].
+    async fn check_heal_dispatcher_heartbeat_at(&self, now: u64) -> Result<()> {
+        let guests = self.graph.list_guests(&self.hotel_name, false)?;
+        let Some(rec) = guests
+            .into_iter()
+            .find(|g| g.role == HEAL_DISPATCHER_ROLE)
+        else {
+            return Ok(()); // not deployed on this hotel — nothing to watch
+        };
+        if !rec.is_active {
+            return Ok(());
+        }
+        let Some(active_pid) = rec.active_pid.clone() else {
+            // No PID: the ordinary reconcile_all() PID-liveness path handles
+            // (re)spawning a genuinely dead guest.
+            return Ok(());
+        };
+
+        // Grant a fresh grace window whenever the observed PID changes (a
+        // respawn happened, ours or otherwise), so a just-spawned dispatcher
+        // is never judged against a heartbeat left over from its predecessor.
+        let first_seen = {
+            let mut tracking = self.dispatcher_pid_tracking.lock().unwrap();
+            let entry = tracking
+                .entry(rec.guest_id.clone())
+                .or_insert_with(|| (active_pid.clone(), now));
+            if entry.0 != active_pid {
+                *entry = (active_pid.clone(), now);
+            }
+            entry.1
+        };
+
+        let is_live = {
+            let mut mat = self.materializer.lock().await;
+            mat.check_status(&rec.guest_id, &active_pid).await?
+        };
+        if !is_live {
+            // Dead PID: reconcile_all() already owns this path.
+            return Ok(());
+        }
+
+        let heartbeat_epoch = self
+            .graph
+            .get_config_value(HEAL_DISPATCHER_HEARTBEAT_KEY)?
+            .and_then(|raw| parse_heartbeat_epoch_secs(&raw));
+
+        if !dispatcher_heartbeat_is_stale(heartbeat_epoch, first_seen, now) {
+            return Ok(());
+        }
+
+        warn!(
+            guest_id = %rec.guest_id,
+            heartbeat_epoch = ?heartbeat_epoch,
+            first_seen_pid_at = first_seen,
+            now,
+            "Heal-dispatcher watchdog: heartbeat stale (process alive, not cycling) — requesting heal-restart"
+        );
+
+        if self.check_heal_restart_budget_at(&rec.guest_id, now) == HealRestartVerdict::Denied {
+            // Either just breached (already marked + escalated inside
+            // check_heal_restart_budget_at) or still cooling down (already
+            // escalated once, intentionally quiet on every subsequent tick).
+            return Ok(());
+        }
+
+        {
+            let mut mat = self.materializer.lock().await;
+            if let Err(e) = mat.reclaim_guest(&rec.guest_id).await {
+                warn!(
+                    "Heal-dispatcher watchdog: reclaim failed for [{}]: {}",
+                    rec.guest_id, e
+                );
+            }
+        }
+        if let Ok(pid) = active_pid.parse::<u32>() {
+            if LocalProcessMaterializer::pid_exists(pid) {
+                warn!(
+                    "Heal-dispatcher watchdog: PID {} survived reclaim; killing directly.",
+                    pid
+                );
+                LocalProcessMaterializer::terminate_pid(pid);
+            }
+        }
+        Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
+
+        // Never silently absent: every auto-restart is visible in the heal
+        // queue too, not just the logs — independent of whether this attempt
+        // happens to stay under budget (budget exhaustion has its own
+        // escalation above, via mark_respawn_budget_exhausted).
+        if let Some(hq) = &self.heal_queue {
+            let msg = format!(
+                "heal-dispatcher watchdog: guest [{}] heartbeat stale (>{}s); auto-restarted",
+                rec.guest_id, HEAL_DISPATCHER_STALE_SECS
+            );
+            if let Err(e) = hq.push_error(&rec.guest_id, &msg) {
+                warn!(
+                    "Heal-dispatcher watchdog: failed to push heal_queue entry for [{}]: {}",
+                    rec.guest_id, e
+                );
+            }
+        }
+
+        match self.ensure_guest_active(&rec.guest_id).await {
+            Ok(true) => info!(
+                guest_id = %rec.guest_id,
+                "Heal-dispatcher watchdog: restarted stale-heartbeat dispatcher."
+            ),
+            Ok(false) => warn!(
+                guest_id = %rec.guest_id,
+                "Heal-dispatcher watchdog: restart requested but guest was not re-materialized."
+            ),
+            Err(e) => error!(
+                guest_id = %rec.guest_id,
+                "Heal-dispatcher watchdog: respawn failed: {}", e
+            ),
         }
 
         Ok(())
@@ -1476,5 +1704,306 @@ mod tests {
         assert_eq!(reclaim_count.load(Ordering::SeqCst), 1);
         let guests = graph.list_guests("test-hotel", false).expect("list guests");
         assert!(guests.is_empty());
+    }
+
+    // ── Heal-the-healer: dispatcher heartbeat watchdog (S2) ────────────────
+
+    #[test]
+    fn parse_heartbeat_epoch_secs_is_defensive() {
+        assert_eq!(parse_heartbeat_epoch_secs("1750000000"), Some(1_750_000_000));
+        assert_eq!(
+            parse_heartbeat_epoch_secs("\"1750000000\""),
+            Some(1_750_000_000)
+        );
+        assert_eq!(
+            parse_heartbeat_epoch_secs("  1750000000  "),
+            Some(1_750_000_000)
+        );
+        assert_eq!(parse_heartbeat_epoch_secs("not-a-number"), None);
+        assert_eq!(parse_heartbeat_epoch_secs("\"nope\""), None);
+    }
+
+    #[test]
+    fn dispatcher_heartbeat_staleness_present_heartbeat() {
+        let now: u64 = 1_000_000;
+        let now_i = now as i64;
+        // Exactly at the boundary is still fresh.
+        assert!(!dispatcher_heartbeat_is_stale(
+            Some(now_i - HEAL_DISPATCHER_STALE_SECS as i64),
+            0,
+            now
+        ));
+        // One second past the boundary is stale.
+        assert!(dispatcher_heartbeat_is_stale(
+            Some(now_i - HEAL_DISPATCHER_STALE_SECS as i64 - 1),
+            0,
+            now
+        ));
+    }
+
+    #[test]
+    fn dispatcher_heartbeat_staleness_future_heartbeat_is_never_stale() {
+        // Clock skew / a seconds-millis unit mismatch must not drive a
+        // spurious restart — doctor surfaces the mismatch itself.
+        let now: u64 = 1_000_000;
+        assert!(!dispatcher_heartbeat_is_stale(
+            Some(now as i64 + 50_000),
+            0,
+            now
+        ));
+    }
+
+    #[test]
+    fn dispatcher_heartbeat_staleness_absent_heartbeat_uses_pid_first_seen() {
+        let now = 1_000_000;
+        // PID observed recently: within the grace window, not stale yet.
+        assert!(!dispatcher_heartbeat_is_stale(
+            None,
+            now - HEAL_DISPATCHER_STALE_SECS,
+            now
+        ));
+        // PID observed long enough ago with STILL no heartbeat: stale.
+        assert!(dispatcher_heartbeat_is_stale(
+            None,
+            now - HEAL_DISPATCHER_STALE_SECS - 1,
+            now
+        ));
+    }
+
+    fn heal_dispatcher_guest(guest_id: &str, active_pid: Option<&str>) -> GuestRecord {
+        GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: guest_id.into(),
+            role: HEAL_DISPATCHER_ROLE.into(),
+            config_json: json!({ "command": "heal-dispatcher" }).to_string(),
+            is_active: true,
+            active_pid: active_pid.map(|s| s.to_string()),
+            last_active_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn heal_dispatcher_watchdog_ignores_fresh_heartbeat() {
+        let pid = "12345".to_string();
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![heal_dispatcher_guest(
+            "test-hotel:heal-dispatcher",
+            Some(&pid),
+        )]));
+        graph
+            .set_config_value(HEAL_DISPATCHER_HEARTBEAT_KEY, "1000")
+            .expect("set heartbeat");
+
+        let mock = MockMaterializer::new(HashMap::from([(pid.clone(), true)]));
+        let spawn_count = mock.spawn_count.clone();
+        let reclaim_count = mock.reclaim_count.clone();
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock));
+
+        // now - heartbeat = 30s, well under the 90s staleness threshold.
+        manager
+            .check_heal_dispatcher_heartbeat_at(1_030)
+            .await
+            .expect("watchdog tick");
+
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
+        assert_eq!(reclaim_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn heal_dispatcher_watchdog_ignores_dead_pid() {
+        // A dead PID is reconcile_all()'s job, not this watchdog's — even
+        // with a stale heartbeat, an already-dead dispatcher must not be
+        // double-restarted here.
+        let pid = "12345".to_string();
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![heal_dispatcher_guest(
+            "test-hotel:heal-dispatcher",
+            Some(&pid),
+        )]));
+        graph
+            .set_config_value(HEAL_DISPATCHER_HEARTBEAT_KEY, "0")
+            .expect("set heartbeat");
+
+        let mock = MockMaterializer::new(HashMap::from([(pid.clone(), false)]));
+        let spawn_count = mock.spawn_count.clone();
+        let reclaim_count = mock.reclaim_count.clone();
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock));
+
+        manager
+            .check_heal_dispatcher_heartbeat_at(1_000_000)
+            .await
+            .expect("watchdog tick");
+
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
+        assert_eq!(reclaim_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn heal_dispatcher_watchdog_ignores_other_roles() {
+        let pid = "12345".to_string();
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: "test-hotel:tool-runner".into(),
+            role: "tool".into(),
+            config_json: json!({ "command": "tool-runner" }).to_string(),
+            is_active: true,
+            active_pid: Some(pid.clone()),
+            last_active_at: None,
+        }]));
+        // No heartbeat at all recorded — if this watchdog mistakenly matched
+        // a non-heal-dispatcher guest, an absent heartbeat this long after
+        // "first seen" would trigger a restart.
+        let mock = MockMaterializer::new(HashMap::from([(pid.clone(), true)]));
+        let spawn_count = mock.spawn_count.clone();
+        let reclaim_count = mock.reclaim_count.clone();
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock));
+
+        manager
+            .check_heal_dispatcher_heartbeat_at(1_000_000)
+            .await
+            .expect("watchdog tick");
+
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
+        assert_eq!(reclaim_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn heal_dispatcher_watchdog_restarts_wedged_dispatcher_and_files_heal_entry() {
+        let pid = "12345".to_string();
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![heal_dispatcher_guest(
+            "test-hotel:heal-dispatcher",
+            Some(&pid),
+        )]));
+        graph
+            .set_config_value(HEAL_DISPATCHER_HEARTBEAT_KEY, "1000")
+            .expect("set heartbeat");
+
+        let mock = MockMaterializer::new(HashMap::from([
+            (pid.clone(), true),
+            ("spawned-1".to_string(), true),
+        ]));
+        let spawn_count = mock.spawn_count.clone();
+        let reclaim_count = mock.reclaim_count.clone();
+        let heal = Arc::new(MockHealQueue::new());
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock))
+            .with_heal_queue(heal.clone());
+
+        // now - heartbeat = 91s, one second past the 90s staleness threshold.
+        manager
+            .check_heal_dispatcher_heartbeat_at(1_091)
+            .await
+            .expect("watchdog tick");
+
+        assert_eq!(
+            reclaim_count.load(Ordering::SeqCst),
+            1,
+            "wedged dispatcher must be killed"
+        );
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "and respawned exactly once"
+        );
+        let pushes = heal.pushes.lock().unwrap();
+        assert_eq!(pushes.len(), 1, "auto-restart must be filed, never silent");
+        assert_eq!(pushes[0].0, "test-hotel:heal-dispatcher");
+        assert!(pushes[0].1.contains("auto-restarted"));
+
+        let guests = graph.list_guests("test-hotel", false).expect("list guests");
+        assert_eq!(guests[0].active_pid.as_deref(), Some("spawned-1"));
+    }
+
+    #[tokio::test]
+    async fn heal_dispatcher_watchdog_absent_heartbeat_past_grace_window_restarts() {
+        // A dispatcher wedged before completing its FIRST cycle never writes
+        // a heartbeat at all — this must still be caught, judged against how
+        // long the PID has been observed, not left to run unchecked forever.
+        let pid = "12345".to_string();
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![heal_dispatcher_guest(
+            "test-hotel:heal-dispatcher",
+            Some(&pid),
+        )]));
+        // No heartbeat key written at all.
+
+        let mock = MockMaterializer::new(HashMap::from([
+            (pid.clone(), true),
+            ("spawned-1".to_string(), true),
+        ]));
+        let spawn_count = mock.spawn_count.clone();
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock));
+
+        // First tick observes the PID (grace window starts at t=1000); still
+        // within the grace window, so no restart yet.
+        manager
+            .check_heal_dispatcher_heartbeat_at(1_000)
+            .await
+            .expect("first tick");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
+
+        // Past the grace window with the SAME pid still no heartbeat: restart.
+        manager
+            .check_heal_dispatcher_heartbeat_at(1_000 + HEAL_DISPATCHER_STALE_SECS + 1)
+            .await
+            .expect("second tick");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn heal_dispatcher_watchdog_stops_at_shared_respawn_budget_and_escalates() {
+        // A dispatcher that never recovers (heartbeat permanently frozen) must
+        // stop being auto-restarted once it hits the SAME respawn budget every
+        // other heal/supervisor restart shares, and the budget exhaustion must
+        // escalate exactly once — never a parallel/unbounded restart loop.
+        let pid = "12345".to_string();
+        let mut status = HashMap::from([(pid.clone(), true)]);
+        for i in 1..=(RESPAWN_BUDGET_MAX + 2) {
+            status.insert(format!("spawned-{i}"), true);
+        }
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![heal_dispatcher_guest(
+            "test-hotel:heal-dispatcher",
+            Some(&pid),
+        )]));
+        graph
+            .set_config_value(HEAL_DISPATCHER_HEARTBEAT_KEY, "0")
+            .expect("set heartbeat");
+
+        let mock = MockMaterializer::new(status);
+        let spawn_count = mock.spawn_count.clone();
+        let heal = Arc::new(MockHealQueue::new());
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock))
+            .with_heal_queue(heal.clone());
+
+        // Ticks 60s apart: heartbeat frozen at 0 is always stale, and 60s
+        // spacing accumulates RESPAWN_BUDGET_MAX attempts inside one 600s
+        // sliding window (mirrors `heal_restart_budget_skips_and_marks_after_sixth_in_window`,
+        // just with a wider, still sub-window, spacing to also exercise the
+        // per-tick PID-first-seen bookkeeping across respawns).
+        for i in 0..(RESPAWN_BUDGET_MAX + 2) {
+            let now = 1_000 + (i as u64) * 60;
+            manager
+                .check_heal_dispatcher_heartbeat_at(now)
+                .await
+                .expect("watchdog tick");
+        }
+
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            RESPAWN_BUDGET_MAX,
+            "heal-restarts must stop at the shared respawn budget"
+        );
+
+        let pushes = heal.pushes.lock().unwrap();
+        // One heal_queue entry per successful auto-restart, plus exactly one
+        // budget-exhaustion escalation — never silently absent, never doubled.
+        assert_eq!(pushes.len(), RESPAWN_BUDGET_MAX + 1);
+        assert!(
+            pushes.last().unwrap().1.contains("exhausted"),
+            "final push must be the budget-exhaustion escalation: {:?}",
+            pushes.last()
+        );
+
+        let state = graph
+            .get_config_value("supervision_state:test-hotel:test-hotel:heal-dispatcher")
+            .expect("config read")
+            .expect("supervision_state should be set");
+        assert!(state.contains("respawn_budget_exhausted"));
     }
 }
