@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub struct CronTicker {
@@ -63,6 +63,32 @@ pub struct CronTicker {
     /// sole delivery owner of its fires — any other consumer that later observes
     /// the same envelope is a structural no-op.
     delivery_claims: DeliveryClaimRegistry,
+    /// Memory Transparency Slice M4 (`memory.hygiene`) context. `None` when
+    /// `with_memory_hygiene` was never called (tests, or a hotel with no
+    /// `memory-hygiene:*` job registered) — `fire()` logs and skips instead
+    /// of panicking if a job somehow targets [`crate::memory_hygiene::CRON_TARGET_ROLE`]
+    /// without it.
+    memory_hygiene: Option<MemoryHygieneCronContext>,
+}
+
+/// Wiring the in-process `memory.hygiene` sweep needs at fire time — separate
+/// from the constructor so existing `CronTicker::new` call sites (including
+/// every test) are untouched; opt in via [`CronTicker::with_memory_hygiene`].
+struct MemoryHygieneCronContext {
+    muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+    hotel_name: String,
+    intel_graph_url: Option<String>,
+    /// This hotel's own `PHILOTIC_MEMORY_HYGIENE_ENABLED` opt-in, captured
+    /// once at boot. **Load-bearing, not redundant with job registration:**
+    /// `startup_sync`/`CronJobSync` replicate a `CronJob` *definition* to
+    /// every mesh-connected peer unconditionally (`handle_cron_job_sync`
+    /// upserts without checking any local flag), so a job registered on one
+    /// opted-in hotel becomes locally due — and would otherwise locally
+    /// fire — on every peer too. Re-checking the *local* opt-in at fire time
+    /// is what actually keeps "operator opts in per hotel" true once the
+    /// mesh is involved; without it, one hotel's opt-in silently sweeps the
+    /// whole fleet.
+    enabled_locally: bool,
 }
 
 impl CronTicker {
@@ -86,7 +112,31 @@ impl CronTicker {
             parked_inbound,
             materialization_requester,
             delivery_claims,
+            memory_hygiene: None,
         }
+    }
+
+    /// Wire the `memory.hygiene` sweep context (Memory Transparency Slice
+    /// M4). `fire()` intercepts jobs whose `target_role` is
+    /// `crate::memory_hygiene::CRON_TARGET_ROLE` and runs the sweep
+    /// in-process instead of delivering to a guest inbox — but only when
+    /// `enabled_locally` is true (this hotel's own
+    /// `PHILOTIC_MEMORY_HYGIENE_ENABLED`, not just a locally-present job
+    /// record — see [`MemoryHygieneCronContext::enabled_locally`]).
+    pub fn with_memory_hygiene(
+        mut self,
+        muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+        hotel_name: impl Into<String>,
+        intel_graph_url: Option<String>,
+        enabled_locally: bool,
+    ) -> Self {
+        self.memory_hygiene = Some(MemoryHygieneCronContext {
+            muninn_config,
+            hotel_name: hotel_name.into(),
+            intel_graph_url,
+            enabled_locally,
+        });
+        self
     }
 
     /// Resolve a cron job's `target_role` (expected shape: `role:{agent_id}:{role_name}`,
@@ -208,6 +258,23 @@ impl CronTicker {
 
     async fn fire(&self, job: &CronJob, now_ms: u64) {
         let fire_epoch = job.next_fire_at;
+
+        // Memory Transparency Slice M4 (`memory.hygiene`): this sentinel
+        // target_role never resolves to a guest inbox — the sweep runs
+        // in-process, right here, instead of going through TaskInvoke
+        // ledger/delivery/materialization. No guaranteed-dedup semantics
+        // apply (the job is always non-guaranteed): the schedule still
+        // advances below so the next fire lands on the following occurrence.
+        if job.target_role == crate::memory_hygiene::CRON_TARGET_ROLE {
+            self.fire_memory_hygiene(now_ms).await;
+            if let Err(e) = self.advance_schedule(job, fire_epoch) {
+                error!(
+                    "CronTicker: memory.hygiene advance failed for job {}: {e}",
+                    job.id
+                );
+            }
+            return;
+        }
 
         // Guaranteed dedup: if last_fired_epoch already covers this epoch,
         // another hotel fired it; skip and advance our local schedule.
@@ -334,6 +401,42 @@ impl CronTicker {
                 job.id
             );
         }
+    }
+
+    /// Run the `memory.hygiene` sweep in-process (Memory Transparency Slice
+    /// M4). Logs and returns if `with_memory_hygiene` was never called —
+    /// should not happen in practice since `ensure_scheduled` only registers
+    /// the job when the hotel has opted in, but a defensive no-op beats a
+    /// panic on a cron tick.
+    async fn fire_memory_hygiene(&self, now_ms: u64) {
+        let Some(ctx) = &self.memory_hygiene else {
+            warn!(
+                "CronTicker: memory.hygiene job fired but no context was wired \
+                 (with_memory_hygiene not called) — skipping"
+            );
+            return;
+        };
+        // Re-check this hotel's own opt-in, not just whether the job record
+        // exists locally: mesh `CronJobSync` replicates job *definitions* to
+        // every peer unconditionally, so this fire may be for a job an
+        // operator enabled on a *different* hotel. Without this check one
+        // hotel's opt-in would silently sweep every mesh-connected peer.
+        if !ctx.enabled_locally {
+            debug!(
+                "CronTicker: memory.hygiene job fired but this hotel has not opted in \
+                 (PHILOTIC_MEMORY_HYGIENE_ENABLED unset here) — job definition was likely \
+                 replicated via CronJobSync from a peer hotel; skipping sweep"
+            );
+            return;
+        }
+        crate::memory_hygiene::run_scheduled_sweep(
+            &self.graph,
+            ctx.muninn_config.as_deref(),
+            &ctx.hotel_name,
+            ctx.intel_graph_url.as_deref(),
+            now_ms / 1000,
+        )
+        .await;
     }
 
     async fn broadcast_cron_fired(&self, job: &CronJob, fire_epoch: u64, now_ms: u64) {
@@ -1024,6 +1127,158 @@ mod tests {
         assert!(
             parked_inbound.lock().await.is_empty(),
             "nothing may be parked when the subscriber is live and the event is claimed"
+        );
+    }
+
+    // ── Memory Transparency Slice M4 (`memory.hygiene`) ────────────────────
+
+    /// Minimal fixture for the sentinel-role fire tests below: a bare hotel
+    /// graph with no guests/role incarnations, since a `memory.hygiene` fire
+    /// never reaches guest resolution — `fire()` intercepts it before any of
+    /// that machinery runs.
+    fn memory_hygiene_ticker(
+        graph: Arc<GraphDomain>,
+    ) -> (
+        CronTicker,
+        crate::service::ipc::ParkedInboundRegistry,
+        tokio::sync::mpsc::UnboundedReceiver<crate::LedgerCommand>,
+    ) {
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let (dispatcher_tx, dispatcher_rx) = crate::service::ipc::test_dispatcher_channel();
+        let parked_inbound: crate::service::ipc::ParkedInboundRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ticker = CronTicker::new(
+            graph,
+            dispatcher_tx,
+            inboxes,
+            "local-aiua-01",
+            0,
+            parked_inbound.clone(),
+            None,
+            crate::service::ipc::new_delivery_claim_registry(),
+        );
+        (ticker, parked_inbound, dispatcher_rx)
+    }
+
+    fn memory_hygiene_job(hotel_name: &str, next_fire_at: u64) -> CronJob {
+        CronJob {
+            id: crate::memory_hygiene::cron_job_id(hotel_name),
+            schedule: crate::memory_hygiene::DEFAULT_SCHEDULE.to_string(),
+            target_role: crate::memory_hygiene::CRON_TARGET_ROLE.to_string(),
+            target_node_id: None,
+            payload: "{}".into(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at,
+            created_at: 0,
+            created_by: CronJobSource::Operator,
+            silent_ok: true,
+            session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+        }
+    }
+
+    /// Regression for the mesh-replication leak: `CronJobSync` replicates a
+    /// `CronJob` *definition* to every peer hotel unconditionally
+    /// (`handle_cron_job_sync` upserts without checking any local flag), so a
+    /// `memory.hygiene` job an operator enabled on one hotel becomes locally
+    /// due on every mesh-connected peer too. A peer that never set
+    /// `PHILOTIC_MEMORY_HYGIENE_ENABLED` must NOT run the sweep just because
+    /// the job record exists locally — `with_memory_hygiene`'s
+    /// `enabled_locally` flag (captured from this hotel's own env at boot)
+    /// is what actually enforces "operator opts in per hotel".
+    #[tokio::test]
+    async fn memory_hygiene_fire_skips_when_not_locally_enabled() {
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let (ticker, parked_inbound, mut dispatcher_rx) = memory_hygiene_ticker(graph.clone());
+        // Context wired but NOT locally enabled — the state a peer hotel is
+        // in after CronJobSync replicates a job it never opted into.
+        let ticker = ticker.with_memory_hygiene(None, "local-hotel", None, false);
+
+        let job = memory_hygiene_job("local-hotel", 1_000);
+        graph.upsert_cron_job(&job).expect("seed job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, 1_000))
+            .await
+            .expect("fire() must not hang when the sweep is skipped");
+
+        // The schedule still advances — a skipped sweep must not wedge the
+        // cron job into permanently re-firing at the same due time.
+        let after = graph
+            .get_cron_job(&job.id)
+            .expect("lookup")
+            .expect("job still present");
+        assert!(
+            after.next_fire_at > 1_000,
+            "schedule must advance even when the sweep is locally disabled"
+        );
+
+        // No guest delivery, no parked task, no ledger append — the sentinel
+        // role never reaches any of that machinery.
+        assert!(parked_inbound.lock().await.is_empty());
+        assert!(dispatcher_rx.try_recv().is_err());
+
+        // No autonomy grant/audit — proof the sweep body was never entered.
+        assert!(
+            graph
+                .get_autonomy_grant(ansible_mesh_core::autonomy::LANE_MEMORY_HYGIENE)
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(
+            crate::memory_hygiene::get_last_sweep_run(&graph, "local-hotel")
+                .expect("lookup")
+                .is_none(),
+            "no sweep ran, so no last-run marker should exist"
+        );
+    }
+
+    /// Companion to the skip test: with `enabled_locally = true` but no
+    /// Muninn config wired, the sweep is entered (unlike the skip case) and
+    /// short-circuits inside `run_scheduled_sweep` instead — still no panic,
+    /// still advances the schedule, still no guest-delivery side effects.
+    #[tokio::test]
+    async fn memory_hygiene_fire_enters_sweep_when_locally_enabled() {
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let (ticker, parked_inbound, mut dispatcher_rx) = memory_hygiene_ticker(graph.clone());
+        let ticker = ticker.with_memory_hygiene(None, "local-hotel", None, true);
+
+        let job = memory_hygiene_job("local-hotel", 1_000);
+        graph.upsert_cron_job(&job).expect("seed job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, 1_000))
+            .await
+            .expect("fire() must not hang");
+
+        let after = graph
+            .get_cron_job(&job.id)
+            .expect("lookup")
+            .expect("job still present");
+        assert!(after.next_fire_at > 1_000);
+        assert!(parked_inbound.lock().await.is_empty());
+        assert!(dispatcher_rx.try_recv().is_err());
+    }
+
+    /// `fire()` must intercept the sentinel role before it ever consults
+    /// `resolve_target_role_record` / guest delivery — proven independent of
+    /// enablement by checking the sentinel string itself never parses as a
+    /// `role:{agent}:{role}` routing key.
+    #[test]
+    fn memory_hygiene_target_role_is_not_a_role_routing_key() {
+        assert!(
+            crate::memory_hygiene::CRON_TARGET_ROLE
+                .strip_prefix("role:")
+                .is_none(),
+            "the sentinel must never be mistaken for a role incarnation routing key"
         );
     }
 }

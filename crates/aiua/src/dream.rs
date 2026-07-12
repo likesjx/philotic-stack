@@ -432,7 +432,10 @@ async fn evolve_all(
 // ──── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Derive `self_{agent_id}` vault names for all active guests in the hotel.
-fn collect_agent_vault_names(graph: &GraphDomain, hotel_name: &str) -> Vec<String> {
+///
+/// `pub(crate)` so the memory.hygiene sweep (`crate::memory_hygiene`) can
+/// reuse the same vault-derivation logic instead of duplicating it.
+pub(crate) fn collect_agent_vault_names(graph: &GraphDomain, hotel_name: &str) -> Vec<String> {
     graph
         .list_guests(hotel_name, true)
         .unwrap_or_default()

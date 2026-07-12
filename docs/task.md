@@ -172,6 +172,17 @@ Seam IDs: `memory-spacetime-frame`, `memory-shaping-context`, `memory-cultivatio
 - [x] Gate promotion from Muninn into AgentGraph/docs/code behind validation evidence or explicit operator approval.
 - [x] Deploy and watched-live verify on `mbp-jane` and `vps-jane` before claiming runtime truth.
 
+## New Project: Memory Transparency
+
+Proposal: [MEMORY_TRANSPARENCY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_TRANSPARENCY_PROPOSAL.md)
+
+Seam IDs: `memory.hygiene` (AutonomyGrant lane)
+
+- [x] M4 `memory.hygiene` lane, first slice (`codex/memory-m4-hygiene-lane`): nightly per-hotel Muninn contradiction sweep + age-based staleness proxy, aggregated annotation-only filing via a new `memory.hygiene` `AutonomyGrant` lane, opt-in `CronJob` scheduling intercepted in-process by `CronTicker`, with a per-hotel fire-time opt-in re-check so mesh `CronJobSync` replication can't silently sweep peer hotels. Test-green (25 new unit tests); not yet deployed/watched-live.
+  - [ ] Deploy + operator opt-in on one hotel; watch a real nightly cycle.
+  - [ ] Land M1 `provenance-envelope` so M4 filings carry richer evidence.
+  - [ ] Consider a real MuninnDB REST addition for access-recency staleness (current proxy is `created_at` age only — see `crates/aiua/src/memory_hygiene.rs` module doc).
+
 ## Muninn v0.7 Capability Adoption
 
 Proposal: [MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md)
