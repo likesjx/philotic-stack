@@ -9,6 +9,7 @@
 
 import AVFoundation
 import Foundation
+import OSLog
 import Observation
 import Speech
 
@@ -18,6 +19,7 @@ import Speech
 @MainActor
 @Observable
 public final class VoiceController: NSObject {
+    static let pcmLog = Logger(subsystem: "com.philotic.apple", category: "pcm")
     /// Live partial transcription while ``isListening``; holds the final
     /// transcript momentarily after ``stopListening()`` before being reset.
     public private(set) var transcript: String = ""
@@ -308,17 +310,19 @@ public final class VoiceController: NSObject {
         // so the agent's own audio doesn't transcribe itself in conversation
         // mode. MUST happen before the format is read and the tap installed —
         // enabling voice processing changes the node's I/O format.
-        do {
-            try inputNode.setVoiceProcessingEnabled(true)
-        } catch {
-            // Not fatal: capture still works, but the agent's voice may leak
-            // into the mic (barge-in becomes less reliable).
-            #if DEBUG
-            print("VoiceController: voice processing unavailable: \(error)")
-            #endif
-        }
+        // Voice processing (AEC) is DISABLED: on macOS, enabling it on an
+        // input-only engine (no configured output node) zeroes the captured
+        // audio entirely — every frame arrives as digital silence (observed
+        // live 2026-07-11, RMS 0.00000 on all frames). Echo protection is
+        // the VAD's sustained-onset barge-in threshold until a proper
+        // duplex-engine AEC configuration lands (route agent playback
+        // through the same engine's output, then enable VP on both nodes).
+        // try inputNode.setVoiceProcessingEnabled(true)
+        Self.pcmLog.info("voice processing disabled (input-only engine)")
 
         let inputFormat = inputNode.outputFormat(forBus: 0)
+        Self.pcmLog.info(
+            "input format rate=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount)")
         guard
             inputFormat.sampleRate > 0,
             let targetFormat = AVAudioFormat(
@@ -330,6 +334,7 @@ public final class VoiceController: NSObject {
             let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
         else {
             voiceError = "Could not configure PCM conversion for this input device."
+            Self.pcmLog.error("PCM converter setup failed (rate=\(inputFormat.sampleRate))")
             return nil
         }
 
@@ -370,10 +375,12 @@ public final class VoiceController: NSObject {
         engine.prepare()
         do {
             try engine.start()
+            Self.pcmLog.info("PCM engine started")
         } catch {
             inputNode.removeTap(onBus: 0)
             continuation.finish()
             voiceError = "Could not start the audio engine: \(error.localizedDescription)"
+            Self.pcmLog.error("PCM engine start failed: \(error.localizedDescription)")
             return nil
         }
 

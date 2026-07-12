@@ -6,6 +6,7 @@
 import Foundation
 import Network
 import Observation
+import OSLog
 import PhiloticKit
 
 #if os(macOS)
@@ -111,6 +112,7 @@ public final class ChatSessionManager {
     @ObservationIgnored private var conversationTask: Task<Void, Never>?
     /// VAD state machine; recreated fresh on every `startConversation()`.
     @ObservationIgnored private var vad = VoiceActivityDetector()
+    private static let vadLog = Logger(subsystem: "com.philotic.apple", category: "vad")
     /// stream_id of conversation mode's currently OPEN utterance, if any.
     private var conversationStreamId: String?
     /// chunk_seq for the open conversation utterance (resets per utterance).
@@ -615,6 +617,10 @@ public final class ChatSessionManager {
         // Stricter (sustained) onset while agent audio is audible or queued,
         // to resist residual echo triggering false barge-ins.
         let agentAudioActive = voiceController.hasPendingReplyAudio
+        // Live-tuning diagnostic: stream RMS + threshold to the unified log —
+        // `log stream --process PhiloticApp --predicate 'category == "vad"'`.
+        Self.vadLog.info(
+            "frame rms=\(VoiceActivityDetector.rms(ofPCMS16LE: frame), format: .fixed(precision: 5)) threshold=\(self.vad.speechThreshold, format: .fixed(precision: 5)) agentAudio=\(agentAudioActive)")
         for event in vad.process(frame: frame, requireSustainedOnset: agentAudioActive) {
             switch event {
             case .utteranceStarted(let preRollFrames):
@@ -883,6 +889,16 @@ public final class ChatSessionManager {
         let wasExpectingVoice = voiceExpectedConversations.remove(conversationId) != nil
         guard wasExpectingVoice || speakAllReplies else { return }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // Streamed persona-voice chunks arrive BEFORE the Final turn event —
+        // if chunked audio for this conversation already played (or is still
+        // playing), the reply has a voice and the fallback must not fire:
+        // otherwise macOS TTS repeats the reply after ElevenLabs spoke it.
+        if let key = activeChunkedReplyKey, key.hasPrefix(conversationId + "|") {
+            return
+        }
+        if voiceController.hasPendingReplyAudio {
+            return
+        }
 
         cancelScheduledFallback(for: conversationId)
         fallbackTasks[conversationId] = Task { [weak self] in
