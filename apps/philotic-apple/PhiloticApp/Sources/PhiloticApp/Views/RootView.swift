@@ -7,11 +7,21 @@ import SwiftUI
 struct RootView: View {
     @Bindable var session: ChatSessionManager
     @State private var showingSettings = false
+    @State private var showingLife = false
 
     var body: some View {
         NavigationSplitView {
             AgentPickerView(session: session) { _ in }
                 .toolbar {
+                    ToolbarItem {
+                        Button {
+                            showingLife = true
+                        } label: {
+                            Image(systemName: "brain")
+                        }
+                        .badge(session.lifeGraph.unseenChangeCount)
+                        .accessibilityLabel("Life graph")
+                    }
                     ToolbarItem {
                         Button {
                             showingSettings = true
@@ -35,6 +45,14 @@ struct RootView: View {
             NavigationStack {
                 ConnectionSettingsView(session: session)
             }
+        }
+        .sheet(isPresented: $showingLife) {
+            NavigationStack {
+                LifeView(session: session)
+            }
+            #if os(macOS)
+                .frame(minWidth: 480, minHeight: 560)
+            #endif
         }
         .task {
             await session.loadConversations()

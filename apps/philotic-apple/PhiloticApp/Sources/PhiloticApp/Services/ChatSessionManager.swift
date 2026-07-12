@@ -36,6 +36,9 @@ public final class ChatSessionManager {
     /// Owns dictation capture, voice-reply playback, and fallback TTS. Views
     /// bind directly to this for mic/speaker UI state.
     public let voiceController = VoiceController()
+    /// Domain state for the Life surface: lens packets from the LifeGraph
+    /// read plane plus live `LifeGraphChange` frames (badge + recent list).
+    public let lifeGraph = LifeGraphStore()
     /// User preference: speak every agent reply via fallback/serverside
     /// audio, even for turns the operator typed rather than spoke.
     /// Persisted directly to `UserDefaults` (not part of `ConnectionSettings`
@@ -815,9 +818,19 @@ public final class ChatSessionManager {
         case .approvalRequest(_, let description, _):
             appendSystemMessage("Approval requested: \(description)", isError: false)
 
+        case .lifeGraphChange(let changeKind, let nodeId, let label, let summary):
+            lifeGraph.noteChange(kind: changeKind, nodeId: nodeId, label: label, summary: summary)
+
         default:
             break
         }
+    }
+
+    /// Credentials for LifeGraph read-plane fetches — nil until the app is
+    /// configured with an anchor and an edge token.
+    public func lifeGraphCredentials() -> (baseURL: URL, token: String)? {
+        guard settings.isConfigured, let url = settings.anchorURL else { return nil }
+        return (url, settings.edgeToken)
     }
 
     // MARK: - Realtime transcript routing
