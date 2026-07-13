@@ -12424,6 +12424,7 @@ fn tools_for_allowed_class(class: &str) -> &'static [&'static str] {
     match class {
         "life_graph" => &[
             "life.observe",
+            "life.observe.batch",
             "life.recall",
             "life.recall.feedback",
             "life.commit",
