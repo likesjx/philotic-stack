@@ -4774,6 +4774,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "target_role": "life-graph-runner",
                 "supported_tools": [
                     "life.observe",
+                    "life.observe.batch",
                     "life.recall",
                     "life.recall.feedback",
                     "life.commit",
@@ -4791,21 +4792,47 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 {
                     continue;
                 }
-                let already_present = profile.remote_tool_runners.iter().any(|r| {
+                let existing_idx = profile.remote_tool_runners.iter().position(|r| {
                     r.get("incarnation_id").and_then(|v| v.as_str())
                         == Some(runner_incarnation_id.as_str())
                 });
-                if already_present {
-                    continue;
+                match existing_idx {
+                    Some(idx) => {
+                        // Reconcile the registered tool set in place. The runner is
+                        // keyed by a STABLE incarnation id, so an already-seeded
+                        // profile was previously never refreshed — which meant a
+                        // newly added tool (e.g. life.observe.batch) could be granted
+                        // to the model yet have NO route to the runner, and the turn
+                        // would hang until the watchdog evicted it. Keep only
+                        // supported_tools current; preserve any runtime-added fields
+                        // (availability_state, etc.).
+                        if profile.remote_tool_runners[idx].get("supported_tools")
+                            == runner.get("supported_tools")
+                        {
+                            continue;
+                        }
+                        if let Some(obj) = profile.remote_tool_runners[idx].as_object_mut() {
+                            obj.insert("supported_tools".into(), runner["supported_tools"].clone());
+                        }
+                        graph.upsert_toolset_profile(&profile)?;
+                        tracing::info!(
+                            node = %remote_node,
+                            hotel = %hotel_id,
+                            profile = %profile.profile_name,
+                            "refreshed remote life-graph-runner supported_tools"
+                        );
+                    }
+                    None => {
+                        profile.remote_tool_runners.push(runner.clone());
+                        graph.upsert_toolset_profile(&profile)?;
+                        tracing::info!(
+                            node = %remote_node,
+                            hotel = %hotel_id,
+                            profile = %profile.profile_name,
+                            "seeded remote life-graph-runner into LifeGraph-capable profile"
+                        );
+                    }
                 }
-                profile.remote_tool_runners.push(runner.clone());
-                graph.upsert_toolset_profile(&profile)?;
-                tracing::info!(
-                    node = %remote_node,
-                    hotel = %hotel_id,
-                    profile = %profile.profile_name,
-                    "seeded remote life-graph-runner into LifeGraph-capable profile"
-                );
             }
         }
     }
