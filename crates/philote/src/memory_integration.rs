@@ -703,12 +703,24 @@ pub(super) fn promotion_gate_report(args: &Value) -> Value {
 }
 
 pub(super) fn inbound_primary_user_id(task: &InboundTaskPayload) -> Option<String> {
-    task.sender_id
+    // Prefer the sender's username (lowercased) — this is the canonical operator
+    // identity that memory vaults are provisioned under. `derive_vault_names`
+    // (muninn provisioning) and the Telegram operator allowlist both key on the
+    // lowercased username (e.g. "likesjx" → vault `user_likesjx`). Preferring the
+    // numeric `sender_id` instead routed SharedUser memory to an unprovisioned
+    // `user_<numeric_id>` vault, so every operator-fact write 401'd. The numeric
+    // id remains a fallback for senders that have no username.
+    task.sender_username
         .as_deref()
-        .or(task.sender_username.as_deref())
-        .map(str::trim)
+        .map(|u| u.trim().to_ascii_lowercase())
         .filter(|user_id| !user_id.is_empty())
-        .map(str::to_string)
+        .or_else(|| {
+            task.sender_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|user_id| !user_id.is_empty())
+                .map(str::to_string)
+        })
 }
 
 pub(super) fn default_turn_recall_scope(session_id: &str) -> MemoryScope {
@@ -2497,6 +2509,42 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbound_primary_user_id_prefers_lowercased_username_over_numeric_id() {
+        // The memory-vault routing identity must be the lowercased username — that
+        // is what vaults are provisioned under (`user_likesjx`) and what the Telegram
+        // operator allowlist matches. Preferring the numeric sender_id routed
+        // SharedUser writes to an unprovisioned `user_<numeric>` vault → 401.
+        let task = InboundTaskPayload {
+            sender_id: Some("7898847424".into()),
+            sender_username: Some("LikesJx".into()),
+            ..Default::default()
+        };
+        assert_eq!(inbound_primary_user_id(&task).as_deref(), Some("likesjx"));
+
+        // Falls back to the numeric id only when the sender has no username.
+        let no_username = InboundTaskPayload {
+            sender_id: Some("7898847424".into()),
+            sender_username: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            inbound_primary_user_id(&no_username).as_deref(),
+            Some("7898847424")
+        );
+
+        // A whitespace-only username is ignored (falls through to the numeric id).
+        let blank_username = InboundTaskPayload {
+            sender_id: Some("42".into()),
+            sender_username: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(inbound_primary_user_id(&blank_username).as_deref(), Some("42"));
+
+        // No sender at all (mesh/cron task) → None.
+        assert_eq!(inbound_primary_user_id(&InboundTaskPayload::default()), None);
+    }
 
     // Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
     // proof-of-adoption for the Muninn `memory.remember` write path — the
