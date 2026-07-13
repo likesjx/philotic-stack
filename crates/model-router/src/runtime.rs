@@ -71,6 +71,56 @@ fn model_dispatch_timeout() -> Duration {
     )
 }
 
+/// Upper bound for the scaled `voice.transcribe` dispatch budget. Kept safely
+/// under the 300s WaitingModel watchdog so a breach still leaves room for the
+/// FailTask → ladder-escalation round trip.
+const TRANSCRIBE_MAX_BUDGET_SECS: u64 = 240;
+
+/// Assumed clip length (seconds) when a voice memo carries no duration metadata,
+/// chosen so the budget defaults to the generous cap (30 + 1.5×140 = 240) rather
+/// than the short default — an unknown-length memo should get room to finish, not
+/// a guaranteed cut-off.
+const TRANSCRIBE_UNKNOWN_DURATION_SECS: u64 = 140;
+
+/// Dispatch budget for a single task. `voice.transcribe` of a long voice memo
+/// legitimately runs past the default 55s cap, so it gets a budget proportional to
+/// the clip length: `30 + 1.5 × duration_secs`, floored at the default dispatch
+/// timeout and capped at [`TRANSCRIBE_MAX_BUDGET_SECS`] (a 10s clip → floor 55s, a
+/// 60s clip → 120s, a 180s clip → the 240s cap). Duration comes from the audio
+/// attachment (e.g. Telegram `voice.duration`); when absent it falls back to
+/// [`TRANSCRIBE_UNKNOWN_DURATION_SECS`] → the cap. Every other task kind uses the
+/// default dispatch timeout unchanged.
+/// Pure budget math (seconds): `30 + 1.5 × duration`, clamped to
+/// `[default_secs, TRANSCRIBE_MAX_BUDGET_SECS]`. A `None` duration assumes a long
+/// clip ([`TRANSCRIBE_UNKNOWN_DURATION_SECS`]) so the budget lands at the cap
+/// rather than the short default.
+fn transcribe_budget_secs(default_secs: u64, duration_secs: Option<u64>) -> u64 {
+    let dur = duration_secs.unwrap_or(TRANSCRIBE_UNKNOWN_DURATION_SECS);
+    (30 + dur.saturating_mul(3) / 2).clamp(default_secs, TRANSCRIBE_MAX_BUDGET_SECS)
+}
+
+fn effective_dispatch_timeout(task: &ControllerTask) -> Duration {
+    let default = model_dispatch_timeout();
+    if task.kind != TaskKind::AudioTranscribe {
+        return default;
+    }
+    let duration_secs = task
+        .context
+        .attachments
+        .iter()
+        .filter_map(|a| a.duration_secs)
+        .max();
+    let budget = transcribe_budget_secs(default.as_secs(), duration_secs);
+    info!(
+        capability = "voice.transcribe",
+        clip_duration_secs = ?duration_secs,
+        budget_secs = budget,
+        scaled_from_duration = duration_secs.is_some(),
+        "sized transcription dispatch budget"
+    );
+    Duration::from_secs(budget)
+}
+
 type ProviderFactory =
     dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn ModelProvider>> + Send + Sync;
 type NativeLiveProviderFactory =
@@ -253,6 +303,16 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         continue;
                     }
                 };
+
+                // Voice-transcription budget scaling: a long voice memo legitimately
+                // runs past the default 55s dispatch cap. `effective_dispatch` is the
+                // per-task ceiling (scaled by clip duration for `voice.transcribe`,
+                // default otherwise). For transcription the single provider attempt is
+                // allowed the whole budget — one long attempt beats a truncated retry.
+                // Pre-dispatch config loads below keep the default cap (they are quick
+                // and independent of clip length).
+                let effective_dispatch = effective_dispatch_timeout(&controller_task);
+                let is_transcribe = controller_task.kind == TaskKind::AudioTranscribe;
 
                 // Pre-dispatch config load: ~a dozen sequential IPC round trips
                 // (GetConfig / secret fetch), none individually timeout-bound.
@@ -701,9 +761,16 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     // attempt+rotation sequence so a single degraded provider (even one
                     // that keeps "making progress" by rotating keys) cannot alone consume
                     // the full WaitingModel window before the ladder engages (RC-1).
-                    let provider_result = match tokio::time::timeout(model_dispatch_timeout(), async {
+                    let provider_result = match tokio::time::timeout(effective_dispatch, async {
                         let retry = provider.retry_policy();
-                        let attempt_secs = provider.attempt_policy().total_secs;
+                        // Transcription gets the full task budget for its single
+                        // attempt; all other kinds keep the provider's own per-attempt
+                        // policy (leaving room for retries within the dispatch cap).
+                        let attempt_secs = if is_transcribe {
+                            effective_dispatch.as_secs()
+                        } else {
+                            provider.attempt_policy().total_secs
+                        };
                         let mut last_err = anyhow::anyhow!("dispatch: no attempts completed");
                         let mut result: Option<Result<ProviderOutput>> = None;
                         let mut attempt: u8 = 0;
@@ -913,7 +980,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         Ok(inner) => inner,
                         Err(_) => Err(anyhow::anyhow!(
                             "provider_timeout: overall dispatch exceeded {}s across attempt/rotation cycles",
-                            model_dispatch_timeout().as_secs()
+                            effective_dispatch.as_secs()
                         )),
                     };
 
@@ -2513,6 +2580,25 @@ mod tests {
         assert_eq!(
             model_result["native_live"]["session_marker"]["resumption_handle"],
             json!("resume-123")
+        );
+    }
+
+    #[test]
+    fn transcribe_budget_scales_with_clip_duration() {
+        // Default per-task cap when no override env is set.
+        let default = super::MODEL_DISPATCH_TIMEOUT_SECS_DEFAULT; // 55
+        // 60s clip -> 30 + 90 = 120s.
+        assert_eq!(super::transcribe_budget_secs(default, Some(60)), 120);
+        // Short 10s clip -> 45s, floored up to the default 55s.
+        assert_eq!(super::transcribe_budget_secs(default, Some(10)), 55);
+        // Long 180s clip -> 300s, capped at 240s (< 300s watchdog).
+        assert_eq!(super::transcribe_budget_secs(default, Some(180)), 240);
+        // Exactly at the cap boundary: 140s -> 30 + 210 = 240.
+        assert_eq!(super::transcribe_budget_secs(default, Some(140)), 240);
+        // Unknown duration assumes a long clip -> lands at the cap, never the floor.
+        assert_eq!(
+            super::transcribe_budget_secs(default, None),
+            super::TRANSCRIBE_MAX_BUDGET_SECS
         );
     }
 }
