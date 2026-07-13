@@ -430,6 +430,20 @@ impl AgentRuntime {
         self.ensure_session_loaded(&session_id, "handoff").await?;
 
         let role_config = self.configured_roles.get(&to_role).cloned();
+        // `configured_roles` only caches roles THIS process configured via a
+        // `role.configure` tool call — a freshly materialized role-incarnation
+        // philote (or one whose role was created over raw IPC, e.g. `/dirty`'s
+        // ensure_vixen_role) receives the handoff with an empty cache. On a
+        // miss, fall back to the hotel's persisted role record; otherwise the
+        // activation silently loses the role's turn_loop_config (fallback
+        // ladder + Layer 1 model bindings), identity addendum, and
+        // content_policy, and the turn dispatches on the DEFAULT ladder
+        // (vixen → gemini instead of its openrouter-only ladder).
+        let fetched_role = if role_config.is_none() {
+            self.fetch_role_activation(&to_role).await
+        } else {
+            None
+        };
 
         {
             let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
@@ -446,19 +460,40 @@ impl AgentRuntime {
                 requested_by: bundle.from_role.clone(),
                 role_addendum: role_config
                     .as_ref()
-                    .and_then(|c| c.role_identity_addendum.clone()),
-                role_manifest: role_config.as_ref().and_then(|c| c.role_manifest.clone()),
+                    .and_then(|c| c.role_identity_addendum.clone())
+                    .or_else(|| fetched_role.as_ref().and_then(|f| f.role_addendum.clone())),
+                role_manifest: role_config
+                    .as_ref()
+                    .and_then(|c| c.role_manifest.clone())
+                    .or_else(|| fetched_role.as_ref().and_then(|f| f.role_manifest.clone())),
                 base_identity_ref: None,
                 activation_requester_class: Some("role_handoff".into()),
                 activation_policy_owner: None,
-                toolset_profile_ref: role_config.as_ref().map(|c| c.toolset_profile.clone()),
+                toolset_profile_ref: role_config
+                    .as_ref()
+                    .map(|c| c.toolset_profile.clone())
+                    .or_else(|| {
+                        fetched_role
+                            .as_ref()
+                            .and_then(|f| f.toolset_profile_ref.clone())
+                    }),
                 skillset_profile_ref: None,
                 effective_skillset: vec![],
                 effective_skill_guidance: vec![],
                 working_memory_policy: None,
                 memory_projection_policy: None,
-                turn_loop_config: role_config.as_ref().map(|c| c.turn_loop_config.clone()),
-                content_policy: role_config.as_ref().map(|c| c.content_policy.clone()),
+                turn_loop_config: role_config
+                    .as_ref()
+                    .map(|c| c.turn_loop_config.clone())
+                    .or_else(|| {
+                        fetched_role
+                            .as_ref()
+                            .and_then(|f| f.turn_loop_config.clone())
+                    }),
+                content_policy: role_config
+                    .as_ref()
+                    .map(|c| c.content_policy.clone())
+                    .or_else(|| fetched_role.as_ref().and_then(|f| f.content_policy.clone())),
             };
 
             if let Some(cap) = activation
