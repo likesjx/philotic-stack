@@ -566,18 +566,46 @@ impl IpcServer {
                 "guest must register before configuring roles",
             );
         };
-        if calling_role != "orchestrator" {
+        // Model-selection self-service: an agent may retune its model routing
+        // (`fallback_tiers` / `model_bindings`) without admin rights. Choosing
+        // which model answers is lower-stakes than changing toolset, manifest,
+        // TTL, or admin status, and this backs the operator's one-tap `/model`
+        // swap command (philote `SlashCommand::ModelPreset`). Gated tightly:
+        // ONLY when no privileged field is being changed. The toolset the
+        // caller passed is IGNORED for this path (force-preserved to the
+        // existing record below), so it can never escalate privilege or alter
+        // capabilities — only the model routing changes.
+        let is_model_selection_only = (fallback_tiers.is_some() || model_bindings.is_some())
+            && !is_admin
+            && role_identity_addendum.is_none()
+            && role_manifest.is_none()
+            && approval_policy.is_none()
+            && model_profile.is_none()
+            && context_window_policy.is_none()
+            && content_policy.is_none()
+            && inactive_ttl_seconds.is_none()
+            && iteration_cap.is_none();
+
+        // A non-orchestrator role may pass ONLY as model-selection-only
+        // self-service on its own record (philote sends `calling_role =
+        // <active role>` for `/model`, so a session in e.g. vixen posture
+        // retunes vixen, not orchestrator — anything broader stays
+        // orchestrator-gated).
+        let is_model_selection_self_service =
+            is_model_selection_only && role_name == calling_role;
+        if calling_role != "orchestrator" && !is_model_selection_self_service {
             return IpcResponse::error(
                 "configure_role",
                 "CONFIGURE_FORBIDDEN",
-                "only agents operating in the orchestrator persona may configure role incarnations",
+                "only agents operating in the orchestrator persona may configure role incarnations \
+                 (exception: any role may apply a model-selection-only change to itself)",
             );
         }
         if !identity.guest_id.starts_with(&agent_id) {
             return IpcResponse::error(
                 "configure_role",
                 "CONFIGURE_FORBIDDEN",
-                "orchestrator guests may only configure roles for their own agent identity",
+                "guests may only configure roles for their own agent identity",
             );
         }
         let caller_agent_id = identity
@@ -590,26 +618,6 @@ impl IpcServer {
             .flatten()
             .map(|r| r.is_admin)
             .unwrap_or(false);
-
-        // Model-selection self-service: an agent's own orchestrator may retune
-        // its model routing (`fallback_tiers` / `model_bindings`) without admin
-        // rights. Choosing which model answers is lower-stakes than changing
-        // toolset, manifest, TTL, or admin status, and this backs the operator's
-        // one-tap `/model` swap command (philote `SlashCommand::ModelPreset`).
-        // Gated tightly: ONLY when no privileged field is being changed. The
-        // toolset the caller passed is IGNORED for this path (force-preserved to
-        // the existing record below), so it can never escalate privilege or
-        // alter capabilities — only the model routing changes.
-        let is_model_selection_only = (fallback_tiers.is_some() || model_bindings.is_some())
-            && !is_admin
-            && role_identity_addendum.is_none()
-            && role_manifest.is_none()
-            && approval_policy.is_none()
-            && model_profile.is_none()
-            && context_window_policy.is_none()
-            && content_policy.is_none()
-            && inactive_ttl_seconds.is_none()
-            && iteration_cap.is_none();
 
         if role_name == "orchestrator" && !caller_is_admin && !is_model_selection_only {
             return IpcResponse::error(
@@ -4005,6 +4013,137 @@ mod tests {
                 assert_eq!(code, "CONFIGURE_FORBIDDEN");
             }
             other => panic!("expected Error, got {:?}", other),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_role_allows_model_selection_self_service_from_non_orchestrator() {
+        // The operator's /model preset swap runs as the session's ACTIVE role
+        // (philote sends calling_role = <active role>), so a session in e.g.
+        // vixen posture retunes vixen's own record. A model-selection-only
+        // change to the caller's own role must pass without orchestrator
+        // posture; anything broader stays orchestrator-gated.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut vixen = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:vixen".into(),
+            role: "vixen".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("vixen connect");
+
+        let model_selection_request = |role_name: &str,
+                                       role_manifest: Option<String>|
+         -> IpcRequest {
+            IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: role_name.into(),
+                guest_id: format!("agent-jane-01:{role_name}"),
+                calling_role: "vixen".into(),
+                toolset_profile: "default".into(),
+                role_identity_addendum: None,
+                role_manifest,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: Some(vec!["model.openrouter".into(), "model".into()]),
+                model_bindings: Some(
+                    [("model.openrouter".to_string(), "z-ai/glm-5.2".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                content_policy: None,
+            }
+        };
+
+        // Own role, model-selection-only → allowed.
+        let resp = vixen
+            .send_request(model_selection_request("vixen", None))
+            .await
+            .expect("self-service configure request");
+        match resp {
+            IpcResponse::ConfigureRoleOk { .. } => {}
+            IpcResponse::Standard {
+                ok, code, message, ..
+            } => {
+                panic!("expected ConfigureRoleOk, got ok={ok} code={code:?} msg={message:?}")
+            }
+            other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        // A DIFFERENT role's record, even model-selection-only → forbidden.
+        let resp = vixen
+            .send_request(model_selection_request("researcher", None))
+            .await
+            .expect("cross-role configure request");
+        match resp {
+            IpcResponse::Standard { ok, code, .. } => {
+                assert!(!ok);
+                assert_eq!(code, "CONFIGURE_FORBIDDEN");
+            }
+            other => panic!("expected CONFIGURE_FORBIDDEN, got {:?}", other),
+        }
+
+        // Own role but with a privileged field (manifest) → forbidden: the
+        // self-service exemption is model-selection-only by construction.
+        let resp = vixen
+            .send_request(model_selection_request(
+                "vixen",
+                Some("rewritten manifest".into()),
+            ))
+            .await
+            .expect("privileged-field configure request");
+        match resp {
+            IpcResponse::Standard { ok, code, .. } => {
+                assert!(!ok);
+                assert_eq!(code, "CONFIGURE_FORBIDDEN");
+            }
+            other => panic!("expected CONFIGURE_FORBIDDEN, got {:?}", other),
         }
 
         unsafe {
