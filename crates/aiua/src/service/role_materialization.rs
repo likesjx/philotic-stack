@@ -566,7 +566,42 @@ impl IpcServer {
                 "guest must register before configuring roles",
             );
         };
-        if calling_role != "orchestrator" {
+        // Model-selection self-service: an agent's own orchestrator may retune
+        // its model routing (`fallback_tiers` / `model_bindings`) without admin
+        // rights. Choosing which model answers is lower-stakes than changing
+        // toolset, manifest, TTL, or admin status, and this backs the operator's
+        // one-tap `/model` swap command (philote `SlashCommand::ModelPreset`).
+        // Gated tightly: ONLY when no privileged field is being changed. The
+        // toolset the caller passed is IGNORED for this path (force-preserved to
+        // the existing record below), so it can never escalate privilege or
+        // alter capabilities — only the model routing changes.
+        let is_model_selection_only = (fallback_tiers.is_some() || model_bindings.is_some())
+            && !is_admin
+            && role_identity_addendum.is_none()
+            && role_manifest.is_none()
+            && approval_policy.is_none()
+            && model_profile.is_none()
+            && context_window_policy.is_none()
+            && content_policy.is_none()
+            && inactive_ttl_seconds.is_none()
+            && iteration_cap.is_none();
+        // A non-orchestrator incarnation may retune ITS OWN model routing —
+        // the operator's `/model` swap sent from inside a register like vixen
+        // arrives with calling_role = that role. The change is
+        // capability-neutral (model-selection-only, toolset force-preserved
+        // below) and scoped to the caller's own live incarnation; everything
+        // else still requires the orchestrator persona. The record must
+        // already exist — self-retune may never CREATE a role (a new role
+        // would take the caller-supplied toolset instead of preserving one).
+        let is_self_model_retune = is_model_selection_only
+            && calling_role == role_name
+            && identity.guest_id == format!("{agent_id}:{role_name}")
+            && graph
+                .get_role_incarnation(&agent_id, &role_name)
+                .ok()
+                .flatten()
+                .is_some();
+        if calling_role != "orchestrator" && !is_self_model_retune {
             return IpcResponse::error(
                 "configure_role",
                 "CONFIGURE_FORBIDDEN",
@@ -590,26 +625,6 @@ impl IpcServer {
             .flatten()
             .map(|r| r.is_admin)
             .unwrap_or(false);
-
-        // Model-selection self-service: an agent's own orchestrator may retune
-        // its model routing (`fallback_tiers` / `model_bindings`) without admin
-        // rights. Choosing which model answers is lower-stakes than changing
-        // toolset, manifest, TTL, or admin status, and this backs the operator's
-        // one-tap `/model` swap command (philote `SlashCommand::ModelPreset`).
-        // Gated tightly: ONLY when no privileged field is being changed. The
-        // toolset the caller passed is IGNORED for this path (force-preserved to
-        // the existing record below), so it can never escalate privilege or
-        // alter capabilities — only the model routing changes.
-        let is_model_selection_only = (fallback_tiers.is_some() || model_bindings.is_some())
-            && !is_admin
-            && role_identity_addendum.is_none()
-            && role_manifest.is_none()
-            && approval_policy.is_none()
-            && model_profile.is_none()
-            && context_window_policy.is_none()
-            && content_policy.is_none()
-            && inactive_ttl_seconds.is_none()
-            && iteration_cap.is_none();
 
         if role_name == "orchestrator" && !caller_is_admin && !is_model_selection_only {
             return IpcResponse::error(
@@ -738,31 +753,60 @@ impl IpcServer {
                 ansible_mesh_core::graph::RoleReadinessState::Configured
             }
         };
+        // Model-selection-only self-service force-preserves EVERY non-model
+        // field from the existing record, not just the toolset: the philote's
+        // `/model` swap sends `None` for fields it doesn't touch, and writing
+        // those `None`s through would wipe the role's identity addendum,
+        // manifest, TTL, admin flag, home pin, and non-model turn-loop config
+        // (a vixen `/model` swap would silently strip the register identity).
+        // `is_model_selection_only` already guarantees the corresponding
+        // request args are all `None`/false, so preserving is never a conflict.
+        let preserved = if is_model_selection_only {
+            previous.as_ref()
+        } else {
+            None
+        };
         let record = ansible_mesh_core::graph::RoleIncarnationRecord {
             agent_id: agent_id.clone(),
             role_name: role_name.clone(),
             guest_id,
             toolset_profile,
-            role_identity_addendum,
-            role_manifest,
+            role_identity_addendum: preserved
+                .map(|p| p.role_identity_addendum.clone())
+                .unwrap_or(role_identity_addendum),
+            role_manifest: preserved
+                .map(|p| p.role_manifest.clone())
+                .unwrap_or(role_manifest),
             content_policy: resolved_content_policy,
-            is_admin,
+            is_admin: preserved.map(|p| p.is_admin).unwrap_or(is_admin),
             readiness_state: initial_readiness,
-            inactive_ttl_seconds,
-            turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
-                iteration_cap,
-                approval_policy,
-                model_profile,
-                model_bindings: resolved_model_bindings,
-                context_window_policy,
-                loop_script: None,
-                fallback_tiers: resolved_fallback_tiers,
-                paracrine_hop_budget: None,
-                paracrine_chain_budget_secs: None,
-                context_window: None,
-                plan_continuation_budget: None,
+            inactive_ttl_seconds: preserved
+                .map(|p| p.inactive_ttl_seconds)
+                .unwrap_or(inactive_ttl_seconds),
+            turn_loop_config: match preserved {
+                // Start from the existing turn-loop config and override ONLY
+                // the model routing, so paracrine budgets, context-window
+                // overrides, and loop scripts survive a `/model` swap too.
+                Some(prev) => ansible_mesh_core::graph::TurnLoopConfig {
+                    model_bindings: resolved_model_bindings,
+                    fallback_tiers: resolved_fallback_tiers,
+                    ..prev.turn_loop_config.clone()
+                },
+                None => ansible_mesh_core::graph::TurnLoopConfig {
+                    iteration_cap,
+                    approval_policy,
+                    model_profile,
+                    model_bindings: resolved_model_bindings,
+                    context_window_policy,
+                    loop_script: None,
+                    fallback_tiers: resolved_fallback_tiers,
+                    paracrine_hop_budget: None,
+                    paracrine_chain_budget_secs: None,
+                    context_window: None,
+                    plan_continuation_budget: None,
+                },
             },
-            home_node: None,
+            home_node: preserved.and_then(|p| p.home_node.clone()),
         };
 
         if let Err(e) = graph.upsert_role_incarnation(&record) {
@@ -3366,6 +3410,166 @@ mod tests {
             "fallback_tiers must survive a reconfigure that passes None"
         );
         assert_eq!(role.turn_loop_config.iteration_cap, Some(25));
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// A non-orchestrator incarnation may retune ITS OWN model routing (the
+    /// operator's `/model` swap from inside a register like vixen), but only
+    /// that: a model-selection-only change to its own EXISTING record. Any
+    /// privileged field, a different role's record, or a nonexistent record
+    /// stays orchestrator-gated.
+    #[tokio::test]
+    async fn configure_role_allows_self_model_retune_from_own_register() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        // Pre-existing vixen record with a known toolset — the retune must
+        // preserve it and only touch the model routing.
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "vixen".into(),
+                guest_id: "agent-jane-01:vixen".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: Some("register addendum".into()),
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig {
+                    fallback_tiers: vec!["model.openrouter".into()],
+                    ..Default::default()
+                },
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed vixen role");
+        // A model-bindings change on an existing role is a breaking change and
+        // restarts the role worker — give the test server a mock materializer.
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut vixen = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:vixen".into(),
+            role: "role:agent-jane-01:vixen".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("vixen connect");
+
+        let retune = |model_bindings: Option<std::collections::BTreeMap<String, String>>,
+                      role_name: &str,
+                      addendum: Option<String>| {
+            IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: role_name.into(),
+                guest_id: format!("agent-jane-01:{role_name}"),
+                calling_role: "vixen".into(),
+                toolset_profile: "sneaky-elevated-toolset".into(),
+                role_identity_addendum: addendum,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+                fallback_tiers: Some(vec!["model.openrouter".into()]),
+                model_bindings,
+                content_policy: None,
+            }
+        };
+
+        // Self model retune: allowed, and the caller-supplied toolset is ignored.
+        let bindings = std::collections::BTreeMap::from([(
+            "model.openrouter".to_string(),
+            "sao10k/l3.1-euryale-70b".to_string(),
+        )]);
+        let resp = vixen
+            .send_request(retune(Some(bindings.clone()), "vixen", None))
+            .await
+            .expect("self retune request");
+        match resp {
+            IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "vixen"),
+            other => panic!("expected ConfigureRoleOk for self model retune, got {other:?}"),
+        }
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "vixen")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(role.turn_loop_config.model_bindings, bindings);
+        assert_eq!(
+            role.toolset_profile, "orchestrator",
+            "self retune must preserve the existing toolset, not adopt the caller's"
+        );
+        assert_eq!(
+            role.role_identity_addendum.as_deref(),
+            Some("register addendum"),
+            "self retune must not touch the addendum"
+        );
+
+        // A privileged field (addendum) from the register: still forbidden.
+        let resp = vixen
+            .send_request(retune(None, "vixen", Some("rewrite myself".into())))
+            .await
+            .expect("addendum request");
+        assert!(
+            matches!(resp, IpcResponse::Standard { ok: false, ref code, .. } if code == "CONFIGURE_FORBIDDEN"),
+            "non-model change from a register must stay forbidden, got {resp:?}"
+        );
+
+        // Another role's record: still forbidden (would also be a CREATE here).
+        let resp = vixen
+            .send_request(retune(Some(bindings), "developer", None))
+            .await
+            .expect("cross-role request");
+        assert!(
+            matches!(resp, IpcResponse::Standard { ok: false, ref code, .. } if code == "CONFIGURE_FORBIDDEN"),
+            "a register may only retune its own role, got {resp:?}"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
