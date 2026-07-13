@@ -1,7 +1,7 @@
 ---
 doc_type: defect-tracker
 status: active
-last_updated: 2026-07-11
+last_updated: 2026-07-13
 ---
 
 # Defects and Technical Debt
@@ -64,6 +64,8 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 | DEF-047 | `phil` CLI hotel-IPC commands (`autonomy`, `heal`, `keys`, `component`) call `socket_path("aiua")` with the literal string as the hotel name — under `PHILOTIC_PROFILE` this resolves to `<profile>/aiua-aiua.sock`, but hotels create `aiua-<hotel>.sock` (e.g. `aiua-mac-jane.sock`), so every profile-based hotel gets "No such file or directory". Workaround (live-verified): unset the profile and pass `PHILOTIC_HOTEL_SOCKET=<socket path>`. Fix: thread the resolved hotel name (as `start.rs`/`status.rs` do) or glob `aiua-*.sock` in the profile dir | medium | open | 1 | 2026-07-12 | — |
 | DEF-048 | Test runs recorded via the MCP `graph_record_test_run` tool do not surface in `phil graph green`, while runs recorded via REST `POST /api/test-run` do (live-verified: REST-recorded 1198/1198 shows green; six MCP-recorded runs from the same evening show `none`) — the two write paths create different TestRun node/edge shapes | low | open | 1 | 2026-07-12 | — |
 | DEF-049 | `phil doctor` `logs.rotation-missing` check still looks for the newsyslog drop-in and warns even when the `com.philotic.logrotate` copytruncate LaunchAgent (the current, correct mechanism — newsyslog was retired because rename+bzip2 strands launchd writers) is installed and rotating | low | open | 1 | 2026-07-12 | — |
+| DEF-050 | Role-addressed replies broadcast through every Telegram bot seat: a turn with no `final_reply_guest_id` (cron-originated turns never carry one) resolves its reply target to role `membrane` only, and aiua's `deliver_inbound_task` delivers a guest-less task to ALL role subscribers — each seat then posts to the same DM `chat_id` (identical under every bot token), so the operator sees one message per bot. Live-hit 2026-07-13 7:40a ET: aria's evicted dev-brief turn watchdog notice arrived from all 4 mbp-jane bots | medium | fixed | 2 | 2026-07-13 | PR #266 — seat-ownership filter on the session id's terminal agent segment, fail-open for non-Telegram shapes. Deployed mbp-jane + mac-jane 2026-07-13 |
+| DEF-051 | Cron-originated turn's model responses silently swallowed — the turn rides the watchdog to a 600s eviction. Forensic (mbp-jane 2026-07-13, first cron fire on the Jul-12 18:47 deploy ≈ PR #260): 7:30a dev-brief turn dispatched to gemini; the response (tool_call `hotel.status`, `model_result: null`) reached aria's turn loop in 1.3s (`action peek` logged) and vanished with NO further log; 7:35a WaitingModel escalation to openrouter, response back in 7.5s, dropped identically; 7:40a CatchAll evicted at 600s. Neither provider hung. The only no-log drop paths in `handle_model_response` are empty `session_id`/`turn_id` and the no-active-turn arm (probe intercept ruled out — probe ids are `probe-<uuid>`; stale-turn mismatch warns). Jul 10–12 crons succeeded on the pre-#218 binary with the identical `routing turn None` dispatch log, so suspect a #218→#260 regression in turn-id echo or active-turn bookkeeping for cron turns. First fix: give every silent-drop arm a `warn!` naming the offending ids. Repro: next 11:30Z cron fire, or a synthetic role-directed task | high | open | 3 | 2026-07-13 | — |
 
 ---
 
