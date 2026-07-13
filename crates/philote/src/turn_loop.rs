@@ -869,11 +869,26 @@ impl AgentRuntime {
     pub(super) async fn handle_model_response(&mut self, task: InboundTaskPayload) -> Result<()> {
         let session_id = match task.session_id.as_deref().filter(|s| !s.is_empty()) {
             Some(session_id) => session_id.to_string(),
-            None => return Ok(()),
+            None => {
+                // DEF-051: never drop a model response without a trace — a
+                // swallowed response leaves the turn riding the watchdog to a
+                // 600s eviction with nothing in the log to explain why.
+                warn!(
+                    turn_id = %task.turn_id.as_deref().unwrap_or(""),
+                    "handle_model_response: dropping response with empty session_id"
+                );
+                return Ok(());
+            }
         };
         let turn_id = match task.turn_id.as_deref().filter(|s| !s.is_empty()) {
             Some(turn_id) => turn_id.to_string(),
-            None => return Ok(()),
+            None => {
+                warn!(
+                    session_id = %session_id,
+                    "handle_model_response: dropping response with empty turn_id"
+                );
+                return Ok(());
+            }
         };
 
         // Sentence-pipelined TTS: per-sentence synthesis responses carry a
@@ -911,7 +926,14 @@ impl AgentRuntime {
             None => {
                 // No active turn — the turn may have already completed (e.g. a duplicate
                 // response from a second controller on the same role inbox arriving after
-                // the first one already resolved the turn). Drop silently.
+                // the first one already resolved the turn). Benign for duplicates, but
+                // logged (DEF-051): if the session SHOULD have an active turn, this is
+                // the arm that strands it until the watchdog eviction.
+                info!(
+                    session_id = %session_id,
+                    turn_id = %turn_id,
+                    "handle_model_response: no active turn for session — dropping response"
+                );
                 return Ok(());
             }
             Some(ref active_id) if active_id != &turn_id => {
