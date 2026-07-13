@@ -180,6 +180,10 @@ pub struct AttachmentInput {
     pub inline_audio_b64: Option<String>,
     pub inline_audio_sample_rate: Option<u32>,
     pub inline_audio_channels: Option<u16>,
+    /// Clip length in whole seconds for audio/video attachments (e.g. Telegram's
+    /// `voice.duration`). Used to size the `voice.transcribe` dispatch budget so a
+    /// long voice memo is not cut off by the default timeout. `None` when unknown.
+    pub duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -991,6 +995,9 @@ fn parse_attachments(value: Option<&Value>) -> Vec<AttachmentInput> {
                             .and_then(|obj| obj.get("inline_audio_channels"))
                             .and_then(Value::as_u64)
                             .map(|v| v as u16),
+                        duration_secs: object
+                            .and_then(|obj| obj.get("duration_secs"))
+                            .and_then(Value::as_u64),
                     }
                 })
                 .collect()

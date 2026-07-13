@@ -1522,21 +1522,31 @@ fn telegram_message_attachments(message: &Value) -> Vec<Value> {
     let mut attachments = Vec::new();
 
     if let Some(voice) = message.get("voice") {
-        attachments.push(transport_attachment(
+        let mut attachment = transport_attachment(
             "voice",
             voice.get("file_id"),
             voice.get("mime_type").and_then(Value::as_str),
             None,
-        ));
+        );
+        // Telegram reports the clip length in whole seconds — carry it through so
+        // the model router can size the transcription timeout to the memo length.
+        if let Some(duration) = voice.get("duration").and_then(Value::as_u64) {
+            attachment["duration_secs"] = json!(duration);
+        }
+        attachments.push(attachment);
     }
 
     if let Some(audio) = message.get("audio") {
-        attachments.push(transport_attachment(
+        let mut attachment = transport_attachment(
             "audio",
             audio.get("file_id"),
             audio.get("mime_type").and_then(Value::as_str),
             audio.get("file_name").and_then(Value::as_str),
-        ));
+        );
+        if let Some(duration) = audio.get("duration").and_then(Value::as_u64) {
+            attachment["duration_secs"] = json!(duration);
+        }
+        attachments.push(attachment);
     }
 
     if let Some(document) = message.get("document") {
