@@ -5219,8 +5219,8 @@ impl AgentRuntime {
                     // change ONLY the model routing and preserve everything else
                     // (toolset, manifest, content policy). This keeps the
                     // ConfigureRole a "model-selection-only" change, which the
-                    // hotel gate lets a non-admin orchestrator apply to its own
-                    // role (see role_materialization.rs).
+                    // hotel gate lets any role (orchestrator or not) apply to
+                    // its own record (see role_materialization.rs).
                     let (role_name, mut tlc, toolset_profile) = {
                         match self.sessions.get(&session_id) {
                             Some(state) => {
