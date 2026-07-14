@@ -253,7 +253,13 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
         CommandManifestEntry {
             command: "model".into(),
             description: "Swap this agent's model by preset (durable), or list the options.".into(),
-            usage_hint: Some("/model [cydonia|dolphin|euryale|deepseek|glm|gemini]".into()),
+            usage_hint: Some("/model [<preset>|<vendor/model>]".into()),
+        },
+        CommandManifestEntry {
+            command: "models".into(),
+            description: "Browse the model catalog — vendors, then models, as tappable buttons."
+                .into(),
+            usage_hint: Some("/models [<vendor>|<search>]".into()),
         },
         CommandManifestEntry {
             command: "preapprove".into(),
@@ -351,6 +357,12 @@ pub enum SlashCommand {
     ModelPreset {
         alias: String,
     },
+    /// Browse the hotel's model catalog: bare `/models` lists vendors as
+    /// tappable buttons; `/models <vendor-or-search>` drills into matching
+    /// models, each button firing `/model <id>` to bind it.
+    Models {
+        query: Option<String>,
+    },
     /// Submit a corrected transcript for a Whisper turn — feeds the training flywheel.
     Correct {
         turn_id: String,
@@ -396,6 +408,7 @@ impl SlashCommand {
             Self::Voice { .. } => None,
             Self::Model { .. } => None,
             Self::ModelPreset { .. } => None,
+            Self::Models { .. } => None,
             Self::Dirty => None,
             Self::Sfw => None,
             Self::Correct { .. } => None,
@@ -475,6 +488,10 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/voice", provider, voice_id, ..] => Some(SlashCommand::Voice {
             provider: Some(normalize_voice_provider(provider)),
             voice_id: Some((*voice_id).to_string()),
+        }),
+        ["/models"] => Some(SlashCommand::Models { query: None }),
+        ["/models", rest @ ..] => Some(SlashCommand::Models {
+            query: Some(rest.join(" ")),
         }),
         ["/model"] => Some(SlashCommand::Model { tier: None }),
         ["/model", arg, ..] => {
@@ -768,6 +785,26 @@ mod tests {
         );
         assert_eq!(find_preset("gemini").and_then(|p| p.model_id), None);
         assert!(find_preset("nope-not-a-model").is_none());
+    }
+
+    #[test]
+    fn parses_models_browse_command() {
+        assert_eq!(
+            parse_slash_command("/models"),
+            Some(SlashCommand::Models { query: None })
+        );
+        assert_eq!(
+            parse_slash_command("/models sao10k"),
+            Some(SlashCommand::Models {
+                query: Some("sao10k".into()),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/models euryale 70b"),
+            Some(SlashCommand::Models {
+                query: Some("euryale 70b".into()),
+            })
+        );
     }
 
     #[test]
