@@ -438,6 +438,17 @@ impl LifeGraphProvider {
         }
         Ok(json!({ "rows": output }))
     }
+
+    /// Execute a vector-search query with the embedding bound as `$vec`.
+    async fn execute_cypher_with_vec(&self, cypher: &str, vec_param: Vec<f64>) -> Result<Value> {
+        let graph = self.connect().await?;
+        let mut rows = graph.execute(query(cypher).param("vec", vec_param)).await?;
+        let mut output = Vec::new();
+        while let Some(row) = rows.next().await? {
+            output.push(row_to_json(&row)?);
+        }
+        Ok(json!({ "rows": output }))
+    }
 }
 
 #[async_trait]
@@ -2117,12 +2128,22 @@ impl LifeGraphProvider {
         if embedding.is_empty() {
             return Ok(());
         }
-        for label in labels {
+        // The per-label searches are independent reads — run them
+        // concurrently instead of serially awaiting each round trip
+        // (CurrentPromptSemantic sweeps ~8 labels on every turn). The
+        // embedding rides as the $vec Bolt param so the query text stays
+        // constant per index and Memgraph can cache the plan.
+        let vec_param: Vec<f64> = embedding.iter().map(|v| f64::from(*v)).collect();
+        let searches = labels.iter().map(|label| {
             let index = projection::index_name(&space, label);
-            let cypher =
-                projection::semantic_expand_cypher(&index, top_k, embedding, min_similarity);
-            let result = self.execute_cypher(&cypher).await?;
-            all_hits.extend(projection::parse_vector_search_rows(&result));
+            let cypher = projection::semantic_expand_cypher(&index, top_k, min_similarity);
+            let vec_param = vec_param.clone();
+            async move {
+                self.execute_cypher_with_vec(&cypher, vec_param).await
+            }
+        });
+        for result in futures::future::join_all(searches).await {
+            all_hits.extend(projection::parse_vector_search_rows(&result?));
         }
         Ok(())
     }

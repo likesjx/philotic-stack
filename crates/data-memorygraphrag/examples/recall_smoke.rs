@@ -68,9 +68,12 @@ async fn main() -> anyhow::Result<()> {
     for pivot in &recall_query.semantic_pivots {
         for label in space_labels(&pivot.space) {
             let index = projection::index_name(&pivot.space, label);
-            let cypher = projection::semantic_expand_cypher(&index, top_k, &embedding, min_sim);
+            let cypher = projection::semantic_expand_cypher(&index, top_k, min_sim);
+            let vec_param: Vec<f64> = embedding.iter().map(|v| f64::from(*v)).collect();
 
-            let mut rows_stream = graph.execute(neo_query(&cypher)).await?;
+            let mut rows_stream = graph
+                .execute(neo_query(&cypher).param("vec", vec_param))
+                .await?;
             let mut raw_rows = Vec::new();
             while let Some(row) = rows_stream.next().await? {
                 raw_rows.push(row_to_json(&row)?);

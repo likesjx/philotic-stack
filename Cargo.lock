@@ -1176,6 +1176,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "datasource",
+ "futures",
  "neo4rs",
  "philotic-client",
  "reqwest",
