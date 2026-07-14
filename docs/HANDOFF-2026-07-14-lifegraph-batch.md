@@ -80,6 +80,17 @@ Root cause (`crates/philote/src/memory_integration.rs` `inbound_primary_user_id`
 
 ---
 
+## 🏗️ Architecture item (operator-flagged): data-driven tool grants — proposal FILED
+
+The operator's principle from this session: **"we should not have any tool hard coded."** Tonight's inability to disable one tool without a code+deploy is the motivating case. Filed as an intel-graph proposal — **`proposal:data-driven-tool-grants-skilldag`** (query it with `phil graph context_for` / `graph_context_for`).
+
+- **Problem:** tool grants are compiled into the binaries (five surfaces: `skill_implied_tools` in `catalog.rs`, `tools_for_allowed_class` in `ipc.rs`, seeded `implied_tools` + runner `supported_tools` in `main.rs`, and `tool_catalog()`), so enable/disable/grant/re-route needs a deploy.
+- **Goal:** grants become graph/config data — seeded once, editable at runtime with **no deploy**; hardcoded lists demote to first-boot seed + fallback.
+- **SkillDAG decision (discussed):** keep the **authoritative, hot-path grants in the LOCAL hotel context graph** (fast, always-available, per-hotel) — do NOT put runtime tool resolution behind the remote LifeGraph (Memgraph on vps-jane), or every agent bricks when it's down (this session's failure mode). Use the **LifeGraph only as an optional reasoning/design layer** the agent proposes changes against, which then **compile down** to the local toolset (compiler pattern; autopoiesis fit). Full pros/cons in the proposal node.
+- **Slices** (in the proposal): (1) grant registry in the context graph — verify by disabling `life.observe.batch` at runtime with no deploy; (2) runner routing as data (the PR #277 reconcile is a precedent); (3) governance/audit; (4) later — SkillDAG reflection in the LifeGraph.
+
+---
+
 ## 📍 Key file/line references
 
 - `crates/philote/src/memory_integration.rs` — `inbound_primary_user_id` (memory routing fix)
