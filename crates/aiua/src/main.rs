@@ -7571,6 +7571,19 @@ async fn main() -> Result<()> {
         warn!(error = %e, "memory.hygiene: failed to ensure nightly sweep cron job");
     }
 
+    // Nightly dream sweep (consolidation): the shutdown-drain sweep alone
+    // never runs on a long-lived hotel, so near-duplicate engrams accumulate
+    // for days. Same opt-in/idempotency contract as memory.hygiene, gated on
+    // PHILOTIC_DREAM_SWEEP_ENABLED.
+    if let Err(e) = dream::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+        |k| std::env::var(k).ok(),
+    ) {
+        warn!(error = %e, "dream-sweep: failed to ensure nightly consolidation cron job");
+    }
+
     if smoke_mode {
         warn!(
             "PHILOTIC_SMOKE_MODE enabled: starting local-only IPC runtime without mesh or guest materialization."
@@ -8058,6 +8071,11 @@ async fn main() -> Result<()> {
             // registration): CronJobSync replicates the job definition to
             // every mesh peer regardless of that peer's own opt-in.
             memory_hygiene::sweep_enabled(|k| std::env::var(k).ok()),
+        )
+        .with_dream_sweep(
+            muninn_config_arc.clone(),
+            hotel_name.clone(),
+            dream::sweep_enabled(|k| std::env::var(k).ok()),
         );
         tokio::spawn(async move {
             cron_ticker.run().await;

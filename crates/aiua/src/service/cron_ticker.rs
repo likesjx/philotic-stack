@@ -69,6 +69,21 @@ pub struct CronTicker {
     /// of panicking if a job somehow targets [`crate::memory_hygiene::CRON_TARGET_ROLE`]
     /// without it.
     memory_hygiene: Option<MemoryHygieneCronContext>,
+    /// Nightly dream-sweep (consolidation) context. Same shape and
+    /// fleet-safety rules as `memory_hygiene`; `None` when
+    /// `with_dream_sweep` was never called.
+    dream_sweep: Option<DreamSweepCronContext>,
+}
+
+/// Wiring the in-process nightly dream sweep needs at fire time. Mirrors
+/// [`MemoryHygieneCronContext`], including the load-bearing local opt-in
+/// re-check (see that struct's `enabled_locally` doc for why job presence
+/// alone is not consent once CronJobSync replicates definitions mesh-wide).
+struct DreamSweepCronContext {
+    muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+    hotel_name: String,
+    /// This hotel's own `PHILOTIC_DREAM_SWEEP_ENABLED`, captured at boot.
+    enabled_locally: bool,
 }
 
 /// Wiring the in-process `memory.hygiene` sweep needs at fire time — separate
@@ -113,6 +128,7 @@ impl CronTicker {
             materialization_requester,
             delivery_claims,
             memory_hygiene: None,
+            dream_sweep: None,
         }
     }
 
@@ -134,6 +150,25 @@ impl CronTicker {
             muninn_config,
             hotel_name: hotel_name.into(),
             intel_graph_url,
+            enabled_locally,
+        });
+        self
+    }
+
+    /// Wire the nightly dream-sweep (consolidation) context. `fire()`
+    /// intercepts jobs targeting `crate::dream::CRON_TARGET_ROLE` and runs
+    /// the sweep in-process — but only when `enabled_locally` is true (this
+    /// hotel's own `PHILOTIC_DREAM_SWEEP_ENABLED`, not just a
+    /// mesh-replicated job record).
+    pub fn with_dream_sweep(
+        mut self,
+        muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+        hotel_name: impl Into<String>,
+        enabled_locally: bool,
+    ) -> Self {
+        self.dream_sweep = Some(DreamSweepCronContext {
+            muninn_config,
+            hotel_name: hotel_name.into(),
             enabled_locally,
         });
         self
@@ -270,6 +305,19 @@ impl CronTicker {
             if let Err(e) = self.advance_schedule(job, fire_epoch) {
                 error!(
                     "CronTicker: memory.hygiene advance failed for job {}: {e}",
+                    job.id
+                );
+            }
+            return;
+        }
+
+        // Nightly dream sweep: same in-process sentinel interception as
+        // memory.hygiene — consolidation must not wait for hotel shutdown.
+        if job.target_role == crate::dream::CRON_TARGET_ROLE {
+            self.fire_dream_sweep().await;
+            if let Err(e) = self.advance_schedule(job, fire_epoch) {
+                error!(
+                    "CronTicker: dream-sweep advance failed for job {}: {e}",
                     job.id
                 );
             }
@@ -437,6 +485,31 @@ impl CronTicker {
             now_ms / 1000,
         )
         .await;
+    }
+
+    /// Run the dream (consolidation) sweep in-process. Same defensive no-op
+    /// and fleet-safety local-opt-in re-check as [`Self::fire_memory_hygiene`].
+    async fn fire_dream_sweep(&self) {
+        let Some(ctx) = &self.dream_sweep else {
+            warn!(
+                "CronTicker: dream-sweep job fired but no context was wired \
+                 (with_dream_sweep not called) — skipping"
+            );
+            return;
+        };
+        if !ctx.enabled_locally {
+            debug!(
+                "CronTicker: dream-sweep job fired but this hotel has not opted in \
+                 (PHILOTIC_DREAM_SWEEP_ENABLED unset here) — job definition was likely \
+                 replicated via CronJobSync from a peer hotel; skipping sweep"
+            );
+            return;
+        }
+        let Some(config) = &ctx.muninn_config else {
+            debug!("CronTicker: dream-sweep fired but MuninnDB is not configured — skipping");
+            return;
+        };
+        crate::dream::dream_sweep(config, &self.graph, &ctx.hotel_name).await;
     }
 
     async fn broadcast_cron_fired(&self, job: &CronJob, fire_epoch: u64, now_ms: u64) {

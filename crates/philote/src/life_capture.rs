@@ -323,6 +323,44 @@ pub(super) fn capture_fingerprint(candidate: &MemoryCandidate) -> u64 {
     hasher.finish()
 }
 
+/// FNV-1a 64-bit. Node identity must survive process restarts *and* toolchain
+/// upgrades, so it cannot ride `DefaultHasher` (stable only within one build).
+fn fnv1a_64(hasher: &mut u64, bytes: &[u8]) {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for byte in bytes {
+        *hasher ^= u64::from(*byte);
+        *hasher = hasher.wrapping_mul(FNV_PRIME);
+    }
+}
+
+/// Content-derived node identity for auto-captured lived facts: FNV-1a over
+/// label + observing agent + the same normalized concept/content tokens as
+/// [`capture_fingerprint`]. The same fact re-observed in a later turn, session,
+/// or process produces the same node id, so the runner's `MERGE` upserts the
+/// existing node instead of minting a duplicate. Scoped per agent so one
+/// agent's re-observation never clobbers another's provenance envelope.
+pub(super) fn stable_capture_node_id(
+    label: LivedFactLabel,
+    agent_id: &str,
+    candidate: &MemoryCandidate,
+) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hash = FNV_OFFSET;
+    fnv1a_64(&mut hash, label.as_str().as_bytes());
+    fnv1a_64(&mut hash, b"\x1f");
+    fnv1a_64(&mut hash, agent_id.as_bytes());
+    for source in [&candidate.concept, &candidate.content] {
+        for token in source
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+        {
+            fnv1a_64(&mut hash, b"\x1f");
+            fnv1a_64(&mut hash, token.to_ascii_lowercase().as_bytes());
+        }
+    }
+    format!("life:{}:{hash:016x}", label.id_slug())
+}
+
 #[derive(Debug, Default)]
 struct SessionCaptureState {
     /// LRU of recently captured fingerprints (front = oldest).
@@ -337,8 +375,9 @@ struct SessionCaptureState {
 
 /// Per-session dedup + budget ledger for the auto-capture lane. Live-only
 /// (never checkpointed), mirroring the prefetch-dispatched flag: a process
-/// restart resets dedup/budget state, which only risks a benign re-observe
-/// (the runner MERGEs idempotently on node identity anyway).
+/// restart resets dedup/budget state, which only risks a benign re-observe —
+/// node ids are content-derived ([`stable_capture_node_id`]), so the runner's
+/// MERGE upserts the same node instead of minting a duplicate.
 #[derive(Debug, Default)]
 pub(super) struct LifeCaptureLedger {
     sessions: HashMap<String, SessionCaptureState>,
@@ -433,8 +472,10 @@ pub(super) fn life_autocapture_task_json(
     observed_role: Option<&str>,
 ) -> Value {
     let now_iso = chrono::Utc::now().to_rfc3339();
+    // Observation/evidence ids stay unique per observation; node identity is
+    // content-derived so re-observations MERGE instead of forking new nodes.
     let suffix = Uuid::new_v4().simple().to_string();
-    let node_id = format!("life:{}:{suffix}", label.id_slug());
+    let node_id = stable_capture_node_id(label, agent_id, candidate);
     let confidence = candidate
         .confidence
         .unwrap_or(LIFE_AUTOCAPTURE_DEFAULT_CONFIDENCE)
@@ -848,6 +889,85 @@ mod tests {
         );
         assert_eq!(capture_fingerprint(&a), capture_fingerprint(&b));
         assert_ne!(capture_fingerprint(&a), capture_fingerprint(&c));
+    }
+
+    #[test]
+    fn stable_node_id_survives_rephrasing_but_splits_on_label_agent_content() {
+        let a = candidate(
+            "rowing habit",
+            "Jared rows every morning before breakfast.",
+            &[],
+        );
+        let b = candidate(
+            "Rowing   Habit",
+            "  jared ROWS, every morning — before breakfast!  ",
+            &[],
+        );
+        let c = candidate(
+            "rowing habit",
+            "Jared rows every evening before dinner.",
+            &[],
+        );
+        let id_a = stable_capture_node_id(LivedFactLabel::Habit, "agent-beacon-01", &a);
+        // Cosmetic rephrasing → same node.
+        assert_eq!(
+            id_a,
+            stable_capture_node_id(LivedFactLabel::Habit, "agent-beacon-01", &b)
+        );
+        // Different content, label, or observing agent → different node.
+        assert_ne!(
+            id_a,
+            stable_capture_node_id(LivedFactLabel::Habit, "agent-beacon-01", &c)
+        );
+        assert_ne!(
+            id_a,
+            stable_capture_node_id(LivedFactLabel::Event, "agent-beacon-01", &a)
+        );
+        assert_ne!(
+            id_a,
+            stable_capture_node_id(LivedFactLabel::Habit, "agent-astrid-01", &a)
+        );
+        assert!(id_a.starts_with("life:habit:"));
+    }
+
+    #[test]
+    fn stable_node_id_is_a_fixed_value_across_builds() {
+        // FNV-1a is toolchain-independent; pin one vector so an accidental
+        // hasher swap (which would silently re-fork every captured node)
+        // fails loudly here.
+        let cand = candidate("anchor", "pinned regression vector for node identity.", &[]);
+        assert_eq!(
+            stable_capture_node_id(LivedFactLabel::Decision, "agent-test-01", &cand),
+            format!("life:decision:{:016x}", expected_fnv_for_pinned_vector())
+        );
+    }
+
+    fn expected_fnv_for_pinned_vector() -> u64 {
+        // Independent re-derivation of the same FNV-1a stream.
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        };
+        eat(b"Decision");
+        eat(b"\x1f");
+        eat(b"agent-test-01");
+        for token in [
+            "anchor",
+            "pinned",
+            "regression",
+            "vector",
+            "for",
+            "node",
+            "identity",
+        ] {
+            eat(b"\x1f");
+            eat(token.as_bytes());
+        }
+        hash
     }
 
     #[test]

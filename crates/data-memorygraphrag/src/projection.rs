@@ -96,22 +96,20 @@ pub fn embedding_space_for_label(label: &str) -> Option<&'static str> {
 /// YIELD names are `node` and `similarity` (no alias) so the parser reads
 /// `result["rows"][i]["node"]` and `result["rows"][i]["similarity"]`.
 ///
+/// The query embedding rides as the `$vec` Bolt parameter, NOT inlined into
+/// the query text: 768 formatted floats per search made every recall query a
+/// unique multi-KB string, defeating Memgraph's query-plan cache on the
+/// hottest read path (~8 searches per turn). Callers must bind `vec`.
+///
 /// Verified against Memgraph 3.10.1 on vps-jane: correct procedure name,
 /// arg arity, and index name format. Empty DB returns 0 rows (not an error).
-pub fn semantic_expand_cypher(
-    index: &str,
-    top_k: usize,
-    vector: &[f32],
-    min_similarity: f32,
-) -> String {
-    let vec_body: Vec<String> = vector.iter().map(|v| format!("{:.6}", v)).collect();
+pub fn semantic_expand_cypher(index: &str, top_k: usize, min_similarity: f32) -> String {
     format!(
-        "CALL vector_search.search(\"{index}\", {top_k}, [{vec_body}]) \
+        "CALL vector_search.search(\"{index}\", {top_k}, $vec) \
          YIELD node, similarity \
          WHERE similarity >= {min_sim:.4} \
          RETURN node, similarity \
          ORDER BY similarity DESC",
-        vec_body = vec_body.join(", "),
         min_sim = min_similarity,
     )
 }
@@ -771,16 +769,17 @@ mod tests {
     }
 
     #[test]
-    fn semantic_expand_cypher_embeds_vector_inline() {
-        let cypher =
-            semantic_expand_cypher("life_event_semantic__OpenLoop", 5, &[0.1, 0.2, 0.3], 0.4);
+    fn semantic_expand_cypher_parameterizes_vector() {
+        let cypher = semantic_expand_cypher("life_event_semantic__OpenLoop", 5, 0.4);
         assert!(cypher.contains("CALL vector_search.search("));
         assert!(cypher.contains("\"life_event_semantic__OpenLoop\""));
-        assert!(cypher.contains(", 5, ["));
-        assert!(cypher.contains("0.100000"));
+        assert!(cypher.contains(", 5, $vec)"));
         assert!(cypher.contains("YIELD node, similarity"));
         assert!(cypher.contains("WHERE similarity >= 0.4000"));
         assert!(cypher.contains("ORDER BY similarity DESC"));
+        // The embedding must ride as a Bolt param, never inline floats — a
+        // regression here re-defeats Memgraph's query-plan cache.
+        assert!(!cypher.contains("0.100000"));
         // No alias — key in parser must be "node", not "pivot".
         assert!(!cypher.contains("AS pivot"));
     }

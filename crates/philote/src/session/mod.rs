@@ -1557,6 +1557,16 @@ impl SessionState {
             .iter()
             .filter_map(|memory| memory.id.clone())
             .collect();
+        // Cross-lane content dedup: the auto-capture lane forks one memory
+        // candidate into both Muninn and the LifeGraph, so the same fact can
+        // come back from both recall lanes under different ids (Muninn ULID
+        // vs life:* node id). Id dedup can't catch that; normalized content
+        // fingerprints can.
+        let mut seen_fingerprints: std::collections::HashSet<u64> = turn
+            .recalled_memories
+            .iter()
+            .filter_map(|memory| recalled_content_fingerprint(&memory.content))
+            .collect();
 
         let mut lanes: Vec<std::collections::VecDeque<RecalledMemoryRecord>> = Vec::new();
         for entry in &self.life_recall_cache {
@@ -1567,6 +1577,11 @@ impl SessionState {
             for record in &entry.records {
                 if let Some(id) = record.id.as_deref() {
                     if !seen_ids.insert(id.to_string()) {
+                        continue;
+                    }
+                }
+                if let Some(fingerprint) = recalled_content_fingerprint(&record.content) {
+                    if !seen_fingerprints.insert(fingerprint) {
                         continue;
                     }
                 }
@@ -2053,7 +2068,7 @@ impl SessionState {
                 .iter()
                 .chain(self.bindings.on_demand_skills.iter())
             {
-                if crate::catalog::skill_is_relevant_for_turn(skill, &normalized) {
+                if self.skill_relevant_for_turn_with_session_signal(skill, &normalized) {
                     for &tool_name in crate::catalog::skill_implied_tools(skill) {
                         add_tool(tool_name);
                     }
@@ -2084,6 +2099,10 @@ impl SessionState {
             .effective_skillset
             .iter()
             .chain(self.bindings.on_demand_skills.iter())
+            // Deliberately the pure keyword gate, NOT the session-signal
+            // fallback: injected LifeGraph context must not defeat the
+            // conversational zero-tools gate — a gratitude/filler turn stays
+            // tool-free even mid-stewardship (tool projection is policy).
             .any(|skill| crate::catalog::skill_is_relevant_for_turn(skill, &normalized));
         if looks_like_conversational_goal(&normalized)
             && !looks_like_retry_goal(&normalized_current)
@@ -2130,15 +2149,43 @@ impl SessionState {
                 all_tools.retain(
                     |tool| match on_demand_ownership.get(tool.tool_name.as_str()) {
                         None => true,
-                        Some(owners) => owners
-                            .iter()
-                            .any(|s| crate::catalog::skill_is_relevant_for_turn(s, &normalized)),
+                        Some(owners) => owners.iter().any(|s| {
+                            self.skill_relevant_for_turn_with_session_signal(s, &normalized)
+                        }),
                     },
                 );
             }
         }
 
         all_tools
+    }
+
+    /// True when the active turn already carries injected LifeGraph context
+    /// (the auto-recall lane marks its records with `vault_id = "life-graph"`).
+    fn turn_carries_life_graph_context(&self) -> bool {
+        self.active_turn
+            .as_ref()
+            .map(|turn| {
+                turn.recalled_memories
+                    .iter()
+                    .any(|memory| memory.vault_id.as_deref() == Some("life-graph"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Skill relevance with a session-state fallback for `life.steward`.
+    ///
+    /// The keyword gate alone suppresses every `life.*` tool on low-signal
+    /// turns: an operator answering "Go" to a recalled open loop got a model
+    /// that could see the loop (auto-recall injection is keyword-independent)
+    /// but could not act on it (life.commit stripped). If the harness is
+    /// showing the model LifeGraph memories this turn, the model gets the
+    /// LifeGraph tools too — the injected context IS the relevance signal.
+    fn skill_relevant_for_turn_with_session_signal(&self, skill: &str, normalized: &str) -> bool {
+        if crate::catalog::skill_is_relevant_for_turn(skill, normalized) {
+            return true;
+        }
+        skill == "life.steward" && self.turn_carries_life_graph_context()
     }
 
     fn projection_relevance_text(&self, normalized_current: &str) -> String {
@@ -2681,7 +2728,7 @@ impl SessionState {
                     .iter()
                     .any(|on_demand| on_demand == *skill)
                 {
-                    return crate::catalog::skill_is_relevant_for_turn(skill, &normalized);
+                    return self.skill_relevant_for_turn_with_session_signal(skill, &normalized);
                 }
 
                 let implied_tools = crate::catalog::skill_implied_tools(skill);
@@ -2695,7 +2742,7 @@ impl SessionState {
             .collect::<std::collections::BTreeSet<_>>();
 
         for skill in &self.bindings.on_demand_skills {
-            if !crate::catalog::skill_is_relevant_for_turn(skill, &normalized) {
+            if !self.skill_relevant_for_turn_with_session_signal(skill, &normalized) {
                 continue;
             }
             let implied_tools = crate::catalog::skill_implied_tools(skill);
@@ -3021,7 +3068,7 @@ impl SessionState {
             sections.push(format!("[Memory seed]\n{memory_summary}"));
         }
 
-        if Self::should_project_lifegraph_stewardship(user_content, projected_tools) {
+        if self.should_project_lifegraph_stewardship(user_content, projected_tools) {
             sections.push(
                 "[LifeGraph stewardship]\n\
                  Use life.recall before answering when the turn involves life structure, \
@@ -3041,6 +3088,7 @@ impl SessionState {
     }
 
     fn should_project_lifegraph_stewardship(
+        &self,
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> bool {
@@ -3054,7 +3102,10 @@ impl SessionState {
             return false;
         }
 
-        crate::catalog::skill_is_relevant_for_turn(
+        // Same session-signal fallback as tool projection: when injected
+        // LifeGraph context earned the tools, the stewardship charter that
+        // tells the model how to use them must render too.
+        self.skill_relevant_for_turn_with_session_signal(
             "life.steward",
             &normalized_turn_text(user_content),
         )
@@ -4214,6 +4265,26 @@ impl SessionState {
             fallback_override,
         })
     }
+}
+
+/// Normalized content fingerprint for cross-lane recall dedup: lowercase
+/// alphanumeric tokens, whitespace/punctuation-insensitive (the same
+/// normalization the capture lane uses, so a fact forked at capture time
+/// dedups at recall time despite carrying different ids per plane).
+/// Returns `None` for content with no tokens — records without comparable
+/// content must never dedup against each other.
+fn recalled_content_fingerprint(content: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut tokens = 0usize;
+    for token in content
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        token.to_ascii_lowercase().hash(&mut hasher);
+        tokens += 1;
+    }
+    (tokens > 0).then(|| hasher.finish())
 }
 
 /// Truncation marker appended when the LifeGraph char budget cuts content.
@@ -7626,6 +7697,89 @@ mod tests {
     }
 
     #[test]
+    fn low_signal_go_turn_keeps_life_tools_when_context_was_injected() {
+        // Regression for the "Go" bug: an operator answering "Go" to recalled
+        // open loops matched none of life.steward's keywords, so the on-demand
+        // ownership filter stripped every life.* tool — the model could SEE the
+        // loops (auto-recall injection is keyword-independent) but could not
+        // act on them. Injected LifeGraph context is now itself the relevance
+        // signal.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-coach-01".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit", "life.resolve"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+
+        let mut turn = make_plain_turn();
+        turn.user_content = "Go".into();
+        let mut life_memory = life_record("life:openloop:ypt", "YPT training due this week");
+        life_memory.vault_id = Some("life-graph".into());
+        turn.recalled_memories = vec![life_memory];
+        state.start_turn(turn);
+
+        let projected = state.project_tools_for_turn("Go");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            projected_names.contains("life.commit"),
+            "expected injected LifeGraph context to keep life.commit projected on a \
+             low-signal continuation turn, got {projected_names:?}"
+        );
+    }
+
+    #[test]
+    fn low_signal_turn_without_life_context_still_strips_life_tools() {
+        // The session-signal fallback must not become "always on": with no
+        // injected LifeGraph context, a keyword-less turn still strips the
+        // on-demand life.* group.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-coach-01".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+        state.start_turn(make_plain_turn());
+
+        let projected = state.project_tools_for_turn("Go");
+        assert!(
+            projected.iter().all(|t| !t.tool_name.starts_with("life.")),
+            "expected life.* stripped without keywords or injected context"
+        );
+    }
+
+    #[test]
+    fn gratitude_turn_stays_tool_free_even_with_life_context_injected() {
+        // Tool projection is policy: injected context must not defeat the
+        // conversational zero-tools gate.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-coach-01".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+
+        let mut turn = make_plain_turn();
+        turn.user_content = "thanks, that looks great!".into();
+        let mut life_memory = life_record("life:openloop:ypt", "YPT training due this week");
+        life_memory.vault_id = Some("life-graph".into());
+        turn.recalled_memories = vec![life_memory];
+        state.start_turn(turn);
+
+        let projected = state.project_tools_for_turn("thanks, that looks great!");
+        assert!(
+            projected.is_empty(),
+            "expected gratitude turn to stay tool-free despite injected context, got {:?}",
+            projected
+                .iter()
+                .map(|t| t.tool_name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn done_and_confirm_turn_projects_life_commit() {
         // Regression for the "done means done" bug: Beacon's real production turn
         // "Confirm for both. Finished my YPT." matched none of life.steward's
@@ -9269,6 +9423,59 @@ mod tests {
         assert_eq!(memories.len(), 2);
         assert_eq!(memories[1].id.as_deref(), Some("life:fresh"));
         assert_eq!(memories[1].vault_id.as_deref(), Some("life-graph"));
+    }
+
+    #[test]
+    fn inject_cached_life_context_dedupes_forked_fact_across_planes() {
+        // The capture lane forks one candidate into Muninn AND the LifeGraph:
+        // same content, different ids (ULID vs life:*). The turn must not
+        // carry the fact twice.
+        let now = 10_000u64;
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = make_plain_turn();
+        let mut muninn_copy = life_record(
+            "01KXGJFG2487NQSGTT7AH5ZCVX",
+            "Renew the passport before the August trip!",
+        );
+        muninn_copy.vault_id = Some("user_likesjx".into());
+        turn.recalled_memories = vec![muninn_copy];
+        state.start_turn(turn);
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "open_loops_by_context".into(),
+            fetched_at: now - 10,
+            query_text: String::new(),
+            records: vec![
+                // Same fact, cosmetically rephrased, LifeGraph node id.
+                life_record(
+                    "life:openloop:abc123",
+                    "renew the PASSPORT, before the august trip",
+                ),
+                life_record("life:openloop:def456", "schedule the dentist appointment"),
+            ],
+        });
+
+        let injected = state.inject_cached_life_context(1_800, now, 2_500);
+        assert_eq!(
+            injected, 1,
+            "forked duplicate must be dropped, fresh fact kept"
+        );
+        let memories = &state.active_turn.as_ref().unwrap().recalled_memories;
+        assert_eq!(memories.len(), 2);
+        assert_eq!(memories[1].id.as_deref(), Some("life:openloop:def456"));
+    }
+
+    #[test]
+    fn recalled_content_fingerprint_never_dedupes_empty_content() {
+        assert_eq!(super::recalled_content_fingerprint(""), None);
+        assert_eq!(super::recalled_content_fingerprint("  —!  "), None);
+        assert_ne!(
+            super::recalled_content_fingerprint("renew passport"),
+            super::recalled_content_fingerprint("schedule dentist")
+        );
     }
 
     #[test]

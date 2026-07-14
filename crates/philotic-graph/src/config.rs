@@ -1,4 +1,3 @@
-use crate::muninn_bridge::MuninnBridgeConfig;
 use graph_intelligence::scanner::ScanConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -41,9 +40,6 @@ pub struct PhiloticGraphConfig {
     /// Documentation directories to scan
     pub doc_roots: Vec<String>,
 
-    /// Muninn bridge configuration
-    pub muninn: MuninnBridgeConfig,
-
     /// Auto-scan on file changes
     pub watch: bool,
 }
@@ -56,7 +52,6 @@ impl Default for PhiloticGraphConfig {
             mcp_port: 8901,
             rust_roots: vec!["crates/".into()],
             doc_roots: vec!["docs/".into()],
-            muninn: MuninnBridgeConfig::default(),
             watch: false,
         }
     }

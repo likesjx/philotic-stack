@@ -163,6 +163,11 @@ struct ActivationItem {
     #[serde(default)]
     tags: Vec<String>,
     confidence: f32,
+    /// Server-side activation relevance for the query (semantic + graph
+    /// blend). Defaults to 0.0 against servers that predate the field, in
+    /// which case cross-scope ranking degrades to recency + confidence.
+    #[serde(default)]
+    score: f64,
     created_at: i64,
     updated_at: Option<i64>,
     #[serde(default)]
@@ -225,6 +230,26 @@ impl From<ReadResponse> for Engram {
             metadata: r.metadata,
         }
     }
+}
+
+/// Cross-scope merge ranking. Each vault's activations arrive already ranked
+/// by the server's query relevance; merging on raw `confidence` (the old
+/// behavior) let a high-confidence but irrelevant memory outrank an exact
+/// match from another vault. Relevance dominates here; recency (exponential
+/// decay, ~14-day scale, mirroring the LifeGraph ranking model) and
+/// confidence act as bounded tiebreakers.
+fn cross_scope_rank_score(
+    server_score: f64,
+    confidence: f32,
+    updated_at_secs: u64,
+    now_secs: u64,
+) -> f64 {
+    const RECENCY_DECAY_DAYS: f64 = 14.0;
+    const RECENCY_WEIGHT: f64 = 0.25;
+    const CONFIDENCE_WEIGHT: f64 = 0.15;
+    let age_days = now_secs.saturating_sub(updated_at_secs) as f64 / 86_400.0;
+    let recency = (-age_days / RECENCY_DECAY_DAYS).exp();
+    server_score + RECENCY_WEIGHT * recency + CONFIDENCE_WEIGHT * f64::from(confidence)
 }
 
 fn link_kind_to_relation(kind: &LinkKind) -> &'static str {
@@ -645,51 +670,91 @@ impl MemoryEngine for MuninnRestEngine {
         let mut total = 0usize;
         let is_cross_scope = matches!(scope, MemoryScope::CrossScope(_));
 
-        for vault in vaults {
-            if is_cross_scope && !self.has_auth_for_vault(&vault) {
-                debug!(
-                    vault = %vault,
-                    "Skipping cross-scope activation for vault without token"
-                );
-                continue;
-            }
+        // Cross-scope recall runs in the turn path before context composition:
+        // the per-vault activations are independent, so fire them concurrently
+        // instead of paying up to three serial round-trips per turn.
+        let fetches = vaults
+            .iter()
+            .filter(|vault| {
+                if is_cross_scope && !self.has_auth_for_vault(vault) {
+                    debug!(
+                        vault = %vault,
+                        "Skipping cross-scope activation for vault without token"
+                    );
+                    return false;
+                }
+                true
+            })
+            .map(|vault| {
+                let body = ActivateRequest {
+                    vault: Some(vault.clone()),
+                    context: vec![context.to_string()],
+                    max_results: max,
+                };
+                async move {
+                    let resp: anyhow::Result<ActivateResponse> = async {
+                        Ok(self
+                            .with_auth(self.client.post(self.url("/api/activate")), vault)
+                            .json(&body)
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json()
+                            .await?)
+                    }
+                    .await;
+                    (vault, resp)
+                }
+            });
 
-            let body = ActivateRequest {
-                vault: Some(vault.clone()),
-                context: vec![context.to_string()],
-                max_results: max,
+        for (vault, resp) in futures::future::join_all(fetches).await {
+            let resp = match resp {
+                Ok(resp) => resp,
+                // Cross-scope recall is advisory: one failing vault degrades
+                // to partial results instead of killing recall for the rest.
+                Err(err) if is_cross_scope => {
+                    tracing::warn!(
+                        vault = %vault,
+                        error = %err,
+                        "Cross-scope activation failed for vault; continuing with others"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
             };
-            let resp: ActivateResponse = self
-                .with_auth(self.client.post(self.url("/api/activate")), &vault)
-                .json(&body)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
 
             total += resp.total_found;
             // Populate cache from activation results so subsequent ops are fast.
             for item in &resp.activations {
-                self.cache_vault(&item.id, &vault).await;
+                self.cache_vault(&item.id, vault).await;
             }
             all_engrams.extend(resp.activations.into_iter().map(|item| {
+                let server_score = item.score;
                 let mut engram: Engram = item.into();
                 engram.vault_id = vault.clone();
-                engram
+                (server_score, engram)
             }));
         }
 
-        // If cross-scope, re-sort by confidence descending and truncate.
+        // Cross-scope: merge on combined relevance/recency/confidence and
+        // truncate. Within a single vault the server's ordering stands.
         if is_cross_scope {
-            all_engrams.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            all_engrams.sort_by(|(score_a, a), (score_b, b)| {
+                cross_scope_rank_score(*score_b, b.confidence, b.updated_at, now_secs).total_cmp(
+                    &cross_scope_rank_score(*score_a, a.confidence, a.updated_at, now_secs),
+                )
+            });
             if let Some(m) = max {
                 all_engrams.truncate(m);
             }
         }
 
         Ok(ActivationResult {
-            engrams: all_engrams,
+            engrams: all_engrams.into_iter().map(|(_, engram)| engram).collect(),
             total,
         })
     }
@@ -876,5 +941,39 @@ mod tests {
         assert!(engine.has_auth_for_vault("self_agent-aria"));
         assert!(engine.has_auth_for_vault("user_likesjx"));
         assert!(!engine.has_auth_for_vault("session_telegram:7898847424:agent-aria"));
+    }
+
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn cross_scope_rank_relevance_beats_stale_confidence() {
+        let now = 1_800_000_000;
+        // Old behavior: a fully-confident but irrelevant memory (score 0.05)
+        // outranked a strong match (score 0.7, confidence 0.6). Relevance
+        // must dominate the merge.
+        let irrelevant_confident = cross_scope_rank_score(0.05, 1.0, now - 30 * DAY, now);
+        let relevant_match = cross_scope_rank_score(0.7, 0.6, now - 30 * DAY, now);
+        assert!(relevant_match > irrelevant_confident);
+    }
+
+    #[test]
+    fn cross_scope_rank_recency_tiebreaks_equal_relevance() {
+        let now = 1_800_000_000;
+        let fresh = cross_scope_rank_score(0.5, 0.8, now - DAY, now);
+        let stale = cross_scope_rank_score(0.5, 0.8, now - 60 * DAY, now);
+        assert!(fresh > stale);
+    }
+
+    #[test]
+    fn cross_scope_rank_degrades_without_server_score() {
+        // Servers that predate the score field default every item to 0.0 —
+        // ranking must still order by recency + confidence, not collapse.
+        let now = 1_800_000_000;
+        let fresh_confident = cross_scope_rank_score(0.0, 0.9, now - DAY, now);
+        let stale_unconfident = cross_scope_rank_score(0.0, 0.3, now - 90 * DAY, now);
+        assert!(fresh_confident > stale_unconfident);
+        // Clock skew (updated_at in the future) must not panic or NaN.
+        let skewed = cross_scope_rank_score(0.2, 0.5, now + DAY, now);
+        assert!(skewed.is_finite());
     }
 }

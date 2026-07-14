@@ -3,23 +3,27 @@ title: Philotic Stack Architecture Reference
 doc_type: reference
 domain: runtime-sessions
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-07-14
 tags:
 - runtime
 - reference
 - hotel
 - ipc
 - mesh
+- memory
 related_docs:
 - README.md
 - ARCHITECTURE_STATUS.md
 - PORT_BLUEPRINT.md
+- KNOWLEDGE_ARCHITECTURE_PROPOSAL.md
+- MEMORY_TRANSPARENCY_PROPOSAL.md
 task_refs:
 - docs/task.md
 tracks_domains:
 - runtime-sessions
 - membrane-transport
 - mesh-placement
+- memory-context
 - tooling-execution
 - deployment-distribution
 ---
@@ -567,6 +571,37 @@ optimistic write (e.g., a conflict resolution from a remote hotel sync),
 it can push `IpcResponse::ApartmentUpdate` back to the guest's socket —
 overriding the local state.
 
+### 10.6 The Three-Plane Memory Model
+
+Apartments (§10.2) are recovery state, not the memory system. Durable
+memory lives on three planes with distinct authority, each with its own
+store and write path. The canonical division of responsibility, surface
+ownership table, and promotion flows live in
+[KNOWLEDGE_ARCHITECTURE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KNOWLEDGE_ARCHITECTURE_PROPOSAL.md);
+this section is the durable summary.
+
+| Plane | Store | Authority | Primary writers |
+|---|---|---|---|
+| **Muninn** (continuity) | MuninnDB daemon, REST `:8475`; vaults `self_{agent}` / `user_{username}` / `session_{id}` | Why something matters next time — decisions, preferences, reality gaps. Advisory, never source of truth. | philote turn loop (Attend hook, `memory.*` tools), tool-runner, aiua background sweeps (dream, hygiene, delta digest) |
+| **LifeGraph** (lived truth) | Memgraph, Bolt `:7687` (`PHILOTIC_MEMGRAPH_URI`), served by the `life-graph-runner` guest (`data-memorygraphrag`) | The operator's lived reality — roles, goals, commitments, open loops, habits. Evidence enters `proposed`; only `life.commit` confirms. | `life.observe` (model-invoked + philote auto-capture lane), attention steward |
+| **Intel Graph** (implementation truth) | SQLite, `graph-intelligence` server (REST `:8900`, MCP `:8901`) | Code structure, proposals, seams, decisions, verification evidence | `phil graph` scan/decide, agent sessions via MCP |
+
+Cross-plane rules:
+
+- **Capture forks, recall merges.** A qualifying turn candidate is forked
+  (not moved) into Muninn and, when it classifies as a lived fact, into
+  the LifeGraph (`philote/src/life_capture.rs`). Both recall lanes inject
+  into the same turn context with cross-lane content dedup; recalled items
+  carry an `origin` discriminator (`muninn` vs `life-graph`).
+- **One explain surface.** `memory.explain` fans a claim across all three
+  planes and merges on the shared `ProvenanceEnvelope` trust taxonomy
+  (`ansible-mesh-core/src/provenance.rs`,
+  [MEMORY_TRANSPARENCY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_TRANSPARENCY_PROPOSAL.md)).
+- **Promotion is deliberate.** Muninn candidates become LifeGraph evidence
+  via `life.observe` (with provenance) and are confirmed only through
+  `life.commit`; LifeGraph facts project back into Muninn as compact
+  continuity handles. No plane writes another's store implicitly.
+
 ---
 
 ## 11. Guest Lifecycle — Materialization & Supervision
@@ -651,6 +686,9 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 | `PHILOTIC_ENABLE_RUST_AUTH`           | `0`                              | Enable Rust-native HMAC auth (`1` = on)             |
 | `PHILOTIC_ENABLE_RUST_DISPATCHER`     | `0`                              | Enable Rust outbound mesh dispatcher                |
 | `PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE` | `0`                              | Enable Rust durable event ledger writer             |
+| `PHILOTIC_MEMORY_HYGIENE_ENABLED`     | unset (off)                      | Opt this hotel into the nightly Muninn contradiction/staleness sweep (03:00 UTC) |
+| `PHILOTIC_DREAM_SWEEP_ENABLED`        | unset (off)                      | Opt this hotel into the nightly Muninn consolidation (dream) sweep (03:30 UTC); the shutdown-drain sweep runs regardless |
+| `PHILOTIC_DREAM_SWEEP_SCHEDULE`       | `0 30 3 * * * *`                 | Override the nightly dream-sweep cron schedule (7-field syntax) |
 
 ---
 
