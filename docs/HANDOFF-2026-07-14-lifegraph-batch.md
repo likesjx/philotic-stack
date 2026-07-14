@@ -31,6 +31,19 @@ Drive a **multi-item `life.observe.batch` directly at the runner over IPC**, byp
 
 Node count climbed **137 → 143** over the session (family details, a car-oil-change loop, etc. **did** land), but **flight/Mali observations NEVER landed — in batch OR single writes.** So this may not be the batch machinery at all; it may be something about the flight observations themselves. The isolation repro settles it in minutes.
 
+### ⚡ 2026-07-14 ~22:20Z UPDATE — the decisive test was run; it points BELOW the provider
+
+A later session (memory-RAG audit fixes, PR #281, fleet deployed at develop `be2bdb4`) ran the isolation test above — the stock **single-item** `life_graph_ipc_smoke_driver`, both from mac-jane (cross-hotel) and **directly on vps-jane** (`sudo -u philotic`, socket `/run/philotic/vps-jane.sock`). Result, both hotels, repeated runs:
+
+- Driver times out: `life.observe: timed out waiting for datasource_response`.
+- The runner **never logs `received datasource task`** (journald confirmed alive — heal-dispatcher lines bracket the window).
+- **Memgraph write never happens** (`Signal WHERE id STARTS WITH "smoke-signal-"` count 18 → 18 across a run).
+- Each attempt later surfaces in **heal-dispatcher as a repaired zombie turn** (`guest_id=smoke:life-graph:life.observe:<run>`, pattern=unclassified, action=noop).
+
+Environment verified healthy at test time: hotel main PID 2096867, life-graph-runner PID 2096903 is its live child, guest record `guest:vps-jane:vps-jane:life-graph-runner` has matching `active_pid` + `is_active:true`, service env carries `PHILOTIC_MEMGRAPH_URI` / runner-home vars, no orphaned old-hotel guests.
+
+**Interpretation:** for a vanilla single observe via raw IPC, the task dies in the HOTEL's park/claim/deliver layer — it never reaches the datasource guest's inbox. That rules out the flight-payload contract gate, the batch machinery, Memgraph contention, and the provider itself for THIS repro. Caveat: the raw-driver envelope (unregistered reply role) may ride a different delivery path than philote-mediated tool calls — the philote lane partially landed writes earlier today, the raw lane lands nothing tonight. Next probe: `RUST_LOG=debug` (or targeted `aiua` delivery-module logging) on vps, one driver run, and watch where the envelope stops: TaskInvoke accept → park → claim → inbox push. Also note the raw-driver smoke DID pass on vps-jane during the 2026-07-14 morning fleet deploy (a974d52), so the regression window for the raw lane is develop a974d52..be2bdb4 + the day's restarts/config changes.
+
 ### What's ALREADY fixed (do NOT redo)
 
 1. **Routing** (PR #271): `life.observe.batch` was granted to the model + handled by the runner but **missing from both philote→runner routing lists** — `tools_for_allowed_class("life_graph")` (`crates/aiua/src/service/ipc.rs`) and the seeded runner `supported_tools` (`crates/aiua/src/main.rs`). Added it to both, and made the boot-seed **reconcile** `supported_tools` in place (it used to `continue` on an already-present runner keyed by a stable incarnation id, so new tools never reached existing profiles). Verified: batch now reaches `handle_observe_batch`.
