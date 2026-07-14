@@ -8,6 +8,8 @@ struct RootView: View {
     @Bindable var session: ChatSessionManager
     @State private var showingSettings = false
     @State private var showingLife = false
+    @State private var showingHealth = false
+    @State private var health = HealthKitCaptureService()
 
     var body: some View {
         NavigationSplitView {
@@ -21,6 +23,14 @@ struct RootView: View {
                         }
                         .badge(session.lifeGraph.unseenChangeCount)
                         .accessibilityLabel("Life graph")
+                    }
+                    ToolbarItem {
+                        Button {
+                            showingHealth = true
+                        } label: {
+                            Image(systemName: "heart.text.square")
+                        }
+                        .accessibilityLabel("Health sync")
                     }
                     ToolbarItem {
                         Button {
@@ -49,6 +59,14 @@ struct RootView: View {
         .sheet(isPresented: $showingLife) {
             NavigationStack {
                 LifeView(session: session)
+            }
+            #if os(macOS)
+                .frame(minWidth: 480, minHeight: 560)
+            #endif
+        }
+        .sheet(isPresented: $showingHealth) {
+            NavigationStack {
+                HealthView(session: session, health: health)
             }
             #if os(macOS)
                 .frame(minWidth: 480, minHeight: 560)

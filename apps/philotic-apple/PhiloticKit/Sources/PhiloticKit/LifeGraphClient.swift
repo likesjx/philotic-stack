@@ -308,6 +308,78 @@ public struct LifeGraphClient: Sendable {
             query: query, bearerToken: bearerToken)
     }
 
+    /// Maximum observations the server accepts in one observe batch.
+    public static let maxObserveBatch = 25
+
+    /// Push observations to the LifeGraph write plane
+    /// (`POST /api/edge/lifegraph/observe`). Batches larger than
+    /// ``maxObserveBatch`` are split across multiple POSTs and their results
+    /// merged; the aggregate `status` is "error" if any batch errored, else
+    /// "partial" if any batch was partial, else "ok". An empty input is a
+    /// no-op that returns an "ok" result without hitting the network.
+    ///
+    /// Note: unlike the spec's bare `postObservations(_:)`, this mirrors the
+    /// stateless read methods and takes `baseURL`/`bearerToken` explicitly
+    /// (the client holds no connection state).
+    @discardableResult
+    public func postObservations(
+        _ observations: [LifeObservation],
+        baseURL: URL,
+        bearerToken: String
+    ) async throws -> ObserveResult {
+        guard !observations.isEmpty else {
+            return ObserveResult(status: "ok", results: [])
+        }
+
+        var merged: [ObserveResultItem] = []
+        var sawError = false
+        var sawPartial = false
+
+        for start in stride(from: 0, to: observations.count, by: Self.maxObserveBatch) {
+            let batch = Array(
+                observations[start..<min(start + Self.maxObserveBatch, observations.count)])
+            let result: ObserveResult = try await post(
+                baseURL: baseURL,
+                path: "api/edge/lifegraph/observe",
+                body: ObserveRequest(observations: batch),
+                bearerToken: bearerToken
+            )
+            merged.append(contentsOf: result.results)
+            switch result.status {
+            case "error": sawError = true
+            case "partial": sawPartial = true
+            default: break
+            }
+        }
+
+        let status = sawError ? "error" : (sawPartial ? "partial" : "ok")
+        return ObserveResult(status: status, results: merged)
+    }
+
+    /// Request envelope for the observe endpoint: `{ "observations": [...] }`.
+    private struct ObserveRequest: Encodable {
+        let observations: [LifeObservation]
+    }
+
+    private func post<Body: Encodable, T: Decodable>(
+        baseURL: URL,
+        path: String,
+        body: Body,
+        bearerToken: String
+    ) async throws -> T {
+        var request = URLRequest(url: baseURL.appending(path: path))
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw LifeGraphError.badResponse(status: status)
+        }
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
     private func get<T: Decodable>(
         baseURL: URL,
         path: String,
