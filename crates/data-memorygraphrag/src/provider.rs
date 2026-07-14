@@ -2138,9 +2138,7 @@ impl LifeGraphProvider {
             let index = projection::index_name(&space, label);
             let cypher = projection::semantic_expand_cypher(&index, top_k, min_similarity);
             let vec_param = vec_param.clone();
-            async move {
-                self.execute_cypher_with_vec(&cypher, vec_param).await
-            }
+            async move { self.execute_cypher_with_vec(&cypher, vec_param).await }
         });
         for result in futures::future::join_all(searches).await {
             all_hits.extend(projection::parse_vector_search_rows(&result?));
@@ -4024,8 +4022,10 @@ async fn embed_text(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
             Ok(result)
         }
         Err(e) => {
-            EMBED_SIDECAR_DOWN_UNTIL
-                .store(now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS), Ordering::Relaxed);
+            EMBED_SIDECAR_DOWN_UNTIL.store(
+                now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
+                Ordering::Relaxed,
+            );
             Err(e)
         }
     }

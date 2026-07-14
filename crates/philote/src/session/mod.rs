@@ -9450,13 +9450,19 @@ mod tests {
             query_text: String::new(),
             records: vec![
                 // Same fact, cosmetically rephrased, LifeGraph node id.
-                life_record("life:openloop:abc123", "renew the PASSPORT, before the august trip"),
+                life_record(
+                    "life:openloop:abc123",
+                    "renew the PASSPORT, before the august trip",
+                ),
                 life_record("life:openloop:def456", "schedule the dentist appointment"),
             ],
         });
 
         let injected = state.inject_cached_life_context(1_800, now, 2_500);
-        assert_eq!(injected, 1, "forked duplicate must be dropped, fresh fact kept");
+        assert_eq!(
+            injected, 1,
+            "forked duplicate must be dropped, fresh fact kept"
+        );
         let memories = &state.active_turn.as_ref().unwrap().recalled_memories;
         assert_eq!(memories.len(), 2);
         assert_eq!(memories[1].id.as_deref(), Some("life:openloop:def456"));

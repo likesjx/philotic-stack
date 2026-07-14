@@ -938,10 +938,7 @@ mod tests {
         let cand = candidate("anchor", "pinned regression vector for node identity.", &[]);
         assert_eq!(
             stable_capture_node_id(LivedFactLabel::Decision, "agent-test-01", &cand),
-            format!(
-                "life:decision:{:016x}",
-                expected_fnv_for_pinned_vector()
-            )
+            format!("life:decision:{:016x}", expected_fnv_for_pinned_vector())
         );
     }
 
@@ -959,7 +956,13 @@ mod tests {
         eat(b"\x1f");
         eat(b"agent-test-01");
         for token in [
-            "anchor", "pinned", "regression", "vector", "for", "node", "identity",
+            "anchor",
+            "pinned",
+            "regression",
+            "vector",
+            "for",
+            "node",
+            "identity",
         ] {
             eat(b"\x1f");
             eat(token.as_bytes());
