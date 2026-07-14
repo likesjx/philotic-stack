@@ -49,6 +49,12 @@ pub struct DiscoveredModel {
     /// did not report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_default: Option<bool>,
+    /// Whether the provider lists tool/function calling for this model
+    /// (`supported_parameters` contains "tools" on OpenRouter). `Some(false)`
+    /// means the parameter list was published WITHOUT tools — dispatch must
+    /// strip tool declarations or the call 404s. `None` = not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tools: Option<bool>,
     /// Provider-declared task kinds (a claim, not verified capability).
     #[serde(default)]
     pub declared_task_kinds: Vec<String>,
@@ -300,6 +306,11 @@ pub fn parse_openrouter_models(
                 }
             }
         };
+        let supports_tools = if m.supported_parameters.is_empty() {
+            None
+        } else {
+            Some(m.supported_parameters.iter().any(|p| p == "tools"))
+        };
         out.push(DiscoveredModel {
             provider: "openrouter".to_string(),
             endpoint_family: "openrouter-hosted".to_string(),
@@ -315,6 +326,7 @@ pub fn parse_openrouter_models(
             ),
             modalities,
             reasoning_default,
+            supports_tools,
             declared_task_kinds,
             lifecycle_hint: None,
             source_url: source_url.clone(),
@@ -382,6 +394,8 @@ pub fn parse_google_models(
             .to_string();
         out.push(DiscoveredModel {
             provider: "gemini".to_string(),
+            // Google's model list does not publish a tools flag.
+            supports_tools: None,
             endpoint_family: "google-hosted".to_string(),
             model_ref: model_ref.clone(),
             provider_model_ref: model_ref,
@@ -473,6 +487,7 @@ mod tests {
 
     fn model(provider: &str, model_ref: &str, reasoning: Option<bool>) -> DiscoveredModel {
         DiscoveredModel {
+            supports_tools: None,
             provider: provider.to_string(),
             endpoint_family: "x".to_string(),
             model_ref: model_ref.to_string(),

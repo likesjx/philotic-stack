@@ -36,6 +36,14 @@ const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 /// survive hotel restarts (the deprecation that bit us happened *during*
 /// downtime — an in-memory `prev` would have missed it).
 const SNAPSHOT_KEY: &str = "model_catalog_discovery.openrouter";
+/// Config-node key holding the COMPACT queryable catalog guests read over
+/// `GetConfig` — the hotel's "possible models" surface. philote's `/models`
+/// drill-down and `/model` tool badges consume this instead of each guest
+/// fetching OpenRouter itself. Kept separate from [`SNAPSHOT_KEY`] (full
+/// `DiscoveredModel` records, diff-only) so the guest payload stays small:
+/// one terse object per model —
+/// `{"id","name","tools":bool?,"ctx":u32?,"in":f64?,"out":f64?,"think":bool?}`.
+pub const CATALOG_KEY: &str = "model_catalog.openrouter";
 const GUEST_ID: &str = "model-catalog-sync";
 const SYNC_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const INITIAL_DELAY_SECS: u64 = 45;
@@ -99,8 +107,13 @@ pub async fn run_once(
 
     let diffs = diff_catalog(&prev, &discovered);
 
-    // Persist the new snapshot before alerting so a restart mid-run can't cause
-    // the same change to alert twice.
+    // Persist the guest-facing compact catalog FIRST — even a first run makes
+    // "possible models" immediately queryable — then the diff snapshot before
+    // alerting so a restart mid-run can't cause the same change to alert twice.
+    graph.set_config_value(
+        CATALOG_KEY,
+        &serde_json::to_string(&compact_catalog(&discovered))?,
+    )?;
     graph.set_config_value(SNAPSHOT_KEY, &serde_json::to_string(&discovered)?)?;
 
     let mut alerts = 0usize;
@@ -146,6 +159,36 @@ pub async fn run_once(
         "model-catalog-sync: catalog synced"
     );
     Ok(())
+}
+
+/// Project the full discovery snapshot into the compact guest-facing catalog
+/// (see [`CATALOG_KEY`]). Unreported fields are omitted, not null.
+fn compact_catalog(models: &[DiscoveredModel]) -> Vec<serde_json::Value> {
+    models
+        .iter()
+        .map(|m| {
+            let mut entry = serde_json::json!({ "id": m.model_ref });
+            if let Some(name) = &m.display_name {
+                entry["name"] = serde_json::json!(name);
+            }
+            if let Some(tools) = m.supports_tools {
+                entry["tools"] = serde_json::json!(tools);
+            }
+            if let Some(ctx) = m.context_window_tokens {
+                entry["ctx"] = serde_json::json!(ctx);
+            }
+            if let Some(cost) = m.input_cost_per_million {
+                entry["in"] = serde_json::json!(cost);
+            }
+            if let Some(cost) = m.output_cost_per_million {
+                entry["out"] = serde_json::json!(cost);
+            }
+            if let Some(think) = m.reasoning_default {
+                entry["think"] = serde_json::json!(think);
+            }
+            entry
+        })
+        .collect()
 }
 
 /// Which diffs are worth a self-heal entry. Additions and context changes are
@@ -317,5 +360,36 @@ mod tests {
         assert!(text.contains("ROUTING IMPACT"));
         assert!(text.contains("role:jane:orchestrator"));
         assert!(text.contains("gemini-2.0-flash-exp"));
+    }
+
+    #[test]
+    fn compact_catalog_projects_tools_and_context() {
+        let model = DiscoveredModel {
+            provider: "openrouter".into(),
+            endpoint_family: "openrouter-hosted".into(),
+            model_ref: "sao10k/l3.1-euryale-70b".into(),
+            provider_model_ref: "sao10k/l3.1-euryale-70b".into(),
+            display_name: Some("Euryale 70B".into()),
+            context_window_tokens: Some(16384),
+            input_cost_per_million: Some(0.7),
+            output_cost_per_million: Some(0.8),
+            modalities: vec!["text".into()],
+            reasoning_default: None,
+            supports_tools: Some(true),
+            declared_task_kinds: vec!["text.generate".into()],
+            lifecycle_hint: None,
+            source_url: "https://openrouter.ai/api/v1/models".into(),
+            fetched_at_secs: Some(1),
+        };
+        let compact = compact_catalog(&[model]);
+        assert_eq!(compact.len(), 1);
+        assert_eq!(compact[0]["id"], "sao10k/l3.1-euryale-70b");
+        assert_eq!(compact[0]["name"], "Euryale 70B");
+        assert_eq!(compact[0]["tools"], true);
+        assert_eq!(compact[0]["ctx"], 16384);
+        assert!(
+            compact[0].get("think").is_none(),
+            "unreported fields are omitted"
+        );
     }
 }

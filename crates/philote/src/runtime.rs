@@ -1616,16 +1616,44 @@ pub struct AgentRuntime {
     voice_chunk_pipelines: HashMap<String, VoiceChunkPipeline>,
 }
 
-/// OpenRouter catalog snapshot used to annotate `/model` presets with tool
-/// capability. See the field docs on `AgentRuntime::openrouter_tools_catalog`.
+/// One model row from the hotel's compact catalog (config node
+/// `model_catalog.openrouter`, written by aiua's model-catalog-sync job) or
+/// from the direct-OpenRouter fallback fetch. Backs both the `/models`
+/// drill-down and the `/model` tool badges.
+#[derive(Debug, Clone)]
+struct CatalogModelEntry {
+    id: String,
+    name: Option<String>,
+    tools: Option<bool>,
+    ctx: Option<u32>,
+}
+
+/// OpenRouter catalog snapshot. See the field docs on
+/// `AgentRuntime::openrouter_tools_catalog`.
 struct OpenRouterToolsCatalog {
     fetched_at: std::time::Instant,
-    tool_capable: std::collections::HashSet<String>,
-    known: std::collections::HashSet<String>,
+    entries: Vec<CatalogModelEntry>,
+}
+
+impl OpenRouterToolsCatalog {
+    /// `Some(bool)` when the catalog lists the model AND reports its tool
+    /// capability; `None` for unknown models or unreported capability.
+    fn supports_tools(&self, model_id: &str) -> Option<bool> {
+        self.entries
+            .iter()
+            .find(|e| e.id == model_id)
+            .and_then(|e| e.tools)
+    }
 }
 
 /// Refresh cadence for the `/model` tool-capability annotation catalog.
 const OPENROUTER_CATALOG_TTL: Duration = Duration::from_secs(600);
+/// Buttons per drill-down page in `/models` (Telegram keyboards stay usable
+/// around this size; more matches get a "refine the search" hint instead).
+const MODELS_PAGE_SIZE: usize = 10;
+/// Telegram rejects `callback_data` over 64 bytes — a model whose `/model
+/// <id>` callback would exceed that is listed as text instead of a button.
+const TELEGRAM_CALLBACK_LIMIT: usize = 64;
 
 impl AgentRuntime {
     /// Live merged `/model` preset list: the hotel config key `model_presets`
@@ -1650,28 +1678,84 @@ impl AgentRuntime {
     }
 
     /// Best-effort tool-capability lookup for `/model` display. `Some(bool)`
-    /// when the OpenRouter catalog knows the model; `None` when the catalog is
+    /// when the catalog knows the model; `None` when the catalog is
     /// unreachable or the model isn't listed (annotation is skipped — the
     /// dispatch-time no-tools handling lives in model-router, not here).
     async fn openrouter_model_supports_tools(&mut self, model_id: &str) -> Option<bool> {
+        self.ensure_openrouter_catalog().await;
+        self.openrouter_tools_catalog
+            .as_ref()
+            .and_then(|c| c.supports_tools(model_id))
+    }
+
+    /// Refresh the cached catalog if stale. HOTEL-FIRST: reads the compact
+    /// catalog aiua's model-catalog-sync job persists to the config node
+    /// `model_catalog.openrouter` (one fetch per hotel, mesh-consistent);
+    /// falls back to a direct OpenRouter fetch when the hotel hasn't run
+    /// discovery yet. A failed refresh keeps the previous snapshot.
+    async fn ensure_openrouter_catalog(&mut self) {
         let stale = self
             .openrouter_tools_catalog
             .as_ref()
             .map(|c| c.fetched_at.elapsed() > OPENROUTER_CATALOG_TTL)
             .unwrap_or(true);
-        if stale {
-            if let Some(fresh) = self.fetch_openrouter_tools_catalog().await {
-                self.openrouter_tools_catalog = Some(fresh);
-            }
+        if !stale {
+            return;
         }
-        let catalog = self.openrouter_tools_catalog.as_ref()?;
-        if !catalog.known.contains(model_id) {
-            return None;
+        let fresh = match self.fetch_hotel_catalog().await {
+            Some(entries) => Some(entries),
+            None => self.fetch_openrouter_catalog_direct().await,
+        };
+        if let Some(entries) = fresh {
+            self.openrouter_tools_catalog = Some(OpenRouterToolsCatalog {
+                fetched_at: std::time::Instant::now(),
+                entries,
+            });
         }
-        Some(catalog.tool_capable.contains(model_id))
     }
 
-    async fn fetch_openrouter_tools_catalog(&mut self) -> Option<OpenRouterToolsCatalog> {
+    /// Read the hotel's compact model catalog (config node
+    /// `model_catalog.openrouter`): a JSON array of
+    /// `{"id","name"?,"tools"?,"ctx"?,...}` objects.
+    async fn fetch_hotel_catalog(&mut self) -> Option<Vec<CatalogModelEntry>> {
+        let raw = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "model_catalog.openrouter".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(v),
+                ..
+            }) => v,
+            _ => return None,
+        };
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).ok()?;
+        let entries: Vec<CatalogModelEntry> = rows
+            .iter()
+            .filter_map(|row| {
+                Some(CatalogModelEntry {
+                    id: row.get("id")?.as_str()?.to_string(),
+                    name: row.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                    tools: row.get("tools").and_then(|t| t.as_bool()),
+                    ctx: row.get("ctx").and_then(|c| c.as_u64()).map(|c| c as u32),
+                })
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    /// Direct OpenRouter fallback for hotels that haven't run catalog
+    /// discovery yet (public endpoint, no key).
+    async fn fetch_openrouter_catalog_direct(&mut self) -> Option<Vec<CatalogModelEntry>> {
         let base = match self
             .ipc_client
             .send_request_with_timeout(
@@ -1701,35 +1785,154 @@ impl AgentRuntime {
             .build()
             .ok()?;
         let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-        let mut known = std::collections::HashSet::new();
-        let mut tool_capable = std::collections::HashSet::new();
-        for model in body.get("data").and_then(|d| d.as_array())? {
-            let Some(id) = model.get("id").and_then(|i| i.as_str()) else {
-                continue;
-            };
-            known.insert(id.to_string());
-            let supports = model
-                .get("supported_parameters")
-                .and_then(|p| p.as_array())
-                .map(|params| {
-                    params
-                        .iter()
-                        .filter_map(|p| p.as_str())
-                        .any(|p| p == "tools")
+        let entries: Vec<CatalogModelEntry> = body
+            .get("data")
+            .and_then(|d| d.as_array())?
+            .iter()
+            .filter_map(|model| {
+                let id = model.get("id").and_then(|i| i.as_str())?.to_string();
+                let tools = model
+                    .get("supported_parameters")
+                    .and_then(|p| p.as_array())
+                    .map(|params| {
+                        params
+                            .iter()
+                            .filter_map(|p| p.as_str())
+                            .any(|p| p == "tools")
+                    });
+                Some(CatalogModelEntry {
+                    id,
+                    name: model
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string),
+                    tools,
+                    ctx: model
+                        .get("context_length")
+                        .and_then(|c| c.as_u64())
+                        .map(|c| c as u32),
                 })
-                .unwrap_or(false);
-            if supports {
-                tool_capable.insert(id.to_string());
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    /// Build the `/models` drill-down reply: bare → vendor buttons; with a
+    /// query → matching-model buttons whose taps fire `/model <id>`.
+    async fn build_models_browse_reply(
+        &mut self,
+        query: Option<&str>,
+    ) -> (String, Option<serde_json::Value>) {
+        self.ensure_openrouter_catalog().await;
+        let Some(catalog) = self.openrouter_tools_catalog.as_ref() else {
+            return (
+                "Model catalog unavailable — the hotel's discovery job hasn't run yet and \
+                 OpenRouter is unreachable. You can still bind directly: /model <vendor/model>."
+                    .to_string(),
+                None,
+            );
+        };
+
+        let query = query.map(str::trim).filter(|q| !q.is_empty());
+        match query {
+            None => {
+                // Vendor page: group by the id's vendor prefix, largest first.
+                let mut counts: std::collections::BTreeMap<&str, usize> =
+                    std::collections::BTreeMap::new();
+                for entry in &catalog.entries {
+                    let vendor = entry.id.split('/').next().unwrap_or(&entry.id);
+                    *counts.entry(vendor).or_default() += 1;
+                }
+                let mut vendors: Vec<(&str, usize)> = counts.into_iter().collect();
+                vendors.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                let shown = vendors.len().min(24);
+                let rows: Vec<Vec<serde_json::Value>> = vendors[..shown]
+                    .chunks(3)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .map(|(vendor, count)| {
+                                serde_json::json!({
+                                    "text": format!("{vendor} ({count})"),
+                                    "callback_data": format!("/models {vendor}"),
+                                })
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let text = format!(
+                    "🗂 {} models from {} vendors. Tap a vendor to drill down, or search with \
+                     /models <text>.",
+                    catalog.entries.len(),
+                    vendors.len(),
+                );
+                (text, Some(serde_json::json!({ "inline_keyboard": rows })))
+            }
+            Some(q) => {
+                let lowered = q.to_lowercase();
+                let matches: Vec<&CatalogModelEntry> = catalog
+                    .entries
+                    .iter()
+                    .filter(|e| {
+                        let vendor = e.id.split('/').next().unwrap_or("");
+                        vendor.eq_ignore_ascii_case(&lowered)
+                            || e.id.to_lowercase().contains(&lowered)
+                            || e.name
+                                .as_deref()
+                                .map(|n| n.to_lowercase().contains(&lowered))
+                                .unwrap_or(false)
+                    })
+                    .collect();
+                if matches.is_empty() {
+                    return (
+                        format!(
+                            "No catalog models match `{q}`. Try /models for the vendor list, or \
+                             bind directly with /model <vendor/model>."
+                        ),
+                        None,
+                    );
+                }
+                let total = matches.len();
+                let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+                for entry in matches.iter().take(MODELS_PAGE_SIZE) {
+                    let callback = format!("/model {}", entry.id);
+                    if callback.len() > TELEGRAM_CALLBACK_LIMIT {
+                        continue;
+                    }
+                    let badge = match entry.tools {
+                        Some(true) => " 🔧",
+                        Some(false) => " 💬",
+                        None => "",
+                    };
+                    let ctx = entry
+                        .ctx
+                        .map(|c| format!(" · {}k", c / 1000))
+                        .unwrap_or_default();
+                    rows.push(vec![serde_json::json!({
+                        "text": format!("{}{}{}", entry.id, badge, ctx),
+                        "callback_data": callback,
+                    })]);
+                }
+                let mut text = format!(
+                    "🎯 {total} match(es) for `{q}` — tap to bind (🔧 tools · 💬 chat-only):"
+                );
+                if total > MODELS_PAGE_SIZE {
+                    text.push_str(&format!(
+                        "\nShowing {MODELS_PAGE_SIZE} — refine with /models <more specific>."
+                    ));
+                }
+                let keyboard = if rows.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({ "inline_keyboard": rows }))
+                };
+                (text, keyboard)
             }
         }
-        if known.is_empty() {
-            return None;
-        }
-        Some(OpenRouterToolsCatalog {
-            fetched_at: std::time::Instant::now(),
-            tool_capable,
-            known,
-        })
     }
 
     pub fn new(ipc_client: PhiloticClient, agent_id: impl Into<String>) -> Self {
@@ -2359,6 +2562,7 @@ impl AgentRuntime {
                 SlashCommand::Voice { .. } => {}
                 SlashCommand::Model { .. } => {}
                 SlashCommand::ModelPreset { .. } => {}
+                SlashCommand::Models { .. } => {}
                 SlashCommand::Dirty | SlashCommand::Sfw => {}
                 SlashCommand::Abandon { .. } => {}
                 SlashCommand::Plan { drop } => {
@@ -3010,7 +3214,8 @@ impl AgentRuntime {
                 SlashCommand::Tts { .. }
                 | SlashCommand::Voice { .. }
                 | SlashCommand::Model { .. }
-                | SlashCommand::ModelPreset { .. } => {
+                | SlashCommand::ModelPreset { .. }
+                | SlashCommand::Models { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
                     )
@@ -5330,6 +5535,29 @@ impl AgentRuntime {
         // OperatorExplicit (see handle_user_message), which disables automatic
         // fallback escalation in advance_turn_to_next_fallback_tier, and is
         // routed at the resolve_model_execution_target choke point.
+        // Handle /models — catalog drill-down. Bare: vendor buttons; with a
+        // query: matching-model buttons that fire `/model <id>` on tap
+        // (membrane passes inline-button callback_data through as a slash
+        // command, same path as the /roles keyboard).
+        if let SlashCommand::Models { ref query } = command {
+            let (reply, keyboard) = self.build_models_browse_reply(query.as_deref()).await;
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: "session_policy_updated".into(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                })
+                .await?;
+            return self
+                .complete_local_command_with_markup(session_id, command_turn_id, reply, keyboard)
+                .await;
+        }
+
         if let SlashCommand::ModelPreset { ref alias } = command {
             // Resolve against the LIVE merged preset list (hotel config over
             // built-ins) — or any direct `vendor/model` OpenRouter slug — so
@@ -5485,6 +5713,36 @@ impl AgentRuntime {
             } else {
                 (Vec::new(), HashMap::new())
             };
+            // One-tap swap keyboard for the bare listing: preset buttons fire
+            // `/model <alias>`, plus a drill-down into the full catalog.
+            let preset_keyboard: Option<serde_json::Value> = if tier.is_none() {
+                let mut rows: Vec<Vec<serde_json::Value>> = presets
+                    .chunks(3)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .map(|p| {
+                                let badge = match tool_notes.get(&p.alias) {
+                                    Some(true) => " 🔧",
+                                    Some(false) => " 💬",
+                                    None => "",
+                                };
+                                serde_json::json!({
+                                    "text": format!("{}{}", p.alias, badge),
+                                    "callback_data": format!("/model {}", p.alias),
+                                })
+                            })
+                            .collect()
+                    })
+                    .collect();
+                rows.push(vec![serde_json::json!({
+                    "text": "📚 Browse all models",
+                    "callback_data": "/models",
+                })]);
+                Some(serde_json::json!({ "inline_keyboard": rows }))
+            } else {
+                None
+            };
             let reply = if let Some(state) = self.sessions.get_mut(&session_id) {
                 // Any `/model` invocation (pin or clear) resets the persisted
                 // fallback override (Slice 2) — the operator is taking explicit
@@ -5562,7 +5820,12 @@ impl AgentRuntime {
                 })
                 .await?;
             return self
-                .complete_local_command(session_id, command_turn_id, reply)
+                .complete_local_command_with_markup(
+                    session_id,
+                    command_turn_id,
+                    reply,
+                    preset_keyboard,
+                )
                 .await;
         }
 
@@ -5805,6 +6068,7 @@ impl AgentRuntime {
                 | SlashCommand::Voice { .. }
                 | SlashCommand::Model { .. }
                 | SlashCommand::ModelPreset { .. }
+                | SlashCommand::Models { .. }
                 | SlashCommand::Dirty
                 | SlashCommand::Sfw
                 | SlashCommand::Role { .. }
