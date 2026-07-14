@@ -92,6 +92,18 @@ REMOTE_LIFE_GRAPH_RUNNER_NODE="${PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE:-${LIFE_
 
 cd "${ROOT_DIR}"
 
+# Freshness guard: refuse to build/push from a tree missing origin/develop
+# commits — a stale-tree push silently reverts merged fixes on the target
+# hotel (2026-07-14: PR #266/#272 reverted on mbp-jane by a #274-era push).
+# Dry runs report instead of aborting; PHILOTIC_DEPLOY_ALLOW_STALE=1 overrides.
+# shellcheck source=scripts/deploy-freshness-check.sh
+source "${ROOT_DIR}/scripts/deploy-freshness-check.sh"
+if [[ ${DRY_RUN} -eq 1 ]]; then
+  assert_tree_fresh "${ROOT_DIR}" nonfatal
+else
+  assert_tree_fresh "${ROOT_DIR}"
+fi
+
 if [[ -n "${EXPECTED_HOSTNAME}" ]]; then
   ACTUAL_HOST="$(ssh "${SSH_OPTS[@]}" "${REMOTE}" "scutil --get LocalHostName 2>/dev/null || hostname -s" 2>/dev/null)"
   if [[ "${ACTUAL_HOST}" != "${EXPECTED_HOSTNAME}" ]]; then
