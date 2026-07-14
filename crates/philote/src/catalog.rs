@@ -1941,8 +1941,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "routing": {
                         "type": "string",
-                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward", "priority_re_entry", "approval_resolution"],
-                        "description": "How to handle the specialist's response when it arrives. Defaults to reflective_re_entry (the orchestrator reflects on the reply privately and decides whether to surface it)."
+                        "enum": ["reflective_re_entry", "cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward", "priority_re_entry", "approval_resolution"],
+                        "description": "How to handle the specialist's response when it arrives. Defaults to reflective_re_entry: the specialist's reply comes back into your own loop as a fresh turn — reason about it, then reply with the text you want the user to see (that reply is surfaced automatically) or call delegate.merge. Complete with NO text only if the user should see nothing."
                     },
                     "wait_for_response": {
                         "type": "boolean",

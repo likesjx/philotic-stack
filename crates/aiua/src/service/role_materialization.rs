@@ -219,18 +219,6 @@ impl IpcServer {
         let Some(session) = session else {
             return AgentRouteResolution::Deliver(target_guest_id);
         };
-        if let Some(explicit_guest_id) = target_guest_id.as_deref() {
-            let targets_base_agent = session
-                .primary_agent_id
-                .as_deref()
-                .map(|agent_id| explicit_guest_id == agent_id)
-                .unwrap_or(false);
-            if !targets_base_agent {
-                return AgentRouteResolution::Deliver(target_guest_id);
-            }
-        }
-        let local_hotel_name = Self::local_hotel_name(graph, local_node_id);
-
         let live_agent_guests: Vec<String> = {
             let guard = inboxes.lock().await;
             guard
@@ -240,8 +228,64 @@ impl IpcServer {
                 .map(|subscriber| subscriber.guest_id.clone())
                 .collect()
         };
-
         let is_registered = |guest_id: &str| live_agent_guests.iter().any(|live| live == guest_id);
+
+        if let Some(explicit_guest_id) = target_guest_id.as_deref() {
+            let targets_base_agent = session
+                .primary_agent_id
+                .as_deref()
+                .map(|agent_id| explicit_guest_id == agent_id)
+                .unwrap_or(false);
+            if !targets_base_agent {
+                // Explicit incarnation target — e.g. a paracrine_response addressed
+                // back to the orchestrator as "{agent_id}:{role_name}". This used to
+                // early-return Deliver(incarnation); deliver_inbound_task then dropped
+                // it "ledger-only" whenever that incarnation was not subscribed under
+                // its exact id (the async-whisper reply drop). Resolve liveness the same
+                // way the active-incarnation path below does so the reply survives an
+                // ephemeral orchestrator or one registered under its bare agent id.
+                //
+                // 1. Incarnation is itself live → deliver straight to it.
+                if is_registered(explicit_guest_id) {
+                    return AgentRouteResolution::Deliver(target_guest_id);
+                }
+                // 2. Its base agent is live (a single-process philote registers under
+                //    the bare agent id, not the incarnation id) → normalize to the live
+                //    base, which handles the incarnation internally.
+                if let Some((base_agent_id, _role_name)) = explicit_guest_id.split_once(':') {
+                    let base_is_this_agent = session.primary_agent_id.as_deref()
+                        == Some(base_agent_id)
+                        || graph
+                            .list_role_incarnations_by_guest_id(explicit_guest_id)
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .any(|record| record.agent_id == base_agent_id);
+                    if base_is_this_agent && is_registered(base_agent_id) {
+                        info!(
+                            "Explicit incarnation [{}] not registered for session [{}]; delivering to its live base agent [{}].",
+                            explicit_guest_id, session_id, base_agent_id
+                        );
+                        return AgentRouteResolution::Deliver(Some(base_agent_id.to_string()));
+                    }
+                }
+                // 3. Nothing live, but the incarnation is configured on this hotel →
+                //    park + materialize instead of dropping, so a respawn can flush the
+                //    reply. For a remote/unknown guest, fall through to Deliver so the
+                //    mesh reroute in EmitTask can forward it.
+                if Self::configured_local_guest_exists(graph, local_node_id, explicit_guest_id) {
+                    info!(
+                        "Explicit incarnation [{}] not live for session [{}]; parking + requesting materialization instead of dropping.",
+                        explicit_guest_id, session_id
+                    );
+                    return AgentRouteResolution::Park {
+                        guest_id: explicit_guest_id.to_string(),
+                    };
+                }
+                return AgentRouteResolution::Deliver(target_guest_id);
+            }
+        }
+        let local_hotel_name = Self::local_hotel_name(graph, local_node_id);
         let mut provenance_hint =
             Self::local_delivery_provenance_hint(&session, local_hotel_name.as_deref());
         // Guard (2026-07-06 parked-tool-result incident): an agent-role task must never
@@ -2476,6 +2520,172 @@ mod tests {
             route,
             AgentRouteResolution::Deliver(Some("agent-beacon".into())),
             "unregistered incarnation must normalize to its live base-agent registration"
+        );
+    }
+
+    /// A paracrine_response addressed explicitly to an incarnation guest id
+    /// ("{agent_id}:{role_name}") that is NOT subscribed under that exact id must
+    /// normalize to the live base agent instead of being delivered-then-dropped.
+    #[tokio::test]
+    async fn resolve_agent_route_explicit_incarnation_delivers_to_live_base() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-para-reply".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-aria".into()),
+                active_incarnation_id: Some("agent-aria:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("555".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+
+        // Base philote is live under its bare agent id; the incarnation id is NOT subscribed.
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let mut subscribed_roles = Vec::new();
+        IpcServer::add_subscription(
+            &inboxes,
+            "agent",
+            Uuid::new_v4(),
+            "agent-aria",
+            &[],
+            &tx,
+            &mut subscribed_roles,
+        )
+        .await;
+
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            Some("agent-aria:orchestrator".into()),
+            &serde_json::json!({
+                "session_id": "sess-para-reply",
+                "action": "paracrine_response",
+                "content": "specialist reply"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            route,
+            AgentRouteResolution::Deliver(Some("agent-aria".into())),
+            "paracrine_response to an unsubscribed incarnation must normalize to the live base agent, not drop"
+        );
+    }
+
+    /// When neither the incarnation NOR its base agent is live, but the incarnation
+    /// is configured on this hotel, the reply must park + trigger materialization
+    /// instead of being dropped ledger-only.
+    #[tokio::test]
+    async fn resolve_agent_route_explicit_incarnation_parks_when_nothing_live() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "agent-aria:orchestrator".into(),
+                    role: "orchestrator".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed incarnation guest");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-para-reply".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-aria".into()),
+                active_incarnation_id: Some("agent-aria:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("555".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+
+        // Nothing subscribed: neither the incarnation nor its base agent is live.
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            Some("agent-aria:orchestrator".into()),
+            &serde_json::json!({
+                "session_id": "sess-para-reply",
+                "action": "paracrine_response",
+                "content": "specialist reply"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            route,
+            AgentRouteResolution::Park {
+                guest_id: "agent-aria:orchestrator".into()
+            },
+            "an offline but locally-configured incarnation must park + materialize, not drop"
         );
     }
 

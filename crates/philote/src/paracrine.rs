@@ -1749,4 +1749,182 @@ mod tests {
             *emitted
         );
     }
+
+    /// Reflective re-entry, top-of-chain: when the orchestrator's reflection turn
+    /// produces user-facing text but does NOT call delegate.merge, that text must be
+    /// surfaced to the user (implicit merge) as a send_reply — not silently absorbed.
+    /// This is the primary "I never see it work" regression guard.
+    #[tokio::test]
+    async fn reflective_reentry_nonempty_reply_surfaces_to_user() {
+        use crate::r#loop::TurnPhase;
+
+        let socket_path = format!(
+            "/tmp/philote-reflect-surface-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-reflect".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-reflect");
+
+        let session_id = "sess-reflect";
+        let turn_id = "turn-reflect";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.pending_tool_call = None;
+        turn.phase = TurnPhase::WaitingModel;
+        // Top-of-chain reflection turn: paracrine_origin set and reply_session_id
+        // loops back to this same session.
+        turn.paracrine_origin = Some("pid-reflect".into());
+        turn.paracrine_reply_session_id = Some(session_id.into());
+        turn.paracrine_reply_chat_id = Some("555".into());
+        turn.paracrine_merge_completed = false;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        let surfaced = "Here is the synthesized answer for the user.";
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                agent_action: Some(serde_json::json!({
+                    "kind": "respond",
+                    "content": surfaced,
+                })),
+                content: Some(surfaced.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("model respond");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "reflection reply must be surfaced to the user exactly once: {:#?}",
+            *emitted
+        );
+        assert!(
+            send_replies[0]["task"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(surfaced),
+            "surfaced reply must carry the model text: {:#?}",
+            *emitted
+        );
+        assert_eq!(send_replies[0]["task"]["chat_id"], "555");
+        assert_eq!(send_replies[0]["target_role"], "membrane");
+        assert!(
+            !emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "paracrine_response"),
+            "top-of-chain surface must not emit a paracrine_response: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Reflective re-entry, top-of-chain, EMPTY content reaching deliver_text_reply:
+    /// the defensive empty-guard must absorb rather than post a blank bubble. (An
+    /// empty *model output* becomes a Fail action upstream, so this guard only fires
+    /// for other paths that reach deliver_text_reply with no text.)
+    #[tokio::test]
+    async fn reflective_reentry_empty_content_is_absorbed_not_surfaced() {
+        use crate::r#loop::TurnPhase;
+
+        let socket_path = format!(
+            "/tmp/philote-reflect-absorb-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-absorb".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-absorb");
+
+        let session_id = "sess-absorb";
+        let turn_id = "turn-absorb";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.pending_tool_call = None;
+        turn.phase = TurnPhase::WaitingModel;
+        turn.paracrine_origin = Some("pid-absorb".into());
+        turn.paracrine_reply_session_id = Some(session_id.into());
+        turn.paracrine_reply_chat_id = Some("555".into());
+        turn.paracrine_merge_completed = false;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Drive deliver_text_reply directly with empty content to exercise the guard
+        // (the normal model path turns empty output into a Fail before reaching here).
+        runtime
+            .deliver_text_reply(
+                session_id.into(),
+                turn_id.into(),
+                "   ".into(),
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("deliver empty");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            !emitted.iter().any(|e| e["task"]["action"] == "send_reply"),
+            "empty reflection completion must not surface a reply: {:#?}",
+            *emitted
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "paracrine_response"),
+            "empty reflection completion must not emit a paracrine_response: {:#?}",
+            *emitted
+        );
+    }
 }

@@ -476,6 +476,37 @@ impl SessionState {
             final_result: None,
             close_reason: None,
         });
+        // The thread vec is push-only and serialized into every checkpoint, so a
+        // long session with many delegations would grow it without bound and bloat
+        // each sync. Prune the oldest CLOSED threads here (the only push site) while
+        // keeping every in-flight (Open) thread and a window of recent history.
+        self.prune_paracrine_threads();
+    }
+
+    /// Cap retained *closed* paracrine threads. Open threads are always kept (they
+    /// are in-flight and bounded elsewhere by the whisper watchdog / hop budget).
+    const MAX_RETAINED_CLOSED_PARACRINE_THREADS: usize = 32;
+
+    fn prune_paracrine_threads(&mut self) {
+        let closed_total = self
+            .paracrine_threads
+            .iter()
+            .filter(|thread| !matches!(thread.status, ParacrineThreadStatus::Open))
+            .count();
+        if closed_total <= Self::MAX_RETAINED_CLOSED_PARACRINE_THREADS {
+            return;
+        }
+        // retain() visits in chronological (push) order, so the first-encountered
+        // closed threads are the oldest — drop exactly the overflow of those.
+        let mut drop_remaining = closed_total - Self::MAX_RETAINED_CLOSED_PARACRINE_THREADS;
+        self.paracrine_threads.retain(|thread| {
+            if drop_remaining > 0 && !matches!(thread.status, ParacrineThreadStatus::Open) {
+                drop_remaining -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub fn close_paracrine_thread(
@@ -496,6 +527,9 @@ impl SessionState {
             thread.final_result = final_result;
             thread.close_reason = close_reason;
         }
+        // Closing a thread turns it into prunable history — cap it here too so the
+        // vec stays bounded between opens.
+        self.prune_paracrine_threads();
     }
 
     pub fn signal_paracrine_thread(&mut self, id: &str, signal: String) {
@@ -1997,8 +2031,10 @@ impl SessionState {
             all_tools.push(ToolDefinition {
                 tool_name: "delegate.merge".into(),
                 description: concat!(
-                    "Send your completed response back to the orchestrator's main conversation. ",
-                    "Call this when you are ready to deliver your result. ",
+                    "Explicitly deliver your response into the main conversation the user sees. ",
+                    "Optional: if you instead just reply with normal text and close, that text is ",
+                    "surfaced automatically — use delegate.merge when you want to deliver early or ",
+                    "control the exact surfaced content. ",
                     "Arguments: { \"content\": \"<your response text>\" }. ",
                     "After calling this your turn will close — do not call it more than once.",
                 )
@@ -5752,6 +5788,73 @@ mod tests {
         assert_eq!(
             closed.paracrine_threads[0].final_result.as_deref(),
             Some("use this")
+        );
+    }
+
+    #[test]
+    fn paracrine_threads_prune_bounds_closed_history() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(test_working_turn(None));
+        // A long-lived in-flight thread that must always survive pruning.
+        state.open_paracrine_thread(
+            "keep-open".into(),
+            "critic".into(),
+            "stay open".into(),
+            philotic_client::ParacrineRouting::CognitiveReEntry,
+            "advice_only".into(),
+            "read_only".into(),
+            "originating_session".into(),
+        );
+        // Churn many delegations that open then immediately close.
+        for i in 0..100 {
+            let id = format!("p-{i}");
+            state.open_paracrine_thread(
+                id.clone(),
+                "critic".into(),
+                "work".into(),
+                philotic_client::ParacrineRouting::CognitiveReEntry,
+                "advice_only".into(),
+                "read_only".into(),
+                "originating_session".into(),
+            );
+            state.close_paracrine_thread(
+                &id,
+                ParacrineThreadStatus::Completed,
+                None,
+                Some("done".into()),
+            );
+        }
+
+        let open_count = state
+            .paracrine_threads
+            .iter()
+            .filter(|t| t.status.as_str() == "open")
+            .count();
+        let closed_count = state
+            .paracrine_threads
+            .iter()
+            .filter(|t| t.status.as_str() != "open")
+            .count();
+        assert_eq!(
+            open_count, 1,
+            "the in-flight open thread must never be pruned"
+        );
+        assert!(
+            closed_count <= 32,
+            "closed history must be capped at 32, got {closed_count}"
+        );
+        assert!(
+            state.paracrine_threads.iter().any(|t| t.id == "keep-open"),
+            "the open thread must be retained"
+        );
+        assert!(
+            state.paracrine_threads.iter().any(|t| t.id == "p-99"),
+            "the newest closed thread must be retained"
+        );
+        assert!(
+            !state.paracrine_threads.iter().any(|t| t.id == "p-0"),
+            "the oldest closed thread must have been pruned"
         );
     }
 
