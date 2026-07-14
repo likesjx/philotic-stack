@@ -360,19 +360,22 @@ fn plan_bridge_action(decision: &AutonomyDecision) -> BridgeAction {
     }
 }
 
+/// Process-global, lazily-built Memgraph connection pool shared by ALL
+/// `LifeGraphProvider` instances. This MUST be static, not a struct field: the
+/// datasource runtime rebuilds the provider registry — and thus
+/// `LifeGraphProvider::from_env()` — PER TASK, so a per-instance pool would be
+/// rebuilt for every observation. A `Graph` IS a pool (`max_size 16`, Arc-backed
+/// and `Clone`) meant to be built once and shared; rebuilding it per call opened
+/// a fresh 16-connection pool per observation, and under a `life.observe.batch`
+/// (or the steward distillation sweep) plus cross-hotel traffic that swamped
+/// Memgraph's tiny `bolt_num_workers=2` with handshake churn — connection setup
+/// queued and the batch stalled until the 93s WaitingTool watchdog evicted it.
+static LIFE_GRAPH_POOL: tokio::sync::OnceCell<Graph> = tokio::sync::OnceCell::const_new();
+
 pub struct LifeGraphProvider {
     config: MemgraphConfig,
     runner: MemoryGraphRagRunner,
     autonomy: Arc<dyn AutonomyGate>,
-    /// Lazily-built, reused neo4rs connection pool. A `Graph` IS a pool
-    /// (`max_size 16`) and is `Clone` (Arc-backed) — it is meant to be built
-    /// once and shared, NOT rebuilt per query. Rebuilding per call (as this used
-    /// to) opened a fresh 16-connection pool for every observation; under a
-    /// `life.observe.batch` (or the steward distillation sweep) plus cross-hotel
-    /// traffic, that swamped Memgraph's tiny `bolt_num_workers=2` with handshake
-    /// churn, connection setup queued, and the batch stalled until the 93s
-    /// WaitingTool watchdog evicted the turn.
-    graph: tokio::sync::OnceCell<Graph>,
 }
 
 impl LifeGraphProvider {
@@ -386,15 +389,14 @@ impl LifeGraphProvider {
                 default_embedding_model: "text-embedding-3-small".to_string(),
             }),
             autonomy: Arc::new(HotelAutonomyGate),
-            graph: tokio::sync::OnceCell::new(),
         }
     }
 
-    /// Return the shared connection pool, building it on first use. Reuses one
-    /// `Graph` across all queries; a build failure is not cached, so a transient
-    /// Memgraph outage at first use is retried on the next call.
+    /// Return the shared process-global connection pool, building it on first
+    /// use. Reused across every task/observation; a build failure is not cached,
+    /// so a transient Memgraph outage at first use is retried on the next call.
     async fn connect(&self) -> Result<Graph> {
-        self.graph
+        LIFE_GRAPH_POOL
             .get_or_try_init(|| async { self.build_graph() })
             .await
             .cloned()
