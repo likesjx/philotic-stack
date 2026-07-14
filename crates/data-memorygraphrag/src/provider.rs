@@ -372,6 +372,18 @@ fn plan_bridge_action(decision: &AutonomyDecision) -> BridgeAction {
 /// queued and the batch stalled until the 93s WaitingTool watchdog evicted it.
 static LIFE_GRAPH_POOL: tokio::sync::OnceCell<Graph> = tokio::sync::OnceCell::const_new();
 
+/// Soft, non-error result for an advisory `life.recall.feedback` call that
+/// could not be recorded (bad params or contract-invalid rating). Returned as a
+/// normal `ProviderOutput` (not an `Err`) so the turn loop does NOT treat it as
+/// a retryable `step_failed` — malformed feedback is dropped, not looped on.
+fn feedback_not_recorded(reason: String) -> ProviderOutput {
+    ProviderOutput::ResultSet(json!({
+        "status": "rejected",
+        "recorded": false,
+        "reason": reason,
+    }))
+}
+
 pub struct LifeGraphProvider {
     config: MemgraphConfig,
     runner: MemoryGraphRagRunner,
@@ -1351,12 +1363,32 @@ impl LifeGraphProvider {
     }
 
     async fn handle_recall_feedback(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        let input: RetrievalFeedbackInput = serde_json::from_value(task.parameters.clone())
-            .context("failed to parse life.recall.feedback parameters as RetrievalFeedbackInput")?;
-        let plan = self
+        // Recall feedback is ADVISORY (the model rating recall quality). A
+        // malformed call — bad params, or a contract-invalid rating such as
+        // "missing" without any missing_context_refs — must degrade to a soft
+        // "not recorded" result, NEVER a step_failed error. Returning an error
+        // here makes the model retry the same bad feedback in a loop that burns
+        // the entire turn budget (93s WaitingTool watchdog), starving the real
+        // work in the turn (e.g. the life.observe.batch that should land). A
+        // rejected feedback simply isn't written; the model reads why and moves
+        // on. Genuine infra failures (Cypher/write, below) still surface.
+        let input: RetrievalFeedbackInput = match serde_json::from_value(task.parameters.clone()) {
+            Ok(input) => input,
+            Err(e) => {
+                return Ok(feedback_not_recorded(format!(
+                    "could not parse life.recall.feedback parameters: {e}"
+                )));
+            }
+        };
+        let plan = match self
             .runner
             .plan(LifeGraphToolRequest::LifeRecallFeedback(input.clone()))
-            .map_err(|e| anyhow::anyhow!("life.recall.feedback plan validation failed: {e}"))?;
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Ok(feedback_not_recorded(format!("feedback not recorded: {e}")));
+            }
+        };
 
         let growth_evaluation = plan
             .steps
@@ -2828,6 +2860,33 @@ mod tests {
             parameters,
             identity: json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn recall_feedback_with_contract_invalid_rating_is_soft_rejected_not_errored() {
+        // rating "missing" with no missing_context_refs violates the feedback
+        // contract. It MUST degrade to Ok(recorded=false) — never an Err, which
+        // the turn loop surfaces as a retryable step_failed and loops the model
+        // on, burning the turn budget so real work (life.observe) never lands.
+        let provider = LifeGraphProvider::from_env();
+        let task = task_with_params(json!({
+            "feedback_id": "fb-1",
+            "packet_id": "pkt-1",
+            "rating": "missing",
+            "query_summary": "test recall",
+            "candidate_count": 1,
+            "connected_candidate_count": 0,
+            "missing_context_refs": [],
+        }));
+        let out = provider
+            .handle_recall_feedback(&task)
+            .await
+            .expect("malformed advisory feedback must be a soft reply, not an Err");
+        let ProviderOutput::ResultSet(value) = out else {
+            panic!("expected ResultSet");
+        };
+        assert_eq!(value["recorded"], json!(false));
+        assert_eq!(value["status"], "rejected");
     }
 
     #[tokio::test]
