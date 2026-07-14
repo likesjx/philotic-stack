@@ -1557,6 +1557,16 @@ impl SessionState {
             .iter()
             .filter_map(|memory| memory.id.clone())
             .collect();
+        // Cross-lane content dedup: the auto-capture lane forks one memory
+        // candidate into both Muninn and the LifeGraph, so the same fact can
+        // come back from both recall lanes under different ids (Muninn ULID
+        // vs life:* node id). Id dedup can't catch that; normalized content
+        // fingerprints can.
+        let mut seen_fingerprints: std::collections::HashSet<u64> = turn
+            .recalled_memories
+            .iter()
+            .filter_map(|memory| recalled_content_fingerprint(&memory.content))
+            .collect();
 
         let mut lanes: Vec<std::collections::VecDeque<RecalledMemoryRecord>> = Vec::new();
         for entry in &self.life_recall_cache {
@@ -1567,6 +1577,11 @@ impl SessionState {
             for record in &entry.records {
                 if let Some(id) = record.id.as_deref() {
                     if !seen_ids.insert(id.to_string()) {
+                        continue;
+                    }
+                }
+                if let Some(fingerprint) = recalled_content_fingerprint(&record.content) {
+                    if !seen_fingerprints.insert(fingerprint) {
                         continue;
                     }
                 }
@@ -4214,6 +4229,26 @@ impl SessionState {
             fallback_override,
         })
     }
+}
+
+/// Normalized content fingerprint for cross-lane recall dedup: lowercase
+/// alphanumeric tokens, whitespace/punctuation-insensitive (the same
+/// normalization the capture lane uses, so a fact forked at capture time
+/// dedups at recall time despite carrying different ids per plane).
+/// Returns `None` for content with no tokens — records without comparable
+/// content must never dedup against each other.
+fn recalled_content_fingerprint(content: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut tokens = 0usize;
+    for token in content
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        token.to_ascii_lowercase().hash(&mut hasher);
+        tokens += 1;
+    }
+    (tokens > 0).then(|| hasher.finish())
 }
 
 /// Truncation marker appended when the LifeGraph char budget cuts content.
@@ -9269,6 +9304,53 @@ mod tests {
         assert_eq!(memories.len(), 2);
         assert_eq!(memories[1].id.as_deref(), Some("life:fresh"));
         assert_eq!(memories[1].vault_id.as_deref(), Some("life-graph"));
+    }
+
+    #[test]
+    fn inject_cached_life_context_dedupes_forked_fact_across_planes() {
+        // The capture lane forks one candidate into Muninn AND the LifeGraph:
+        // same content, different ids (ULID vs life:*). The turn must not
+        // carry the fact twice.
+        let now = 10_000u64;
+        let mut state = SessionState::new(
+            "sess-lg".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        let mut turn = make_plain_turn();
+        let mut muninn_copy = life_record(
+            "01KXGJFG2487NQSGTT7AH5ZCVX",
+            "Renew the passport before the August trip!",
+        );
+        muninn_copy.vault_id = Some("user_likesjx".into());
+        turn.recalled_memories = vec![muninn_copy];
+        state.start_turn(turn);
+        state.upsert_life_recall_cache(LifeRecallCacheEntry {
+            strategy: "open_loops_by_context".into(),
+            fetched_at: now - 10,
+            query_text: String::new(),
+            records: vec![
+                // Same fact, cosmetically rephrased, LifeGraph node id.
+                life_record("life:openloop:abc123", "renew the PASSPORT, before the august trip"),
+                life_record("life:openloop:def456", "schedule the dentist appointment"),
+            ],
+        });
+
+        let injected = state.inject_cached_life_context(1_800, now, 2_500);
+        assert_eq!(injected, 1, "forked duplicate must be dropped, fresh fact kept");
+        let memories = &state.active_turn.as_ref().unwrap().recalled_memories;
+        assert_eq!(memories.len(), 2);
+        assert_eq!(memories[1].id.as_deref(), Some("life:openloop:def456"));
+    }
+
+    #[test]
+    fn recalled_content_fingerprint_never_dedupes_empty_content() {
+        assert_eq!(super::recalled_content_fingerprint(""), None);
+        assert_eq!(super::recalled_content_fingerprint("  —!  "), None);
+        assert_ne!(
+            super::recalled_content_fingerprint("renew passport"),
+            super::recalled_content_fingerprint("schedule dentist")
+        );
     }
 
     #[test]
