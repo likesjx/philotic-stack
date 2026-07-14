@@ -2,9 +2,9 @@
 title: Local ONNX Inference Runner
 doc_type: proposal
 domain: memory-context
-status: proposed
+status: implemented
 disposition: implemented
-last_updated: 2026-03-31
+last_updated: 2026-07-14
 tags:
 - onnx
 - embeddings
