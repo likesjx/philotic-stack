@@ -45,8 +45,17 @@ impl AgentRuntime {
         const WAITING_TOOL_SECS: u64 = 90;
         const WAITING_VOICE_SECS: u64 = 60;
         const WAITING_APPROVAL_SECS: u64 = 300; // 5 min — operator may be slow
+        // A blocking `delegate.whisper` waits for a specialist turn that itself may
+        // run up to MAX_TOTAL_ACTIVE_SECS on its own hotel PLUS materialization and
+        // dispatch overhead. This deadline MUST exceed the specialist's total budget,
+        // otherwise the orchestrator gives up before a slow-but-healthy specialist can
+        // ever reply (the timeout inversion that made blocking whispers unusable).
+        const PARACRINE_WHISPER_WAIT_SECS: u64 = 660; // > MAX_TOTAL_ACTIVE_SECS + overhead
         // Hard ceiling: any active turn alive longer than this in ANY phase gets
         // evicted. Prevents InProgress or unknown-phase turns from sticking forever.
+        // Exception: a turn blocking on a paracrine whisper is bounded by
+        // PARACRINE_WHISPER_WAIT_SECS instead (see the CatchAll skip below), so this
+        // ceiling does not preempt its longer, deliberately-larger deadline.
         const MAX_TOTAL_ACTIVE_SECS: u64 = 600; // 10 min overall budget
 
         let now = std::time::Instant::now();
@@ -192,7 +201,7 @@ impl AgentRuntime {
                             .map(|tool| tool.tool_name == "delegate.whisper")
                             .unwrap_or(false) =>
                     {
-                        WAITING_APPROVAL_SECS
+                        PARACRINE_WHISPER_WAIT_SECS
                     }
                     TurnPhase::WaitingTool => WAITING_TOOL_SECS,
                     TurnPhase::WaitingVoice => WAITING_VOICE_SECS,
@@ -242,6 +251,20 @@ impl AgentRuntime {
                 }
                 let state = self.sessions.get(session_id)?;
                 let turn = state.active_turn.as_ref()?;
+                // A turn blocking on a paracrine whisper has its own, deliberately
+                // larger deadline (PARACRINE_WHISPER_WAIT_SECS) handled above. Skip it
+                // here so the 600s ceiling never evicts it before a slow specialist can
+                // reply — otherwise this catch-all would silently re-introduce the
+                // timeout inversion the whisper deadline exists to prevent.
+                let blocking_on_whisper = matches!(turn.phase, TurnPhase::WaitingTool)
+                    && turn
+                        .pending_tool_call
+                        .as_ref()
+                        .map(|tool| tool.tool_name == "delegate.whisper")
+                        .unwrap_or(false);
+                if blocking_on_whisper && elapsed < PARACRINE_WHISPER_WAIT_SECS {
+                    return None;
+                }
                 Some((
                     session_id.clone(),
                     turn.task_id,
@@ -2904,6 +2927,12 @@ impl AgentRuntime {
         let _attend_content = content.clone();
         let attend_session_id = session_id.clone();
 
+        // Capture whether the model actually produced user-facing text BEFORE the
+        // attribution tag is appended (the tag would otherwise make an empty reply
+        // look non-empty). Used by the reflective-re-entry branch to decide between
+        // surfacing the reply and absorbing a genuinely silent completion.
+        let reply_is_empty = content.trim().is_empty();
+
         // Named specialist philotes always append an @agent attribution tag so the
         // membrane (or receiving philote) knows which role secreted this Exosome.
         // Format: `@agent:<role_name>` on its own line at the end of content.
@@ -2944,33 +2973,59 @@ impl AgentRuntime {
             let reply_chat_id = completed_turn
                 .paracrine_reply_chat_id
                 .as_deref()
-                .unwrap_or(&completed_turn.chat_id);
+                .unwrap_or(&completed_turn.chat_id)
+                .to_string();
             // Reflective re-entry, top-of-chain: reply_session_id loops back to our
-            // own session, meaning this was Astrid's reflection turn after receiving
-            // brain's response. She chose not to call delegate.merge → absorb silently.
-            if reply_session_id == session_id {
+            // own session, meaning this was the orchestrator's reflection turn after
+            // receiving the specialist's response.
+            let is_top_of_chain = reply_session_id == session_id;
+            if is_top_of_chain {
+                // The orchestrator did not call delegate.merge explicitly. If it still
+                // produced user-facing text, surface it (implicit merge) — that is
+                // almost always what the reply was for, and silently dropping it is the
+                // "I never see it work" failure mode. Only a genuinely empty completion
+                // is absorbed, which preserves the deliberate "reflect privately and
+                // stay quiet" path (the model completes with no content to stay silent).
+                if reply_is_empty {
+                    info!(
+                        "deliver_text_reply: reflective re-entry turn {} completed empty — absorbing silently",
+                        turn_id
+                    );
+                    self.drain_next_user_task(&attend_session_id);
+                    return Ok(());
+                }
                 info!(
-                    "deliver_text_reply: reflective re-entry turn {} completed without delegate.merge — absorbing silently",
+                    "deliver_text_reply: reflective re-entry turn {} produced text without delegate.merge — surfacing to user (implicit merge)",
                     turn_id
                 );
-                self.drain_next_user_task(&attend_session_id);
-                return Ok(());
+                let reply_payload = FinalReplyPayload {
+                    action: "send_reply",
+                    session_id,
+                    turn_id,
+                    chat_id: reply_chat_id,
+                    content,
+                    audio_artifact,
+                    send_text_caption,
+                    reply_markup: None,
+                };
+                serde_json::to_string(&reply_payload)?
+            } else {
+                serde_json::json!({
+                    "action": "paracrine_response",
+                    "session_id": reply_session_id,
+                    "turn_id": turn_id,
+                    "chat_id": reply_chat_id,
+                    "content": content,
+                    "exosome": {
+                        "prompt": "",
+                        "paracrine_id": pid,
+                        "response_routing": completed_turn.paracrine_response_routing,
+                        "source_session_id": reply_session_id,
+                        "source_chat_id": reply_chat_id,
+                    },
+                })
+                .to_string()
             }
-            serde_json::json!({
-                "action": "paracrine_response",
-                "session_id": reply_session_id,
-                "turn_id": turn_id,
-                "chat_id": reply_chat_id,
-                "content": content,
-                "exosome": {
-                    "prompt": "",
-                    "paracrine_id": pid,
-                    "response_routing": completed_turn.paracrine_response_routing,
-                    "source_session_id": reply_session_id,
-                    "source_chat_id": reply_chat_id,
-                },
-            })
-            .to_string()
         } else {
             let reply_payload = FinalReplyPayload {
                 action: "send_reply",
