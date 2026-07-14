@@ -1,6 +1,4 @@
-use crate::commands::{
-    SlashCommand, command_manifest, find_preset, model_presets, parse_slash_command,
-};
+use crate::commands::{SlashCommand, command_manifest, parse_slash_command};
 use crate::r#loop::{
     AgentAction, ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase,
     interpret_model_payload,
@@ -1562,6 +1560,13 @@ pub struct AgentRuntime {
     muninn_available: bool,
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
+    /// Cached OpenRouter catalog snapshot for `/model` display: the set of
+    /// model ids whose endpoints accept tool calls, plus the set of all known
+    /// ids (absent-from-catalog models stay unannotated). Refreshed lazily
+    /// when older than [`OPENROUTER_CATALOG_TTL`]; `None` until first fetch or
+    /// when the last fetch failed (annotation is best-effort — dispatch-time
+    /// tools handling lives in model-router, not here).
+    openrouter_tools_catalog: Option<OpenRouterToolsCatalog>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
     default_agent_profile: AgentProfile,
@@ -1611,7 +1616,122 @@ pub struct AgentRuntime {
     voice_chunk_pipelines: HashMap<String, VoiceChunkPipeline>,
 }
 
+/// OpenRouter catalog snapshot used to annotate `/model` presets with tool
+/// capability. See the field docs on `AgentRuntime::openrouter_tools_catalog`.
+struct OpenRouterToolsCatalog {
+    fetched_at: std::time::Instant,
+    tool_capable: std::collections::HashSet<String>,
+    known: std::collections::HashSet<String>,
+}
+
+/// Refresh cadence for the `/model` tool-capability annotation catalog.
+const OPENROUTER_CATALOG_TTL: Duration = Duration::from_secs(600);
+
 impl AgentRuntime {
+    /// Live merged `/model` preset list: the hotel config key `model_presets`
+    /// (JSON array of `{alias, label, tier, model, description}`) merged over
+    /// the compiled-in defaults. Config edits apply on the next `/model` —
+    /// no restart, no redeploy.
+    async fn load_model_presets(&mut self) -> Vec<crate::commands::ResolvedModelPreset> {
+        let config_json = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "model_presets".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(IpcResponse::ConfigData { value_json, .. }) => value_json,
+            _ => None,
+        };
+        crate::commands::merge_config_model_presets(config_json.as_deref())
+    }
+
+    /// Best-effort tool-capability lookup for `/model` display. `Some(bool)`
+    /// when the OpenRouter catalog knows the model; `None` when the catalog is
+    /// unreachable or the model isn't listed (annotation is skipped — the
+    /// dispatch-time no-tools handling lives in model-router, not here).
+    async fn openrouter_model_supports_tools(&mut self, model_id: &str) -> Option<bool> {
+        let stale = self
+            .openrouter_tools_catalog
+            .as_ref()
+            .map(|c| c.fetched_at.elapsed() > OPENROUTER_CATALOG_TTL)
+            .unwrap_or(true);
+        if stale {
+            if let Some(fresh) = self.fetch_openrouter_tools_catalog().await {
+                self.openrouter_tools_catalog = Some(fresh);
+            }
+        }
+        let catalog = self.openrouter_tools_catalog.as_ref()?;
+        if !catalog.known.contains(model_id) {
+            return None;
+        }
+        Some(catalog.tool_capable.contains(model_id))
+    }
+
+    async fn fetch_openrouter_tools_catalog(&mut self) -> Option<OpenRouterToolsCatalog> {
+        let base = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "openrouter_base_url".into(),
+                },
+                Duration::from_secs(3),
+            )
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(v),
+                ..
+            }) => v,
+            _ => "https://openrouter.ai/api".to_string(),
+        };
+        let base = base
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/')
+            .to_string();
+        let url = format!("{base}/v1/models");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(4))
+            .build()
+            .ok()?;
+        let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        let mut known = std::collections::HashSet::new();
+        let mut tool_capable = std::collections::HashSet::new();
+        for model in body.get("data").and_then(|d| d.as_array())? {
+            let Some(id) = model.get("id").and_then(|i| i.as_str()) else {
+                continue;
+            };
+            known.insert(id.to_string());
+            let supports = model
+                .get("supported_parameters")
+                .and_then(|p| p.as_array())
+                .map(|params| {
+                    params
+                        .iter()
+                        .filter_map(|p| p.as_str())
+                        .any(|p| p == "tools")
+                })
+                .unwrap_or(false);
+            if supports {
+                tool_capable.insert(id.to_string());
+            }
+        }
+        if known.is_empty() {
+            return None;
+        }
+        Some(OpenRouterToolsCatalog {
+            fetched_at: std::time::Instant::now(),
+            tool_capable,
+            known,
+        })
+    }
+
     pub fn new(ipc_client: PhiloticClient, agent_id: impl Into<String>) -> Self {
         Self {
             ipc_client,
@@ -1620,6 +1740,7 @@ impl AgentRuntime {
             muninn_config: None,
             muninn_available: true,
             configured_roles: HashMap::new(),
+            openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
@@ -5210,9 +5331,15 @@ impl AgentRuntime {
         // fallback escalation in advance_turn_to_next_fallback_tier, and is
         // routed at the resolve_model_execution_target choke point.
         if let SlashCommand::ModelPreset { ref alias } = command {
-            let reply = match find_preset(alias) {
+            // Resolve against the LIVE merged preset list (hotel config over
+            // built-ins) — or any direct `vendor/model` OpenRouter slug — so
+            // the swappable model set is operator-editable without a redeploy.
+            let presets = self.load_model_presets().await;
+            let reply = match crate::commands::resolve_model_preset(alias, &presets) {
                 None => format!(
-                    "Unknown model preset `{alias}`. Send /model to see the available presets."
+                    "Unknown model preset `{alias}`. Send /model to see the presets, \
+                     use any OpenRouter id directly (e.g. /model sao10k/l3.1-euryale-70b), \
+                     or /model model.<tier> to pin a session tier."
                 ),
                 Some(preset) => {
                     // Read the active role + its current turn-loop config so we
@@ -5256,13 +5383,12 @@ impl AgentRuntime {
 
                     // Make the preset's provider tier primary, then bind the
                     // concrete model name to that tier (Layer 1 model_bindings).
-                    let tier = preset.tier_role.to_string();
+                    let tier = preset.tier_role.clone();
                     let mut tiers: Vec<String> = tlc.fallback_tiers.clone();
                     tiers.retain(|t| t != &tier);
                     tiers.insert(0, tier.clone());
-                    if let Some(model_id) = preset.model_id {
-                        tlc.model_bindings
-                            .insert(tier.clone(), model_id.to_string());
+                    if let Some(model_id) = preset.model_id.as_ref() {
+                        tlc.model_bindings.insert(tier.clone(), model_id.clone());
                     }
                     tlc.fallback_tiers = tiers.clone();
 
@@ -5338,6 +5464,27 @@ impl AgentRuntime {
         }
 
         if let SlashCommand::Model { ref tier } = command {
+            // Bare `/model` lists the live merged presets with best-effort
+            // tool-capability notes. Both need `&mut self` (IPC + catalog
+            // fetch), so gather them BEFORE borrowing the session state.
+            let (presets, tool_notes) = if tier.is_none() {
+                let presets = self.load_model_presets().await;
+                let mut notes: HashMap<String, bool> = HashMap::new();
+                for preset in &presets {
+                    if preset.tier_role != "model.openrouter" {
+                        continue;
+                    }
+                    let Some(model_id) = preset.model_id.clone() else {
+                        continue;
+                    };
+                    if let Some(supports) = self.openrouter_model_supports_tools(&model_id).await {
+                        notes.insert(preset.alias.clone(), supports);
+                    }
+                }
+                (presets, notes)
+            } else {
+                (Vec::new(), HashMap::new())
+            };
             let reply = if let Some(state) = self.sessions.get_mut(&session_id) {
                 // Any `/model` invocation (pin or clear) resets the persisted
                 // fallback override (Slice 2) — the operator is taking explicit
@@ -5370,10 +5517,10 @@ impl AgentRuntime {
                         let current_label = current
                             .as_deref()
                             .map(|id| {
-                                model_presets()
+                                presets
                                     .iter()
-                                    .find(|p| p.model_id == Some(id))
-                                    .map(|p| p.label.to_string())
+                                    .find(|p| p.model_id.as_deref() == Some(id))
+                                    .map(|p| p.label.clone())
                                     .unwrap_or_else(|| id.to_string())
                             })
                             .unwrap_or_else(|| "provider default".to_string());
@@ -5384,9 +5531,18 @@ impl AgentRuntime {
                         list.push_str(&format!(
                             "🧠 Current: {current_label}\nSwap with /model <name>:"
                         ));
-                        for p in model_presets() {
-                            list.push_str(&format!("\n • {} — {}", p.alias, p.description));
+                        for p in &presets {
+                            let note = match tool_notes.get(&p.alias) {
+                                Some(true) => " 🔧",
+                                Some(false) => " 💬 chat-only (no tools)",
+                                None => "",
+                            };
+                            list.push_str(&format!("\n • {} — {}{}", p.alias, p.description, note));
                         }
+                        list.push_str(
+                            "\n • <vendor/model> — any OpenRouter id \
+                             (e.g. /model sao10k/l3.1-euryale-70b)",
+                        );
                         list
                     }
                 }
