@@ -951,6 +951,61 @@ pub(crate) async fn handle_edge_lifegraph_neighborhood(
     }
 }
 
+/// Per-request observation cap — mirrors `MAX_OBSERVE_BATCH` in
+/// data-memorygraphrag (the runner rejects larger batches). The client
+/// chunks; this bound is the server's own guard against oversized bodies.
+const EDGE_OBSERVE_MAX_BATCH: usize = 25;
+
+#[derive(Deserialize)]
+pub(crate) struct EdgeObserveBody {
+    #[serde(default)]
+    observations: Vec<Value>,
+}
+
+/// `POST /api/edge/lifegraph/observe` — edge-bearer LifeGraph WRITE plane:
+/// submit up to 25 `LifeObserveInput` observations as one `life.observe.batch`
+/// datasource call. The write plane routes through the SAME life-graph-runner
+/// binding as the read lenses (local or remote per
+/// `PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE`), so a cross-hotel runner that is
+/// unreachable will surface here as `life_graph_unavailable`, identically to
+/// the read side. Devices (HealthKit etc.) push observations here; raw
+/// samples stay on-device, only summary EvidencePackets are sent.
+pub(crate) async fn handle_edge_lifegraph_observe(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<EdgeObserveBody>,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    if body.observations.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no observations submitted" })),
+        )
+            .into_response();
+    }
+    if body.observations.len() > EDGE_OBSERVE_MAX_BATCH {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "batch of {} exceeds the {EDGE_OBSERVE_MAX_BATCH}-observation limit",
+                    body.observations.len()
+                ),
+                "max_batch": EDGE_OBSERVE_MAX_BATCH,
+            })),
+        )
+            .into_response();
+    }
+    let arguments = json!({ "observations": body.observations });
+    match super::ipc_life_graph_datasource_call(&state.socket, "life.observe.batch", arguments).await
+    {
+        Ok(data) => Json(data).into_response(),
+        Err(err) => life_graph_unavailable(err),
+    }
+}
+
 /// Outcome of a successful handshake ([`process_hello`]).
 #[derive(Debug, PartialEq)]
 struct HandshakeAccept {

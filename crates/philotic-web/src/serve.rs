@@ -705,6 +705,11 @@ pub async fn run(
             get(edge::handle_edge_lifegraph_neighborhood),
         )
         .route(
+            "/api/edge/lifegraph/observe",
+            post(edge::handle_edge_lifegraph_observe)
+                .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route(
             "/api/edge/blob",
             post(edge::handle_edge_blob)
                 .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),

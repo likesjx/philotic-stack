@@ -53,6 +53,14 @@ targets:
     dependencies:
       - package: PhiloticKit
         product: PhiloticKit
+    # HealthKit capability lives on the iOS target ONLY. The macOS target
+    # (the build gate) gets no HealthKit entitlement — the service compiles
+    # out its HealthKit surface under `#if os(iOS)` there.
+    entitlements:
+      path: PhiloticApp-iOS.entitlements
+      properties:
+        com.apple.developer.healthkit: true
+        com.apple.developer.healthkit.access: []
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.philotic.apple.ios
@@ -64,6 +72,7 @@ targets:
         INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: "YES"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "PhiloticApp uses the microphone for voice messages to your agents."
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
+        INFOPLIST_KEY_NSHealthShareUsageDescription: "PhiloticApp reads your health metrics to build your life graph."
         TARGETED_DEVICE_FAMILY: "1,2"
         # Pinned to the Simulator SDK/platform (not iphoneos device) because this
         # dev environment's installed simulator runtime (iOS 26.2) trails the
