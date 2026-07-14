@@ -36,9 +36,11 @@ pub fn model_presets() -> &'static [ModelPreset] {
         },
         ModelPreset {
             alias: "euryale",
+            // L3.1, not L3.3: only the L3.1 finetune has tool-capable
+            // endpoints on OpenRouter (L3.3 is chat-only).
             label: "Euryale 70B",
             tier_role: "model.openrouter",
-            model_id: Some("sao10k/l3.3-euryale-70b"),
+            model_id: Some("sao10k/l3.1-euryale-70b"),
             description: "bigger, best coherence",
         },
         ModelPreset {
@@ -69,6 +71,117 @@ pub fn model_presets() -> &'static [ModelPreset] {
 pub fn find_preset(alias: &str) -> Option<&'static ModelPreset> {
     let alias = alias.trim().to_lowercase();
     model_presets().iter().find(|p| p.alias == alias)
+}
+
+/// An owned, dynamically-sourced model preset. The compiled-in
+/// [`model_presets`] list is only the FALLBACK: the hotel config key
+/// `model_presets` (a JSON array of `{alias, label, tier, model, description}`
+/// objects) overrides or extends it live — editable via a config patch, no
+/// redeploy — and any `vendor/model` slug resolves directly without a preset
+/// entry at all (see [`resolve_model_preset`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelPreset {
+    pub alias: String,
+    pub label: String,
+    pub tier_role: String,
+    pub model_id: Option<String>,
+    pub description: String,
+}
+
+impl From<&ModelPreset> for ResolvedModelPreset {
+    fn from(p: &ModelPreset) -> Self {
+        Self {
+            alias: p.alias.to_string(),
+            label: p.label.to_string(),
+            tier_role: p.tier_role.to_string(),
+            model_id: p.model_id.map(str::to_string),
+            description: p.description.to_string(),
+        }
+    }
+}
+
+/// Merge the hotel's `model_presets` config value (if any) over the built-in
+/// preset list. Config entries win on alias collision and append otherwise;
+/// malformed entries are skipped so one bad row can't take out the whole
+/// list. `None` / unparsable config yields exactly the built-ins.
+pub fn merge_config_model_presets(config_json: Option<&str>) -> Vec<ResolvedModelPreset> {
+    let mut presets: Vec<ResolvedModelPreset> = model_presets().iter().map(Into::into).collect();
+    let Some(raw) = config_json else {
+        return presets;
+    };
+    let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(raw)
+    else {
+        return presets;
+    };
+    for entry in entries {
+        let Some(alias) = entry
+            .get("alias")
+            .and_then(serde_json::Value::as_str)
+            .map(|a| a.trim().to_lowercase())
+            .filter(|a| !a.is_empty())
+        else {
+            continue;
+        };
+        let model_id = entry
+            .get("model")
+            .or_else(|| entry.get("model_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        let tier_role = entry
+            .get("tier")
+            .or_else(|| entry.get("tier_role"))
+            .and_then(serde_json::Value::as_str)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "model.openrouter".to_string());
+        let label = entry
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| alias.clone());
+        let description = entry
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let resolved = ResolvedModelPreset {
+            alias: alias.clone(),
+            label,
+            tier_role,
+            model_id,
+            description,
+        };
+        match presets.iter_mut().find(|p| p.alias == alias) {
+            Some(existing) => *existing = resolved,
+            None => presets.push(resolved),
+        }
+    }
+    presets
+}
+
+/// Resolve a `/model` argument against the merged preset list. Falls through
+/// to a direct binding for any `vendor/model` OpenRouter slug — the operator
+/// is not limited to curated aliases.
+pub fn resolve_model_preset(
+    alias: &str,
+    presets: &[ResolvedModelPreset],
+) -> Option<ResolvedModelPreset> {
+    let lowered = alias.trim().to_lowercase();
+    if let Some(preset) = presets.iter().find(|p| p.alias == lowered) {
+        return Some(preset.clone());
+    }
+    let raw = alias.trim();
+    if raw.contains('/') && !raw.starts_with('/') && !raw.ends_with('/') {
+        return Some(ResolvedModelPreset {
+            alias: raw.to_string(),
+            label: raw.to_string(),
+            tier_role: "model.openrouter".to_string(),
+            model_id: Some(raw.to_string()),
+            description: "direct OpenRouter model".to_string(),
+        });
+    }
+    None
 }
 
 /// Returns the agent's command manifest.  Pass `active_skills` to include skill-specific commands.
@@ -365,17 +478,32 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         }),
         ["/model"] => Some(SlashCommand::Model { tier: None }),
         ["/model", arg, ..] => {
-            // A known preset alias (cydonia, glm, gemini, ...) triggers the
-            // durable swap; anything else falls through to the legacy
-            // session tier-pin (ollama/local/mlx/model.*).
-            if let Some(preset) = find_preset(arg) {
-                Some(SlashCommand::ModelPreset {
-                    alias: preset.alias.to_string(),
-                })
-            } else {
+            // Explicit tier names (ollama/local/mlx/model.*) keep the legacy
+            // session tier-pin. Everything else — built-in preset aliases,
+            // config-defined aliases, or a direct `vendor/model` OpenRouter
+            // slug — takes the durable ModelPreset swap path; the alias is
+            // resolved at HANDLE time against the live merged preset list
+            // (hotel config + built-ins), not the compiled-in list, so parse
+            // must not gate on `find_preset`.
+            let lowered = arg.to_lowercase();
+            let is_tier_pin = arg.starts_with("model.")
+                || matches!(
+                    lowered.as_str(),
+                    "ollama" | "local" | "onnx" | "kokoro" | "mlx" | "cloud" | "model"
+                );
+            if is_tier_pin {
                 Some(SlashCommand::Model {
                     tier: Some(normalize_model_tier(arg)),
                 })
+            } else {
+                // Slugs keep their case (OpenRouter ids are case-sensitive);
+                // bare aliases are lowercased for case-insensitive matching.
+                let alias = if arg.contains('/') {
+                    (*arg).to_string()
+                } else {
+                    lowered
+                };
+                Some(SlashCommand::ModelPreset { alias })
             }
         }
         ["/correct", turn_id, rest @ ..] if !rest.is_empty() => Some(SlashCommand::Correct {
@@ -634,9 +762,92 @@ mod tests {
             })
         );
         // find_preset resolves aliases and rejects unknowns.
-        assert_eq!(find_preset("glm").map(|p| p.tier_role), Some("model.openrouter"));
+        assert_eq!(
+            find_preset("glm").map(|p| p.tier_role),
+            Some("model.openrouter")
+        );
         assert_eq!(find_preset("gemini").and_then(|p| p.model_id), None);
         assert!(find_preset("nope-not-a-model").is_none());
+    }
+
+    #[test]
+    fn parses_slugs_and_unknown_aliases_as_preset_swaps() {
+        // A direct OpenRouter `vendor/model` slug keeps its case and takes
+        // the durable swap path.
+        assert_eq!(
+            parse_slash_command("/model sao10k/l3.1-euryale-70b"),
+            Some(SlashCommand::ModelPreset {
+                alias: "sao10k/l3.1-euryale-70b".into(),
+            })
+        );
+        // An unknown bare alias also goes to the preset path (resolved at
+        // handle time against hotel-config presets), lowercased.
+        assert_eq!(
+            parse_slash_command("/model MyAlias"),
+            Some(SlashCommand::ModelPreset {
+                alias: "myalias".into(),
+            })
+        );
+        // Explicit tier pins are untouched.
+        assert_eq!(
+            parse_slash_command("/model model.anthropic"),
+            Some(SlashCommand::Model {
+                tier: Some("model.anthropic".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn merges_config_presets_over_builtins() {
+        use super::{merge_config_model_presets, model_presets};
+
+        // No config → exactly the built-ins.
+        let defaults = merge_config_model_presets(None);
+        assert_eq!(defaults.len(), model_presets().len());
+
+        // Config overrides an existing alias and appends a new one; a
+        // malformed row (no alias) is skipped without poisoning the list.
+        let config = r#"[
+            {"alias": "cydonia", "model": "thedrummer/cydonia-24b-v9", "label": "Cydonia v9"},
+            {"alias": "mist", "model": "vendor/mist-large", "description": "config-added"},
+            {"label": "no alias — skipped"}
+        ]"#;
+        let merged = merge_config_model_presets(Some(config));
+        assert_eq!(merged.len(), model_presets().len() + 1);
+        let cydonia = merged.iter().find(|p| p.alias == "cydonia").unwrap();
+        assert_eq!(
+            cydonia.model_id.as_deref(),
+            Some("thedrummer/cydonia-24b-v9")
+        );
+        assert_eq!(cydonia.label, "Cydonia v9");
+        let mist = merged.iter().find(|p| p.alias == "mist").unwrap();
+        assert_eq!(mist.tier_role, "model.openrouter");
+        assert_eq!(mist.model_id.as_deref(), Some("vendor/mist-large"));
+
+        // Unparsable config falls back to the built-ins.
+        let broken = merge_config_model_presets(Some("not json"));
+        assert_eq!(broken.len(), model_presets().len());
+    }
+
+    #[test]
+    fn resolves_presets_and_direct_slugs() {
+        use super::{merge_config_model_presets, resolve_model_preset};
+
+        let presets = merge_config_model_presets(None);
+        // Alias match is case-insensitive.
+        let euryale = resolve_model_preset("EURYALE", &presets).unwrap();
+        assert_eq!(euryale.model_id.as_deref(), Some("sao10k/l3.1-euryale-70b"));
+        // Any vendor/model slug binds directly to the openrouter tier.
+        let direct = resolve_model_preset("some-vendor/some-model:free", &presets).unwrap();
+        assert_eq!(direct.tier_role, "model.openrouter");
+        assert_eq!(
+            direct.model_id.as_deref(),
+            Some("some-vendor/some-model:free")
+        );
+        // Unknown bare aliases (and degenerate slugs) resolve to nothing.
+        assert!(resolve_model_preset("nope", &presets).is_none());
+        assert!(resolve_model_preset("/leading", &presets).is_none());
+        assert!(resolve_model_preset("trailing/", &presets).is_none());
     }
 
     #[test]
