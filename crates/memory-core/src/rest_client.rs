@@ -645,33 +645,63 @@ impl MemoryEngine for MuninnRestEngine {
         let mut total = 0usize;
         let is_cross_scope = matches!(scope, MemoryScope::CrossScope(_));
 
-        for vault in vaults {
-            if is_cross_scope && !self.has_auth_for_vault(&vault) {
-                debug!(
-                    vault = %vault,
-                    "Skipping cross-scope activation for vault without token"
-                );
-                continue;
-            }
+        // Cross-scope recall runs in the turn path before context composition:
+        // the per-vault activations are independent, so fire them concurrently
+        // instead of paying up to three serial round-trips per turn.
+        let fetches = vaults
+            .iter()
+            .filter(|vault| {
+                if is_cross_scope && !self.has_auth_for_vault(vault) {
+                    debug!(
+                        vault = %vault,
+                        "Skipping cross-scope activation for vault without token"
+                    );
+                    return false;
+                }
+                true
+            })
+            .map(|vault| {
+                let body = ActivateRequest {
+                    vault: Some(vault.clone()),
+                    context: vec![context.to_string()],
+                    max_results: max,
+                };
+                async move {
+                    let resp: anyhow::Result<ActivateResponse> = async {
+                        Ok(self
+                            .with_auth(self.client.post(self.url("/api/activate")), vault)
+                            .json(&body)
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json()
+                            .await?)
+                    }
+                    .await;
+                    (vault, resp)
+                }
+            });
 
-            let body = ActivateRequest {
-                vault: Some(vault.clone()),
-                context: vec![context.to_string()],
-                max_results: max,
+        for (vault, resp) in futures::future::join_all(fetches).await {
+            let resp = match resp {
+                Ok(resp) => resp,
+                // Cross-scope recall is advisory: one failing vault degrades
+                // to partial results instead of killing recall for the rest.
+                Err(err) if is_cross_scope => {
+                    tracing::warn!(
+                        vault = %vault,
+                        error = %err,
+                        "Cross-scope activation failed for vault; continuing with others"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
             };
-            let resp: ActivateResponse = self
-                .with_auth(self.client.post(self.url("/api/activate")), &vault)
-                .json(&body)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
 
             total += resp.total_found;
             // Populate cache from activation results so subsequent ops are fast.
             for item in &resp.activations {
-                self.cache_vault(&item.id, &vault).await;
+                self.cache_vault(&item.id, vault).await;
             }
             all_engrams.extend(resp.activations.into_iter().map(|item| {
                 let mut engram: Engram = item.into();
