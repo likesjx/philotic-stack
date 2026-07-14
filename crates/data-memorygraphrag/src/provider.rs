@@ -364,6 +364,15 @@ pub struct LifeGraphProvider {
     config: MemgraphConfig,
     runner: MemoryGraphRagRunner,
     autonomy: Arc<dyn AutonomyGate>,
+    /// Lazily-built, reused neo4rs connection pool. A `Graph` IS a pool
+    /// (`max_size 16`) and is `Clone` (Arc-backed) — it is meant to be built
+    /// once and shared, NOT rebuilt per query. Rebuilding per call (as this used
+    /// to) opened a fresh 16-connection pool for every observation; under a
+    /// `life.observe.batch` (or the steward distillation sweep) plus cross-hotel
+    /// traffic, that swamped Memgraph's tiny `bolt_num_workers=2` with handshake
+    /// churn, connection setup queued, and the batch stalled until the 93s
+    /// WaitingTool watchdog evicted the turn.
+    graph: tokio::sync::OnceCell<Graph>,
 }
 
 impl LifeGraphProvider {
@@ -377,10 +386,21 @@ impl LifeGraphProvider {
                 default_embedding_model: "text-embedding-3-small".to_string(),
             }),
             autonomy: Arc::new(HotelAutonomyGate),
+            graph: tokio::sync::OnceCell::new(),
         }
     }
 
+    /// Return the shared connection pool, building it on first use. Reuses one
+    /// `Graph` across all queries; a build failure is not cached, so a transient
+    /// Memgraph outage at first use is retried on the next call.
     async fn connect(&self) -> Result<Graph> {
+        self.graph
+            .get_or_try_init(|| async { self.build_graph() })
+            .await
+            .cloned()
+    }
+
+    fn build_graph(&self) -> Result<Graph> {
         let mut builder = ConfigBuilder::default()
             .uri(self.config.uri.as_str())
             .user(self.config.user.as_str())
@@ -3876,12 +3896,71 @@ mod tests {
 /// (default `http://127.0.0.1:11435`).
 /// Returns an explicit error on dim mismatch — callers should surface this, not silently
 /// continue with a wrong-dim vector.
+/// Hard ceiling for a single embed-on-write sidecar call. Sized so a stalled
+/// ONNX embedding sidecar fails fast — surfacing as a graceful "sidecar
+/// unavailable" skip in `handle_observe` (the node is already written; the
+/// embedding is optional) — instead of hanging the observe indefinitely. That
+/// indefinite hang is what wedged `life.observe.batch`: with no timeout, each
+/// per-item embed blocked forever and the turn sat until the watchdog evicted
+/// it. Kept small so even a multi-item batch degrades within the turn watchdog.
+const EMBED_SIDECAR_TIMEOUT_SECS: u64 = 8;
+
+/// After an embed sidecar failure, treat it as down for this long and
+/// short-circuit further embed calls (fast Err, no HTTP). This turns a
+/// persistently-down sidecar from "N × timeout per bulk write" into a single
+/// timeout, so `life.observe.batch` and the steward distillation sweep don't
+/// wedge when embeddings are unavailable — the observations still land, just
+/// without vectors.
+const EMBED_SIDECAR_COOLDOWN_SECS: u64 = 60;
+
+/// Unix-seconds deadline before which the embed sidecar is treated as down.
+/// `0` = healthy. Process-global, best-effort (Relaxed) — a stale read only
+/// costs at most one extra timeout, never correctness.
+static EMBED_SIDECAR_DOWN_UNTIL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Circuit-breaking wrapper over [`embed_text_inner`]: skips the sidecar during
+/// the post-failure cooldown, and arms the cooldown on any failure. Callers get
+/// an `Err` (handled as a graceful "sidecar_unavailable" skip) either way.
 async fn embed_text(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
+    use std::sync::atomic::Ordering;
+    let now = now_unix_secs();
+    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
+        anyhow::bail!("embed_text: sidecar in cooldown after a recent failure");
+    }
+    match embed_text_inner(text).await {
+        Ok(result) => {
+            // Recovered (or never down): clear any lingering cooldown.
+            EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
+            Ok(result)
+        }
+        Err(e) => {
+            EMBED_SIDECAR_DOWN_UNTIL
+                .store(now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS), Ordering::Relaxed);
+            Err(e)
+        }
+    }
+}
+
+async fn embed_text_inner(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
     let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
         .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
     let url = format!("{base}/api/embeddings");
 
-    let client = reqwest::Client::new();
+    // Bounded client: a sidecar that accepts the TCP connection but never
+    // responds must NOT hang embed-on-write forever (see EMBED_SIDECAR_TIMEOUT_SECS).
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(EMBED_SIDECAR_TIMEOUT_SECS))
+        .build()
+        .context("embed_text: failed to build HTTP client")?;
     let resp: serde_json::Value = client
         .post(&url)
         .json(&serde_json::json!({"prompt": text}))
