@@ -5,6 +5,16 @@
 set -euo pipefail
 
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Freshness guard: this script installs whatever target/release already
+# holds, so both a stale HEAD and stale build artifacts can silently revert
+# merged fixes (2026-07-14: PR #266/#272 reverted on mbp-jane by a stale
+# push). PHILOTIC_DEPLOY_ALLOW_STALE=1 overrides the hard abort.
+# shellcheck source=scripts/deploy-freshness-check.sh
+source "$WT/scripts/deploy-freshness-check.sh"
+assert_tree_fresh "$WT"
+warn_stale_artifacts "$WT" "$WT/target/release/aiua"
+
 CBIN=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
 CWEB=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin/philotic-web
 BK="/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin-backup-$(date +%Y%m%d-%H%M%S)"
