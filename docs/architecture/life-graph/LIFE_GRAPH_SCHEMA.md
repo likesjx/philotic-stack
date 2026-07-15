@@ -358,6 +358,26 @@ A belief about what will help the operator improve or change.
 
 Embedding space: `skill_tool_semantic`
 
+#### Idea-node convention (`idea:<slug>`)
+
+Operator ideas captured by the idea-intake charter
+([ARIA_IDEA_PIPELINE_PROPOSAL](../ARIA_IDEA_PIPELINE_PROPOSAL.md)) reuse
+`GrowthHypothesis` — a convention, not a schema patch:
+
+| Convention | Value |
+|---|---|
+| `id` | `idea:<slug>` (e.g. `idea:healthkit-observe`) |
+| `claim_summary` | The idea in 1–2 sentences, operator's words preserved in the evidence packet |
+| `idea_kind` | `implementation` |
+| `target` | `philotic-stack` (later: `muninndb`, `home`, …) |
+| `idea_status` | `captured` → `promoted` (with `graph_ref: doc:<proposal-id>`) → `shipped` \| `declined` (with reason) |
+
+Provenance envelope as always (`source_membrane`, `observed_by`,
+`validation_state: proposed`). The LifeGraph node is the provenance anchor
+for the idea's whole life; the intel-graph node referenced by `graph_ref`
+owns execution state. Revisit a dedicated `Idea` label (a governed
+SchemaPatch) only if lens ergonomics demand it.
+
 ---
 
 ### GrowthExperiment

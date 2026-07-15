@@ -431,6 +431,18 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("mark complete")
                 || t.contains("mark it done")
                 || t.contains("cross the finish line")
+                // Idea-intake language (aria-idea-pipeline, stage 1): operator
+                // wants/needs/ideas for new capabilities are captured as
+                // GrowthHypothesis idea:<slug> nodes via life.observe. Without
+                // these keywords the idea-steward charter is dead text — the
+                // life.* tools never get projected on an "I need X" turn.
+                || t.contains("idea")
+                || t.contains("implement")
+                || t.contains("build me")
+                || t.contains("i need")
+                || t.contains("feature")
+                || t.contains("capture this")
+                || t.contains("backlog")
         }
         "lifegraph.truth_summarizer" => {
             t.contains("lifegraph")
@@ -3545,6 +3557,31 @@ mod tests {
             "mark it done",
             "that's complete now",
             "yep, resolved",
+        ] {
+            assert!(
+                skill_is_relevant_for_turn("life.steward", turn),
+                "expected life.steward to be relevant for {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn life_steward_relevant_for_idea_intake_language() {
+        // aria-idea-pipeline stage 1: the operator texting an idea ("I need
+        // HealthKit pulling my data") must project the life.* tools so the
+        // idea-steward charter can capture it as an idea:<slug> node. The
+        // Coach incident (2026-07-14) showed a charter without matching
+        // relevance keywords is dead text. Turn text reaches this function
+        // already lowercased (normalized_turn_text in session/mod.rs).
+        for turn in [
+            "i need healthkit pulling my data into the lifegraph",
+            "idea: let beacon summarize my mornings",
+            "can you implement a weekly review digest",
+            "build me a dashboard for the rowing data",
+            "feature request: dark mode on the life tab",
+            "capture this for later",
+            "add that one to the backlog",
+            "what ideas are pending?",
         ] {
             assert!(
                 skill_is_relevant_for_turn("life.steward", turn),
