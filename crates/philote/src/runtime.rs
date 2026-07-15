@@ -420,6 +420,23 @@ fn provider_for_role(role: &str) -> Option<String> {
     }
 }
 
+/// Capability guard for shadow-mode (`PHILOTIC_SHADOW_ORACLE`) oracle-vs-ladder
+/// logging at the FIRST-TURN dispatch (Model Oracle Primary Authority, slice 2).
+///
+/// The first-turn dispatch in `handle_user_message` multiplexes the cognitive
+/// text-generation ladder with aux `transform` tasks (voice transcription, media
+/// analysis / description / summarization). The shadow oracle comparison must
+/// fire ONLY for the cognitive text case — the same class of dispatch slice 1
+/// instruments in `turn_loop` — and NEVER for aux tasks (they don't ride the
+/// text fallback ladder, so an oracle-vs-ladder comparison is meaningless there).
+///
+/// Returns `true` only for `"text.generate"` / `"response.generate"`, the exact
+/// pair that also flags this dispatch's `request_class` as `"cognitive"`. Pure so
+/// the cognitive-eligible / aux-excluded contract is unit-testable without IPC.
+fn shadow_eligible_capability(capability: &str) -> bool {
+    matches!(capability, "text.generate" | "response.generate")
+}
+
 /// Pick the first oracle-ranked entry whose role is not already in the
 /// turn's ladder. Returns `(role, provider)`. Pure so the skip-tried-roles
 /// contract is unit-testable without IPC.
@@ -3463,7 +3480,7 @@ impl AgentRuntime {
         let ligand = planning_ligand(self.sessions.get(&session_id), &content, &tools_for_model);
         let affordances =
             model_affordances(self.sessions.get(&session_id), &content, &tools_for_model);
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action,
             request_class: Some(
                 if matches!(capability.as_str(), "text.generate" | "response.generate") {
@@ -3497,6 +3514,22 @@ impl AgentRuntime {
             oracle_pick: None,
             oracle_agreement: None,
         };
+
+        // Shadow-mode (PHILOTIC_SHADOW_ORACLE, default OFF): log-only oracle-vs-
+        // ladder annotation on the FIRST-TURN dispatch (Model Oracle Primary
+        // Authority, slice 2). Capability-guarded so it fires ONLY for the
+        // cognitive text-generation case — the same dispatch class slice 1
+        // instruments in `turn_loop` — and NEVER for the aux/transform tasks
+        // this site also multiplexes (voice.transcribe, media.analyze, ...).
+        // `shadow_oracle_pick` is itself flag-gated (returns before any
+        // ipc_client access when off), so aux tasks stay completely untouched
+        // and the cognitive OFF path costs nothing beyond this string compare.
+        // Never alters the dispatch target (target_node/role/guest_id unchanged).
+        if shadow_eligible_capability(&capability) {
+            let (shadow_pick, shadow_agreement) = self.shadow_oracle_pick(&target_role).await;
+            model_req.oracle_pick = shadow_pick;
+            model_req.oracle_agreement = shadow_agreement;
+        }
 
         if debug_model_requests_enabled()
             && matches!(capability.as_str(), "text.generate" | "response.generate")
@@ -6957,7 +6990,7 @@ mod tests {
         media_analysis_attachments, next_ladder_tier, normalized_user_content,
         parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
         resolve_media_routing, resolve_model_execution_target, role_model_binding,
-        should_attempt_provider_repair, tool_step_earns_streak,
+        shadow_eligible_capability, should_attempt_provider_repair, tool_step_earns_streak,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -7031,6 +7064,37 @@ mod tests {
         let (role, provider) = pick_oracle_role(&data, &tried).expect("pick");
         assert_eq!(role, "model.openai");
         assert_eq!(provider, "unknown");
+    }
+
+    #[test]
+    fn shadow_eligible_capability_fires_only_on_cognitive_text() {
+        // (a) The cognitive text-generation dispatch — the same class slice 1
+        // instruments in turn_loop — is shadow-eligible. Firing here makes a
+        // first-turn cognitive dispatch stamp oracle_pick/agreement onto the
+        // outgoing task (recorded downstream by the model-router trace store,
+        // proven by from_task_threads_agent_id_and_shadow_into_recorded_trace).
+        assert!(shadow_eligible_capability("text.generate"));
+        assert!(shadow_eligible_capability("response.generate"));
+    }
+
+    #[test]
+    fn shadow_eligible_capability_excludes_aux_transform_tasks() {
+        // (b) The aux/transform tasks the first-turn dispatch also multiplexes
+        // must NEVER be compared against the oracle — they don't ride the text
+        // fallback ladder. These are the exact capability strings produced by
+        // resolve_media_routing / action_to_capability at this site.
+        for aux in [
+            "voice.transcribe",
+            "media.analyze",
+            "image.describe",
+            "document.summarize",
+            "voice.synthesize",
+        ] {
+            assert!(
+                !shadow_eligible_capability(aux),
+                "aux capability {aux} must be excluded from shadow-oracle logging"
+            );
+        }
     }
 
     #[test]

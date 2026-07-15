@@ -2687,7 +2687,10 @@ impl AgentRuntime {
     ///   non-empty exclude list, so shadow queries have no side effects).
     /// - On any oracle error / non-success / empty ranking it returns
     ///   `(None, None)` (divergence-unknown) and never fails the turn.
-    async fn shadow_oracle_pick(&mut self, resolved_role: &str) -> (Option<String>, Option<bool>) {
+    pub(super) async fn shadow_oracle_pick(
+        &mut self,
+        resolved_role: &str,
+    ) -> (Option<String>, Option<bool>) {
         if !ansible_mesh_core::model_oracle::shadow_oracle_enabled() {
             return (None, None);
         }
