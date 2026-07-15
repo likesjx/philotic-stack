@@ -2,8 +2,8 @@
 title: Aria Idea Pipeline — Operator Ideas to Implemented Slices
 doc_type: proposal
 domain: product-management-plane
-status: proposed
-last_updated: 2026-07-14
+status: active
+last_updated: 2026-07-15
 tags:
 - idea-intake
 - aria
@@ -142,7 +142,10 @@ the slice, on `doc:native-apple-app-proposal`):
 
 ## Disposition
 
-`proposed`
+`accepted for current slice` — slice 1 (`idea-intake-charter`) in flight
+on `codex/aria-idea-intake-charter` (2026-07-15): items 1–3 implemented
+(catalog keywords + charter text + schema convention note); item 4 (mbp-jane
+deploy + watched-live) pending rollout.
 
 ## Current Slice (for the picking-up session)
 

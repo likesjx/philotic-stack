@@ -4218,7 +4218,17 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                           count), then use life.observe.batch (up to 25 observations per call) \
                           instead of repeated life.observe calls. Completed writes are durable \
                           per item — partial failure never rolls anything back, so never report \
-                          a rollback; re-check with life.recall and continue from what landed."
+                          a rollback; re-check with life.recall and continue from what landed. \
+                          Idea steward: when the operator expresses a want, need, or idea for a \
+                          new capability (\"I need X\", \"build me Y\", \"idea: Z\"), capture it \
+                          with life.observe as a GrowthHypothesis node — id `idea:<slug>`, \
+                          claim_summary in one or two sentences preserving the operator's words, \
+                          properties idea_kind=implementation, target=philotic-stack, \
+                          idea_status=captured. Batch with life.observe.batch when several ideas \
+                          arrive at once. Echo back the captured summary and id, ask at most ONE \
+                          clarifying question — capture first, refine later. Never silently drop \
+                          an idea. On \"what ideas are pending?\", answer from life.recall over \
+                          the idea nodes."
                 .into(),
             implied_tools: vec![
                 "life.observe".into(),
