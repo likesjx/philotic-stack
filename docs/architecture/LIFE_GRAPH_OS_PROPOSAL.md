@@ -125,7 +125,7 @@ Follow the `handle_observe` method (line ~108) as the pattern for every handler 
 - Parse `LifeResolveInput` from `task.parameters`.
 - Call `runner.plan(...)`. Check `plan.allowed()`.
 - Step 1 of the plan: `life.conflict.resolve` → run `MERGE (n:{label} {id: $id}) ON MATCH SET n.validation_state = 'proposed', n.adjudication_status = 'resolved'` for each `graph_fact_ref` in the handoff.
-- Step 2 (if present in plan): `memory.true_up` / `memory.contradiction_review` / etc. → call Muninn MCP tool `muninn_evolve` or `muninn_decide` with the `conflict_id` and `resolution_summary` as payload. Use the existing Muninn MCP client pattern from the codebase.
+- Step 2 (if present in plan): `memory.true_up` / `memory.contradiction_review` / etc. → call Muninn MCP tool `muninn_evolve` or `muninn_decide` with the `conflict_id` and `resolution_summary` as payload. Use the existing Muninn REST client (`crates/memory-core/src/rest_client.rs`) — the stack has no Rust MCP client today (see `MCP_CLIENT_FABRIC_PROPOSAL.md`); the same operations exist as MCP tools only for external callers.
 - Return `{ status: "resolved", handoff_id, conflict_id, muninn_step: <step action or "none"> }`.
 
 ### 3. `life.patch.propose` — `handle_patch_propose`
