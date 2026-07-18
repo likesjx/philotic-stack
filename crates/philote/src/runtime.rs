@@ -3995,12 +3995,40 @@ impl AgentRuntime {
             oracle_agreement: None,
         };
 
+        // Bound once so the routing resolution below and the shadow-mode
+        // capability guard can never drift apart.
+        let capability = "text.generate";
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            capability,
             DEFAULT_TEXT_MODEL_ROLE,
         );
         model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
+
+        // Shadow-mode (PHILOTIC_SHADOW_ORACLE, default OFF): log-only oracle-vs-
+        // ladder annotation on the TRANSCRIPTION-REENTRY dispatch (Model Oracle
+        // Primary Authority, slice 3).
+        //
+        // This is the cognitive leg of a voice-originated turn. The preceding
+        // `voice.transcribe` leg was dispatched by `handle_user_message`, whose
+        // slice-2 hook excludes it via the same `shadow_eligible_capability`
+        // guard; this function then emits its OWN `EmitTask` rather than
+        // re-entering `handle_user_message` or the two instrumented `turn_loop`
+        // sites — so without this hook a healthy voice turn logged ZERO shadow
+        // rows for the leg that actually rides the text fallback ladder.
+        //
+        // Unlike the slice-2 site this dispatch is unconditionally cognitive
+        // (`request_class` is hardcoded "cognitive"), so the guard is trivially
+        // true here; it is applied for uniformity and to stay correct if this
+        // site ever starts multiplexing aux capabilities. `shadow_oracle_pick`
+        // is itself flag-gated — its first statement returns (None, None)
+        // before any ipc_client access — so the OFF path performs no oracle IPC.
+        // Never alters the dispatch target (target_node/role/guest_id unchanged).
+        if shadow_eligible_capability(capability) {
+            let (shadow_pick, shadow_agreement) = self.shadow_oracle_pick(&target_role).await;
+            model_req.oracle_pick = shadow_pick;
+            model_req.oracle_agreement = shadow_agreement;
+        }
 
         info!(
             "Session [{}] re-entering normal reasoning after voice transcription",
@@ -12216,6 +12244,373 @@ mod tests {
             .expect("turn started");
         assert_eq!(turn.selection_source, SelectionSource::CronPrimary);
 
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // ── Model Oracle Primary Authority, slice 3 ─────────────────────────────
+    //
+    // Wiring proof for the TRANSCRIPTION-REENTRY shadow hook. A pure predicate
+    // test would pass even if the hook were absent, so this drives both legs of
+    // a real voice turn over a stub hotel and asserts on the emitted envelopes.
+
+    /// Serializes tests that mutate PHILOTIC_SHADOW_ORACLE, since env vars are
+    /// process-global and tests run concurrently.
+    static SHADOW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn shadow_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        SHADOW_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Stub hotel that records every EmitTask envelope and answers the shadow
+    /// oracle's `QueryModelRoute` with a fixed ranking topped by
+    /// `model.anthropic` — deliberately DIFFERENT from the text ladder's
+    /// default role, so an `agreement: false` annotation is unambiguous
+    /// evidence that the shadow path actually executed (rather than a field
+    /// that happened to match).
+    async fn run_shadow_oracle_hotel(
+        listener: tokio::net::UnixListener,
+        emitted: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        loop {
+            let buf = match async {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await?;
+                Ok::<_, std::io::Error>(buf)
+            }
+            .await
+            {
+                Ok(b) => b,
+                Err(_) => return, // client disconnected
+            };
+
+            let req: philotic_client::IpcRequest =
+                serde_json::from_slice(&buf).expect("decode request");
+            let reply = match &req {
+                philotic_client::IpcRequest::GetConfig { key } => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::ConfigData {
+                        key: key.clone(),
+                        value_json: None,
+                    })
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::QueryModelRoute {
+                    exclude_providers, ..
+                } => {
+                    // Shadow queries must use an EMPTY exclude list so the hotel
+                    // stays on its read-only path (no heal-queue reroute write).
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "query_model_route": { "exclude_providers": exclude_providers },
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success(
+                        "ok",
+                        Some(serde_json::json!({
+                            "ranked": [
+                                { "role": "model.anthropic", "provider": "anthropic", "score": 0.9 },
+                                { "role": "model", "provider": "gemini", "score": 0.5 }
+                            ]
+                        })),
+                    ))
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::EmitTask {
+                    target_node,
+                    target_role,
+                    target_guest_id,
+                    task_json,
+                } => {
+                    let task: serde_json::Value =
+                        serde_json::from_str(task_json).unwrap_or(serde_json::Value::Null);
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "target_node": target_node,
+                        "target_role": target_role,
+                        "target_guest_id": target_guest_id,
+                        "task": task,
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+                _ => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+            };
+
+            let len = u32::try_from(reply.len()).expect("frame length fits u32");
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .expect("write header");
+            stream.write_all(&reply).await.expect("write payload");
+        }
+    }
+
+    async fn shadow_test_runtime(
+        tag: &str,
+    ) -> (
+        AgentRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        String,
+    ) {
+        let socket_path = format!("/tmp/philote-{}-{}.sock", tag, Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_shadow_oracle_hotel(listener, emitted.clone()));
+        let identity = philotic_client::GuestIdentity {
+            guest_id: format!("agent-{tag}"),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let runtime = AgentRuntime::new(client, format!("agent-{tag}"));
+        (runtime, emitted, server, socket_path)
+    }
+
+    /// A blob-backed voice attachment, the shape `media_analysis_attachments`
+    /// accepts and `resolve_media_routing` routes to `voice.transcribe`.
+    fn voice_attachment() -> TransportAttachment {
+        TransportAttachment {
+            kind: "voice".into(),
+            file_id: "voice-1".into(),
+            mime_type: Some("audio/ogg".into()),
+            blob_id: Some("sha256-voice".into()),
+            blob_download_url: Some("http://127.0.0.1:9001/download/sha256-voice".into()),
+            transport_error: None,
+            ..Default::default()
+        }
+    }
+
+    /// Drives BOTH legs of a voice-originated turn with the shadow flag ON:
+    ///
+    ///   leg 1 — `handle_user_message` dispatches `voice.transcribe` (aux).
+    ///   leg 2 — the transcript comes back and `reenter_turn_after_transcription`
+    ///           dispatches the cognitive `generate_text` follow-on.
+    ///
+    /// Asserts leg 1 carries NO shadow fields (the slice-2 capability guard
+    /// excludes aux transforms) and leg 2 DOES (the slice-3 hook). Because both
+    /// legs run in the same process under the same flag, this proves the guard
+    /// discriminates rather than the flag simply being off — and it fails if
+    /// the slice-3 hook is removed.
+    #[tokio::test]
+    async fn transcription_reentry_records_shadow_fields_while_transcribe_leg_does_not() {
+        let _guard = shadow_env_guard();
+        unsafe {
+            std::env::set_var("PHILOTIC_SHADOW_ORACLE", "1");
+        }
+
+        let (mut runtime, emitted, server, socket_path) = shadow_test_runtime("shadow3").await;
+        let session_id = "sess-shadow3";
+        let turn_id = "turn-shadow3";
+
+        let result = async {
+            runtime
+                .ensure_session_loaded(session_id, "telegram")
+                .await?;
+
+            // Route voice attachments to transcription (the path that arms
+            // awaiting_transcription_reentry).
+            {
+                let state = runtime.sessions.get_mut(session_id).expect("session");
+                state
+                    .agent_profile
+                    .media_routing_policy
+                    .forward_media_to_model = true;
+                state.agent_profile.media_routing_policy.voice_action = Some("transcribe".into());
+            }
+
+            // ── Leg 1: the voice.transcribe dispatch ──
+            runtime
+                .handle_user_message(
+                    InboundTaskPayload {
+                        source: Some("telegram".into()),
+                        transport: Some("telegram".into()),
+                        session_id: Some(session_id.into()),
+                        turn_id: Some(turn_id.into()),
+                        chat_id: Some("123".into()),
+                        message_kind: Some("voice".into()),
+                        content: Some("voice message".into()),
+                        attachments: vec![voice_attachment()],
+                        ..Default::default()
+                    },
+                    Uuid::new_v4(),
+                )
+                .await?;
+
+            // ── Leg 2: transcript returns → cognitive re-entry ──
+            runtime
+                .handle_model_response(respond_payload(
+                    session_id,
+                    turn_id,
+                    "what is the weather tomorrow",
+                ))
+                .await
+        }
+        .await;
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_SHADOW_ORACLE");
+        }
+        result.expect("both legs dispatch");
+
+        let emitted = emitted.lock().unwrap();
+
+        // Leg 1 must be an aux voice.transcribe task with NO shadow annotation.
+        let transcribe: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "transcribe" || e["task"]["kind"] == "voice.transcribe"
+            })
+            .collect();
+        assert_eq!(
+            transcribe.len(),
+            1,
+            "exactly one voice.transcribe dispatch: {:#?}",
+            *emitted
+        );
+        assert!(
+            transcribe[0]["task"]["oracle_pick"].is_null(),
+            "aux voice.transcribe leg must carry NO oracle_pick even with the flag ON: {:#?}",
+            transcribe[0]
+        );
+        assert!(
+            transcribe[0]["task"]["oracle_agreement"].is_null(),
+            "aux voice.transcribe leg must carry NO oracle_agreement: {:#?}",
+            transcribe[0]
+        );
+
+        // Leg 2 — the transcription re-entry — is the cognitive dispatch and
+        // MUST carry the shadow annotation. This assertion is what fails if the
+        // slice-3 hook is missing.
+        let cognitive: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "generate_text" && e["task"]["request_class"] == "cognitive"
+            })
+            .collect();
+        assert_eq!(
+            cognitive.len(),
+            1,
+            "exactly one cognitive re-entry dispatch: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            cognitive[0]["task"]["oracle_pick"], "model.anthropic:anthropic",
+            "re-entry must record the oracle's top pick: {:#?}",
+            cognitive[0]
+        );
+        assert_eq!(
+            cognitive[0]["task"]["oracle_agreement"], false,
+            "oracle ranked model.anthropic but the ladder resolved its default \
+             role — divergence must be recorded as agreement=false: {:#?}",
+            cognitive[0]
+        );
+
+        // Routing is UNCHANGED: the re-entry still goes to the ladder's role,
+        // never the oracle's pick. This is the log-only invariant.
+        assert_ne!(
+            cognitive[0]["target_role"], "model.anthropic",
+            "shadow mode must NEVER redirect the dispatch to the oracle pick: {:#?}",
+            cognitive[0]
+        );
+
+        // The shadow query must use an empty exclude list (read-only path).
+        let queries: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.get("query_model_route").is_some())
+            .collect();
+        assert_eq!(
+            queries.len(),
+            1,
+            "exactly one shadow oracle query — the aux leg must not query: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            queries[0]["query_model_route"]["exclude_providers"],
+            serde_json::json!([]),
+            "shadow query must keep the hotel on its read-only path"
+        );
+
+        drop(emitted);
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// OFF path (the default): the same re-entry emits NO shadow fields and
+    /// issues NO oracle query at all.
+    #[tokio::test]
+    async fn transcription_reentry_records_nothing_when_shadow_flag_is_off() {
+        let _guard = shadow_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_SHADOW_ORACLE");
+        }
+
+        let (mut runtime, emitted, server, socket_path) = shadow_test_runtime("shadow3off").await;
+        let session_id = "sess-shadow3off";
+        let turn_id = "turn-shadow3off";
+
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state
+                .agent_profile
+                .media_routing_policy
+                .forward_media_to_model = true;
+            state.agent_profile.media_routing_policy.voice_action = Some("transcribe".into());
+        }
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    source: Some("telegram".into()),
+                    transport: Some("telegram".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some(turn_id.into()),
+                    chat_id: Some("123".into()),
+                    message_kind: Some("voice".into()),
+                    content: Some("voice message".into()),
+                    attachments: vec![voice_attachment()],
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("transcribe leg");
+        runtime
+            .handle_model_response(respond_payload(session_id, turn_id, "hello there"))
+            .await
+            .expect("re-entry leg");
+
+        let emitted = emitted.lock().unwrap();
+        let cognitive: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "generate_text" && e["task"]["request_class"] == "cognitive"
+            })
+            .collect();
+        assert_eq!(cognitive.len(), 1, "one re-entry dispatch: {:#?}", *emitted);
+        assert!(
+            cognitive[0]["task"]["oracle_pick"].is_null()
+                && cognitive[0]["task"]["oracle_agreement"].is_null(),
+            "flag OFF must leave the re-entry unannotated: {:#?}",
+            cognitive[0]
+        );
+        assert!(
+            !emitted.iter().any(|e| e.get("query_model_route").is_some()),
+            "flag OFF must issue ZERO oracle IPC: {:#?}",
+            *emitted
+        );
+
+        drop(emitted);
         drop(runtime);
         let _ = server.await;
         let _ = std::fs::remove_file(&socket_path);
