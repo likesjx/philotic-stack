@@ -13,11 +13,41 @@
 //!   safe — a restart resets the budget, not a security bypass).
 
 use ansible_mesh_core::mcp_route::{McpAuthScheme, McpCallAllotment, McpTokenGrant};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+// ── Auth failure classification ───────────────────────────────────────────────
+
+/// Why an authorization attempt failed. Each class maps to a distinct MCP
+/// error code at the dispatch layer. Messages contain no secret material and
+/// are safe to include in JSON-RPC error responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthError {
+    /// No credential presented where one is required.
+    Missing(String),
+    /// A credential was presented but matched no grant.
+    Invalid(String),
+    /// The credential matched a grant whose expiry has passed.
+    Expired(String),
+    /// The credential is valid but its call allotment is exhausted.
+    Allotment(String),
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthError::Missing(m)
+            | AuthError::Invalid(m)
+            | AuthError::Expired(m)
+            | AuthError::Allotment(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
 
 // ── Caller identity (post-auth) ───────────────────────────────────────────────
 
@@ -120,7 +150,7 @@ impl AllotmentTracker {
         tool_name: &str,
         token_id: &str,
         allotment: &McpCallAllotment,
-    ) -> Result<()> {
+    ) -> Result<(), AuthError> {
         let key = (tool_name.to_string(), token_id.to_string());
         let window_duration = Duration::from_secs(allotment.window_secs);
 
@@ -136,14 +166,10 @@ impl AllotmentTracker {
         }
 
         if entry.count >= allotment.max_per_window {
-            bail!(
+            return Err(AuthError::Allotment(format!(
                 "call allotment exhausted for token '{}' on '{}': {}/{} per {}s window",
-                token_id,
-                tool_name,
-                entry.count,
-                allotment.max_per_window,
-                allotment.window_secs,
-            );
+                token_id, tool_name, entry.count, allotment.max_per_window, allotment.window_secs,
+            )));
         }
 
         entry.count += 1;
@@ -155,16 +181,16 @@ impl AllotmentTracker {
 
 /// Resolves a vault_ref to BLAKE3 hash bytes.
 ///
-/// In Slice 1 this is a sync interface backed by a cache. Slice 2 wires this
-/// to `IpcRequest::GetSecret` so the vault lookup goes through the hotel.
+/// Backed by `IpcRequest::GetSecret` in production so the vault lookup goes
+/// through the hotel; tests substitute a static map.
 pub trait VaultResolver: Send + Sync {
     fn resolve(&self, vault_ref: &str) -> Result<[u8; 32]>;
 }
 
 /// Check a presented bearer token against a route's auth scheme.
 ///
-/// Returns the `CallerIdentity` on success, or an error describing the failure.
-/// The error message is safe to include in a JSON-RPC error response (no secrets).
+/// Returns the `CallerIdentity` on success, or a classified [`AuthError`].
+/// Error messages are safe to include in a JSON-RPC error response (no secrets).
 pub fn check_bearer_token(
     tool_name: &str,
     presented_token: &str,
@@ -172,7 +198,7 @@ pub fn check_bearer_token(
     vault_cache: &VaultHashCache,
     vault: &dyn VaultResolver,
     allotment: &AllotmentTracker,
-) -> Result<CallerIdentity> {
+) -> Result<CallerIdentity, AuthError> {
     let grant = matching_bearer_grant(tool_name, presented_token, grants, vault_cache, vault)?;
 
     // Token matched — check allotment.
@@ -194,7 +220,7 @@ pub fn verify_bearer_token(
     grants: &[McpTokenGrant],
     vault_cache: &VaultHashCache,
     vault: &dyn VaultResolver,
-) -> Result<CallerIdentity> {
+) -> Result<CallerIdentity, AuthError> {
     matching_bearer_grant(tool_name, presented_token, grants, vault_cache, vault)
         .map(caller_identity)
 }
@@ -205,7 +231,7 @@ fn matching_bearer_grant<'a>(
     grants: &'a [McpTokenGrant],
     vault_cache: &VaultHashCache,
     vault: &dyn VaultResolver,
-) -> Result<&'a McpTokenGrant> {
+) -> Result<&'a McpTokenGrant, AuthError> {
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -214,15 +240,11 @@ fn matching_bearer_grant<'a>(
     // BLAKE3 hash of the presented token.
     let presented_hash = blake3::hash(presented_token.as_bytes());
 
-    for grant in grants {
-        // Check expiry before touching vault.
-        if let Some(exp) = grant.expires_at {
-            if now_epoch > exp {
-                warn!(token_id = %grant.token_id, "token expired, skipping");
-                continue;
-            }
-        }
+    // Expiry is checked AFTER the hash match so a caller presenting a real but
+    // expired credential gets TOKEN_EXPIRED, not a generic mismatch.
+    let mut matched_expired = false;
 
+    for grant in grants {
         // Fetch hash from cache or vault.
         let stored_bytes = if let Some(bytes) = vault_cache.get(&grant.vault_ref) {
             bytes
@@ -246,13 +268,28 @@ fn matching_bearer_grant<'a>(
             continue;
         }
 
+        if let Some(exp) = grant.expires_at {
+            if now_epoch > exp {
+                warn!(token_id = %grant.token_id, "presented token matches an expired grant");
+                matched_expired = true;
+                continue;
+            }
+        }
+
         return Ok(grant);
     }
 
-    bail!(
-        "no matching token grant for presented credential on tool '{}'",
-        tool_name
-    )
+    if matched_expired {
+        Err(AuthError::Expired(format!(
+            "token grant for tool '{}' has expired",
+            tool_name
+        )))
+    } else {
+        Err(AuthError::Invalid(format!(
+            "no matching token grant for presented credential on tool '{}'",
+            tool_name
+        )))
+    }
 }
 
 fn caller_identity(grant: &McpTokenGrant) -> CallerIdentity {
@@ -271,9 +308,11 @@ pub fn extract_bearer(authorization_header: Option<&str>) -> Option<&str> {
 /// Check auth for a route whose scheme is `McpAuthScheme::None`.
 ///
 /// Only permitted when the request comes from a loopback address.
-pub fn check_none_auth(is_loopback: bool) -> Result<CallerIdentity> {
+pub fn check_none_auth(is_loopback: bool) -> Result<CallerIdentity, AuthError> {
     if !is_loopback {
-        bail!("route has no auth scheme but request is not from loopback");
+        return Err(AuthError::Missing(
+            "route has no auth scheme but request is not from loopback".into(),
+        ));
     }
     Ok(CallerIdentity {
         token_id: "loopback".into(),
@@ -290,11 +329,12 @@ pub fn authorize_call(
     vault_cache: &VaultHashCache,
     vault: &dyn VaultResolver,
     allotment: &AllotmentTracker,
-) -> Result<CallerIdentity> {
+) -> Result<CallerIdentity, AuthError> {
     match auth_scheme {
         McpAuthScheme::BearerToken { grants } => {
-            let token = extract_bearer(authorization_header)
-                .ok_or_else(|| anyhow::anyhow!("missing Authorization: Bearer header"))?;
+            let token = extract_bearer(authorization_header).ok_or_else(|| {
+                AuthError::Missing("missing Authorization: Bearer header".into())
+            })?;
             check_bearer_token(tool_name, token, grants, vault_cache, vault, allotment)
         }
         McpAuthScheme::None => check_none_auth(is_loopback),

@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::{
-    AllotmentTracker, VaultHashCache, VaultResolver, authorize_call, extract_bearer,
+    AllotmentTracker, AuthError, VaultHashCache, VaultResolver, authorize_call, extract_bearer,
     verify_bearer_token,
 };
 use crate::protocol::{
@@ -34,6 +34,22 @@ use ansible_mesh_core::mcp_route::McpAuthScheme;
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Approval-required routes park the HTTP connection for up to 5 minutes.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Protocol versions this server can speak. The client's requested version is
+/// echoed when supported; otherwise the newest supported version is advertised.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", "2024-11-05"];
+
+// ── Dispatch outcome ──────────────────────────────────────────────────────────
+
+/// Terminal result of one dispatched tool call, delivered through the pending
+/// oneshot. `Err` carries a philote business error and surfaces to the MCP
+/// client as a successful JSON-RPC response whose result has `isError: true`,
+/// per the MCP tool-error convention.
+#[derive(Debug)]
+pub enum DispatchOutcome {
+    Ok(String),
+    Err(String),
+}
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -55,7 +71,13 @@ pub struct MembraneState {
     /// Channel into the runtime's IPC dispatch loop.
     pub inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// Pending tool-call responses keyed by turn_id.
-    pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<DispatchOutcome>>>>,
+    /// Accumulated streaming tokens keyed by turn_id, folded into the final
+    /// result when the terminal reply carries no content of its own.
+    pub streaming_buffers: Arc<Mutex<HashMap<String, String>>>,
+    /// True when running without an IPC socket: `tools/call` cannot dispatch
+    /// and fails immediately instead of timing out.
+    pub static_mode: bool,
     /// Current exposure tier for this listener — drives the ingress fence gate.
     /// Updated via `update_perimeter` push from the hotel when the perimeter shifts.
     pub ingress_tier: Arc<std::sync::RwLock<ExposureTier>>,
@@ -186,7 +208,12 @@ async fn handle_mcp(
 
     match req.method.as_str() {
         // Notifications — JSON-RPC spec: MUST NOT send a response.
-        "initialized" | "notifications/cancelled" | "notifications/progress" => {
+        // "notifications/initialized" is the spec name; bare "initialized" is
+        // kept for clients that predate the namespaced form.
+        "notifications/initialized"
+        | "initialized"
+        | "notifications/cancelled"
+        | "notifications/progress" => {
             return (StatusCode::ACCEPTED, "").into_response();
         }
         _ => {}
@@ -212,12 +239,21 @@ async fn handle_mcp(
 
 fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
     // Params are optional — tolerate clients that omit them entirely.
-    let _params: Option<InitializeParams> = params.and_then(|p| serde_json::from_value(p).ok());
+    let params: Option<InitializeParams> = params.and_then(|p| serde_json::from_value(p).ok());
+
+    // Version negotiation: echo the client's requested version when we speak
+    // it; otherwise advertise our newest supported version.
+    let protocol_version = params
+        .as_ref()
+        .map(|p| p.protocol_version.as_str())
+        .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
+        .to_string();
 
     JsonRpcResponse::ok(
         id,
         serde_json::to_value(InitializeResult {
-            protocol_version: "2024-11-05".into(),
+            protocol_version,
             server_info: ServerInfo {
                 name: "philotic-membrane-mcp".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -289,6 +325,64 @@ async fn handle_tools_list(
     JsonRpcResponse::ok(id, serde_json::to_value(ToolsListResult { tools }).unwrap())
 }
 
+/// Map a classified auth failure to its MCP error code.
+fn auth_error_code(e: &AuthError) -> i32 {
+    match e {
+        AuthError::Missing(_) | AuthError::Invalid(_) => error_code::PERMISSION_DENIED,
+        AuthError::Expired(_) => error_code::TOKEN_EXPIRED,
+        AuthError::Allotment(_) => error_code::ALLOTMENT_EXCEEDED,
+    }
+}
+
+/// Await a dispatched call's terminal outcome and map it onto the MCP result
+/// shape: business errors become `isError: true` results, approval-window
+/// timeouts become `APPROVAL_REQUIRED`, transport failures stay JSON-RPC errors.
+async fn await_dispatch_outcome(
+    state: &SharedState,
+    id: Value,
+    tool_name: &str,
+    turn_id: &str,
+    timeout: Duration,
+    requires_approval: bool,
+    rx: oneshot::Receiver<DispatchOutcome>,
+    transform_ok: impl FnOnce(&str) -> Value,
+) -> JsonRpcResponse {
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(DispatchOutcome::Ok(content))) => JsonRpcResponse::ok(
+            id,
+            serde_json::to_value(ToolCallResult::json(transform_ok(&content))).unwrap(),
+        ),
+        Ok(Ok(DispatchOutcome::Err(message))) => JsonRpcResponse::ok(
+            id,
+            serde_json::to_value(ToolCallResult::error(message)).unwrap(),
+        ),
+        Ok(Err(_)) => {
+            warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
+            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
+        }
+        Err(_) => {
+            {
+                let mut pending = state.pending_responses.lock().await;
+                pending.remove(turn_id);
+            }
+            {
+                let mut buffers = state.streaming_buffers.lock().await;
+                buffers.remove(turn_id);
+            }
+            warn!(tool = tool_name, %turn_id, requires_approval, "dispatch timed out");
+            if requires_approval {
+                JsonRpcResponse::err(
+                    id,
+                    error_code::APPROVAL_REQUIRED,
+                    "operator approval was not granted within the approval window",
+                )
+            } else {
+                JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "tool call timed out")
+            }
+        }
+    }
+}
+
 async fn handle_tools_call(
     state: &SharedState,
     id: Value,
@@ -306,6 +400,16 @@ async fn handle_tools_call(
             );
         }
     };
+
+    // Static-only mode has no IPC dispatch path — fail immediately and
+    // honestly instead of parking the caller into a 30s timeout.
+    if state.static_mode {
+        return JsonRpcResponse::err(
+            id,
+            error_code::DISPATCH_ERROR,
+            "this membrane runs in static-only mode (no IPC socket); tools/call cannot dispatch",
+        );
+    }
 
     let tool_name = &params.name;
     let args = params.arguments.unwrap_or(json!({}));
@@ -340,7 +444,7 @@ async fn handle_tools_call(
             Ok(c) => c,
             Err(e) => {
                 warn!(tool = tool_name, err = %e, "config-driven auth rejected");
-                return JsonRpcResponse::err(id, error_code::PERMISSION_DENIED, e.to_string());
+                return JsonRpcResponse::err(id, auth_error_code(&e), e.to_string());
             }
         };
 
@@ -413,7 +517,7 @@ async fn handle_tools_call(
             extra: serde_json::Map::new(),
         };
 
-        let (tx, rx) = oneshot::channel::<String>();
+        let (tx, rx) = oneshot::channel::<DispatchOutcome>();
         {
             let mut pending = state.pending_responses.lock().await;
             pending.insert(turn_id.clone(), tx);
@@ -426,27 +530,20 @@ async fn handle_tools_call(
             return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
         }
 
-        return match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(content)) => {
-                let transformed = transform::apply_outbound(&tool_spec, &content);
-                let result_value =
-                    serde_json::from_str(&transformed).unwrap_or(json!({ "text": transformed }));
-                JsonRpcResponse::ok(
-                    id,
-                    serde_json::to_value(ToolCallResult::json(result_value)).unwrap(),
-                )
-            }
-            Ok(Err(_)) => {
-                warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
-                JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
-            }
-            Err(_) => {
-                let mut pending = state.pending_responses.lock().await;
-                pending.remove(&turn_id);
-                warn!(tool = tool_name, %turn_id, "dispatch timed out");
-                JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "tool call timed out")
-            }
-        };
+        return await_dispatch_outcome(
+            state,
+            id,
+            tool_name,
+            &turn_id,
+            timeout,
+            requires_approval,
+            rx,
+            |content| {
+                let transformed = transform::apply_outbound(&tool_spec, content);
+                serde_json::from_str(&transformed).unwrap_or(json!({ "text": transformed }))
+            },
+        )
+        .await;
     }
     drop(endpoint);
 
@@ -476,7 +573,7 @@ async fn handle_tools_call(
         Ok(c) => c,
         Err(e) => {
             warn!(tool = tool_name, err = %e, "auth rejected");
-            return JsonRpcResponse::err(id, error_code::PERMISSION_DENIED, e.to_string());
+            return JsonRpcResponse::err(id, auth_error_code(&e), e.to_string());
         }
     };
 
@@ -539,7 +636,7 @@ async fn handle_tools_call(
         extra: serde_json::Map::new(),
     };
 
-    let (tx, rx) = oneshot::channel::<String>();
+    let (tx, rx) = oneshot::channel::<DispatchOutcome>();
     {
         let mut pending = state.pending_responses.lock().await;
         pending.insert(turn_id.clone(), tx);
@@ -552,23 +649,15 @@ async fn handle_tools_call(
         return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
     }
 
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(content)) => JsonRpcResponse::ok(
-            id,
-            serde_json::to_value(ToolCallResult::json(
-                serde_json::from_str(&content).unwrap_or(json!({ "text": content })),
-            ))
-            .unwrap(),
-        ),
-        Ok(Err(_)) => {
-            warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
-            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
-        }
-        Err(_) => {
-            let mut pending = state.pending_responses.lock().await;
-            pending.remove(&turn_id);
-            warn!(tool = tool_name, %turn_id, "dispatch timed out");
-            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "tool call timed out")
-        }
-    }
+    await_dispatch_outcome(
+        state,
+        id,
+        tool_name,
+        &turn_id,
+        timeout,
+        requires_approval,
+        rx,
+        |content| serde_json::from_str(content).unwrap_or(json!({ "text": content })),
+    )
+    .await
 }

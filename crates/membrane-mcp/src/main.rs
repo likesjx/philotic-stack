@@ -341,8 +341,12 @@ impl MembraneGuest for McpMembrane {
                 );
                 return Ok(());
             }
-            OutboundReply::StreamingToken { .. } => {
-                // Streaming accumulation over MCP is not yet implemented.
+            OutboundReply::StreamingToken { token, .. } => {
+                // Accumulate streamed tokens so a terminal reply that carries no
+                // content of its own still yields the streamed text. True
+                // streaming over SSE is deferred; silent drop is not acceptable.
+                let mut buffers = self.state.streaming_buffers.lock().await;
+                buffers.entry(turn_id).or_default().push_str(token);
                 return Ok(());
             }
             _ => {}
@@ -352,13 +356,22 @@ impl MembraneGuest for McpMembrane {
             let mut pending = self.state.pending_responses.lock().await;
             pending.remove(&turn_id)
         };
+        let streamed = {
+            let mut buffers = self.state.streaming_buffers.lock().await;
+            buffers.remove(&turn_id)
+        };
 
         match (reply, sender) {
             (OutboundReply::Text { content, .. }, Some(tx)) => {
-                let _ = tx.send(content);
+                let content = if content.trim().is_empty() {
+                    streamed.unwrap_or(content)
+                } else {
+                    content
+                };
+                let _ = tx.send(server::DispatchOutcome::Ok(content));
             }
             (OutboundReply::Error { message, .. }, Some(tx)) => {
-                let _ = tx.send(serde_json::json!({ "error": message }).to_string());
+                let _ = tx.send(server::DispatchOutcome::Err(message));
             }
             (_, None) => {
                 warn!(turn_id, "deliver: no pending receiver for turn");
@@ -411,11 +424,19 @@ impl MembraneGuest for McpMembrane {
                     return Ok(false);
                 };
 
-                let content = if let Some(result) = payload.get("result") {
-                    serde_json::to_string(result)
-                        .unwrap_or_else(|_| serde_json::json!({ "result": result }).to_string())
+                let outcome = if let Some(result) = payload.get("result") {
+                    server::DispatchOutcome::Ok(
+                        serde_json::to_string(result).unwrap_or_else(|_| {
+                            serde_json::json!({ "result": result }).to_string()
+                        }),
+                    )
                 } else if let Some(error) = payload.get("error") {
-                    serde_json::json!({ "error": error }).to_string()
+                    server::DispatchOutcome::Err(
+                        error
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| error.to_string()),
+                    )
                 } else {
                     warn!(turn_id, "datasource_response push missing result/error");
                     return Ok(false);
@@ -427,7 +448,7 @@ impl MembraneGuest for McpMembrane {
                 };
 
                 if let Some(tx) = sender {
-                    let _ = tx.send(content);
+                    let _ = tx.send(outcome);
                 } else {
                     warn!(turn_id, "datasource_response: no pending receiver for turn");
                 }
@@ -600,6 +621,8 @@ async fn main() -> Result<()> {
         guest_id: args.guest_id.clone(),
         inbound_tx,
         pending_responses,
+        streaming_buffers: Arc::new(Mutex::new(HashMap::new())),
+        static_mode: args.ipc_socket.is_none(),
         ingress_tier,
         declared_exposure,
     });
