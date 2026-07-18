@@ -1506,6 +1506,13 @@ pub struct AgentProfile {
     /// (the default) is equivalent to `"standard"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_policy: Option<String>,
+    /// Opt-in gate for startup MCP route auto-publication. When `false` (the
+    /// default) the philote publishes NO routes derived from its toolset at
+    /// startup — only operator-stored route overrides or explicit
+    /// `mcp.provision` endpoints expose anything over MCP. When `true`, the
+    /// derived routes are published with `require_approval` forced on.
+    #[serde(default)]
+    pub mcp_auto_publish: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

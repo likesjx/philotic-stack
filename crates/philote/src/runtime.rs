@@ -2146,20 +2146,15 @@ impl AgentRuntime {
         }
     }
 
-    /// Build `McpRouteRecord`s from the agent's effective toolset.
+    /// Fetch operator-stored MCP route overrides (key `__mcp_routes__:<agent_id>`).
     ///
-    /// Operator-stored overrides (key `__mcp_routes__:<agent_id>`) take precedence.
-    /// When no overrides are stored, every tool in `default_toolset` that has a real
-    /// catalog entry is projected as a self-targeting `Philote` route. Tools with no
-    /// catalog entry are skipped — they are model-internal only.
-    async fn mcp_routes_from_profile(
+    /// These represent an explicit operator provisioning decision, so they publish
+    /// regardless of the `mcp_auto_publish` gate.
+    async fn operator_mcp_route_overrides(
         &mut self,
-    ) -> Vec<ansible_mesh_core::mcp_route::McpRouteRecord> {
-        use ansible_mesh_core::mcp_route::{
-            McpAuthScheme, McpRouteRecord, McpRouteSecurity, McpRouteTarget,
-        };
+    ) -> Option<Vec<ansible_mesh_core::mcp_route::McpRouteRecord>> {
+        use ansible_mesh_core::mcp_route::McpRouteRecord;
 
-        // Operator override takes precedence.
         let key = format!("__mcp_routes__:{}", self.agent_id);
         let mcp_override = self
             .ipc_client
@@ -2177,7 +2172,7 @@ impl AgentRuntime {
             match serde_json::from_str::<Vec<McpRouteRecord>>(&json) {
                 Ok(r) if !r.is_empty() => {
                     info!(agent_id = %self.agent_id, count = r.len(), "Using operator-stored MCP route overrides.");
-                    return r;
+                    return Some(r);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -2185,8 +2180,21 @@ impl AgentRuntime {
                 }
             }
         }
+        None
+    }
 
-        // Derive from default_toolset — catalog entries only.
+    /// Build `McpRouteRecord`s from the agent's effective toolset.
+    ///
+    /// Every tool in `default_toolset` that has a real catalog entry is projected
+    /// as a self-targeting `Philote` route. Tools with no catalog entry are
+    /// skipped — they are model-internal only. All derived routes are published
+    /// with `require_approval` forced on: startup publication is a convenience,
+    /// not an authorization event.
+    fn derived_mcp_routes(&self) -> Vec<ansible_mesh_core::mcp_route::McpRouteRecord> {
+        use ansible_mesh_core::mcp_route::{
+            McpAuthScheme, McpRouteRecord, McpRouteSecurity, McpRouteTarget,
+        };
+
         let catalog = crate::catalog::tool_catalog();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2210,7 +2218,7 @@ impl AgentRuntime {
                     security: McpRouteSecurity {
                         auth: McpAuthScheme::None,
                         global_allotment: None,
-                        require_approval: crate::catalog::tool_requires_approval(tool_name),
+                        require_approval: true,
                     },
                     updated_at: now,
                 })
@@ -2218,16 +2226,60 @@ impl AgentRuntime {
             .collect()
     }
 
-    /// At startup, derive `McpRouteRecord`s from the agent profile and push them to
-    /// the hotel so the `membrane-mcp` guest advertises this philote's tools
-    /// immediately after restart. Operator-stored overrides take precedence over
-    /// the profile-derived set.
+    /// At startup, publish this philote's MCP routes to the hotel.
+    ///
+    /// Publication policy (MCP membrane hardening, S2):
+    /// - Operator-stored overrides always publish — they are an explicit decision.
+    /// - Toolset-derived routes publish only when the agent profile opts in via
+    ///   `mcp_auto_publish`; they carry `require_approval = true`.
+    /// - With the gate off, any previously auto-published route set is revoked
+    ///   so stale publications from earlier releases do not stay live.
     async fn register_mcp_routes(&mut self) {
-        let routes = self.mcp_routes_from_profile().await;
-        if routes.is_empty() {
+        if let Some(routes) = self.operator_mcp_route_overrides().await {
+            self.push_mcp_routes(routes).await;
+            return;
+        }
+
+        let derived = self.derived_mcp_routes();
+        if !self.default_agent_profile.mcp_auto_publish {
+            if !derived.is_empty() {
+                warn!(
+                    agent_id = %self.agent_id,
+                    suppressed = derived.len(),
+                    "MCP startup auto-publication is opt-in and OFF for this agent — \
+                     publishing nothing and revoking any previously auto-published routes. \
+                     Set `mcp_auto_publish: true` on the agent profile to re-enable."
+                );
+            }
+            // Fail-closed cleanup: remove any route set a previous release
+            // auto-published for this agent.
+            let result = self
+                .ipc_client
+                .send_request_with_timeout(
+                    IpcRequest::RevokeMcpRoutes {
+                        agent_id: self.agent_id.clone(),
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+            if let Err(e) = result {
+                if is_ipc_timeout(&e) {
+                    warn!(agent_id = %self.agent_id, "MCP route revoke timed out (startup race) — continuing");
+                } else {
+                    warn!(agent_id = %self.agent_id, err = %e, "Failed to revoke stale MCP routes");
+                }
+            }
+            return;
+        }
+
+        if derived.is_empty() {
             info!(agent_id = %self.agent_id, "No MCP routes to register (empty default_toolset or no catalog matches).");
             return;
         }
+        self.push_mcp_routes(derived).await;
+    }
+
+    async fn push_mcp_routes(&mut self, routes: Vec<ansible_mesh_core::mcp_route::McpRouteRecord>) {
         let count = routes.len();
         let result = self
             .ipc_client
