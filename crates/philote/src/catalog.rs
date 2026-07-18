@@ -371,7 +371,13 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
         "context.synthesize" => &["workspace.list", "workspace.read"],
         "agent.initiate" => &["agent.graph.write", "agent.graph.recall"],
         "profile.manage" => &["role.configure"],
-        "mcp.manage" => &["mcp.provision", "mcp.revoke"],
+        "mcp.manage" => &[
+            "mcp.provision",
+            "mcp.revoke",
+            "mcp.grant_token",
+            "mcp.rotate_token",
+            "mcp.revoke_token",
+        ],
         _ => &[],
     }
 }
@@ -2788,11 +2794,40 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         "path": { "type": "string" }
                                     },
                                     "required": ["kind"]
+                                },
+                                "auth": {
+                                    "type": "object",
+                                    "description": "Per-tool auth override. Usually {scheme:'bearer_token',grants:[]} \
+                                                    then mint credentials with mcp.grant_token. Omit to inherit \
+                                                    default_auth; {scheme:'none'} = loopback-only callers.",
+                                    "properties": {
+                                        "scheme": { "type": "string", "enum": ["bearer_token", "none"] },
+                                        "grants": { "type": "array", "items": { "type": "object" } }
+                                    },
+                                    "required": ["scheme"]
                                 }
                             },
                             "required": ["name", "description", "input_schema",
                                          "inbound_transform", "outbound_transform"]
                         }
+                    },
+                    "default_auth": {
+                        "type": "object",
+                        "description": "Endpoint-wide default auth for tools without their own 'auth'. \
+                                        Use {scheme:'bearer_token',grants:[]} and mint credentials with \
+                                        mcp.grant_token. Absent = none (loopback-only callers).",
+                        "properties": {
+                            "scheme": { "type": "string", "enum": ["bearer_token", "none"] },
+                            "grants": { "type": "array", "items": { "type": "object" } }
+                        },
+                        "required": ["scheme"]
+                    },
+                    "allow_unauthenticated": {
+                        "type": "boolean",
+                        "description": "Explicit acknowledgment that this endpoint intentionally serves \
+                                        unauthenticated tools beyond loopback. Without it, provisioning a \
+                                        lan/mesh/internet endpoint with any no-auth tool is REJECTED. \
+                                        Surfaced in the operator approval prompt."
                     },
                     "exposure": {
                         "type": "string",
@@ -2823,6 +2858,117 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["endpoint_id", "port", "tools"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.grant_token".into(),
+        ToolDefinition {
+            tool_name: "mcp.grant_token".into(),
+            description: "Mint a bearer-token credential for an MCP endpoint this agent owns. \
+                          The hotel generates the token, stores only its BLAKE3 hash in the \
+                          vault, attaches the grant to the named tool (or the endpoint's \
+                          default auth), and pushes the updated config to the membrane. The \
+                          raw token is returned ONCE in the tool result — relay it to the \
+                          operator immediately with a storage warning; it cannot be shown again."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The MCP endpoint to attach the grant to (must be owned by this agent)."
+                    },
+                    "token_id": {
+                        "type": "string",
+                        "description": "Stable opaque label for this credential (e.g. 'claude-desktop', 'n8n-prod')."
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Attach to this specific tool's auth. Omit to attach to the endpoint's default_auth (covers every tool without its own auth)."
+                    },
+                    "scopes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional capability scopes granted to this token."
+                    },
+                    "expires_at": {
+                        "type": "integer",
+                        "description": "Optional unix epoch expiry. Absent = no expiry."
+                    },
+                    "allotment": {
+                        "type": "object",
+                        "description": "Optional per-token call budget.",
+                        "properties": {
+                            "max_per_window": { "type": "integer" },
+                            "window_secs": { "type": "integer" }
+                        },
+                        "required": ["max_per_window", "window_secs"]
+                    }
+                },
+                "required": ["endpoint_id", "token_id"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.rotate_token".into(),
+        ToolDefinition {
+            tool_name: "mcp.rotate_token".into(),
+            description: "Rotate the credential behind an existing MCP token grant in place: \
+                          same token_id and grant scope, new secret. The old token stops \
+                          working (the membrane's vault cache may honor it for up to 60s). \
+                          The new raw token is returned ONCE — relay it to the operator \
+                          immediately."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The MCP endpoint holding the grant (must be owned by this agent)."
+                    },
+                    "token_id": {
+                        "type": "string",
+                        "description": "The existing grant label to rotate."
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Tool whose auth holds the grant. Omit if the grant lives on default_auth."
+                    }
+                },
+                "required": ["endpoint_id", "token_id"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.revoke_token".into(),
+        ToolDefinition {
+            tool_name: "mcp.revoke_token".into(),
+            description: "Revoke an MCP token grant by token_id. Removes the grant from every \
+                          tool auth and the endpoint default; callers holding the token lose \
+                          access (the membrane's vault cache may honor it for up to 60s). An \
+                          emptied bearer grant list stays bearer — it does not degrade to \
+                          unauthenticated."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The MCP endpoint holding the grant (must be owned by this agent)."
+                    },
+                    "token_id": {
+                        "type": "string",
+                        "description": "The grant label to revoke."
+                    }
+                },
+                "required": ["endpoint_id", "token_id"]
             }),
             class: Some("config".into()),
         },

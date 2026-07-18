@@ -28,6 +28,7 @@ axum = { version = "0.7", features = ["multipart", "ws"] }
 tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 reqwest = { version = "0.12", features = ["json", "stream", "cookies", "multipart"] }
 sha2 = "0.10"
+blake3 = "1"
 hex = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"

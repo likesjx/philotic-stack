@@ -170,6 +170,11 @@ impl McpEndpointTable {
         self.config.is_some()
     }
 
+    /// The full endpoint config, when one has been pushed.
+    pub fn config(&self) -> Option<&McpEndpointConfig> {
+        self.config.as_ref()
+    }
+
     /// All tool specs as MCP descriptors for `tools/list`.
     pub fn tool_descriptors(&self) -> Vec<McpToolDescriptor> {
         self.config.as_ref().map_or(vec![], |c| {

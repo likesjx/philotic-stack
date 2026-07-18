@@ -1690,6 +1690,47 @@ pub enum IpcRequest {
     GetMcpEndpointStatus {
         endpoint_id: String,
     },
+    /// Mint (or rotate) a bearer-token grant for an MCP endpoint.
+    ///
+    /// The hotel generates the token, stores `BLAKE3(token)` in the vault under
+    /// an `mcp_endpoint_token` secret readable by the `mcp-membrane` role,
+    /// attaches the grant to the named tool's auth (or the endpoint's
+    /// `default_auth` when `tool_name` is absent), and fans the updated config
+    /// out to the membrane guest. Responds with [`IpcResponse::Standard`]; the
+    /// raw token appears ONCE in `data.raw_token` and is never stored.
+    ///
+    /// Only the endpoint's `owner_agent_id` may call this; the hotel verifies
+    /// the claim against the registered guest identity on the connection.
+    ProvisionMcpTokenGrant {
+        endpoint_id: String,
+        owner_agent_id: String,
+        /// Stable opaque label for this credential (e.g. `"claude-desktop"`).
+        token_id: String,
+        /// Attach to this tool's auth; absent = endpoint `default_auth`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allotment: Option<ansible_mesh_core::mcp_route::McpCallAllotment>,
+        /// Rotate an existing grant in place (same `token_id`, same vault ref,
+        /// new credential) instead of creating a new grant.
+        #[serde(default)]
+        rotate: bool,
+    },
+    /// Remove a bearer-token grant from an MCP endpoint by `token_id`.
+    ///
+    /// Removes the grant from every tool auth and the endpoint `default_auth`.
+    /// An emptied `BearerToken` grant list stays `BearerToken` (nobody can
+    /// call) rather than degrading to `None` (loopback-open).
+    /// Responds with [`IpcResponse::Standard`].
+    RevokeMcpTokenGrant {
+        endpoint_id: String,
+        owner_agent_id: String,
+        token_id: String,
+    },
     // ── Training data admin IPC ───────────────────────────────────────────────
     /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
     ListTrainingSamples {

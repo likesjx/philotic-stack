@@ -240,17 +240,17 @@ async fn handle_tools_list(
 ) -> JsonRpcResponse {
     // Prefer config-driven endpoint table; fall back to legacy route table.
     let endpoint = state.endpoint_table.read().await;
-    let tools: Vec<McpToolDescriptor> = if endpoint.is_active() {
+    let tools: Vec<McpToolDescriptor> = if let Some(cfg) = endpoint.config() {
         let bearer = extract_bearer(auth_header);
-        endpoint.visible_tool_descriptors(|tool| {
-            let auth_scheme = tool.auth.as_ref().unwrap_or(&McpAuthScheme::None);
-            match auth_scheme {
+        cfg.tools
+            .iter()
+            .filter(|tool| match cfg.effective_auth(tool) {
                 McpAuthScheme::BearerToken { grants } => bearer
                     .and_then(|token| {
                         verify_bearer_token(
                             &tool.name,
                             token,
-                            grants,
+                            &grants,
                             &state.vault_cache,
                             state.vault.as_ref(),
                         )
@@ -258,9 +258,13 @@ async fn handle_tools_list(
                     })
                     .is_some(),
                 McpAuthScheme::None => is_loopback,
-                McpAuthScheme::HmacSha256 { .. } => false,
-            }
-        })
+            })
+            .map(|t| McpToolDescriptor {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+            })
+            .collect()
     } else {
         drop(endpoint);
         let bearer = extract_bearer(auth_header);
@@ -279,7 +283,6 @@ async fn handle_tools_list(
                 })
                 .is_some(),
             McpAuthScheme::None => is_loopback,
-            McpAuthScheme::HmacSha256 { .. } => false,
         })
     };
 
@@ -321,7 +324,10 @@ async fn handle_tools_call(
             }
         };
 
-        let auth_scheme = tool_spec.auth.clone().unwrap_or(McpAuthScheme::None);
+        let auth_scheme = endpoint
+            .config()
+            .map(|cfg| cfg.effective_auth(&tool_spec))
+            .unwrap_or(McpAuthScheme::None);
         let caller = match authorize_call(
             tool_name,
             &auth_scheme,

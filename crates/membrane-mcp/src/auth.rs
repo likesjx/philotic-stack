@@ -297,10 +297,6 @@ pub fn authorize_call(
                 .ok_or_else(|| anyhow::anyhow!("missing Authorization: Bearer header"))?;
             check_bearer_token(tool_name, token, grants, vault_cache, vault, allotment)
         }
-        McpAuthScheme::HmacSha256 { .. } => {
-            // Slice 3: implement HMAC body signing.
-            bail!("HMAC-SHA256 auth not yet implemented")
-        }
         McpAuthScheme::None => check_none_auth(is_loopback),
     }
 }
