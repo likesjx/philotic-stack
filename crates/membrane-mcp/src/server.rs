@@ -59,6 +59,11 @@ pub struct MembraneState {
     /// Current exposure tier for this listener — drives the ingress fence gate.
     /// Updated via `update_perimeter` push from the hotel when the perimeter shifts.
     pub ingress_tier: Arc<std::sync::RwLock<ExposureTier>>,
+    /// Exposure tier the provisioned endpoint declared, when known. `None` for
+    /// legacy/static route-table mode. Together with `ingress_tier` (the hotel
+    /// ceiling) this drives the listener bind address: anything other than an
+    /// explicitly declared, ceiling-honored wide tier binds loopback-only.
+    pub declared_exposure: Arc<std::sync::RwLock<Option<ExposureTier>>>,
 }
 
 impl std::fmt::Debug for MembraneState {
@@ -78,10 +83,45 @@ pub fn build_router(state: SharedState) -> Router {
         .with_state(state)
 }
 
+// ── Ingress fence helper ──────────────────────────────────────────────────────
+
+/// Run the listener-level ingress fence for a request. Returns `None` when the
+/// request may proceed, or a ready-to-send denial response.
+fn ingress_fence_gate(
+    state: &SharedState,
+    headers: &HeaderMap,
+    is_loopback: bool,
+) -> Option<axum::response::Response> {
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let tier = *state.ingress_tier.read().unwrap();
+    let decision = perimeter_core::fence::check_ingress(tier, auth_header, is_loopback);
+    match decision {
+        perimeter_core::IngressDecision::Allow => None,
+        perimeter_core::IngressDecision::Deny { status, message } => Some(
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED),
+                message,
+            )
+                .into_response(),
+        ),
+    }
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
-async fn handle_health() -> impl IntoResponse {
-    (StatusCode::OK, "membrane-mcp ok")
+// Health stays open on loopback only; every other source passes the fence.
+async fn handle_health(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let is_loopback = addr.ip().is_loopback();
+    if !is_loopback {
+        if let Some(denied) = ingress_fence_gate(&state, &headers, is_loopback) {
+            return denied;
+        }
+    }
+    (StatusCode::OK, "membrane-mcp ok").into_response()
 }
 
 // ── GET /mcp — Streamable HTTP SSE channel (MCP 2025-03-26) ──────────────────
@@ -90,7 +130,14 @@ async fn handle_health() -> impl IntoResponse {
 // server-initiated messages. We don't push server-initiated messages yet, so we
 // return a minimal SSE stream with a keepalive comment and then close it.
 // Clients will reconnect if they need more events.
-async fn handle_mcp_sse() -> impl IntoResponse {
+async fn handle_mcp_sse(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(denied) = ingress_fence_gate(&state, &headers, addr.ip().is_loopback()) {
+        return denied;
+    }
     let body = ": keepalive\n\n";
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -99,7 +146,7 @@ async fn handle_mcp_sse() -> impl IntoResponse {
     );
     headers.insert("cache-control", HeaderValue::from_static("no-cache"));
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
-    (StatusCode::OK, headers, body)
+    (StatusCode::OK, headers, body).into_response()
 }
 
 // ── MCP dispatcher ────────────────────────────────────────────────────────────
@@ -302,7 +349,10 @@ async fn handle_tools_call(
         let preapproved = endpoint.is_preapproved(&inbound.action);
         drop(endpoint);
 
-        let requires_approval = !preapproved && !is_loopback;
+        // Pre-approval rules are the only approval bypass. Loopback callers get
+        // no special treatment: the provisioning turn is the authorization event,
+        // and local processes are not implicitly the operator.
+        let requires_approval = !preapproved;
         let timeout = if requires_approval {
             APPROVAL_TIMEOUT
         } else {
