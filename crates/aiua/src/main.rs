@@ -8187,8 +8187,12 @@ async fn main() -> Result<()> {
     crate::service::host_health_scan::spawn_loop(
         graph_domain_arc.clone(),
         db_path.to_string_lossy().to_string(),
+        // A relative db_path (no PHILOTIC_PROFILE, e.g. the vps systemd unit
+        // with WorkingDirectory set) has `Some("")` as parent — `df -k ""`
+        // fails, so an empty parent must fall back to "." like a missing one.
         db_path
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from(".")),
         hotel_name.clone(),
