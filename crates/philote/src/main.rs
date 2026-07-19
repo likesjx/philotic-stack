@@ -40,12 +40,14 @@ async fn main() -> Result<()> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    let (role, guest_id) = match role_name {
-        Some(ref rn) => {
-            let role = role_inbox.unwrap_or_else(|| rn.clone());
-            (role, format!("{}:{}", agent_id, rn))
-        }
-        None => ("agent".to_string(), agent_id.clone()),
+    // Guest identity comes from the same composition every model dispatch
+    // stamps as `reply_guest_id` (DEF-051) — the two must never drift, or
+    // model responses stop finding the runtime that holds the turn.
+    let guest_id =
+        agent_core::runtime::compose_guest_identity(&agent_id, role_name.as_deref());
+    let role = match role_name {
+        Some(ref rn) => role_inbox.unwrap_or_else(|| rn.clone()),
+        None => "agent".to_string(),
     };
 
     let identity = GuestIdentity {

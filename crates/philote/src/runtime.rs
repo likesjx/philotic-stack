@@ -1566,6 +1566,19 @@ struct CachedRoleConfig {
     content_policy: String,
 }
 
+/// The guest identity a philote registers with the hotel — bare `agent_id`
+/// for a base philote, `"{agent_id}:{role_name}"` for a role-incarnation.
+/// `main.rs` builds its `GuestIdentity` from this same function, and every
+/// model dispatch stamps this exact string as `reply_guest_id` (DEF-051) so
+/// the hotel delivers the response back to the subscription owned by the
+/// runtime that holds the active turn.
+pub fn compose_guest_identity(agent_id: &str, role_name: Option<&str>) -> String {
+    match role_name {
+        Some(role_name) => format!("{agent_id}:{role_name}"),
+        None => agent_id.to_string(),
+    }
+}
+
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
@@ -1982,6 +1995,21 @@ impl AgentRuntime {
 
     pub fn set_role_name(&mut self, rn: impl Into<String>) {
         self.role_name = Some(rn.into());
+    }
+
+    /// The guest identity THIS runtime registered with the hotel — bare
+    /// `agent_id` for a base philote, `"{agent_id}:{role_name}"` for a
+    /// role-incarnation (matches the `GuestIdentity` built in `main.rs`).
+    ///
+    /// Every model dispatch must carry this as `reply_guest_id` (DEF-051):
+    /// without it, aiua's delivery falls back to inferring the guest from
+    /// `agent_id`, which routes the model RESPONSE to the base-agent
+    /// subscription even when the turn lives in a role-incarnation runtime —
+    /// the response then hits the no-active-turn drop and the turn rides the
+    /// watchdog to a 600s eviction (the daily morning-cron stuck message,
+    /// live-confirmed by instrumentation 2026-07-15 11:30:04Z).
+    pub(super) fn own_guest_id(&self) -> String {
+        compose_guest_identity(&self.agent_id, self.role_name.as_deref())
     }
 
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
@@ -2822,6 +2850,7 @@ impl AgentRuntime {
                     chat_id: restored_chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
+                    reply_guest_id: Some(self.own_guest_id()),
                     final_reply_to: restored_reply_to,
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
@@ -3564,6 +3593,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -4044,6 +4074,7 @@ impl AgentRuntime {
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to: reentry.final_reply_to,
             final_reply_role: reentry.final_reply_role,
             final_reply_guest_id: reentry.final_reply_guest_id,
@@ -4776,6 +4807,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -5399,6 +5431,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -7137,9 +7170,10 @@ mod tests {
         extract_model_error, extract_model_error_payload, format_role_command_reply,
         format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
         media_analysis_attachments, next_ladder_tier, normalized_user_content,
-        parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
-        resolve_media_routing, resolve_model_execution_target, role_model_binding,
-        shadow_eligible_capability, should_attempt_provider_repair, tool_step_earns_streak,
+        compose_guest_identity, parse_memory_candidate, pick_oracle_role,
+        primary_dispatch_used_ladder, provider_for_role, resolve_media_routing,
+        resolve_model_execution_target, role_model_binding, shadow_eligible_capability,
+        should_attempt_provider_repair, tool_step_earns_streak,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -7156,6 +7190,57 @@ mod tests {
     use uuid::Uuid;
 
     // ── Routing-oracle helpers ────────────────────────────────────────────
+
+    #[test]
+    fn compose_guest_identity_matches_registration_shapes() {
+        // DEF-051: this string is both the hotel registration identity AND the
+        // reply_guest_id stamped on every model dispatch — base philotes are
+        // the bare agent id, role incarnations are "{agent_id}:{role_name}".
+        assert_eq!(compose_guest_identity("agent-aria", None), "agent-aria");
+        assert_eq!(
+            compose_guest_identity("agent-aria", Some("orchestrator")),
+            "agent-aria:orchestrator"
+        );
+    }
+
+    #[test]
+    fn model_request_payload_reply_guest_id_reaches_return_route() {
+        // End-to-end field-name lock (DEF-051): a serialized ModelRequestPayload
+        // must yield its reply_guest_id through philotic-client's
+        // ReturnRoute::from_task — that is the exact path the model controller
+        // uses to address the response. A rename on either side breaks this.
+        let payload = ModelRequestPayload {
+            action: "generate_text".into(),
+            request_class: None,
+            session_id: "telegram:1:agent-aria".into(),
+            turn_id: "turn-1".into(),
+            prompt: "p".into(),
+            user_content: "u".into(),
+            context: None,
+            context_projection: None,
+            affordances: None,
+            attachments: Vec::new(),
+            tools_for_model: Vec::new(),
+            model: None,
+            response_contract: None,
+            response_route: None,
+            ligand: None,
+            provider_options: serde_json::Map::new(),
+            chat_id: String::new(),
+            reply_to: "node-1".into(),
+            reply_role: "agent".into(),
+            reply_guest_id: Some("agent-aria:orchestrator".into()),
+            final_reply_to: "node-1".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            agent_id: Some("agent-aria".into()),
+            oracle_pick: None,
+            oracle_agreement: None,
+        };
+        let wire = serde_json::to_value(&payload).expect("payload serializes");
+        let route = philotic_client::ReturnRoute::from_task(&wire, "d-node", "d-role");
+        assert_eq!(route.guest_id.as_deref(), Some("agent-aria:orchestrator"));
+    }
 
     #[test]
     fn provider_for_role_inverts_hotel_seeding() {
@@ -7496,6 +7581,7 @@ mod tests {
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
+            reply_guest_id: None,
             final_reply_to: LOCAL_NODE.into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
