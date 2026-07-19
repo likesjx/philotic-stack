@@ -4533,6 +4533,29 @@ mod tests {
     }
 
     #[test]
+    fn return_route_reply_guest_id_beats_agent_id_fallback() {
+        // A role-incarnation philote (e.g. a whisper specialist running as a
+        // separate `{agent_id}:{role_name}` process) sets `reply_guest_id` to its
+        // own incarnation id. It MUST win over the bare `agent_id` fallback so the
+        // model response returns to the incarnation process — not the base agent,
+        // where it would be dropped and the specialist's turn would hang.
+        let task = serde_json::json!({
+            "reply_to": "node-1",
+            "reply_role": "agent",
+            "reply_guest_id": "agent-bjork-01:theoretician",
+            "agent_id": "agent-bjork-01"
+        });
+
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.role, "agent");
+        assert_eq!(
+            route.guest_id.as_deref(),
+            Some("agent-bjork-01:theoretician"),
+            "reply_guest_id (incarnation) must beat the agent_id base fallback"
+        );
+    }
+
+    #[test]
     fn return_route_agent_id_fallback_is_agent_role_only() {
         let task = serde_json::json!({
             "reply_to": "compat-node",
