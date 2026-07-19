@@ -5472,14 +5472,14 @@ mod tests {
         ActivePlan, ApprovalPolicy, ApprovalRiskHint, CarryoverPlan, ComponentExecutionRoute,
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
         ContextLayerId, ContextMutability, FallbackOverride, HookRequest, HookResult,
-        LIFE_RECALL_TRUNCATION_MARKER, LifeRecallCacheEntry, MemoryAuthority, MemorySpacetimeFrame,
-        MemorySpatialScope, MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus,
-        PlanStep, PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode,
-        RoleActivation, SelectionSource, SessionBindings, SessionState, TaskRunnerBaseConfig,
-        McpUpstreamToolBinding, ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode,
-        TurnRecord, VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn,
-        apply_life_recall_char_budget, default_tool_assembly_for_bindings, merge_session_index,
-        session_checkpoint_memory_type,
+        LIFE_RECALL_TRUNCATION_MARKER, LifeRecallCacheEntry, McpUpstreamToolBinding,
+        MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind,
+        MemoryValidationLevel, ParacrineThreadStatus, PlanStep, PromotionAction,
+        RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation, SelectionSource,
+        SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
+        TransportReplyTargetBinding, TtsMode, TurnRecord, VoiceDeliveryMode, VoiceResponsePolicy,
+        WorkingTurn, apply_life_recall_char_budget, default_tool_assembly_for_bindings,
+        merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use crate::reflex::ReflexEvent;
@@ -10388,7 +10388,10 @@ mod tests {
             .policy_annotations
             .get(name)
             .expect("projected tool has a policy annotation");
-        assert!(annotation.approval_required, "remote tools require approval");
+        assert!(
+            annotation.approval_required,
+            "remote tools require approval"
+        );
         assert_eq!(annotation.policy_class, "mcp_remote");
 
         // Projection never shadows a native assembled tool.
