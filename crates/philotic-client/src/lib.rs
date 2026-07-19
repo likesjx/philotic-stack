@@ -4488,6 +4488,31 @@ mod tests {
     }
 
     #[test]
+    fn return_route_prefers_reply_guest_id_over_agent_id_fallback() {
+        // DEF-051: a role-incarnation runtime names its own guest identity
+        // ("{agent_id}:{role_name}") in reply_guest_id. The agent_id fallback
+        // would deliver the model response to the BASE philote's subscription
+        // instead — a runtime with no active turn — silently stranding the
+        // turn until the 600s watchdog eviction.
+        let task = serde_json::json!({
+            "reply_to": "node-1",
+            "reply_role": "agent",
+            "reply_guest_id": "agent-aria:orchestrator",
+            "agent_id": "agent-aria",
+        });
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.guest_id.as_deref(), Some("agent-aria:orchestrator"));
+
+        // Legacy payloads without the field keep the agent_id inference.
+        let task = serde_json::json!({
+            "reply_role": "agent",
+            "agent_id": "agent-aria",
+        });
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.guest_id.as_deref(), Some("agent-aria"));
+    }
+
+    #[test]
     fn return_route_reads_typed_route_before_compat_fields() {
         let task = serde_json::json!({
             "reply_to": "compat-node",
