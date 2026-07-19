@@ -4714,6 +4714,18 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
                 }
             }
         }
+        // Also expand via the shared class map for tool families whose catalog
+        // entries carry a different (or no) class tag — e.g. `agent_graph`,
+        // `mcp`, `training`, `asr`. Without this, those classes granted in a
+        // ToolsetProfileRecord expanded to nothing here ("dead classes") and
+        // the hotel and philote disagreed about what a class grants.
+        for class in &bindings.allowed_classes {
+            for &tool in ansible_mesh_core::graph::tools_for_tool_class(class) {
+                if !toolset.iter().any(|existing| existing == tool) {
+                    toolset.push(tool.to_string());
+                }
+            }
+        }
     }
 
     // Always include observer and meta-approval tools — every philote can inspect its own

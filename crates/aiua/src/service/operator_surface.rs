@@ -1812,7 +1812,7 @@ impl IpcServer {
             let is_admin = calling_role_record
                 .ok()
                 .flatten()
-                .map(|r| r.is_admin || r.role_name == "orchestrator")
+                .map(|r| r.has_operational_admin_authority())
                 .unwrap_or(false);
             if !is_admin {
                 anyhow::bail!(
