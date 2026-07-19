@@ -795,7 +795,12 @@ impl Check for SupervisionInvariant {
         }
         let active_pid = hotel_active_pid(&ctx.conn, &ctx.hotel)?;
         let supervised = active_pid.and_then(|pid| hotel_is_supervised(&ctx.hotel, pid));
-        Ok(evaluate_supervision(self.id(), &ctx.hotel, active_pid, supervised))
+        Ok(evaluate_supervision(
+            self.id(),
+            &ctx.hotel,
+            active_pid,
+            supervised,
+        ))
     }
 }
 
@@ -3058,8 +3063,7 @@ mod tests {
     // AND never a false-alarm Warning on data doctor couldn't actually read.
     #[test]
     fn supervision_unknown_is_soft_info_not_a_failure() {
-        let findings =
-            evaluate_supervision("supervision.not-supervised", "jane", Some(100), None);
+        let findings = evaluate_supervision("supervision.not-supervised", "jane", Some(100), None);
         assert!(only(&[Severity::Info], &findings));
         assert!(
             findings[0].severity < Severity::Warning,

@@ -1236,7 +1236,9 @@ mod tests {
         assert!(is_session_like(
             "telegram:7898847424:1783786667254:agent-jane"
         ));
-        assert!(is_session_like("operator-chat:smoke-agent-turn-abc:agent-jane"));
+        assert!(is_session_like(
+            "operator-chat:smoke-agent-turn-abc:agent-jane"
+        ));
         assert!(is_session_like("paracrine:7898847424:orchestrator"));
         // Real materialized guests must NOT be treated as sessions.
         assert!(!is_session_like("mbp-jane:model-controller-openrouter"));

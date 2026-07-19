@@ -5365,7 +5365,11 @@ impl AgentRuntime {
                                  ({} grant entr{} removed). Callers holding that token lose \
                                  access; the membrane's vault cache may honor it for up to 60s.",
                                 data["removed_grants"].as_u64().unwrap_or(0),
-                                if data["removed_grants"].as_u64() == Some(1) { "y" } else { "ies" },
+                                if data["removed_grants"].as_u64() == Some(1) {
+                                    "y"
+                                } else {
+                                    "ies"
+                                },
                             )
                         } else {
                             let raw = data["raw_token"].as_str().unwrap_or("<missing>");
@@ -5382,7 +5386,11 @@ impl AgentRuntime {
                                  {raw}\n\
                                  \n\
                                  Callers authenticate with `Authorization: Bearer {raw}`.",
-                                if tool == "mcp.rotate_token" { "rotated" } else { "created" },
+                                if tool == "mcp.rotate_token" {
+                                    "rotated"
+                                } else {
+                                    "created"
+                                },
                             )
                         };
                         (content, None)

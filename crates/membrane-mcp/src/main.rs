@@ -1,5 +1,6 @@
 mod auth;
-mod dispatch;
+#[cfg(test)]
+mod dispatch_tests;
 mod protocol;
 mod routing;
 mod server;
@@ -297,10 +298,9 @@ impl MembraneGuest for McpMembrane {
                     data: Some(data),
                     ..
                 }) => {
-                    if let Some(config) = data
-                        .get("config")
-                        .and_then(|value| serde_json::from_value::<McpEndpointConfig>(value.clone()).ok())
-                    {
+                    if let Some(config) = data.get("config").and_then(|value| {
+                        serde_json::from_value::<McpEndpointConfig>(value.clone()).ok()
+                    }) {
                         *self.state.declared_exposure.write().unwrap() = Some(config.exposure);
                         let mut table = self.state.endpoint_table.write().await;
                         table.update(config);
@@ -424,23 +424,22 @@ impl MembraneGuest for McpMembrane {
                     return Ok(false);
                 };
 
-                let outcome = if let Some(result) = payload.get("result") {
-                    server::DispatchOutcome::Ok(
-                        serde_json::to_string(result).unwrap_or_else(|_| {
-                            serde_json::json!({ "result": result }).to_string()
-                        }),
-                    )
-                } else if let Some(error) = payload.get("error") {
-                    server::DispatchOutcome::Err(
-                        error
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| error.to_string()),
-                    )
-                } else {
-                    warn!(turn_id, "datasource_response push missing result/error");
-                    return Ok(false);
-                };
+                let outcome =
+                    if let Some(result) = payload.get("result") {
+                        server::DispatchOutcome::Ok(serde_json::to_string(result).unwrap_or_else(
+                            |_| serde_json::json!({ "result": result }).to_string(),
+                        ))
+                    } else if let Some(error) = payload.get("error") {
+                        server::DispatchOutcome::Err(
+                            error
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| error.to_string()),
+                        )
+                    } else {
+                        warn!(turn_id, "datasource_response push missing result/error");
+                        return Ok(false);
+                    };
 
                 let sender = {
                     let mut pending = self.state.pending_responses.lock().await;

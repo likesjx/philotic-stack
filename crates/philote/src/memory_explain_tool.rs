@@ -24,9 +24,9 @@
 
 use super::*;
 use ansible_mesh_core::memory_explain::{
-    band_report, envelope_from_decision_details, envelope_from_engram_metadata,
-    muninn_activate_timestamp_to_unix_seconds, render_text, ExplainEvidenceItem, ExplainPlane,
-    ExplainPlaneOutcome, ExplainReport,
+    ExplainEvidenceItem, ExplainPlane, ExplainPlaneOutcome, ExplainReport, band_report,
+    envelope_from_decision_details, envelope_from_engram_metadata,
+    muninn_activate_timestamp_to_unix_seconds, render_text,
 };
 use ansible_mesh_core::provenance::{ProvenanceEnvelope, TrustTier};
 
@@ -77,7 +77,9 @@ impl AgentRuntime {
             .map(turn_memory_user_id)
             .unwrap_or_else(|| self.agent_id.clone());
 
-        let muninn_outcome = self.fetch_muninn_explain_plane(&claim, &memory_user_id, limit).await;
+        let muninn_outcome = self
+            .fetch_muninn_explain_plane(&claim, &memory_user_id, limit)
+            .await;
         let intel_graph_outcome = fetch_intel_graph_explain_plane(&claim, entity.as_deref()).await;
         let lifegraph_outcome = self.fetch_lifegraph_explain_plane(&payload.session_id, &claim);
 
@@ -136,16 +138,20 @@ impl AgentRuntime {
         // error) — see `MuninnRestEngine::activate`'s cross-scope handling.
         let scope = MemoryScope::CrossScope(vec![MemoryScope::SelfOnly, MemoryScope::SharedUser]);
 
-        match tokio::time::timeout(MUNINN_PLANE_TIMEOUT, engine.activate(claim, scope, Some(limit)))
-            .await
+        match tokio::time::timeout(
+            MUNINN_PLANE_TIMEOUT,
+            engine.activate(claim, scope, Some(limit)),
+        )
+        .await
         {
             Err(_) => ExplainPlaneOutcome::unavailable(
                 ExplainPlane::Muninn,
                 format!("activate() did not respond within {MUNINN_PLANE_TIMEOUT:?}"),
             ),
-            Ok(Err(e)) => {
-                ExplainPlaneOutcome::unavailable(ExplainPlane::Muninn, format!("activate() failed: {e}"))
-            }
+            Ok(Err(e)) => ExplainPlaneOutcome::unavailable(
+                ExplainPlane::Muninn,
+                format!("activate() failed: {e}"),
+            ),
             Ok(Ok(result)) => {
                 let items = result
                     .engrams
@@ -178,7 +184,10 @@ impl AgentRuntime {
     /// zero matches — a real "the plane answered, found nothing" outcome).
     fn fetch_lifegraph_explain_plane(&self, session_id: &str, claim: &str) -> ExplainPlaneOutcome {
         let Some(state) = self.sessions.get(session_id) else {
-            return ExplainPlaneOutcome::unavailable(ExplainPlane::LifeGraph, "no session state found");
+            return ExplainPlaneOutcome::unavailable(
+                ExplainPlane::LifeGraph,
+                "no session state found",
+            );
         };
         if state.resolve_tool_route("life.recall").is_none() {
             return ExplainPlaneOutcome::unavailable(
@@ -282,7 +291,7 @@ async fn fetch_intel_graph_explain_plane(claim: &str, entity: Option<&str>) -> E
             return ExplainPlaneOutcome::unavailable(
                 ExplainPlane::IntelGraph,
                 format!("failed to build HTTP client: {e}"),
-            )
+            );
         }
     };
 
@@ -302,7 +311,7 @@ async fn fetch_intel_graph_explain_plane(claim: &str, entity: Option<&str>) -> E
             return ExplainPlaneOutcome::unavailable(
                 ExplainPlane::IntelGraph,
                 format!("request to {url} failed: {e}"),
-            )
+            );
         }
     };
     if !resp.status().is_success() {
@@ -317,7 +326,7 @@ async fn fetch_intel_graph_explain_plane(claim: &str, entity: Option<&str>) -> E
             return ExplainPlaneOutcome::unavailable(
                 ExplainPlane::IntelGraph,
                 format!("failed to parse {url} response: {e}"),
-            )
+            );
         }
     };
 

@@ -890,12 +890,10 @@ async fn test_api_decide_carries_provenance_envelope_fields() {
         .expect("evidence array on decision node");
     assert_eq!(evidence.len(), 2);
     assert_eq!(evidence[0].as_str().unwrap(), "engram:self_agent-1:eng-a");
-    assert!(
-        node["properties"]["reversal"]
-            .as_str()
-            .unwrap()
-            .contains("muninn_contradictions")
-    );
+    assert!(node["properties"]["reversal"]
+        .as_str()
+        .unwrap()
+        .contains("muninn_contradictions"));
     assert_eq!(node["properties"]["trust"].as_str().unwrap(), "observed");
 
     // The recorded mutation's details carry the same fields.
@@ -912,10 +910,7 @@ async fn test_api_decide_carries_provenance_envelope_fields() {
         .iter()
         .find(|m| m["action"].as_str() == Some("memory_hygiene_finding_filed"))
         .expect("mutation for this decision should be recorded");
-    assert_eq!(
-        mutation["details"]["evidence"].as_array().unwrap().len(),
-        2
-    );
+    assert_eq!(mutation["details"]["evidence"].as_array().unwrap().len(), 2);
     assert_eq!(mutation["details"]["trust"].as_str().unwrap(), "observed");
 }
 

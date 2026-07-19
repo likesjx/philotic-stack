@@ -3722,7 +3722,10 @@ impl IpcServer {
         let Some(identity) = current_identity.as_ref() else {
             return true;
         };
-        if matches!(identity.role.as_str(), "operator" | "admin" | "desktop-membrane") {
+        if matches!(
+            identity.role.as_str(),
+            "operator" | "admin" | "desktop-membrane"
+        ) {
             return true;
         }
         identity.guest_id == owner_agent_id
@@ -8354,18 +8357,12 @@ impl IpcServer {
                         return IpcResponse::error(
                             "mcp_token_grant",
                             "GRANT_NOT_FOUND",
-                            format!(
-                                "no grant '{token_id}' on endpoint '{endpoint_id}' to rotate"
-                            ),
+                            format!("no grant '{token_id}' on endpoint '{endpoint_id}' to rotate"),
                         );
                     };
                     let vault_ref = existing.vault_ref.clone();
                     if let Err(e) = crate::vault::rotate_secret(graph, &vault_ref, &hash_hex) {
-                        return IpcResponse::error(
-                            "mcp_token_grant",
-                            "VAULT_ERROR",
-                            e.to_string(),
-                        );
+                        return IpcResponse::error("mcp_token_grant", "VAULT_ERROR", e.to_string());
                     }
                     vault_ref
                 } else {
@@ -8447,7 +8444,10 @@ impl IpcServer {
                 )
                 .await;
 
-                info!(endpoint_id, token_id, rotate, "MCP token grant provisioned.");
+                info!(
+                    endpoint_id,
+                    token_id, rotate, "MCP token grant provisioned."
+                );
 
                 IpcResponse::success(
                     "mcp_token_grant",
@@ -8509,8 +8509,7 @@ impl IpcServer {
                 // list stays BearerToken (nobody can call) — it must not degrade
                 // to None, which would open the tool to loopback callers.
                 let mut removed = 0usize;
-                let mut slots: Vec<&mut Option<McpAuthScheme>> =
-                    vec![&mut config.default_auth];
+                let mut slots: Vec<&mut Option<McpAuthScheme>> = vec![&mut config.default_auth];
                 slots.extend(config.tools.iter_mut().map(|t| &mut t.auth));
                 for slot in slots {
                     if let Some(McpAuthScheme::BearerToken { grants }) = slot.as_mut() {

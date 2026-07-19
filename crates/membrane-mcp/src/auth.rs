@@ -332,9 +332,8 @@ pub fn authorize_call(
 ) -> Result<CallerIdentity, AuthError> {
     match auth_scheme {
         McpAuthScheme::BearerToken { grants } => {
-            let token = extract_bearer(authorization_header).ok_or_else(|| {
-                AuthError::Missing("missing Authorization: Bearer header".into())
-            })?;
+            let token = extract_bearer(authorization_header)
+                .ok_or_else(|| AuthError::Missing("missing Authorization: Bearer header".into()))?;
             check_bearer_token(tool_name, token, grants, vault_cache, vault, allotment)
         }
         McpAuthScheme::None => check_none_auth(is_loopback),

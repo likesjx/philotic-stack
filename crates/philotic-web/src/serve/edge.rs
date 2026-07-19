@@ -999,7 +999,8 @@ pub(crate) async fn handle_edge_lifegraph_observe(
             .into_response();
     }
     let arguments = json!({ "observations": body.observations });
-    match super::ipc_life_graph_datasource_call(&state.socket, "life.observe.batch", arguments).await
+    match super::ipc_life_graph_datasource_call(&state.socket, "life.observe.batch", arguments)
+        .await
     {
         Ok(data) => Json(data).into_response(),
         Err(err) => life_graph_unavailable(err),

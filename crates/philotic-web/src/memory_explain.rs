@@ -61,7 +61,11 @@ pub enum MemoryAction {
 
 pub async fn run(action: MemoryAction) -> Result<()> {
     match action {
-        MemoryAction::Explain { claim, limit, entity } => explain(claim, limit, entity).await,
+        MemoryAction::Explain {
+            claim,
+            limit,
+            entity,
+        } => explain(claim, limit, entity).await,
     }
 }
 
@@ -157,8 +161,16 @@ async fn fetch_muninn_plane(claim: &str, limit: usize) -> ExplainPlaneOutcome {
     let items = activations
         .into_iter()
         .map(|a| {
-            let concept = a.get("concept").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let content = a.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let concept = a
+                .get("concept")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let content = a
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let id = a.get("id").and_then(|v| v.as_str()).map(str::to_string);
             // `/api/activate` returns nanosecond-epoch timestamps (unlike
             // `/api/engrams`'s second-epoch) — normalize so cross-plane
@@ -168,14 +180,19 @@ async fn fetch_muninn_plane(claim: &str, limit: usize) -> ExplainPlaneOutcome {
                 .and_then(|v| v.as_i64())
                 .or_else(|| a.get("created_at").and_then(|v| v.as_i64()))
                 .map(muninn_activate_timestamp_to_unix_seconds);
-            let metadata = a.get("metadata").cloned().unwrap_or(serde_json::Value::Null);
+            let metadata = a
+                .get("metadata")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             ExplainEvidenceItem {
                 plane: ExplainPlane::Muninn,
                 label: concept,
                 detail: content,
                 source_ref: id,
                 recorded_at,
-                envelope: ansible_mesh_core::memory_explain::envelope_from_engram_metadata(&metadata),
+                envelope: ansible_mesh_core::memory_explain::envelope_from_engram_metadata(
+                    &metadata,
+                ),
             }
         })
         .collect();
@@ -252,7 +269,11 @@ async fn fetch_intel_graph_plane(claim: &str, entity: Option<&str>) -> ExplainPl
                 continue;
             }
         }
-        let agent = m.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let agent = m
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let details = m.get("details").cloned().unwrap_or(serde_json::Value::Null);
         let recorded_at = m
             .get("timestamp")

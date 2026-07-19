@@ -179,10 +179,23 @@ async fn handle_mcp(
     headers: HeaderMap,
     axum::Json(req): axum::Json<JsonRpcRequest>,
 ) -> axum::response::Response {
-    let is_notification = req.id.is_none();
-    let id = req.id.clone().unwrap_or(Value::Null);
     let is_loopback = addr.ip().is_loopback();
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    dispatch_rpc(&state, req, auth_header, is_loopback).await
+}
+
+/// Full JSON-RPC dispatch for one request: ingress fence, notification
+/// handling, then method routing. Split from the axum handler so the dispatch
+/// surface is testable across fence tiers × auth schemes × source addresses
+/// without real sockets.
+pub(crate) async fn dispatch_rpc(
+    state: &SharedState,
+    req: JsonRpcRequest,
+    auth_header: Option<&str>,
+    is_loopback: bool,
+) -> axum::response::Response {
+    let is_notification = req.id.is_none();
+    let id = req.id.clone().unwrap_or(Value::Null);
 
     // Ingress fence: listener-level check before any per-route auth.
     {
@@ -227,8 +240,8 @@ async fn handle_mcp(
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id, req.params),
         "ping" => JsonRpcResponse::ok(id, json!({})),
-        "tools/list" => handle_tools_list(&state, id, auth_header, is_loopback).await,
-        "tools/call" => handle_tools_call(&state, id, req.params, auth_header, is_loopback).await,
+        "tools/list" => handle_tools_list(state, id, auth_header, is_loopback).await,
+        "tools/call" => handle_tools_call(state, id, req.params, auth_header, is_loopback).await,
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
 

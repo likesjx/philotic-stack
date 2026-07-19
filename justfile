@@ -360,6 +360,10 @@ smoke-subagent:
 smoke-session-control:
     ./scripts/smoke-session-control-roundtrip.sh
 
+# Run the MCP client UAT (safe modes only; no live tokens required)
+smoke-mcp:
+    ./scripts/mcp-client-uat.sh safe
+
 # Run the session bindings binary smoke test
 smoke-session-bindings:
     ./scripts/smoke-session-bindings-roundtrip.sh
