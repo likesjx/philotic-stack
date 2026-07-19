@@ -188,15 +188,6 @@ pub struct ModelRequestPayload {
     pub chat_id: String,
     pub reply_to: String,
     pub reply_role: String,
-    /// The dispatching runtime's OWN registered guest identity (DEF-051):
-    /// bare `agent_id` for a base philote, `"{agent_id}:{role_name}"` for a
-    /// role-incarnation. The model controller threads this into
-    /// `ReturnRoute.guest_id` so the response is delivered back to the
-    /// runtime that holds the active turn. Without it, aiua infers the guest
-    /// from `agent_id` and role-incarnation turns never see their responses
-    /// (no-active-turn drop → 600s watchdog eviction).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply_guest_id: Option<String>,
     pub final_reply_to: String,
     pub final_reply_role: String,
     #[serde(skip_serializing_if = "Option::is_none")]

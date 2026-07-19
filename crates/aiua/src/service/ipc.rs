@@ -87,12 +87,104 @@ pub(super) struct SubagentHookRecord {
 /// Maps `subagent_guest_id` → routing record.
 pub(super) type SubagentHookRegistry = Arc<Mutex<HashMap<String, SubagentHookRecord>>>;
 
+/// How many undrained outbound frames mark a subscriber as wedged. A healthy
+/// guest drains its socket in milliseconds; a backlog this deep means the
+/// guest event loop is stuck while its socket stays open (the 2026-07-19
+/// Beacon dead-delivery mode: "Delivering … to 1 local subscriber" into a
+/// process that never read another frame).
+const SUBSCRIBER_BACKLOG_WEDGE_THRESHOLD: u64 = 32;
+
+/// How long a delivered InboundTask may sit unflushed to the guest socket
+/// before delivery is declared unconfirmed and a heal entry is filed.
+#[cfg(not(test))]
+const DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS: u64 = 10;
+#[cfg(test)]
+const DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS: u64 = 1;
+
+/// Poll cadence for the write-confirmation watcher.
+#[cfg(not(test))]
+const DELIVERY_WRITE_CONFIRM_POLL_MS: u64 = 250;
+#[cfg(test)]
+const DELIVERY_WRITE_CONFIRM_POLL_MS: u64 = 50;
+
+/// Outbound IPC sender with frame accounting.
+///
+/// `enqueued` counts frames accepted into the (unbounded) channel; `drained`
+/// counts frames the connection's write task actually flushed to the guest
+/// socket (serialize failures also count as drained so the gauge can't
+/// drift). `backlog() = enqueued − drained` is therefore "frames the guest
+/// has not received yet": a send into this channel proves nothing about the
+/// guest, only a drained frame does. Delivery paths use the gauge to detect
+/// alive-but-wedged guests, which reader-EOF cleanup can never catch.
+#[derive(Clone)]
+pub(crate) struct CountedSender {
+    tx: mpsc::UnboundedSender<IpcResponse>,
+    enqueued: Arc<std::sync::atomic::AtomicU64>,
+    drained: Arc<std::sync::atomic::AtomicU64>,
+    /// Latched when the wedge threshold is crossed so heal entries file once
+    /// per wedge episode, not once per delivery attempt.
+    backlog_flagged: Arc<std::sync::atomic::AtomicBool>,
+    /// Heal sink for delivery anomalies; `None` for detached senders
+    /// (internal consumers, tests).
+    heal: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+}
+
+impl CountedSender {
+    pub(crate) fn new(
+        tx: mpsc::UnboundedSender<IpcResponse>,
+        heal: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+    ) -> Self {
+        Self {
+            tx,
+            enqueued: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            drained: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            backlog_flagged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            heal,
+        }
+    }
+
+    /// Sender with fresh counters and no heal sink — for callers that manage
+    /// their own receive loop (cron ticker, role materialization, tests).
+    pub(crate) fn detached(tx: &mpsc::UnboundedSender<IpcResponse>) -> Self {
+        Self::new(tx.clone(), None)
+    }
+
+    pub(crate) fn send(
+        &self,
+        response: IpcResponse,
+    ) -> Result<(), mpsc::error::SendError<IpcResponse>> {
+        self.tx.send(response).map(|()| {
+            self.enqueued
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+    }
+
+    /// Handle the write task uses to mark frames flushed (or dropped).
+    pub(crate) fn drained_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.drained)
+    }
+
+    pub(crate) fn backlog(&self) -> u64 {
+        self.enqueued
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(self.drained.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn enqueued_now(&self) -> u64 {
+        self.enqueued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn drained_now(&self) -> u64 {
+        self.drained.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RoleSubscriber {
     conn_id: Uuid,
     pub(crate) guest_id: String,
     supported_tools: Vec<String>,
-    pub(crate) tx: mpsc::UnboundedSender<IpcResponse>,
+    pub(crate) tx: CountedSender,
 }
 
 #[cfg(not(test))]
@@ -2815,19 +2907,25 @@ impl IpcServer {
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let (raw_outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let outbound_tx = CountedSender::new(raw_outbound_tx, heal_queue.clone());
+        let drained_frames = outbound_tx.drained_handle();
         let write_task = tokio::spawn(async move {
             while let Some(response) = outbound_rx.recv().await {
                 let res_bytes = match serde_json::to_vec(&response) {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         error!("Failed to serialize IPC response: {}", e);
+                        // Count dropped frames as drained so the backlog
+                        // gauge measures only frames the guest still owes.
+                        drained_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
                 };
                 if let Err(e) = Self::write_frame(&mut writer, &res_bytes).await {
                     return Err(e);
                 }
+                drained_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Ok::<(), std::io::Error>(())
         });
@@ -3202,7 +3300,7 @@ impl IpcServer {
         conn_id: Uuid,
         guest_id: &str,
         supported_tools: &[String],
-        tx: &mpsc::UnboundedSender<IpcResponse>,
+        tx: &CountedSender,
         subscribed_roles: &mut Vec<String>,
     ) {
         let mut guard = inboxes.lock().await;
@@ -3336,13 +3434,120 @@ impl IpcServer {
 
         let mut stale = Vec::new();
         for subscriber in subscribers {
+            // Wedge gauge: a growing backlog means this guest holds its
+            // socket open but is not draining it — a state reader-EOF
+            // cleanup can never detect. Latch a heal entry once per episode
+            // so the heal dispatcher (which knows restart_guest) can act.
+            let backlog = subscriber.tx.backlog();
+            if backlog >= SUBSCRIBER_BACKLOG_WEDGE_THRESHOLD {
+                if !subscriber
+                    .tx
+                    .backlog_flagged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    warn!(
+                        guest_id = subscriber.guest_id.as_str(),
+                        target_role,
+                        backlog,
+                        "Subscriber outbound backlog crossed wedge threshold — guest appears alive but not draining its socket"
+                    );
+                    if let Some(hq) = subscriber.tx.heal.as_deref() {
+                        let message = format!(
+                            "[subscriber_wedged] guest [{}] role [{target_role}] has {backlog} undrained outbound frames (threshold {SUBSCRIBER_BACKLOG_WEDGE_THRESHOLD}) — deliveries are queuing into a socket the guest is not reading",
+                            subscriber.guest_id
+                        );
+                        if let Err(err) = hq.push_classified(
+                            &subscriber.guest_id,
+                            &message,
+                            "high",
+                            "subscriber_wedged",
+                        ) {
+                            warn!(error = %err, "Failed to push subscriber-wedged heal entry");
+                        }
+                    }
+                }
+            } else if backlog < SUBSCRIBER_BACKLOG_WEDGE_THRESHOLD / 2 {
+                subscriber
+                    .tx
+                    .backlog_flagged
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+
             if subscriber.tx.send(response.clone()).is_err() {
                 warn!(
                     "Failed to deliver inbound task {} to local subscriber role='{}' guest='{}'. Removing stale inbox subscription.",
                     task_id, target_role, subscriber.guest_id
                 );
+                if let Some(hq) = subscriber.tx.heal.as_deref() {
+                    let message = format!(
+                        "[delivery_channel_closed] inbound task {task_id} for role [{target_role}] guest [{}] hit a closed outbound channel — the task was NOT received by this guest",
+                        subscriber.guest_id
+                    );
+                    if let Err(err) = hq.push_classified(
+                        &subscriber.guest_id,
+                        &message,
+                        "medium",
+                        "delivery_channel_closed",
+                    ) {
+                        warn!(error = %err, "Failed to push delivery-channel-closed heal entry");
+                    }
+                }
                 stale.push(subscriber.conn_id);
+                continue;
             }
+
+            // Write confirmation: a send only proves the frame entered the
+            // channel. Watch the drain gauge until every frame enqueued so
+            // far (ours included) has been flushed to the guest socket;
+            // past the timeout, file a heal entry — the frame is sitting in
+            // a buffer the guest has not read, and the task will otherwise
+            // vanish silently (2026-07-19 Beacon dead-delivery).
+            let confirm_target = subscriber.tx.enqueued_now();
+            let sender = subscriber.tx.clone();
+            let guest_id = subscriber.guest_id.clone();
+            let role = target_role.to_string();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now()
+                    + tokio::time::Duration::from_secs(DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS);
+                loop {
+                    if sender.drained_now() >= confirm_target {
+                        debug!(
+                            %task_id,
+                            guest_id = guest_id.as_str(),
+                            "inbound task write-confirmed to guest socket"
+                        );
+                        return;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        DELIVERY_WRITE_CONFIRM_POLL_MS,
+                    ))
+                    .await;
+                }
+                warn!(
+                    %task_id,
+                    guest_id = guest_id.as_str(),
+                    role = role.as_str(),
+                    backlog = sender.backlog(),
+                    "inbound task delivery UNCONFIRMED after {DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS}s — frame never flushed to the guest socket"
+                );
+                if let Some(hq) = sender.heal.as_deref() {
+                    let message = format!(
+                        "[delivery_write_unconfirmed] inbound task {task_id} for role [{role}] guest [{guest_id}] was queued but never flushed to the guest socket within {DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS}s (backlog {})",
+                        sender.backlog()
+                    );
+                    if let Err(err) = hq.push_classified(
+                        &guest_id,
+                        &message,
+                        "high",
+                        "delivery_write_unconfirmed",
+                    ) {
+                        warn!(error = %err, "Failed to push delivery-unconfirmed heal entry");
+                    }
+                }
+            });
         }
 
         if !stale.is_empty() {
@@ -3763,7 +3968,7 @@ impl IpcServer {
         webrtc_signal_tx: Option<&mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>>,
         heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
         conn_id: Uuid,
-        outbound_tx: &mpsc::UnboundedSender<IpcResponse>,
+        outbound_tx: &CountedSender,
         subscribed_roles: &mut Vec<String>,
         current_identity: &mut Option<GuestIdentity>,
         follow_up_responses: &mut Vec<IpcResponse>,
@@ -4853,8 +5058,35 @@ impl IpcServer {
                 // ledger addressed to a node that exists nowhere and silently
                 // black-holed — surfacing only as healed zombie turns
                 // (2026-07-19 Beacon/life.observe investigation).
-                let target_node =
-                    if target_node == CLIENT_DEFAULT_NODE_ID && target_node != local_node_id {
+                //
+                // Guarded twice, because "local-aiua-01" is only *usually* a
+                // sentinel — a node can legitimately carry that literal name
+                // (bridge tests, single-node dev hotels):
+                //   1. if a mesh peer is actually NAMED local-aiua-01
+                //      (registry entry or peer socket), it is a real remote
+                //      target — e.g. the return address of a cross-hotel
+                //      reply — and must not be hijacked;
+                //   2. only rewrite when the role has a live local subscriber,
+                //      i.e. the task is actually deliverable here. Otherwise
+                //      leave the envelope alone (ledger/bridge relays may own
+                //      it) and let the unknown-node guard below make the
+                //      misroute visible instead.
+                let target_node = if target_node == CLIENT_DEFAULT_NODE_ID
+                    && target_node != local_node_id
+                {
+                    let sentinel_is_real_peer =
+                        {
+                            let reg = registry.read().await;
+                            reg.get_node(&target_node).is_some()
+                        } || peer_sockets.read().await.contains_key(&target_node);
+                    let role_has_local_subscriber = {
+                        let guard = inboxes.lock().await;
+                        guard
+                            .get(target_role.as_str())
+                            .map(|subs| !subs.is_empty())
+                            .unwrap_or(false)
+                    };
+                    if !sentinel_is_real_peer && role_has_local_subscriber {
                         info!(
                             target_role = target_role.as_str(),
                             local_node_id,
@@ -4863,7 +5095,10 @@ impl IpcServer {
                         local_node_id.to_string()
                     } else {
                         target_node
-                    };
+                    }
+                } else {
+                    target_node
+                };
                 let response_like_agent_action = response_like_agent_action_for_task(
                     &target_role,
                     target_guest_id.as_deref(),
@@ -8842,9 +9077,7 @@ impl IpcServer {
                         return IpcResponse::error(
                             "mcp_upstream",
                             "FORBIDDEN",
-                            format!(
-                                "upstream {upstream_id} is not owned by {owner_agent_id}"
-                            ),
+                            format!("upstream {upstream_id} is not owned by {owner_agent_id}"),
                         );
                     }
                     None => {
@@ -8953,11 +9186,7 @@ impl IpcServer {
                         }
                     }
                 }) {
-                    return IpcResponse::error(
-                        "mcp_upstream",
-                        "CONFIG_STORE_ERROR",
-                        e.to_string(),
-                    );
+                    return IpcResponse::error("mcp_upstream", "CONFIG_STORE_ERROR", e.to_string());
                 }
                 info!(
                     upstream_id,
@@ -27397,6 +27626,227 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&graph_db_path);
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    // ── Delivery hardening (2026-07-19 Beacon dead-delivery) ─────────────────
+
+    mod delivery_hardening {
+        use super::*;
+        use ansible_mesh_core::heal_queue::{HealQueueRow, HealQueueStorage};
+        use std::sync::Mutex as StdMutex;
+
+        /// Records `push_classified` calls: `(guest_id, raw_text, severity, pattern_tag)`.
+        #[derive(Default)]
+        struct DeliveryRecorder {
+            pushed: StdMutex<Vec<(String, String, String, String)>>,
+        }
+
+        impl DeliveryRecorder {
+            fn entries_with_pattern(&self, pattern: &str) -> usize {
+                self.pushed
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, _, _, tag)| tag == pattern)
+                    .count()
+            }
+        }
+
+        impl HealQueueStorage for DeliveryRecorder {
+            fn push_error(&self, _guest_id: &str, _raw_text: &str) -> anyhow::Result<String> {
+                panic!("delivery hardening must use push_classified");
+            }
+            fn push_classified(
+                &self,
+                guest_id: &str,
+                raw_text: &str,
+                severity: &str,
+                pattern_tag: &str,
+            ) -> anyhow::Result<Option<String>> {
+                self.pushed.lock().unwrap().push((
+                    guest_id.to_string(),
+                    raw_text.to_string(),
+                    severity.to_string(),
+                    pattern_tag.to_string(),
+                ));
+                Ok(Some("hq-delivery-1".to_string()))
+            }
+            fn pending_errors(&self, _limit: usize) -> anyhow::Result<Vec<HealQueueRow>> {
+                Ok(vec![])
+            }
+            fn update_triage(
+                &self,
+                _id: &str,
+                _severity: &str,
+                _pattern_tag: &str,
+                _heal_action: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn resolve(&self, _id: &str, _outcome: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn vacuum_old(&self, _older_than_secs: u64) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        async fn subscribe_recorded(
+            inboxes: &InboxRegistry,
+            role: &str,
+            guest_id: &str,
+            recorder: &Arc<DeliveryRecorder>,
+        ) -> (
+            mpsc::UnboundedReceiver<IpcResponse>,
+            Arc<std::sync::atomic::AtomicU64>,
+        ) {
+            let (tx, rx) = mpsc::unbounded_channel::<IpcResponse>();
+            let sender =
+                CountedSender::new(tx, Some(Arc::clone(recorder) as Arc<dyn HealQueueStorage>));
+            let drained = sender.drained_handle();
+            let mut subscribed_roles = Vec::new();
+            IpcServer::add_subscription(
+                inboxes,
+                role,
+                Uuid::new_v4(),
+                guest_id,
+                &[],
+                &sender,
+                &mut subscribed_roles,
+            )
+            .await;
+            (rx, drained)
+        }
+
+        #[test]
+        fn counted_sender_backlog_is_enqueued_minus_drained() {
+            let (tx, mut rx) = mpsc::unbounded_channel::<IpcResponse>();
+            let sender = CountedSender::new(tx, None);
+            assert_eq!(sender.backlog(), 0);
+            for _ in 0..3 {
+                sender
+                    .send(IpcResponse::success("t", None))
+                    .expect("send should succeed");
+            }
+            assert_eq!(sender.backlog(), 3);
+            // Simulate the write task flushing two frames.
+            let _ = rx.try_recv();
+            let _ = rx.try_recv();
+            sender
+                .drained_handle()
+                .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(sender.backlog(), 1);
+        }
+
+        #[tokio::test]
+        async fn wedged_subscriber_files_one_heal_entry_per_episode() {
+            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let recorder = Arc::new(DeliveryRecorder::default());
+            // rx intentionally held but never drained — alive-but-wedged guest.
+            let (_rx, _drained) =
+                subscribe_recorded(&inboxes, "life-graph-runner", "wedged-guest", &recorder).await;
+
+            for i in 0..(SUBSCRIBER_BACKLOG_WEDGE_THRESHOLD + 8) {
+                IpcServer::deliver_inbound_task(
+                    &inboxes,
+                    "test-node",
+                    "life-graph-runner",
+                    None,
+                    Uuid::new_v4(),
+                    format!("{{\"n\":{i}}}"),
+                )
+                .await;
+            }
+
+            assert_eq!(
+                recorder.entries_with_pattern("subscriber_wedged"),
+                1,
+                "wedge heal entry must latch once per episode, not per delivery"
+            );
+        }
+
+        #[tokio::test]
+        async fn unconfirmed_write_files_heal_entry_and_confirmed_write_does_not() {
+            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+            // Confirmed lane: frames drain promptly → no heal entry.
+            let confirmed_recorder = Arc::new(DeliveryRecorder::default());
+            let (mut rx, drained) =
+                subscribe_recorded(&inboxes, "agent", "healthy-guest", &confirmed_recorder).await;
+            IpcServer::deliver_inbound_task(
+                &inboxes,
+                "test-node",
+                "agent",
+                None,
+                Uuid::new_v4(),
+                "{}".into(),
+            )
+            .await;
+            let _ = rx.recv().await;
+            drained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // Unconfirmed lane: frame never drains → heal entry after timeout.
+            let wedged_recorder = Arc::new(DeliveryRecorder::default());
+            let (_rx2, _never_drained) = subscribe_recorded(
+                &inboxes,
+                "life-graph-runner",
+                "stuck-guest",
+                &wedged_recorder,
+            )
+            .await;
+            IpcServer::deliver_inbound_task(
+                &inboxes,
+                "test-node",
+                "life-graph-runner",
+                None,
+                Uuid::new_v4(),
+                "{}".into(),
+            )
+            .await;
+
+            // Wait past the (test-shortened) confirmation window.
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS * 1000 + 500,
+            ))
+            .await;
+
+            assert_eq!(
+                wedged_recorder.entries_with_pattern("delivery_write_unconfirmed"),
+                1,
+                "undrained frame must file exactly one unconfirmed heal entry"
+            );
+            assert_eq!(
+                confirmed_recorder.entries_with_pattern("delivery_write_unconfirmed"),
+                0,
+                "drained frame must not file an unconfirmed heal entry"
+            );
+        }
+
+        #[tokio::test]
+        async fn closed_channel_prunes_subscriber_and_files_heal_entry() {
+            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let recorder = Arc::new(DeliveryRecorder::default());
+            let (rx, _drained) =
+                subscribe_recorded(&inboxes, "agent", "dead-guest", &recorder).await;
+            drop(rx); // guest connection torn down — channel closed
+
+            IpcServer::deliver_inbound_task(
+                &inboxes,
+                "test-node",
+                "agent",
+                None,
+                Uuid::new_v4(),
+                "{}".into(),
+            )
+            .await;
+
+            assert_eq!(recorder.entries_with_pattern("delivery_channel_closed"), 1);
+            let guard = inboxes.lock().await;
+            assert!(
+                guard.get("agent").map(|v| v.is_empty()).unwrap_or(true),
+                "dead subscriber must be pruned from the inbox registry"
+            );
         }
     }
 }
