@@ -1758,7 +1758,7 @@ mod tests {
             Uuid::new_v4(),
             "agent-test:orchestrator",
             &[],
-            &subscriber_tx,
+            &crate::service::ipc::CountedSender::detached(&subscriber_tx),
             &mut subscribed_roles,
         )
         .await;
@@ -2496,7 +2496,7 @@ mod tests {
             Uuid::new_v4(),
             "agent-beacon",
             &[],
-            &tx,
+            &crate::service::ipc::CountedSender::detached(&tx),
             &mut subscribed_roles,
         )
         .await;
@@ -2577,7 +2577,7 @@ mod tests {
             Uuid::new_v4(),
             "agent-aria",
             &[],
-            &tx,
+            &crate::service::ipc::CountedSender::detached(&tx),
             &mut subscribed_roles,
         )
         .await;
