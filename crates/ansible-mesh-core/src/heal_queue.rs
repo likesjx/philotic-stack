@@ -380,7 +380,15 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         // A content/safety block is a request/config-shape problem (like
         // provider_4xx), not a guest-health problem — no restart or provider
         // swap fixes it, so this is escalate-not-restart, same as provider_4xx.
-        | "content_blocked" => "escalate",
+        | "content_blocked"
+        // Host-vitals breaches and dependency-probe failures filed by the
+        // hotel's host-health-scan: no guest restart relieves host pressure
+        // or brings an external service back — operator escalation only.
+        | "host_load_high"
+        | "host_cpu_high"
+        | "host_mem_pressure"
+        | "host_disk_low"
+        | "service_probe_failed" => "escalate",
         "provider_timeout" => "noop",
         _ => "noop",
     }
@@ -710,6 +718,19 @@ impl HealQueueStorage for SqliteHealQueueStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_health_tags_escalate() {
+        for tag in [
+            "host_load_high",
+            "host_cpu_high",
+            "host_mem_pressure",
+            "host_disk_low",
+            "service_probe_failed:memgraph",
+        ] {
+            assert_eq!(heal_action_for_pattern_tag(tag), "escalate", "{tag}");
+        }
+    }
 
     #[test]
     fn cap_evidence_keeps_newest_lines_within_line_and_byte_budgets() {

@@ -19,6 +19,7 @@ Source-of-truth note: this README is a convenience overview. For current impleme
 | **Outbound dispatch**     | Polls `EventLedger`, ships unacked routed events to peer hotels over TCP         |
 | **Blob service**          | HTTP server on port 9001 — content-addressed large payload store                 |
 | **State sync**            | `SyncApartment` IPC → LWW upsert into `memory_apartments`                        |
+| **Host health scan**      | Periodic vitals sample (load/CPU/mem/disk) + config-driven TCP service probes; threshold breaches file pre-classified self-heal entries (`host_*`, `service_probe_failed:*`) that the heal-dispatcher escalates to the operator. Config node `host_health.config` (live-tunable), status snapshot in `host_health.status`. |
 
 ## Key Services (`src/service/`)
 
@@ -28,6 +29,7 @@ Source-of-truth note: this README is a convenience overview. For current impleme
 - **`mesh_dispatcher.rs`** — Outbound inter-hotel routed-event dispatcher
 - **`execution_transport.rs`** — TCP execution-plane listener and point-to-point sender
 - **`webrtc_guest.rs`** — WebRTC transceiver for SDP signaling
+- **`host_health_scan.rs`** — host vitals + service-probe scan feeding the self-heal queue (successor to the vps-jane openclaw-era cron monitors)
 
 ## Environment Variables
 
