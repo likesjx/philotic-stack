@@ -5954,7 +5954,10 @@ impl AgentRuntime {
                                     if missing.is_empty() {
                                         String::new()
                                     } else {
-                                        format!("\n  stale grants (not advertised): {}", missing.join(", "))
+                                        format!(
+                                            "\n  stale grants (not advertised): {}",
+                                            missing.join(", ")
+                                        )
                                     },
                                 ));
                             }

@@ -100,15 +100,15 @@ fn passage_ref_schema() -> Value {
 fn evidence_packet_schema() -> Value {
     json!({
         "type": "object",
-        "required": [
-            "packet_id", "claim_ref", "claim_summary",
-            "confidence", "validation_state", "source_reliability",
-            "adjudication_status"
-        ],
+        // Only the claim itself is hard-required: advisory metadata parses
+        // with documented defaults, and identity fields are auto-generated
+        // when omitted (2026-07-19: model-authored observes were rejected
+        // wholesale over a missing source_reliability).
+        "required": ["claim_ref", "claim_summary"],
         "properties": {
             "packet_id": {
                 "type": "string",
-                "description": "Unique ID for this evidence packet."
+                "description": "Unique ID for this evidence packet. Optional — auto-generated when omitted."
             },
             "claim_ref": graph_record_ref_schema(),
             "claim_summary": {
@@ -128,7 +128,9 @@ fn evidence_packet_schema() -> Value {
             "confidence": {
                 "type": "number",
                 "minimum": 0,
-                "maximum": 1
+                "maximum": 1,
+                "default": 0.6,
+                "description": "How confident the observer is in the claim. Optional — defaults to 0.6 (agent-inferred tier)."
             },
             "validation_state": {
                 "type": "string",
@@ -138,7 +140,9 @@ fn evidence_packet_schema() -> Value {
             "source_reliability": {
                 "type": "number",
                 "minimum": 0,
-                "maximum": 1
+                "maximum": 1,
+                "default": 0.6,
+                "description": "How reliable the underlying source is. Optional — defaults to 0.6 (agent-inferred tier)."
             },
             "adjudication_status": {
                 "type": "string",
@@ -3156,7 +3160,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["observation_id", "evidence"],
+                "required": ["evidence"],
                 "properties": {
                     "observation_id": {
                         "type": "string",
@@ -3164,9 +3168,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "evidence": {
                         "type": "object",
-                        "required": ["packet_id", "claim_ref", "claim_summary", "source_refs",
-                                     "confidence", "validation_state", "source_reliability",
-                                     "adjudication_status"],
+                        "required": ["claim_ref", "claim_summary"],
                         "properties": {
                             "packet_id": {
                                 "type": "string",
