@@ -3059,6 +3059,21 @@ impl AgentRuntime {
             // choke point, so the turn is tagged AutoFallback to match — it is
             // not the session's configured default, even though the operator
             // never explicitly pinned it.
+            // Operator-authored cron jobs carry a narrow standing tool
+            // preapproval (`cron_preapproved_tools` — aiua forwards it only
+            // for jobs with created_by=Operator, see
+            // CronTicker::build_cron_task_json). Seed it into this session's
+            // approval policy so the unattended fire can execute the tools
+            // its instruction names instead of parking WaitingApproval with
+            // no operator awake and riding the watchdog to eviction.
+            if task.cron_job_id.is_some() {
+                for tool in &task.cron_preapproved_tools {
+                    if !state.approval_policy.preapproved_tools.contains(tool) {
+                        state.approval_policy.preapproved_tools.push(tool.clone());
+                    }
+                }
+            }
+
             let selection_source = if task.cron_job_id.is_some() {
                 SelectionSource::CronPrimary
             } else if state.pinned_tier_role.is_some() {
@@ -12433,6 +12448,181 @@ mod tests {
             .as_ref()
             .expect("turn started");
         assert_eq!(turn.selection_source, SelectionSource::CronPrimary);
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Operator-authored cron preapproval: `cron_preapproved_tools` on a
+    /// cron-delivered task must seed the session's approval policy so the
+    /// unattended fire can execute its named tools instead of parking
+    /// WaitingApproval. (aiua only forwards the field for operator-created
+    /// jobs — see CronTicker tests.)
+    #[tokio::test]
+    async fn cron_preapproved_tools_seed_session_approval_policy() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronpreapp").await;
+        let session_id = "cron:ephemeral:agent-cronpreapp";
+        runtime
+            .ensure_session_loaded(session_id, "cron")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("run the nightly backup".into()),
+                    cron_job_id: Some("job-backup".into()),
+                    cron_preapproved_tools: vec!["bash.exec".into(), "bash.exec".into()],
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        let policy = &runtime
+            .session(session_id)
+            .expect("session")
+            .approval_policy;
+        assert_eq!(
+            policy.preapproved_tools,
+            vec!["bash.exec".to_string()],
+            "cron preapproval must seed the session policy exactly once"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A non-cron task must ignore `cron_preapproved_tools` even if present —
+    /// only the CronTicker delivery path is trusted to carry it.
+    #[tokio::test]
+    async fn non_cron_task_ignores_preapproved_tools() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("nocronpre").await;
+        let session_id = "sess-nocronpre";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("hello".into()),
+                    cron_preapproved_tools: vec!["bash.exec".into()],
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .approval_policy
+                .preapproved_tools
+                .is_empty(),
+            "non-cron tasks must not seed approval policy"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// DEF-051: the model request must carry the dispatching philote's exact
+    /// IPC guest identity as `reply_guest_id`. With a roster philote and a
+    /// role-incarnation philote both subscribed under role="agent" for the
+    /// same agent, aiua's `agent_id` routing fallback is ambiguous — the
+    /// response can be consumed (and dropped as "no active turn") by the
+    /// sibling process, stranding the real turn in WaitingModel until the
+    /// 600s watchdog eviction. `reply_guest_id` feeds aiua's
+    /// `explicit_response_guest_from_payload`, which routes the response back
+    /// to the instance that owns the turn.
+    #[tokio::test]
+    async fn model_request_carries_incarnation_guest_identity() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("guestroute").await;
+        runtime.set_role_name("orchestrator");
+        let session_id = "cron:ephemeral:agent-guestroute";
+        runtime
+            .ensure_session_loaded(session_id, "cron")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("run the nightly backup".into()),
+                    cron_job_id: Some("job-backup".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        {
+            let emitted = emitted.lock().unwrap();
+            let model_req = emitted
+                .iter()
+                .find(|e| e["task"]["action"] == "generate_text")
+                .expect("model request emitted");
+            assert_eq!(
+                model_req["task"]["reply_guest_id"], "agent-guestroute:orchestrator",
+                "model request must carry the incarnation's exact guest identity"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Roster philote (no role name set): `reply_guest_id` is the bare agent
+    /// id, matching its IPC registration in `main.rs`.
+    #[tokio::test]
+    async fn model_request_carries_roster_guest_identity() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("rosterroute").await;
+        let session_id = "sess-rosterroute";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("hello".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        {
+            let emitted = emitted.lock().unwrap();
+            let model_req = emitted
+                .iter()
+                .find(|e| e["task"]["action"] == "generate_text")
+                .expect("model request emitted");
+            // Converged contract (develop's `model_reply_guest_id`): the base
+            // philote sends NO reply_guest_id — aiua's `agent_id` fallback is
+            // its own registration, so omission routes correctly.
+            assert!(
+                model_req["task"].get("reply_guest_id").is_none()
+                    || model_req["task"]["reply_guest_id"].is_null(),
+                "base philote must omit reply_guest_id (agent_id fallback is correct)"
+            );
+        }
 
         drop(runtime);
         let _ = server.await;
