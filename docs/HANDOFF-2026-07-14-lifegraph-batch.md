@@ -31,18 +31,30 @@ Drive a **multi-item `life.observe.batch` directly at the runner over IPC**, byp
 
 Node count climbed **137 → 143** over the session (family details, a car-oil-change loop, etc. **did** land), but **flight/Mali observations NEVER landed — in batch OR single writes.** So this may not be the batch machinery at all; it may be something about the flight observations themselves. The isolation repro settles it in minutes.
 
-### ⚡ 2026-07-14 ~22:20Z UPDATE — the decisive test was run; it points BELOW the provider
+### ⚡ 2026-07-14 ~22:20Z UPDATE — RETRACTED 2026-07-19 (test artifact, see below)
 
-A later session (memory-RAG audit fixes, PR #281, fleet deployed at develop `be2bdb4`) ran the isolation test above — the stock **single-item** `life_graph_ipc_smoke_driver`, both from mac-jane (cross-hotel) and **directly on vps-jane** (`sudo -u philotic`, socket `/run/philotic/vps-jane.sock`). Result, both hotels, repeated runs:
+~~A later session ran the isolation test and concluded the task dies in the hotel's park/claim/deliver layer.~~ **That conclusion was wrong — the repro was mis-addressed.** Kept for the record; see the 2026-07-19 resolution.
 
-- Driver times out: `life.observe: timed out waiting for datasource_response`.
-- The runner **never logs `received datasource task`** (journald confirmed alive — heal-dispatcher lines bracket the window).
-- **Memgraph write never happens** (`Signal WHERE id STARTS WITH "smoke-signal-"` count 18 → 18 across a run).
-- Each attempt later surfaces in **heal-dispatcher as a repaired zombie turn** (`guest_id=smoke:life-graph:life.observe:<run>`, pattern=unclassified, action=noop).
+### ✅ 2026-07-19 RESOLUTION — the "raw-driver black hole" was a mis-addressed test client; the smoke PASSES when addressed correctly
 
-Environment verified healthy at test time: hotel main PID 2096867, life-graph-runner PID 2096903 is its live child, guest record `guest:vps-jane:vps-jane:life-graph-runner` has matching `active_pid` + `is_active:true`, service env carries `PHILOTIC_MEMGRAPH_URI` / runner-home vars, no orphaned old-hotel guests.
+The 07-14 isolation runs invoked `life_graph_ipc_smoke_driver` **without `PHILOTIC_TARGET_NODE`**, so the driver defaulted `target_node` to the SDK sentinel `"local-aiua-01"`. The hotel compared that against its real node id (`vps-jane-aiua-01`), treated it as a *remote* node, and appended the TaskInvoke to the ledger addressed to a node that exists nowhere — silent black hole, later healed as a zombie turn. The hotel-side log line that gave it away (visible in `/opt/philotic/data/logs/aiua.<date>.log`, NOT journald — the hotel logs to `PHILOTIC_LOG_DIR`, only guests log to journald):
 
-**Interpretation:** for a vanilla single observe via raw IPC, the task dies in the HOTEL's park/claim/deliver layer — it never reaches the datasource guest's inbox. That rules out the flight-payload contract gate, the batch machinery, Memgraph contention, and the provider itself for THIS repro. Caveat: the raw-driver envelope (unregistered reply role) may ride a different delivery path than philote-mediated tool calls — the philote lane partially landed writes earlier today, the raw lane lands nothing tonight. Next probe: `RUST_LOG=debug` (or targeted `aiua` delivery-module logging) on vps, one driver run, and watch where the envelope stops: TaskInvoke accept → park → claim → inbox push. Also note the raw-driver smoke DID pass on vps-jane during the 2026-07-14 morning fleet deploy (a974d52), so the regression window for the raw lane is develop a974d52..be2bdb4 + the day's restarts/config changes.
+```
+EmitTask mapped to TaskInvoke for local-aiua-01/life-graph-runner guest=None
+```
+
+Correctly addressed, the full path **passes on the deployed `be2bdb4` binaries** (2026-07-19 ~20:00Z, vps-jane local):
+
+```
+PHILOTIC_TARGET_NODE=vps-jane-aiua-01 PHILOTIC_HOTEL_SOCKET=/run/philotic/vps-jane.sock life_graph_ipc_smoke_driver
+→ life.observe IPC ok / life.recall IPC ok result_count=12 / life.recall.feedback IPC ok status=recorded / PASSED
+```
+
+So: provider, runner delivery, Memgraph writes, embed, and the new `$vec` recall path are all healthy. **The philote-lane "flight observations don't land" question from this handoff is still open** (philote addresses the runner via `life_graph_runner_node_id()`, which is correctly defaulted — so the philote lane was never subject to this artifact; re-run that repro with the lesson below).
+
+Hardening landed from this: (1) the hotel now **normalizes the `local-aiua-01` sentinel to itself** in EmitTask, so unaddressed clients can no longer black-hole tasks; (2) EmitTask **warns + files a classified heal entry** (`emit_task_unknown_target_node`) when a task targets a node unknown to registry/peer-sockets; (3) the smoke driver falls back to `PHILOTIC_NODE_ID` and prints its target.
+
+Repro discipline lesson: when a smoke "proves" total breakage, first confirm the client is addressed at the node under test, and read the hotel's file log (`PHILOTIC_LOG_DIR`), not journald.
 
 ### What's ALREADY fixed (do NOT redo)
 
