@@ -1587,6 +1587,10 @@ pub struct AgentRuntime {
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
     default_agent_profile: AgentProfile,
+    /// Projected upstream MCP tools (`mcp:<upstream>.<tool>`) this agent owns
+    /// or is granted, cached from `GetMcpUpstreams`. Copied into each session's
+    /// bindings so the tool assembly projects them (proposal mcp-client-fabric).
+    mcp_upstream_tools: Vec<crate::session::McpUpstreamToolBinding>,
     /// Tasks dequeued from a session's pending_user_tasks after a turn completed.
     /// Dispatched at the top of the main event loop to avoid async recursion.
     pending_drains: std::collections::VecDeque<(Uuid, InboundTaskPayload)>,
@@ -1962,6 +1966,7 @@ impl AgentRuntime {
             configured_roles: HashMap::new(),
             openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
+            mcp_upstream_tools: Vec::new(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
             stuck_turn_signature: HashMap::new(),
@@ -1979,20 +1984,30 @@ impl AgentRuntime {
         self.role_name = Some(rn.into());
     }
 
-    /// The exact guest identity this philote registered with over IPC —
-    /// `"{agent_id}:{role_name}"` for a role-incarnation philote (mirrors
-    /// `main.rs` guest_id construction), bare `agent_id` for the roster
-    /// philote. Stamped as `reply_guest_id` on model requests so responses
-    /// come back to THIS instance: with a roster philote and a role
-    /// incarnation both subscribed under role="agent" for the same agent,
-    /// the `agent_id` routing fallback is ambiguous and the response can be
-    /// consumed (and dropped) by the sibling that has no active turn
-    /// (DEF-051).
-    pub(crate) fn ipc_guest_identity(&self) -> String {
-        match self.role_name.as_deref() {
-            Some(role_name) => format!("{}:{}", self.agent_id, role_name),
-            None => self.agent_id.clone(),
-        }
+    /// Guest id a model RESPONSE should be routed back to for this philote.
+    ///
+    /// For a role-incarnation philote (a separate process running as
+    /// `{agent_id}:{role_name}`, e.g. a whisper specialist) this is its own
+    /// incarnation id, so the reply returns to THIS process — which subscribes
+    /// to role `agent` under that incarnation guest id. Returning `None` for the
+    /// base philote is correct: `ReturnRoute::from_task` then falls back to
+    /// `agent_id`, which is the base philote's own registration. Without this,
+    /// a role specialist's model reply is addressed to the base agent and lands
+    /// in the wrong process, hanging the specialist's turn.
+    pub(crate) fn model_reply_guest_id(&self) -> Option<String> {
+        self.role_name
+            .as_ref()
+            .map(|rn| format!("{}:{}", self.agent_id, rn))
+    }
+
+    /// The concrete guest identity THIS runtime registered with the hotel —
+    /// `model_reply_guest_id()` for role incarnations, the bare `agent_id`
+    /// for base philotes. Used by the tool / life.* dispatch paths (DEF-051
+    /// part 2), which need an explicit return guest rather than the
+    /// Option-and-infer contract the model dispatch uses.
+    pub(crate) fn own_guest_id(&self) -> String {
+        self.model_reply_guest_id()
+            .unwrap_or_else(|| self.agent_id.clone())
     }
 
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
@@ -2833,7 +2848,7 @@ impl AgentRuntime {
                     chat_id: restored_chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
-                    reply_guest_id: Some(self.ipc_guest_identity()),
+                    reply_guest_id: self.model_reply_guest_id(),
                     final_reply_to: restored_reply_to,
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
@@ -3591,7 +3606,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: Some(self.ipc_guest_identity()),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -4072,7 +4087,7 @@ impl AgentRuntime {
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: Some(self.ipc_guest_identity()),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to: reentry.final_reply_to,
             final_reply_role: reentry.final_reply_role,
             final_reply_guest_id: reentry.final_reply_guest_id,
@@ -4805,7 +4820,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: Some(self.ipc_guest_identity()),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -5429,7 +5444,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: Some(self.ipc_guest_identity()),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -6625,6 +6640,67 @@ impl AgentRuntime {
     /// effective_toolset, effective_skillset, and component routing into the live session state.
     /// This ensures tool grants and runtime routing changes take effect immediately on the next
     /// message without requiring a session restart or reconnect.
+    /// Refresh the projected upstream MCP tool cache from the hotel and apply
+    /// it to every live session (proposal mcp-client-fabric). Sessions whose
+    /// projection changed get their tool assembly rebuilt, so revoked
+    /// upstreams disappear and newly reported catalogs appear.
+    pub(crate) async fn refresh_mcp_upstream_projection(&mut self) {
+        let entries = match self
+            .ipc_client
+            .send_request_with_timeout(IpcRequest::GetMcpUpstreams {}, Duration::from_secs(5))
+            .await
+        {
+            Ok(IpcResponse::McpUpstreamsState { mcp_upstreams }) => mcp_upstreams,
+            Ok(_) => return,
+            Err(e) => {
+                warn!("refresh_mcp_upstream_projection: GetMcpUpstreams failed: {e}");
+                return;
+            }
+        };
+
+        let mut projected = Vec::new();
+        for entry in entries {
+            let cfg = entry.config;
+            let granted = cfg.owner_agent_id == self.agent_id
+                || cfg.grant_agents.iter().any(|a| a == &self.agent_id);
+            if !granted {
+                continue;
+            }
+            let Some(catalog) = entry.catalog else {
+                continue;
+            };
+            for tool in catalog.tools {
+                projected.push(crate::session::McpUpstreamToolBinding {
+                    upstream_id: cfg.upstream_id.clone(),
+                    remote_name: tool.remote_name,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                });
+            }
+        }
+
+        self.mcp_upstream_tools = projected;
+        let cache = self.mcp_upstream_tools.clone();
+        for state in self.sessions.values_mut() {
+            if state.bindings.mcp_upstream_tools != cache {
+                state.bindings.mcp_upstream_tools = cache.clone();
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
+    /// Copy the cached upstream projection into one session's bindings if it
+    /// drifted (e.g. a session restored from a pre-projection checkpoint).
+    fn apply_mcp_upstream_projection(&mut self, session_id: &str) {
+        let cache = self.mcp_upstream_tools.clone();
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            if state.bindings.mcp_upstream_tools != cache {
+                state.bindings.mcp_upstream_tools = cache;
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
     async fn refresh_bindings_from_snapshot(&mut self, session_id: &str) {
         let response = self
             .ipc_client
@@ -6705,6 +6781,7 @@ impl AgentRuntime {
         fallback_source: &str,
     ) -> Result<()> {
         if self.sessions.contains_key(session_id) {
+            self.apply_mcp_upstream_projection(session_id);
             return Ok(());
         }
 
@@ -6842,6 +6919,7 @@ impl AgentRuntime {
                         }
 
                         self.sessions.insert(session_id.to_string(), state);
+                        self.apply_mcp_upstream_projection(session_id);
                         return Ok(());
                     }
                 }
@@ -6904,6 +6982,7 @@ impl AgentRuntime {
         }
 
         self.sessions.insert(session_id.to_string(), state);
+        self.apply_mcp_upstream_projection(session_id);
         Ok(())
     }
 
@@ -7463,7 +7542,7 @@ mod tests {
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
-            reply_guest_id: Some("jane".into()),
+            reply_guest_id: None,
             final_reply_to: LOCAL_NODE.into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
@@ -9129,6 +9208,43 @@ mod tests {
             arguments: serde_json::json!({}),
         });
         turn
+    }
+
+    /// A role-incarnation philote must route its model-response back to its OWN
+    /// incarnation guest id ({agent_id}:{role_name}); the base philote returns
+    /// None so `ReturnRoute::from_task`'s agent_id fallback resolves it to the
+    /// base registration. Without this a whisper specialist's model reply is
+    /// addressed to the base agent (a different process) and its turn hangs.
+    #[tokio::test]
+    async fn model_reply_guest_id_targets_own_incarnation() {
+        let socket_path = format!("/tmp/philote-mrg-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-bjork-01".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-bjork-01");
+
+        // Base philote → None (agent_id fallback is correct).
+        assert_eq!(runtime.model_reply_guest_id(), None);
+
+        // Role incarnation → its own "{agent_id}:{role_name}" id.
+        runtime.set_role_name("theoretician");
+        assert_eq!(
+            runtime.model_reply_guest_id().as_deref(),
+            Some("agent-bjork-01:theoretician"),
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     #[tokio::test]
@@ -12498,7 +12614,14 @@ mod tests {
                 .iter()
                 .find(|e| e["task"]["action"] == "generate_text")
                 .expect("model request emitted");
-            assert_eq!(model_req["task"]["reply_guest_id"], "agent-rosterroute");
+            // Converged contract (develop's `model_reply_guest_id`): the base
+            // philote sends NO reply_guest_id — aiua's `agent_id` fallback is
+            // its own registration, so omission routes correctly.
+            assert!(
+                model_req["task"].get("reply_guest_id").is_none()
+                    || model_req["task"]["reply_guest_id"].is_null(),
+                "base philote must omit reply_guest_id (agent_id fallback is correct)"
+            );
         }
 
         drop(runtime);

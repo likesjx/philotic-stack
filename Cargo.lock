@@ -2726,6 +2726,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "membrane-mcp-client"
+version = "0.1.0"
+dependencies = [
+ "ansible-mesh-core",
+ "anyhow",
+ "philotic-client",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "membrane-telegram"
 version = "0.1.0"
 dependencies = [

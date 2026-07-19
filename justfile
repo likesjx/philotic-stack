@@ -25,6 +25,12 @@ session-start:
     python3 scripts/muninn_mcp.py bootstrap
     just harness-drift 2>/dev/null || true
     bash scripts/session-start.sh
+    ./scripts/idea-sweep.sh pending || echo "⚠ idea sweep skipped (Memgraph unreachable) — run 'just idea-sweep' later"
+
+# Aria idea pipeline (stage 2): sweep + triage operator ideas in the LifeGraph.
+# Verbs: pending (default) | all | promote <idea:slug> <graph-ref> | decline <idea:slug> <reason> | ship <idea:slug> [note]
+idea-sweep *args="pending":
+    ./scripts/idea-sweep.sh {{args}}
 
 # Verify private native Muninn access, including the vps-jane SSH tunnel path.
 muninn-private-smoke:

@@ -100,15 +100,15 @@ fn passage_ref_schema() -> Value {
 fn evidence_packet_schema() -> Value {
     json!({
         "type": "object",
-        "required": [
-            "packet_id", "claim_ref", "claim_summary",
-            "confidence", "validation_state", "source_reliability",
-            "adjudication_status"
-        ],
+        // Only the claim itself is hard-required: advisory metadata parses
+        // with documented defaults, and identity fields are auto-generated
+        // when omitted (2026-07-19: model-authored observes were rejected
+        // wholesale over a missing source_reliability).
+        "required": ["claim_ref", "claim_summary"],
         "properties": {
             "packet_id": {
                 "type": "string",
-                "description": "Unique ID for this evidence packet."
+                "description": "Unique ID for this evidence packet. Optional — auto-generated when omitted."
             },
             "claim_ref": graph_record_ref_schema(),
             "claim_summary": {
@@ -128,7 +128,9 @@ fn evidence_packet_schema() -> Value {
             "confidence": {
                 "type": "number",
                 "minimum": 0,
-                "maximum": 1
+                "maximum": 1,
+                "default": 0.6,
+                "description": "How confident the observer is in the claim. Optional — defaults to 0.6 (agent-inferred tier)."
             },
             "validation_state": {
                 "type": "string",
@@ -138,7 +140,9 @@ fn evidence_packet_schema() -> Value {
             "source_reliability": {
                 "type": "number",
                 "minimum": 0,
-                "maximum": 1
+                "maximum": 1,
+                "default": 0.6,
+                "description": "How reliable the underlying source is. Optional — defaults to 0.6 (agent-inferred tier)."
             },
             "adjudication_status": {
                 "type": "string",
@@ -377,6 +381,9 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "mcp.grant_token",
             "mcp.rotate_token",
             "mcp.revoke_token",
+            "mcp.connect",
+            "mcp.disconnect",
+            "mcp.upstreams",
         ],
         _ => &[],
     }
@@ -575,6 +582,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("mcp.provision")
                 || t.contains("mcp server")
                 || t.contains("mcp route")
+                || t.contains("upstream")
+                || t.contains("connect mcp")
         }
         _ => false,
     }
@@ -595,6 +604,11 @@ pub fn tool_class(tool_name: &str) -> Option<&'static str> {
 pub fn tool_requires_approval(tool_name: &str) -> bool {
     if matches!(tool_name, "handoff.to_role" | "handoff.back") {
         return false;
+    }
+    // Projected upstream MCP tools (`mcp:<upstream>.<tool>`) are not in the
+    // catalog; they always require approval (class `mcp_remote`).
+    if tool_name.starts_with(ansible_mesh_core::mcp_upstream::MCP_PROJECTED_TOOL_PREFIX) {
+        return true;
     }
     matches!(tool_class(tool_name), Some("config") | Some("shell"))
 }
@@ -3022,6 +3036,94 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "mcp.connect".into(),
+        ToolDefinition {
+            tool_name: "mcp.connect".into(),
+            description: "Register an upstream MCP server whose tools this agent consumes. \
+                          The hotel checks the egress policy (loopback + tailnet by default), \
+                          persists the registration, and the mcp-client guest connects, lists \
+                          the server's tools, and projects the allowlisted ones into this \
+                          agent's catalog as mcp:<upstream_id>.<tool> (approval-gated). \
+                          Each remote tool must be explicitly allowlisted — nothing is \
+                          projected by default. Connection happens asynchronously; run \
+                          mcp.upstreams afterwards to see the projected tools."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "upstream_id": {
+                        "type": "string",
+                        "description": "Stable ID for this upstream (e.g. 'intel-graph')."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP(S) URL of the MCP server's JSON-RPC endpoint \
+                                        (e.g. 'http://127.0.0.1:8901/mcp'). Must be loopback, \
+                                        tailnet, or operator-allowlisted."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "description": "Remote tool names to allowlist for projection.",
+                        "items": { "type": "string" }
+                    },
+                    "grant_agents": {
+                        "type": "array",
+                        "description": "Additional agent IDs allowed to call the projected \
+                                        tools. Absent = owner only.",
+                        "items": { "type": "string" }
+                    },
+                    "credential_ref": {
+                        "type": "string",
+                        "description": "Optional vault secret ref holding the bearer token \
+                                        for this upstream (operator-provisioned)."
+                    }
+                },
+                "required": ["upstream_id", "url", "tools"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.disconnect".into(),
+        ToolDefinition {
+            tool_name: "mcp.disconnect".into(),
+            description: "Remove an upstream MCP server registration this agent owns. \
+                          Projected mcp:<upstream>.<tool> entries disappear from the \
+                          catalog and the mcp-client guest drops the connection."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "upstream_id": {
+                        "type": "string",
+                        "description": "The upstream ID to remove (must be owned by this agent)."
+                    }
+                },
+                "required": ["upstream_id"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.upstreams".into(),
+        ToolDefinition {
+            tool_name: "mcp.upstreams".into(),
+            description: "List registered upstream MCP servers: connection state, owner, \
+                          allowlisted and projected tools, and any stale grants. Also \
+                          refreshes this agent's projected mcp:<upstream>.<tool> catalog \
+                          entries from the latest reported state."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
         "agent.migrate_to".into(),
         ToolDefinition {
             tool_name: "agent.migrate_to".into(),
@@ -3058,7 +3160,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["observation_id", "evidence"],
+                "required": ["evidence"],
                 "properties": {
                     "observation_id": {
                         "type": "string",
@@ -3066,9 +3168,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "evidence": {
                         "type": "object",
-                        "required": ["packet_id", "claim_ref", "claim_summary", "source_refs",
-                                     "confidence", "validation_state", "source_reliability",
-                                     "adjudication_status"],
+                        "required": ["claim_ref", "claim_summary"],
                         "properties": {
                             "packet_id": {
                                 "type": "string",

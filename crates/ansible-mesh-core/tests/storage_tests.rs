@@ -930,6 +930,7 @@ fn graph_storage_toolset_profile_round_trip() {
         on_demand_skills: vec![],
         description: Some("Core orchestrator profile.".into()),
         remote_tool_runners: vec![],
+        seed_baseline: None,
     };
 
     store.upsert_toolset_profile(&profile).unwrap();

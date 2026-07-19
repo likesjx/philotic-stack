@@ -566,10 +566,13 @@ impl LifeGraphProvider {
         // `datasource::runtime` can tell philote it's safe to grant the model
         // one bounded retry with the cause surfaced, instead of treating this
         // like a DB/transport failure.
-        let input: LifeObserveInput = serde_json::from_value(task.parameters.clone())
+        let mut input: LifeObserveInput = serde_json::from_value(task.parameters.clone())
             .context(format!(
                 "{CONTRACT_ERROR_MARKER} failed to parse life.observe parameters as LifeObserveInput"
             ))?;
+        // Synthesize identity fields model-authored calls omit — must run
+        // before plan/validate, which require non-empty ids.
+        input.normalize_defaults();
 
         let plan = self
             .runner

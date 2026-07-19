@@ -198,15 +198,15 @@ pub struct ModelRequestPayload {
     pub chat_id: String,
     pub reply_to: String,
     pub reply_role: String,
-    /// Exact IPC guest identity of the philote instance dispatching this
-    /// request (`"{agent_id}:{role_name}"` for role incarnations, bare
-    /// `agent_id` for the roster philote). aiua's response routing reads this
-    /// (`explicit_response_guest_from_payload`) before any fallback, so the
-    /// model response returns to the instance that owns the turn instead of
-    /// whichever same-agent subscriber the `agent_id` fallback picks — a
-    /// roster/incarnation pair otherwise strands the turn in WaitingModel
-    /// until the 600s watchdog eviction (DEF-051).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Guest id the model RESPONSE must be delivered back to. Set to this
+    /// philote's own incarnation guest id (`{agent_id}:{role_name}`) for role
+    /// incarnations so the reply returns to THIS process. Without it,
+    /// `ReturnRoute::from_task` falls back to `agent_id` (the bare base agent),
+    /// so a role specialist's model reply is delivered to the BASE philote — a
+    /// different process — where it is dropped and the specialist's turn hangs
+    /// in `waiting_model` until the watchdog reaps it. `None` for the base
+    /// philote (the `agent_id` fallback is correct there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_guest_id: Option<String>,
     pub final_reply_to: String,
     pub final_reply_role: String,

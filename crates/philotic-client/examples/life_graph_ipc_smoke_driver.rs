@@ -16,9 +16,17 @@ const DEFAULT_CONFIDENCE: f64 = 0.9;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let target_node =
-        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
+    // Resolution order: explicit target > this process's node identity >
+    // the SDK sentinel "local-aiua-01" (which the hotel normalizes to
+    // itself). Misaddressing here used to black-hole every task — the
+    // 2026-07-14/19 "delivery layer broken" false alarm was exactly this
+    // driver running with neither env var set against a pre-normalization
+    // hotel.
+    let target_node = std::env::var("PHILOTIC_TARGET_NODE")
+        .or_else(|_| std::env::var("PHILOTIC_NODE_ID"))
+        .unwrap_or_else(|_| "local-aiua-01".to_string());
     let reply_node = std::env::var("PHILOTIC_REPLY_NODE").unwrap_or_else(|_| target_node.clone());
+    println!("target_node={target_node} reply_node={reply_node}");
     let node_id = format!("smoke-signal-{}", Uuid::new_v4().simple());
     let observation_id = format!("obs-{}", Uuid::new_v4().simple());
     let packet_id = format!("pkt-{}", Uuid::new_v4().simple());

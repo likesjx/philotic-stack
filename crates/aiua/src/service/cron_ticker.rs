@@ -1193,7 +1193,7 @@ mod tests {
             Uuid::new_v4(),
             "agent-test:orchestrator",
             &[],
-            &subscriber_tx,
+            &crate::service::ipc::CountedSender::detached(&subscriber_tx),
             &mut subscribed_roles,
         )
         .await;

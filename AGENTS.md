@@ -103,7 +103,7 @@ Use this split:
 
 Default memory lanes:
 
-1. **Session orientation**: before meaningful work, run the Muninn bootstrap and recall the triad: who am I, who am I talking to, what matters about this topic right now.
+1. **Session orientation**: before meaningful work, run the Muninn bootstrap and recall the triad: who am I, who am I talking to, what matters about this topic right now. `just session-start` also sweeps pending operator ideas from the LifeGraph (`just idea-sweep`) — triage them per the `$graph-intelligence` skill's Idea Sweep section.
 2. **Durable decisions**: use `muninn_decide` when there is a decision with rationale.
 3. **Reality gaps**: use `muninn_remember` for mismatches between assumption and observed repo/runtime truth.
 4. **Closeout bursts**: at slice/session end, store only the durable delta, not the whole story.

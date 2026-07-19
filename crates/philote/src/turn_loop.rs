@@ -539,7 +539,7 @@ impl AgentRuntime {
             chat_id: String::new(),
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: Some(self.ipc_guest_identity()),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to: local_node_id(),
             final_reply_role: "agent".into(),
             final_reply_guest_id: None,
@@ -658,6 +658,10 @@ impl AgentRuntime {
         // Re-advertise this philote's MCP tool routes to the hotel so that the
         // membrane-mcp guest picks them up immediately on restart.
         self.register_mcp_routes().await;
+
+        // Load projected upstream MCP tools (mcp:<upstream>.<tool>) so granted
+        // remote tools are in the catalog from the first turn.
+        self.refresh_mcp_upstream_projection().await;
 
         loop {
             // Run the watchdog every loop, not only on an idle receive timeout. A busy
@@ -1980,7 +1984,7 @@ impl AgentRuntime {
                     chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
-                    reply_guest_id: Some(self.ipc_guest_identity()),
+                    reply_guest_id: self.model_reply_guest_id(),
                     final_reply_to,
                     final_reply_role,
                     final_reply_guest_id,
@@ -2134,7 +2138,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: Some(self.ipc_guest_identity()),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -2564,7 +2568,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: Some(self.ipc_guest_identity()),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,

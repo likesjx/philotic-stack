@@ -145,9 +145,34 @@ GET  /api/health/sessions     # session hygiene: stale, orphaned, overloaded
 GET  /api/health/proposals    # proposal pipeline: dispositions, verification, embeddings
 ```
 
+## Idea Sweep (LifeGraph → intel-graph)
+
+Operator ideas texted to Aria live as LifeGraph `GrowthHypothesis` nodes with
+id `idea:<slug>` (ARIA_IDEA_PIPELINE_PROPOSAL). Surface them during
+orientation — `just session-start` runs the sweep automatically; run it
+manually with:
+
+```bash
+just idea-sweep                # pending (captured) ideas
+just idea-sweep all            # every idea with lifecycle status
+```
+
+Triage each pending idea (operator approves promotion unless standing
+approval exists for the target — manual for the first ~10 ideas):
+
+- **promote**: create the intel-graph node first (`graph_create_node` — a new
+  proposal, or a seam on an existing proposal when the idea belongs there),
+  then `just idea-sweep promote idea:<slug> <graph-ref>`. The LifeGraph node
+  stays the provenance anchor; the intel-graph node owns execution state.
+- **decline / defer**: `just idea-sweep decline idea:<slug> "<reason>"` — the
+  reason must reach the operator through Aria, never silence.
+- **shipped** (closure, at slice closeout): `just idea-sweep ship idea:<slug>`
+  — see `$philotic-slice-closeout`.
+
 ## Session Protocol
 
 1. **Orient**: `graph_status` or `graph_digest` → understand the current state
+   (and triage any pending ideas the bootstrap sweep surfaced — see Idea Sweep)
 2. **Pick work**: `graph_next_task` → scored recommendation with conflict check
 3. **Load context**: `graph_context_for` → proposal + seams + code + diagram in one call
 4. **Claim**: `session_start` → register your session against the target seam/proposal

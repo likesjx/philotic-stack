@@ -192,6 +192,7 @@ pub(super) fn life_domain_slug_for_agent(agent_id: &str) -> Option<&'static str>
 /// a cache refresh instead of a tool result.
 pub(super) fn life_recall_prefetch_task_json(
     agent_id: &str,
+    reply_guest_id: &str,
     session_id: &str,
     local_node: &str,
     named_strategy: &str,
@@ -220,7 +221,7 @@ pub(super) fn life_recall_prefetch_task_json(
         "arguments": arguments,
         "reply_to": local_node,
         "reply_role": "agent",
-        "reply_guest_id": agent_id,
+        "reply_guest_id": reply_guest_id,
         "session_id": session_id,
         "turn_id": LIFE_AUTORECALL_PREFETCH_TURN_ID,
         "chat_id": "",
@@ -1379,6 +1380,7 @@ impl AgentRuntime {
         for strategy in LIFE_AUTORECALL_STRATEGIES {
             let task_json = life_recall_prefetch_task_json(
                 &self.agent_id,
+                &self.own_guest_id(),
                 session_id,
                 &local_node,
                 strategy,
@@ -1846,14 +1848,16 @@ impl AgentRuntime {
             return_route: Some(philotic_client::ReturnRoute {
                 node: local_node_id(),
                 role: "agent".into(),
-                guest_id: Some(self.agent_id.clone()),
+                // DEF-051: route the result back to THIS runtime's own guest
+                // identity (role incarnations are "{agent_id}:{role_name}").
+                guest_id: Some(self.own_guest_id()),
                 session_id: Some(session_id.clone()),
                 turn_id: Some(turn_id.clone()),
                 correlation_id: None,
             }),
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: Some(self.agent_id.clone()),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to: reply_to.clone(),
             final_reply_role: reply_role.clone(),
             final_reply_guest_id: reply_guest_id.clone(),
@@ -2604,8 +2608,11 @@ mod tests {
     #[test]
     fn life_recall_prefetch_task_json_matches_runner_contract() {
         let long_topic = "x".repeat(600);
+        // DEF-051: reply_guest_id is the dispatching RUNTIME's registered
+        // identity — for a role incarnation it differs from agent_id.
         let task = life_recall_prefetch_task_json(
             "agent-beacon-01",
+            "agent-beacon-01:orchestrator",
             "sess-1",
             "mbp-jane-aiua-01",
             "re_entry_context",
@@ -2618,7 +2625,7 @@ mod tests {
         assert_eq!(task["session_id"], "sess-1");
         assert_eq!(task["reply_to"], "mbp-jane-aiua-01");
         assert_eq!(task["reply_role"], "agent");
-        assert_eq!(task["reply_guest_id"], "agent-beacon-01");
+        assert_eq!(task["reply_guest_id"], "agent-beacon-01:orchestrator");
 
         let args = &task["arguments"];
         assert_eq!(args["named_strategy"], "re_entry_context");
@@ -2668,6 +2675,7 @@ mod tests {
         // placeholder — same seeding path the other two strategies already use.
         let current_message = "Did I ever follow up with the vet about Fig's checkup?";
         let task = life_recall_prefetch_task_json(
+            "agent-jane-01",
             "agent-jane-01",
             "sess-42",
             "mbp-jane-aiua-01",

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Every session MUST begin with these steps in order:
 1.  **Read [AGENTS.md](file:///Users/jaredlikes/code/philotic-stack/AGENTS.md)**: Adopt the standing protocol.
 2.  **Query the Project Graph**: If the graph server is running (`just intel-graph-ensure`), use MCP tools (`graph_status`, `graph_digest`) for a complete picture of what's in flight. The graph is faster and more complete than reading raw files but is NOT required — agents can work effectively without it. See `$graph-intelligence` skill.
-3.  **Orient and Recall**: Run `just session-start` to bootstrap Muninn. Use `$muninn-memory-habit` for cognitive context and the Muninn triad: self, user, topic. The graph gives you structural facts; Muninn gives you learned context.
+3.  **Orient and Recall**: Run `just session-start` to bootstrap Muninn (it also runs the LifeGraph idea sweep — triage any pending operator ideas per `$graph-intelligence` § Idea Sweep). Use `$muninn-memory-habit` for cognitive context and the Muninn triad: self, user, topic. The graph gives you structural facts; Muninn gives you learned context.
     - Trusted local Claude clients may use Muninn's native stdio proxy (`muninn mcp`) against the loopback listener; do not expose native Muninn MCP publicly.
 4.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to confirm the baseline is stable before editing.
 5.  **Record Decisions**: After completing work, use `graph_decide` (MCP) or `phil graph decide` to record what you did and why. Use `muninn_decide` / `muninn_remember` for the durable memory delta: decisions, reality gaps, validation outcomes, next seams, and operator preferences.
@@ -110,6 +110,8 @@ The Philotic Stack is a distributed AI agent OS (Rust). Metaphor: **Hotel** (nod
 - `philote`: Persona/agent cognitive loop guest.
 - `model-router`: Model provider routing guest (Gemini/ElevenLabs).
 - `tool-runner`: Seeded/inactive tool execution guest.
+- `membrane-mcp`: MCP gateway guest (serves tools to external MCP clients).
+- `membrane-mcp-client`: MCP client guest (consumes upstream MCP servers; `mcp:<upstream>.<tool>` projection).
 
 ### Communication
 

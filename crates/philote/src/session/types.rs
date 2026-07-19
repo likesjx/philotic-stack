@@ -1553,6 +1553,28 @@ pub struct SessionBindings {
     /// by `default_visible_toolset` using the local catalog's class annotations.
     #[serde(default)]
     pub allowed_classes: Vec<String>,
+    /// Remote MCP tools projected from registered upstream servers this agent
+    /// owns or is granted (proposal `mcp-client-fabric`). Each entry becomes a
+    /// `mcp:<upstream>.<tool>` ToolDefinition in the assembly with class
+    /// `mcp_remote` (approval-required) and an execution route to the
+    /// `mcp-client-runner` guest. Refreshed by the runtime from
+    /// `GetMcpUpstreams`; descriptions/schemas are third-party content.
+    #[serde(default)]
+    pub mcp_upstream_tools: Vec<McpUpstreamToolBinding>,
+}
+
+/// One projected upstream MCP tool bound into a session (see
+/// [`SessionBindings::mcp_upstream_tools`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct McpUpstreamToolBinding {
+    pub upstream_id: String,
+    pub remote_name: String,
+    /// Remote description verbatim — untrusted third-party content.
+    #[serde(default)]
+    pub description: String,
+    /// Remote input schema verbatim (a JSON object).
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

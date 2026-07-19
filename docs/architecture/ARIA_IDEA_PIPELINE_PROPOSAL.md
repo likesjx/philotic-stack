@@ -3,7 +3,7 @@ title: Aria Idea Pipeline — Operator Ideas to Implemented Slices
 doc_type: proposal
 domain: product-management-plane
 status: active
-last_updated: 2026-07-15
+last_updated: 2026-07-16
 tags:
 - idea-intake
 - aria
@@ -96,6 +96,16 @@ ownership split in LIFE_GRAPH_OS_PROPOSAL.
 
 ## Stage 2 — `idea-triage-sweep` (coding sessions)
 
+> **Implemented 2026-07-16** (`codex/idea-triage-sweep`): `scripts/idea-sweep.sh`
+> + `just idea-sweep` (wired into `just session-start`), triage flow in
+> `$graph-intelligence` § Idea Sweep. **Reality gap discovered**: `life.observe`
+> writes a fixed property set — the custom `idea_kind`/`target`/`idea_status`
+> properties in the intake convention have no runner write path, so the
+> convention is now **absence of `idea_status` means `captured`**; all status
+> transitions are written by the triage pipeline via direct Memgraph cypher
+> (named transitional — no provenance envelope, no LifeGraphChange push; a
+> governed session-side life.* write client is the successor seam).
+
 - Add an **idea sweep** step to the session-bootstrap path of coding agents
   (`skills/graph-intelligence` + `session-hygiene`, and AGENTS.md §Bootstrap):
   after Muninn recall, query pending ideas (`life.recall` with idea-tag
@@ -113,6 +123,14 @@ ownership split in LIFE_GRAPH_OS_PROPOSAL.
   orientation and round-trips to `promoted` with a real graph node.
 
 ## Stage 3 — `idea-closure-loop`
+
+> **Implemented 2026-07-16** (`codex/idea-closure-loop`): `just idea-sweep ship`
+> wired into `$philotic-slice-closeout` step 3; Aria's charter gained closure
+> delivery (shipped-idea digest, decline reasons always relayed, anti-nagging)
+> and dropped the unwritable intake properties (see the Stage 2 reality gap).
+> The `LifeGraphChange` push on ship remains a transitional gap — the direct
+> cypher write bypasses the runner; the app badge arrives with the governed
+> session-side life.* write client (successor seam).
 
 - When a promoted idea's slice merges (session closeout), the closing session
   sets `idea_status: shipped` on the LifeGraph node and emits the existing
@@ -142,10 +160,11 @@ the slice, on `doc:native-apple-app-proposal`):
 
 ## Disposition
 
-`accepted for current slice` — slice 1 (`idea-intake-charter`) in flight
-on `codex/aria-idea-intake-charter` (2026-07-15): items 1–3 implemented
-(catalog keywords + charter text + schema convention note); item 4 (mbp-jane
-deploy + watched-live) pending rollout.
+`implemented` — all three stages landed (slice 1 PR #289, slice 2 PR #294,
+slice 3 `codex/idea-closure-loop`); watched-live intake verification (operator
+texts Aria, node lands) pending operator. Deferred by design: cron
+`idea_digest` paracrine signal; governed session-side life.* write client
+(restores provenance envelope + LifeGraphChange push on status transitions).
 
 ## Current Slice (for the picking-up session)
 

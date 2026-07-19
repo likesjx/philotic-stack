@@ -33,9 +33,10 @@ pub enum ValidationState {
     Conflicted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AdjudicationStatus {
+    #[default]
     NotNeeded,
     Pending,
     MuninnFirst,
@@ -114,8 +115,29 @@ pub struct TimeRange {
     pub ends_at: Option<String>,
 }
 
+/// Default confidence/reliability for evidence whose author did not grade
+/// it: the agent-inferred tier (matches the auto-capture lane's constants).
+fn default_evidence_score() -> f32 {
+    0.6
+}
+
+/// Evidence enters the graph as `proposed` unless the author says otherwise —
+/// `life.observe` proposes, only `life.commit` confirms.
+fn default_validation_state() -> ValidationState {
+    ValidationState::Proposed
+}
+
+/// Model-authored tool calls routinely omit advisory metadata fields even
+/// when the projected schema documents them (live failure 2026-07-19: Aria's
+/// `life.observe` rejected with `missing field 'source_reliability'`, blocking
+/// every model-authored observation while the auto-capture lane — which
+/// builds its own payload — kept landing writes). Advisory fields therefore
+/// parse with documented defaults; only the claim itself (`claim_ref`,
+/// `claim_summary`) stays hard-required. Identity fields default to empty and
+/// are synthesized by [`LifeObserveInput::normalize_defaults`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePacket {
+    #[serde(default)]
     pub packet_id: PacketId,
     pub claim_ref: GraphRecordRef,
     pub claim_summary: String,
@@ -123,15 +145,19 @@ pub struct EvidencePacket {
     pub source_refs: Vec<SourceRef>,
     #[serde(default)]
     pub passage_refs: Vec<PassageRef>,
+    #[serde(default = "default_evidence_score")]
     pub confidence: f32,
+    #[serde(default = "default_validation_state")]
     pub validation_state: ValidationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_time_range: Option<TimeRange>,
+    #[serde(default = "default_evidence_score")]
     pub source_reliability: f32,
     #[serde(default)]
     pub conflict_ids: Vec<ConflictId>,
+    #[serde(default)]
     pub adjudication_status: AdjudicationStatus,
     #[serde(default)]
     pub metadata: serde_json::Value,
@@ -931,10 +957,12 @@ impl ContextPacket {
 #[serde(rename_all = "snake_case")]
 pub enum LifeGraphToolName {
     LifeObserve,
+    LifeObserveBatch,
     LifeRecall,
     LifeRecallFeedback,
     LifeCommit,
     LifeResolve,
+    LifeConflict,
     LifePatchPropose,
 }
 
@@ -942,10 +970,12 @@ impl LifeGraphToolName {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::LifeObserve => "life.observe",
+            Self::LifeObserveBatch => "life.observe.batch",
             Self::LifeRecall => "life.recall",
             Self::LifeRecallFeedback => "life.recall.feedback",
             Self::LifeCommit => "life.commit",
             Self::LifeResolve => "life.resolve",
+            Self::LifeConflict => "life.conflict",
             Self::LifePatchPropose => "life.patch.propose",
         }
     }
@@ -954,6 +984,7 @@ impl LifeGraphToolName {
         matches!(
             self,
             Self::LifeObserve
+                | Self::LifeObserveBatch
                 | Self::LifeRecallFeedback
                 | Self::LifeCommit
                 | Self::LifeResolve
@@ -997,6 +1028,11 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
             false,
         ),
         LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeObserveBatch,
+            "Capture multiple grounded observations as proposed Life Graph evidence in one call.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
             LifeGraphToolName::LifeRecall,
             "Build an evidence-backed Life Graph retrieval context packet.",
             false,
@@ -1015,6 +1051,11 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
             LifeGraphToolName::LifeResolve,
             "Resolve a Life Graph conflict handoff with Muninn/operator policy gates.",
             true,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeConflict,
+            "List or inspect open Life Graph conflicts awaiting resolution.",
+            false,
         ),
         LifeGraphToolSpec::new(
             LifeGraphToolName::LifePatchPropose,
@@ -1443,6 +1484,9 @@ pub struct ObserveEdge {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifeObserveInput {
+    /// Defaults to empty for model-authored calls;
+    /// [`Self::normalize_defaults`] synthesizes a ULID-backed id.
+    #[serde(default)]
     pub observation_id: String,
     pub evidence: EvidencePacket,
     #[serde(default)]
@@ -1465,6 +1509,22 @@ pub struct LifeObserveInput {
     /// those deserializing unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ansible_mesh_core::provenance::ProvenanceEnvelope>,
+}
+
+impl LifeObserveInput {
+    /// Fill identity fields a model-authored call may omit. Contract
+    /// validation (`EvidencePacket::validate`) requires non-empty ids, so
+    /// this must run after parse and before `plan`/`validate` — the handler
+    /// calls it as its first post-parse step.
+    pub fn normalize_defaults(&mut self) {
+        if self.observation_id.trim().is_empty() {
+            self.observation_id = format!("obs-{}", ulid::Ulid::new().to_string().to_lowercase());
+        }
+        if self.evidence.packet_id.trim().is_empty() {
+            self.evidence.packet_id =
+                format!("evidence-{}", ulid::Ulid::new().to_string().to_lowercase());
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2114,6 +2174,74 @@ fn finish_validation(violations: Vec<String>) -> Result<(), ContractError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn model_authored_observe_without_advisory_fields_parses_and_validates() {
+        // Regression for the 2026-07-19 live failure: Aria's life.observe was
+        // rejected with `missing field 'source_reliability'` — a model-shaped
+        // payload carrying only the claim must parse, normalize, and pass
+        // contract validation with documented defaults.
+        let payload = serde_json::json!({
+            "evidence": {
+                "claim_ref": {
+                    "id": "life:openloop:aria-test",
+                    "label": "OpenLoop",
+                    "datasource": "life-graph"
+                },
+                "claim_summary": "Operator wants the delivery mechanism hardened.",
+                "source_refs": [{
+                    "source_id": "agent:agent-aria-01",
+                    "source_kind": "agent_inference",
+                    "reliability": { "score": 0.7, "basis": "agent_inferred" }
+                }]
+            }
+        });
+
+        let mut input: LifeObserveInput =
+            serde_json::from_value(payload).expect("model-shaped observe payload must parse");
+        assert_eq!(input.evidence.source_reliability, 0.6);
+        assert_eq!(input.evidence.confidence, 0.6);
+        assert_eq!(input.evidence.validation_state, ValidationState::Proposed);
+        assert_eq!(
+            input.evidence.adjudication_status,
+            AdjudicationStatus::NotNeeded
+        );
+
+        input.normalize_defaults();
+        assert!(input.observation_id.starts_with("obs-"));
+        assert!(input.evidence.packet_id.starts_with("evidence-"));
+        input
+            .evidence
+            .validate()
+            .expect("normalized minimal evidence must pass contract validation");
+    }
+
+    #[test]
+    fn normalize_defaults_never_overwrites_supplied_ids() {
+        let mut input: LifeObserveInput = serde_json::from_value(serde_json::json!({
+            "observation_id": "obs:rowing-2026-06-05",
+            "evidence": {
+                "packet_id": "evidence:rowing-1",
+                "claim_ref": { "id": "life:habit:rowing", "label": "Habit" },
+                "claim_summary": "Rows most mornings before work.",
+                "source_refs": [{
+                    "source_id": "agent:agent-coach-01",
+                    "source_kind": "agent_inference",
+                    "reliability": { "score": 0.8, "basis": "agent_inferred" }
+                }],
+                "confidence": 0.9,
+                "validation_state": "proposed",
+                "source_reliability": 0.85,
+                "adjudication_status": "not_needed"
+            }
+        }))
+        .expect("fully-specified payload must keep parsing");
+        input.normalize_defaults();
+        assert_eq!(input.observation_id, "obs:rowing-2026-06-05");
+        assert_eq!(input.evidence.packet_id, "evidence:rowing-1");
+        assert_eq!(input.evidence.source_reliability, 0.85);
+        assert_eq!(input.evidence.confidence, 0.9);
+    }
+
     fn graph_ref(id: &str) -> GraphRecordRef {
         GraphRecordRef {
             id: id.into(),
@@ -2571,14 +2699,21 @@ mod tests {
         let catalog = runner.tool_catalog();
         let tool_names: Vec<_> = catalog.iter().map(|tool| tool.tool_name.as_str()).collect();
 
+        // Must stay in lockstep with the grant surface: the `life_graph` tool
+        // class (ansible_mesh_core::graph::tools_for_tool_class) and the
+        // `life.steward` skill both expose all 8 life.* tools. A declared
+        // catalog narrower than the grant surface is the PR #271 failure
+        // pattern (granted tool with no declared route).
         assert_eq!(
             tool_names,
             vec![
                 "life.observe",
+                "life.observe.batch",
                 "life.recall",
                 "life.recall.feedback",
                 "life.commit",
                 "life.resolve",
+                "life.conflict",
                 "life.patch.propose"
             ]
         );
