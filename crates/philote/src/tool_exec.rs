@@ -730,14 +730,18 @@ impl AgentRuntime {
                 return_route: Some(philotic_client::ReturnRoute {
                     node: local_node_id(),
                     role: "agent".into(),
-                    guest_id: Some(self.agent_id.clone()),
+                    // DEF-051: the runtime's OWN guest identity, not the bare
+                    // agent id — tool results must come back to the runtime
+                    // that holds the turn (role incarnations register as
+                    // "{agent_id}:{role_name}").
+                    guest_id: Some(self.own_guest_id()),
                     session_id: Some(session_id.clone()),
                     turn_id: Some(turn_id.clone()),
                     correlation_id: None,
                 }),
                 reply_to: local_node_id(),
                 reply_role: "agent".into(),
-                reply_guest_id: Some(self.agent_id.clone()),
+                reply_guest_id: Some(self.own_guest_id()),
                 final_reply_to,
                 final_reply_role,
                 final_reply_guest_id,

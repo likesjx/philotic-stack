@@ -101,6 +101,10 @@ impl AgentRuntime {
                 "arguments": serde_json::to_value(&observe_input)?,
                 "reply_to": node_id,
                 "reply_role": "agent",
+                // DEF-051: address the (fire-and-forget) result back to THIS
+                // runtime's registered guest so it doesn't land in a sibling
+                // runtime's inbox via the bare-agent-id inference.
+                "reply_guest_id": self.own_guest_id(),
                 "session_id": "",
                 "turn_id": "",
                 "chat_id": "",

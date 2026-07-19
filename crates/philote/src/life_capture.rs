@@ -463,6 +463,7 @@ pub(super) fn life_autocapture_edges(agent_id: &str) -> Vec<Value> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn life_autocapture_task_json(
     agent_id: &str,
+    reply_guest_id: &str,
     session_id: &str,
     origin_turn_id: &str,
     chat_id: &str,
@@ -529,7 +530,7 @@ pub(super) fn life_autocapture_task_json(
         "arguments": arguments,
         "reply_to": local_node,
         "reply_role": "agent",
-        "reply_guest_id": agent_id,
+        "reply_guest_id": reply_guest_id,
         "session_id": session_id,
         "turn_id": LIFE_AUTOCAPTURE_TURN_ID,
         "chat_id": "",
@@ -640,6 +641,7 @@ impl AgentRuntime {
 
         let task_json = life_autocapture_task_json(
             &self.agent_id,
+            &self.own_guest_id(),
             session_id,
             &origin_turn_id,
             &chat_id,
@@ -1080,6 +1082,7 @@ mod tests {
         };
         let task = life_autocapture_task_json(
             "agent-beacon-01",
+            "agent-beacon-01",
             "sess-1",
             "turn-real-1",
             "chat-9",
@@ -1178,6 +1181,7 @@ mod tests {
         );
         let task = life_autocapture_task_json(
             "agent-beacon-01",
+            "agent-beacon-01",
             "sess-1",
             "turn-1",
             "chat-1",
@@ -1209,6 +1213,7 @@ mod tests {
         };
         let _task = life_autocapture_task_json(
             "agent-beacon-01",
+            "agent-beacon-01",
             "sess-1",
             "turn-1",
             "chat-1",
@@ -1235,6 +1240,7 @@ mod tests {
             &[],
         );
         let task = life_autocapture_task_json(
+            "agent-jane-01",
             "agent-jane-01",
             "sess-1",
             "turn-1",
