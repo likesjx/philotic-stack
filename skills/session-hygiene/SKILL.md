@@ -9,7 +9,7 @@ Sessions are the coordination primitive for multi-agent work. Without hygiene, s
 
 ## When to Run
 
-- **Session start**: Quick health check before claiming work
+- **Session start**: Quick health check before claiming work; `just session-start` also runs the LifeGraph idea sweep (`just idea-sweep`) — triage pending operator ideas per `$graph-intelligence` § Idea Sweep
 - **Check-engine**: Full sweep as part of the E step
 - **On-demand**: When the dashboard shows suspicious activity
 - **Automated**: Via `just intel-graph-session-cleanup` (cron-friendly)

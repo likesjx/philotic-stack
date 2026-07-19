@@ -3,7 +3,7 @@ title: Aria Idea Pipeline — Operator Ideas to Implemented Slices
 doc_type: proposal
 domain: product-management-plane
 status: active
-last_updated: 2026-07-15
+last_updated: 2026-07-16
 tags:
 - idea-intake
 - aria
@@ -95,6 +95,16 @@ ownership split in LIFE_GRAPH_OS_PROPOSAL.
   in Memgraph and in the app's Life surface.
 
 ## Stage 2 — `idea-triage-sweep` (coding sessions)
+
+> **Implemented 2026-07-16** (`codex/idea-triage-sweep`): `scripts/idea-sweep.sh`
+> + `just idea-sweep` (wired into `just session-start`), triage flow in
+> `$graph-intelligence` § Idea Sweep. **Reality gap discovered**: `life.observe`
+> writes a fixed property set — the custom `idea_kind`/`target`/`idea_status`
+> properties in the intake convention have no runner write path, so the
+> convention is now **absence of `idea_status` means `captured`**; all status
+> transitions are written by the triage pipeline via direct Memgraph cypher
+> (named transitional — no provenance envelope, no LifeGraphChange push; a
+> governed session-side life.* write client is the successor seam).
 
 - Add an **idea sweep** step to the session-bootstrap path of coding agents
   (`skills/graph-intelligence` + `session-hygiene`, and AGENTS.md §Bootstrap):
