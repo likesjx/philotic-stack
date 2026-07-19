@@ -82,6 +82,19 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+/// The guest identity a philote registers under and stamps as `reply_guest_id`
+/// on its dispatches: the bare `agent_id` for a base philote, or
+/// `"{agent_id}:{role_name}"` for a role incarnation. Keeping the registration
+/// shape and the reply-address shape in one place is what lets the hotel deliver
+/// a response back to the subscription owned by the runtime that holds the turn
+/// (DEF-051).
+pub fn compose_guest_identity(agent_id: &str, role_name: Option<&str>) -> String {
+    match role_name {
+        Some(role_name) => format!("{agent_id}:{role_name}"),
+        None => agent_id.to_string(),
+    }
+}
+
 /// Best-effort chat_id recovery for out-of-turn dispatch, when there is no
 /// active `WorkingTurn` to read `chat_id` from directly. Mirrors the
 /// session_id encoding from `InboundTaskPayload::session_id_or_default`
@@ -1984,20 +1997,21 @@ impl AgentRuntime {
         self.role_name = Some(rn.into());
     }
 
-    /// Guest id a model RESPONSE should be routed back to for this philote.
+    /// This philote's own registered guest identity — the value stamped as
+    /// `reply_guest_id` on every model/tool/life dispatch so the hotel delivers
+    /// the response back to the subscription owned by THIS runtime (the one
+    /// holding the active turn).
     ///
     /// For a role-incarnation philote (a separate process running as
     /// `{agent_id}:{role_name}`, e.g. a whisper specialist) this is its own
     /// incarnation id, so the reply returns to THIS process — which subscribes
-    /// to role `agent` under that incarnation guest id. Returning `None` for the
-    /// base philote is correct: `ReturnRoute::from_task` then falls back to
-    /// `agent_id`, which is the base philote's own registration. Without this,
-    /// a role specialist's model reply is addressed to the base agent and lands
-    /// in the wrong process, hanging the specialist's turn.
-    pub(crate) fn model_reply_guest_id(&self) -> Option<String> {
-        self.role_name
-            .as_ref()
-            .map(|rn| format!("{}:{}", self.agent_id, rn))
+    /// to role `agent` under that incarnation guest id. For the base philote it
+    /// is the bare `agent_id`, matching its own registration. Without stamping
+    /// it, `ReturnRoute::from_task` falls back to the bare `agent_id` and a role
+    /// specialist's reply is addressed to the base agent — the wrong process —
+    /// hanging the specialist's turn (DEF-051).
+    pub(super) fn own_guest_id(&self) -> String {
+        compose_guest_identity(&self.agent_id, self.role_name.as_deref())
     }
 
     /// The concrete guest identity THIS runtime registered with the hotel —
@@ -2848,7 +2862,7 @@ impl AgentRuntime {
                     chat_id: restored_chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
-                    reply_guest_id: self.model_reply_guest_id(),
+                    reply_guest_id: Some(self.own_guest_id()),
                     final_reply_to: restored_reply_to,
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
@@ -3606,7 +3620,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: self.model_reply_guest_id(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -4087,7 +4101,7 @@ impl AgentRuntime {
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: self.model_reply_guest_id(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to: reentry.final_reply_to,
             final_reply_role: reentry.final_reply_role,
             final_reply_guest_id: reentry.final_reply_guest_id,
@@ -4820,7 +4834,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: self.model_reply_guest_id(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -5444,7 +5458,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
-            reply_guest_id: self.model_reply_guest_id(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -9210,13 +9224,24 @@ mod tests {
         turn
     }
 
-    /// A role-incarnation philote must route its model-response back to its OWN
-    /// incarnation guest id ({agent_id}:{role_name}); the base philote returns
-    /// None so `ReturnRoute::from_task`'s agent_id fallback resolves it to the
-    /// base registration. Without this a whisper specialist's model reply is
-    /// addressed to the base agent (a different process) and its turn hangs.
+    /// DEF-051: `own_guest_id` is both the hotel registration identity AND the
+    /// `reply_guest_id` stamped on every dispatch — the bare agent id for a base
+    /// philote, `{agent_id}:{role_name}` for a role incarnation. A role
+    /// specialist must stamp its incarnation id so its model reply returns to
+    /// THIS process instead of the base agent's (which would hang its turn).
+    #[test]
+    fn compose_guest_identity_matches_registration_shapes() {
+        use super::compose_guest_identity;
+        assert_eq!(compose_guest_identity("agent-bjork-01", None), "agent-bjork-01");
+        assert_eq!(
+            compose_guest_identity("agent-bjork-01", Some("theoretician")),
+            "agent-bjork-01:theoretician"
+        );
+    }
+
+    /// End-to-end shape of the reply address a role-incarnation runtime stamps.
     #[tokio::test]
-    async fn model_reply_guest_id_targets_own_incarnation() {
+    async fn own_guest_id_targets_own_incarnation() {
         let socket_path = format!("/tmp/philote-mrg-{}.sock", Uuid::new_v4().simple());
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -9232,15 +9257,12 @@ mod tests {
             .expect("connect to stub hotel");
         let mut runtime = AgentRuntime::new(client, "agent-bjork-01");
 
-        // Base philote → None (agent_id fallback is correct).
-        assert_eq!(runtime.model_reply_guest_id(), None);
+        // Base philote → bare agent id (matches its own registration).
+        assert_eq!(runtime.own_guest_id(), "agent-bjork-01");
 
         // Role incarnation → its own "{agent_id}:{role_name}" id.
         runtime.set_role_name("theoretician");
-        assert_eq!(
-            runtime.model_reply_guest_id().as_deref(),
-            Some("agent-bjork-01:theoretician"),
-        );
+        assert_eq!(runtime.own_guest_id(), "agent-bjork-01:theoretician");
 
         drop(runtime);
         let _ = server.await;
