@@ -2014,16 +2014,6 @@ impl AgentRuntime {
         compose_guest_identity(&self.agent_id, self.role_name.as_deref())
     }
 
-    /// The concrete guest identity THIS runtime registered with the hotel —
-    /// `model_reply_guest_id()` for role incarnations, the bare `agent_id`
-    /// for base philotes. Used by the tool / life.* dispatch paths (DEF-051
-    /// part 2), which need an explicit return guest rather than the
-    /// Option-and-infer contract the model dispatch uses.
-    pub(crate) fn own_guest_id(&self) -> String {
-        self.model_reply_guest_id()
-            .unwrap_or_else(|| self.agent_id.clone())
-    }
-
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
     /// Applied to every new session so the correct persona is used from the first message.
     async fn fetch_agent_profile(&mut self) {
@@ -12607,8 +12597,11 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    /// Roster philote (no role name set): `reply_guest_id` is the bare agent
-    /// id, matching its IPC registration in `main.rs`.
+    /// Roster (base) philote: every dispatch — model, tool, and life.* — now
+    /// explicitly stamps `reply_guest_id = own_guest_id()`, which for a base
+    /// philote is the bare agent id matching its IPC registration in `main.rs`.
+    /// (Converged onto always-stamp: consistent with the tool/life paths and no
+    /// longer dependent on aiua's `agent_id` fallback inference.)
     #[tokio::test]
     async fn model_request_carries_roster_guest_identity() {
         let (mut runtime, emitted, server, socket_path) = plan_test_runtime("rosterroute").await;
@@ -12636,13 +12629,13 @@ mod tests {
                 .iter()
                 .find(|e| e["task"]["action"] == "generate_text")
                 .expect("model request emitted");
-            // Converged contract (develop's `model_reply_guest_id`): the base
-            // philote sends NO reply_guest_id — aiua's `agent_id` fallback is
-            // its own registration, so omission routes correctly.
-            assert!(
-                model_req["task"].get("reply_guest_id").is_none()
-                    || model_req["task"]["reply_guest_id"].is_null(),
-                "base philote must omit reply_guest_id (agent_id fallback is correct)"
+            // Converged contract: every dispatch explicitly stamps its own guest
+            // identity. For a base philote that is the bare agent id (its own
+            // registration), so the response routes back to this runtime.
+            assert_eq!(
+                model_req["task"]["reply_guest_id"].as_str(),
+                Some("agent-rosterroute"),
+                "base philote must stamp its bare agent id as reply_guest_id"
             );
         }
 
