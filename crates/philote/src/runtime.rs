@@ -1979,6 +1979,22 @@ impl AgentRuntime {
         self.role_name = Some(rn.into());
     }
 
+    /// The exact guest identity this philote registered with over IPC —
+    /// `"{agent_id}:{role_name}"` for a role-incarnation philote (mirrors
+    /// `main.rs` guest_id construction), bare `agent_id` for the roster
+    /// philote. Stamped as `reply_guest_id` on model requests so responses
+    /// come back to THIS instance: with a roster philote and a role
+    /// incarnation both subscribed under role="agent" for the same agent,
+    /// the `agent_id` routing fallback is ambiguous and the response can be
+    /// consumed (and dropped) by the sibling that has no active turn
+    /// (DEF-051).
+    pub(crate) fn ipc_guest_identity(&self) -> String {
+        match self.role_name.as_deref() {
+            Some(role_name) => format!("{}:{}", self.agent_id, role_name),
+            None => self.agent_id.clone(),
+        }
+    }
+
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
     /// Applied to every new session so the correct persona is used from the first message.
     async fn fetch_agent_profile(&mut self) {
@@ -2817,6 +2833,7 @@ impl AgentRuntime {
                     chat_id: restored_chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
+                    reply_guest_id: Some(self.ipc_guest_identity()),
                     final_reply_to: restored_reply_to,
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
@@ -3559,6 +3576,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.ipc_guest_identity()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -4039,6 +4057,7 @@ impl AgentRuntime {
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.ipc_guest_identity()),
             final_reply_to: reentry.final_reply_to,
             final_reply_role: reentry.final_reply_role,
             final_reply_guest_id: reentry.final_reply_guest_id,
@@ -4771,6 +4790,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.ipc_guest_identity()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -5394,6 +5414,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.ipc_guest_identity()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -7427,6 +7448,7 @@ mod tests {
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
+            reply_guest_id: Some("jane".into()),
             final_reply_to: LOCAL_NODE.into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
@@ -12295,6 +12317,92 @@ mod tests {
             .as_ref()
             .expect("turn started");
         assert_eq!(turn.selection_source, SelectionSource::CronPrimary);
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// DEF-051: the model request must carry the dispatching philote's exact
+    /// IPC guest identity as `reply_guest_id`. With a roster philote and a
+    /// role-incarnation philote both subscribed under role="agent" for the
+    /// same agent, aiua's `agent_id` routing fallback is ambiguous — the
+    /// response can be consumed (and dropped as "no active turn") by the
+    /// sibling process, stranding the real turn in WaitingModel until the
+    /// 600s watchdog eviction. `reply_guest_id` feeds aiua's
+    /// `explicit_response_guest_from_payload`, which routes the response back
+    /// to the instance that owns the turn.
+    #[tokio::test]
+    async fn model_request_carries_incarnation_guest_identity() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("guestroute").await;
+        runtime.set_role_name("orchestrator");
+        let session_id = "cron:ephemeral:agent-guestroute";
+        runtime
+            .ensure_session_loaded(session_id, "cron")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("run the nightly backup".into()),
+                    cron_job_id: Some("job-backup".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        {
+            let emitted = emitted.lock().unwrap();
+            let model_req = emitted
+                .iter()
+                .find(|e| e["task"]["action"] == "generate_text")
+                .expect("model request emitted");
+            assert_eq!(
+                model_req["task"]["reply_guest_id"], "agent-guestroute:orchestrator",
+                "model request must carry the incarnation's exact guest identity"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Roster philote (no role name set): `reply_guest_id` is the bare agent
+    /// id, matching its IPC registration in `main.rs`.
+    #[tokio::test]
+    async fn model_request_carries_roster_guest_identity() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("rosterroute").await;
+        let session_id = "sess-rosterroute";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("hello".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        {
+            let emitted = emitted.lock().unwrap();
+            let model_req = emitted
+                .iter()
+                .find(|e| e["task"]["action"] == "generate_text")
+                .expect("model request emitted");
+            assert_eq!(model_req["task"]["reply_guest_id"], "agent-rosterroute");
+        }
 
         drop(runtime);
         let _ = server.await;
