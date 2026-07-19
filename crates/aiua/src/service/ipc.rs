@@ -100,6 +100,12 @@ const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 900;
 #[cfg(test)]
 const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 5;
 
+/// The client-SDK fallback node id sent when `PHILOTIC_NODE_ID` is unset
+/// (bare SDK use, external smoke drivers). Semantically it means "the hotel
+/// this client is connected to" — EmitTask normalizes it to the local node,
+/// because no node with this literal id ever exists on a real mesh.
+pub(crate) const CLIENT_DEFAULT_NODE_ID: &str = "local-aiua-01";
+
 /// Test-only ledger dispatcher channel. In production the durable-writer
 /// thread in `main.rs` drains `dispatcher_rx`; unit tests do not spawn that
 /// thread, so a bare bounded channel deadlocks once its buffer fills (the
@@ -4840,6 +4846,24 @@ impl IpcServer {
                     );
                     return IpcResponse::success("emit", None);
                 }
+                // Normalize the client-SDK default node id sentinel. A client
+                // that never learned its node (PHILOTIC_NODE_ID unset) sends
+                // "local-aiua-01", which means "the hotel I am connected to".
+                // Before this normalization such tasks were appended to the
+                // ledger addressed to a node that exists nowhere and silently
+                // black-holed — surfacing only as healed zombie turns
+                // (2026-07-19 Beacon/life.observe investigation).
+                let target_node =
+                    if target_node == CLIENT_DEFAULT_NODE_ID && target_node != local_node_id {
+                        info!(
+                            target_role = target_role.as_str(),
+                            local_node_id,
+                            "EmitTask: normalizing client-default node id sentinel to this hotel"
+                        );
+                        local_node_id.to_string()
+                    } else {
+                        target_node
+                    };
                 let response_like_agent_action = response_like_agent_action_for_task(
                     &target_role,
                     target_guest_id.as_deref(),
@@ -5171,6 +5195,40 @@ impl IpcServer {
                 } else {
                     task_json
                 };
+                // Visibility guard: a task addressed to a remote node this
+                // hotel has never seen (no registry entry, no peer socket)
+                // will sit in the ledger with no consumer. Don't block it —
+                // the node may legitimately appear later (boot races) — but
+                // make the misroute loudly observable instead of silent.
+                if target_node != local_node_id {
+                    let node_known = {
+                        let reg = registry.read().await;
+                        reg.get_node(&target_node).is_some()
+                    } || peer_sockets.read().await.contains_key(&target_node);
+                    if !node_known {
+                        let message = format!(
+                            "[emit_task_unknown_target_node] task for role [{target_role}] addressed to node [{target_node}] unknown to this hotel (no registry entry, no peer socket) — undeliverable until that node appears on the mesh"
+                        );
+                        warn!(
+                            target_node = target_node.as_str(),
+                            target_role = target_role.as_str(),
+                            "EmitTask: target node unknown to this hotel — task may never deliver"
+                        );
+                        if let Some(hq) = heal_queue {
+                            if let Err(err) = hq.push_classified(
+                                "aiua.emit_task_route",
+                                &message,
+                                "medium",
+                                "emit_task_unknown_target_node",
+                            ) {
+                                warn!(
+                                    error = %err,
+                                    "Failed to push unknown-target-node route to heal queue"
+                                );
+                            }
+                        }
+                    }
+                }
                 info!(
                     "EmitTask mapped to TaskInvoke for {}/{} guest={:?}",
                     target_node, target_role, resolved_target_guest_id
@@ -15964,6 +16022,97 @@ pub(crate) mod tests {
                 assert_eq!(env.target_node_id.as_deref(), Some("local-aiua-01"));
             }
             _ => panic!("unexpected ledger command"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_normalizes_client_default_node_sentinel_to_local() {
+        // Regression (2026-07-19 Beacon/life.observe investigation): a client
+        // without PHILOTIC_NODE_ID sends target_node="local-aiua-01". On a
+        // hotel with a real node id that used to be treated as a REMOTE node
+        // that exists nowhere — appended to the ledger, never delivered,
+        // healed later as a zombie turn. The sentinel must deliver locally.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "vps-jane-aiua-01",
+            dispatcher_tx,
+            graph,
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let runner_identity = GuestIdentity {
+            guest_id: "vps-jane:life-graph-runner".into(),
+            role: "life-graph-runner".into(),
+            supported_tools: Vec::new(),
+        };
+        let driver_identity = GuestIdentity {
+            guest_id: "life-graph-ipc-smoke-driver".into(),
+            role: "life-graph.ipc.smoke.reply".into(),
+            supported_tools: Vec::new(),
+        };
+
+        let mut runner = PhiloticClient::connect(runner_identity)
+            .await
+            .expect("runner connect");
+        let mut driver = PhiloticClient::connect(driver_identity)
+            .await
+            .expect("driver connect");
+
+        let task_payload = serde_json::json!({
+            "capability": "life.observe",
+            "content": "sentinel-addressed observe"
+        })
+        .to_string();
+
+        let response = driver
+            .send_request(IpcRequest::EmitTask {
+                target_node: CLIENT_DEFAULT_NODE_ID.into(),
+                target_role: "life-graph-runner".into(),
+                target_guest_id: None,
+                task_json: task_payload,
+            })
+            .await
+            .expect("emit task");
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), runner.recv_task())
+                .await
+                .expect("sentinel-addressed task must deliver to the local subscriber")
+                .expect("runner recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask {
+                source_node,
+                task_json,
+                ..
+            } => {
+                assert_eq!(source_node, "vps-jane-aiua-01");
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["capability"], "life.observe");
+            }
+            other => panic!("unexpected inbound response: {other:?}"),
         }
 
         unsafe {
