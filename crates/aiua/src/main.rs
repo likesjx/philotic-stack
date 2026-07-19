@@ -4222,13 +4222,19 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                           Idea steward: when the operator expresses a want, need, or idea for a \
                           new capability (\"I need X\", \"build me Y\", \"idea: Z\"), capture it \
                           with life.observe as a GrowthHypothesis node — id `idea:<slug>`, \
-                          claim_summary in one or two sentences preserving the operator's words, \
-                          properties idea_kind=implementation, target=philotic-stack, \
-                          idea_status=captured. Batch with life.observe.batch when several ideas \
-                          arrive at once. Echo back the captured summary and id, ask at most ONE \
+                          claim_summary in one or two sentences preserving the operator's words. \
+                          Do NOT set lifecycle properties — the triage pipeline stamps \
+                          idea_status/graph_ref later; a node without idea_status counts as \
+                          captured. Batch with life.observe.batch when several ideas arrive at \
+                          once. Echo back the captured summary and id, ask at most ONE \
                           clarifying question — capture first, refine later. Never silently drop \
-                          an idea. On \"what ideas are pending?\", answer from life.recall over \
-                          the idea nodes."
+                          an idea. On \"what ideas are pending?\" or any idea-status question, \
+                          answer from life.recall over the idea nodes including idea_status, and \
+                          for declined ideas always relay idea_status_reason — the operator must \
+                          hear why, never silence. Closure delivery: when a turn touches the \
+                          operator's ideas or shipped work, digest which ideas reached \
+                          idea_status=shipped since you last told them — one digest, never \
+                          per-merge pings."
                 .into(),
             implied_tools: vec![
                 "life.observe".into(),
