@@ -5453,7 +5453,7 @@ impl IpcServer {
                 let is_admin = calling_role_record
                     .ok()
                     .flatten()
-                    .map(|r| r.is_admin || r.role_name == "orchestrator")
+                    .map(|r| r.has_operational_admin_authority())
                     .unwrap_or(false);
                 if !is_admin {
                     return IpcResponse::error(
@@ -13235,19 +13235,10 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
 }
 
 fn tools_for_allowed_class(class: &str) -> &'static [&'static str] {
-    match class {
-        "life_graph" => &[
-            "life.observe",
-            "life.observe.batch",
-            "life.recall",
-            "life.recall.feedback",
-            "life.commit",
-            "life.resolve",
-            "life.conflict",
-            "life.patch.propose",
-        ],
-        _ => &[],
-    }
+    // Shared with philote's session assembly so a class granted in a
+    // ToolsetProfileRecord expands identically on both sides of the IPC
+    // boundary. See ansible_mesh_core::graph::tools_for_tool_class.
+    ansible_mesh_core::graph::tools_for_tool_class(class)
 }
 
 fn shared_tool_receptor_record<'a>(
@@ -16305,6 +16296,7 @@ pub(crate) mod tests {
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: Some("Codex specialist role profile — workspace read access.".into()),
             })
             .expect("seed toolset profile");
@@ -20055,6 +20047,7 @@ pub(crate) mod tests {
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: None,
             })
             .expect("toolset profile should seed");
@@ -22735,6 +22728,7 @@ pub(crate) mod tests {
                 allowed_skills: vec!["handoff.back".into()],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: Some("Implementation-focused role lens.".into()),
             })
             .expect("toolset profile should seed");
@@ -25661,6 +25655,7 @@ pub(crate) mod tests {
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: None,
             })
             .expect("seed toolset profile");
@@ -25760,6 +25755,7 @@ pub(crate) mod tests {
                 allowed_skills: vec!["research".into(), "handoff.back".into()],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: None,
             })
             .expect("seed toolset profile with skills");
@@ -25863,6 +25859,7 @@ pub(crate) mod tests {
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: None,
             })
             .expect("seed empty toolset profile");
@@ -25953,6 +25950,7 @@ pub(crate) mod tests {
                 allowed_skills: vec!["research".into()],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: None,
             })
             .expect("seed profile with research already present");
@@ -26057,6 +26055,7 @@ pub(crate) mod tests {
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: None,
             })
             .expect("seed toolset profile");
@@ -26144,6 +26143,7 @@ pub(crate) mod tests {
                 allowed_skills: vec![],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
+                seed_baseline: None,
                 description: None,
             })
             .expect("seed toolset profile");

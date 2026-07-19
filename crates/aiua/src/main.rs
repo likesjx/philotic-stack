@@ -4360,6 +4360,55 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             }),
             ..Default::default()
         },
+        // routing.refinement and mcp.manage were referenced by the orchestrator
+        // profile's on_demand_skills but only existed as hardcoded arms in
+        // philote's catalog (tools_for_skill / skill_is_relevant_for_turn) —
+        // never as DB records, so skill.list could not show them and their
+        // implied tools were absent from the abstract catalog. The implied
+        // tool lists below mirror the philote catalog arms.
+        AbstractSkillRecord {
+            skill_name: "routing.refinement".into(),
+            description: "Inspect and refine the agent's routing layer: propose routing policy \
+                          changes, set or read reflex rules, and manage routing pipelines. Use \
+                          router.stats to observe live routing behavior before proposing changes."
+                .into(),
+            implied_tools: vec![
+                "session.status".into(),
+                "routing.policy.propose".into(),
+                "routing.reflex.set".into(),
+                "routing.reflex.get".into(),
+                "routing.pipeline.set".into(),
+                "routing.pipeline.remove".into(),
+                "routing.pipeline.get".into(),
+                "router.stats".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "source": "mirrors philote catalog tools_for_skill(\"routing.refinement\")"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "mcp.manage".into(),
+            description: "Provision, inspect, and revoke MCP endpoints and their access tokens. \
+                          mcp.provision declares or updates an endpoint this agent exposes; \
+                          mcp.grant_token / mcp.rotate_token / mcp.revoke_token manage caller \
+                          credentials; mcp.revoke retires an endpoint."
+                .into(),
+            implied_tools: vec![
+                "mcp.provision".into(),
+                "mcp.revoke".into(),
+                "mcp.grant_token".into(),
+                "mcp.rotate_token".into(),
+                "mcp.revoke_token".into(),
+                "mcp.status".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "source": "mirrors philote catalog tools_for_skill(\"mcp.manage\")"
+            }),
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -4395,6 +4444,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "skill.register".into(),
                 "skill.list".into(),
                 "skill.assign".into(),
+                "skill.revoke".into(),
                 "subagent.spawn".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
@@ -4453,6 +4503,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "mcp.manage".into(),
             ],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some("Default orchestrator role profile.".into()),
         },
         ToolsetProfileRecord {
@@ -4479,6 +4530,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some("Codex specialist role profile — workspace read access.".into()),
         },
         ToolsetProfileRecord {
@@ -4503,6 +4555,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some("Research specialist role profile — minimal tool surface.".into()),
         },
         ToolsetProfileRecord {
@@ -4525,6 +4578,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some("Bare utility profile — session and echo only.".into()),
         },
         ToolsetProfileRecord {
@@ -4557,6 +4611,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Scheduler specialist role profile — narrow cron scheduling and handoff-back authority."
                     .into(),
@@ -4620,6 +4675,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.disable".into(),
                 "cron.remove".into(),
                 "router.stats".into(),
+                "agent.migrate_to".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -4659,6 +4715,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Admin role profile — full skill crafting, role governance, training data authority, ASR provisioning, vision model provisioning, and cron scheduling.".into(),
             ),
@@ -4693,6 +4750,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Architect specialist role profile — systems, infrastructure, debugging. \
                  bash.exec requires operator approval."
@@ -4737,6 +4795,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Brain specialist role profile — synthesis, memory, graph reasoning, and LifeGraph context."
                     .into(),
@@ -4762,6 +4821,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Virtuoso specialist role profile — creative and expressive. \
                  Minimal tools, focused on reflection and lyrical output."
@@ -4770,8 +4830,17 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
         },
     ];
 
+    // Reconcile, don't overwrite: runtime grant mutations (skill.assign /
+    // skill.revoke, operator live-DB patches) must survive reboot, while new
+    // seed entries from a release still propagate to existing profiles. The
+    // stored seed_baseline lets the reconciler tell runtime deltas apart from
+    // seed changes. A plain upsert here previously wiped every runtime grant
+    // on each `aiua run` / `aiua load`.
     for profile in &profiles {
-        graph.upsert_toolset_profile(profile)?;
+        let existing = graph.get_toolset_profile(&profile.profile_name)?;
+        let reconciled =
+            ToolsetProfileRecord::reconcile_seed_with_existing(profile, existing.as_ref());
+        graph.upsert_toolset_profile(&reconciled)?;
     }
 
     // If PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE is set, seed every LifeGraph-capable
@@ -8390,7 +8459,8 @@ mod tests {
         hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, nearest_available_base_port, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
-        seed_orchestrator_roles, seed_toolset_profiles, startup_test_gemini_base_url,
+        seed_abstract_skill_catalog, seed_orchestrator_roles, seed_skill_crafting,
+        seed_toolset_profiles, startup_test_gemini_base_url,
     };
 
     #[test]
@@ -8725,6 +8795,150 @@ mod tests {
                 .iter()
                 .any(|skill| skill == "lifegraph.truth_summarizer")
         );
+    }
+
+    #[test]
+    fn seed_toolset_profiles_preserves_runtime_grant_mutations_across_reseed() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        // First boot.
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        // Runtime mutations between boots: a skill.assign, a skill.revoke of a
+        // seeded skill, and a runtime-registered remote runner.
+        let mut orchestrator = graph
+            .get_toolset_profile("orchestrator")
+            .expect("read orchestrator profile")
+            .expect("orchestrator profile should exist");
+        assert!(
+            orchestrator.seed_baseline.is_some(),
+            "boot seed should stamp a seed baseline"
+        );
+        orchestrator
+            .allowed_skills
+            .push("runtime.assigned.skill".into());
+        orchestrator.allowed_skills.retain(|s| s != "memory.fix");
+        orchestrator.remote_tool_runners.push(serde_json::json!({
+            "incarnation_id": "test-hotel:test-runner",
+            "supported_tools": ["test.tool"],
+        }));
+        graph
+            .upsert_toolset_profile(&orchestrator)
+            .expect("persist runtime mutation");
+
+        // Second boot: the reseed must reconcile, not overwrite.
+        seed_toolset_profiles(&graph).expect("reseed toolset profiles");
+
+        let orchestrator = graph
+            .get_toolset_profile("orchestrator")
+            .expect("read orchestrator profile")
+            .expect("orchestrator profile should exist");
+        assert!(
+            orchestrator
+                .allowed_skills
+                .iter()
+                .any(|s| s == "runtime.assigned.skill"),
+            "a skill assigned at runtime must survive reboot"
+        );
+        assert!(
+            !orchestrator
+                .allowed_skills
+                .iter()
+                .any(|s| s == "memory.fix"),
+            "a seeded skill revoked at runtime must stay revoked after reboot"
+        );
+        assert!(
+            orchestrator.remote_tool_runners.iter().any(|runner| {
+                runner.get("incarnation_id").and_then(|v| v.as_str())
+                    == Some("test-hotel:test-runner")
+            }),
+            "runtime-registered remote runners must survive reboot"
+        );
+        // Seeded grants are still fully present.
+        assert!(
+            orchestrator
+                .allowed_tools
+                .iter()
+                .any(|t| t == "skill.revoke"),
+            "orchestrator seed must grant skill.revoke so admins can remove capabilities"
+        );
+        assert!(
+            orchestrator
+                .allowed_skills
+                .iter()
+                .any(|s| s == "handoff.to_role")
+        );
+    }
+
+    #[test]
+    fn seed_toolset_profiles_reconciles_pre_baseline_records_without_losing_live_edits() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        // Simulate a live fleet record written by an OLD binary: seeded shape,
+        // no seed_baseline, plus an operator live-DB patch.
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+        let mut legacy = graph
+            .get_toolset_profile("admin")
+            .expect("read admin profile")
+            .expect("admin profile should exist");
+        legacy.seed_baseline = None;
+        legacy.allowed_tools.push("operator.patched.tool".into());
+        graph
+            .upsert_toolset_profile(&legacy)
+            .expect("persist legacy-shaped record");
+
+        seed_toolset_profiles(&graph).expect("reseed toolset profiles");
+
+        let admin = graph
+            .get_toolset_profile("admin")
+            .expect("read admin profile")
+            .expect("admin profile should exist");
+        assert!(
+            admin
+                .allowed_tools
+                .iter()
+                .any(|t| t == "operator.patched.tool"),
+            "a live operator patch on a pre-baseline record must survive the first reseed"
+        );
+        assert!(
+            admin.seed_baseline.is_some(),
+            "the reseed must stamp a baseline on pre-baseline records"
+        );
+        assert!(
+            admin.allowed_tools.iter().any(|t| t == "agent.migrate_to"),
+            "admin seed must grant agent.migrate_to (the only class-admin tool)"
+        );
+    }
+
+    #[test]
+    fn seeded_skill_catalog_defines_all_on_demand_skills_of_seeded_profiles() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_abstract_skill_catalog(&graph).expect("seed skill catalog");
+        seed_skill_crafting(&graph).expect("seed skill.crafting");
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        for profile in graph.list_toolset_profiles().expect("list profiles") {
+            for skill in profile
+                .allowed_skills
+                .iter()
+                .chain(profile.on_demand_skills.iter())
+            {
+                assert!(
+                    graph
+                        .get_abstract_skill(skill)
+                        .expect("skill lookup")
+                        .is_some(),
+                    "profile '{}' references skill '{}' that is not seeded in the abstract \
+                     skill catalog — ghost skills are invisible to skill.list",
+                    profile.profile_name,
+                    skill
+                );
+            }
+        }
     }
 
     #[test]

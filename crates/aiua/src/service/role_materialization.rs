@@ -672,7 +672,7 @@ impl IpcServer {
             .get_role_incarnation(caller_agent_id, &identity.role)
             .ok()
             .flatten()
-            .map(|r| r.is_admin)
+            .map(|r| r.has_full_admin_authority())
             .unwrap_or(false);
 
         if role_name == "orchestrator" && !caller_is_admin && !is_model_selection_only {
@@ -1532,12 +1532,12 @@ impl IpcServer {
             );
         }
 
-        // Only the orchestrator or admin roles may move roles.
+        // Only roles with operational admin authority may move roles.
         let calling_role_record = graph.get_role_incarnation(&agent_id, &calling_role);
         let is_admin = calling_role_record
             .ok()
             .flatten()
-            .map(|r| r.is_admin || r.role_name == "orchestrator")
+            .map(|r| r.has_operational_admin_authority())
             .unwrap_or(false);
         if !is_admin {
             return IpcResponse::error(

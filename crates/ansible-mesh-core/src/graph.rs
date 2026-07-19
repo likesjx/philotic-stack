@@ -236,6 +236,170 @@ pub struct ToolsetProfileRecord {
     /// `allowed_tool_runner_incarnations` during session snapshot composition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_tool_runners: Vec<serde_json::Value>,
+    /// Snapshot of what the hotel's boot seed granted the last time it
+    /// reconciled this profile. Runtime mutations (skill.assign / skill.revoke,
+    /// operator DB patches) diff against this baseline so the next boot can
+    /// preserve them while still propagating seed changes from new releases.
+    /// `None` on records written before this field existed — the reconciler
+    /// then treats every difference from the current seed as a runtime delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_baseline: Option<ToolsetSeedBaseline>,
+}
+
+/// The grant lists a boot seed last wrote into a [`ToolsetProfileRecord`].
+/// See [`ToolsetProfileRecord::seed_baseline`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolsetSeedBaseline {
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_classes: Vec<String>,
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    #[serde(default)]
+    pub on_demand_skills: Vec<String>,
+}
+
+impl ToolsetProfileRecord {
+    /// The seed baseline this record would leave behind if it were the seed.
+    pub fn as_seed_baseline(&self) -> ToolsetSeedBaseline {
+        ToolsetSeedBaseline {
+            allowed_tools: self.allowed_tools.clone(),
+            allowed_classes: self.allowed_classes.clone(),
+            allowed_skills: self.allowed_skills.clone(),
+            on_demand_skills: self.on_demand_skills.clone(),
+        }
+    }
+
+    /// Merge a boot-seed profile with the stored record so seeding is a
+    /// reconcile, not an overwrite.
+    ///
+    /// For each grant list, runtime deltas are computed against the stored
+    /// [`ToolsetSeedBaseline`] (entries added since last seed, entries removed
+    /// since last seed) and re-applied on top of the new seed:
+    ///
+    /// `result = (seed − runtime_removed) ∪ runtime_added`
+    ///
+    /// Consequences:
+    /// - a skill assigned at runtime via `skill.assign` survives reboot
+    /// - a skill revoked at runtime via `skill.revoke` stays revoked
+    /// - a tool newly added to the seed in a release reaches existing profiles
+    /// - `remote_tool_runners` is runtime-owned and always preserved from the
+    ///   stored record (the env-gated runner seed reconciles it separately)
+    ///
+    /// With no stored record, the seed is used as-is. With a stored record that
+    /// predates baselines (`seed_baseline: None`), every difference from the
+    /// current seed is treated as a runtime delta — i.e. existing live edits
+    /// are preserved on the first boot after this change ships.
+    pub fn reconcile_seed_with_existing(seed: &Self, existing: Option<&Self>) -> Self {
+        let Some(existing) = existing else {
+            let mut record = seed.clone();
+            record.seed_baseline = Some(seed.as_seed_baseline());
+            return record;
+        };
+        let baseline = existing
+            .seed_baseline
+            .clone()
+            .unwrap_or_else(|| seed.as_seed_baseline());
+
+        fn merge(seed: &[String], existing: &[String], baseline: &[String]) -> Vec<String> {
+            use std::collections::BTreeSet;
+            let existing_set: BTreeSet<&str> = existing.iter().map(String::as_str).collect();
+            let baseline_set: BTreeSet<&str> = baseline.iter().map(String::as_str).collect();
+            let runtime_removed: BTreeSet<&str> =
+                baseline_set.difference(&existing_set).copied().collect();
+            let mut out: Vec<String> = seed
+                .iter()
+                .filter(|entry| !runtime_removed.contains(entry.as_str()))
+                .cloned()
+                .collect();
+            for entry in existing {
+                let runtime_added = !baseline_set.contains(entry.as_str());
+                if runtime_added && !out.contains(entry) {
+                    out.push(entry.clone());
+                }
+            }
+            out
+        }
+
+        Self {
+            profile_name: seed.profile_name.clone(),
+            allowed_tools: merge(
+                &seed.allowed_tools,
+                &existing.allowed_tools,
+                &baseline.allowed_tools,
+            ),
+            allowed_classes: merge(
+                &seed.allowed_classes,
+                &existing.allowed_classes,
+                &baseline.allowed_classes,
+            ),
+            allowed_skills: merge(
+                &seed.allowed_skills,
+                &existing.allowed_skills,
+                &baseline.allowed_skills,
+            ),
+            on_demand_skills: merge(
+                &seed.on_demand_skills,
+                &existing.on_demand_skills,
+                &baseline.on_demand_skills,
+            ),
+            description: seed
+                .description
+                .clone()
+                .or_else(|| existing.description.clone()),
+            remote_tool_runners: existing.remote_tool_runners.clone(),
+            seed_baseline: Some(seed.as_seed_baseline()),
+        }
+    }
+}
+
+/// Shared class→tools expansion for tool classes that are NOT (fully) tagged in
+/// the philote tool catalog. Both the hotel (rights projection, visible-toolset
+/// composition) and philote (session assembly) consult this map, so a class
+/// granted in a `ToolsetProfileRecord` expands identically on both sides.
+///
+/// Classes the philote catalog already tags (`session`, `utility`, `config`,
+/// `memory`, `graph`, `table`, `cron`, `shell`, `desktop`, `workspace`,
+/// `life_graph`, …) stay authoritative there; this map only covers families
+/// whose members carry a different or no catalog class tag, which previously
+/// made these grants expand to nothing ("dead classes").
+pub fn tools_for_tool_class(class: &str) -> &'static [&'static str] {
+    match class {
+        "life_graph" => &[
+            "life.observe",
+            "life.observe.batch",
+            "life.recall",
+            "life.recall.feedback",
+            "life.commit",
+            "life.resolve",
+            "life.conflict",
+            "life.patch.propose",
+        ],
+        "agent_graph" => &[
+            "agent.graph.read",
+            "agent.graph.write",
+            "agent.graph.declare",
+            "agent.graph.recall",
+            "agent.graph.sync",
+        ],
+        "mcp" => &[
+            "mcp.provision",
+            "mcp.revoke",
+            "mcp.grant_token",
+            "mcp.rotate_token",
+            "mcp.revoke_token",
+            "mcp.status",
+        ],
+        "training" => &[
+            "training.list",
+            "training.correct",
+            "training.export",
+            "training.status",
+        ],
+        "asr" => &["asr.setup", "asr.status"],
+        _ => &[],
+    }
 }
 
 /// A single step in a LoopScript.
@@ -438,6 +602,25 @@ impl Default for RoleIncarnationRecord {
 impl RoleIncarnationRecord {
     pub fn routing_role(&self) -> String {
         format!("role:{}:{}", self.agent_id, self.role_name)
+    }
+
+    /// Full admin authority: may edit operator-owned records (the orchestrator
+    /// role incarnation) and mint other admin roles. Granted ONLY by the stored
+    /// `is_admin` flag — a role being *named* "orchestrator" is not sufficient.
+    pub fn has_full_admin_authority(&self) -> bool {
+        self.is_admin
+    }
+
+    /// Operational admin authority: transport-home and role-home moves and
+    /// operator-surface mutations. Any role named "orchestrator" qualifies in
+    /// addition to `is_admin` roles — the orchestrator is the membrane-facing
+    /// management persona and these are its day-to-day placement duties.
+    ///
+    /// This is the single authority predicate for those gates; do not re-derive
+    /// `is_admin || role_name == "orchestrator"` inline at call sites, so the
+    /// two authority tiers stay visible and auditable in one place.
+    pub fn has_operational_admin_authority(&self) -> bool {
+        self.is_admin || self.role_name == "orchestrator"
     }
 }
 
@@ -805,5 +988,114 @@ mod content_policy_tests {
         assert!(!is_valid_content_policy("permissive"));
         assert!(!is_valid_content_policy(""));
         assert!(!is_valid_content_policy("UNRESTRICTED"));
+    }
+
+    #[test]
+    fn reconcile_fresh_profile_uses_seed_and_stamps_baseline() {
+        let seed = ToolsetProfileRecord {
+            profile_name: "p".into(),
+            allowed_tools: vec!["a".into(), "b".into()],
+            allowed_skills: vec!["s1".into()],
+            ..Default::default()
+        };
+        let out = ToolsetProfileRecord::reconcile_seed_with_existing(&seed, None);
+        assert_eq!(out.allowed_tools, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(out.seed_baseline, Some(seed.as_seed_baseline()));
+    }
+
+    #[test]
+    fn reconcile_preserves_runtime_adds_and_removes_and_propagates_seed_changes() {
+        // Boot 1 seeded {a, b}; runtime added {x} and removed {b}.
+        let boot1_seed = ToolsetProfileRecord {
+            profile_name: "p".into(),
+            allowed_tools: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        let mut stored = ToolsetProfileRecord::reconcile_seed_with_existing(&boot1_seed, None);
+        stored.allowed_tools.retain(|t| t != "b");
+        stored.allowed_tools.push("x".into());
+
+        // Boot 2 ships a new seed {a, b, c}.
+        let boot2_seed = ToolsetProfileRecord {
+            profile_name: "p".into(),
+            allowed_tools: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
+        };
+        let out = ToolsetProfileRecord::reconcile_seed_with_existing(&boot2_seed, Some(&stored));
+        // Runtime remove of b holds, runtime add of x holds, new seed entry c arrives.
+        assert_eq!(
+            out.allowed_tools,
+            vec!["a".to_string(), "c".to_string(), "x".to_string()]
+        );
+        assert_eq!(out.seed_baseline, Some(boot2_seed.as_seed_baseline()));
+    }
+
+    #[test]
+    fn reconcile_without_baseline_treats_every_difference_as_runtime_delta() {
+        // A record written by a pre-baseline binary: operator added {x},
+        // removed seeded {b}. No baseline stored.
+        let seed = ToolsetProfileRecord {
+            profile_name: "p".into(),
+            allowed_tools: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        let stored = ToolsetProfileRecord {
+            profile_name: "p".into(),
+            allowed_tools: vec!["a".into(), "x".into()],
+            ..Default::default()
+        };
+        let out = ToolsetProfileRecord::reconcile_seed_with_existing(&seed, Some(&stored));
+        assert_eq!(out.allowed_tools, vec!["a".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_preserves_runtime_owned_remote_tool_runners() {
+        let seed = ToolsetProfileRecord {
+            profile_name: "p".into(),
+            ..Default::default()
+        };
+        let stored = ToolsetProfileRecord {
+            profile_name: "p".into(),
+            remote_tool_runners: vec![serde_json::json!({"incarnation_id": "h:r"})],
+            seed_baseline: Some(seed.as_seed_baseline()),
+            ..Default::default()
+        };
+        let out = ToolsetProfileRecord::reconcile_seed_with_existing(&seed, Some(&stored));
+        assert_eq!(out.remote_tool_runners, stored.remote_tool_runners);
+    }
+
+    #[test]
+    fn admin_authority_tiers() {
+        let plain = RoleIncarnationRecord {
+            role_name: "vixen".into(),
+            ..Default::default()
+        };
+        assert!(!plain.has_full_admin_authority());
+        assert!(!plain.has_operational_admin_authority());
+
+        let orchestrator = RoleIncarnationRecord {
+            role_name: "orchestrator".into(),
+            ..Default::default()
+        };
+        assert!(!orchestrator.has_full_admin_authority());
+        assert!(orchestrator.has_operational_admin_authority());
+
+        let admin = RoleIncarnationRecord {
+            role_name: "steward".into(),
+            is_admin: true,
+            ..Default::default()
+        };
+        assert!(admin.has_full_admin_authority());
+        assert!(admin.has_operational_admin_authority());
+    }
+
+    #[test]
+    fn tool_class_map_covers_dead_classes_and_unknowns_expand_to_nothing() {
+        assert!(tools_for_tool_class("life_graph").contains(&"life.observe.batch"));
+        assert!(tools_for_tool_class("agent_graph").contains(&"agent.graph.sync"));
+        assert!(tools_for_tool_class("mcp").contains(&"mcp.rotate_token"));
+        assert!(tools_for_tool_class("training").contains(&"training.export"));
+        assert!(tools_for_tool_class("asr").contains(&"asr.setup"));
+        assert!(tools_for_tool_class("nonexistent").is_empty());
     }
 }

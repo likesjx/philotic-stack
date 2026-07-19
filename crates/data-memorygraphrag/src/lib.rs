@@ -931,10 +931,12 @@ impl ContextPacket {
 #[serde(rename_all = "snake_case")]
 pub enum LifeGraphToolName {
     LifeObserve,
+    LifeObserveBatch,
     LifeRecall,
     LifeRecallFeedback,
     LifeCommit,
     LifeResolve,
+    LifeConflict,
     LifePatchPropose,
 }
 
@@ -942,10 +944,12 @@ impl LifeGraphToolName {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::LifeObserve => "life.observe",
+            Self::LifeObserveBatch => "life.observe.batch",
             Self::LifeRecall => "life.recall",
             Self::LifeRecallFeedback => "life.recall.feedback",
             Self::LifeCommit => "life.commit",
             Self::LifeResolve => "life.resolve",
+            Self::LifeConflict => "life.conflict",
             Self::LifePatchPropose => "life.patch.propose",
         }
     }
@@ -954,6 +958,7 @@ impl LifeGraphToolName {
         matches!(
             self,
             Self::LifeObserve
+                | Self::LifeObserveBatch
                 | Self::LifeRecallFeedback
                 | Self::LifeCommit
                 | Self::LifeResolve
@@ -997,6 +1002,11 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
             false,
         ),
         LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeObserveBatch,
+            "Capture multiple grounded observations as proposed Life Graph evidence in one call.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
             LifeGraphToolName::LifeRecall,
             "Build an evidence-backed Life Graph retrieval context packet.",
             false,
@@ -1015,6 +1025,11 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
             LifeGraphToolName::LifeResolve,
             "Resolve a Life Graph conflict handoff with Muninn/operator policy gates.",
             true,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeConflict,
+            "List or inspect open Life Graph conflicts awaiting resolution.",
+            false,
         ),
         LifeGraphToolSpec::new(
             LifeGraphToolName::LifePatchPropose,
@@ -2571,14 +2586,21 @@ mod tests {
         let catalog = runner.tool_catalog();
         let tool_names: Vec<_> = catalog.iter().map(|tool| tool.tool_name.as_str()).collect();
 
+        // Must stay in lockstep with the grant surface: the `life_graph` tool
+        // class (ansible_mesh_core::graph::tools_for_tool_class) and the
+        // `life.steward` skill both expose all 8 life.* tools. A declared
+        // catalog narrower than the grant surface is the PR #271 failure
+        // pattern (granted tool with no declared route).
         assert_eq!(
             tool_names,
             vec![
                 "life.observe",
+                "life.observe.batch",
                 "life.recall",
                 "life.recall.feedback",
                 "life.commit",
                 "life.resolve",
+                "life.conflict",
                 "life.patch.propose"
             ]
         );
