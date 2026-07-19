@@ -1984,6 +1984,22 @@ impl AgentRuntime {
         self.role_name = Some(rn.into());
     }
 
+    /// Guest id a model RESPONSE should be routed back to for this philote.
+    ///
+    /// For a role-incarnation philote (a separate process running as
+    /// `{agent_id}:{role_name}`, e.g. a whisper specialist) this is its own
+    /// incarnation id, so the reply returns to THIS process — which subscribes
+    /// to role `agent` under that incarnation guest id. Returning `None` for the
+    /// base philote is correct: `ReturnRoute::from_task` then falls back to
+    /// `agent_id`, which is the base philote's own registration. Without this,
+    /// a role specialist's model reply is addressed to the base agent and lands
+    /// in the wrong process, hanging the specialist's turn.
+    pub(crate) fn model_reply_guest_id(&self) -> Option<String> {
+        self.role_name
+            .as_ref()
+            .map(|rn| format!("{}:{}", self.agent_id, rn))
+    }
+
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
     /// Applied to every new session so the correct persona is used from the first message.
     async fn fetch_agent_profile(&mut self) {
@@ -2822,6 +2838,7 @@ impl AgentRuntime {
                     chat_id: restored_chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
+                    reply_guest_id: self.model_reply_guest_id(),
                     final_reply_to: restored_reply_to,
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
@@ -3564,6 +3581,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -4044,6 +4062,7 @@ impl AgentRuntime {
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to: reentry.final_reply_to,
             final_reply_role: reentry.final_reply_role,
             final_reply_guest_id: reentry.final_reply_guest_id,
@@ -4776,6 +4795,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -5399,6 +5419,7 @@ impl AgentRuntime {
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: self.model_reply_guest_id(),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
@@ -7496,6 +7517,7 @@ mod tests {
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
+            reply_guest_id: None,
             final_reply_to: LOCAL_NODE.into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
@@ -9161,6 +9183,43 @@ mod tests {
             arguments: serde_json::json!({}),
         });
         turn
+    }
+
+    /// A role-incarnation philote must route its model-response back to its OWN
+    /// incarnation guest id ({agent_id}:{role_name}); the base philote returns
+    /// None so `ReturnRoute::from_task`'s agent_id fallback resolves it to the
+    /// base registration. Without this a whisper specialist's model reply is
+    /// addressed to the base agent (a different process) and its turn hangs.
+    #[tokio::test]
+    async fn model_reply_guest_id_targets_own_incarnation() {
+        let socket_path = format!("/tmp/philote-mrg-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-bjork-01".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-bjork-01");
+
+        // Base philote → None (agent_id fallback is correct).
+        assert_eq!(runtime.model_reply_guest_id(), None);
+
+        // Role incarnation → its own "{agent_id}:{role_name}" id.
+        runtime.set_role_name("theoretician");
+        assert_eq!(
+            runtime.model_reply_guest_id().as_deref(),
+            Some("agent-bjork-01:theoretician"),
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     #[tokio::test]
