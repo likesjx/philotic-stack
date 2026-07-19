@@ -70,14 +70,18 @@ pub struct McpRouteSecurity {
 }
 
 /// Authentication scheme for a single route.
+///
+/// `hmac_sha256` was removed in the MCP membrane hardening: it was
+/// provisionable but never callable (filtered from `tools/list`, rejected on
+/// `tools/call`), so a config carrying it could not authenticate anyone.
+/// Deserializing a stored `hmac_sha256` scheme now fails with serde's
+/// unknown-variant error — re-provision with `bearer_token`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "scheme", rename_all = "snake_case")]
 pub enum McpAuthScheme {
     /// Each caller presents a bearer token. Membrane fetches the BLAKE3 hash
     /// from the vault and compares in constant time.
     BearerToken { grants: Vec<McpTokenGrant> },
-    /// Caller signs the full request body with HMAC-SHA256. Key lives in vault.
-    HmacSha256 { key_ref: String },
     /// No authentication — only valid for loopback/internal routes.
     None,
 }

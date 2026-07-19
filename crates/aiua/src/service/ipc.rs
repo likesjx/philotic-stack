@@ -3707,6 +3707,34 @@ impl IpcServer {
             .is_some_and(Self::pid_exists))
     }
 
+    /// Verify a self-asserted MCP `owner_agent_id` against the guest identity
+    /// registered on this IPC connection.
+    ///
+    /// Philotes register as `<agent_id>` or `<agent_id>:<role>`; both forms
+    /// bind. Admin-class roles may act on any agent's behalf. An unregistered
+    /// connection (local ops tooling speaking raw IPC) is treated as
+    /// admin-equivalent — holding the hotel socket is already root-equivalent
+    /// for the hotel, which is the documented residual risk.
+    fn mcp_owner_identity_ok(
+        current_identity: &Option<GuestIdentity>,
+        owner_agent_id: &str,
+    ) -> bool {
+        let Some(identity) = current_identity.as_ref() else {
+            return true;
+        };
+        if matches!(
+            identity.role.as_str(),
+            "operator" | "admin" | "desktop-membrane"
+        ) {
+            return true;
+        }
+        identity.guest_id == owner_agent_id
+            || identity
+                .guest_id
+                .strip_prefix(owner_agent_id)
+                .is_some_and(|rest| rest.starts_with(':'))
+    }
+
     async fn process_request(
         req: IpcRequest,
         local_node_id: &str,
@@ -3994,6 +4022,19 @@ impl IpcServer {
             },
             IpcRequest::SetConfig { key, value_json } => {
                 info!("SetConfig requested: {}", key);
+                // Reserved prefix: MCP endpoint/route/preapproval state changes
+                // only through their dedicated, validated handlers — the generic
+                // config writer must not be a side door around identity checks.
+                if key.starts_with("__mcp_") {
+                    return IpcResponse::error(
+                        "config",
+                        "RESERVED_KEY",
+                        format!(
+                            "config key '{key}' uses the reserved __mcp_ prefix; \
+                             use the dedicated MCP provisioning IPC instead"
+                        ),
+                    );
+                }
                 match graph.set_config_value(&key, &value_json) {
                     Ok(()) => IpcResponse::success("config", None),
                     Err(e) => IpcResponse::error("config", "CONFIG_ERROR", e.to_string()),
@@ -7830,6 +7871,76 @@ impl IpcServer {
                 let endpoint_id = config.endpoint_id.clone();
                 let port = config.port;
 
+                // Identity: the self-asserted owner must match the registered
+                // guest identity on this connection.
+                if !Self::mcp_owner_identity_ok(current_identity, &config.owner_agent_id) {
+                    return IpcResponse::error(
+                        "mcp_endpoint",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{}' does not match the registered guest identity '{}'",
+                            config.owner_agent_id,
+                            current_identity
+                                .as_ref()
+                                .map(|i| i.guest_id.as_str())
+                                .unwrap_or("<unregistered>")
+                        ),
+                    );
+                }
+
+                // An existing endpoint may only be re-provisioned by its owner.
+                {
+                    let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                    let existing_owner = graph
+                        .get_config_value(&config_key)
+                        .ok()
+                        .flatten()
+                        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                        .and_then(|v| v["owner_agent_id"].as_str().map(str::to_string));
+                    if let Some(owner) = existing_owner {
+                        if owner != config.owner_agent_id {
+                            return IpcResponse::error(
+                                "mcp_endpoint",
+                                "FORBIDDEN",
+                                format!("endpoint {endpoint_id} is already owned by {owner}"),
+                            );
+                        }
+                    }
+                }
+
+                // Unauthenticated exposure beyond loopback requires an explicit
+                // acknowledgment carried on the config (surfaced in the
+                // provisioning approval prompt).
+                if config.exposure > ansible_mesh_core::ExposureTier::Local
+                    && !config.allow_unauthenticated
+                {
+                    let open_tools: Vec<&str> = config
+                        .tools
+                        .iter()
+                        .filter(|t| {
+                            matches!(
+                                config.effective_auth(t),
+                                ansible_mesh_core::mcp_route::McpAuthScheme::None
+                            )
+                        })
+                        .map(|t| t.name.as_str())
+                        .collect();
+                    if !open_tools.is_empty() {
+                        return IpcResponse::error(
+                            "mcp_endpoint",
+                            "UNAUTHENTICATED_EXPOSURE",
+                            format!(
+                                "endpoint '{}' declares {:?} exposure but tools [{}] have no auth \
+                                 scheme; add bearer auth (mcp.grant_token), or pass \
+                                 allow_unauthenticated=true to expose them anyway",
+                                endpoint_id,
+                                config.exposure,
+                                open_tools.join(", ")
+                            ),
+                        );
+                    }
+                }
+
                 // Fence: reject provision if the declared exposure exceeds the hotel's
                 // current perimeter ceiling. An agent must not open a higher-tier
                 // endpoint than the hotel is currently able to defend.
@@ -8061,6 +8172,17 @@ impl IpcServer {
                 endpoint_id,
                 owner_agent_id,
             } => {
+                // Identity: the self-asserted owner must match the registered
+                // guest identity on this connection.
+                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
+                    return IpcResponse::error(
+                        "mcp_endpoint",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{owner_agent_id}' does not match the registered guest identity"
+                        ),
+                    );
+                }
                 // Verify ownership before clearing.
                 let config_key = format!("__mcp_endpoint__:{endpoint_id}");
                 let existing = graph.get_config_value(&config_key).ok().flatten();
@@ -8149,6 +8271,305 @@ impl IpcServer {
                         "config": config,
                         "hotel_ceiling": ceiling,
                         "active": config.is_some(),
+                    })),
+                )
+            }
+
+            IpcRequest::ProvisionMcpTokenGrant {
+                endpoint_id,
+                owner_agent_id,
+                token_id,
+                tool_name,
+                scopes,
+                expires_at,
+                allotment,
+                rotate,
+            } => {
+                use ansible_mesh_core::mcp_endpoint::McpEndpointConfig;
+                use ansible_mesh_core::mcp_route::{McpAuthScheme, McpTokenGrant};
+
+                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
+                    return IpcResponse::error(
+                        "mcp_token_grant",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{owner_agent_id}' does not match the registered guest identity"
+                        ),
+                    );
+                }
+
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let mut config: McpEndpointConfig = match graph
+                    .get_config_value(&config_key)
+                    .ok()
+                    .flatten()
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                {
+                    Some(c) => c,
+                    None => {
+                        return IpcResponse::error(
+                            "mcp_token_grant",
+                            "ENDPOINT_NOT_FOUND",
+                            format!("no provisioned MCP endpoint '{endpoint_id}'"),
+                        );
+                    }
+                };
+                if config.owner_agent_id != owner_agent_id {
+                    return IpcResponse::error(
+                        "mcp_token_grant",
+                        "FORBIDDEN",
+                        format!("endpoint {endpoint_id} is not owned by {owner_agent_id}"),
+                    );
+                }
+
+                // Mint the credential. Only its BLAKE3 hash is ever stored.
+                let raw_token = {
+                    use rand::RngCore;
+                    let mut bytes = [0u8; 32];
+                    rand::thread_rng().fill_bytes(&mut bytes);
+                    format!("pmcp_{}", hex::encode(bytes))
+                };
+                let hash_hex = blake3::hash(raw_token.as_bytes()).to_hex().to_string();
+
+                // Locate the auth slot: named tool, or the endpoint default.
+                let auth_slot: &mut Option<McpAuthScheme> = match tool_name.as_deref() {
+                    Some(name) => match config.tools.iter_mut().find(|t| t.name == name) {
+                        Some(tool) => &mut tool.auth,
+                        None => {
+                            return IpcResponse::error(
+                                "mcp_token_grant",
+                                "TOOL_NOT_FOUND",
+                                format!("endpoint '{endpoint_id}' has no tool '{name}'"),
+                            );
+                        }
+                    },
+                    None => &mut config.default_auth,
+                };
+                if auth_slot.is_none() || matches!(auth_slot, Some(McpAuthScheme::None)) {
+                    *auth_slot = Some(McpAuthScheme::BearerToken { grants: vec![] });
+                }
+                let Some(McpAuthScheme::BearerToken { grants }) = auth_slot.as_mut() else {
+                    unreachable!("auth slot normalized to BearerToken above");
+                };
+
+                let vault_ref = if rotate {
+                    let Some(existing) = grants.iter().find(|g| g.token_id == token_id) else {
+                        return IpcResponse::error(
+                            "mcp_token_grant",
+                            "GRANT_NOT_FOUND",
+                            format!("no grant '{token_id}' on endpoint '{endpoint_id}' to rotate"),
+                        );
+                    };
+                    let vault_ref = existing.vault_ref.clone();
+                    if let Err(e) = crate::vault::rotate_secret(graph, &vault_ref, &hash_hex) {
+                        return IpcResponse::error("mcp_token_grant", "VAULT_ERROR", e.to_string());
+                    }
+                    vault_ref
+                } else {
+                    if grants.iter().any(|g| g.token_id == token_id) {
+                        return IpcResponse::error(
+                            "mcp_token_grant",
+                            "DUPLICATE_TOKEN_ID",
+                            format!(
+                                "grant '{token_id}' already exists on endpoint '{endpoint_id}'; \
+                                 use rotate to replace its credential"
+                            ),
+                        );
+                    }
+                    let secret_ref = match store_secret(
+                        graph,
+                        SecretInput {
+                            secret_kind: "mcp_endpoint_token".into(),
+                            scope: "hotel".into(),
+                            allowed_roles: vec!["mcp-membrane".into()],
+                            allowed_guests: Vec::new(),
+                            plaintext: hash_hex,
+                        },
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return IpcResponse::error(
+                                "mcp_token_grant",
+                                "VAULT_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    };
+                    grants.push(McpTokenGrant {
+                        token_id: token_id.clone(),
+                        vault_ref: secret_ref.clone(),
+                        scopes: scopes.clone(),
+                        expires_at,
+                        allotment: allotment.clone(),
+                    });
+                    secret_ref
+                };
+
+                config.updated_at = unix_ts();
+                match serde_json::to_string(&config) {
+                    Ok(json) => {
+                        if let Err(e) = graph.set_config_value(&config_key, &json) {
+                            return IpcResponse::error(
+                                "mcp_token_grant",
+                                "CONFIG_STORE_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "mcp_token_grant",
+                            "SERIALIZE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                }
+
+                // Fan the updated config out to the endpoint's membrane guest.
+                // NOTE: the membrane caches vault hashes for up to 60s, so a
+                // rotated-out credential may keep working for that window.
+                let guest_id = format!("mcp-membrane-{endpoint_id}");
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_config",
+                    "config": config,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &guest_id,
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(
+                    endpoint_id,
+                    token_id, rotate, "MCP token grant provisioned."
+                );
+
+                IpcResponse::success(
+                    "mcp_token_grant",
+                    Some(serde_json::json!({
+                        "endpoint_id": endpoint_id,
+                        "token_id": token_id,
+                        "tool_name": tool_name,
+                        "vault_ref": vault_ref,
+                        "rotated": rotate,
+                        "raw_token": raw_token,
+                        "warning": "store this token now — only its hash is retained and it cannot be shown again",
+                    })),
+                )
+            }
+
+            IpcRequest::RevokeMcpTokenGrant {
+                endpoint_id,
+                owner_agent_id,
+                token_id,
+            } => {
+                use ansible_mesh_core::mcp_endpoint::McpEndpointConfig;
+                use ansible_mesh_core::mcp_route::McpAuthScheme;
+
+                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
+                    return IpcResponse::error(
+                        "mcp_token_grant",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{owner_agent_id}' does not match the registered guest identity"
+                        ),
+                    );
+                }
+
+                let config_key = format!("__mcp_endpoint__:{endpoint_id}");
+                let mut config: McpEndpointConfig = match graph
+                    .get_config_value(&config_key)
+                    .ok()
+                    .flatten()
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                {
+                    Some(c) => c,
+                    None => {
+                        return IpcResponse::error(
+                            "mcp_token_grant",
+                            "ENDPOINT_NOT_FOUND",
+                            format!("no provisioned MCP endpoint '{endpoint_id}'"),
+                        );
+                    }
+                };
+                if config.owner_agent_id != owner_agent_id {
+                    return IpcResponse::error(
+                        "mcp_token_grant",
+                        "FORBIDDEN",
+                        format!("endpoint {endpoint_id} is not owned by {owner_agent_id}"),
+                    );
+                }
+
+                // Remove the grant everywhere it appears. An emptied BearerToken
+                // list stays BearerToken (nobody can call) — it must not degrade
+                // to None, which would open the tool to loopback callers.
+                let mut removed = 0usize;
+                let mut slots: Vec<&mut Option<McpAuthScheme>> = vec![&mut config.default_auth];
+                slots.extend(config.tools.iter_mut().map(|t| &mut t.auth));
+                for slot in slots {
+                    if let Some(McpAuthScheme::BearerToken { grants }) = slot.as_mut() {
+                        let before = grants.len();
+                        grants.retain(|g| g.token_id != token_id);
+                        removed += before - grants.len();
+                    }
+                }
+                if removed == 0 {
+                    return IpcResponse::error(
+                        "mcp_token_grant",
+                        "GRANT_NOT_FOUND",
+                        format!("no grant '{token_id}' on endpoint '{endpoint_id}'"),
+                    );
+                }
+
+                config.updated_at = unix_ts();
+                match serde_json::to_string(&config) {
+                    Ok(json) => {
+                        if let Err(e) = graph.set_config_value(&config_key, &json) {
+                            return IpcResponse::error(
+                                "mcp_token_grant",
+                                "CONFIG_STORE_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "mcp_token_grant",
+                            "SERIALIZE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                }
+
+                let guest_id = format!("mcp-membrane-{endpoint_id}");
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_config",
+                    "config": config,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &guest_id,
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(endpoint_id, token_id, removed, "MCP token grant revoked.");
+
+                IpcResponse::success(
+                    "mcp_token_grant",
+                    Some(serde_json::json!({
+                        "endpoint_id": endpoint_id,
+                        "token_id": token_id,
+                        "removed_grants": removed,
                     })),
                 )
             }

@@ -5164,6 +5164,30 @@ impl AgentRuntime {
                     })
                     .unwrap_or(ansible_mesh_core::ExposureTier::Local);
 
+                let default_auth = match args.get("default_auth") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(v) => match serde_json::from_value::<
+                        ansible_mesh_core::mcp_route::McpAuthScheme,
+                    >(v.clone())
+                    {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            return self
+                                .fail_active_turn(
+                                    session_id,
+                                    turn_id,
+                                    format!("mcp.provision: invalid 'default_auth' — {e}"),
+                                )
+                                .await;
+                        }
+                    },
+                };
+
+                let allow_unauthenticated = args
+                    .get("allow_unauthenticated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
                 let config = ansible_mesh_core::mcp_endpoint::McpEndpointConfig {
                     endpoint_id: endpoint_id.clone(),
                     owner_agent_id: self.agent_id.clone(),
@@ -5171,6 +5195,8 @@ impl AgentRuntime {
                     path: None,
                     exposure,
                     tools,
+                    default_auth,
+                    allow_unauthenticated,
                     preapproval_rules,
                     updated_at,
                 };
@@ -5257,6 +5283,173 @@ impl AgentRuntime {
                     raw_transport_event: None,
                     error: tool_err,
                     tool_name: Some("mcp.provision".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── mcp.grant_token / mcp.rotate_token / mcp.revoke_token ────────
+            tool @ ("mcp.grant_token" | "mcp.rotate_token" | "mcp.revoke_token") => {
+                let tool = tool.to_string();
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let args = &payload.arguments;
+
+                let endpoint_id = match args.get("endpoint_id").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                format!("{tool}: missing required argument 'endpoint_id'"),
+                            )
+                            .await;
+                    }
+                };
+                let token_id = match args.get("token_id").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                format!("{tool}: missing required argument 'token_id'"),
+                            )
+                            .await;
+                    }
+                };
+
+                let request = if tool == "mcp.revoke_token" {
+                    IpcRequest::RevokeMcpTokenGrant {
+                        endpoint_id: endpoint_id.clone(),
+                        owner_agent_id: self.agent_id.clone(),
+                        token_id: token_id.clone(),
+                    }
+                } else {
+                    IpcRequest::ProvisionMcpTokenGrant {
+                        endpoint_id: endpoint_id.clone(),
+                        owner_agent_id: self.agent_id.clone(),
+                        token_id: token_id.clone(),
+                        tool_name: args
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        scopes: args
+                            .get("scopes")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default(),
+                        expires_at: args.get("expires_at").and_then(|v| v.as_u64()),
+                        allotment: args
+                            .get("allotment")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                        rotate: tool == "mcp.rotate_token",
+                    }
+                };
+
+                let response = self.ipc_client.send_request(request).await;
+
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let content = if tool == "mcp.revoke_token" {
+                            format!(
+                                "Token grant '{token_id}' revoked from endpoint '{endpoint_id}' \
+                                 ({} grant entr{} removed). Callers holding that token lose \
+                                 access; the membrane's vault cache may honor it for up to 60s.",
+                                data["removed_grants"].as_u64().unwrap_or(0),
+                                if data["removed_grants"].as_u64() == Some(1) {
+                                    "y"
+                                } else {
+                                    "ies"
+                                },
+                            )
+                        } else {
+                            let raw = data["raw_token"].as_str().unwrap_or("<missing>");
+                            let slot = data["tool_name"]
+                                .as_str()
+                                .map(|t| format!("tool '{t}'"))
+                                .unwrap_or_else(|| "the endpoint default auth".to_string());
+                            format!(
+                                "Token grant '{token_id}' {} on endpoint '{endpoint_id}' ({slot}).\n\
+                                 \n\
+                                 RAW TOKEN (shown once, only its hash is stored — relay it to the \
+                                 operator NOW and tell them to store it securely):\n\
+                                 \n\
+                                 {raw}\n\
+                                 \n\
+                                 Callers authenticate with `Authorization: Bearer {raw}`.",
+                                if tool == "mcp.rotate_token" {
+                                    "rotated"
+                                } else {
+                                    "created"
+                                },
+                            )
+                        };
+                        (content, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "IPC_ERROR",
+                            msg,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            format!("{tool}: unexpected hotel response"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = philotic_client::TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("{tool}: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(tool),
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),

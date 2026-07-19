@@ -2540,10 +2540,16 @@ mod tests {
             sender_username: Some("   ".into()),
             ..Default::default()
         };
-        assert_eq!(inbound_primary_user_id(&blank_username).as_deref(), Some("42"));
+        assert_eq!(
+            inbound_primary_user_id(&blank_username).as_deref(),
+            Some("42")
+        );
 
         // No sender at all (mesh/cron task) → None.
-        assert_eq!(inbound_primary_user_id(&InboundTaskPayload::default()), None);
+        assert_eq!(
+            inbound_primary_user_id(&InboundTaskPayload::default()),
+            None
+        );
     }
 
     // Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):

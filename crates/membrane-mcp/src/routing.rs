@@ -7,8 +7,8 @@
 //! `McpEndpointTable` takes priority for `tools/list` and `tools/call` when
 //! an endpoint config is present. The legacy table acts as fallback.
 
-use ansible_mesh_core::mcp_endpoint::{McpEndpointConfig, McpPreapprovalRule, McpToolSpec};
-use ansible_mesh_core::mcp_route::{McpRouteRecord, McpRouteTarget};
+use ansible_mesh_core::mcp_endpoint::{McpEndpointConfig, McpToolSpec};
+use ansible_mesh_core::mcp_route::McpRouteRecord;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -26,14 +26,6 @@ pub struct ResolvedRoute {
 }
 
 impl ResolvedRoute {
-    pub fn tool_name(&self) -> &str {
-        &self.record.tool_name
-    }
-
-    pub fn target(&self) -> &McpRouteTarget {
-        &self.record.target
-    }
-
     pub fn as_descriptor(&self) -> McpToolDescriptor {
         McpToolDescriptor {
             name: self.record.tool_name.clone(),
@@ -170,36 +162,9 @@ impl McpEndpointTable {
         self.config.is_some()
     }
 
-    /// All tool specs as MCP descriptors for `tools/list`.
-    pub fn tool_descriptors(&self) -> Vec<McpToolDescriptor> {
-        self.config.as_ref().map_or(vec![], |c| {
-            c.tools
-                .iter()
-                .map(|t| McpToolDescriptor {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    input_schema: t.input_schema.clone(),
-                })
-                .collect()
-        })
-    }
-
-    /// Tool descriptors visible to a caller after endpoint-level auth filtering.
-    pub fn visible_tool_descriptors(
-        &self,
-        mut is_visible: impl FnMut(&McpToolSpec) -> bool,
-    ) -> Vec<McpToolDescriptor> {
-        self.config.as_ref().map_or(vec![], |c| {
-            c.tools
-                .iter()
-                .filter(|tool| is_visible(tool))
-                .map(|t| McpToolDescriptor {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    input_schema: t.input_schema.clone(),
-                })
-                .collect()
-        })
+    /// The full endpoint config, when one has been pushed.
+    pub fn config(&self) -> Option<&McpEndpointConfig> {
+        self.config.as_ref()
     }
 
     /// Look up a tool spec by name.
@@ -226,12 +191,6 @@ impl McpEndpointTable {
                 rule.action_pattern == "*" || rule.action_pattern == action
             })
         })
-    }
-
-    pub fn preapproval_rules(&self) -> &[McpPreapprovalRule] {
-        self.config
-            .as_ref()
-            .map_or(&[], |c| c.preapproval_rules.as_slice())
     }
 }
 

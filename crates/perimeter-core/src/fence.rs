@@ -22,9 +22,18 @@ impl IngressDecision {
 /// The fence checks structural requirements (is a token present?) not validity
 /// (is the token correct?). Per-route auth does the cryptographic check.
 ///
-/// Policy:
-/// - Local:    Always allow. Loopback-only listener; trust is implicit.
-/// - Lan:      Always allow. Optional bearer at route level only.
+/// The fence does NOT control who can reach the listener — the bind address
+/// does. `membrane-mcp` binds `127.0.0.1` unless the endpoint's declared
+/// exposure tier is wider than `Local` AND the hotel's perimeter ceiling
+/// honors it (see `ListenerManager` in `membrane-mcp`). The fence is the
+/// second gate, applied to every route on whatever interface is bound.
+///
+/// Policy (tier = the hotel's current perimeter ceiling):
+/// - Local:    Allow. The listener is loopback-bound at this tier, so only
+///             local processes can connect at all.
+/// - Lan:      Allow any source that reached the listener. Auth is enforced
+///             at route level (`auth != None` is required for non-loopback
+///             publication as of the MCP membrane hardening).
 /// - Mesh:     Bearer token required unless request is from loopback
 ///             (loopback callers are local hotel tooling, not remote mesh clients).
 /// - Internet: Bearer token required. No loopback bypass — callers must authenticate.

@@ -172,7 +172,10 @@ pub struct BandedExplainReport {
 
 impl BandedExplainReport {
     pub fn total_items(&self) -> usize {
-        self.confirmed.len() + self.inferred.len() + self.told_or_seeded.len() + self.no_provenance.len()
+        self.confirmed.len()
+            + self.inferred.len()
+            + self.told_or_seeded.len()
+            + self.no_provenance.len()
     }
 }
 
@@ -188,7 +191,11 @@ pub fn muninn_activate_timestamp_to_unix_seconds(raw: i64) -> i64 {
 }
 
 fn sort_by_recency(items: &mut [ExplainEvidenceItem]) {
-    items.sort_by(|a, b| b.recorded_at.unwrap_or(i64::MIN).cmp(&a.recorded_at.unwrap_or(i64::MIN)));
+    items.sort_by(|a, b| {
+        b.recorded_at
+            .unwrap_or(i64::MIN)
+            .cmp(&a.recorded_at.unwrap_or(i64::MIN))
+    });
 }
 
 /// Merge a raw [`ExplainReport`] into truth bands, honestly separating
@@ -249,7 +256,10 @@ fn render_items(out: &mut String, heading: &str, items: &[ExplainEvidenceItem]) 
             .as_deref()
             .map(|s| format!(" [{s}]"))
             .unwrap_or_default();
-        out.push_str(&format!("- ({plane}) {}: {}{}\n", item.label, item.detail, source));
+        out.push_str(&format!(
+            "- ({plane}) {}: {}{}\n",
+            item.label, item.detail, source
+        ));
         if let Some(env) = &item.envelope {
             if !env.evidence.is_empty() {
                 out.push_str(&format!("    evidence: {}\n", env.evidence.join(", ")));
@@ -378,7 +388,11 @@ mod tests {
             .with_evidence(["pointer:1"])
     }
 
-    fn item(plane: ExplainPlane, label: &str, envelope: Option<ProvenanceEnvelope>) -> ExplainEvidenceItem {
+    fn item(
+        plane: ExplainPlane,
+        label: &str,
+        envelope: Option<ProvenanceEnvelope>,
+    ) -> ExplainEvidenceItem {
         ExplainEvidenceItem {
             plane,
             label: label.into(),
@@ -392,15 +406,27 @@ mod tests {
     #[test]
     fn truth_band_maps_trust_tiers_and_absence_correctly() {
         assert_eq!(
-            truth_band(&item(ExplainPlane::Muninn, "a", Some(envelope(TrustTier::Observed)))),
+            truth_band(&item(
+                ExplainPlane::Muninn,
+                "a",
+                Some(envelope(TrustTier::Observed))
+            )),
             TruthBand::Confirmed
         );
         assert_eq!(
-            truth_band(&item(ExplainPlane::Muninn, "b", Some(envelope(TrustTier::Inferred)))),
+            truth_band(&item(
+                ExplainPlane::Muninn,
+                "b",
+                Some(envelope(TrustTier::Inferred))
+            )),
             TruthBand::Inferred
         );
         assert_eq!(
-            truth_band(&item(ExplainPlane::Muninn, "c", Some(envelope(TrustTier::Told)))),
+            truth_band(&item(
+                ExplainPlane::Muninn,
+                "c",
+                Some(envelope(TrustTier::Told))
+            )),
             TruthBand::ToldOrSeeded
         );
         assert_eq!(
@@ -417,13 +443,21 @@ mod tests {
                 ExplainPlaneOutcome::ok(
                     ExplainPlane::Muninn,
                     vec![
-                        item(ExplainPlane::Muninn, "observed-fact", Some(envelope(TrustTier::Observed))),
+                        item(
+                            ExplainPlane::Muninn,
+                            "observed-fact",
+                            Some(envelope(TrustTier::Observed)),
+                        ),
                         item(ExplainPlane::Muninn, "old-engram", None),
                     ],
                 ),
                 ExplainPlaneOutcome::ok(
                     ExplainPlane::IntelGraph,
-                    vec![item(ExplainPlane::IntelGraph, "decision", Some(envelope(TrustTier::Told)))],
+                    vec![item(
+                        ExplainPlane::IntelGraph,
+                        "decision",
+                        Some(envelope(TrustTier::Told)),
+                    )],
                 ),
             ],
         };
@@ -443,14 +477,20 @@ mod tests {
             claim: "claim".into(),
             planes: vec![
                 ExplainPlaneOutcome::ok(ExplainPlane::Muninn, vec![]),
-                ExplainPlaneOutcome::unavailable(ExplainPlane::LifeGraph, "no transport from this surface"),
+                ExplainPlaneOutcome::unavailable(
+                    ExplainPlane::LifeGraph,
+                    "no transport from this surface",
+                ),
             ],
         };
         let banded = band_report(&report);
         assert_eq!(banded.total_items(), 0);
         assert_eq!(banded.unavailable_planes.len(), 1);
         assert_eq!(banded.unavailable_planes[0].0, ExplainPlane::LifeGraph);
-        assert_eq!(banded.unavailable_planes[0].1, "no transport from this surface");
+        assert_eq!(
+            banded.unavailable_planes[0].1,
+            "no transport from this surface"
+        );
         // The Muninn plane answered (no unavailable_reason) with zero items —
         // that must be tracked as "queried, found nothing", not silently
         // indistinguishable from a plane that was never asked at all.
@@ -477,7 +517,10 @@ mod tests {
     fn render_text_includes_unavailable_section_and_empty_notice() {
         let report = ExplainReport {
             claim: "claim with no evidence".into(),
-            planes: vec![ExplainPlaneOutcome::unavailable(ExplainPlane::IntelGraph, "connection refused")],
+            planes: vec![ExplainPlaneOutcome::unavailable(
+                ExplainPlane::IntelGraph,
+                "connection refused",
+            )],
         };
         let text = render_text(&band_report(&report));
         assert!(text.contains("No evidence found on any queried plane"));
@@ -491,7 +534,11 @@ mod tests {
             claim: "claim".into(),
             planes: vec![ExplainPlaneOutcome::ok(
                 ExplainPlane::LifeGraph,
-                vec![item(ExplainPlane::LifeGraph, "recalled", Some(envelope(TrustTier::Inferred)))],
+                vec![item(
+                    ExplainPlane::LifeGraph,
+                    "recalled",
+                    Some(envelope(TrustTier::Inferred)),
+                )],
             )],
         };
         let text = render_text(&band_report(&report));
@@ -502,14 +549,25 @@ mod tests {
 
     #[test]
     fn recency_sort_orders_most_recent_first_within_a_band() {
-        let mut older = item(ExplainPlane::Muninn, "older", Some(envelope(TrustTier::Observed)));
+        let mut older = item(
+            ExplainPlane::Muninn,
+            "older",
+            Some(envelope(TrustTier::Observed)),
+        );
         older.recorded_at = Some(100);
-        let mut newer = item(ExplainPlane::Muninn, "newer", Some(envelope(TrustTier::Observed)));
+        let mut newer = item(
+            ExplainPlane::Muninn,
+            "newer",
+            Some(envelope(TrustTier::Observed)),
+        );
         newer.recorded_at = Some(200);
 
         let report = ExplainReport {
             claim: "claim".into(),
-            planes: vec![ExplainPlaneOutcome::ok(ExplainPlane::Muninn, vec![older, newer])],
+            planes: vec![ExplainPlaneOutcome::ok(
+                ExplainPlane::Muninn,
+                vec![older, newer],
+            )],
         };
         let banded = band_report(&report);
         assert_eq!(banded.confirmed[0].label, "newer");
@@ -523,7 +581,11 @@ mod tests {
         // normalizing units first, or the (numerically enormous) raw
         // nanosecond value always sorts first regardless of real time.
         let muninn_raw_ns: i64 = 1_782_527_813_435_365_000; // observed live
-        let mut muninn_item = item(ExplainPlane::Muninn, "muninn-2026", Some(envelope(TrustTier::Observed)));
+        let mut muninn_item = item(
+            ExplainPlane::Muninn,
+            "muninn-2026",
+            Some(envelope(TrustTier::Observed)),
+        );
         muninn_item.recorded_at = Some(muninn_activate_timestamp_to_unix_seconds(muninn_raw_ns));
 
         let mut intel_graph_item = item(
@@ -532,7 +594,8 @@ mod tests {
             Some(envelope(TrustTier::Observed)),
         );
         // A later Unix-seconds timestamp than the normalized Muninn one above.
-        intel_graph_item.recorded_at = Some(muninn_activate_timestamp_to_unix_seconds(muninn_raw_ns) + 1000);
+        intel_graph_item.recorded_at =
+            Some(muninn_activate_timestamp_to_unix_seconds(muninn_raw_ns) + 1000);
 
         let report = ExplainReport {
             claim: "claim".into(),
@@ -590,6 +653,9 @@ mod tests {
         assert_eq!(parsed, env);
 
         assert!(envelope_from_engram_metadata(&serde_json::json!({})).is_none());
-        assert!(envelope_from_engram_metadata(&serde_json::json!({"provenance": "not-an-envelope"})).is_none());
+        assert!(envelope_from_engram_metadata(
+            &serde_json::json!({"provenance": "not-an-envelope"})
+        )
+        .is_none());
     }
 }

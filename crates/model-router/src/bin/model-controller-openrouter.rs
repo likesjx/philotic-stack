@@ -1,6 +1,8 @@
 use anyhow::Result;
 use model_router::providers::OpenAIProvider;
-use model_router::runtime::{ControllerGuestConfig, DEFAULT_OPENROUTER_MODEL, run_model_controller};
+use model_router::runtime::{
+    ControllerGuestConfig, DEFAULT_OPENROUTER_MODEL, run_model_controller,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {

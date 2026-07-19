@@ -3068,9 +3068,7 @@ impl TelegramSeatGuest {
         // without this check each seat re-sends the same message and the
         // operator sees it once per bot. Only the seat owning the session's
         // agent may act on the task.
-        if !session_id.is_empty()
-            && !session_owned_by_agent(&session_id, &self.target_agent_id)
-        {
+        if !session_id.is_empty() && !session_owned_by_agent(&session_id, &self.target_agent_id) {
             info!(
                 "Dropping reply task [{}] for session [{}]: session belongs to another seat's agent (this seat serves [{}]).",
                 action, session_id, self.target_agent_id

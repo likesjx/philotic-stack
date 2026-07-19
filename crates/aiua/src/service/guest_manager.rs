@@ -994,10 +994,7 @@ impl GuestManager {
     /// Clock injected for deterministic tests; see [`check_heal_dispatcher_heartbeat`].
     async fn check_heal_dispatcher_heartbeat_at(&self, now: u64) -> Result<()> {
         let guests = self.graph.list_guests(&self.hotel_name, false)?;
-        let Some(rec) = guests
-            .into_iter()
-            .find(|g| g.role == HEAL_DISPATCHER_ROLE)
-        else {
+        let Some(rec) = guests.into_iter().find(|g| g.role == HEAL_DISPATCHER_ROLE) else {
             return Ok(()); // not deployed on this hotel — nothing to watch
         };
         if !rec.is_active {
@@ -1710,7 +1707,10 @@ mod tests {
 
     #[test]
     fn parse_heartbeat_epoch_secs_is_defensive() {
-        assert_eq!(parse_heartbeat_epoch_secs("1750000000"), Some(1_750_000_000));
+        assert_eq!(
+            parse_heartbeat_epoch_secs("1750000000"),
+            Some(1_750_000_000)
+        );
         assert_eq!(
             parse_heartbeat_epoch_secs("\"1750000000\""),
             Some(1_750_000_000)
