@@ -2,9 +2,9 @@
 title: MCP Client Fabric — Philote-Governed Consumption of External MCP Servers
 doc_type: proposal
 domain: membrane-transport
-status: proposed
-disposition: proposed
-last_updated: 2026-07-15
+status: in-progress
+disposition: phase-1-implemented
+last_updated: 2026-07-18
 tags:
   - mcp
   - mcp-client
@@ -32,6 +32,30 @@ source_of_truth_targets:
 ---
 
 # MCP Client Fabric — Philote-Governed Consumption of External MCP Servers
+
+> **Phase 1 implemented (2026-07-18, `codex/mcp-client-fabric`).** Registry +
+> HTTP client + projection are live with these design deviations from the text
+> below, chosen to reuse existing machinery:
+> - **Storage**: upstreams live in ONE registry map config node
+>   (`__mcp_upstreams__`, plus `__mcp_upstream_catalogs__` for guest reports)
+>   following the `__mcp_routes__` pattern, not per-key
+>   `__mcp_upstream__:<id>` nodes.
+> - **Call path**: there is no `CallMcpUpstreamTool` IPC. Projected tools get
+>   an assembled `ToolExecutionRoute` (`execution_mode: "mcp_upstream"`,
+>   `target_role: "mcp-client-runner"`), so the philote's standard parked
+>   EmitTask dispatch carries the call and the guest replies with the standard
+>   `datasource_response` shape — zero new routing or re-entry code.
+> - **Guest**: `crates/membrane-mcp-client`, a plain inbox-subscriber
+>   (datasource pattern) under role **`mcp-client-runner`** (the `*-runner`
+>   suffix gets the reserved-role protections), one guest per hotel,
+>   materialized on first `RegisterMcpUpstream`.
+> - **Credentials**: the read side is live (`credential_ref` → `GetSecret` →
+>   bearer); the `mcp.set_credential` write tool remains Phase 2, so
+>   authenticated upstreams need an operator-provisioned vault secret.
+> - Grant checks are enforced in the guest (owner or `grant_agents`);
+>   allotments are in-memory sliding-hour; response caps default 256 KiB.
+> Phase-1 proof target (connect to the local intel-graph MCP server) still
+> needs a live hotel run.
 
 ## Problem
 

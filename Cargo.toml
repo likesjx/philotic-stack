@@ -2,6 +2,7 @@
 members = [
     "crates/aiua",
     "crates/membrane-mcp",
+    "crates/membrane-mcp-client",
     "crates/membrane",
     "crates/membrane-discord",
     "crates/membrane-telegram",

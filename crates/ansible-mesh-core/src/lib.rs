@@ -23,6 +23,7 @@ pub mod ledger;
 pub mod materializer;
 pub mod mcp_endpoint;
 pub mod mcp_route;
+pub mod mcp_upstream;
 pub mod membership;
 pub mod memory_explain;
 pub mod meshops;

@@ -658,6 +658,10 @@ impl AgentRuntime {
         // membrane-mcp guest picks them up immediately on restart.
         self.register_mcp_routes().await;
 
+        // Load projected upstream MCP tools (mcp:<upstream>.<tool>) so granted
+        // remote tools are in the catalog from the first turn.
+        self.refresh_mcp_upstream_projection().await;
+
         loop {
             // Run the watchdog every loop, not only on an idle receive timeout. A busy
             // inbox must not keep a stuck active turn alive indefinitely.

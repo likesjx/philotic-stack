@@ -8574,6 +8574,341 @@ impl IpcServer {
                 )
             }
 
+            // ── MCP upstream (client fabric) registry ─────────────────────────
+            IpcRequest::RegisterMcpUpstream { config } => {
+                use ansible_mesh_core::mcp_upstream::{
+                    McpEgressPolicy, McpUpstreamConfig, McpUpstreamTransport, host_from_http_url,
+                };
+                let upstream_id = config.upstream_id.clone();
+
+                // Owner claim must match the registered guest identity on this
+                // connection (hardening S4 pattern).
+                if !Self::mcp_owner_identity_ok(current_identity, &config.owner_agent_id) {
+                    return IpcResponse::error(
+                        "mcp_upstream",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{}' does not match the registered guest identity",
+                            config.owner_agent_id
+                        ),
+                    );
+                }
+
+                // Phase 1: HTTP transport only. Stdio needs the command
+                // allowlist + sandbox review (client-fabric Phase 3).
+                let url = match &config.transport {
+                    McpUpstreamTransport::Http { url } => url.clone(),
+                    McpUpstreamTransport::Stdio { .. } => {
+                        return IpcResponse::error(
+                            "mcp_upstream",
+                            "TRANSPORT_NOT_IMPLEMENTED",
+                            "stdio upstream transport is not available yet; use an HTTP url",
+                        );
+                    }
+                };
+
+                // Egress fence: the target host must be loopback, tailnet, or
+                // explicitly allowlisted in the operator-managed policy node.
+                let policy: McpEgressPolicy = graph
+                    .get_config_value("mcp_egress_policy")
+                    .ok()
+                    .flatten()
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                    .unwrap_or_default();
+                match host_from_http_url(&url) {
+                    Some(host) if policy.host_allowed(&host) => {}
+                    Some(host) => {
+                        return IpcResponse::error(
+                            "mcp_upstream",
+                            "EGRESS_DENIED",
+                            format!(
+                                "host '{host}' is outside the egress policy (loopback + tailnet \
+                                 by default); an operator must add it to the mcp_egress_policy \
+                                 config node"
+                            ),
+                        );
+                    }
+                    None => {
+                        return IpcResponse::error(
+                            "mcp_upstream",
+                            "INVALID_URL",
+                            format!("'{url}' is not a valid http(s) URL"),
+                        );
+                    }
+                }
+
+                // Ownership: an existing registration may only be updated by
+                // its owner.
+                let mut registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
+                    .get_config_value("__mcp_upstreams__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                if let Some(existing) = registry.get(&upstream_id) {
+                    if existing.owner_agent_id != config.owner_agent_id {
+                        return IpcResponse::error(
+                            "mcp_upstream",
+                            "FORBIDDEN",
+                            format!(
+                                "upstream {upstream_id} is owned by {}",
+                                existing.owner_agent_id
+                            ),
+                        );
+                    }
+                }
+                registry.insert(upstream_id.clone(), config.clone());
+                match serde_json::to_string(&registry) {
+                    Ok(json) => {
+                        if let Err(e) = graph.set_config_value("__mcp_upstreams__", &json) {
+                            return IpcResponse::error(
+                                "mcp_upstream",
+                                "CONFIG_STORE_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "mcp_upstream",
+                            "SERIALIZE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                }
+
+                // Fan out the config to the mcp-client guest inbox.
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_upstream",
+                    "config": config,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    "mcp-client-runner",
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                // Materialize the single mcp-client guest on first use.
+                let materialized = if let Some(hotel_name) =
+                    Self::local_hotel_name(graph, local_node_id)
+                {
+                    let socket_path = graph
+                        .list_hotels()
+                        .ok()
+                        .and_then(|hs| {
+                            hs.into_iter()
+                                .find(|h| h.capabilities.node_id == local_node_id)
+                                .map(|h| h.ipc_socket_path)
+                        })
+                        .unwrap_or_default();
+                    let client_config = serde_json::json!({
+                        "command": "membrane-mcp-client",
+                        "args": [],
+                        "env": {
+                            "PHILOTIC_HOTEL_SOCKET": socket_path,
+                            "PHILOTIC_GUEST_ID": "mcp-client",
+                            "PHILOTIC_NODE_ID": local_node_id,
+                        }
+                    });
+                    let record = ansible_mesh_core::storage::GuestRecord {
+                        hotel_name: hotel_name.clone(),
+                        guest_id: "mcp-client".into(),
+                        role: "mcp-client-runner".into(),
+                        config_json: client_config.to_string(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    };
+                    match graph.upsert_guest(&record) {
+                        Err(e) => {
+                            warn!("RegisterMcpUpstream: failed to upsert mcp-client guest: {e}");
+                            false
+                        }
+                        Ok(()) => {
+                            if let Some(requester) = materialization_requester {
+                                match requester.ensure_guest_active("mcp-client").await {
+                                    Ok(spawned) => spawned,
+                                    Err(e) => {
+                                        warn!("mcp-client guest materialization error: {e}");
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                } else {
+                    warn!(
+                        "RegisterMcpUpstream: hotel name not found for node [{}]; skipping guest spawn.",
+                        local_node_id
+                    );
+                    false
+                };
+
+                info!(upstream_id, "MCP upstream registered and fanned out.");
+                IpcResponse::McpUpstreamRegistered {
+                    mcp_upstream_id: upstream_id,
+                    mcp_upstream_materialized: materialized,
+                }
+            }
+
+            IpcRequest::RevokeMcpUpstream {
+                upstream_id,
+                owner_agent_id,
+            } => {
+                use ansible_mesh_core::mcp_upstream::McpUpstreamConfig;
+                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
+                    return IpcResponse::error(
+                        "mcp_upstream",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{owner_agent_id}' does not match the registered \
+                             guest identity"
+                        ),
+                    );
+                }
+                let mut registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
+                    .get_config_value("__mcp_upstreams__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                match registry.get(&upstream_id) {
+                    Some(existing) if existing.owner_agent_id != owner_agent_id => {
+                        return IpcResponse::error(
+                            "mcp_upstream",
+                            "FORBIDDEN",
+                            format!(
+                                "upstream {upstream_id} is not owned by {owner_agent_id}"
+                            ),
+                        );
+                    }
+                    None => {
+                        return IpcResponse::error(
+                            "mcp_upstream",
+                            "NOT_FOUND",
+                            format!("no upstream registered as {upstream_id}"),
+                        );
+                    }
+                    Some(_) => {}
+                }
+                registry.remove(&upstream_id);
+                if let Ok(json) = serde_json::to_string(&registry) {
+                    let _ = graph.set_config_value("__mcp_upstreams__", &json);
+                }
+                // Drop the stored catalog too.
+                let mut catalogs: std::collections::HashMap<String, serde_json::Value> = graph
+                    .get_config_value("__mcp_upstream_catalogs__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                catalogs.remove(&upstream_id);
+                if let Ok(json) = serde_json::to_string(&catalogs) {
+                    let _ = graph.set_config_value("__mcp_upstream_catalogs__", &json);
+                }
+
+                let task_json = serde_json::json!({
+                    "action": "revoke_mcp_upstream",
+                    "upstream_id": upstream_id,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    "mcp-client-runner",
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(upstream_id, "MCP upstream revoked.");
+                IpcResponse::McpUpstreamRegistered {
+                    mcp_upstream_id: upstream_id,
+                    mcp_upstream_materialized: false,
+                }
+            }
+
+            IpcRequest::GetMcpUpstreams {} => {
+                use ansible_mesh_core::mcp_upstream::{McpUpstreamCatalog, McpUpstreamConfig};
+                let registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
+                    .get_config_value("__mcp_upstreams__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let mut catalogs: std::collections::HashMap<String, McpUpstreamCatalog> = graph
+                    .get_config_value("__mcp_upstream_catalogs__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let mut entries: Vec<philotic_client::McpUpstreamEntry> = registry
+                    .into_values()
+                    .map(|config| {
+                        let catalog = catalogs.remove(&config.upstream_id);
+                        philotic_client::McpUpstreamEntry { config, catalog }
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.config.upstream_id.cmp(&b.config.upstream_id));
+                IpcResponse::McpUpstreamsState {
+                    mcp_upstreams: entries,
+                }
+            }
+
+            IpcRequest::ReportMcpUpstreamCatalog { catalog } => {
+                let upstream_id = catalog.upstream_id.clone();
+                let mut catalogs: std::collections::HashMap<String, serde_json::Value> = graph
+                    .get_config_value("__mcp_upstream_catalogs__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                match serde_json::to_value(&catalog) {
+                    Ok(v) => {
+                        catalogs.insert(upstream_id.clone(), v);
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "mcp_upstream",
+                            "SERIALIZE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                }
+                if let Err(e) = graph.set_config_value("__mcp_upstream_catalogs__", &{
+                    match serde_json::to_string(&catalogs) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            return IpcResponse::error(
+                                "mcp_upstream",
+                                "SERIALIZE_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    }
+                }) {
+                    return IpcResponse::error(
+                        "mcp_upstream",
+                        "CONFIG_STORE_ERROR",
+                        e.to_string(),
+                    );
+                }
+                info!(
+                    upstream_id,
+                    tool_count = catalog.tools.len(),
+                    "MCP upstream catalog reported."
+                );
+                IpcResponse::success("mcp_upstream_catalog", None)
+            }
+
             // ── User Task Engine ──────────────────────────────────────────────
             IpcRequest::CreateUserTask {
                 task_id,

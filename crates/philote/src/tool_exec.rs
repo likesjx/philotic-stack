@@ -5632,6 +5632,378 @@ impl AgentRuntime {
                 .await
             }
 
+            // ── mcp.connect ──────────────────────────────────────────────────
+            "mcp.connect" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let args = &payload.arguments;
+
+                let upstream_id = match args.get("upstream_id").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "mcp.connect: missing required argument 'upstream_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let url = match args.get("url").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "mcp.connect: missing required argument 'url'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let tools: Vec<String> = args
+                    .get("tools")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                if tools.is_empty() {
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            turn_id,
+                            "mcp.connect: 'tools' must name at least one remote tool to \
+                             allowlist — nothing is projected by default"
+                                .into(),
+                        )
+                        .await;
+                }
+                let grant_agents: Vec<String> = args
+                    .get("grant_agents")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let credential_ref = args
+                    .get("credential_ref")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string);
+
+                let config = ansible_mesh_core::mcp_upstream::McpUpstreamConfig {
+                    upstream_id: upstream_id.clone(),
+                    owner_agent_id: self.agent_id.clone(),
+                    transport: ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http {
+                        url: url.clone(),
+                    },
+                    credential_ref,
+                    tool_allowlist: tools
+                        .iter()
+                        .map(
+                            |name| ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
+                                remote_name: name.clone(),
+                                allotment: None,
+                                max_response_bytes: None,
+                            },
+                        )
+                        .collect(),
+                    grant_agents,
+                    refresh_interval_secs: None,
+                    updated_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                };
+
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::RegisterMcpUpstream { config })
+                    .await;
+
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::McpUpstreamRegistered {
+                        ref mcp_upstream_id,
+                        mcp_upstream_materialized,
+                    }) => {
+                        let status = if mcp_upstream_materialized {
+                            "spawned the mcp-client guest"
+                        } else {
+                            "updated the existing mcp-client guest"
+                        };
+                        (
+                            format!(
+                                "MCP upstream registered.\n\
+                                 Upstream ID: {mcp_upstream_id}\n\
+                                 URL: {url}\n\
+                                 Allowlisted tools: {}\n\
+                                 Status: {status}. The connection is established \
+                                 asynchronously — run mcp.upstreams to confirm and load \
+                                 the projected mcp:{mcp_upstream_id}.<tool> entries.",
+                                tools.join(", ")
+                            ),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "IPC_ERROR",
+                            msg,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "mcp.connect: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = philotic_client::TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("mcp.connect: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some("mcp.connect".into()),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── mcp.disconnect ───────────────────────────────────────────────
+            "mcp.disconnect" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let upstream_id = match payload
+                    .arguments
+                    .get("upstream_id")
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "mcp.disconnect: missing required argument 'upstream_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::RevokeMcpUpstream {
+                        upstream_id: upstream_id.clone(),
+                        owner_agent_id: self.agent_id.clone(),
+                    })
+                    .await;
+
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::McpUpstreamRegistered {
+                        ref mcp_upstream_id,
+                        ..
+                    }) => (
+                        format!(
+                            "MCP upstream '{mcp_upstream_id}' removed. Its projected \
+                             tools are no longer available."
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "IPC_ERROR",
+                            msg,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "mcp.disconnect: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = philotic_client::TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("mcp.disconnect: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                // Drop the revoked upstream's projections from live sessions.
+                self.refresh_mcp_upstream_projection().await;
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some("mcp.disconnect".into()),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── mcp.upstreams ────────────────────────────────────────────────
+            "mcp.upstreams" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+
+                // Refresh the projection cache first so the listing and the
+                // catalog agree on what is currently projected.
+                self.refresh_mcp_upstream_projection().await;
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetMcpUpstreams {})
+                    .await
+                {
+                    Ok(IpcResponse::McpUpstreamsState { mcp_upstreams }) => {
+                        if mcp_upstreams.is_empty() {
+                            (
+                                "No upstream MCP servers are registered on this hotel. \
+                                 Use mcp.connect to register one."
+                                    .to_string(),
+                                None,
+                            )
+                        } else {
+                            let mut lines = Vec::new();
+                            for entry in &mcp_upstreams {
+                                let cfg = &entry.config;
+                                let url = cfg.transport.http_url().unwrap_or("<stdio>");
+                                let state = entry
+                                    .catalog
+                                    .as_ref()
+                                    .map(|c| format!("{:?}", c.state))
+                                    .unwrap_or_else(|| "Pending".into());
+                                let projected: Vec<String> = entry
+                                    .catalog
+                                    .as_ref()
+                                    .map(|c| {
+                                        c.tools
+                                            .iter()
+                                            .map(|t| {
+                                                ansible_mesh_core::mcp_upstream::projected_tool_name(
+                                                    &cfg.upstream_id,
+                                                    &t.remote_name,
+                                                )
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let missing = entry
+                                    .catalog
+                                    .as_ref()
+                                    .map(|c| c.missing_grants.clone())
+                                    .unwrap_or_default();
+                                lines.push(format!(
+                                    "• {} — {} [{}] owner={}\n  projected: {}{}",
+                                    cfg.upstream_id,
+                                    url,
+                                    state,
+                                    cfg.owner_agent_id,
+                                    if projected.is_empty() {
+                                        "(none yet)".to_string()
+                                    } else {
+                                        projected.join(", ")
+                                    },
+                                    if missing.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("\n  stale grants (not advertised): {}", missing.join(", "))
+                                    },
+                                ));
+                            }
+                            (
+                                format!(
+                                    "Registered MCP upstreams:\n{}\n\nProjected tools are \
+                                     callable by name (approval-gated).",
+                                    lines.join("\n")
+                                ),
+                                None,
+                            )
+                        }
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("MCP upstream state unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("mcp.upstreams: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some("mcp.upstreams".into()),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             // ── table.add_listener ───────────────────────────────────────────
             "table.add_listener" => {
                 let args = payload.arguments.as_object();

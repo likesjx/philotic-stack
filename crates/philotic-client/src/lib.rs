@@ -1731,6 +1731,33 @@ pub enum IpcRequest {
         owner_agent_id: String,
         token_id: String,
     },
+    // ── MCP upstream (client fabric) IPC ─────────────────────────────────────
+    /// Register or update an upstream MCP server this hotel consumes.
+    ///
+    /// The hotel checks the egress policy, persists the config under the
+    /// `__mcp_upstreams__` registry, fans out an `update_mcp_upstream` push to
+    /// the `mcp-client` guest, and materializes that guest if needed.
+    /// Responds with [`IpcResponse::McpUpstreamRegistered`].
+    RegisterMcpUpstream {
+        config: ansible_mesh_core::mcp_upstream::McpUpstreamConfig,
+    },
+    /// Remove an upstream MCP server registration.
+    ///
+    /// Only the `owner_agent_id` that registered the upstream may revoke it.
+    /// The hotel clears stored state and fans out a `revoke_mcp_upstream` push.
+    /// Responds with [`IpcResponse::McpUpstreamRegistered`].
+    RevokeMcpUpstream {
+        upstream_id: String,
+        owner_agent_id: String,
+    },
+    /// Return all registered upstreams with their last reported catalogs.
+    /// Responds with [`IpcResponse::McpUpstreamsState`].
+    GetMcpUpstreams {},
+    /// Guest → hotel: report an upstream's connection state and projected
+    /// tool catalog after connect/refresh. Responds with [`IpcResponse::Standard`].
+    ReportMcpUpstreamCatalog {
+        catalog: ansible_mesh_core::mcp_upstream::McpUpstreamCatalog,
+    },
     // ── Training data admin IPC ───────────────────────────────────────────────
     /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
     ListTrainingSamples {
@@ -2552,6 +2579,18 @@ pub enum IpcResponse {
         /// existing guest's config was updated in place.
         materialized: bool,
     },
+    /// Response to [`IpcRequest::RegisterMcpUpstream`] /
+    /// [`IpcRequest::RevokeMcpUpstream`].
+    McpUpstreamRegistered {
+        mcp_upstream_id: String,
+        /// `true` if a new mcp-client guest was spawned; `false` if an
+        /// existing guest received the config update in place.
+        mcp_upstream_materialized: bool,
+    },
+    /// Response to [`IpcRequest::GetMcpUpstreams`].
+    McpUpstreamsState {
+        mcp_upstreams: Vec<McpUpstreamEntry>,
+    },
     DiscordGatewayLease {
         granted: bool,
         lease: Option<LeaseEnvelope>,
@@ -2697,6 +2736,16 @@ pub struct PersistedMcpRouteEntry {
     /// Vault ref for the bearer token, if one was supplied at provisioning time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_ref: Option<String>,
+}
+
+/// One registered upstream MCP server plus its last reported catalog, as
+/// returned by [`IpcResponse::McpUpstreamsState`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpUpstreamEntry {
+    pub config: ansible_mesh_core::mcp_upstream::McpUpstreamConfig,
+    /// Last catalog report from the mcp-client guest, if any yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<ansible_mesh_core::mcp_upstream::McpUpstreamCatalog>,
 }
 
 impl IpcResponse {
