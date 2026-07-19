@@ -3714,17 +3714,13 @@ mod tests {
             commit.input_schema["required"],
             json!(["evidence", "operator_approved"])
         );
+        // life.commit relaxed its required evidence fields to just the claim
+        // identity + summary (commit 7b5622b: model-authored life.observe parses
+        // with documented defaults rather than failing wholesale over a missing
+        // source_reliability). The richer governance fields are optional.
         assert_eq!(
             commit.input_schema["properties"]["evidence"]["required"],
-            json!([
-                "packet_id",
-                "claim_ref",
-                "claim_summary",
-                "confidence",
-                "validation_state",
-                "source_reliability",
-                "adjudication_status"
-            ])
+            json!(["claim_ref", "claim_summary"])
         );
 
         let conflict = catalog
