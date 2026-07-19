@@ -2000,6 +2000,16 @@ impl AgentRuntime {
             .map(|rn| format!("{}:{}", self.agent_id, rn))
     }
 
+    /// The concrete guest identity THIS runtime registered with the hotel —
+    /// `model_reply_guest_id()` for role incarnations, the bare `agent_id`
+    /// for base philotes. Used by the tool / life.* dispatch paths (DEF-051
+    /// part 2), which need an explicit return guest rather than the
+    /// Option-and-infer contract the model dispatch uses.
+    pub(crate) fn own_guest_id(&self) -> String {
+        self.model_reply_guest_id()
+            .unwrap_or_else(|| self.agent_id.clone())
+    }
+
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
     /// Applied to every new session so the correct persona is used from the first message.
     async fn fetch_agent_profile(&mut self) {
