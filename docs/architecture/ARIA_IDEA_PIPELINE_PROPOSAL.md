@@ -124,6 +124,14 @@ ownership split in LIFE_GRAPH_OS_PROPOSAL.
 
 ## Stage 3 — `idea-closure-loop`
 
+> **Implemented 2026-07-16** (`codex/idea-closure-loop`): `just idea-sweep ship`
+> wired into `$philotic-slice-closeout` step 3; Aria's charter gained closure
+> delivery (shipped-idea digest, decline reasons always relayed, anti-nagging)
+> and dropped the unwritable intake properties (see the Stage 2 reality gap).
+> The `LifeGraphChange` push on ship remains a transitional gap — the direct
+> cypher write bypasses the runner; the app badge arrives with the governed
+> session-side life.* write client (successor seam).
+
 - When a promoted idea's slice merges (session closeout), the closing session
   sets `idea_status: shipped` on the LifeGraph node and emits the existing
   change-push (`LifeGraphChange`) — the operator's app badges it live.
@@ -152,10 +160,11 @@ the slice, on `doc:native-apple-app-proposal`):
 
 ## Disposition
 
-`accepted for current slice` — slice 1 (`idea-intake-charter`) in flight
-on `codex/aria-idea-intake-charter` (2026-07-15): items 1–3 implemented
-(catalog keywords + charter text + schema convention note); item 4 (mbp-jane
-deploy + watched-live) pending rollout.
+`implemented` — all three stages landed (slice 1 PR #289, slice 2 PR #294,
+slice 3 `codex/idea-closure-loop`); watched-live intake verification (operator
+texts Aria, node lands) pending operator. Deferred by design: cron
+`idea_digest` paracrine signal; governed session-side life.* write client
+(restores provenance envelope + LifeGraphChange push on status transitions).
 
 ## Current Slice (for the picking-up session)
 
