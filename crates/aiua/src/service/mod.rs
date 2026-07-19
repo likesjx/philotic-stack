@@ -4,6 +4,7 @@ pub mod egress;
 pub mod execution_transport;
 pub mod golgi;
 pub mod guest_manager;
+pub mod host_health_scan;
 pub mod ipc;
 pub mod lease;
 pub mod lease_handlers;

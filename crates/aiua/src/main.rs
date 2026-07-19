@@ -8181,6 +8181,19 @@ async fn main() -> Result<()> {
         db_path.to_string_lossy().to_string(),
     );
 
+    // Host-health scan: samples host vitals (load/CPU/mem/disk) plus
+    // config-driven TCP service probes and routes threshold breaches into the
+    // self-heal queue — successor to the hand-rolled vps-jane cron monitors.
+    crate::service::host_health_scan::spawn_loop(
+        graph_domain_arc.clone(),
+        db_path.to_string_lossy().to_string(),
+        db_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        hotel_name.clone(),
+    );
+
     tokio::spawn(run_operator_surface_query_worker(
         operator_surface_rx,
         socket_path.clone(),
