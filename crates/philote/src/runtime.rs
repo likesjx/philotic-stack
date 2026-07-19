@@ -1587,6 +1587,10 @@ pub struct AgentRuntime {
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
     default_agent_profile: AgentProfile,
+    /// Projected upstream MCP tools (`mcp:<upstream>.<tool>`) this agent owns
+    /// or is granted, cached from `GetMcpUpstreams`. Copied into each session's
+    /// bindings so the tool assembly projects them (proposal mcp-client-fabric).
+    mcp_upstream_tools: Vec<crate::session::McpUpstreamToolBinding>,
     /// Tasks dequeued from a session's pending_user_tasks after a turn completed.
     /// Dispatched at the top of the main event loop to avoid async recursion.
     pending_drains: std::collections::VecDeque<(Uuid, InboundTaskPayload)>,
@@ -1962,6 +1966,7 @@ impl AgentRuntime {
             configured_roles: HashMap::new(),
             openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
+            mcp_upstream_tools: Vec::new(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
             stuck_turn_signature: HashMap::new(),
@@ -6589,6 +6594,67 @@ impl AgentRuntime {
     /// effective_toolset, effective_skillset, and component routing into the live session state.
     /// This ensures tool grants and runtime routing changes take effect immediately on the next
     /// message without requiring a session restart or reconnect.
+    /// Refresh the projected upstream MCP tool cache from the hotel and apply
+    /// it to every live session (proposal mcp-client-fabric). Sessions whose
+    /// projection changed get their tool assembly rebuilt, so revoked
+    /// upstreams disappear and newly reported catalogs appear.
+    pub(crate) async fn refresh_mcp_upstream_projection(&mut self) {
+        let entries = match self
+            .ipc_client
+            .send_request_with_timeout(IpcRequest::GetMcpUpstreams {}, Duration::from_secs(5))
+            .await
+        {
+            Ok(IpcResponse::McpUpstreamsState { mcp_upstreams }) => mcp_upstreams,
+            Ok(_) => return,
+            Err(e) => {
+                warn!("refresh_mcp_upstream_projection: GetMcpUpstreams failed: {e}");
+                return;
+            }
+        };
+
+        let mut projected = Vec::new();
+        for entry in entries {
+            let cfg = entry.config;
+            let granted = cfg.owner_agent_id == self.agent_id
+                || cfg.grant_agents.iter().any(|a| a == &self.agent_id);
+            if !granted {
+                continue;
+            }
+            let Some(catalog) = entry.catalog else {
+                continue;
+            };
+            for tool in catalog.tools {
+                projected.push(crate::session::McpUpstreamToolBinding {
+                    upstream_id: cfg.upstream_id.clone(),
+                    remote_name: tool.remote_name,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                });
+            }
+        }
+
+        self.mcp_upstream_tools = projected;
+        let cache = self.mcp_upstream_tools.clone();
+        for state in self.sessions.values_mut() {
+            if state.bindings.mcp_upstream_tools != cache {
+                state.bindings.mcp_upstream_tools = cache.clone();
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
+    /// Copy the cached upstream projection into one session's bindings if it
+    /// drifted (e.g. a session restored from a pre-projection checkpoint).
+    fn apply_mcp_upstream_projection(&mut self, session_id: &str) {
+        let cache = self.mcp_upstream_tools.clone();
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            if state.bindings.mcp_upstream_tools != cache {
+                state.bindings.mcp_upstream_tools = cache;
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
     async fn refresh_bindings_from_snapshot(&mut self, session_id: &str) {
         let response = self
             .ipc_client
@@ -6669,6 +6735,7 @@ impl AgentRuntime {
         fallback_source: &str,
     ) -> Result<()> {
         if self.sessions.contains_key(session_id) {
+            self.apply_mcp_upstream_projection(session_id);
             return Ok(());
         }
 
@@ -6806,6 +6873,7 @@ impl AgentRuntime {
                         }
 
                         self.sessions.insert(session_id.to_string(), state);
+                        self.apply_mcp_upstream_projection(session_id);
                         return Ok(());
                     }
                 }
@@ -6868,6 +6936,7 @@ impl AgentRuntime {
         }
 
         self.sessions.insert(session_id.to_string(), state);
+        self.apply_mcp_upstream_projection(session_id);
         Ok(())
     }
 

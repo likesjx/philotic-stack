@@ -18,7 +18,7 @@ brew install philotic-web    # installs the operator CLI + all core binaries
 brew install muninn          # installs the cognitive memory store
 ```
 
-This installs the `phil` CLI (symlinked from `philotic-web`), the `aiua` hotel daemon, and all guest binaries (philote, membrane-telegram, membrane-discord, membrane-mcp, model-router, the model-controller-* family, tool-runner, graph-datasource, and the rest of the release set below).
+This installs the `phil` CLI (symlinked from `philotic-web`), the `aiua` hotel daemon, and all guest binaries (philote, membrane-telegram, membrane-discord, membrane-mcp, membrane-mcp-client, model-router, the model-controller-* family, tool-runner, graph-datasource, and the rest of the release set below).
 
 ### From Source
 
@@ -37,7 +37,8 @@ Binaries are built to `target/release/`. A full release build emits ~24 binaries
 | `philote` / `philote-worker` | Agent core — cognitive loop, sessions, roles (+ delegated worker) |
 | `membrane-telegram` | Telegram gateway (runs on the MembraneRuntime SDK) |
 | `membrane-discord` | Discord gateway |
-| `membrane-mcp` | MCP gateway |
+| `membrane-mcp` | MCP gateway (serves hotel tools to external MCP clients) |
+| `membrane-mcp-client` | MCP client guest (consumes upstream MCP servers, projects their tools to philotes) |
 | `membrane` | MembraneRuntime SDK library (no binary; consumed by the gateway guests) |
 | `model-router` | LLM inference routing |
 | `model-controller-*` | Per-provider model controllers (gemini, elevenlabs, openai, openrouter, anthropic, mlx, ollama, onnx, parakeet, vision) |
@@ -94,6 +95,7 @@ aiua --load-config mesh-config.json
 | [`membrane-telegram`](crates/membrane-telegram/) | Telegram / external protocol gateway (MembraneRuntime SDK + LeaseDriver) |
 | [`membrane-discord`](crates/membrane-discord/) | Discord gateway |
 | [`membrane-mcp`](crates/membrane-mcp/) | MCP gateway |
+| [`membrane-mcp-client`](crates/membrane-mcp-client/) | MCP client guest — upstream server consumption (`mcp-client-fabric` Phase 1) |
 | [`philotic-web`](crates/philotic-web/) | Operator CLI + desktop membrane (REST API, WebSocket, operator chat) |
 | [`model-router`](crates/model-router/) | Shared LLM inference routing SDK |
 | [`tool-runner`](crates/tool-runner/) | Sandboxed tool execution (Landlock + seccomp via philotic-sandbox) |

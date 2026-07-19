@@ -110,6 +110,8 @@ The Philotic Stack is a distributed AI agent OS (Rust). Metaphor: **Hotel** (nod
 - `philote`: Persona/agent cognitive loop guest.
 - `model-router`: Model provider routing guest (Gemini/ElevenLabs).
 - `tool-runner`: Seeded/inactive tool execution guest.
+- `membrane-mcp`: MCP gateway guest (serves tools to external MCP clients).
+- `membrane-mcp-client`: MCP client guest (consumes upstream MCP servers; `mcp:<upstream>.<tool>` projection).
 
 ### Communication
 
