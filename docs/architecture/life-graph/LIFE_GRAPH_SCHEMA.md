@@ -368,9 +368,9 @@ Operator ideas captured by the idea-intake charter
 |---|---|
 | `id` | `idea:<slug>` (e.g. `idea:healthkit-observe`) |
 | `claim_summary` | The idea in 1–2 sentences, operator's words preserved in the evidence packet |
-| `idea_kind` | `implementation` |
-| `target` | `philotic-stack` (later: `muninndb`, `home`, …) |
-| `idea_status` | `captured` → `promoted` (with `graph_ref: doc:<proposal-id>`) → `shipped` \| `declined` (with reason) |
+| `idea_kind` | `implementation` — set at triage time (see `idea_status` note) |
+| `target` | `philotic-stack` (later: `muninndb`, `home`, …) — set at triage time |
+| `idea_status` | absent = `captured` → `promoted` (with `graph_ref: doc:<proposal-id>`) → `shipped` \| `declined` (with `idea_status_reason`). Written by the triage pipeline (`just idea-sweep`), not at intake — `life.observe` has no custom-property write path |
 
 Provenance envelope as always (`source_membrane`, `observed_by`,
 `validation_state: proposed`). The LifeGraph node is the provenance anchor
