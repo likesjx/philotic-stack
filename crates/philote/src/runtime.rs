@@ -3044,6 +3044,21 @@ impl AgentRuntime {
             // choke point, so the turn is tagged AutoFallback to match — it is
             // not the session's configured default, even though the operator
             // never explicitly pinned it.
+            // Operator-authored cron jobs carry a narrow standing tool
+            // preapproval (`cron_preapproved_tools` — aiua forwards it only
+            // for jobs with created_by=Operator, see
+            // CronTicker::build_cron_task_json). Seed it into this session's
+            // approval policy so the unattended fire can execute the tools
+            // its instruction names instead of parking WaitingApproval with
+            // no operator awake and riding the watchdog to eviction.
+            if task.cron_job_id.is_some() {
+                for tool in &task.cron_preapproved_tools {
+                    if !state.approval_policy.preapproved_tools.contains(tool) {
+                        state.approval_policy.preapproved_tools.push(tool.clone());
+                    }
+                }
+            }
+
             let selection_source = if task.cron_job_id.is_some() {
                 SelectionSource::CronPrimary
             } else if state.pinned_tier_role.is_some() {
@@ -12317,6 +12332,88 @@ mod tests {
             .as_ref()
             .expect("turn started");
         assert_eq!(turn.selection_source, SelectionSource::CronPrimary);
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Operator-authored cron preapproval: `cron_preapproved_tools` on a
+    /// cron-delivered task must seed the session's approval policy so the
+    /// unattended fire can execute its named tools instead of parking
+    /// WaitingApproval. (aiua only forwards the field for operator-created
+    /// jobs — see CronTicker tests.)
+    #[tokio::test]
+    async fn cron_preapproved_tools_seed_session_approval_policy() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronpreapp").await;
+        let session_id = "cron:ephemeral:agent-cronpreapp";
+        runtime
+            .ensure_session_loaded(session_id, "cron")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("run the nightly backup".into()),
+                    cron_job_id: Some("job-backup".into()),
+                    cron_preapproved_tools: vec!["bash.exec".into(), "bash.exec".into()],
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        let policy = &runtime
+            .session(session_id)
+            .expect("session")
+            .approval_policy;
+        assert_eq!(
+            policy.preapproved_tools,
+            vec!["bash.exec".to_string()],
+            "cron preapproval must seed the session policy exactly once"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A non-cron task must ignore `cron_preapproved_tools` even if present —
+    /// only the CronTicker delivery path is trusted to carry it.
+    #[tokio::test]
+    async fn non_cron_task_ignores_preapproved_tools() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("nocronpre").await;
+        let session_id = "sess-nocronpre";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("hello".into()),
+                    cron_preapproved_tools: vec!["bash.exec".into()],
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .approval_policy
+                .preapproved_tools
+                .is_empty(),
+            "non-cron tasks must not seed approval policy"
+        );
 
         drop(runtime);
         let _ = server.await;

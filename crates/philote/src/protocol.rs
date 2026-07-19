@@ -117,6 +117,16 @@ pub struct InboundTaskPayload {
     /// distinguish synthetic/scheduled prompts from operator-authored ones.
     #[serde(default)]
     pub cron_job_id: Option<String>,
+    /// Standing tool preapproval carried by OPERATOR-authored cron jobs: the
+    /// operator approved these tools when they authored the job's payload.
+    /// aiua's `CronTicker::build_cron_task_json` forwards the payload's
+    /// `preapproved_tools` under this key only when the job's `created_by`
+    /// is `Operator` — guest-created jobs can never self-grant approval.
+    /// Seeded into the cron session's approval policy at turn start so an
+    /// unattended fire (e.g. a 02:30 nightly backup) doesn't park
+    /// WaitingApproval with nobody awake and ride the watchdog to eviction.
+    #[serde(default)]
+    pub cron_preapproved_tools: Vec<String>,
 }
 
 // Transitional note: older emitters may still carry failures in

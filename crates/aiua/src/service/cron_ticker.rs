@@ -704,6 +704,31 @@ fn build_cron_task_json(
                 obj[key] = v.clone();
             }
         }
+        // Operator-authored jobs may carry a narrow standing tool
+        // preapproval: the operator approved these tools when they authored
+        // the job's payload, so the receiving philote seeds them into the
+        // cron session's approval policy instead of parking an unattended
+        // turn as WaitingApproval. NEVER forwarded for guest-created jobs —
+        // a guest could otherwise register a cron job that self-grants
+        // approval for high-agency tools (privilege escalation).
+        if matches!(
+            job.created_by,
+            ansible_mesh_core::cron::CronJobSource::Operator
+        ) {
+            if let Some(tools) = payload_json
+                .get("preapproved_tools")
+                .and_then(serde_json::Value::as_array)
+            {
+                let clean: Vec<serde_json::Value> = tools
+                    .iter()
+                    .filter(|t| t.as_str().is_some_and(|s| !s.trim().is_empty()))
+                    .cloned()
+                    .collect();
+                if !clean.is_empty() {
+                    obj["cron_preapproved_tools"] = serde_json::Value::Array(clean);
+                }
+            }
+        }
         return apply_cron_session_routing(obj, job).to_string();
     };
 
@@ -802,6 +827,42 @@ mod tests {
         assert!(
             value.get("action").is_none(),
             "action must be absent for non-paracrine tasks"
+        );
+    }
+
+    #[test]
+    fn operator_job_forwards_preapproved_tools() {
+        let task = build_cron_task_json(
+            &test_job(), // created_by: Operator
+            1_234,
+            "mbp-jane-aiua-01",
+            r#"{"message":"run the backup","preapproved_tools":["bash.exec","","  "]}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+        assert_eq!(
+            value["cron_preapproved_tools"],
+            serde_json::json!(["bash.exec"]),
+            "operator-authored preapproval must be forwarded (blank entries dropped)"
+        );
+    }
+
+    /// A guest-created job must NEVER forward preapproved_tools — a guest
+    /// could otherwise register a cron job that self-grants approval for
+    /// high-agency tools.
+    #[test]
+    fn guest_job_never_forwards_preapproved_tools() {
+        let mut job = test_job();
+        job.created_by = CronJobSource::Guest("agent-aria".into());
+        let task = build_cron_task_json(
+            &job,
+            1_234,
+            "mbp-jane-aiua-01",
+            r#"{"message":"run the backup","preapproved_tools":["bash.exec"]}"#.into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+        assert!(
+            value.get("cron_preapproved_tools").is_none(),
+            "guest-created jobs must not self-grant tool approval"
         );
     }
 
