@@ -793,18 +793,27 @@ fn draft_already_final(draft_text: &str, final_text: &str) -> bool {
     !draft_text.is_empty() && draft_text == final_text
 }
 
-/// True when a Telegram session id belongs to the given agent — i.e. this seat
-/// may act on a reply/turn-event task for it. Telegram session ids are stamped
-/// by [`telegram_inbound_envelope`] as `telegram:{chat}[:{thread}]:{agent_id}`,
-/// so ownership is the terminal `:`-segment. Anything that doesn't look like a
-/// Telegram session (different scheme, fewer than three segments) fails OPEN:
-/// the caller delivers it, preserving legacy single-seat behaviour.
+/// True when a session id belongs to the given agent — i.e. this seat may act
+/// on a reply/turn-event task for it. Telegram session ids are stamped by
+/// [`telegram_inbound_envelope`] as `telegram:{chat}[:{thread}]:{agent_id}`,
+/// and cron sessions as `cron:{shape}:{agent_id}` — in both, ownership is the
+/// terminal `:`-segment. Anything else fails OPEN (the caller delivers it,
+/// preserving legacy single-seat behaviour): unknown schemes, fewer than
+/// three segments, or a `cron:` terminal segment that isn't unambiguously an
+/// agent id (`agent-*`) — e.g. `paracrine:…:orchestrator` must never be
+/// dropped by every seat at once.
 fn session_owned_by_agent(session_id: &str, agent_id: &str) -> bool {
     let parts: Vec<&str> = session_id.split(':').collect();
-    if parts.len() < 3 || parts[0] != "telegram" {
+    if parts.len() < 3 || !matches!(parts[0], "telegram" | "cron") {
         return true;
     }
-    parts.last().is_none_or(|last| *last == agent_id)
+    let Some(last) = parts.last().copied() else {
+        return true;
+    };
+    if parts[0] == "cron" && !last.starts_with("agent-") {
+        return true;
+    }
+    last == agent_id
 }
 
 /// Bounded TTL set of recently dispatched Telegram `update_id`s, scoped to a single
@@ -4421,7 +4430,21 @@ mod tests {
             "telegram:-10012345:77:agent-jane-01",
             "agent-astrid"
         ));
-        // Non-telegram schemes fail open — not this filter's business.
+        // Cron sessions carry the agent as the terminal segment too — the
+        // ephemeral cron finalization previously fanned to every seat and
+        // only the RC-3 dedupe absorbed the duplicates.
+        assert!(session_owned_by_agent(
+            "cron:ephemeral:agent-aria",
+            "agent-aria"
+        ));
+        assert!(!session_owned_by_agent(
+            "cron:ephemeral:agent-aria",
+            "agent-jane"
+        ));
+        // A cron terminal segment that isn't an agent id fails open — a shape
+        // every seat would otherwise drop simultaneously.
+        assert!(session_owned_by_agent("cron:daily:cleanup", "agent-aria"));
+        // Non-telegram/cron schemes fail open — not this filter's business.
         assert!(session_owned_by_agent(
             "paracrine:7898847424:orchestrator",
             "agent-aria"
