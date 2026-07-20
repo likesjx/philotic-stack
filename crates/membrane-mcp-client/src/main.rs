@@ -69,6 +69,9 @@ struct Guest {
     ipc_client: PhiloticClient,
     upstreams: HashMap<String, UpstreamClient>,
     allotments: Allotments,
+    /// Unix ts of the last connect/refresh per upstream, for
+    /// `refresh_interval_secs` scheduling.
+    last_refresh: HashMap<String, u64>,
 }
 
 impl Guest {
@@ -109,7 +112,9 @@ impl Guest {
         }
     }
 
-    /// (Re)connect one upstream and report its catalog to the hotel.
+    /// (Re)connect one upstream from a fresh config and report its catalog.
+    /// A config update is the approval event, so the listing becomes the new
+    /// approved baseline for stale-grant detection.
     async fn sync_upstream(&mut self, config: McpUpstreamConfig) {
         let upstream_id = config.upstream_id.clone();
         let bearer = self.resolve_bearer(&config).await;
@@ -120,12 +125,30 @@ impl Guest {
                 return;
             }
         };
-        let outcome = client.connect_and_list().await;
+        let outcome = client.connect_and_list(true).await;
+        self.upstreams.insert(upstream_id.clone(), client);
+        self.report_outcome(&upstream_id, outcome).await;
+    }
+
+    /// Periodic re-list for one connected upstream, diffing against the
+    /// approved baseline (changed tools go stale, never silently re-project).
+    async fn refresh_upstream(&mut self, upstream_id: &str) {
+        let Some(client) = self.upstreams.get_mut(upstream_id) else {
+            return;
+        };
+        let outcome = client.connect_and_list(false).await;
+        let upstream_id = upstream_id.to_string();
+        self.report_outcome(&upstream_id, outcome).await;
+    }
+
+    async fn report_outcome(&mut self, upstream_id: &str, outcome: upstream::ConnectOutcome) {
+        self.last_refresh.insert(upstream_id.to_string(), unix_ts());
         let catalog = McpUpstreamCatalog {
-            upstream_id: upstream_id.clone(),
+            upstream_id: upstream_id.to_string(),
             state: outcome.state,
             tools: outcome.tools,
             missing_grants: outcome.missing_grants,
+            stale_grants: outcome.stale_grants,
             reported_at: unix_ts(),
         };
         if let Err(e) = self
@@ -138,7 +161,23 @@ impl Guest {
         {
             warn!(upstream = upstream_id, err = %e, "catalog report failed");
         }
-        self.upstreams.insert(upstream_id, client);
+    }
+
+    /// Kick refreshes for every upstream whose interval has elapsed.
+    async fn run_due_refreshes(&mut self) {
+        let now = unix_ts();
+        let due: Vec<String> = self
+            .upstreams
+            .iter()
+            .filter_map(|(id, client)| {
+                let interval = client.config.refresh_interval_secs?;
+                let last = self.last_refresh.get(id).copied().unwrap_or(0);
+                (now.saturating_sub(last) >= interval.max(30)).then(|| id.clone())
+            })
+            .collect();
+        for id in due {
+            self.refresh_upstream(&id).await;
+        }
     }
 
     /// Startup replay: fetch every registered upstream and connect.
@@ -308,6 +347,7 @@ async fn main() -> Result<()> {
         ipc_client,
         upstreams: HashMap::new(),
         allotments: Allotments::default(),
+        last_refresh: HashMap::new(),
     };
     guest.replay_upstreams().await;
 
@@ -366,7 +406,9 @@ async fn main() -> Result<()> {
                 }
                 warn!(err = %e, "IPC receive error");
             }
-            Err(_) => {}
+            Err(_) => {
+                guest.run_due_refreshes().await;
+            }
         }
     }
 }

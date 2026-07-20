@@ -5666,9 +5666,37 @@ impl AgentRuntime {
                             .await;
                     }
                 };
-                let tools: Vec<String> = args
+                // Each entry is a bare name or {name, allotment, max_response_bytes}.
+                let tools: Vec<ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant> = args
                     .get("tools")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| {
+                                if let Some(name) = item.as_str() {
+                                    return Some(
+                                        ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
+                                            remote_name: name.to_string(),
+                                            allotment: None,
+                                            max_response_bytes: None,
+                                        },
+                                    );
+                                }
+                                let name = item.get("name")?.as_str()?.to_string();
+                                Some(ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
+                                    remote_name: name,
+                                    allotment: item
+                                        .get("allotment")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|v| v as u32),
+                                    max_response_bytes: item
+                                        .get("max_response_bytes")
+                                        .and_then(|v| v.as_u64()),
+                                })
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if tools.is_empty() {
                     return self
@@ -5698,18 +5726,12 @@ impl AgentRuntime {
                         url: url.clone(),
                     },
                     credential_ref,
-                    tool_allowlist: tools
-                        .iter()
-                        .map(
-                            |name| ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
-                                remote_name: name.clone(),
-                                allotment: None,
-                                max_response_bytes: None,
-                            },
-                        )
-                        .collect(),
+                    tool_allowlist: tools.clone(),
                     grant_agents,
-                    refresh_interval_secs: None,
+                    refresh_interval_secs: args
+                        .get("refresh_interval_secs")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v.max(30)),
                     updated_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
@@ -5740,7 +5762,11 @@ impl AgentRuntime {
                                  Status: {status}. The connection is established \
                                  asynchronously — run mcp.upstreams to confirm and load \
                                  the projected mcp:{mcp_upstream_id}.<tool> entries.",
-                                tools.join(", ")
+                                tools
+                                    .iter()
+                                    .map(|g| g.remote_name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             ),
                             None,
                         )
@@ -5893,6 +5919,126 @@ impl AgentRuntime {
             }
 
             // ── mcp.upstreams ────────────────────────────────────────────────
+            // ── mcp.set_credential ───────────────────────────────────────────
+            "mcp.set_credential" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let upstream_id = match payload
+                    .arguments
+                    .get("upstream_id")
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "mcp.set_credential: missing required argument 'upstream_id'"
+                                    .into(),
+                            )
+                            .await;
+                    }
+                };
+                let credential = match payload
+                    .arguments
+                    .get("credential")
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) if !s.trim().is_empty() => s.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "mcp.set_credential: missing required argument 'credential'"
+                                    .into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::ProvisionMcpUpstreamCredential {
+                        upstream_id: upstream_id.clone(),
+                        owner_agent_id: self.agent_id.clone(),
+                        credential,
+                    })
+                    .await;
+
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let rotated = data
+                            .get("rotated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        (
+                            format!(
+                                "Credential {} for upstream '{upstream_id}' and stored in \
+                                 the vault. The mcp-client guest is reconnecting \
+                                 authenticated — run mcp.upstreams to confirm.",
+                                if rotated { "rotated" } else { "stored" }
+                            ),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e =
+                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "IPC_ERROR",
+                            msg,
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = philotic_client::TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "mcp.set_credential: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = philotic_client::TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("mcp.set_credential: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some("mcp.set_credential".into()),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             "mcp.upstreams" => {
                 let session_id = payload.session_id.clone();
                 let turn_id = payload.turn_id.clone();
@@ -5944,8 +6090,13 @@ impl AgentRuntime {
                                     .as_ref()
                                     .map(|c| c.missing_grants.clone())
                                     .unwrap_or_default();
+                                let stale = entry
+                                    .catalog
+                                    .as_ref()
+                                    .map(|c| c.stale_grants.clone())
+                                    .unwrap_or_default();
                                 lines.push(format!(
-                                    "• {} — {} [{}] owner={}\n  projected: {}{}",
+                                    "• {} — {} [{}] owner={}\n  projected: {}{}{}",
                                     cfg.upstream_id,
                                     url,
                                     state,
@@ -5959,8 +6110,16 @@ impl AgentRuntime {
                                         String::new()
                                     } else {
                                         format!(
-                                            "\n  stale grants (not advertised): {}",
+                                            "\n  missing (not advertised): {}",
                                             missing.join(", ")
+                                        )
+                                    },
+                                    if stale.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(
+                                            "\n  STALE (changed since approval — re-run mcp.connect to re-approve): {}",
+                                            stale.join(", ")
                                         )
                                     },
                                 ));

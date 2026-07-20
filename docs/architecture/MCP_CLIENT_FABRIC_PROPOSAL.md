@@ -3,7 +3,7 @@ title: MCP Client Fabric — Philote-Governed Consumption of External MCP Server
 doc_type: proposal
 domain: membrane-transport
 status: in-progress
-disposition: phase-1-implemented
+disposition: phase-2-implemented
 last_updated: 2026-07-18
 tags:
   - mcp
@@ -65,6 +65,26 @@ source_of_truth_targets:
 > (`PHILOTIC_HOTEL_SOCKET=<sock> cargo run -p philotic-client --example
 > mcp_upstream_smoke_driver`). Not yet live-exercised: the operator-approval
 > UX through a real philote turn (covered by the Phase-2 live drill).
+>
+> **Phase 2 implemented + SMOKE-GREEN ×3 (2026-07-20).**
+> - `mcp.set_credential` tool → `ProvisionMcpUpstreamCredential` IPC → vault
+>   secret-kind `mcp_upstream_credential` (readable by `mcp-client-runner`
+>   only; rotate-in-place when a ref exists; plaintext never in graph/logs).
+> - Per-grant `allotment`/`max_response_bytes` in `mcp.connect` tool items +
+>   `refresh_interval_secs`.
+> - Periodic re-list with **stale-grant re-approval**: the listing at config
+>   update time is the approved baseline; a changed remote description/schema
+>   drops the tool from projection (`McpUpstreamCatalog.stale_grants`) until
+>   `mcp.connect` is re-run.
+> - Live proofs (scratch hotel, `scripts/mcp_auth_stub_server.py` +
+>   real servers): (1) **auth loop** — 401-enforcing stub answers only with
+>   the vault-resolved bearer; (2) **stale drill** — mutated description →
+>   `projected=[] stale=["ping"]` → re-connect re-approves; (3) **real
+>   server** — Muninn MCP `:8750` (auth-required) returned live vault status
+>   through the credential path. Driver supports `MCP_SMOKE_CREDENTIAL`,
+>   `MCP_SMOKE_REFRESH_SECS`, `MCP_SMOKE_MODE=inspect`.
+> Remaining for Phase 3: stdio transport under a command allowlist; also
+> outstanding — philote approval-UX live drill on a deployed hotel.
 
 ## Problem
 
