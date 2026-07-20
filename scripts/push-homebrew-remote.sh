@@ -144,6 +144,7 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
     echo "  restart plan:       hand-start via nohup (legacy path)"
   fi
   echo "  log rotation:       would run scripts/install-log-rotation.sh on ${REMOTE}"
+  echo "  hotel watchdog:     would install scripts/aiua-watchdog.sh via install-aiua-watchdog.sh ${HOTEL_NAME} on ${REMOTE}"
   echo "✅ Dry run complete."
   exit 0
 fi
@@ -287,6 +288,18 @@ echo "▶ Ensuring log rotation on ${REMOTE}..."
 # failure here must not fail an otherwise-complete push.
 if ! ssh "${SSH_OPTS[@]}" "${REMOTE}" 'bash -s' < "${ROOT_DIR}/scripts/install-log-rotation.sh"; then
   echo "⚠ Log-rotation install failed on ${REMOTE} (non-fatal). Run scripts/install-log-rotation.sh there manually."
+fi
+
+echo "▶ Ensuring hotel watchdog on ${REMOTE}..."
+# Re-bootstraps this hotel if a future parallel deploy boots it out without a
+# completed start (KeepAlive can't respawn an UNLOADED job). Unlike log rotation
+# the installer needs the watchdog script too, so scp it to the stable path the
+# installer reads, then stream the installer with the hotel arg. macOS-only and
+# best-effort — a transport failure here must not fail an otherwise-complete push.
+if ! ssh "${SSH_OPTS[@]}" "${REMOTE}" "mkdir -p '${REMOTE_HOME}/.philotic'" \
+   || ! scp -q "${SSH_OPTS[@]}" "${ROOT_DIR}/scripts/aiua-watchdog.sh" "${REMOTE}:${REMOTE_HOME}/.philotic/aiua-watchdog.sh" \
+   || ! ssh "${SSH_OPTS[@]}" "${REMOTE}" "bash -s ${HOTEL_NAME}" < "${ROOT_DIR}/scripts/install-aiua-watchdog.sh"; then
+  echo "⚠ Watchdog install failed on ${REMOTE} (non-fatal). Run scripts/install-aiua-watchdog.sh ${HOTEL_NAME} there manually."
 fi
 
 echo "✅ ${REMOTE}:${HOTEL_NAME} updated and restarted."
