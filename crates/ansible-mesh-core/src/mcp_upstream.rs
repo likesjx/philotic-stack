@@ -203,7 +203,9 @@ impl McpEgressPolicy {
         self.allowed_hosts.iter().any(|pattern| {
             if let Some(suffix) = pattern.strip_prefix("*.") {
                 host.len() > suffix.len()
-                    && host.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
+                    && host
+                        .to_ascii_lowercase()
+                        .ends_with(&suffix.to_ascii_lowercase())
                     && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
             } else {
                 host.eq_ignore_ascii_case(pattern)

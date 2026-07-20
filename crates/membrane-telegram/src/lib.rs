@@ -2596,11 +2596,31 @@ struct TelegramSeatGuest {
     lease_key: Option<String>,
     tg_base: Option<String>,
     poll_task: Option<JoinHandle<()>>,
-    /// Permanent stand-down: invalid/missing bot token, or the lease is held
-    /// by another live seat after the single re-acquire attempt. Mirrors the
-    /// deployed behaviour where such a seat stopped polling for good.
-    yielded: bool,
+    /// Stand-down state. `TokenMissing` is permanent (a config problem no
+    /// retry fixes — but it files a heal event so it can't sit silent for
+    /// months like the vps Beacon 401). `LeaseHeld` is NOT permanent: the
+    /// 2026-07-20 Aria outage was a seat that lost the lease to a holder
+    /// which then died — the lease sat ownerless and nothing on either side
+    /// ever re-probed. A stood-down seat now re-probes the lease owner every
+    /// [`LEASE_REPROBE_SECS`] on the renew tick and un-yields when the lease
+    /// is free.
+    stand_down: Option<StandDownReason>,
 }
+
+/// Why a seat stopped polling. See the `stand_down` field docs.
+#[derive(Debug)]
+enum StandDownReason {
+    /// Bot token missing/invalid. Permanent until config changes.
+    TokenMissing,
+    /// Lease held by another live seat when we last tried. Re-probed
+    /// periodically; `next_probe_at` gates the probe cadence.
+    LeaseHeld { next_probe_at: Instant },
+}
+
+/// How often a lease-held stood-down seat re-probes the lease owner. Twice
+/// the lease TTL (90s): fast enough that a dead holder is replaced within
+/// ~3 minutes, slow enough that a live holder sees negligible probe load.
+const LEASE_REPROBE_SECS: u64 = 180;
 
 impl TelegramSeatGuest {
     #[allow(clippy::too_many_arguments)]
@@ -2641,7 +2661,7 @@ impl TelegramSeatGuest {
             lease_key: None,
             tg_base: None,
             poll_task: None,
-            yielded: false,
+            stand_down: None,
         }
     }
 
@@ -2762,10 +2782,10 @@ impl MembraneGuest for TelegramSeatGuest {
     }
 
     async fn setup(&mut self, client: &mut PhiloticClient) -> Result<()> {
-        if self.yielded {
+        if self.stand_down.is_some() {
             info!(
-                "Seat [{}] has stood down; skipping setup.",
-                self.seat_guest_id
+                "Seat [{}] has stood down ({:?}); skipping setup.",
+                self.seat_guest_id, self.stand_down
             );
             return Ok(());
         }
@@ -2779,7 +2799,20 @@ impl MembraneGuest for TelegramSeatGuest {
                 "No valid Telegram Bot Token for seat [{}]. Membrane will stop instead of polling without authority.",
                 self.seat_guest_id
             );
-            self.yielded = true;
+            self.stand_down = Some(StandDownReason::TokenMissing);
+            // File it: a token problem previously left the seat silently dead
+            // (vps Beacon 401 sat unnoticed for months). Escalates to an A3
+            // work item via the heal lane instead of relying on the operator
+            // noticing the silence.
+            self.queue_heal_event(
+                self.seat_guest_id.clone(),
+                "high",
+                "seat_stood_down:token_missing",
+                format!(
+                    "Telegram seat [{}] stood down: bot token missing/invalid (key {}).",
+                    self.seat_guest_id, self.telegram_token_key
+                ),
+            );
             return Ok(());
         };
 
@@ -2851,10 +2884,22 @@ impl MembraneGuest for TelegramSeatGuest {
                 }
                 LeaseEvent::Lost { owner } => {
                     warn!(
-                        "Telegram poll lease [{}] is held by {:?}. Seat [{}] will stop instead of polling without authority.",
+                        "Telegram poll lease [{}] is held by {:?}. Seat [{}] stands down; will re-probe the lease every {LEASE_REPROBE_SECS}s.",
                         lease_key, owner, self.seat_guest_id
                     );
-                    self.yielded = true;
+                    self.stand_down = Some(StandDownReason::LeaseHeld {
+                        next_probe_at: Instant::now() + Duration::from_secs(LEASE_REPROBE_SECS),
+                    });
+                    self.queue_heal_event(
+                        self.seat_guest_id.clone(),
+                        "low",
+                        "seat_stood_down:lease_held",
+                        format!(
+                            "Telegram seat [{}] stood down: lease [{}] held by {:?}. \
+                             Self-heal re-probe armed ({LEASE_REPROBE_SECS}s cadence).",
+                            self.seat_guest_id, lease_key, owner
+                        ),
+                    );
                     return Ok(());
                 }
                 LeaseEvent::BackingOff { retry_in, error } => {
@@ -2922,8 +2967,58 @@ impl MembraneGuest for TelegramSeatGuest {
         // with no lease key yet, so nothing queued during setup is lost.
         self.flush_pending_heal_events(client).await;
 
-        if self.yielded {
-            return Ok(LeaseRenewResult::Ok { epoch: 0 });
+        match &self.stand_down {
+            Some(StandDownReason::TokenMissing) => {
+                return Ok(LeaseRenewResult::Ok { epoch: 0 });
+            }
+            Some(StandDownReason::LeaseHeld { next_probe_at }) => {
+                if Instant::now() < *next_probe_at {
+                    return Ok(LeaseRenewResult::Ok { epoch: 0 });
+                }
+                // Re-probe: is the lease still held? The hotel handler drops
+                // stale leases before answering, so `active: false` means the
+                // previous holder is genuinely gone (2026-07-20: a holder
+                // that died without handoff left the lease ownerless and
+                // this seat latched down forever).
+                let lease_key = self.lease_key.clone().unwrap_or_default();
+                let still_held = match client
+                    .send_request(IpcRequest::GetTelegramPollLeaseOwner {
+                        lease_key: lease_key.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::TelegramPollLeaseStatus { active, .. }) => active,
+                    // Probe failure: keep standing down, try again next window.
+                    _ => true,
+                };
+                if still_held {
+                    self.stand_down = Some(StandDownReason::LeaseHeld {
+                        next_probe_at: Instant::now() + Duration::from_secs(LEASE_REPROBE_SECS),
+                    });
+                    return Ok(LeaseRenewResult::Ok { epoch: 0 });
+                }
+                info!(
+                    "Telegram poll lease [{}] is free again; seat [{}] self-healing out of stand-down.",
+                    lease_key, self.seat_guest_id
+                );
+                self.stand_down = None;
+                self.lease_driver = LeaseDriver::new(LeaseDriverConfig::default());
+                self.queue_heal_event(
+                    self.seat_guest_id.clone(),
+                    "low",
+                    "seat_lease_self_healed",
+                    format!(
+                        "Telegram seat [{}] re-acquiring lease [{}] after the previous holder died.",
+                        self.seat_guest_id, lease_key
+                    ),
+                );
+                // Full seat rebuild: token fetch, lease acquire, poll loop.
+                self.setup(client).await?;
+                return Ok(LeaseRenewResult::Ok {
+                    epoch: self.lease_driver.epoch().unwrap_or(0),
+                });
+            }
+            None => {}
         }
         let Some(lease_key) = self.lease_key.clone() else {
             return Ok(LeaseRenewResult::Ok { epoch: 0 });
