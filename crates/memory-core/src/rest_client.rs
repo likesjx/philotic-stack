@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, instrument};
 
@@ -263,6 +265,136 @@ fn link_kind_to_relation(kind: &LinkKind) -> &'static str {
     }
 }
 
+// ──── Recall Cache ─────────────────────────────────────────────────────────────
+
+/// Env var overriding the recall cache TTL (seconds). `0` disables caching entirely.
+const RECALL_CACHE_TTL_ENV: &str = "MUNINN_RECALL_CACHE_TTL_SECS";
+const RECALL_CACHE_DEFAULT_TTL_SECS: u64 = 45;
+const RECALL_CACHE_CAPACITY: usize = 32;
+
+/// Normalizes a recall context string into a cache key component:
+/// lowercased alphanumeric tokens joined by a single space. This makes
+/// whitespace/punctuation variation between otherwise-identical turns
+/// collapse onto the same cache entry.
+fn normalize_recall_context(context: &str) -> String {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in context.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens.join(" ")
+}
+
+struct RecallCacheEntry {
+    key: String,
+    value: ActivationResult,
+    inserted_at: Instant,
+}
+
+/// Short-TTL cache for `activate()` results, keyed on `(normalized context,
+/// scope-derived vault list, effective max_results)`.
+///
+/// `activate()` runs in the philote turn path before context composition —
+/// every turn pays the per-vault HTTP round-trip(s) even when consecutive
+/// turns carry near-identical recall context. A short cache window (default
+/// 45s, overridable via `MUNINN_RECALL_CACHE_TTL_SECS`, `0` disables caching)
+/// amortizes that cost.
+///
+/// Staleness up to the TTL is acceptable for reads EXCEPT immediately after
+/// this engine performs a write of its own — read-your-own-write matters for
+/// UX (the agent should see a memory it just wrote reflected in the very
+/// next recall). So every successful write path (`remember`,
+/// `remember_batch`, `forget`, `link`, `evolve`) clears the cache outright
+/// rather than waiting out the TTL.
+///
+/// Bounded to `RECALL_CACHE_CAPACITY` entries, LRU-evicted (oldest insert
+/// first) via a `VecDeque` — no new dependency needed for 32 entries.
+struct RecallCache {
+    ttl: Duration,
+    capacity: usize,
+    entries: Mutex<VecDeque<RecallCacheEntry>>,
+}
+
+impl RecallCache {
+    fn from_env() -> Self {
+        let ttl_secs = std::env::var(RECALL_CACHE_TTL_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(RECALL_CACHE_DEFAULT_TTL_SECS);
+        Self::new(Duration::from_secs(ttl_secs), RECALL_CACHE_CAPACITY)
+    }
+
+    fn new(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            ttl,
+            capacity,
+            entries: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn make_key(context: &str, vaults: &[VaultId], max_results: Option<usize>) -> String {
+        format!(
+            "{}|{}|{:?}",
+            normalize_recall_context(context),
+            vaults.join(","),
+            max_results
+        )
+    }
+
+    /// Returns a clone of the cached value if present and still fresh.
+    /// A stale entry is evicted on lookup. The clone happens under the lock;
+    /// HTTP never happens under the lock.
+    fn get(&self, key: &str) -> Option<ActivationResult> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let mut entries = self.entries.lock().unwrap();
+        let pos = entries.iter().position(|e| e.key == key)?;
+        if entries[pos].inserted_at.elapsed() < self.ttl {
+            Some(entries[pos].value.clone())
+        } else {
+            entries.remove(pos);
+            None
+        }
+    }
+
+    /// Insert or refresh an entry, evicting the oldest entry once over
+    /// capacity.
+    fn insert(&self, key: String, value: ActivationResult) {
+        if self.ttl.is_zero() || self.capacity == 0 {
+            return;
+        }
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|e| e.key != key);
+        if entries.len() >= self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(RecallCacheEntry {
+            key,
+            value,
+            inserted_at: Instant::now(),
+        });
+    }
+
+    /// Invalidates all cached recall results. Called after every successful
+    /// write so the next `activate()` reflects it immediately.
+    fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+}
+
 // ──── MuninnRestEngine ────────────────────────────────────────────────────────
 
 /// MemoryEngine implementation backed by the MuninnDB REST API (port 8475).
@@ -290,6 +422,8 @@ pub struct MuninnRestEngine {
     /// id → vault_id populated by every write. Eliminates vault-discovery
     /// overhead on the read side for the common case.
     id_vault_cache: tokio::sync::RwLock<HashMap<EngramId, VaultId>>,
+    /// Short-TTL cache of recent activate() results. See `RecallCache` docs.
+    recall_cache: RecallCache,
 }
 
 impl MuninnRestEngine {
@@ -300,6 +434,7 @@ impl MuninnRestEngine {
             resolver,
             lens: tokio::sync::RwLock::new(None),
             id_vault_cache: tokio::sync::RwLock::new(HashMap::new()),
+            recall_cache: RecallCache::from_env(),
         }
     }
 
@@ -474,6 +609,9 @@ impl MemoryEngine for MuninnRestEngine {
         }
 
         self.cache_vault(&resp.id, &vault).await;
+        // Read-your-own-write: a fresh recall must reflect what was just
+        // written rather than serving a pre-write cache entry for its TTL.
+        self.recall_cache.clear();
         Ok(EngramRef {
             id: resp.id,
             vault_id: vault,
@@ -511,6 +649,13 @@ impl MemoryEngine for MuninnRestEngine {
             .error_for_status()?
             .json()
             .await?;
+
+        // Read-your-own-write: clear the recall cache now that the batch
+        // write round-trip has completed, regardless of individual item
+        // outcomes below (a successful round-trip means at least the server
+        // processed the batch; per-item failures are surfaced via the
+        // returned Result but don't change the invalidation need).
+        self.recall_cache.clear();
 
         resp.results
             .into_iter()
@@ -571,6 +716,7 @@ impl MemoryEngine for MuninnRestEngine {
                 return Ok(()); // already gone — idempotent
             }
             resp.error_for_status()?;
+            self.recall_cache.clear();
             return Ok(());
         }
 
@@ -583,6 +729,7 @@ impl MemoryEngine for MuninnRestEngine {
             .await?
         {
             resp.error_for_status()?;
+            self.recall_cache.clear();
         }
         Ok(())
     }
@@ -665,10 +812,17 @@ impl MemoryEngine for MuninnRestEngine {
     ) -> anyhow::Result<ActivationResult> {
         let vaults = self.resolver.resolve(&scope);
         let max = self.effective_max_results(max_results).await;
+        let is_cross_scope = matches!(scope, MemoryScope::CrossScope(_));
+
+        let cache_key = RecallCache::make_key(context, &vaults, max);
+        if let Some(cached) = self.recall_cache.get(&cache_key) {
+            debug!("recall cache hit");
+            return Ok(cached);
+        }
 
         let mut all_engrams = Vec::new();
         let mut total = 0usize;
-        let is_cross_scope = matches!(scope, MemoryScope::CrossScope(_));
+        let mut had_vault_error = false;
 
         // Cross-scope recall runs in the turn path before context composition:
         // the per-vault activations are independent, so fire them concurrently
@@ -718,6 +872,7 @@ impl MemoryEngine for MuninnRestEngine {
                         error = %err,
                         "Cross-scope activation failed for vault; continuing with others"
                     );
+                    had_vault_error = true;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -753,10 +908,24 @@ impl MemoryEngine for MuninnRestEngine {
             }
         }
 
-        Ok(ActivationResult {
+        let result = ActivationResult {
             engrams: all_engrams.into_iter().map(|(_, engram)| engram).collect(),
             total,
-        })
+        };
+
+        // Cache the result unless it's a cross-scope call that degraded to
+        // nothing because every vault errored — that's not a genuine "no
+        // memories" answer, just the absence of a good one. A partial
+        // cross-scope result with at least some data, or a clean empty
+        // result from vaults that all responded successfully, is the best
+        // known answer and is worth caching.
+        let is_empty_degraded_result =
+            is_cross_scope && had_vault_error && result.engrams.is_empty() && result.total == 0;
+        if !is_empty_degraded_result {
+            self.recall_cache.insert(cache_key, result.clone());
+        }
+
+        Ok(result)
     }
 
     async fn read(&self, id: &EngramId) -> anyhow::Result<Option<Engram>> {
@@ -846,6 +1015,7 @@ impl MemoryEngine for MuninnRestEngine {
             .send()
             .await?
             .error_for_status()?;
+        self.recall_cache.clear();
         Ok(())
     }
 
@@ -975,5 +1145,95 @@ mod tests {
         // Clock skew (updated_at in the future) must not panic or NaN.
         let skewed = cross_scope_rank_score(0.2, 0.5, now + DAY, now);
         assert!(skewed.is_finite());
+    }
+
+    // ──── RecallCache ───────────────────────────────────────────────────
+
+    fn dummy_activation_result(engram_id: &str) -> ActivationResult {
+        ActivationResult {
+            engrams: vec![Engram {
+                id: engram_id.to_string(),
+                vault_id: "self_test".to_string(),
+                concept: "concept".to_string(),
+                content: "content".to_string(),
+                tags: vec![],
+                confidence: 0.5,
+                created_at: 0,
+                updated_at: 0,
+                metadata: serde_json::Value::Null,
+            }],
+            total: 1,
+        }
+    }
+
+    #[test]
+    fn normalize_recall_context_collapses_whitespace_case_and_punctuation() {
+        let a = normalize_recall_context("  Hello,   World!! ");
+        let b = normalize_recall_context("hello world");
+        assert_eq!(a, b);
+        assert_eq!(a, "hello world");
+    }
+
+    #[test]
+    fn recall_cache_hit_returns_clone_within_ttl() {
+        let cache = RecallCache::new(Duration::from_millis(200), 8);
+        let key = RecallCache::make_key("ctx", &["self_a".to_string()], Some(5));
+        cache.insert(key.clone(), dummy_activation_result("e1"));
+        let hit = cache.get(&key);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().engrams[0].id, "e1");
+    }
+
+    #[test]
+    fn recall_cache_entry_expires_after_ttl() {
+        let cache = RecallCache::new(Duration::from_millis(20), 8);
+        let key = RecallCache::make_key("ctx", &["self_a".to_string()], None);
+        cache.insert(key.clone(), dummy_activation_result("e1"));
+        assert!(cache.get(&key).is_some());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(cache.get(&key).is_none());
+        // Stale entry is evicted on lookup, not left dangling.
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn recall_cache_evicts_oldest_over_capacity() {
+        let cache = RecallCache::new(Duration::from_secs(60), 2);
+        cache.insert("k1".to_string(), dummy_activation_result("e1"));
+        cache.insert("k2".to_string(), dummy_activation_result("e2"));
+        cache.insert("k3".to_string(), dummy_activation_result("e3"));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("k1").is_none()); // oldest evicted
+        assert!(cache.get("k2").is_some());
+        assert!(cache.get("k3").is_some());
+    }
+
+    #[test]
+    fn recall_cache_clear_invalidates_all_entries() {
+        let cache = RecallCache::new(Duration::from_secs(60), 8);
+        cache.insert("k1".to_string(), dummy_activation_result("e1"));
+        cache.insert("k2".to_string(), dummy_activation_result("e2"));
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get("k1").is_none());
+    }
+
+    #[test]
+    fn recall_cache_ttl_zero_env_disables_caching() {
+        // SAFETY: test-local env mutation; this var is not read by any other
+        // test's assertions (only by RecallCache::from_env() at construction).
+        unsafe {
+            std::env::set_var(RECALL_CACHE_TTL_ENV, "0");
+        }
+        let cache = RecallCache::from_env();
+        unsafe {
+            std::env::remove_var(RECALL_CACHE_TTL_ENV);
+        }
+        assert!(cache.ttl.is_zero());
+        cache.insert("k1".to_string(), dummy_activation_result("e1"));
+        // insert() is a no-op when ttl is zero — nothing to hit, ever.
+        assert!(cache.get("k1").is_none());
+        assert_eq!(cache.len(), 0);
     }
 }
