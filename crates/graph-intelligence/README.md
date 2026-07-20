@@ -19,6 +19,23 @@ cargo run -p philotic-web -- graph serve
 # - WebSocket: ws://localhost:8900/ws
 ```
 
+## Binding & Auth
+
+The server binds **127.0.0.1** by default. The REST and MCP surfaces expose
+unauthenticated write endpoints (node/edge upserts, decisions, test runs,
+scans), so non-loopback exposure requires an explicit choice:
+
+- `--bind <addr>` / `PHILOTIC_GRAPH_BIND` — bind another interface (e.g. a
+  Tailscale IP for cross-machine MCP clients).
+- `--token <t>` / `PHILOTIC_GRAPH_TOKEN` — bearer token required on all
+  mutating REST calls and every MCP call (`Authorization: Bearer <t>` or
+  `x-philotic-graph-token`). GET/HEAD stay open so the read-only web UI works.
+- `--insecure-bind` / `PHILOTIC_GRAPH_INSECURE=1` — explicit opt-out: allow a
+  non-loopback bind without a token. Without it the server refuses to start.
+
+CORS is restricted to localhost origins (permissive CORS previously allowed
+any web page to POST JSON to the write endpoints).
+
 ---
 
 ## Architecture

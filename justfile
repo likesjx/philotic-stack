@@ -48,6 +48,23 @@ muninn-cluster-preflight mode="local":
 harness-drift:
     @phil graph harness drift
 
+# Verify every managed harness against its projection, then report drift.
+harness-verify-all:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    phil graph harness list | awk 'NR>2 {print $1}' | while read -r h; do
+        [ -n "$h" ] && phil graph harness verify "$h" || true
+    done
+    phil graph harness drift
+
+# Sync the harness skill catalog in the graph from skills/*/SKILL.md.
+harness-skills-sync:
+    phil graph harness skills sync
+
+# Install the launchd schedule that refreshes graph scan + harness drift every 6 hours.
+intel-graph-freshness-schedule:
+    ./scripts/install-intel-graph-freshness-schedule.sh
+
 # Re-apply the canonical profile to a harness (default: claude-local with philotic-operator).
 harness-apply harness="claude-local" profile="philotic-operator":
     phil graph harness apply {{harness}} --profile {{profile}}

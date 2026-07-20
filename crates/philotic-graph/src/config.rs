@@ -69,11 +69,19 @@ impl PhiloticGraphConfig {
 
     pub fn to_server_config(&self, repo_root: &str) -> graph_intelligence::server::ServerConfig {
         graph_intelligence::server::ServerConfig {
+            bind_addr: std::env::var("PHILOTIC_GRAPH_BIND")
+                .unwrap_or_else(|_| "127.0.0.1".to_string()),
             http_port: self.http_port,
             mcp_port: self.mcp_port,
             db_path: self.db_path.clone(),
             scan_config: self.to_scan_config(),
             repo_root: repo_root.to_string(),
+            auth_token: std::env::var("PHILOTIC_GRAPH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty()),
+            allow_insecure_bind: std::env::var("PHILOTIC_GRAPH_INSECURE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }
