@@ -449,6 +449,16 @@ impl LifeGraphProvider {
         }
         Ok(json!({ "rows": output }))
     }
+
+    /// Run one Life Graph hygiene sweep (audit-roadmap slice 3a): auto-retire
+    /// stale `proposed` nodes and collapse exact-duplicate claims. See
+    /// `data_memorygraphrag::hygiene` for the pure planning logic; this just
+    /// wires it to the shared connection pool. Called from the runner's
+    /// internal timer (`main.rs`) — never on the request path.
+    pub async fn hygiene_sweep(&self) -> Result<data_memorygraphrag::hygiene::SweepSummary> {
+        let graph = self.connect().await?;
+        data_memorygraphrag::hygiene::sweep(&graph).await
+    }
 }
 
 #[async_trait]
@@ -558,7 +568,27 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
 }
 
 impl LifeGraphProvider {
+    /// `life.observe`, single-item path: embeds its own claim_summary via one
+    /// sidecar round trip. Thin wrapper over
+    /// [`Self::handle_observe_with_embedding`] with no precomputed vector.
     async fn handle_observe(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        self.handle_observe_with_embedding(task, None).await
+    }
+
+    /// `life.observe`, sharing its Cypher/plan/edge pipeline with the batch
+    /// path (lifegraph-batch-observe-embeds seam): when `precomputed` is
+    /// `Some((vector, model_gen))` — supplied by
+    /// [`Self::handle_observe_batch`] after a single batched
+    /// `/api/embeddings/batch` sidecar call — the embed-on-write step skips
+    /// its own sidecar round trip and writes the given vector directly.
+    /// `None` (single-item `life.observe`, or a batch item whose sidecar
+    /// batch call failed/was unavailable) falls back to the normal per-item
+    /// `embed_text` call, unchanged from pre-batch behavior.
+    async fn handle_observe_with_embedding(
+        &self,
+        task: &DatasourceTask,
+        precomputed: Option<(Vec<f32>, String)>,
+    ) -> Result<ProviderOutput> {
         // Every failure branch below this point and above `self.connect()` is
         // pre-write and originates from the caller's payload shape (bad JSON,
         // a plan the model isn't allowed to run, an unknown edge rel_type) —
@@ -695,97 +725,41 @@ impl LifeGraphProvider {
             }));
         }
 
-        // Embed-on-write: compute embedding for the claim_summary and write it back.
+        // Embed-on-write: use the precomputed vector (batch path — one shared
+        // sidecar round trip already ran for the whole batch) when given one,
+        // otherwise fall back to the original single-item sidecar call.
         // Explicit error on dim mismatch — a wrong embedding silently breaks retrieval.
-        let embed_status = match embed_text(&compiled.claim_summary).await {
-            Ok((vector, model_gen)) => {
-                if vector.len() != LIFE_GRAPH_EMBEDDING_DIMS {
-                    let msg = format!(
-                        "embed-on-write: sidecar returned {}d but Life Graph requires {}d; \
-                         check PHILOTIC_ONNX_EMBED_REPO on the hotel",
-                        vector.len(),
-                        LIFE_GRAPH_EMBEDDING_DIMS
-                    );
-                    warn!("{msg}");
-                    "wrong_dim"
-                } else {
-                    let embed_cypher = format!(
-                        "MATCH (n:{} {{id: $id}}) \
-                         SET n.embedding = $vec, \
-                             n.embedding_model_gen = $gen, \
-                             n.embedding_dims = {}, \
-                             n.embedding_updated_at = $now, \
-                             n.embedding_space = $space \
-                         RETURN n.embedding_dims AS embedding_dims, \
-                                size(n.embedding) AS embedding_len",
-                        compiled.label, LIFE_GRAPH_EMBEDDING_DIMS
-                    );
-                    let space = projection::embedding_space_for_label(&compiled.label)
-                        .unwrap_or("life_event_semantic");
-                    let vector_param: Vec<f64> = vector.iter().map(|v| f64::from(*v)).collect();
-                    match graph
-                        .execute(
-                            query(&embed_cypher)
-                                .param("id", compiled.node_id.as_str())
-                                .param("vec", vector_param)
-                                .param("gen", model_gen.as_str())
-                                .param("now", now.as_str())
-                                .param("space", space),
-                        )
-                        .await
-                    {
-                        Ok(mut rows) => match rows.next().await {
-                            Ok(Some(row)) => {
-                                let dims = row
-                                    .get::<i64>("embedding_dims")
-                                    .unwrap_or(LIFE_GRAPH_EMBEDDING_DIMS as i64);
-                                let len = row
-                                    .get::<i64>("embedding_len")
-                                    .unwrap_or(LIFE_GRAPH_EMBEDDING_DIMS as i64);
-                                if dims == LIFE_GRAPH_EMBEDDING_DIMS as i64
-                                    && len == LIFE_GRAPH_EMBEDDING_DIMS as i64
-                                {
-                                    info!(
-                                        node_id = %node_id,
-                                        model_gen = %model_gen,
-                                        dims,
-                                        len,
-                                        "embed-on-write OK"
-                                    );
-                                    "ok"
-                                } else {
-                                    warn!(
-                                        node_id = %node_id,
-                                        dims,
-                                        len,
-                                        "embed-on-write returned unexpected metadata"
-                                    );
-                                    "write_mismatch"
-                                }
-                            }
-                            Ok(None) => {
-                                warn!(
-                                    node_id = %compiled.node_id,
-                                    "embed-on-write matched no Life Graph node"
-                                );
-                                "write_missed"
-                            }
-                            Err(e) => {
-                                warn!("embed-on-write result read failed: {e}");
-                                "write_failed"
-                            }
-                        },
-                        Err(e) => {
-                            warn!("embed-on-write SET failed: {e}");
-                            "write_failed"
-                        }
-                    }
+        let embed_status = match precomputed {
+            Some((vector, model_gen)) => {
+                self.write_embedding(
+                    &graph,
+                    &compiled.node_id,
+                    &node_id,
+                    &compiled.label,
+                    vector,
+                    &model_gen,
+                    &now,
+                )
+                .await
+            }
+            None => match embed_text(&compiled.claim_summary).await {
+                Ok((vector, model_gen)) => {
+                    self.write_embedding(
+                        &graph,
+                        &compiled.node_id,
+                        &node_id,
+                        &compiled.label,
+                        vector,
+                        &model_gen,
+                        &now,
+                    )
+                    .await
                 }
-            }
-            Err(e) => {
-                warn!("embed-on-write skipped: {e}");
-                "sidecar_unavailable"
-            }
+                Err(e) => {
+                    warn!("embed-on-write skipped: {e}");
+                    "sidecar_unavailable"
+                }
+            },
         };
 
         Ok(ProviderOutput::ResultSet(json!({
@@ -802,6 +776,104 @@ impl LifeGraphProvider {
             "embed_status": embed_status,
             "edges": edge_reports,
         })))
+    }
+
+    /// Write an embedding vector onto a freshly-observed node. Extracted from
+    /// the original inline embed-on-write block so the single path (sidecar
+    /// call per item) and the batch path (one shared sidecar round trip,
+    /// precomputed vectors) share identical write/verify semantics. Returns
+    /// the `embed_status` string surfaced in the observe result.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_embedding(
+        &self,
+        graph: &Graph,
+        match_node_id: &str,
+        display_node_id: &str,
+        label: &str,
+        vector: Vec<f32>,
+        model_gen: &str,
+        now: &str,
+    ) -> &'static str {
+        if vector.len() != LIFE_GRAPH_EMBEDDING_DIMS {
+            let msg = format!(
+                "embed-on-write: sidecar returned {}d but Life Graph requires {}d; \
+                 check PHILOTIC_ONNX_EMBED_REPO on the hotel",
+                vector.len(),
+                LIFE_GRAPH_EMBEDDING_DIMS
+            );
+            warn!("{msg}");
+            return "wrong_dim";
+        }
+        let embed_cypher = format!(
+            "MATCH (n:{} {{id: $id}}) \
+             SET n.embedding = $vec, \
+                 n.embedding_model_gen = $gen, \
+                 n.embedding_dims = {}, \
+                 n.embedding_updated_at = $now, \
+                 n.embedding_space = $space \
+             RETURN n.embedding_dims AS embedding_dims, \
+                    size(n.embedding) AS embedding_len",
+            label, LIFE_GRAPH_EMBEDDING_DIMS
+        );
+        let space = projection::embedding_space_for_label(label).unwrap_or("life_event_semantic");
+        let vector_param: Vec<f64> = vector.iter().map(|v| f64::from(*v)).collect();
+        match graph
+            .execute(
+                query(&embed_cypher)
+                    .param("id", match_node_id)
+                    .param("vec", vector_param)
+                    .param("gen", model_gen)
+                    .param("now", now)
+                    .param("space", space),
+            )
+            .await
+        {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => {
+                    let dims = row
+                        .get::<i64>("embedding_dims")
+                        .unwrap_or(LIFE_GRAPH_EMBEDDING_DIMS as i64);
+                    let len = row
+                        .get::<i64>("embedding_len")
+                        .unwrap_or(LIFE_GRAPH_EMBEDDING_DIMS as i64);
+                    if dims == LIFE_GRAPH_EMBEDDING_DIMS as i64
+                        && len == LIFE_GRAPH_EMBEDDING_DIMS as i64
+                    {
+                        info!(
+                            node_id = %display_node_id,
+                            model_gen = %model_gen,
+                            dims,
+                            len,
+                            "embed-on-write OK"
+                        );
+                        "ok"
+                    } else {
+                        warn!(
+                            node_id = %display_node_id,
+                            dims,
+                            len,
+                            "embed-on-write returned unexpected metadata"
+                        );
+                        "write_mismatch"
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        node_id = %match_node_id,
+                        "embed-on-write matched no Life Graph node"
+                    );
+                    "write_missed"
+                }
+                Err(e) => {
+                    warn!("embed-on-write result read failed: {e}");
+                    "write_failed"
+                }
+            },
+            Err(e) => {
+                warn!("embed-on-write SET failed: {e}");
+                "write_failed"
+            }
+        }
     }
 
     /// Handle `life.observe.batch` — bounded bulk observation write
@@ -840,6 +912,37 @@ impl LifeGraphProvider {
         }
 
         let requested = input.observations.len();
+
+        // One shared sidecar round trip for the whole batch
+        // (lifegraph-batch-observe-embeds seam). The embed source is exactly
+        // what the single-item path embeds: evidence.claim_summary. Failure
+        // modes degrade per-item: Ok(None) = old sidecar without the batch
+        // route, Err = sidecar down — both fall back to the per-item
+        // embed_text call inside handle_observe (which fails fast under the
+        // shared circuit breaker when the sidecar is genuinely down).
+        let embed_sources: Vec<String> = input
+            .observations
+            .iter()
+            .map(|observation| observation.evidence.claim_summary.clone())
+            .collect();
+        let mut precomputed_embeddings: Vec<Option<(Vec<f32>, String)>> = match embed_texts_batch(
+            &embed_sources,
+        )
+        .await
+        {
+            Ok(Some(vectors)) => vectors.into_iter().map(Some).collect(),
+            Ok(None) => {
+                info!(
+                    "life.observe.batch: sidecar has no batch endpoint — falling back to per-item embeds"
+                );
+                vec![None; requested]
+            }
+            Err(e) => {
+                warn!("life.observe.batch: batch embed failed ({e:#}) — per-item fallback");
+                vec![None; requested]
+            }
+        };
+
         let mut results = Vec::with_capacity(requested);
         let mut succeeded = 0usize;
         let mut failed = 0usize;
@@ -854,7 +957,11 @@ impl LifeGraphProvider {
                 parameters: serde_json::to_value(&observation)?,
                 identity: task.identity.clone(),
             };
-            let item_result = match self.handle_observe(&item_task).await {
+            let precomputed = precomputed_embeddings.get_mut(index).and_then(Option::take);
+            let item_result = match self
+                .handle_observe_with_embedding(&item_task, precomputed)
+                .await
+            {
                 Ok(ProviderOutput::ResultSet(value)) => value,
                 Ok(_) => json!({ "status": "acknowledged" }),
                 Err(err) => json!({ "status": "error", "error": format!("{err:#}") }),
@@ -4032,6 +4139,111 @@ async fn embed_text(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
             Err(e)
         }
     }
+}
+
+/// One-round-trip batch embed via the sidecar's `/api/embeddings/batch`
+/// (lifegraph-batch-observe-embeds seam). Outcomes:
+/// - `Ok(Some(vectors))` — one vector per input text, shared model gen;
+/// - `Ok(None)` — the sidecar predates the batch endpoint (404): the caller
+///   falls back to per-item [`embed_text`] so mixed fleets keep working;
+/// - `Err` — transport/inference failure; arms the same circuit breaker as
+///   [`embed_text`], so subsequent per-item calls fail fast too.
+async fn embed_texts_batch(texts: &[String]) -> anyhow::Result<Option<Vec<(Vec<f32>, String)>>> {
+    use std::sync::atomic::Ordering;
+    let now = now_unix_secs();
+    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
+        anyhow::bail!("embed_texts_batch: sidecar in cooldown after a recent failure");
+    }
+
+    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
+        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
+    let url = format!("{base}/api/embeddings/batch");
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        // Whole-batch budget: sequential inference server-side, so scale the
+        // single-item budget by batch size (bounded by the server's own cap).
+        .timeout(std::time::Duration::from_secs(
+            EMBED_SIDECAR_TIMEOUT_SECS.saturating_mul(texts.len().max(1) as u64),
+        ))
+        .build()
+        .context("embed_texts_batch: failed to build HTTP client")?;
+
+    let arm_cooldown = || {
+        EMBED_SIDECAR_DOWN_UNTIL.store(
+            now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
+            Ordering::Relaxed,
+        );
+    };
+
+    let response = match client
+        .post(&url)
+        .json(&serde_json::json!({ "prompts": texts }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            arm_cooldown();
+            return Err(e).context("embed_texts_batch: HTTP request failed");
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Older sidecar without the batch route — NOT a health failure.
+        return Ok(None);
+    }
+    let resp: serde_json::Value = match response.json().await {
+        Ok(value) => value,
+        Err(e) => {
+            arm_cooldown();
+            return Err(e).context("embed_texts_batch: failed to parse JSON response");
+        }
+    };
+    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
+        arm_cooldown();
+        anyhow::bail!("embed_texts_batch: sidecar error: {err}");
+    }
+
+    let model_gen = resp
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let embeddings: Vec<Vec<f32>> = resp
+        .get("embeddings")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .ok_or_else(|| {
+            arm_cooldown();
+            anyhow::anyhow!("embed_texts_batch: response missing 'embeddings' array")
+        })?;
+    if embeddings.len() != texts.len() {
+        arm_cooldown();
+        anyhow::bail!(
+            "embed_texts_batch: sidecar returned {} embeddings for {} prompts",
+            embeddings.len(),
+            texts.len()
+        );
+    }
+
+    EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
+    Ok(Some(
+        embeddings
+            .into_iter()
+            .map(|vector| (vector, model_gen.clone()))
+            .collect(),
+    ))
 }
 
 async fn embed_text_inner(text: &str) -> anyhow::Result<(Vec<f32>, String)> {

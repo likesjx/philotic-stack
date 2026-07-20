@@ -7,6 +7,7 @@
 pub mod attention_observer;
 pub mod cypher;
 pub mod entanglement;
+pub mod hygiene;
 pub mod projection;
 pub mod zoning;
 

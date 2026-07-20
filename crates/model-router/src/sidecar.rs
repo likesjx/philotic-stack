@@ -99,6 +99,92 @@ async fn embed(
     }
 }
 
+// ── /api/embeddings/batch ────────────────────────────────────────────────────
+
+/// Hard cap on prompts accepted per `/api/embeddings/batch` request. Sized so
+/// one over-budget caller fails fast with a 400 instead of the sidecar
+/// silently accepting an unbounded batch and blocking the executor for a
+/// long stretch of sequential inference calls.
+pub const EMBED_BATCH_MAX_PROMPTS: usize = 64;
+
+/// `POST /api/embeddings/batch` request body.
+#[derive(Debug, Deserialize)]
+pub struct EmbedBatchRequest {
+    pub prompts: Vec<String>,
+}
+
+/// `POST /api/embeddings/batch` response body: one embedding per input
+/// prompt, in the same order, plus the shared model generation token (the
+/// whole batch runs through the same loaded backend).
+#[derive(Debug, Serialize)]
+pub struct EmbedBatchResponse {
+    pub embeddings: Vec<Vec<f32>>,
+    #[serde(rename = "model")]
+    pub model_gen: String,
+}
+
+/// Pure request-shape validation: non-empty, at most [`EMBED_BATCH_MAX_PROMPTS`].
+/// Split out from the handler so it's testable without spinning up axum.
+fn validate_batch_prompt_count(count: usize) -> Result<(), String> {
+    if count == 0 {
+        return Err("prompts must be a non-empty array".to_string());
+    }
+    if count > EMBED_BATCH_MAX_PROMPTS {
+        return Err(format!(
+            "batch of {count} prompts exceeds the {EMBED_BATCH_MAX_PROMPTS}-item cap"
+        ));
+    }
+    Ok(())
+}
+
+async fn embed_batch(
+    State(state): State<SidecarState>,
+    Json(req): Json<EmbedBatchRequest>,
+) -> impl IntoResponse {
+    if let Err(msg) = validate_batch_prompt_count(req.prompts.len()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response();
+    }
+
+    let guard = state.embeddings.read().await;
+    let Some(backend) = guard.as_ref() else {
+        error!("sidecar: embedding backend not loaded");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "embedding backend not loaded"})),
+        )
+            .into_response();
+    };
+
+    let mut embeddings = Vec::with_capacity(req.prompts.len());
+    let mut model_gen = String::new();
+    for prompt in &req.prompts {
+        match backend.embed(prompt) {
+            Ok(output) => {
+                model_gen = output.model_gen;
+                embeddings.push(output.vector);
+            }
+            Err(err) => {
+                error!(%err, "sidecar: batch embedding inference failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": err.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    Json(EmbedBatchResponse {
+        embeddings,
+        model_gen,
+    })
+    .into_response()
+}
+
 // ── /api/transcribe ───────────────────────────────────────────────────────────
 
 /// `POST /api/transcribe` response body.
@@ -223,6 +309,7 @@ pub fn router(state: SidecarState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/embeddings", post(embed))
+        .route("/api/embeddings/batch", post(embed_batch))
         .route("/api/transcribe", post(transcribe))
         .route("/api/synthesize", post(synthesize))
         .with_state(state)
@@ -262,4 +349,35 @@ pub fn load_embeddings_into(
     let backend = EmbeddingsBackend::load(&handle, max_seq_len)?;
     *slot.lock().unwrap() = Some(backend);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_prompt_count_rejects_empty() {
+        let err = validate_batch_prompt_count(0).expect_err("empty batch must be rejected");
+        assert!(err.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn batch_prompt_count_accepts_the_cap_exactly() {
+        assert!(validate_batch_prompt_count(EMBED_BATCH_MAX_PROMPTS).is_ok());
+    }
+
+    #[test]
+    fn batch_prompt_count_rejects_one_over_the_cap() {
+        let err = validate_batch_prompt_count(EMBED_BATCH_MAX_PROMPTS + 1)
+            .expect_err("over-cap batch must be rejected");
+        assert!(
+            err.contains(&EMBED_BATCH_MAX_PROMPTS.to_string()),
+            "cap must be named in the error: {err}"
+        );
+    }
+
+    #[test]
+    fn batch_prompt_count_accepts_a_single_prompt() {
+        assert!(validate_batch_prompt_count(1).is_ok());
+    }
 }
