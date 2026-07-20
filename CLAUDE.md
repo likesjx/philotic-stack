@@ -64,6 +64,17 @@ just intel-graph-status        # check if running
 just intel-graph-health        # health check both services
 just intel-graph-ui            # open the web UI (http://127.0.0.1:8900)
 just intel-graph-agent 60      # start with auto-shutdown after N minutes
+just intel-graph-freshness-schedule  # launchd: scan + harness verify every 6h
+
+# Harnesses (graph-managed agent charters for Claude Code, Codex, Windsurf, Antigravity)
+just harness-drift             # drift report for all managed harnesses
+just harness-verify-all        # verify every harness projection, then report drift
+just harness-skills-sync       # sync graph skill catalog from skills/*/SKILL.md
+just harness-apply <id> <profile>  # re-apply canonical profile + verify
+
+# The server binds loopback by default. For tailnet exposure set
+# PHILOTIC_GRAPH_BIND=<tailscale-ip> and PHILOTIC_GRAPH_TOKEN=<secret>
+# (bearer auth on writes/MCP). See crates/graph-intelligence/README.md.
 ```
 
 The hotel daemon requires `mesh-config.json` in root — copy from `mesh-config.example.json`.

@@ -10,7 +10,7 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing;
 
 use crate::engine::ManageProposalRequest;
@@ -242,7 +242,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/scan", post(trigger_scan))
         .route("/api/edges", post(post_upsert_edge))
         .route("/api/mempalace/turn", post(post_mempalace_turn))
-        .layer(CorsLayer::permissive())
+        // Local-origin CORS only: permissive CORS let any web page POST JSON to
+        // the unauthenticated write endpoints (drive-by graph mutation).
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin, _| {
+                    origin
+                        .to_str()
+                        .map(|o| {
+                            o.starts_with("http://localhost")
+                                || o.starts_with("http://127.0.0.1")
+                                || o.starts_with("https://localhost")
+                                || o.starts_with("https://127.0.0.1")
+                        })
+                        .unwrap_or(false)
+                }))
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .fallback(get(handle_ui_static))
         .with_state(state)
 }
@@ -385,11 +402,17 @@ async fn get_status(
     let edge_count = engine.count_edges().map_err(internal_error)?;
     let snippet_count = engine.count_snippets().map_err(internal_error)?;
 
+    let last_scan = engine
+        .get_mutations(Some("system:scan"), 1)
+        .ok()
+        .and_then(|m| m.into_iter().next())
+        .map(|m| m.timestamp.to_rfc3339());
+
     Ok(Json(StatusResponse {
         node_counts: serde_json::Value::Object(counts),
         edge_count,
         snippet_count,
-        last_scan: None,
+        last_scan,
     }))
 }
 

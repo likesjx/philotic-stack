@@ -27,7 +27,7 @@ tower-http = { version = "0.5", features = ["cors"] }
 tokio-tungstenite = "0.24"
 rust-embed = { version = "8", features = ["mime-guess"] }
 reqwest = { version = "0.12", features = ["json"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1.44"
 
 [dev-dependencies]

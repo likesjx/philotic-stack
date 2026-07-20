@@ -95,10 +95,7 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
 
         let (frontmatter, body) = parse_frontmatter(&content);
 
-        let file_name = file_path
-            .file_stem()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let file_name = doc_identity_stem(file_path);
 
         let title = frontmatter
             .title
@@ -664,6 +661,26 @@ fn parse_task_items(body: &str, engine: &GraphEngine) -> Result<()> {
     Ok(())
 }
 
+/// Identity stem for a doc file. Container-style filenames
+/// (skills/foo/SKILL.md, docs/bar/README.md) carry their identity in the
+/// parent directory; using the bare stem collapses every such file onto one
+/// node id (e.g. skill:skill), each upsert overwriting the previous one.
+fn doc_identity_stem(file_path: &Path) -> String {
+    let stem = file_path
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let parent_name = file_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string());
+    match (stem.to_ascii_lowercase().as_str(), parent_name) {
+        ("skill", Some(parent)) => parent,
+        ("readme", Some(parent)) => format!("{}-readme", parent),
+        _ => stem,
+    }
+}
+
 fn slugify(s: &str) -> String {
     s.to_lowercase()
         .replace(' ', "-")
@@ -691,7 +708,28 @@ fn normalize_disposition(status: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_disposition, parse_frontmatter};
+    use super::{doc_identity_stem, normalize_disposition, parse_frontmatter};
+    use std::path::Path;
+
+    #[test]
+    fn container_style_filenames_take_identity_from_parent_dir() {
+        assert_eq!(
+            doc_identity_stem(Path::new("skills/graph-intelligence/SKILL.md")),
+            "graph-intelligence"
+        );
+        assert_eq!(
+            doc_identity_stem(Path::new("skills/check-engine/SKILL.md")),
+            "check-engine"
+        );
+        assert_eq!(
+            doc_identity_stem(Path::new("docs/architecture/README.md")),
+            "architecture-readme"
+        );
+        assert_eq!(
+            doc_identity_stem(Path::new("docs/architecture/ARCHITECTURE.md")),
+            "ARCHITECTURE"
+        );
+    }
 
     #[test]
     fn parses_array_tags_and_status_fields() {

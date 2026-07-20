@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
@@ -99,6 +99,13 @@ pub enum HarnessSkillAction {
         skill_name: String,
         #[arg(long)]
         description: Option<String>,
+    },
+
+    /// Sync the catalog from the repository's skills/ directory (skills/*/SKILL.md).
+    Sync {
+        /// Directory containing skill subdirectories (default: <cwd>/skills)
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 
     /// Assign a registered skill to a harness desired state.
@@ -231,14 +238,40 @@ pub enum HarnessTrialAction {
     },
 }
 
+/// Verification contract for an auxiliary file written by `apply` beyond the
+/// main projection. `Hash` is for files the harness exclusively owns;
+/// `Contains` is for co-owned files (e.g. settings.local.json, ~/.codex/AGENTS.md)
+/// where other writers legitimately change unrelated content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CodexHarnessConfig {
-    harness_id: String,
-    runtime_kind: String,
-    role_charter: String,
-    managed_by: String,
-    generated_at: String,
-    skills: Vec<String>,
+#[serde(tag = "check", rename_all = "snake_case")]
+enum AuxCheck {
+    Hash { path: String, hash: String },
+    Contains { path: String, needle: String },
+}
+
+impl AuxCheck {
+    fn path(&self) -> &str {
+        match self {
+            AuxCheck::Hash { path, .. } => path,
+            AuxCheck::Contains { path, .. } => path,
+        }
+    }
+
+    /// Returns None when the check passes, or a short failure description.
+    fn evaluate(&self) -> Option<String> {
+        match self {
+            AuxCheck::Hash { path, hash } => match fs::read(path) {
+                Ok(content) if sha256_hex(&content) == *hash => None,
+                Ok(_) => Some(format!("{path}: content hash mismatch")),
+                Err(_) => Some(format!("{path}: missing or unreadable")),
+            },
+            AuxCheck::Contains { path, needle } => match fs::read_to_string(path) {
+                Ok(content) if content.contains(needle.as_str()) => None,
+                Ok(_) => Some(format!("{path}: managed marker/hook missing")),
+                Err(_) => Some(format!("{path}: missing or unreadable")),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -279,12 +312,12 @@ impl HarnessAdapter for CodexAdapter {
     fn plan(&self, harness_id: &str, profile: Option<String>) -> Result<HarnessConfigSnapshot> {
         let profile = profile.unwrap_or_else(|| "orchestrator".into());
         let target_path = codex_target_path(harness_id)?;
-        let config = desired_codex_config(harness_id, &profile);
-        let content = serde_json::to_vec_pretty(&config)?;
+        let skills = default_skills_for_profile(&profile);
+        let content = render_codex_markdown(harness_id, &profile, &skills).into_bytes();
         Ok(HarnessConfigSnapshot {
             profile,
             runtime_kind: self.runtime_kind().into(),
-            skills: config.skills,
+            skills,
             target_path,
             content,
         })
@@ -304,16 +337,9 @@ impl HarnessAdapter for CodexAdapter {
             .to_string();
         let mut snapshot = self.plan(harness_id, Some(profile))?;
         if let Some(skill_refs) = harness_skill_refs(harness) {
-            let config = CodexHarnessConfig {
-                harness_id: harness_id.to_string(),
-                runtime_kind: self.runtime_kind().into(),
-                role_charter: snapshot.profile.clone(),
-                managed_by: "phil graph harness".into(),
-                generated_at: Utc::now().to_rfc3339(),
-                skills: skill_refs,
-            };
-            snapshot.skills = config.skills.clone();
-            snapshot.content = serde_json::to_vec_pretty(&config)?;
+            snapshot.skills = skill_refs.clone();
+            snapshot.content =
+                render_codex_markdown(harness_id, &snapshot.profile, &skill_refs).into_bytes();
         }
         Ok(snapshot)
     }
@@ -511,6 +537,7 @@ fn run_skill_action(engine: &GraphEngine, action: HarnessSkillAction) -> Result<
             skill_name,
             description,
         } => register_harness_skill(engine, &skill_name, description.as_deref()),
+        HarnessSkillAction::Sync { dir } => sync_harness_skills(engine, dir.as_deref()),
         HarnessSkillAction::Assign {
             harness_id,
             skill_name,
@@ -695,6 +722,144 @@ fn register_harness_skill(
         json!({ "description": description.unwrap_or("") }),
     )?;
     println!("Registered harness skill {}", skill_name);
+    Ok(())
+}
+
+/// Extract a scalar value from simple `key: value` YAML frontmatter delimited by `---` lines.
+fn frontmatter_scalar(content: &str, key: &str) -> Option<String> {
+    let mut in_frontmatter = false;
+    for line in content.lines() {
+        let trimmed = line.trim_end();
+        if trimmed == "---" {
+            if in_frontmatter {
+                break;
+            }
+            in_frontmatter = true;
+            continue;
+        }
+        if !in_frontmatter {
+            // No frontmatter at all
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
+            let value = rest.trim().trim_matches('"').trim_matches('\'');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Upsert one catalog entry per skills/<name>/SKILL.md, keeping the graph's
+/// harness skill catalog in lockstep with the on-disk skill corpus. Catalog
+/// entries with no on-disk directory are reported (canonical bundles from
+/// `bootstrap` are expected to appear there).
+fn sync_harness_skills(engine: &GraphEngine, dir: Option<&Path>) -> Result<()> {
+    let root = match dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::current_dir()
+            .context("failed to locate current workspace")?
+            .join("skills"),
+    };
+    if !root.is_dir() {
+        bail!("skills directory not found: {}", root.display());
+    }
+
+    let mut on_disk = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&root)
+        .with_context(|| format!("failed to read {}", root.display()))?
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let skill_md = entry.path().join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        let content = fs::read_to_string(&skill_md)
+            .with_context(|| format!("failed to read {}", skill_md.display()))?;
+        let name = frontmatter_scalar(&content, "name").unwrap_or_else(|| dir_name.clone());
+        let description = frontmatter_scalar(&content, "description").unwrap_or_default();
+        // Keep the description compact for the catalog table.
+        let description: String = description.chars().take(200).collect();
+
+        let now = Utc::now();
+        let node_id = harness_skill_node_id(&name);
+        let existing = engine.get_node(&node_id)?;
+        let changed = existing
+            .as_ref()
+            .map(|node| {
+                node.properties
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(|d| d != description)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true);
+        let node = Node {
+            id: node_id.clone(),
+            kind: NodeKind::HarnessSkill,
+            name: name.clone(),
+            properties: json!({
+                "description": description,
+                "status": "active",
+                "source_path": skill_md.to_string_lossy().to_string(),
+                "synced_at": now.to_rfc3339()
+            }),
+            file_path: Some(skill_md.to_string_lossy().to_string()),
+            worktree: String::new(),
+            created_at: existing.as_ref().map(|n| n.created_at).unwrap_or(now),
+            updated_at: now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
+        };
+        engine.upsert_node(&node)?;
+        let verb = match (&existing, changed) {
+            (None, _) => "added",
+            (Some(_), true) => "updated",
+            (Some(_), false) => "unchanged",
+        };
+        println!("  {verb}: {name}");
+        on_disk.push(name);
+    }
+
+    let catalog = engine.query_nodes(Some(NodeKind::HarnessSkill), None)?;
+    let orphans: Vec<&str> = catalog
+        .iter()
+        .filter(|node| !on_disk.contains(&node.name))
+        .map(|node| node.name.as_str())
+        .collect();
+
+    record_mutation(
+        engine,
+        "harness_skill_sync",
+        None,
+        None,
+        None,
+        Some(format!(
+            "Synced {} skills from {}",
+            on_disk.len(),
+            root.display()
+        )),
+        json!({ "synced": on_disk, "catalog_only": orphans }),
+    )?;
+
+    println!(
+        "Synced {} skills from {} into the harness catalog.",
+        on_disk.len(),
+        root.display()
+    );
+    if !orphans.is_empty() {
+        println!(
+            "Catalog entries with no on-disk skill (bundles or stale): {}",
+            orphans.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -1286,22 +1451,21 @@ fn apply_harness(
         )?;
     }
     write_harness_file(&config.target_path, &config.content)?;
-    if adapter.runtime_kind() == "windsurf" {
-        write_windsurf_workspace_files(
+    let aux_checks: Vec<AuxCheck> = match adapter.runtime_kind() {
+        "windsurf" => write_windsurf_workspace_files(
             engine,
             harness_id,
             &desired.role_charter,
             &config.skills,
             &config.target_path,
-        )?;
-    }
-    if adapter.runtime_kind() == "claude-code" {
-        write_claude_code_workspace_files(harness_id, &config.target_path)?;
-    }
-    if adapter.runtime_kind() == "antigravity" {
-        write_antigravity_workspace_files(harness_id, &config.target_path)?;
-    }
+        )?,
+        "claude-code" => write_claude_code_workspace_files(harness_id, &config.target_path)?,
+        "antigravity" => write_antigravity_workspace_files(harness_id, &config.target_path)?,
+        "codex" => write_codex_workspace_files(harness_id, &config.target_path)?,
+        _ => Vec::new(),
+    };
     let hash = sha256_hex(&config.content);
+    let aux_checks_json = serde_json::to_value(&aux_checks)?;
     let now = Utc::now();
     let harness_node_id = harness_node_id(harness_id);
     let projection_node_id = harness_projection_node_id(harness_id, "main-config");
@@ -1329,7 +1493,8 @@ fn apply_harness(
                 "revision": now.timestamp(),
                 "config_hash": hash,
                 "rendered_at": now.to_rfc3339(),
-                "renderer_version": "v1"
+                "renderer_version": "v2",
+                "aux_checks": aux_checks_json.clone()
             });
             properties["observed_summary"] = json!({
                 "status": "pending_verify",
@@ -1560,6 +1725,26 @@ fn verify_harness(
             ("missing", None, "stale")
         };
 
+        // Auxiliary files written by apply (workspace imports, hooks, managed
+        // blocks) drift independently of the main projection; check each.
+        let aux_checks: Vec<AuxCheck> = harness
+            .properties
+            .get("rendered")
+            .and_then(|v| v.get("aux_checks"))
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let aux_failures: Vec<String> = aux_checks
+            .iter()
+            .filter_map(|check| check.evaluate())
+            .collect();
+        if !aux_failures.is_empty() {
+            drift_status = "drifted";
+            if severity != Some("error") {
+                severity = Some("warn");
+            }
+        }
+
         let mut updated = harness.clone();
         updated.updated_at = now;
         updated.properties["observed_summary"] = json!({
@@ -1625,10 +1810,18 @@ fn verify_harness(
                     "last_seen_at": now.to_rfc3339(),
                     "resolved_at": serde_json::Value::Null,
                     "resolved_by_observation": serde_json::Value::Null,
-                    "summary": "Rendered config does not match observed local state",
+                    "summary": if aux_failures.is_empty() {
+                        "Rendered config does not match observed local state".to_string()
+                    } else {
+                        format!(
+                            "Harness drift: {} auxiliary check(s) failed",
+                            aux_failures.len()
+                        )
+                    },
                     "details": {
                         "rendered_hash": rendered_hash,
-                        "observed_hash": observation.properties["profile_hash"].clone()
+                        "observed_hash": observation.properties["profile_hash"].clone(),
+                        "aux_failures": aux_failures
                     }
                 }),
                 file_path: Some(config.target_path.to_string_lossy().to_string()),
@@ -2250,18 +2443,6 @@ fn close_harness_trial(
     Ok(())
 }
 
-fn desired_codex_config(harness_id: &str, profile: &str) -> CodexHarnessConfig {
-    let skills = default_skills_for_profile(profile);
-    CodexHarnessConfig {
-        harness_id: harness_id.to_string(),
-        runtime_kind: "codex".into(),
-        role_charter: profile.to_string(),
-        managed_by: "phil graph harness".into(),
-        generated_at: Utc::now().to_rfc3339(),
-        skills,
-    }
-}
-
 fn render_harness_config(
     runtime_kind: &str,
     harness_id: &str,
@@ -2269,14 +2450,7 @@ fn render_harness_config(
     skills: Vec<String>,
 ) -> Result<Vec<u8>> {
     match runtime_kind {
-        "codex" => Ok(serde_json::to_vec_pretty(&CodexHarnessConfig {
-            harness_id: harness_id.to_string(),
-            runtime_kind: "codex".into(),
-            role_charter: profile.to_string(),
-            managed_by: "phil graph harness".into(),
-            generated_at: Utc::now().to_rfc3339(),
-            skills,
-        })?),
+        "codex" => Ok(render_codex_markdown(harness_id, profile, &skills).into_bytes()),
         "claude-code" => Ok(render_claude_code_markdown(harness_id, profile, &skills).into_bytes()),
         "windsurf" => Ok(render_windsurf_rule_markdown(harness_id, profile, &skills).into_bytes()),
         "antigravity" => Ok(render_antigravity_markdown(harness_id, profile, &skills).into_bytes()),
@@ -2290,7 +2464,8 @@ fn codex_target_path(harness_id: &str) -> Result<PathBuf> {
         .join(".codex")
         .join("philotic")
         .join("harnesses")
-        .join(format!("{harness_id}.json")))
+        .join(harness_id)
+        .join("AGENTS.md"))
 }
 
 fn claude_code_target_path(harness_id: &str) -> Result<PathBuf> {
@@ -2332,6 +2507,93 @@ fn default_skills_for_profile(profile: &str) -> Vec<String> {
             "muninn-memory-habit".into(),
         ],
     }
+}
+
+fn render_codex_markdown(harness_id: &str, profile: &str, skills: &[String]) -> String {
+    let skills_lines = if skills.is_empty() {
+        "- none".to_string()
+    } else {
+        skills
+            .iter()
+            .map(|skill| format!("- {}", skill))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "# Philotic Codex Harness: {harness_id}\n\nManaged by `phil graph harness`.\n\n## Role Charter\n\n{profile}\n\n## Active Skills\n\n{skills_lines}\n\n## Session Protocol\n\n- At session start, run `phil graph harness verify {harness_id}` and surface anything other than `clean`.\n- Follow the repository `AGENTS.md` protocol; the skills above are this harness's active skill set under `skills/` in the repo.\n- Record decisions with `graph_decide` (MCP) or `phil graph decide`, and durable memory with Muninn.\n\n## Muninn Memory\n\n{MUNINN_HARNESS_INSTRUCTIONS}"
+    )
+}
+
+/// Replace the marker-delimited block in `existing` with `block`, or append it.
+/// Idempotent: applying the same block twice yields identical content.
+fn merge_managed_block(existing: &str, begin: &str, end: &str, block: &str) -> String {
+    match (existing.find(begin), existing.find(end)) {
+        (Some(start), Some(stop)) if stop > start => {
+            let after = stop + end.len();
+            // Swallow the trailing newline of the old block so replacement is stable.
+            let after = if existing[after..].starts_with('\n') {
+                after + 1
+            } else {
+                after
+            };
+            format!("{}{}{}", &existing[..start], block, &existing[after..])
+        }
+        _ => {
+            if existing.is_empty() {
+                block.to_string()
+            } else if existing.ends_with('\n') {
+                format!("{existing}\n{block}")
+            } else {
+                format!("{existing}\n\n{block}")
+            }
+        }
+    }
+}
+
+fn codex_managed_block_markers(harness_id: &str) -> (String, String) {
+    (
+        format!("<!-- BEGIN PHILOTIC HARNESS {harness_id} (managed by `phil graph harness apply`; do not edit) -->"),
+        format!("<!-- END PHILOTIC HARNESS {harness_id} -->"),
+    )
+}
+
+/// Merge a marker-delimited managed block into ~/.codex/AGENTS.md so the
+/// OpenAI Codex CLI actually loads the harness charter at session start.
+/// The JSON-era projection was inert: nothing Codex reads referenced it.
+fn write_codex_workspace_files(
+    harness_id: &str,
+    projection_path: &PathBuf,
+) -> Result<Vec<AuxCheck>> {
+    let home = dirs::home_dir().context("failed to locate home directory")?;
+    let agents_md = home.join(".codex").join("AGENTS.md");
+    let (begin, end) = codex_managed_block_markers(harness_id);
+    let block = format!(
+        "{begin}\n\
+         Philotic harness `{harness_id}` is active in this environment.\n\
+         - Read and adopt the harness charter at {path} before starting work.\n\
+         - At session start, run `phil graph harness verify {harness_id}` and surface anything other than `clean`.\n\
+         {end}\n",
+        path = projection_path.display()
+    );
+
+    let existing = if agents_md.exists() {
+        fs::read_to_string(&agents_md)
+            .with_context(|| format!("failed to read {}", agents_md.display()))?
+    } else {
+        String::new()
+    };
+
+    let updated = merge_managed_block(&existing, &begin, &end, &block);
+    write_harness_file(&agents_md, updated.as_bytes())?;
+    println!(
+        "  → merged managed harness block into {} (loaded by Codex at session start)",
+        agents_md.display()
+    );
+    // ~/.codex/AGENTS.md is co-owned by the operator; only assert our block survives.
+    Ok(vec![AuxCheck::Contains {
+        path: agents_md.to_string_lossy().to_string(),
+        needle: begin,
+    }])
 }
 
 fn render_claude_code_markdown(harness_id: &str, profile: &str, skills: &[String]) -> String {
@@ -2431,7 +2693,10 @@ fn render_windsurf_workflow_markdown(
     )
 }
 
-fn write_claude_code_workspace_files(harness_id: &str, projection_path: &PathBuf) -> Result<()> {
+fn write_claude_code_workspace_files(
+    harness_id: &str,
+    projection_path: &PathBuf,
+) -> Result<Vec<AuxCheck>> {
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let dot_claude = root.join(".claude");
 
@@ -2443,7 +2708,8 @@ fn write_claude_code_workspace_files(harness_id: &str, projection_path: &PathBuf
          <!-- Re-run `phil graph harness apply {harness_id}` to refresh after profile changes. -->\n\
          @{import_path}\n"
     );
-    write_harness_file(&dot_claude.join("CLAUDE.md"), import_md.as_bytes())?;
+    let claude_md_path = dot_claude.join("CLAUDE.md");
+    write_harness_file(&claude_md_path, import_md.as_bytes())?;
 
     // 2. Merge a SessionStart hook into .claude/settings.local.json.
     //    The hook verifies the harness on startup so drift is visible before any work.
@@ -2501,10 +2767,24 @@ fn write_claude_code_workspace_files(harness_id: &str, projection_path: &PathBuf
         projection_path.display()
     );
     println!("  → merged SessionStart verify hook into .claude/settings.local.json");
-    Ok(())
+    Ok(vec![
+        AuxCheck::Hash {
+            path: claude_md_path.to_string_lossy().to_string(),
+            hash: sha256_hex(import_md.as_bytes()),
+        },
+        // settings.local.json is co-owned (Claude Code itself merges permission
+        // grants into it), so only assert our verify hook is still present.
+        AuxCheck::Contains {
+            path: settings_path.to_string_lossy().to_string(),
+            needle: format!("phil graph harness verify {harness_id}"),
+        },
+    ])
 }
 
-fn write_antigravity_workspace_files(harness_id: &str, projection_path: &PathBuf) -> Result<()> {
+fn write_antigravity_workspace_files(
+    harness_id: &str,
+    projection_path: &PathBuf,
+) -> Result<Vec<AuxCheck>> {
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let agents_dir = root.join(".agents").join("workflows");
 
@@ -2549,7 +2829,10 @@ fn write_antigravity_workspace_files(harness_id: &str, projection_path: &PathBuf
         harness_id.replace("harness:", ""),
         projection_path.display()
     );
-    Ok(())
+    Ok(vec![AuxCheck::Hash {
+        path: harness_hook_path.to_string_lossy().to_string(),
+        hash: sha256_hex(hook_md.as_bytes()),
+    }])
 }
 
 fn write_windsurf_workspace_files(
@@ -2558,21 +2841,26 @@ fn write_windsurf_workspace_files(
     profile: &str,
     skills: &[String],
     rule_path: &PathBuf,
-) -> Result<()> {
-    write_harness_file(
-        rule_path,
-        render_windsurf_rule_markdown(harness_id, profile, skills).as_bytes(),
-    )?;
+) -> Result<Vec<AuxCheck>> {
+    let mut checks = Vec::new();
+    let rule_md = render_windsurf_rule_markdown(harness_id, profile, skills);
+    write_harness_file(rule_path, rule_md.as_bytes())?;
+    checks.push(AuxCheck::Hash {
+        path: rule_path.to_string_lossy().to_string(),
+        hash: sha256_hex(rule_md.as_bytes()),
+    });
 
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let skills_root = root.join(".windsurf").join("skills");
     for skill in skills {
         let skill_dir = skills_root.join(format!("philotic-{}", skill));
         let skill_path = skill_dir.join("SKILL.md");
-        write_harness_file(
-            &skill_path,
-            render_windsurf_skill_markdown(skill).as_bytes(),
-        )?;
+        let skill_md = render_windsurf_skill_markdown(skill);
+        write_harness_file(&skill_path, skill_md.as_bytes())?;
+        checks.push(AuxCheck::Hash {
+            path: skill_path.to_string_lossy().to_string(),
+            hash: sha256_hex(skill_md.as_bytes()),
+        });
     }
 
     let workflows_root = root.join(".windsurf").join("workflows");
@@ -2599,8 +2887,12 @@ fn write_windsurf_workspace_files(
                 .and_then(|v| v.as_str()),
         );
         write_harness_file(&workflow_path, markdown.as_bytes())?;
+        checks.push(AuxCheck::Hash {
+            path: workflow_path.to_string_lossy().to_string(),
+            hash: sha256_hex(markdown.as_bytes()),
+        });
     }
-    Ok(())
+    Ok(checks)
 }
 
 fn write_harness_file(path: &PathBuf, content: &[u8]) -> Result<()> {
@@ -3010,5 +3302,87 @@ mod tests {
         assert!(!trial_close_has_verified("completed", Some("")));
         assert!(trial_close_has_verified("completed", Some("test-green")));
         assert!(trial_close_has_verified("blocked", None));
+    }
+
+    #[test]
+    fn managed_block_merge_is_idempotent_and_preserves_surrounding_content() {
+        let (begin, end) = codex_managed_block_markers("codex-local");
+        let block = format!("{begin}\nharness body v1\n{end}\n");
+
+        // Empty file → block alone.
+        let first = merge_managed_block("", &begin, &end, &block);
+        assert_eq!(first, block);
+
+        // Re-applying the same block changes nothing.
+        let again = merge_managed_block(&first, &begin, &end, &block);
+        assert_eq!(again, first);
+
+        // Existing operator content is preserved around the block.
+        let with_user = format!("# My notes\n\n{first}");
+        let block_v2 = format!("{begin}\nharness body v2\n{end}\n");
+        let updated = merge_managed_block(&with_user, &begin, &end, &block_v2);
+        assert!(updated.starts_with("# My notes\n"));
+        assert!(updated.contains("harness body v2"));
+        assert!(!updated.contains("harness body v1"));
+
+        // Appending to a file without the block keeps prior content.
+        let appended = merge_managed_block("existing agents doc\n", &begin, &end, &block);
+        assert!(appended.starts_with("existing agents doc\n"));
+        assert!(appended.contains("harness body v1"));
+    }
+
+    #[test]
+    fn frontmatter_scalar_parses_simple_yaml() {
+        let doc = "---\nname: graph-intelligence\ndescription: Orient via the graph.\n---\n\n# Body\nname: not-this\n";
+        assert_eq!(
+            frontmatter_scalar(doc, "name").as_deref(),
+            Some("graph-intelligence")
+        );
+        assert_eq!(
+            frontmatter_scalar(doc, "description").as_deref(),
+            Some("Orient via the graph.")
+        );
+        assert_eq!(frontmatter_scalar("no frontmatter here", "name"), None);
+    }
+
+    #[test]
+    fn aux_check_contains_and_hash_evaluate() {
+        let dir = std::env::temp_dir().join(format!("philotic-aux-check-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        fs::write(&file, b"{\"hooks\": \"phil graph harness verify x\"}").unwrap();
+
+        let contains_ok = AuxCheck::Contains {
+            path: file.to_string_lossy().to_string(),
+            needle: "phil graph harness verify x".into(),
+        };
+        assert!(contains_ok.evaluate().is_none());
+
+        let contains_missing = AuxCheck::Contains {
+            path: file.to_string_lossy().to_string(),
+            needle: "not present".into(),
+        };
+        assert!(contains_missing.evaluate().is_some());
+
+        let content = fs::read(&file).unwrap();
+        let hash_ok = AuxCheck::Hash {
+            path: file.to_string_lossy().to_string(),
+            hash: sha256_hex(&content),
+        };
+        assert!(hash_ok.evaluate().is_none());
+
+        let hash_bad = AuxCheck::Hash {
+            path: file.to_string_lossy().to_string(),
+            hash: "deadbeef".into(),
+        };
+        assert!(hash_bad.evaluate().is_some());
+
+        let missing = AuxCheck::Hash {
+            path: dir.join("nope").to_string_lossy().to_string(),
+            hash: "deadbeef".into(),
+        };
+        assert!(missing.evaluate().is_some());
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

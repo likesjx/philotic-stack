@@ -19,6 +19,7 @@ pub struct ScanConfig {
 }
 
 /// Aggregate results from a full scan.
+#[derive(serde::Serialize)]
 pub struct ScanResult {
     pub crates: usize,
     pub modules: usize,
@@ -154,7 +155,7 @@ pub fn full_scan(root: &Path, config: &ScanConfig, engine: &mut GraphEngine) -> 
         }
     }
 
-    Ok(ScanResult {
+    let result = ScanResult {
         crates: total_crates,
         modules: total_modules,
         types: total_types,
@@ -165,5 +166,21 @@ pub fn full_scan(root: &Path, config: &ScanConfig, engine: &mut GraphEngine) -> 
         commits,
         branches,
         duration_ms: duration.as_millis() as u64,
-    })
+    };
+
+    // Record scan completion so freshness is observable (surfaced as last_scan in /api/status)
+    let _ = engine.record_mutation(&crate::schema::Mutation {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: Utc::now(),
+        agent: None,
+        session: None,
+        action: "full_scan".to_string(),
+        target_node: Some("system:scan".to_string()),
+        from_value: None,
+        to_value: None,
+        reason: None,
+        details: serde_json::to_value(&result).unwrap_or(serde_json::Value::Null),
+    });
+
+    Ok(result)
 }
