@@ -5940,10 +5940,7 @@ impl AgentRuntime {
                             .await;
                     }
                 };
-                let credential = match payload
-                    .arguments
-                    .get("credential")
-                    .and_then(|v| v.as_str())
+                let credential = match payload.arguments.get("credential").and_then(|v| v.as_str())
                 {
                     Some(s) if !s.trim().is_empty() => s.to_string(),
                     _ => {
@@ -5951,8 +5948,7 @@ impl AgentRuntime {
                             .fail_active_turn(
                                 session_id,
                                 turn_id,
-                                "mcp.set_credential: missing required argument 'credential'"
-                                    .into(),
+                                "mcp.set_credential: missing required argument 'credential'".into(),
                             )
                             .await;
                     }
