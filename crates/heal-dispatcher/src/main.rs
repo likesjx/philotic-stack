@@ -883,6 +883,25 @@ fn rule_classify(text: &str) -> Option<(String, String, String)> {
     if t.contains("api key expired") || t.contains("key expired") {
         return Some(("high".into(), "api_key_expired".into(), "escalate".into()));
     }
+    // External (non-model-provider) API failures — membrane transports and
+    // integrations reporting an upstream HTTP error, e.g.
+    // "Discord API error 405 Method Not Allowed". Provider-marked lines never
+    // reach here (classify_turn_failure claims them above). A 4xx is a
+    // request/config problem on our side; a 5xx is the upstream's outage —
+    // both escalate to a work item (no restart fixes either), 2026-07-20:
+    // Discord replies silently failed for hours with zero heal visibility.
+    if t.contains("api error") {
+        if ansible_mesh_core::heal_queue::has_standalone_status(&t, 400, 499) {
+            return Some(("high".into(), "external_api_4xx".into(), "escalate".into()));
+        }
+        if ansible_mesh_core::heal_queue::has_standalone_status(&t, 500, 599) {
+            return Some((
+                "medium".into(),
+                "external_api_5xx".into(),
+                "escalate".into(),
+            ));
+        }
+    }
     if t.contains("no_provider") || t.contains("no provider registered") {
         return Some((
             "high".into(),
@@ -1408,5 +1427,32 @@ mod tests {
         breaker.record_success();
         assert!(!breaker.is_open(t0), "a success must reset the breaker");
         assert_eq!(breaker.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn rule_classify_external_api_errors() {
+        // Live sample 2026-07-20: membrane-discord failing every agent reply.
+        let (sev, tag, action) = rule_classify(
+            "Failed to handle agent reply: Discord API error 405 Method Not Allowed: {\"message\": \"405: Method Not Allowed\", \"code\": 0}",
+        )
+        .expect("discord 405 must classify");
+        assert_eq!(sev, "high");
+        assert_eq!(tag, "external_api_4xx");
+        assert_eq!(action, "escalate");
+
+        let (sev, tag, action) =
+            rule_classify("Telegram API error 502 Bad Gateway while sending message")
+                .expect("external 5xx must classify");
+        assert_eq!(sev, "medium");
+        assert_eq!(tag, "external_api_5xx");
+        assert_eq!(action, "escalate");
+
+        // An "API error" line carrying 401 prefers the auth_failure rule
+        // (more actionable), and a plain line without a standalone status
+        // stays unmatched by the external-api rules.
+        let (_, tag, _) =
+            rule_classify("Discord API error 401 Unauthorized").expect("401 must classify");
+        assert_eq!(tag, "auth_failure");
+        assert!(rule_classify("api error rate averaged 0.405 today").is_none());
     }
 }

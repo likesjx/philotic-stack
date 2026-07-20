@@ -42,14 +42,25 @@ fn ipc_socket() -> String {
 }
 
 fn db_path() -> PathBuf {
-    std::env::var("PHILOTIC_AGENT_GRAPH_DB")
+    let path = std::env::var("PHILOTIC_AGENT_GRAPH_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(home)
                 .join(".philotic")
                 .join(format!("agent-graph-{}.db", agent_id()))
-        })
+        });
+    // SQLite cannot create intermediate directories; on hosts where
+    // `$HOME/.philotic/` does not pre-exist (e.g. the vps `philotic` service
+    // user) a missing parent crashlooped this runner until its respawn budget
+    // exhausted (2026-07-12..20, count 255 on agent-beacon). Best-effort:
+    // startup still fails loudly if creation is truly impossible.
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(dir = %parent.display(), "could not create agent-graph db dir: {e}");
+        }
+    }
+    path
 }
 
 const AGENT_GRAPH_TOOLS: &[&str] = &[
