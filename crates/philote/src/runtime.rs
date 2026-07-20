@@ -11048,9 +11048,18 @@ mod tests {
             "user must see the fallback answer, not an error: {:#?}",
             replies[0]
         );
-        assert!(
-            emitted.iter().all(|e| e["heal_event"].is_null()),
-            "a successful mid-turn switch must not push heal events: {:#?}",
+        // A successful switch still means a tier is DOWN: it must file exactly
+        // one provider_fallback heal event (2026-07-20: a schema 400 silenced
+        // the gemini tier for hours with zero heal rows because the ladder
+        // kept answering) — and nothing stronger (no fallback_exhausted).
+        let heal_tags: Vec<&str> = emitted
+            .iter()
+            .filter_map(|e| e["heal_event"]["pattern_tag"].as_str())
+            .collect();
+        assert_eq!(
+            heal_tags,
+            vec!["provider_fallback:gemini"],
+            "mid-ladder degradation must file provider_fallback and nothing else: {:#?}",
             *emitted
         );
     }
@@ -11168,8 +11177,14 @@ mod tests {
             "the single configured ladder tier must be tried on failure: {:#?}",
             *emitted
         );
+        // One tier failure files a provider_fallback (degradation visibility)
+        // but must NOT claim exhaustion — the single configured tier is still
+        // being tried.
         assert!(
-            emitted.iter().all(|e| e["heal_event"].is_null()),
+            emitted
+                .iter()
+                .filter_map(|e| e["heal_event"]["pattern_tag"].as_str())
+                .all(|tag| !tag.starts_with("fallback_exhausted")),
             "the ladder must not be exhausted after only one failure: {:#?}",
             *emitted
         );

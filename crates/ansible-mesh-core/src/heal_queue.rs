@@ -395,13 +395,24 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         // specific task, so surface a work item for the operator/agents.
         | "delivery_write_unconfirmed"
         | "delivery_channel_closed"
-        | "emit_task_unknown_target_node" => "escalate",
+        | "emit_task_unknown_target_node"
+        // A tier fallback that SUCCEEDED still means a provider tier is down
+        // (2026-07-20: gemini schema 400s were invisible because the ladder
+        // kept answering) — no restart fixes a provider; surface a work item.
+        | "provider_fallback"
+        // A seat that stood down (token missing, or lease held and the seat's
+        // self-heal re-probe hasn't recovered it) is an availability gap the
+        // operator should see; restarting the guest just re-runs the same
+        // stand-down. The lease_held case usually self-heals in ≤3 min.
+        | "seat_stood_down" => "escalate",
         // An alive-but-wedged guest (open socket, undrained outbound backlog)
         // IS fixed by a restart: respawn → resubscribe → drain resumes. The
         // hotel's shared respawn budget rate-limits this, so a flapping guest
         // cannot restart-loop (the 2026-07-19 Beacon dead-delivery closer).
         "subscriber_wedged" => "restart_guest",
         "provider_timeout" => "noop",
+        // Pure visibility record: the seat already fixed itself.
+        "seat_lease_self_healed" => "noop",
         _ => "noop",
     }
 }

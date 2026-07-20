@@ -2514,6 +2514,23 @@ impl AgentRuntime {
                     Some(format!("{switch_from} -> {switch_to} ({switch_reason})")),
                 )
                 .await;
+            // Heal intake for mid-ladder degradation: a SUCCESSFUL fallback
+            // hides tier loss entirely — the task never fails, so FailTask
+            // classification never runs and zero heal rows are filed while an
+            // origin tier is down (2026-07-20: a schema-induced Gemini 400
+            // silenced Aria's origin tier for hours, invisible to the heal
+            // lane because the fallback ladder kept answering). Recurrence in
+            // the dispatcher turns a persistent burst into an A3 work item;
+            // the hotel's per-(guest, tag) 60s flood window absorbs sticky
+            // sessions walking tiers repeatedly.
+            self.push_heal_event(
+                &format!("provider_fallback:{switch_from}"),
+                &format!(
+                    "Model tier fallback {switch_from} -> {switch_to} ({switch_reason}) \
+                     for session {session_id}: origin tier degraded but the ladder answered."
+                ),
+            )
+            .await;
         }
 
         // Slice 3: one-time operational notice so the operator learns their

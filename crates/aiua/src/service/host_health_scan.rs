@@ -83,6 +83,12 @@ pub struct HostHealthConfig {
     pub cpu_limit_pct: f32,
     pub mem_used_limit_pct: f32,
     pub disk_used_limit_pct: f32,
+    /// Absolute free-space floor (GiB). A disk breach requires BOTH used% over
+    /// `disk_used_limit_pct` AND available below this floor: on APFS,
+    /// `df` available excludes purgeable space (local snapshots, caches), so
+    /// used% alone reads 95% on a disk with tens of GiB reclaimable —
+    /// mbp-jane filed 155 false `host_disk_low critical` rows that way.
+    pub disk_min_avail_gb: f32,
     pub probes: Vec<ServiceProbe>,
 }
 
@@ -95,6 +101,7 @@ impl Default for HostHealthConfig {
             cpu_limit_pct: 90.0,
             mem_used_limit_pct: 92.0,
             disk_used_limit_pct: 90.0,
+            disk_min_avail_gb: 15.0,
             probes: Vec::new(),
         }
     }
@@ -108,6 +115,7 @@ pub struct HostVitals {
     pub cpu_used_pct: Option<f32>,
     pub mem_used_pct: Option<f32>,
     pub disk_used_pct: Option<f32>,
+    pub disk_avail_gb: Option<f32>,
 }
 
 /// Cumulative CPU jiffies from `/proc/stat`, kept across scans for the delta.
@@ -127,9 +135,11 @@ pub struct Breach {
 
 // ── parsers (pure, unit-tested) ──────────────────────────────────────────────
 
-/// Used % from `df -k <path>` output (used / (used + available); ignores the
-/// rounded `Capacity`/`Use%` column so macOS and Linux parse identically).
-pub fn parse_df_used_pct(stdout: &str) -> Option<f32> {
+/// Used % and available GiB from `df -k <path>` output (used / (used +
+/// available); ignores the rounded `Capacity`/`Use%` column so macOS and
+/// Linux parse identically). Available GiB feeds the absolute free-space
+/// floor — see [`HostHealthConfig::disk_min_avail_gb`].
+pub fn parse_df_disk(stdout: &str) -> Option<(f32, f32)> {
     let line = stdout.lines().nth(1)?;
     let cols: Vec<&str> = line.split_whitespace().collect();
     let used: u64 = cols.get(2)?.parse().ok()?;
@@ -138,7 +148,9 @@ pub fn parse_df_used_pct(stdout: &str) -> Option<f32> {
     if total == 0 {
         return None;
     }
-    Some(used as f32 / total as f32 * 100.0)
+    let used_pct = used as f32 / total as f32 * 100.0;
+    let avail_gb = avail as f32 / (1024.0 * 1024.0);
+    Some((used_pct, avail_gb))
 }
 
 /// Used % from `/proc/meminfo` via `MemAvailable` (the kernel's own
@@ -161,8 +173,12 @@ pub fn parse_meminfo_used_pct(content: &str) -> Option<f32> {
     Some((total - avail.min(total)) as f32 / total as f32 * 100.0)
 }
 
-/// Used % from macOS `vm_stat` (100 − free; free = "Pages free" +
-/// "Pages speculative", same accounting as the mesh heartbeat sampler).
+/// Used % from macOS `vm_stat`. "Free" must count everything the kernel can
+/// reclaim on demand — free, speculative, inactive, and purgeable pages —
+/// or a healthy Mac reads ~100% used forever (macOS deliberately keeps RAM
+/// full of reclaimable cache). The old free+speculative-only accounting
+/// filed `host_mem_pressure critical` on every scan cycle of every Mac
+/// (155 false rows on mbp-jane by 2026-07-20), burying real heal signals.
 pub fn parse_vm_stat_used_pct(stdout: &str) -> Option<f32> {
     let mut free_pages: u64 = 0;
     let mut total_pages: u64 = 0;
@@ -173,7 +189,11 @@ pub fn parse_vm_stat_used_pct(stdout: &str) -> Option<f32> {
         }
         let val: u64 = parts[1].trim().trim_end_matches('.').parse().unwrap_or(0);
         total_pages += val;
-        if parts[0].contains("Pages free") || parts[0].contains("Pages speculative") {
+        if parts[0].contains("Pages free")
+            || parts[0].contains("Pages speculative")
+            || parts[0].contains("Pages inactive")
+            || parts[0].contains("Pages purgeable")
+        {
             free_pages += val;
         }
     }
@@ -254,13 +274,23 @@ pub fn grade_vitals(cfg: &HostHealthConfig, v: &HostVitals) -> Vec<Breach> {
         }
     }
     if let Some(disk) = v.disk_used_pct {
-        if disk > cfg.disk_used_limit_pct {
+        // Both gates must trip: used% over the limit AND absolute free space
+        // under the floor. APFS `df` available excludes purgeable space, so
+        // used% alone cries wolf on healthy Macs (see disk_min_avail_gb doc).
+        // A missing avail sample falls back to the old %-only behavior.
+        let below_floor = v
+            .disk_avail_gb
+            .map_or(true, |gb| gb < cfg.disk_min_avail_gb);
+        if disk > cfg.disk_used_limit_pct && below_floor {
             out.push(Breach {
                 pattern_tag: "host_disk_low".into(),
                 severity: if disk >= 95.0 { "critical" } else { "high" },
                 detail: format!(
-                    "disk_used={disk:.0}% > limit {:.0}%",
-                    cfg.disk_used_limit_pct
+                    "disk_used={disk:.0}% > limit {:.0}% and avail={}GB < floor {:.0}GB",
+                    cfg.disk_used_limit_pct,
+                    v.disk_avail_gb
+                        .map_or_else(|| "?".into(), |gb| format!("{gb:.0}")),
+                    cfg.disk_min_avail_gb
                 ),
             });
         }
@@ -304,14 +334,16 @@ fn sample_vitals(data_dir: &Path, prev_cpu: &mut Option<CpuTotals>) -> HostVital
         }
     })();
 
-    let disk_used_pct = (|| -> Option<f32> {
+    let disk = (|| -> Option<(f32, f32)> {
         let out = std::process::Command::new("df")
             .arg("-k")
             .arg(data_dir)
             .output()
             .ok()?;
-        parse_df_used_pct(&String::from_utf8_lossy(&out.stdout))
+        parse_df_disk(&String::from_utf8_lossy(&out.stdout))
     })();
+    let disk_used_pct = disk.map(|(pct, _)| pct);
+    let disk_avail_gb = disk.map(|(_, gb)| gb);
 
     let mem_used_pct = (|| -> Option<f32> {
         #[cfg(target_os = "macos")]
@@ -349,6 +381,7 @@ fn sample_vitals(data_dir: &Path, prev_cpu: &mut Option<CpuTotals>) -> HostVital
         cpu_used_pct,
         mem_used_pct,
         disk_used_pct,
+        disk_avail_gb,
     }
 }
 
@@ -503,18 +536,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn df_used_pct_parses_both_platforms() {
+    fn df_disk_parses_both_platforms() {
         let linux = "Filesystem     1K-blocks     Used Available Use% Mounted on\n\
                      /dev/sda1      102400000 61440000  40960000  60% /\n";
-        let pct = parse_df_used_pct(linux).unwrap();
+        let (pct, avail_gb) = parse_df_disk(linux).unwrap();
         assert!((pct - 60.0).abs() < 0.5, "{pct}");
+        assert!((avail_gb - 39.0).abs() < 0.5, "{avail_gb}");
 
         let macos = "Filesystem   1024-blocks      Used Available Capacity iused ifree %iused  Mounted on\n\
                      /dev/disk3s5   482797652 300000000 182797652    63%  1000  100    1%   /System/Volumes/Data\n";
-        let pct = parse_df_used_pct(macos).unwrap();
+        let (pct, avail_gb) = parse_df_disk(macos).unwrap();
         assert!((pct - 62.1).abs() < 1.0, "{pct}");
+        assert!((avail_gb - 174.3).abs() < 1.0, "{avail_gb}");
 
-        assert!(parse_df_used_pct("garbage").is_none());
+        assert!(parse_df_disk("garbage").is_none());
     }
 
     #[test]
@@ -547,8 +582,10 @@ mod tests {
                    Pages inactive:                100000.\n\
                    Pages speculative:             100000.\n";
         let pct = parse_vm_stat_used_pct(out).unwrap();
-        // free = 200000 of 500000 → used 60%
-        assert!((pct - 60.0).abs() < 0.1, "{pct}");
+        // free = free + speculative + inactive = 300000 of 500000 → used 40%
+        // (inactive pages are reclaimable — see vm_stat_counts_reclaimable_
+        // pages_as_free for why they must count as free).
+        assert!((pct - 40.0).abs() < 0.1, "{pct}");
     }
 
     #[test]
@@ -559,6 +596,7 @@ mod tests {
             cpu_used_pct: Some(50.0),
             mem_used_pct: Some(80.0),
             disk_used_pct: Some(63.0),
+            disk_avail_gb: Some(200.0),
         };
         assert!(grade_vitals(&cfg, &ok).is_empty());
 
@@ -569,7 +607,8 @@ mod tests {
             load_1m: Some(6.5),        // ≥ 4.0*1.5 → critical
             cpu_used_pct: Some(92.0),  // high
             mem_used_pct: Some(98.0),  // ≥97 → critical
-            disk_used_pct: Some(91.0), // high
+            disk_used_pct: Some(91.0), // high (avail below floor too)
+            disk_avail_gb: Some(8.0),
         };
         let breaches = grade_vitals(&cfg, &bad);
         let by_tag: std::collections::HashMap<_, _> = breaches
@@ -580,6 +619,50 @@ mod tests {
         assert_eq!(by_tag["host_cpu_high"], "high");
         assert_eq!(by_tag["host_mem_pressure"], "critical");
         assert_eq!(by_tag["host_disk_low"], "high");
+    }
+
+    #[test]
+    fn apfs_purgeable_space_does_not_cry_disk_low() {
+        // mbp-jane 2026-07-20: APFS `df` reported 95% used with 45 GiB
+        // genuinely available (purgeable snapshots inflate used%). 155 false
+        // `host_disk_low critical` rows buried real heal signals. Used% over
+        // the limit must NOT breach while absolute free space is above the
+        // floor.
+        let cfg = HostHealthConfig::default();
+        let apfs = HostVitals {
+            disk_used_pct: Some(95.0),
+            disk_avail_gb: Some(45.0),
+            ..Default::default()
+        };
+        assert!(grade_vitals(&cfg, &apfs).is_empty());
+
+        // A genuinely full disk (over limit AND under floor) still breaches.
+        let full = HostVitals {
+            disk_used_pct: Some(96.0),
+            disk_avail_gb: Some(9.0),
+            ..Default::default()
+        };
+        let breaches = grade_vitals(&cfg, &full);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].pattern_tag, "host_disk_low");
+        assert_eq!(breaches[0].severity, "critical");
+    }
+
+    #[test]
+    fn vm_stat_counts_reclaimable_pages_as_free() {
+        // macOS keeps RAM full of reclaimable cache: inactive + purgeable
+        // pages must count as free or a healthy Mac reads ~100% used and
+        // files `host_mem_pressure critical` on every scan cycle.
+        let stdout = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                      Pages free:                   10000.\n\
+                      Pages active:                 40000.\n\
+                      Pages inactive:               30000.\n\
+                      Pages speculative:             5000.\n\
+                      Pages wired down:             10000.\n\
+                      Pages purgeable:               5000.\n";
+        let pct = parse_vm_stat_used_pct(stdout).unwrap();
+        // free = 10000 + 5000 + 30000 + 5000 = 50000 of 100000 → 50% used.
+        assert!((pct - 50.0).abs() < 0.5, "{pct}");
     }
 
     #[test]
