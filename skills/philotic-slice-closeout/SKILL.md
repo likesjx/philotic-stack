@@ -51,7 +51,15 @@ Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the main job is findi
    - next seams
    - operator preferences
 10. Commit and push one coherent slice per the commit convention in `AGENTS.md §6`.
-11. State the next seam.
+11. If a measured harness trial is open for this slice (see
+    [$sver-harness](../sver-harness/SKILL.md)), close it now with an honest
+    status and verification level:
+    `just harness-trial-close completed <verification-level> "<summary>"`.
+    If no trial was started, note that telemetry was skipped — for seam-scoped
+    implementation slices, prefer starting one next time
+    (`just harness-trial-start <seam-id>`); the trial ledger is the only
+    per-slice record of tokens, elapsed time, and lines changed per harness.
+12. State the next seam.
 
 ## Output Expectations
 

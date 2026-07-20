@@ -34,6 +34,12 @@ This is the standard flow for an agent picking up and completing work:
 
 Use `graph_agent_dashboard` at any time to see who else is working and on what.
 
+**Telemetry**: for seam-scoped implementation slices, prefer a measured harness
+trial over a bare `session_start` — `just harness-trial-start <seam-id>` claims
+the work AND records per-slice tokens/elapsed/lines telemetry; close it at
+slice end with `just harness-trial-close completed <verification-level>`.
+Mechanics live in the `sver-harness` skill.
+
 ## Available Tools (MCP)
 
 If the graph server is running (`just intel-graph-start`), these MCP tools are available at `http://127.0.0.1:8901/mcp`:

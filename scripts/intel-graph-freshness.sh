@@ -33,7 +33,7 @@ fi
 
 # Verify all managed harnesses; tolerate individual failures so one broken
 # harness doesn't hide drift state for the rest.
-phil graph harness list 2>/dev/null | awk 'NR>2 {print $1}' | while read -r harness; do
+phil graph harness list 2>/dev/null | awk 'NR>2 {print $1}' | sed 's/^harness://' | while read -r harness; do
     [ -n "$harness" ] || continue
     phil graph harness verify "$harness" || true
 done
