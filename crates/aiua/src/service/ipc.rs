@@ -10999,10 +10999,13 @@ impl IpcServer {
 
         // ── 4. Vault entries (re-encrypt with local vault key) ───────────────
         for ve in &bundle.vault_entries {
+            // Keep the source vault_name as the kind — a migrated
+            // `gemini_api_key` re-stored as generic `vault-token` loses its
+            // identity in the secret_ref (same defect as AddVaultEntry).
             let new_secret_ref = store_secret(
                 graph,
                 SecretInput {
-                    secret_kind: "vault-token".to_string(),
+                    secret_kind: ve.vault_name.clone(),
                     scope: "hotel".to_string(),
                     allowed_roles: ve.allowed_roles.clone(),
                     allowed_guests: Vec::new(),
@@ -11238,11 +11241,15 @@ impl IpcServer {
         plaintext: String,
         allowed_roles: Vec<String>,
     ) -> anyhow::Result<String> {
-        // Store the encrypted secret.
+        // Store the encrypted secret. The kind must be the caller's vault_name
+        // (e.g. `gemini_api_key`), not a generic label: the kind is embedded in
+        // the secret_ref, and a `phil keys configure` entry stored as
+        // `vault-token` is indistinguishable from an MCP token grant when
+        // debugging ACL failures (2026-07-20 vps-jane provider-key incident).
         let secret_ref = store_secret(
             graph,
             SecretInput {
-                secret_kind: "vault-token".to_string(),
+                secret_kind: vault_name.clone(),
                 scope: "hotel".to_string(),
                 allowed_roles,
                 allowed_guests: Vec::new(),
@@ -19382,6 +19389,41 @@ pub(crate) mod tests {
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[test]
+    fn add_vault_entry_stores_secret_under_the_vault_name_kind() {
+        let _env_guard = ipc_env_guard();
+        let vault_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        unsafe {
+            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", &vault_key);
+        }
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        let secret_ref = IpcServer::handle_add_vault_entry(
+            &graph,
+            "gemini_api_key".into(),
+            "sk-live-key".into(),
+            vec!["model".into(), "model.gemini".into()],
+        )
+        .expect("add vault entry");
+
+        assert!(
+            secret_ref.contains("/gemini_api_key/"),
+            "secret_ref must embed the vault_name as its kind, got {secret_ref}"
+        );
+        let record = graph
+            .get_secret(&secret_ref)
+            .expect("get secret")
+            .expect("secret stored");
+        assert_eq!(record.secret_kind, "gemini_api_key");
+        assert_eq!(record.allowed_roles, vec!["model", "model.gemini"]);
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
         }
     }
 
