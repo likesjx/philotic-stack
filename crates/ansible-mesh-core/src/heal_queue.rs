@@ -388,7 +388,19 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         | "host_cpu_high"
         | "host_mem_pressure"
         | "host_disk_low"
-        | "service_probe_failed" => "escalate",
+        | "service_probe_failed"
+        // Delivery-layer anomalies (2026-07-19 hardening): a task that hit a
+        // closed channel, never flushed to the guest socket, or targeted a
+        // node unknown to the mesh is LOST — no restart recovers that
+        // specific task, so surface a work item for the operator/agents.
+        | "delivery_write_unconfirmed"
+        | "delivery_channel_closed"
+        | "emit_task_unknown_target_node" => "escalate",
+        // An alive-but-wedged guest (open socket, undrained outbound backlog)
+        // IS fixed by a restart: respawn → resubscribe → drain resumes. The
+        // hotel's shared respawn budget rate-limits this, so a flapping guest
+        // cannot restart-loop (the 2026-07-19 Beacon dead-delivery closer).
+        "subscriber_wedged" => "restart_guest",
         "provider_timeout" => "noop",
         _ => "noop",
     }
@@ -954,6 +966,29 @@ mod tests {
         assert_ne!(
             heal_action_for_pattern_tag("content_blocked:gemini"),
             "restart_guest"
+        );
+    }
+
+    /// Delivery-hardening patterns (2026-07-19): a wedged subscriber restarts
+    /// (respawn-budget-guarded); lost-task anomalies escalate to work items —
+    /// no restart recovers an already-lost task.
+    #[test]
+    fn heal_actions_for_delivery_hardening_patterns() {
+        assert_eq!(
+            heal_action_for_pattern_tag("subscriber_wedged"),
+            "restart_guest"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("delivery_write_unconfirmed"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("delivery_channel_closed"),
+            "escalate"
+        );
+        assert_eq!(
+            heal_action_for_pattern_tag("emit_task_unknown_target_node"),
+            "escalate"
         );
     }
 
