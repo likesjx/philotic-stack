@@ -107,6 +107,16 @@ const DELIVERY_WRITE_CONFIRM_POLL_MS: u64 = 250;
 #[cfg(test)]
 const DELIVERY_WRITE_CONFIRM_POLL_MS: u64 = 50;
 
+/// After the confirmation window expires the watcher keeps observing (at a
+/// slower cadence) for the one outcome that makes redelivery PROVABLY safe:
+/// the connection closing while the frame is still undrained. Frames drain
+/// FIFO, so closed + undrained ⇒ the guest never received this task ⇒
+/// re-parking cannot duplicate. Capped so watchers never outlive an episode.
+#[cfg(not(test))]
+const DELIVERY_LOST_WATCH_CAP_SECS: u64 = 600;
+#[cfg(test)]
+const DELIVERY_LOST_WATCH_CAP_SECS: u64 = 3;
+
 /// Outbound IPC sender with frame accounting.
 ///
 /// `enqueued` counts frames accepted into the (unbounded) channel; `drained`
@@ -127,12 +137,19 @@ pub(crate) struct CountedSender {
     /// Heal sink for delivery anomalies; `None` for detached senders
     /// (internal consumers, tests).
     heal: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+    /// Re-park registry for provably-lost frames (claim-until-confirmed):
+    /// when this connection dies with a delivered InboundTask still
+    /// undrained, the task is parked under the subscriber's guest id so the
+    /// guest's next registration (e.g. after a `subscriber_wedged` auto
+    /// restart) flushes it. `None` disables redelivery (detached senders).
+    repark: Option<ParkedInboundRegistry>,
 }
 
 impl CountedSender {
     pub(crate) fn new(
         tx: mpsc::UnboundedSender<IpcResponse>,
         heal: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+        repark: Option<ParkedInboundRegistry>,
     ) -> Self {
         Self {
             tx,
@@ -140,13 +157,18 @@ impl CountedSender {
             drained: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             backlog_flagged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             heal,
+            repark,
         }
     }
 
     /// Sender with fresh counters and no heal sink — for callers that manage
     /// their own receive loop (cron ticker, role materialization, tests).
     pub(crate) fn detached(tx: &mpsc::UnboundedSender<IpcResponse>) -> Self {
-        Self::new(tx.clone(), None)
+        Self::new(tx.clone(), None, None)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
     }
 
     pub(crate) fn send(
@@ -2908,7 +2930,11 @@ impl IpcServer {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
         let (raw_outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<IpcResponse>();
-        let outbound_tx = CountedSender::new(raw_outbound_tx, heal_queue.clone());
+        let outbound_tx = CountedSender::new(
+            raw_outbound_tx,
+            heal_queue.clone(),
+            Some(parked_inbound.clone()),
+        );
         let drained_frames = outbound_tx.drained_handle();
         let write_task = tokio::spawn(async move {
             while let Some(response) = outbound_rx.recv().await {
@@ -3376,6 +3402,49 @@ impl IpcServer {
         }
     }
 
+    /// Park a provably-lost InboundTask under its target guest id so the
+    /// guest's next registration flushes it (the same parked-inbound path
+    /// used for not-yet-materialized guests). Only called when the frame
+    /// demonstrably never reached the guest — closed channel before send, or
+    /// connection closed with the frame still undrained. Returns whether the
+    /// task was actually requeued.
+    async fn repark_lost_task(
+        repark: Option<&ParkedInboundRegistry>,
+        guest_id: &str,
+        source_node: &str,
+        task_id: Uuid,
+        response: &IpcResponse,
+    ) -> bool {
+        let Some(registry) = repark else {
+            return false;
+        };
+        if guest_id.is_empty() {
+            return false;
+        }
+        let IpcResponse::InboundTask { task_json, .. } = response else {
+            return false;
+        };
+        let mut guard = registry.lock().await;
+        let entry = guard.entry(guest_id.to_string()).or_default();
+        // At-most-once requeue per task id — the immediate-failure path and
+        // the lost-watcher can both fire for one task.
+        if entry.iter().any(|parked| parked.task_id == task_id) {
+            return false;
+        }
+        entry.push(ParkedInboundTask {
+            source_node: source_node.to_string(),
+            task_id,
+            task_json: task_json.clone(),
+            activate_session_id: None,
+        });
+        info!(
+            %task_id,
+            guest_id,
+            "re-parked provably-lost inbound task; will flush on the guest's next registration"
+        );
+        true
+    }
+
     pub(crate) async fn deliver_inbound_task(
         inboxes: &InboxRegistry,
         source_node: &str,
@@ -3478,9 +3547,19 @@ impl IpcServer {
                     "Failed to deliver inbound task {} to local subscriber role='{}' guest='{}'. Removing stale inbox subscription.",
                     task_id, target_role, subscriber.guest_id
                 );
+                // Channel already closed ⇒ provably undelivered ⇒ re-park
+                // under the guest id so its next registration flushes it.
+                let requeued = Self::repark_lost_task(
+                    subscriber.tx.repark.as_ref(),
+                    &subscriber.guest_id,
+                    source_node,
+                    task_id,
+                    &response,
+                )
+                .await;
                 if let Some(hq) = subscriber.tx.heal.as_deref() {
                     let message = format!(
-                        "[delivery_channel_closed] inbound task {task_id} for role [{target_role}] guest [{}] hit a closed outbound channel — the task was NOT received by this guest",
+                        "[delivery_channel_closed] inbound task {task_id} for role [{target_role}] guest [{}] hit a closed outbound channel — the task was NOT received by this guest (requeued={requeued})",
                         subscriber.guest_id
                     );
                     if let Err(err) = hq.push_classified(
@@ -3506,6 +3585,8 @@ impl IpcServer {
             let sender = subscriber.tx.clone();
             let guest_id = subscriber.guest_id.clone();
             let role = target_role.to_string();
+            let watched_response = response.clone();
+            let watched_source_node = source_node.to_string();
             tokio::spawn(async move {
                 let deadline = tokio::time::Instant::now()
                     + tokio::time::Duration::from_secs(DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS);
@@ -3546,6 +3627,48 @@ impl IpcServer {
                     ) {
                         warn!(error = %err, "Failed to push delivery-unconfirmed heal entry");
                     }
+                }
+                // Claim-until-confirmed tail: keep watching (slow cadence)
+                // for the one provably-safe redelivery trigger — the
+                // connection closing while this frame is still undrained.
+                // Frames drain FIFO, so closed + undrained ⇒ the guest never
+                // received the task ⇒ re-parking cannot duplicate. A late
+                // flush (wedge cleared) ends the watch with no action.
+                let lost_cap = tokio::time::Instant::now()
+                    + tokio::time::Duration::from_secs(DELIVERY_LOST_WATCH_CAP_SECS);
+                loop {
+                    if sender.drained_now() >= confirm_target {
+                        info!(
+                            %task_id,
+                            guest_id = guest_id.as_str(),
+                            "previously-unconfirmed inbound task flushed late — no redelivery needed"
+                        );
+                        return;
+                    }
+                    if sender.is_closed() {
+                        let requeued = Self::repark_lost_task(
+                            sender.repark.as_ref(),
+                            &guest_id,
+                            &watched_source_node,
+                            task_id,
+                            &watched_response,
+                        )
+                        .await;
+                        warn!(
+                            %task_id,
+                            guest_id = guest_id.as_str(),
+                            requeued,
+                            "guest connection closed with inbound task still undrained — provably lost"
+                        );
+                        return;
+                    }
+                    if tokio::time::Instant::now() >= lost_cap {
+                        return;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        DELIVERY_WRITE_CONFIRM_POLL_MS.max(250),
+                    ))
+                    .await;
                 }
             });
         }
@@ -27701,9 +27824,26 @@ pub(crate) mod tests {
             mpsc::UnboundedReceiver<IpcResponse>,
             Arc<std::sync::atomic::AtomicU64>,
         ) {
+            let repark: ParkedInboundRegistry = Arc::new(Mutex::new(HashMap::new()));
+            subscribe_recorded_with_park(inboxes, role, guest_id, recorder, &repark).await
+        }
+
+        async fn subscribe_recorded_with_park(
+            inboxes: &InboxRegistry,
+            role: &str,
+            guest_id: &str,
+            recorder: &Arc<DeliveryRecorder>,
+            repark: &ParkedInboundRegistry,
+        ) -> (
+            mpsc::UnboundedReceiver<IpcResponse>,
+            Arc<std::sync::atomic::AtomicU64>,
+        ) {
             let (tx, rx) = mpsc::unbounded_channel::<IpcResponse>();
-            let sender =
-                CountedSender::new(tx, Some(Arc::clone(recorder) as Arc<dyn HealQueueStorage>));
+            let sender = CountedSender::new(
+                tx,
+                Some(Arc::clone(recorder) as Arc<dyn HealQueueStorage>),
+                Some(Arc::clone(repark)),
+            );
             let drained = sender.drained_handle();
             let mut subscribed_roles = Vec::new();
             IpcServer::add_subscription(
@@ -27722,7 +27862,7 @@ pub(crate) mod tests {
         #[test]
         fn counted_sender_backlog_is_enqueued_minus_drained() {
             let (tx, mut rx) = mpsc::unbounded_channel::<IpcResponse>();
-            let sender = CountedSender::new(tx, None);
+            let sender = CountedSender::new(tx, None, None);
             assert_eq!(sender.backlog(), 0);
             for _ in 0..3 {
                 sender
@@ -27820,6 +27960,124 @@ pub(crate) mod tests {
                 confirmed_recorder.entries_with_pattern("delivery_write_unconfirmed"),
                 0,
                 "drained frame must not file an unconfirmed heal entry"
+            );
+        }
+
+        #[tokio::test]
+        async fn closed_channel_delivery_reparks_task_under_guest_id() {
+            // Claim-until-confirmed, immediate branch: a send into an
+            // already-closed channel is provably undelivered — the task must
+            // land in parked_inbound keyed by the guest, ready for the next
+            // registration flush.
+            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let repark: ParkedInboundRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let recorder = Arc::new(DeliveryRecorder::default());
+            let (rx, _drained) =
+                subscribe_recorded_with_park(&inboxes, "agent", "agent-beacon", &recorder, &repark)
+                    .await;
+            drop(rx);
+
+            let task_id = Uuid::new_v4();
+            IpcServer::deliver_inbound_task(
+                &inboxes,
+                "test-node",
+                "agent",
+                None,
+                task_id,
+                "{\"content\":\"hello beacon\"}".into(),
+            )
+            .await;
+
+            let guard = repark.lock().await;
+            let parked = guard
+                .get("agent-beacon")
+                .expect("task parked under guest id");
+            assert_eq!(parked.len(), 1);
+            assert_eq!(parked[0].task_id, task_id);
+            assert_eq!(parked[0].source_node, "test-node");
+        }
+
+        #[tokio::test]
+        async fn connection_death_with_undrained_frame_reparks_task() {
+            // Claim-until-confirmed, watcher branch: delivery succeeded into
+            // the channel, the guest never drained it, then the connection
+            // died (e.g. subscriber_wedged auto-restart) — the watcher must
+            // detect closed+undrained and re-park exactly once.
+            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let repark: ParkedInboundRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let recorder = Arc::new(DeliveryRecorder::default());
+            let (rx, _drained) = subscribe_recorded_with_park(
+                &inboxes,
+                "life-graph-runner",
+                "wedged-runner",
+                &recorder,
+                &repark,
+            )
+            .await;
+
+            let task_id = Uuid::new_v4();
+            IpcServer::deliver_inbound_task(
+                &inboxes,
+                "test-node",
+                "life-graph-runner",
+                None,
+                task_id,
+                "{}".into(),
+            )
+            .await;
+
+            // Let the confirm window lapse (1s in tests), then kill the
+            // connection with the frame still undrained.
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS * 1000 + 300,
+            ))
+            .await;
+            drop(rx);
+            // Lost-watch poll cadence is 250ms in tests; give it two cycles.
+            tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
+
+            let guard = repark.lock().await;
+            let parked = guard.get("wedged-runner").expect("lost task re-parked");
+            assert_eq!(parked.len(), 1);
+            assert_eq!(parked[0].task_id, task_id);
+        }
+
+        #[tokio::test]
+        async fn late_flush_never_reparks() {
+            // A frame that drains AFTER the confirm window (wedge cleared)
+            // must end the watch with no redelivery — re-parking a received
+            // task would duplicate it.
+            let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let repark: ParkedInboundRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let recorder = Arc::new(DeliveryRecorder::default());
+            let (mut rx, drained) =
+                subscribe_recorded_with_park(&inboxes, "agent", "slow-guest", &recorder, &repark)
+                    .await;
+
+            IpcServer::deliver_inbound_task(
+                &inboxes,
+                "test-node",
+                "agent",
+                None,
+                Uuid::new_v4(),
+                "{}".into(),
+            )
+            .await;
+
+            // Past the confirm window, THEN drain (late flush), THEN close.
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                DELIVERY_WRITE_CONFIRM_TIMEOUT_SECS * 1000 + 300,
+            ))
+            .await;
+            let _ = rx.recv().await;
+            drained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+            drop(rx);
+            tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
+
+            assert!(
+                repark.lock().await.get("slow-guest").is_none(),
+                "late-flushed task must never be re-parked"
             );
         }
 
