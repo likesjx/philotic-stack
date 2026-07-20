@@ -435,9 +435,21 @@ pub struct RankingWeights {
     /// pre-existing five-field wire payloads still deserialize.
     #[serde(default = "default_role_relevance_weight")]
     pub role_relevance: f32,
+    /// Weight of the learned `recall_utility` node property — the
+    /// feedback-informed ranking term (life-graph-semantic-retrieval seam:
+    /// "feedback path"). `recall_utility` lives in [-1, 0]: nodes repeatedly
+    /// flagged noisy/stale by `life.recall.feedback` accumulate a bounded
+    /// EWMA penalty and stop crowding out pertinent context. Kept
+    /// `serde(default)` for pre-existing wire payloads.
+    #[serde(default = "default_recall_utility_weight")]
+    pub recall_utility: f32,
 }
 
 fn default_role_relevance_weight() -> f32 {
+    0.15
+}
+
+fn default_recall_utility_weight() -> f32 {
     0.15
 }
 
@@ -450,6 +462,7 @@ impl Default for RankingWeights {
             confirmation: 0.15,
             active_commitment: 0.1,
             role_relevance: default_role_relevance_weight(),
+            recall_utility: default_recall_utility_weight(),
         }
     }
 }
