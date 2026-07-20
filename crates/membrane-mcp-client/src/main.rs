@@ -14,14 +14,14 @@
 mod upstream;
 
 use ansible_mesh_core::mcp_upstream::{
-    McpUpstreamCatalog, McpUpstreamConfig, parse_projected_tool_name,
+    parse_projected_tool_name, McpUpstreamCatalog, McpUpstreamConfig,
 };
 use anyhow::Result;
 use philotic_client::{
-    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute, TaskErrorPayload,
-    is_ipc_disconnect,
+    is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute,
+    TaskErrorPayload,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -188,7 +188,10 @@ impl Guest {
             .await
         {
             Ok(IpcResponse::McpUpstreamsState { mcp_upstreams }) => {
-                info!(count = mcp_upstreams.len(), "replaying registered upstreams");
+                info!(
+                    count = mcp_upstreams.len(),
+                    "replaying registered upstreams"
+                );
                 for entry in mcp_upstreams {
                     self.sync_upstream(entry.config).await;
                 }
@@ -271,7 +274,9 @@ impl Guest {
         arguments: Value,
     ) -> Result<Value, String> {
         let Some((upstream_id, remote_name)) = parse_projected_tool_name(tool_name) else {
-            return Err(format!("'{tool_name}' is not an mcp:<upstream>.<tool> name"));
+            return Err(format!(
+                "'{tool_name}' is not an mcp:<upstream>.<tool> name"
+            ));
         };
         let (upstream_id, remote_name) = (upstream_id.to_string(), remote_name.to_string());
 
@@ -309,10 +314,7 @@ impl Guest {
             ));
         }
 
-        let client = self
-            .upstreams
-            .get_mut(&upstream_id)
-            .expect("checked above");
+        let client = self.upstreams.get_mut(&upstream_id).expect("checked above");
         client
             .call_tool(&grant, arguments)
             .await
@@ -329,8 +331,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let guest_id =
-        std::env::var("PHILOTIC_GUEST_ID").unwrap_or_else(|_| "mcp-client".to_string());
+    let guest_id = std::env::var("PHILOTIC_GUEST_ID").unwrap_or_else(|_| "mcp-client".to_string());
     info!(guest_id, role = ROLE, "membrane-mcp-client starting");
 
     let identity = GuestIdentity {

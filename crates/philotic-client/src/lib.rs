@@ -304,6 +304,12 @@ pub type DesktopMembraneTargetAgentInventoryView = OperatorTargetAgentInventoryV
 pub type DesktopMembraneTargetComponentInventoryView = OperatorTargetComponentInventoryView;
 
 pub const OPERATOR_SURFACE_QUERY_ROLE: &str = "management.operator_surface_query";
+/// Mesh role for muninn-cluster single-writer routing: shared-vault memory
+/// writes from lobe hotels are forwarded as TaskInvoke envelopes with this
+/// target role to the Cortex hotel, whose aiua applies them to the cluster
+/// PRIMARY in-process (`deliver_event_envelope_or_park` interception — same
+/// pattern as `OPERATOR_SURFACE_QUERY_ROLE`). Never subscribed by any guest.
+pub const MEMORY_WRITE_FORWARD_ROLE: &str = "hotel.memory_write_forward";
 pub const OPERATOR_SURFACE_QUERY_REPLY_ROLE: &str = "management.operator_surface_query.reply";
 pub const OPERATOR_SURFACE_QUERY_HANDOFF_KIND: &str = "operator_surface_query";
 pub const OPERATOR_REMOTE_CONFIG_KEYS: &[&str] =

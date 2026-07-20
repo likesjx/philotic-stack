@@ -35,6 +35,12 @@ pub fn load_muninn_config(graph: &GraphDomain) -> Result<Option<MuninnConfig>> {
 
     let mut config = MuninnConfig::local("default");
     config.base_url = endpoint;
+    // Muninn-cluster single-writer routing: on lobe/observer hotels the
+    // operator sets `muninn_write_route` to the Cortex hotel's node id;
+    // guests then forward fleet-shared-vault writes over the mesh instead of
+    // stranding them on the local replica. Absent everywhere by default and
+    // on the Cortex hotel itself.
+    config.shared_write_route = graph.get_muninn_write_route()?;
 
     // Hotel daemon accesses its own secrets using the "hotel" identity.
     let access = SecretAccess {
@@ -89,6 +95,56 @@ pub fn load_muninn_config(graph: &GraphDomain) -> Result<Option<MuninnConfig>> {
     Ok(Some(config))
 }
 
+/// Apply a mesh-forwarded shared-vault memory write to THIS hotel's muninn —
+/// the Cortex-side of `MuninnConfig::shared_write_route` (single-writer
+/// routing). The payload is the `memory.write_forward` task JSON emitted by
+/// a lobe philote's `forward_shared_memory_write`; the vault name arrives
+/// already resolved by the originating guest, so this writes directly into
+/// that vault (`remember_in_vault`) rather than re-resolving against a local
+/// identity. Idempotent per `{vault}:{concept}` — a redelivered mesh
+/// envelope reinforces instead of duplicating.
+pub async fn apply_forwarded_write(graph: &GraphDomain, task_json: &str) -> Result<String> {
+    let payload: serde_json::Value = serde_json::from_str(task_json)?;
+    let op = payload.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    if op != "remember" {
+        anyhow::bail!("memory.write_forward: unsupported op {op:?}");
+    }
+    let vault = payload
+        .get("vault")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("memory.write_forward: missing vault"))?;
+    let concept = payload
+        .get("concept")
+        .and_then(|v| v.as_str())
+        .unwrap_or("untitled");
+    let content = payload
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tags: Vec<String> = payload
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let metadata = payload
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let config = load_muninn_config(graph)?
+        .ok_or_else(|| anyhow::anyhow!("memory.write_forward: MuninnDB not configured here"))?;
+    let engine = engine_for_agent(config, "hotel", "hotel");
+    let engram = engine
+        .remember_in_vault(vault, concept, content, tags, metadata)
+        .await?;
+    Ok(engram.id)
+}
+
 /// Create a `MuninnRestEngine` scoped to a specific agent+user identity.
 ///
 /// Called at agent session start (Slice E). The `config` is the shared hotel
@@ -112,6 +168,44 @@ mod tests {
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::VaultRegistryEntry;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn apply_forwarded_write_rejects_bad_payloads() {
+        let (_s, domain) = open_domain();
+        // unsupported op
+        let err = apply_forwarded_write(&domain, r#"{"op":"forget","vault":"default"}"#)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported op"), "{err}");
+        // missing vault
+        let err = apply_forwarded_write(&domain, r#"{"op":"remember","concept":"c"}"#)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing vault"), "{err}");
+        // valid shape but no muninn configured on this hotel
+        let err = apply_forwarded_write(
+            &domain,
+            r#"{"op":"remember","vault":"default","concept":"c","content":"x"}"#,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
+    }
+
+    #[test]
+    fn write_route_config_round_trips_through_load() {
+        let (_s, domain) = open_domain();
+        domain
+            .set_muninn_write_route("vps-jane-aiua-01")
+            .expect("set route");
+        assert_eq!(
+            domain
+                .get_muninn_write_route()
+                .expect("get route")
+                .as_deref(),
+            Some("vps-jane-aiua-01")
+        );
+    }
 
     fn open_domain() -> (SqliteGraphStorage, GraphDomain) {
         let storage = SqliteGraphStorage::open(":memory:").expect("open in-memory graph");

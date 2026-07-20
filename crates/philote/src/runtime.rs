@@ -12484,6 +12484,96 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
+    /// Muninn-cluster single-writer routing: with `shared_write_route` set, a
+    /// SharedUser-scope write must be forwarded to the Cortex hotel as an
+    /// EmitTask (role `hotel.memory_write_forward`) instead of hitting the
+    /// local replica, where it would strand (scrypster/muninndb#631).
+    #[tokio::test]
+    async fn shared_scope_write_forwards_to_cortex_when_routed() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("memroute").await;
+        let mut cfg = memory_core::MuninnConfig::local("default");
+        cfg.shared_write_route = Some("cortex-node-01".into());
+        runtime.muninn_config = Some(cfg);
+
+        let routed = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::SharedUser,
+                "likesjx",
+                "test concept",
+                "test content",
+                &["tag-a".into()],
+                &serde_json::Value::Null,
+                "sess-memroute",
+            )
+            .await;
+        assert!(routed.is_some(), "SharedUser write must be forwarded");
+
+        {
+            let emitted = emitted.lock().unwrap();
+            let fwd = emitted
+                .iter()
+                .find(|e| e["target_role"] == philotic_client::MEMORY_WRITE_FORWARD_ROLE)
+                .expect("forwarded EmitTask present");
+            assert_eq!(fwd["target_node"], "cortex-node-01");
+            assert_eq!(fwd["task"]["action"], "memory.write_forward");
+            assert_eq!(fwd["task"]["op"], "remember");
+            assert_eq!(fwd["task"]["vault"], "user_likesjx");
+            assert_eq!(fwd["task"]["concept"], "test concept");
+        }
+
+        // Self-scope writes stay local even with a route configured — agent
+        // vaults are per-host by design (the vault registry never replicates).
+        let not_routed = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::SelfOnly,
+                "likesjx",
+                "self concept",
+                "self content",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memroute",
+            )
+            .await;
+        assert!(not_routed.is_none(), "SelfOnly write must stay local");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// No route configured (the default, and the Cortex hotel itself):
+    /// every write proceeds locally.
+    #[tokio::test]
+    async fn shared_scope_write_stays_local_without_route() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("memnoroute").await;
+        runtime.muninn_config = Some(memory_core::MuninnConfig::local("default"));
+
+        let routed = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::SharedUser,
+                "likesjx",
+                "c",
+                "x",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memnoroute",
+            )
+            .await;
+        assert!(routed.is_none());
+        assert!(
+            emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| e["target_role"] != philotic_client::MEMORY_WRITE_FORWARD_ROLE),
+            "no forward envelope may be emitted without a route"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     /// Operator-authored cron preapproval: `cron_preapproved_tools` on a
     /// cron-delivered task must seed the session's approval policy so the
     /// unattended fire can execute its named tools instead of parking

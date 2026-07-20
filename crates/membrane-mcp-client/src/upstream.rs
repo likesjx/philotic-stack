@@ -4,11 +4,11 @@
 //! `initialize` → `tools/list` → `tools/call` over `POST <url>` JSON-RPC 2.0.
 
 use ansible_mesh_core::mcp_upstream::{
-    DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS, DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES, McpProjectedTool,
-    McpUpstreamConfig, McpUpstreamState, McpUpstreamToolGrant,
+    McpProjectedTool, McpUpstreamConfig, McpUpstreamState, McpUpstreamToolGrant,
+    DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS, DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES,
 };
-use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::{info, warn};
 

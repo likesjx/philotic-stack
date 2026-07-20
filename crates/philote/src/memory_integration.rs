@@ -2063,6 +2063,94 @@ impl AgentRuntime {
         .await
     }
 
+    /// Muninn-cluster single-writer routing (see `MuninnConfig::shared_write_route`).
+    ///
+    /// Returns `Some(status_text)` when the write was forwarded to the Cortex
+    /// hotel over the mesh — the caller must NOT also write locally (the
+    /// canonical engram arrives back on this host via cluster replication; a
+    /// local write would strand a divergent duplicate on the replica).
+    /// Returns `None` when the write should proceed locally: no route
+    /// configured, the route names this hotel, the vault is not fleet-shared,
+    /// or the forward could not be enqueued (falling back to a local write
+    /// strands the memory on the replica, but never loses it).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn forward_shared_memory_write(
+        &mut self,
+        scope: &MemoryScope,
+        memory_user_id: &str,
+        concept: &str,
+        content: &str,
+        tags: &[String],
+        metadata: &serde_json::Value,
+        session_id: &str,
+    ) -> Option<String> {
+        let route = self
+            .muninn_config
+            .as_ref()
+            .and_then(|cfg| cfg.shared_write_route.clone())?;
+        let local_node = local_node_id();
+        if route == local_node {
+            return None;
+        }
+        let vault = memory_core::VaultResolver {
+            agent_id: self.agent_id.clone(),
+            user_id: memory_user_id.to_string(),
+        }
+        .resolve_primary(scope);
+        if !memory_core::is_fleet_shared_vault(&vault) {
+            return None;
+        }
+
+        let task_json = serde_json::json!({
+            "action": "memory.write_forward",
+            "op": "remember",
+            "vault": vault,
+            "concept": concept,
+            "content": content,
+            "tags": tags,
+            "metadata": metadata,
+            "origin_node": local_node,
+            "origin_agent": self.agent_id,
+            "session_id": session_id,
+        })
+        .to_string();
+
+        match self
+            .ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: route.clone(),
+                target_role: philotic_client::MEMORY_WRITE_FORWARD_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard { ok: true, .. }) => {
+                info!(
+                    vault = %vault,
+                    concept = %concept,
+                    cortex = %route,
+                    "memory.remember: shared-vault write forwarded to cluster primary"
+                );
+                Some(format!(
+                    "Stored memory '{}' (vault: {}, routed to cluster primary {}; \
+                     it will appear in local recall after replication).",
+                    concept, vault, route
+                ))
+            }
+            other => {
+                warn!(
+                    vault = %vault,
+                    cortex = %route,
+                    ?other,
+                    "memory.remember: shared-write forward failed — falling back to local write \
+                     (memory will strand on this replica until reconciled)"
+                );
+                None
+            }
+        }
+    }
+
     pub(super) async fn execute_memory_remember_tool(
         &mut self,
         payload: ToolExecutionPayload,
@@ -2125,21 +2213,46 @@ impl AgentRuntime {
             &payload.turn_id,
         );
         merge_provenance_into_metadata(&mut metadata, &provenance);
-        let result_text = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
-            None => "Memory unavailable: MuninnDB not configured.".to_string(),
-            Some(engine) => {
-                match engine
-                    .remember_with_metadata(scope, &concept, &content_str, tags, metadata)
-                    .await
-                {
-                    Ok(engram_ref) => {
-                        let _ = engine.retry_enrich(&engram_ref.id).await;
-                        format!(
-                            "Stored memory '{}' (id: {}, vault: {}).",
-                            concept, engram_ref.id, engram_ref.vault_id
-                        )
+
+        // Muninn-cluster single-writer routing: a write whose resolved vault
+        // is fleet-shared must land on the cluster PRIMARY, not this host's
+        // observer replica (where it would strand — replicas accept local
+        // writes but never forward them, scrypster/muninndb#631). When the
+        // hotel's MuninnConfig carries `shared_write_route`, forward the op
+        // through the hotel mesh (EmitTask → ledger → Cortex hotel, which
+        // applies it and lets replication deliver the canonical engram back).
+        // The ledger queues while offline, so laptop writes are never lost.
+        let routed_result = self
+            .forward_shared_memory_write(
+                &scope,
+                &memory_user_id,
+                &concept,
+                &content_str,
+                &tags,
+                &metadata,
+                &payload.session_id,
+            )
+            .await;
+
+        let result_text = if let Some(routed) = routed_result {
+            routed
+        } else {
+            match self.memory_engine_for(&self.agent_id, &memory_user_id) {
+                None => "Memory unavailable: MuninnDB not configured.".to_string(),
+                Some(engine) => {
+                    match engine
+                        .remember_with_metadata(scope, &concept, &content_str, tags, metadata)
+                        .await
+                    {
+                        Ok(engram_ref) => {
+                            let _ = engine.retry_enrich(&engram_ref.id).await;
+                            format!(
+                                "Stored memory '{}' (id: {}, vault: {}).",
+                                concept, engram_ref.id, engram_ref.vault_id
+                            )
+                        }
+                        Err(e) => format!("memory.remember error: {e}"),
                     }
-                    Err(e) => format!("memory.remember error: {e}"),
                 }
             }
         };

@@ -34,6 +34,26 @@ pub struct MuninnConfig {
     pub default_token: Option<String>,
     /// Default vault when MemoryScope does not resolve to a named vault.
     pub default_vault: String,
+    /// Muninn-cluster single-writer routing: node id of the hotel that owns
+    /// the cluster PRIMARY (Cortex). When set — and the resolved vault is
+    /// fleet-shared (see [`is_fleet_shared_vault`]) — guests forward the
+    /// write through the hotel mesh to that node instead of writing to the
+    /// local replica, where it would strand: observer/lobe muninn daemons
+    /// accept local writes but never forward them, and only Cortex writes
+    /// replicate (scrypster/muninndb#631). `None` (the default, and the
+    /// correct value on the Cortex hotel itself) preserves direct local
+    /// writes. Rides inside `MemoryConfigPayload.config_json`, so adding it
+    /// is wire-compatible with older guests.
+    #[serde(default)]
+    pub shared_write_route: Option<String>,
+}
+
+/// True for vaults whose contents are fleet-visible and therefore must be
+/// written on the cluster PRIMARY: the shared `default` vault and `user_*`
+/// vaults. Agent (`self_*`) and `session_*` vaults are per-host by design —
+/// the muninn vault registry does not replicate — and always write locally.
+pub fn is_fleet_shared_vault(vault: &str) -> bool {
+    vault == "default" || vault.starts_with("user_")
 }
 
 impl MuninnConfig {
@@ -43,6 +63,7 @@ impl MuninnConfig {
             vault_tokens: HashMap::new(),
             default_token: None,
             default_vault: default_vault.into(),
+            shared_write_route: None,
         }
     }
 
@@ -548,6 +569,54 @@ impl MuninnRestEngine {
         } else {
             anyhow::bail!("unauthorized on all vault token pairs")
         }
+    }
+
+    /// Write an engram directly into a NAMED vault, bypassing the
+    /// `MemoryScope` → `VaultResolver` mapping. This is the apply side of
+    /// mesh-forwarded shared writes (`memory.write_forward`): the Cortex
+    /// hotel receives the originating guest's already-resolved vault name in
+    /// the forwarded payload and must write to exactly that vault, not one
+    /// re-resolved against its own agent/user identity.
+    ///
+    /// Same idempotency contract as `remember_with_metadata`
+    /// (`idempotent_id = "{vault}:{concept}"`), so a mesh envelope that is
+    /// redelivered reinforces the existing engram instead of duplicating it.
+    pub async fn remember_in_vault(
+        &self,
+        vault: &str,
+        concept: &str,
+        content: &str,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> anyhow::Result<EngramRef> {
+        let tags = self.apply_lens_tags(tags).await;
+        let metadata = match metadata {
+            serde_json::Value::Null => None,
+            other => Some(other),
+        };
+        let body = WriteRequest {
+            vault: vault.to_string(),
+            concept: concept.to_string(),
+            content: content.to_string(),
+            tags,
+            confidence: None,
+            metadata,
+            idempotent_id: Some(format!("{}:{}", vault, concept)),
+        };
+        let resp: WriteResponse = self
+            .with_auth(self.client.post(self.url("/api/engrams")), vault)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        self.cache_vault(&resp.id, &vault.to_string()).await;
+        self.recall_cache.clear();
+        Ok(EngramRef {
+            id: resp.id,
+            vault_id: vault.to_string(),
+        })
     }
 }
 
@@ -1235,5 +1304,38 @@ mod tests {
         // insert() is a no-op when ttl is zero — nothing to hit, ever.
         assert!(cache.get("k1").is_none());
         assert_eq!(cache.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod shared_write_route_tests {
+    use super::*;
+
+    #[test]
+    fn fleet_shared_vault_predicate() {
+        assert!(is_fleet_shared_vault("default"));
+        assert!(is_fleet_shared_vault("user_likesjx"));
+        assert!(!is_fleet_shared_vault("self_agent-aria"));
+        assert!(!is_fleet_shared_vault("session_01abc"));
+        assert!(!is_fleet_shared_vault("user")); // no underscore suffix — not a user vault
+    }
+
+    /// Wire compat: configs serialized before `shared_write_route` existed
+    /// (e.g. an older hotel's MemoryConfigPayload.config_json) must still
+    /// deserialize, defaulting to no routing.
+    #[test]
+    fn config_without_route_field_deserializes_to_none() {
+        let legacy = r#"{"base_url":"http://127.0.0.1:8475","vault_tokens":{},"default_token":null,"default_vault":"default"}"#;
+        let cfg: MuninnConfig = serde_json::from_str(legacy).expect("legacy config parses");
+        assert_eq!(cfg.shared_write_route, None);
+    }
+
+    #[test]
+    fn config_route_round_trips() {
+        let mut cfg = MuninnConfig::local("default");
+        cfg.shared_write_route = Some("vps-jane-aiua-01".into());
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: MuninnConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.shared_write_route.as_deref(), Some("vps-jane-aiua-01"));
     }
 }
