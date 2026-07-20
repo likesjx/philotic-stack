@@ -88,12 +88,42 @@ pub struct VaultResolver {
     pub user_id: String,
 }
 
+/// Coerce a vault-name component into MuninnDB's allowed alphabet
+/// (`[a-z0-9_-]`, max 64 chars total for the full name). Session-derived
+/// fallback ids (`cron:ephemeral:agent-aria`, `telegram:123:agent-jane`)
+/// contain `:` and uppercase, which MuninnDB rejects outright — before this,
+/// every shared/session-scope write from such a session failed at the vault
+/// layer. Mapping is deterministic so the same session always resolves to
+/// the same vault.
+fn sanitize_vault_component(raw: &str) -> String {
+    let mut out: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Leave room for the "{scope}_" prefix within MuninnDB's 64-char limit.
+    out.truncate(56);
+    out
+}
+
 impl VaultResolver {
     pub fn resolve(&self, scope: &MemoryScope) -> Vec<VaultId> {
         match scope {
-            MemoryScope::SelfOnly => vec![format!("self_{}", self.agent_id)],
-            MemoryScope::SharedUser => vec![format!("user_{}", self.user_id)],
-            MemoryScope::Session(id) => vec![format!("session_{}", id)],
+            MemoryScope::SelfOnly => {
+                vec![format!("self_{}", sanitize_vault_component(&self.agent_id))]
+            }
+            MemoryScope::SharedUser => {
+                vec![format!("user_{}", sanitize_vault_component(&self.user_id))]
+            }
+            MemoryScope::Session(id) => {
+                vec![format!("session_{}", sanitize_vault_component(id))]
+            }
             MemoryScope::CrossScope(scopes) => {
                 scopes.iter().flat_map(|s| self.resolve(s)).collect()
             }
@@ -1310,6 +1340,30 @@ mod tests {
 #[cfg(test)]
 mod shared_write_route_tests {
     use super::*;
+
+    #[test]
+    fn vault_components_are_sanitized_to_muninn_alphabet() {
+        let r = VaultResolver {
+            agent_id: "agent-aria".into(),
+            user_id: "cron:ephemeral:agent-aria".into(),
+        };
+        assert_eq!(
+            r.resolve_primary(&MemoryScope::SharedUser),
+            "user_cron-ephemeral-agent-aria",
+            "colons must be mapped, not passed through to MuninnDB"
+        );
+        assert_eq!(
+            r.resolve_primary(&MemoryScope::Session("telegram:123:agent-jane".into())),
+            "session_telegram-123-agent-jane"
+        );
+        // Clean ids pass through unchanged.
+        let r = VaultResolver {
+            agent_id: "agent-aria".into(),
+            user_id: "likesjx".into(),
+        };
+        assert_eq!(r.resolve_primary(&MemoryScope::SharedUser), "user_likesjx");
+        assert_eq!(r.resolve_primary(&MemoryScope::SelfOnly), "self_agent-aria");
+    }
 
     #[test]
     fn fleet_shared_vault_predicate() {

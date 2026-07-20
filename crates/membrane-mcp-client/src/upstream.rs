@@ -350,8 +350,14 @@ mod tests {
         ];
         let schema = json!({"type": "object", "properties": {}});
         let baseline: std::collections::HashMap<String, (String, Value)> = [
-            ("alpha".to_string(), ("does alpha".to_string(), schema.clone())),
-            ("beta".to_string(), ("does beta".to_string(), schema.clone())),
+            (
+                "alpha".to_string(),
+                ("does alpha".to_string(), schema.clone()),
+            ),
+            (
+                "beta".to_string(),
+                ("does beta".to_string(), schema.clone()),
+            ),
         ]
         .into();
         let advertised = vec![
@@ -361,7 +367,10 @@ mod tests {
         ];
         let (tools, missing, stale) = filter_listing(&allowlist, &advertised, &baseline);
         assert_eq!(
-            tools.iter().map(|t| t.remote_name.as_str()).collect::<Vec<_>>(),
+            tools
+                .iter()
+                .map(|t| t.remote_name.as_str())
+                .collect::<Vec<_>>(),
             vec!["alpha"]
         );
         assert_eq!(missing, vec!["gone".to_string()]);
@@ -377,8 +386,7 @@ mod tests {
         }];
         let advertised =
             vec![json!({"name": "alpha", "description": "x", "inputSchema": {"type": "object"}})];
-        let (tools, missing, stale) =
-            filter_listing(&allowlist, &advertised, &Default::default());
+        let (tools, missing, stale) = filter_listing(&allowlist, &advertised, &Default::default());
         assert_eq!(tools.len(), 1);
         assert!(missing.is_empty() && stale.is_empty());
     }
