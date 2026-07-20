@@ -31,7 +31,8 @@ use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
     ProjectedUserIdentityRecord, SecretRecord, SessionEventRecord, SessionParticipantRecord,
     SessionRecord, SessionTurnRecord, UserProfile, VaultRegistryEntry,
-    CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT, CONFIG_VAULT_REGISTRY,
+    CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT, CONFIG_MUNINN_WRITE_ROUTE,
+    CONFIG_VAULT_REGISTRY,
 };
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
@@ -1344,6 +1345,19 @@ impl GraphDomain {
 
     pub fn set_muninn_endpoint(&self, url: &str) -> Result<()> {
         self.set_config_value(CONFIG_MUNINN_ENDPOINT, &serde_json::to_string(url)?)
+    }
+
+    /// Muninn-cluster single-writer routing target (Cortex hotel node id), or
+    /// `None` when this hotel writes its own muninn directly. Stored as a
+    /// JSON string config value under `muninn_write_route`.
+    pub fn get_muninn_write_route(&self) -> Result<Option<String>> {
+        self.get_config_value(CONFIG_MUNINN_WRITE_ROUTE)?
+            .map(|raw| serde_json::from_str::<String>(&raw).map_err(anyhow::Error::from))
+            .transpose()
+    }
+
+    pub fn set_muninn_write_route(&self, node_id: &str) -> Result<()> {
+        self.set_config_value(CONFIG_MUNINN_WRITE_ROUTE, &serde_json::to_string(node_id)?)
     }
 
     // ── Graph runner registry (stored as a config value) ──────────────────────

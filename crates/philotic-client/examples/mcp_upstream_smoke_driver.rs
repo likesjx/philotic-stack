@@ -36,11 +36,10 @@ fn now() -> u64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let url = std::env::var("MCP_SMOKE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8901/mcp".to_string());
+    let url =
+        std::env::var("MCP_SMOKE_URL").unwrap_or_else(|_| "http://127.0.0.1:8901/mcp".to_string());
     let tool = std::env::var("MCP_SMOKE_TOOL").unwrap_or_else(|_| "graph_status".to_string());
-    let node_id =
-        std::env::var("MCP_SMOKE_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
+    let node_id = std::env::var("MCP_SMOKE_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
 
     let identity = GuestIdentity {
         guest_id: OWNER.into(),
@@ -61,9 +60,7 @@ async fn main() -> Result<()> {
     let config = ansible_mesh_core::mcp_upstream::McpUpstreamConfig {
         upstream_id: UPSTREAM_ID.into(),
         owner_agent_id: OWNER.into(),
-        transport: ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http {
-            url: url.clone(),
-        },
+        transport: ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http { url: url.clone() },
         credential_ref: None,
         tool_allowlist: vec![ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
             remote_name: tool.clone(),
@@ -88,14 +85,12 @@ async fn main() -> Result<()> {
     }
 
     // 2. Poll until the guest reports the catalog.
-    let projected_name =
-        ansible_mesh_core::mcp_upstream::projected_tool_name(UPSTREAM_ID, &tool);
+    let projected_name = ansible_mesh_core::mcp_upstream::projected_tool_name(UPSTREAM_ID, &tool);
     let mut connected = false;
     for attempt in 0..30 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        if let IpcResponse::McpUpstreamsState { mcp_upstreams } = client
-            .send_request(IpcRequest::GetMcpUpstreams {})
-            .await?
+        if let IpcResponse::McpUpstreamsState { mcp_upstreams } =
+            client.send_request(IpcRequest::GetMcpUpstreams {}).await?
         {
             if let Some(entry) = mcp_upstreams
                 .iter()

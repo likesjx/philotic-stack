@@ -1027,6 +1027,34 @@ impl IpcServer {
                         return true;
                     }
                 }
+                // Muninn-cluster single-writer routing: a lobe hotel forwarded
+                // a fleet-shared-vault memory write here because this hotel
+                // owns the cluster PRIMARY (`MuninnConfig::shared_write_route`).
+                // Applied in-process — no guest ever subscribes this role
+                // (same interception pattern as the operator surface above).
+                // Idempotent per {vault}:{concept}, so a redelivered envelope
+                // reinforces rather than duplicates.
+                if target_role == philotic_client::MEMORY_WRITE_FORWARD_ROLE {
+                    match crate::memory::apply_forwarded_write(graph, data).await {
+                        Ok(engram_id) => {
+                            info!(
+                                event_id = %event.event_id,
+                                source_node = %event.source_node_id,
+                                engram_id = %engram_id,
+                                "memory.write_forward applied to cluster primary"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                event_id = %event.event_id,
+                                source_node = %event.source_node_id,
+                                error = %err,
+                                "memory.write_forward FAILED to apply — forwarded memory write not stored on primary"
+                            );
+                        }
+                    }
+                    return true;
+                }
                 let target_guest_id: Option<String> =
                     serde_json::from_str::<serde_json::Value>(data)
                         .ok()
