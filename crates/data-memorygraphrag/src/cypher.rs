@@ -788,6 +788,36 @@ pub fn is_known_label(label: &str) -> bool {
     KNOWN_LABELS.contains(&label)
 }
 
+/// EWMA retention factor for the feedback-informed `recall_utility` penalty:
+/// each noisy/stale flag keeps 70% of the accumulated signal and subtracts a
+/// fresh 0.3, floored at -1.0. One flag ≈ -0.3; repeated flags converge to
+/// -1.0; ~3 flag-free... (recovery only via hygiene/operator edits today).
+pub const RECALL_UTILITY_EWMA_KEEP: f64 = 0.7;
+/// Fresh penalty added per noisy/stale flag.
+pub const RECALL_UTILITY_PENALTY: f64 = 0.3;
+
+/// Compiled atomically in Cypher (read-modify-write under Memgraph's write
+/// lock). Caller MUST validate the label via [`is_known_label`] first — the
+/// label is interpolated. The node id rides as `$id`.
+pub fn recall_utility_penalty_cypher(label: &str) -> String {
+    format!(
+        "MATCH (n:{label} {{id: $id}}) \
+         SET n.recall_utility = CASE \
+             WHEN coalesce(n.recall_utility, 0.0) * {keep} - {penalty} < -1.0 THEN -1.0 \
+             ELSE coalesce(n.recall_utility, 0.0) * {keep} - {penalty} \
+         END \
+         RETURN n.recall_utility AS recall_utility",
+        keep = RECALL_UTILITY_EWMA_KEEP,
+        penalty = RECALL_UTILITY_PENALTY,
+    )
+}
+
+/// Reference implementation of the penalty formula for tests and callers
+/// that need the expected next value in Rust.
+pub fn next_recall_utility(current: Option<f64>) -> f64 {
+    (current.unwrap_or(0.0) * RECALL_UTILITY_EWMA_KEEP - RECALL_UTILITY_PENALTY).max(-1.0)
+}
+
 fn conflict_status_str(status: &ConflictHandoffStatus) -> &'static str {
     match status {
         ConflictHandoffStatus::Open => "open",
@@ -1667,5 +1697,31 @@ mod tests {
         let q0 = patch_list_query(&[PATCH_STATUS_APPLIED.to_string()], 0);
         assert!(q0.contains("LIMIT 1"));
         assert!(q0.contains("'applied'"));
+    }
+
+    #[test]
+    fn recall_utility_penalty_is_bounded_ewma() {
+        // First flag from a clean node: -0.3.
+        assert!((next_recall_utility(None) - (-0.3)).abs() < 1e-9);
+        // Repeated flags converge toward -1.0 and never cross it.
+        let mut utility = None;
+        for _ in 0..50 {
+            utility = Some(next_recall_utility(utility));
+        }
+        let converged = utility.unwrap();
+        assert!(converged >= -1.0, "must stay floored at -1.0: {converged}");
+        assert!(converged < -0.99, "must converge near -1.0: {converged}");
+        // Floor is exact when already saturated.
+        assert_eq!(next_recall_utility(Some(-1.0)), -1.0);
+    }
+
+    #[test]
+    fn recall_utility_penalty_cypher_shape() {
+        let q = recall_utility_penalty_cypher("OpenLoop");
+        assert!(q.contains("MATCH (n:OpenLoop {id: $id})"));
+        assert!(q.contains("CASE"));
+        assert!(q.contains("-1.0"), "floor must be inline: {q}");
+        assert!(q.contains("coalesce(n.recall_utility, 0.0)"));
+        assert!(q.contains("RETURN n.recall_utility"));
     }
 }

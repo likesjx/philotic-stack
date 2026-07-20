@@ -524,12 +524,21 @@ pub fn ranking_score(
     // Soft-zoning bonus: earned only by domain-tied hits, never subtracted.
     let role_relevance = if role_matched { 1.0_f32 } else { 0.0_f32 };
 
+    // Feedback-informed utility: a bounded EWMA in [-1, 0] accumulated from
+    // life.recall.feedback noisy/stale flags. Absent property (all nodes
+    // written before the feedback loop) ranks exactly as before.
+    let recall_utility = hit
+        .prop_f64("recall_utility")
+        .map(|u| (u as f32).clamp(-1.0, 0.0))
+        .unwrap_or(0.0);
+
     (weights.semantic_similarity * sim
         + weights.recency * recency
         + weights.confirmation * confirmation
         + weights.active_commitment * active_commitment
         + weights.graph_specificity * specificity
-        + weights.role_relevance * role_relevance)
+        + weights.role_relevance * role_relevance
+        + weights.recall_utility * recall_utility)
         .clamp(0.0, 1.0)
 }
 
@@ -891,6 +900,41 @@ mod tests {
         assert!(score_fresh > score_stale, "fresh hit should rank higher");
         assert!(score_fresh > 0.5, "fresh confirmed hit should score well");
         assert!(score_stale >= 0.0 && score_stale <= 1.0);
+    }
+
+    #[test]
+    fn ranking_score_penalises_feedback_flagged_nodes() {
+        // Two identical hits except one carries the feedback-informed
+        // recall_utility penalty — it must rank strictly lower, and an
+        // absent property must rank exactly like utility 0 (pre-loop nodes).
+        let make_hit = |utility: Option<f64>| {
+            let mut props = open_loop_props("l:ol:x", "Loop", 0.8, "proposed");
+            if let Some(u) = utility {
+                props["recall_utility"] = json!(u);
+            }
+            VectorHit {
+                bolt_id: 1,
+                label: "OpenLoop".to_string(),
+                properties: props,
+                similarity: 0.8,
+            }
+        };
+        let weights = RankingWeights::default();
+        let clean = ranking_score(&make_hit(None), &weights, 0, false);
+        let zeroed = ranking_score(&make_hit(Some(0.0)), &weights, 0, false);
+        let flagged = ranking_score(&make_hit(Some(-1.0)), &weights, 0, false);
+        assert_eq!(clean, zeroed, "absent property must equal utility 0");
+        assert!(
+            flagged < clean,
+            "flagged node must rank lower: {flagged} vs {clean}"
+        );
+        assert!(
+            (clean - flagged - weights.recall_utility).abs() < 1e-6,
+            "penalty magnitude must equal the utility weight"
+        );
+        // A (nonsensical) positive utility must clamp to 0, never boost.
+        let boosted = ranking_score(&make_hit(Some(0.9)), &weights, 0, false);
+        assert_eq!(boosted, clean, "positive utility must clamp to 0");
     }
 
     #[test]

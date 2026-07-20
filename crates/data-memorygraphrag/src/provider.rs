@@ -1545,6 +1545,51 @@ impl LifeGraphProvider {
         let mut rows = graph.execute(q).await?;
         let _ = rows.next().await?;
 
+        // ── Feedback-informed ranking (recall_utility EWMA) ───────────────
+        // Nodes the model explicitly flagged noisy/stale accumulate a
+        // bounded penalty (recall_utility ∈ [-1, 0]) that ranking_score
+        // consults on every future recall — the feedback loop finally
+        // changes what gets recalled, not just the graph's structure.
+        // Non-fatal: a penalty failure never fails the feedback write.
+        let utility_penalized = {
+            let mut refs: Vec<&GraphRecordRef> = input
+                .noisy_node_refs
+                .iter()
+                .chain(input.stale_node_refs.iter())
+                .collect();
+            refs.sort_by(|a, b| (&a.label, &a.id).cmp(&(&b.label, &b.id)));
+            refs.dedup_by(|a, b| a.id == b.id && a.label == b.label);
+            let mut updated = 0usize;
+            for node_ref in refs {
+                if !cypher::is_known_label(&node_ref.label) {
+                    warn!(
+                        label = %node_ref.label,
+                        id = %node_ref.id,
+                        "recall_utility penalty skipped: unknown label in feedback ref"
+                    );
+                    continue;
+                }
+                let penalty_query = cypher::recall_utility_penalty_cypher(&node_ref.label);
+                match graph
+                    .execute(query(&penalty_query).param("id", node_ref.id.as_str()))
+                    .await
+                {
+                    Ok(mut penalty_rows) => match penalty_rows.next().await {
+                        Ok(Some(_)) => updated += 1,
+                        Ok(None) => {
+                            warn!(
+                                id = %node_ref.id,
+                                "recall_utility penalty matched no node; skipped"
+                            );
+                        }
+                        Err(e) => warn!("recall_utility penalty read failed: {e}"),
+                    },
+                    Err(e) => warn!("recall_utility penalty SET failed: {e}"),
+                }
+            }
+            updated
+        };
+
         // ── Feedback-to-action (Autopoiesis Slice A2) ─────────────────────
         // SafeAutoUpdate feedback whose remedy is structural and unambiguous
         // (disconnected/missing with an anchor + candidate node ids) is
@@ -1641,6 +1686,7 @@ impl LifeGraphProvider {
             "growth_evaluation": growth_evaluation,
             "improvement_steps": improvement_steps,
             "generated_patch": generated_patch_summary,
+            "utility_penalized": utility_penalized,
             "requires_operator": plan.requires_operator,
         })))
     }
