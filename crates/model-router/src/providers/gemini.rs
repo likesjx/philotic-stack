@@ -485,6 +485,25 @@ impl GeminiProvider {
                                 .unwrap_or_default(),
                         ),
                         "items" => Self::normalize_function_parameters(value, false),
+                        // JSON Schema union types ('"type": ["string","null"]')
+                        // are proto-invalid for Gemini ("Proto field is not
+                        // repeating, cannot start list" → HTTP 400 for the
+                        // WHOLE request, killing every turn that projects the
+                        // tool). Collapse to the first non-"null" entry;
+                        // nullability is already conveyed by absence from
+                        // `required`. Live incident 2026-07-20: agent.graph.declare
+                        // took down Aria's Gemini tier fleet-wide.
+                        "type" => match value {
+                            Value::Array(entries) => Value::String(
+                                entries
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .find(|t| !t.eq_ignore_ascii_case("null"))
+                                    .unwrap_or("string")
+                                    .to_string(),
+                            ),
+                            other => other.clone(),
+                        },
                         _ => value.clone(),
                     };
                     normalized.insert(key.clone(), normalized_value);
@@ -2602,6 +2621,38 @@ impl GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::{GeminiAuth, GeminiProvider};
+
+    #[test]
+    fn union_type_arrays_collapse_to_first_non_null() {
+        // Regression for the 2026-07-20 incident: '"type": ["string","null"]'
+        // in one projected tool schema 400s the ENTIRE Gemini request
+        // ("Proto field is not repeating, cannot start list"), killing every
+        // turn of every agent that projects the tool. Union types must
+        // collapse to their first non-null member at this boundary — schemas
+        // arrive from the philote catalog AND from arbitrary upstream MCP
+        // servers via the client fabric, so the provider cannot trust its
+        // callers to pre-sanitize.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config_hint": {
+                    "type": ["string", "null"],
+                    "description": "hint"
+                },
+                "count": { "type": ["null", "integer"] }
+            },
+            "required": ["count"]
+        });
+        let normalized = GeminiProvider::normalize_function_parameters(&schema, true);
+        assert_eq!(
+            normalized["properties"]["config_hint"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            normalized["properties"]["count"]["type"],
+            serde_json::json!("integer")
+        );
+    }
     use crate::controller::{
         AttachmentInput, ContextEnvelope, ControllerTask, NativeLiveProvider, RequestClass,
         RoutingHints, TaskKind,

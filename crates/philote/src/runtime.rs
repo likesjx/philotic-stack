@@ -9222,7 +9222,10 @@ mod tests {
     #[test]
     fn compose_guest_identity_matches_registration_shapes() {
         use super::compose_guest_identity;
-        assert_eq!(compose_guest_identity("agent-bjork-01", None), "agent-bjork-01");
+        assert_eq!(
+            compose_guest_identity("agent-bjork-01", None),
+            "agent-bjork-01"
+        );
         assert_eq!(
             compose_guest_identity("agent-bjork-01", Some("theoretician")),
             "agent-bjork-01:theoretician"

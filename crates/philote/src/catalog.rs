@@ -793,7 +793,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "description": "Resource type to declare, matching the shared resource enum."
                     },
                     "config_hint": {
-                        "type": ["string", "null"],
+                        // Not ["string","null"]: union types 400 the entire
+                        // Gemini request (proto rejects type lists). Optionality
+                        // is expressed by omission from `required`.
+                        "type": "string",
                         "description": "Optional configuration hint to store with the declaration."
                     }
                 },
@@ -3829,6 +3832,40 @@ mod tests {
                 skill_is_relevant_for_turn("life.steward", turn),
                 "expected life.steward to be relevant for {turn:?}"
             );
+        }
+    }
+
+    #[test]
+    fn no_catalog_schema_uses_union_type_arrays() {
+        // '"type": ["string","null"]' is valid JSON Schema but proto-invalid
+        // for Gemini — ONE such property 400s the whole request and silences
+        // the agent's Gemini tier (live incident 2026-07-20, agent.graph.declare).
+        // The gemini provider now collapses unions defensively, but the
+        // catalog should never emit them in the first place: optionality is
+        // expressed by omission from `required`.
+        fn assert_no_union_types(name: &str, value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(t) = map.get("type") {
+                        assert!(
+                            !t.is_array(),
+                            "tool {name} declares a union type array: {t}"
+                        );
+                    }
+                    for v in map.values() {
+                        assert_no_union_types(name, v);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for v in items {
+                        assert_no_union_types(name, v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (name, tool) in tool_catalog() {
+            assert_no_union_types(&name, &tool.input_schema);
         }
     }
 
