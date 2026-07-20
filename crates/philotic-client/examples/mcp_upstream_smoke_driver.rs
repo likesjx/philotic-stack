@@ -17,7 +17,13 @@
 //!   cargo run -p philotic-client --example mcp_upstream_smoke_driver
 //!
 //! Env overrides: MCP_SMOKE_URL (default http://127.0.0.1:8901/mcp),
-//! MCP_SMOKE_TOOL (default graph_status), MCP_SMOKE_NODE (default node id).
+//! MCP_SMOKE_TOOL (default graph_status), MCP_SMOKE_NODE (default node id),
+//! MCP_SMOKE_CREDENTIAL (set the upstream credential via
+//! ProvisionMcpUpstreamCredential before connecting — Phase-2 auth proof),
+//! MCP_SMOKE_REFRESH_SECS (periodic re-list interval),
+//! MCP_SMOKE_MODE=inspect (only print the stored catalog incl. stale grants,
+//! no register/call — for stale-grant drills where re-registering would reset
+//! the approval baseline).
 
 use anyhow::{Context, Result, bail};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
@@ -41,6 +47,11 @@ async fn main() -> Result<()> {
     let tool = std::env::var("MCP_SMOKE_TOOL").unwrap_or_else(|_| "graph_status".to_string());
     let node_id =
         std::env::var("MCP_SMOKE_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
+    let credential = std::env::var("MCP_SMOKE_CREDENTIAL").ok().filter(|s| !s.is_empty());
+    let refresh_secs = std::env::var("MCP_SMOKE_REFRESH_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let inspect_only = std::env::var("MCP_SMOKE_MODE").as_deref() == Ok("inspect");
 
     let identity = GuestIdentity {
         guest_id: OWNER.into(),
@@ -57,6 +68,32 @@ async fn main() -> Result<()> {
         })
         .await?;
 
+    if inspect_only {
+        if let IpcResponse::McpUpstreamsState { mcp_upstreams } =
+            client.send_request(IpcRequest::GetMcpUpstreams {}).await?
+        {
+            for entry in &mcp_upstreams {
+                let (state, tools, stale, missing) = entry
+                    .catalog
+                    .as_ref()
+                    .map(|c| {
+                        (
+                            format!("{:?}", c.state),
+                            c.tools.iter().map(|t| t.remote_name.clone()).collect::<Vec<_>>(),
+                            c.stale_grants.clone(),
+                            c.missing_grants.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| ("Pending".into(), vec![], vec![], vec![]));
+                println!(
+                    "upstream={} state={} projected={:?} stale={:?} missing={:?}",
+                    entry.config.upstream_id, state, tools, stale, missing
+                );
+            }
+        }
+        return Ok(());
+    }
+
     // 1. Register the upstream.
     let config = ansible_mesh_core::mcp_upstream::McpUpstreamConfig {
         upstream_id: UPSTREAM_ID.into(),
@@ -71,7 +108,7 @@ async fn main() -> Result<()> {
             max_response_bytes: None,
         }],
         grant_agents: vec![],
-        refresh_interval_secs: None,
+        refresh_interval_secs: refresh_secs,
         updated_at: now(),
     };
     match client
@@ -85,6 +122,24 @@ async fn main() -> Result<()> {
             "[2/4] upstream '{mcp_upstream_id}' registered (guest spawned: {mcp_upstream_materialized})"
         ),
         other => bail!("RegisterMcpUpstream unexpected response: {other:?}"),
+    }
+
+    // 1b. Provision the outbound credential (Phase-2 authenticated path).
+    if let Some(cred) = credential {
+        match client
+            .send_request(IpcRequest::ProvisionMcpUpstreamCredential {
+                upstream_id: UPSTREAM_ID.into(),
+                owner_agent_id: OWNER.into(),
+                credential: cred,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, data, .. } => println!(
+                "      credential stored in vault ({})",
+                data.and_then(|d| d.get("vault_ref").cloned()).unwrap_or_default()
+            ),
+            other => bail!("ProvisionMcpUpstreamCredential unexpected response: {other:?}"),
+        }
     }
 
     // 2. Poll until the guest reports the catalog.

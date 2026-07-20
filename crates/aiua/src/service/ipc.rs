@@ -9319,6 +9319,144 @@ impl IpcServer {
                 IpcResponse::success("mcp_upstream_catalog", None)
             }
 
+            IpcRequest::ProvisionMcpUpstreamCredential {
+                upstream_id,
+                owner_agent_id,
+                credential,
+            } => {
+                use ansible_mesh_core::mcp_upstream::McpUpstreamConfig;
+
+                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
+                    return IpcResponse::error(
+                        "mcp_upstream_credential",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{owner_agent_id}' does not match the registered \
+                             guest identity"
+                        ),
+                    );
+                }
+                if credential.trim().is_empty() {
+                    return IpcResponse::error(
+                        "mcp_upstream_credential",
+                        "EMPTY_CREDENTIAL",
+                        "credential must be non-empty",
+                    );
+                }
+
+                let mut registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
+                    .get_config_value("__mcp_upstreams__")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let Some(config) = registry.get_mut(&upstream_id) else {
+                    return IpcResponse::error(
+                        "mcp_upstream_credential",
+                        "NOT_FOUND",
+                        format!("no upstream registered as {upstream_id}"),
+                    );
+                };
+                if config.owner_agent_id != owner_agent_id {
+                    return IpcResponse::error(
+                        "mcp_upstream_credential",
+                        "FORBIDDEN",
+                        format!("upstream {upstream_id} is not owned by {owner_agent_id}"),
+                    );
+                }
+
+                // Rotate in place when a credential ref already exists;
+                // otherwise mint a new vault secret. The plaintext is stored
+                // (the guest must present it outbound) — readable only by the
+                // mcp-client-runner role, and kind-scoped so registry sweeps
+                // (e.g. Muninn config loading) can filter it out.
+                let (vault_ref, rotated) = match config.credential_ref.clone() {
+                    Some(existing_ref) => {
+                        if let Err(e) =
+                            crate::vault::rotate_secret(graph, &existing_ref, &credential)
+                        {
+                            return IpcResponse::error(
+                                "mcp_upstream_credential",
+                                "VAULT_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                        (existing_ref, true)
+                    }
+                    None => {
+                        let secret_ref = match store_secret(
+                            graph,
+                            SecretInput {
+                                secret_kind: "mcp_upstream_credential".into(),
+                                scope: "hotel".into(),
+                                allowed_roles: vec!["mcp-client-runner".into()],
+                                allowed_guests: Vec::new(),
+                                plaintext: credential,
+                            },
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return IpcResponse::error(
+                                    "mcp_upstream_credential",
+                                    "VAULT_ERROR",
+                                    e.to_string(),
+                                );
+                            }
+                        };
+                        config.credential_ref = Some(secret_ref.clone());
+                        (secret_ref, false)
+                    }
+                };
+                config.updated_at = unix_ts();
+                let config_snapshot = config.clone();
+
+                match serde_json::to_string(&registry) {
+                    Ok(json) => {
+                        if let Err(e) = graph.set_config_value("__mcp_upstreams__", &json) {
+                            return IpcResponse::error(
+                                "mcp_upstream_credential",
+                                "CONFIG_STORE_ERROR",
+                                e.to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "mcp_upstream_credential",
+                            "SERIALIZE_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                }
+
+                // Fan out so the guest re-resolves the credential and
+                // reconnects authenticated.
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_upstream",
+                    "config": config_snapshot,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    "mcp-client-runner",
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+
+                info!(upstream_id, rotated, "MCP upstream credential provisioned.");
+                IpcResponse::success(
+                    "mcp_upstream_credential",
+                    Some(serde_json::json!({
+                        "upstream_id": upstream_id,
+                        "vault_ref": vault_ref,
+                        "rotated": rotated,
+                    })),
+                )
+            }
+
             // ── User Task Engine ──────────────────────────────────────────────
             IpcRequest::CreateUserTask {
                 task_id,

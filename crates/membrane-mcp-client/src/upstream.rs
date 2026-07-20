@@ -21,6 +21,11 @@ pub struct UpstreamClient {
     /// Raw bearer credential resolved from the vault, if any.
     bearer: Option<String>,
     next_id: u64,
+    /// Approved baseline per remote tool: `(description, input_schema)` as
+    /// captured at the last config update (`mcp.connect` re-run / replay).
+    /// Periodic refreshes diff against this — a changed description or schema
+    /// marks the grant stale until the owner re-approves.
+    baseline: std::collections::HashMap<String, (String, serde_json::Value)>,
 }
 
 /// Result of connecting: state + the allowlist-filtered projected tools.
@@ -28,6 +33,58 @@ pub struct ConnectOutcome {
     pub state: McpUpstreamState,
     pub tools: Vec<McpProjectedTool>,
     pub missing_grants: Vec<String>,
+    pub stale_grants: Vec<String>,
+}
+
+/// Pure allowlist filter with optional baseline diff. Returns
+/// `(projected, missing, stale)`:
+/// - `projected`: allowlisted tools advertised with a valid object schema and
+///   (when a baseline entry exists) an UNCHANGED description + schema
+/// - `missing`: allowlisted names the server did not advertise (or advertised
+///   with a malformed schema)
+/// - `stale`: allowlisted tools whose description/schema changed vs baseline
+pub fn filter_listing(
+    allowlist: &[McpUpstreamToolGrant],
+    advertised: &[Value],
+    baseline: &std::collections::HashMap<String, (String, Value)>,
+) -> (Vec<McpProjectedTool>, Vec<String>, Vec<String>) {
+    let mut tools = Vec::new();
+    let mut missing = Vec::new();
+    let mut stale = Vec::new();
+    for grant in allowlist {
+        let found = advertised
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(grant.remote_name.as_str()));
+        let Some(t) = found else {
+            missing.push(grant.remote_name.clone());
+            continue;
+        };
+        let schema = t
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+        if !schema.is_object() {
+            missing.push(grant.remote_name.clone());
+            continue;
+        }
+        let description = t
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some((base_desc, base_schema)) = baseline.get(&grant.remote_name) {
+            if *base_desc != description || *base_schema != schema {
+                stale.push(grant.remote_name.clone());
+                continue;
+            }
+        }
+        tools.push(McpProjectedTool {
+            remote_name: grant.remote_name.clone(),
+            description,
+            input_schema: schema,
+        });
+    }
+    (tools, missing, stale)
 }
 
 impl UpstreamClient {
@@ -41,6 +98,7 @@ impl UpstreamClient {
             http,
             bearer,
             next_id: 1,
+            baseline: std::collections::HashMap::new(),
         })
     }
 
@@ -127,8 +185,13 @@ impl UpstreamClient {
     }
 
     /// Connect: handshake, list tools, filter through the allowlist.
-    pub async fn connect_and_list(&mut self) -> ConnectOutcome {
-        match self.try_connect_and_list().await {
+    ///
+    /// `reset_baseline: true` treats this listing as the approved baseline
+    /// (config update / `mcp.connect` re-run — the approval event);
+    /// `false` (periodic refresh) diffs against the stored baseline and marks
+    /// changed tools stale instead of projecting them.
+    pub async fn connect_and_list(&mut self, reset_baseline: bool) -> ConnectOutcome {
+        match self.try_connect_and_list(reset_baseline).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!(upstream = self.config.upstream_id, err = %format!("{e:#}"), "upstream connect failed");
@@ -148,12 +211,13 @@ impl UpstreamClient {
                         .iter()
                         .map(|g| g.remote_name.clone())
                         .collect(),
+                    stale_grants: Vec::new(),
                 }
             }
         }
     }
 
-    async fn try_connect_and_list(&mut self) -> Result<ConnectOutcome> {
+    async fn try_connect_and_list(&mut self, reset_baseline: bool) -> Result<ConnectOutcome> {
         self.initialize().await?;
         let result = self.rpc("tools/list", json!({})).await?;
         let advertised = result
@@ -162,53 +226,49 @@ impl UpstreamClient {
             .cloned()
             .unwrap_or_default();
 
-        let mut tools = Vec::new();
-        let mut missing: Vec<String> = Vec::new();
-        for grant in &self.config.tool_allowlist {
-            let found = advertised.iter().find(|t| {
-                t.get("name").and_then(Value::as_str) == Some(grant.remote_name.as_str())
-            });
-            match found {
-                Some(t) => {
+        if reset_baseline {
+            self.baseline = advertised
+                .iter()
+                .filter_map(|t| {
+                    let name = t.get("name").and_then(Value::as_str)?.to_string();
+                    let description = t
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     let schema = t
                         .get("inputSchema")
                         .cloned()
                         .unwrap_or_else(|| json!({"type": "object"}));
-                    // Schemas must be JSON objects — reject anything else rather
-                    // than projecting a malformed shape into a philote catalog.
-                    if !schema.is_object() {
-                        warn!(
-                            upstream = self.config.upstream_id,
-                            tool = grant.remote_name,
-                            "remote tool schema is not an object; skipping projection"
-                        );
-                        missing.push(grant.remote_name.clone());
-                        continue;
-                    }
-                    tools.push(McpProjectedTool {
-                        remote_name: grant.remote_name.clone(),
-                        description: t
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        input_schema: schema,
-                    });
-                }
-                None => missing.push(grant.remote_name.clone()),
-            }
+                    Some((name, (description, schema)))
+                })
+                .collect();
+        }
+
+        let (tools, missing, stale) =
+            filter_listing(&self.config.tool_allowlist, &advertised, &self.baseline);
+        for name in &stale {
+            warn!(
+                upstream = self.config.upstream_id,
+                tool = name,
+                "remote tool description/schema changed since approval — grant marked stale; \
+                 re-run mcp.connect to re-approve"
+            );
         }
         info!(
             upstream = self.config.upstream_id,
             advertised = advertised.len(),
             projected = tools.len(),
             missing = missing.len(),
+            stale = stale.len(),
+            reset_baseline,
             "upstream tools listed"
         );
         Ok(ConnectOutcome {
             state: McpUpstreamState::Connected,
             tools,
             missing_grants: missing,
+            stale_grants: stale,
         })
     }
 
@@ -268,6 +328,60 @@ pub fn extract_text_content(result: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_grant_detection() {
+        let allowlist = vec![
+            McpUpstreamToolGrant {
+                remote_name: "alpha".into(),
+                allotment: None,
+                max_response_bytes: None,
+            },
+            McpUpstreamToolGrant {
+                remote_name: "beta".into(),
+                allotment: None,
+                max_response_bytes: None,
+            },
+            McpUpstreamToolGrant {
+                remote_name: "gone".into(),
+                allotment: None,
+                max_response_bytes: None,
+            },
+        ];
+        let schema = json!({"type": "object", "properties": {}});
+        let baseline: std::collections::HashMap<String, (String, Value)> = [
+            ("alpha".to_string(), ("does alpha".to_string(), schema.clone())),
+            ("beta".to_string(), ("does beta".to_string(), schema.clone())),
+        ]
+        .into();
+        let advertised = vec![
+            json!({"name": "alpha", "description": "does alpha", "inputSchema": schema}),
+            // beta's description mutated since approval → stale, not projected
+            json!({"name": "beta", "description": "does beta AND exfiltrates", "inputSchema": schema}),
+        ];
+        let (tools, missing, stale) = filter_listing(&allowlist, &advertised, &baseline);
+        assert_eq!(
+            tools.iter().map(|t| t.remote_name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+        assert_eq!(missing, vec!["gone".to_string()]);
+        assert_eq!(stale, vec!["beta".to_string()]);
+    }
+
+    #[test]
+    fn empty_baseline_projects_everything_advertised() {
+        let allowlist = vec![McpUpstreamToolGrant {
+            remote_name: "alpha".into(),
+            allotment: None,
+            max_response_bytes: None,
+        }];
+        let advertised =
+            vec![json!({"name": "alpha", "description": "x", "inputSchema": {"type": "object"}})];
+        let (tools, missing, stale) =
+            filter_listing(&allowlist, &advertised, &Default::default());
+        assert_eq!(tools.len(), 1);
+        assert!(missing.is_empty() && stale.is_empty());
+    }
 
     #[test]
     fn text_content_extraction() {
