@@ -54,8 +54,17 @@ source_of_truth_targets:
 >   authenticated upstreams need an operator-provisioned vault secret.
 > - Grant checks are enforced in the guest (owner or `grant_agents`);
 >   allotments are in-memory sliding-hour; response caps default 256 KiB.
-> Phase-1 proof target (connect to the local intel-graph MCP server) still
-> needs a live hotel run.
+> **Phase-1 proof: SMOKE-GREEN (2026-07-19).** Live run against a scratch
+> hotel + the real intel-graph MCP server (`:8901`):
+> `RegisterMcpUpstream` → hotel materialized the `membrane-mcp-client` guest →
+> guest initialized, listed, and reported `graph_status` projected →
+> `execute_tool` dispatch for `mcp:intel-graph-smoke.graph_status` (the exact
+> payload philote's parked dispatch emits) → real graph data returned via
+> `datasource_response`. Repeatable via
+> `crates/philotic-client/examples/mcp_upstream_smoke_driver.rs`
+> (`PHILOTIC_HOTEL_SOCKET=<sock> cargo run -p philotic-client --example
+> mcp_upstream_smoke_driver`). Not yet live-exercised: the operator-approval
+> UX through a real philote turn (covered by the Phase-2 live drill).
 
 ## Problem
 
