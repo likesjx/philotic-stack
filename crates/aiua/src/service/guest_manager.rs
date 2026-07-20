@@ -19,6 +19,61 @@ pub struct GuestStderrLine {
     pub line: String,
 }
 
+/// Strip ANSI SGR escape sequences (`ESC [ ... <letter>`) from a log line.
+/// Guest tracing output carries color codes even when piped, so level-token
+/// matching must happen on the stripped text.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for e in chars.by_ref() {
+                    if e.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Decide whether a guest STDOUT line is a health signal worth persisting to
+/// the heal queue.
+///
+/// Guests write their tracing logs to stdout, which historically was inherited
+/// straight to the hotel's own stdout — so runtime `ERROR` events (external
+/// API failures, auth 401s) never reached the self-heal circuit at all; only
+/// true stderr (panics, crash output) did. Live gap 2026-07-20: membrane
+/// Discord-405s on every reply and Beacon memory-401s were invisible to
+/// `phil heal list`.
+///
+/// Volume control: only `ERROR`-level events are forwarded, plus `WARN`-level
+/// events that carry an auth/API-failure marker (a 401 on the memory path is
+/// logged at WARN but is a real standing fault). Everything else stays
+/// log-only. Downstream `push_error` collapses near-identical lines within
+/// its flood window, so a hot error loop cannot swamp the queue.
+fn stdout_line_is_health_signal(line: &str) -> bool {
+    let stripped = strip_ansi(line);
+    if stripped.contains(" ERROR ") {
+        return true;
+    }
+    if stripped.contains(" WARN ") {
+        let lower = stripped.to_lowercase();
+        return lower.contains("unauthorized")
+            || lower.contains("permission denied")
+            || lower.contains("forbidden")
+            || lower.contains("api error")
+            || lower.contains("api key");
+    }
+    false
+}
+
 /// A Universal Materializer backed by the local OS Process space.
 pub struct LocalProcessMaterializer {
     children: HashMap<String, tokio::process::Child>,
@@ -143,6 +198,7 @@ impl Materializer for LocalProcessMaterializer {
             }
 
             command.stderr(std::process::Stdio::piped());
+            command.stdout(std::process::Stdio::piped());
 
             let mut child = command.spawn().with_context(|| {
                 format!(
@@ -165,6 +221,35 @@ impl Materializer for LocalProcessMaterializer {
                                 guest_id: gid.clone(),
                                 line,
                             });
+                        }
+                    }
+                });
+            }
+
+            // Guest stdout: pass every line through to the hotel's stdout
+            // verbatim (preserving the historical inherit behavior journald /
+            // launchd log files rely on), and additionally forward ERROR-level
+            // tracing events into the heal queue — guests log runtime faults
+            // to STDOUT, so without this tap the self-heal circuit only ever
+            // saw crash-time stderr (see stdout_line_is_health_signal).
+            if let Some(stdout) = child.stdout.take() {
+                let gid = guest_id.to_string();
+                let tx = self.stderr_tx.clone();
+                tokio::spawn(async move {
+                    use std::io::Write;
+                    let mut lines = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        {
+                            let mut out = std::io::stdout().lock();
+                            let _ = writeln!(out, "{line}");
+                        }
+                        if let Some(ref tx) = tx {
+                            if stdout_line_is_health_signal(&line) {
+                                let _ = tx.try_send(GuestStderrLine {
+                                    guest_id: gid.clone(),
+                                    line,
+                                });
+                            }
                         }
                     }
                 });
@@ -2005,5 +2090,44 @@ mod tests {
             .expect("config read")
             .expect("supervision_state should be set");
         assert!(state.contains("respawn_budget_exhausted"));
+    }
+
+    #[test]
+    fn stdout_health_signal_matches_error_level_with_ansi() {
+        // Real journal sample shape: tracing fmt with ANSI color codes.
+        let line = "\u{1b}[2m2026-07-20T13:20:12.050455Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m \u{1b}[2mmembrane_discord\u{1b}[0m\u{1b}[2m:\u{1b}[0m Failed to handle agent reply: Discord API error 405 Method Not Allowed";
+        assert!(stdout_line_is_health_signal(line));
+    }
+
+    #[test]
+    fn stdout_health_signal_matches_warn_with_auth_marker() {
+        let line = "\u{1b}[33m WARN\u{1b}[0m memory_core::rest_client: Cross-scope activation failed for vault; continuing with others vault=self_agent-beacon error=HTTP status client error (401 Unauthorized) for url (http://127.0.0.1:8475/api/activate)";
+        assert!(stdout_line_is_health_signal(line));
+    }
+
+    #[test]
+    fn stdout_health_signal_skips_info_and_plain_warn() {
+        assert!(!stdout_line_is_health_signal(
+            "2026-07-20T13:20:12Z  INFO agent_core::runtime::turn_loop: Agent dispatch: action peek"
+        ));
+        // A WARN without an auth/API marker stays log-only (e.g. the mesh
+        // EMSGSIZE broadcast warns every 30s — pure noise for the heal queue).
+        assert!(!stdout_line_is_health_signal(
+            "2026-07-20T13:18:55Z  WARN aiua::service::mesh_runtime: hotel-state broadcast to 100.79.239.64:13112: Message too long (os error 40)"
+        ));
+        // Message BODIES that merely contain the word "error" without an
+        // ERROR level token do not match.
+        assert!(!stdout_line_is_health_signal(
+            "2026-07-20T13:20:12Z  INFO philote: tool result contained field error=none"
+        ));
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_sequences() {
+        assert_eq!(
+            strip_ansi("\u{1b}[31mERROR\u{1b}[0m plain \u{1b}[2mdim\u{1b}[0m"),
+            "ERROR plain dim"
+        );
+        assert_eq!(strip_ansi("no escapes"), "no escapes");
     }
 }

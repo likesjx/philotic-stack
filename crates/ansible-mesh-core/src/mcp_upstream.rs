@@ -144,6 +144,14 @@ pub struct McpUpstreamCatalog {
     /// Allowlisted names the server did NOT advertise (grant is stale).
     #[serde(default)]
     pub missing_grants: Vec<String>,
+    /// Allowlisted tools whose remote description or input schema CHANGED
+    /// since the approved baseline (the listing captured at the last
+    /// `mcp.connect`/config update). Stale tools are excluded from `tools`
+    /// — and therefore from philote projection — until the owner re-approves
+    /// by re-running `mcp.connect` (Phase 2 re-approval rule: descriptions
+    /// cannot silently mutate under an existing approval).
+    #[serde(default)]
+    pub stale_grants: Vec<String>,
     /// Unix epoch (seconds) of this report.
     pub reported_at: u64,
 }
@@ -292,6 +300,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             }],
             missing_grants: vec!["graph_scan".into()],
+            stale_grants: vec!["graph_query".into()],
             reported_at: 1_700_000_000,
         });
     }

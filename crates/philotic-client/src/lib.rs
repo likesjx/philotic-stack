@@ -1764,6 +1764,21 @@ pub enum IpcRequest {
     ReportMcpUpstreamCatalog {
         catalog: ansible_mesh_core::mcp_upstream::McpUpstreamCatalog,
     },
+    /// Store (or rotate) the outbound credential for an upstream MCP server.
+    ///
+    /// The plaintext credential passes through to the hotel vault under
+    /// secret-kind `mcp_upstream_credential` (readable by the
+    /// `mcp-client-runner` role only) and is never persisted in the graph or
+    /// echoed back. The upstream's `credential_ref` is set and the updated
+    /// config fans out so the guest reconnects authenticated. Only the
+    /// upstream's `owner_agent_id` may call this; the claim is verified
+    /// against the registered guest identity. Responds with
+    /// [`IpcResponse::Standard`].
+    ProvisionMcpUpstreamCredential {
+        upstream_id: String,
+        owner_agent_id: String,
+        credential: String,
+    },
     // ── Training data admin IPC ───────────────────────────────────────────────
     /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
     ListTrainingSamples {

@@ -4838,6 +4838,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "mcp.connect"
             | "mcp.disconnect"
             | "mcp.upstreams"
+            | "mcp.set_credential"
             | "desktop.observe"
             | "skill.register"
             | "skill.list"

@@ -384,6 +384,7 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "mcp.connect",
             "mcp.disconnect",
             "mcp.upstreams",
+            "mcp.set_credential",
         ],
         _ => &[],
     }
@@ -3066,8 +3067,31 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "tools": {
                         "type": "array",
-                        "description": "Remote tool names to allowlist for projection.",
-                        "items": { "type": "string" }
+                        "description": "Remote tools to allowlist for projection. Each item is \
+                                        a name string, or an object {name, allotment, \
+                                        max_response_bytes} to set a per-tool hourly call \
+                                        budget and response-size cap.",
+                        "items": {
+                            "anyOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "allotment": { "type": "integer", "description": "Max calls per sliding hour." },
+                                        "max_response_bytes": { "type": "integer", "description": "Response size cap (default 262144)." }
+                                    },
+                                    "required": ["name"]
+                                }
+                            ]
+                        }
+                    },
+                    "refresh_interval_secs": {
+                        "type": "integer",
+                        "description": "Optionally re-list the server's tools every N seconds \
+                                        (min 30). Tools whose description or schema changed \
+                                        since approval are dropped as stale until mcp.connect \
+                                        is re-run. Absent = refresh only on connect."
                     },
                     "grant_agents": {
                         "type": "array",
@@ -3104,6 +3128,35 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["upstream_id"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.set_credential".into(),
+        ToolDefinition {
+            tool_name: "mcp.set_credential".into(),
+            description: "Store or rotate the outbound credential (bearer token) for an \
+                          upstream MCP server this agent owns. The value passes through to \
+                          the hotel vault (kind mcp_upstream_credential, readable only by \
+                          the mcp-client guest) and is never stored in the graph, logged, \
+                          or echoed back. The guest reconnects authenticated immediately. \
+                          Ask the operator for the token value — never invent one."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "upstream_id": {
+                        "type": "string",
+                        "description": "The upstream this credential is for (must be owned by this agent)."
+                    },
+                    "credential": {
+                        "type": "string",
+                        "description": "The raw bearer token/credential value, exactly as provided by the operator."
+                    }
+                },
+                "required": ["upstream_id", "credential"]
             }),
             class: Some("config".into()),
         },

@@ -193,8 +193,10 @@ fn marker_value(text: &str, key: &str) -> Option<String> {
 
 /// True when the text contains a standalone 3-digit token within `lo..=hi`
 /// (an HTTP status code). Tokens glued to letters/digits/dots (`400s`,
-/// `v1.400`, `gemini400`) do not match.
-fn has_standalone_status(text: &str, lo: u32, hi: u32) -> bool {
+/// `v1.400`, `gemini400`) do not match. Public so the heal-dispatcher's rule
+/// table can reuse the same status parsing for non-provider (external API)
+/// error lines.
+pub fn has_standalone_status(text: &str, lo: u32, hi: u32) -> bool {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -400,6 +402,12 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         // (2026-07-20: gemini schema 400s were invisible because the ladder
         // kept answering) — no restart fixes a provider; surface a work item.
         | "provider_fallback"
+        // External (non-model-provider) API errors from membranes and
+        // integrations (Discord/Telegram/etc.): a 4xx is our request/config
+        // problem, a 5xx is the upstream's outage — neither is fixed by a
+        // guest restart (2026-07-20: Discord 405 on every reply).
+        | "external_api_4xx"
+        | "external_api_5xx"
         // A seat that stood down (token missing, or lease held and the seat's
         // self-heal re-probe hasn't recovered it) is an availability gap the
         // operator should see; restarting the guest just re-runs the same
